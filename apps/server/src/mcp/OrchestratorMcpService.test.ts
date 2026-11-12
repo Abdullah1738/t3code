@@ -29,6 +29,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
+import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -1368,6 +1370,190 @@ describe("OrchestratorMcpService provider resolution", () => {
     runtimeRequests: [],
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
+
+  it.effect.each(["caller", "catalog", "receipt", "selection", "dispatch"] as const)(
+    "delegateTask bounds a stalled %s phase and never dispatches after a preflight timeout",
+    (stage) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let dispatches = 0;
+        const stall = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.uninterruptible,
+        );
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () =>
+              stage === "caller"
+                ? stall.pipe(Effect.as(parentProjection([])))
+                : Effect.succeed(parentProjection([])),
+            hasReceipt: () =>
+              stage === "receipt" ? stall.pipe(Effect.as(false)) : Effect.succeed(false),
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatches++;
+              }).pipe(Effect.andThen(stall), Effect.as({ sequence: 1, storedEvents: [] } as never)),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: (stage === "catalog" ? stall : Effect.void).pipe(
+              Effect.as([
+                providerSnapshot({
+                  instanceId: codexInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  model: "gpt-5.4",
+                }),
+              ]),
+            ),
+          }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () =>
+              (stage === "selection" ? stall : Effect.void).pipe(Effect.as([codexInstanceId])),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const call = yield* service
+            .delegateTask(scope, {
+              task: "Check the diff",
+              mode: "async",
+              clientRequestId: "cancelled-first-run",
+            })
+            .pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust("30 seconds");
+          const completed = call.pollUnsafe();
+          yield* Deferred.succeed(release, undefined);
+          assert.isDefined(completed);
+          const error = yield* Fiber.join(call);
+          assert.equal(error.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
+          assert.include(error.message, parentThreadId);
+          if (stage !== "caller") assert.include(error.message, stage);
+          if (stage === "dispatch") assert.include(error.message, "cancelled-first-run");
+          assert.equal(dispatches, stage === "dispatch" ? 1 : 0);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
+  it.effect.each(["result", "wait", "wake_policy"] as const)(
+    "delegateTask recovers an accepted task when %s I/O stalls",
+    (stage) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const finished = yield* Deferred.make<void>();
+        const stall = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.uninterruptible,
+          Effect.ensuring(Deferred.succeed(finished, undefined)),
+        );
+        let accepted = false;
+        let slow = true;
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: codexInstanceId,
+          model: "gpt-5.4",
+          status: "running",
+          result: null,
+        };
+        const commandIds: string[] = [];
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (id) => {
+              const projection =
+                id === parentThreadId ? parentProjection(accepted ? [task] : []) : childProjection;
+              return accepted && slow && stage === "result"
+                ? stall.pipe(Effect.as(projection))
+                : Effect.succeed(projection);
+            },
+            hasReceipt: () => Effect.succeed(accepted),
+            getThreadEventSequence: () =>
+              stage === "wait" || stage === "wake_policy"
+                ? stall.pipe(Effect.as(0))
+                : Effect.succeed(0),
+            dispatch: (command) => {
+              if (command.type === "delegated_task.request") {
+                accepted = true;
+                commandIds.push(command.commandId);
+                return Effect.succeed({
+                  sequence: 1,
+                  storedEvents: [
+                    {
+                      sequence: 1,
+                      commandId: command.commandId,
+                      event: { type: "subagent.updated", payload: task },
+                    },
+                  ],
+                } as never);
+              }
+              return stage === "wake_policy" && slow
+                ? stall.pipe(Effect.as({ sequence: 1, storedEvents: [] } as never))
+                : Effect.succeed({ sequence: 1, storedEvents: [] } as never);
+            },
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const input = {
+            task: "Check diff",
+            mode: stage === "result" ? ("async" as const) : ("wait" as const),
+            timeoutMs: 1000,
+            clientRequestId: "recover-accepted",
+          };
+          const pending = yield* service
+            .delegateTask(scope, input)
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust("20 seconds");
+          const completed = pending.pollUnsafe();
+          slow = false;
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(finished);
+          assert.isDefined(completed);
+          const outcome = yield* Fiber.join(pending);
+          if (stage === "result") {
+            assert.isTrue(Exit.isFailure(outcome));
+            if (Exit.isFailure(outcome)) {
+              const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
+              assert.equal(error.code, "delegation_timeout");
+              assert.include(error.message, taskId);
+            }
+          } else {
+            assert.isTrue(Exit.isSuccess(outcome));
+            if (Exit.isSuccess(outcome)) {
+              assert.equal(outcome.value.taskId, taskId);
+              assert.isTrue(outcome.value.waitTimedOut);
+            }
+          }
+          // Replay uses the same command, even after an accepted call lost its response.
+          const retry = yield* service.delegateTask(scope, { ...input, mode: "async" });
+          assert.equal(retry.taskId, taskId);
+          assert.equal(commandIds.length, 2);
+          assert.equal(commandIds[0], commandIds[1]);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
 
   it.effect(
     "advertises orchestration capability from registered adapters rather than a driver allowlist",
