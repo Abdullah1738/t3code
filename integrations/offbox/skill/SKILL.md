@@ -257,8 +257,9 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   included, and nothing leaves without the tunnel (owner, 12 Nov 2026). So a site can answer a home run with a
   captcha, a 403 or German content where a Boat run got through; that is the VPN address, not your code. DNS
   goes to the server's resolver whatever the box asks for. The home server's own tailnet and LAN services are
-  not reachable from a box. If downloads fail on every home run, the tunnel may be down: say so and use
-  `OFFBOX_BACKEND=boat` for that run (server side: `server/home/README.md`, "VPN (Mullvad)").
+  not reachable from a box. A tunnel that stays down for 2 minutes makes the server report itself not ok, and
+  runs go to Boat like in any other outage; a run caught in that gap fails on its downloads, run it again
+  (server side: `server/home/README.md`, "VPN (Mullvad)").
 - At home every owner has their own token and it only sees that owner's boxes, saved states and templates. Plain
   `offbox` (reap, pools, `release`, `ssh`, `ports`, `logs`, `wait`, `kill`) only acts on our own. A box or run id
   of a person's box is refused with exit 2 ("belongs to moni ..."), nothing changed: go through `offbox-person`.
