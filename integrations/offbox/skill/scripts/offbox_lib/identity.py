@@ -340,7 +340,7 @@ def repo_root(cwd: str | None = None) -> Path:
 
 
 def repo_key(root: Path) -> str:
-    """Stable short name for a repo: basename of the origin URL (or dir) + 6-char hash of the path."""
+    """Stable short name for a repo: basename of the origin URL, falling back to the directory name."""
     name = root.name
     try:
         p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=root, capture_output=True,

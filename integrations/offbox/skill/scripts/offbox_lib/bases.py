@@ -333,7 +333,8 @@ def recipe(name: str) -> tuple[str, str]:
     p = TEMPLATES_DIR / f"{name}.sh"
     if not p.is_file():
         raise OffboxError(f"no recipe {p}", code=2)
-    body = ((TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + p.read_text() +
+    crpko_tools = (TEMPLATES_DIR / "tools/crpko.sh").read_text() + "\n" if name == "crpko-go" else ""
+    body = ((TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + (crpko_tools + p.read_text()) +
             "\n# ---- keep docker images ----\n(\n" + (TEMPLATES_DIR / "docker-images.sh").read_text() + "\n)\n")
     return body, hashlib.sha256(body.encode()).hexdigest()[:12]
 

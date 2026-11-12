@@ -54,16 +54,18 @@ version = match[1] if match else ''
 print(hashlib.sha256(recipe + b'\0' + version.encode()).hexdigest())
 OFFBOX_REPO_STAMP
   )
-  if [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
-     [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
-    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
-    rm -f "$_offbox_base.stamp"
-    _offbox_t0=$SECONDS
-    python3 - "$_offbox_base.sh" <<'OFFBOX_REPO_RECIPE'
+  python3 - "$_offbox_base.sh" <<'OFFBOX_REPO_RECIPE'
 import base64, sys
 from pathlib import Path
 Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
 OFFBOX_REPO_RECIPE
+  _offbox_needs_setup=false
+  @CHECK@
+  if $_offbox_needs_setup || [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
+     [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
+    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    rm -f "$_offbox_base.stamp"
+    _offbox_t0=$SECONDS
     bash "$_offbox_base.sh"
     # A successful recipe must publish the environment before we trust its stamp.
     test -f "$HOME/.offbox/repo-env/@KEY@.sh"
@@ -94,12 +96,17 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     recipe = REPO_RECIPES_DIR / f"{repo_key}.sh"
     if not recipe.is_file():
         return ""
+    body = recipe.read_bytes()
+    if repo_key == "crpko-devops":
+        body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
+    check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '
             f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
             'echo offbox-repo-setup-failed >&2; exit 98; }\n'
             + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
-            .replace('@RECIPE@', base64.b64encode(recipe.read_bytes()).decode()))
+            .replace('@CHECK@', check)
+            .replace('@RECIPE@', base64.b64encode(body).decode()))
 
 # Shared by pre-command probes: neither root ownership nor uninterruptible I/O can extend the deadline.
 BOUNDED_PROCESS = r'''
@@ -1053,6 +1060,13 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
+              ('''for _offbox_tool in terraform aws ruby vector; do
+  command -v "$_offbox_tool" >/dev/null || {
+    echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
+    echo offbox-repo-setup-failed >&2
+    exit 98
+  }
+done''' if repo_key == "crpko-devops" else ':'),
               f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
               # Keep caller cd/exit/traps inside a subshell so the root check always runs.
               "(\n" + cmd + "\n)"]
