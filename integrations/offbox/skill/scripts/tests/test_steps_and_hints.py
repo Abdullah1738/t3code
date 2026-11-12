@@ -284,7 +284,7 @@ class CliStepTests(Isolated):
         root = Path(self.tmp.name)
         (root / 'package.json').write_text('{"packageManager":"bun@1.3.0"}')
         log = runs.LOGS_DIR / 'bg.log'
-        row = dict(run_id='bg', box_id='B', repo_root=str(root), pulls='[]', exit_code=127,
+        row = dict(run_id='bg', mode='bg', box_id='B', repo_root=str(root), pulls='[]', exit_code=127,
                    status='failed', error=None)
         cases = [(1, '', True), (127, '', True), (254, '', True), (0, '', False),
                  (None, '', False), (None, 'offbox step 1 rc=0: vitest\n', False),
@@ -307,13 +307,13 @@ class CliStepTests(Isolated):
                         self.assertIn(f'exit={code}', out.getvalue())
 
     def test_background_legacy_run_without_repo_and_marker_keeps_exit(self):
-        row = dict(run_id='legacy', box_id='B', repo_root=None, pulls='[]', exit_code=127,
+        row = dict(run_id='legacy', mode='bg', box_id='B', repo_root=None, pulls='[]', exit_code=127,
                    status='failed', error=None)
         err, out = io.StringIO(), io.StringIO()
         with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             self.assertEqual(misc._settled(row), 127)
-        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(err.getvalue(), 'offbox: legacy settled with no output on record\n')
         self.assertIn('exit=127', out.getvalue())
 
     def glitch_events(self):
