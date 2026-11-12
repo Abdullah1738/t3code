@@ -128,6 +128,18 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
     reason: "ancestor of build",
   });
   NodeAssert.equal((await checkLive(newer, { repo, health: health(older) })).live, false);
+  for (const status of ["degraded", "recovered-unverified"]) {
+    NodeAssert.equal(
+      (
+        await checkLive(older, {
+          repo,
+          health: async () => ({ ...(await health(newer)()), status }),
+        })
+      ).live,
+      true,
+    );
+  }
+
   NodeAssert.equal((await checkLive("HEAD", { repo, health: health(newer) })).live, true);
   NodeAssert.equal((await checkLive("garbage", { repo, health: health(newer) })).live, null);
   NodeAssert.equal((await checkLive(older, { repo, health: health(null) })).live, null);
