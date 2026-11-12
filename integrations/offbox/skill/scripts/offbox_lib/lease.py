@@ -529,6 +529,9 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
+    except BaseException:
+        _retire_recipe_box(box_id, pid, f"{name} recipe interrupted before completion")
+        raise
     touch(box_id)
     event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
     if code == 0:
@@ -556,7 +559,11 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    th.join(timeout_s)
+    try:
+        th.join(timeout_s)
+    except BaseException:
+        stop_evt.set()
+        raise
     if th.is_alive():
         stop_evt.set()
         th.join(_FOLLOW_STOP_S)
@@ -571,9 +578,9 @@ _FOLLOW_STOP_S = 160
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
-    from . import outage
+    from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
-    with outage.accepted_machine():
+    with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
         try:
             ssh_sync.setup(box_id)
@@ -637,6 +644,8 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         t = now()
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)
         box_id = s["id"]
+        from . import prepare
+        prepare.identify(box_id)
         hold = None
         if pooled:
             hold = file_lock(f"box-{box_id}", timeout=0)
@@ -859,8 +868,8 @@ def _wait_unanswered_resume(con, box_id):
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
                       confirm_only: bool = False):
-    from . import allocation
-    with allocation.guard(box_id, reconcile=pending):
+    from . import allocation, prepare
+    with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending):
         return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
 
 
@@ -877,6 +886,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         con.commit()
 
     def confirm(unanswered):
+        from . import prepare
+        with prepare.phase("resume_confirm", box_id):
+            return confirm_state(unanswered)
+
+    def confirm_state(unanswered):
         log(f"resume_unanswered {box_id}")
         # A read timeout is not a refusal. Only resend if boat confirms the box stayed stopped for the full window.
         seconds = capacity.setting("OFFBOX_RESUME_CONFIRM_SECONDS", 120, minimum=0, maximum=120)
@@ -895,6 +909,8 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
+                    from . import prepare
+                    prepare.check(reserve=0.05)
                     raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if left <= 0:

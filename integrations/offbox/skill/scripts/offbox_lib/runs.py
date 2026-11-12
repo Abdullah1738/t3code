@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, lease, node_version, pool, ssh_sync
-from . import prune
+from . import prune, prepare
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
 
@@ -1101,6 +1101,8 @@ class Runner:
                      cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.commit()
+        say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
+        event(con, None, "run_pending", self.run_id)
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
@@ -1126,6 +1128,13 @@ class Runner:
                     self.lease_row, self.box = replacement, replacement['box_id']
                     continue
                 break
+            except prepare.Stalled as e:
+                self.record(box_id=None)
+                self.cold_boxes.add(self.box)
+                pool.release_guard(row)
+                self.lease_row = self.box = replacement = None
+                prepare.move_once(e)
+                say(f"{e}; trying another box")
             except lease.DeadMount as e:
                 replacement = None
                 dead_attempts += 1
@@ -1137,6 +1146,7 @@ class Runner:
                 if dead_attempts == 2:
                     raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
                                       "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+                prepare.move_once(e)
                 say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
                     "Trying another box")
         try:
@@ -1182,6 +1192,16 @@ class Runner:
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
+        with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
+            replacement = self._check_box(con, a, rdir)
+        if replacement is not None:
+            return replacement
+        # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
+        with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
+            self._sync_box(a, rdir, env_file, body)
+        return None
+
+    def _check_box(self, con, a, rdir) -> dict | None:
         # The probe goes before prune: prune's ssh hangs on a dead filesystem.
         forced_cold = self.lease_row.get('_cold_resume')
         reason, home_s = ssh_sync.probe_home(self.box, measure_write=not forced_cold)
@@ -1210,24 +1230,32 @@ class Runner:
                     missing = exists.returncode == 1
                 except (subprocess.TimeoutExpired, OSError):
                     pass
-            if missing:
+            if missing and prepare.can_move():
                 replacement = pool.try_warm(self.me, self.lease_row['size'], self.lease_row.get('source'),
                                             self.cold_boxes, self.run_id)
                 if replacement is not None:
+                    prepare.move_once(OffboxError(f'{self.box} has a cold disk; using a warm box'))
                     self.cold_moved = True
                     say(f'{self.box} was just resumed and its disk is still loading; '
                         f'using running box {replacement["box_id"]} instead')
                     return replacement
             say(f'{self.box} was just resumed and its disk is still loading; the first sync, installs and Docker '
                 'databases on it can be slow for 5-25 min. For long runs use --bg + offbox wait.')
+        return None
+
+    def _sync_box(self, a, rdir, env_file, body):
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
-        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
+        left = api.left()
+        upload_timeout = 120 if left is None else max(.001, min(120, left))
+        tw = threading.Thread(target=_safe,
+                              args=(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout), daemon=True)
         tw.start()
         push_exc = None
         try:
             if not a.no_sync:
-                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                with prepare.phase("push (source read stalled if no transfer progress)", self.box):
+                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1241,7 +1269,8 @@ class Runner:
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
             push_exc = e
         finally:
-            tw.join()
+            left = api.left()
+            tw.join(timeout=max(0, left) if left is not None else None)
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -1676,6 +1705,11 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
 
 
 def run_remote(a, me: dict) -> int:
+    with prepare.attempts():
+        return _run_prepared(a, me)
+
+
+def _run_prepared(a, me: dict) -> int:
     """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
     # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
     if not a.no_sync and getattr(a, "include", None):
@@ -1689,6 +1723,7 @@ def run_remote(a, me: dict) -> int:
             if attempt == 2:
                 raise OffboxError(f"{wedged[0]} and {wedged[1]} were both wedged before the command; "
                                   "both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+            prepare.move_once(e)
             say(wedged_message(e.box, e.evidence, e.stopped, retry=True))
 
 

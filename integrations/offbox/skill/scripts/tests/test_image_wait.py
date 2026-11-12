@@ -256,8 +256,10 @@ class ImageWaitTests(unittest.TestCase):
                     result = subprocess.run(['bash', '-c', script], env=fx.env,
                                             capture_output=True, text=True, timeout=5)
                     self.assertEqual(result.returncode, 97)
-                    self.assertLess(time.monotonic() - start, 4)
-                    self.assertIn('offbox-box-wedged: diagnostic', result.stderr)
+                    # A stuck mkdir spends both 2s budgets: the PID marker, then the exit writer.
+                    self.assertLess(time.monotonic() - start, 4.8)
+                    expected = 'run marker setup failed' if stage == 'mkdir' else 'diagnostic'
+                    self.assertIn(expected, result.stderr)
                 finally:
                     if Path(fx.env['STUCK_PID']).exists():
                         try:

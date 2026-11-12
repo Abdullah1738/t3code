@@ -7,7 +7,7 @@ import hashlib
 import os
 import time
 
-from . import capacity
+from . import capacity, prepare
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      kv_get, kv_set, now, say)
 from .identity import remote_dir_for
@@ -58,8 +58,15 @@ def lock_name(key: str) -> str:
 def _pool_lock(key: str, deadline: float, wait: int):
     """The pool lock covers only choosing a box or a create slot, so a wait for it is a busy pool, never infra."""
     lk = file_lock(lock_name(key), timeout=max(1, deadline - time.monotonic()))
+    acquired = False
     try:
-        lk.__enter__()
+        with prepare.guard("repository pool"), prepare.phase("lock_wait", "repository pool"):
+            lk.__enter__()
+            acquired = True
+    except prepare.Stalled:
+        if acquired:
+            lk.__exit__(None, None, None)
+        raise
     except OffboxError as e:
         raise PoolBusyError(f"repository pool busy for {key}: other offbox runs kept its pool lock for the whole "
                             f"{wait}s queue wait. Nothing ran (exit {EXIT_BUSY}, not an infra failure): retry, or "
@@ -182,10 +189,27 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
     from . import allocation
     con = db()
     try:
-        with allocation.scope(me['repo_key']):
-            return _acquire(con, me, size, template, base, fresh, run_id, exclude)
+        with allocation.scope(me['repo_key']), prepare.attempts():
+            while True:
+                try:
+                    return _acquire(con, me, size, template, base, fresh, run_id, exclude)
+                except prepare.Stalled as e:
+                    con.execute("UPDATE leases SET state=CASE WHEN source LIKE 'recipe:%' THEN 'quarantined' "
+                                "ELSE 'resume_stalled' END, note=? WHERE box_id=?", (str(e), e.box))
+                    con.commit()
+                    prepare.move_once(e)
+                    say(f"{e}; trying once more")
     finally:
         con.close()
+
+
+def _reuse_prepared(con, row, *args, **kwargs):
+    from . import lease
+    with prepare.guard(row['box_id']) as budget:
+        got = lease._reuse(con, row, *args, **kwargs)
+        if got:
+            got['_prepare_end'] = budget.end
+        return got
 
 
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
@@ -259,7 +283,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                 if lease.active_runs(con, bid):
                     raise lease.ResumeUnresolved(f"{bid} has an active run and an unanswered resume; nothing ran")
                 try:
-                    got = lease._reuse(con, pending, size, skip_archiving=True)
+                    got = _reuse_prepared(con, pending, size, skip_archiving=True)
                 except lease.BoxNotReady as e:
                     readiness_failed(pending, e)
                     guard.__exit__(None, None, None)
@@ -269,9 +293,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     guard.__exit__(None, None, None)
                     say(str(e))
                     continue
-                except lease.ResumeProvisionStalled as e:
+                except (lease.ResumeProvisionStalled, prepare.Stalled) as e:
                     con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
                     con.commit()
+                    prepare.move_once(e)
                     resume_stall, create_first = e, True
                     guard.__exit__(None, None, None)
                     say(str(e))
@@ -424,14 +449,15 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                             if not wait and not needs_start:
                                 budget = AFFINITY_WAIT_S  # a zero queue wait still permits a ready box's health check
                             with api.budget(budget):
-                                got = lease._reuse(con, row, size, skip_archiving=False,
+                                got = _reuse_prepared(con, row, size, skip_archiving=False,
                                                    before_grow=before_grow, **options)
                         else:
-                            got = lease._reuse(con, row, size, skip_archiving=True, before_grow=before_grow, **options)
-                    except lease.ResumeProvisionStalled as e:
+                            got = _reuse_prepared(con, row, size, skip_archiving=True, before_grow=before_grow, **options)
+                    except (lease.ResumeProvisionStalled, prepare.Stalled) as e:
                         con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
                                     (str(e), row['box_id']))
                         con.commit()
+                        prepare.move_once(e)
                         resume_stall = e
                         create_first = True
                         say(str(e))
@@ -502,7 +528,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
                     try:
-                        got = creator(shared, size, template, base, fresh)
+                        with prepare.guard('new allocation') as budget:
+                            got = creator(shared, size, template, base, fresh)
+                            got['_prepare_end'] = budget.end
                     except capacity.CapacityError as e:
                         if resume_stall is not None:
                             e.args = (f"{e} Earlier cause: {resume_stall}",)

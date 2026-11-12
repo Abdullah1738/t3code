@@ -676,10 +676,10 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path,
     return st
 
 
-def put_file(box_id: str, remote_path: str, content: bytes, mode: str = "600") -> None:
+def put_file(box_id: str, remote_path: str, content: bytes, mode: str = "600", timeout: float = 120) -> None:
     d = os.path.dirname(remote_path)
     ssh(box_id, f"umask 077; mkdir -p {shlex.quote(d)} && cat > {shlex.quote(remote_path)} && chmod {mode} "
-                f"{shlex.quote(remote_path)}", input=content, check=True)
+                f"{shlex.quote(remote_path)}", input=content, check=True, timeout=timeout)
 
 
 def tunnel(box_id: str, remote_port: int, local_port: int, reverse: bool = False) -> subprocess.Popen:
