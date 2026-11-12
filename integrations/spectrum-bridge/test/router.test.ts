@@ -6748,6 +6748,205 @@ async function failedTick(router: Router): Promise<void> {
   await router.tick();
 }
 
+test.each([
+  [3, true, true], [6, true, true], [6 + 1 / 3600_000, true, false],
+  [10, true, false], [24, true, false], [48, true, false], [48 + 1 / 3600_000, false, false], [72, false, false],
+] as const)("failed-inbound received age %s hours limits alerts and replay", async (hours, alert, replay) => {
+  const keys: string[] = [];
+  const decisions: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; },
+    log: (event, code) => { if (event === "delivery-watchdog") decisions.push(JSON.parse(code!).decision); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("aged", "Please pause", { source: "typed", receivedAt: now - hours * 3600_000 });
+  // A recent failure must not refresh an old inbound's eligibility.
+  h.store.updateInbound("aged", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: now - 121_000 });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:aged", { ...route, inboundId: "aged", messageId: messageId("aged"), phase: "failed", startedAt: now - hours * 3600_000 });
+  await Promise.all([h.router.checkFailedInbound(), h.router.checkFailedInbound()]);
+  await h.router.tick();
+  setSystemTime(now + 60_000); await failedTick(h.router);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual(alert ? ["bridge-failed:aged"] : []);
+  expect(h.backend.prompts).toHaveLength(replay ? 1 : 0);
+  expect(decisions.filter(decision => decision === "replay")).toHaveLength(replay ? 1 : 0);
+});
+
+test.each(["receivedAt", "sentAt"] as const)("failed-inbound legacy cutoffs use %s despite reason backfill", async timestamp => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.store.set("route", { id: "ses_1", directory: "/Chats/old", generation: 1 });
+  for (const hours of [3, 10, 72]) {
+    const id = `legacy-${hours}`;
+    h.input(id, "Please pause", { source: "typed", receivedAt: undefined, [timestamp]: now - hours * 3600_000 });
+    h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run(id);
+    h.store.set(`failed-delivery:${id}`, { id: "ses_1", directory: "/Chats/old", generation: 1,
+      inboundId: id, messageId: messageId(id), phase: "failed", startedAt: now - hours * 3600_000 });
+  }
+  await failedTick(h.router);
+  setSystemTime(now + 60_000); await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys.sort()).toEqual(["bridge-failed:legacy-10", "bridge-failed:legacy-3"]);
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([messageId("legacy-3")]);
+  expect(h.store.inboundFailure("legacy-10")?.stage).toBe("legacy");
+});
+
+test("failed-inbound concurrent health scans and ticks submit a held replay once", async () => {
+  const decisions: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async () => true,
+    log: (event, code) => { if (event === "delivery-watchdog") decisions.push(JSON.parse(code!).decision); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("replay-once", "Please pause", { source: "typed", receivedAt: now - 3 * 3600_000 });
+  h.store.updateInbound("replay-once", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: now - 121_000 });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:replay-once", { ...route, inboundId: "replay-once", messageId: messageId("replay-once"), phase: "failed", startedAt: now - 3 * 3600_000 });
+  let entered!: () => void; const posting = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  h.backend.promptBehavior = async call => { entered(); await gate; h.backend.accept(call); };
+  await Promise.all([h.router.checkFailedInbound(), h.router.checkFailedInbound()]);
+  expect(h.backend.prompts).toEqual([]);
+  const tick = h.router.tick(); await posting;
+  const overlapping = [h.router.tick(), h.router.tick()];
+  try {
+    await h.router.checkFailedInbound();
+    expect(h.backend.prompts).toHaveLength(1);
+  } finally { release(); await Promise.all([tick, ...overlapping]); }
+  setSystemTime(now + 60_000); await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(1); expect(decisions).toEqual(["replay"]);
+  expect(h.store.get<string>("batch-phase:replay-once")).toBe("accepted");
+});
+
+test.each(["queued", "queued-stale", "preparing", "retry", "late-accepted"])("failed-inbound replay expiry survives restart (%s)", async stage => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const receivedAt = Date.parse("2026-11-13T00:00:00Z");
+  setSystemTime(receivedAt + 6 * 3600_000 - 1000);
+  h.input("expiring-replay", "Please pause", { source: "typed", receivedAt });
+  h.store.updateInbound("expiring-replay", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: receivedAt });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:expiring-replay", { ...route, inboundId: "expiring-replay", messageId: messageId("expiring-replay"), phase: "failed", startedAt: receivedAt });
+  await h.router.checkFailedInbound();
+  const posted = stage === "retry" || stage === "late-accepted";
+  if (posted) {
+    h.backend.promptBehavior = async () => { throw new Error("still offline"); };
+    await h.router.tick();
+    expect(h.backend.prompts).toHaveLength(1);
+    if (stage === "late-accepted") h.backend.accept(h.backend.prompts[0]!);
+    h.backend.promptBehavior = undefined;
+  }
+  if (stage === "preparing") {
+    h.backend.onStatuses = () => { setSystemTime(receivedAt + 10 * 3600_000); };
+    await h.router.tick();
+    h.backend.onStatuses = undefined;
+  }
+  setSystemTime(receivedAt + (stage === "queued-stale" ? 49 : 10) * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(posted ? 1 : 0);
+  expect(inbounds(h.store).find(row => row.id === "expiring-replay")?.state).toBe(stage === "late-accepted" ? "done" : "failed");
+  setSystemTime(receivedAt + 49 * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(posted ? 1 : 0);
+  expect(keys).toEqual(["bridge-failed:expiring-replay"]);
+  // Expiry releases the chat for a new message.
+  if (stage !== "late-accepted") {
+    h.input("fresh-after-expiry", "New instruction", { source: "typed" });
+    await h.router.tick();
+    expect(h.backend.prompts.at(-1)!.text).toContain("New instruction");
+  }
+});
+
+test.each(["none", "completed", "running"])("failed-inbound adopts acceptance after expiry without another POST (newer turn: %s)", async newer => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const receivedAt = Date.parse("2026-11-13T00:00:00Z"); setSystemTime(receivedAt + 6 * 3600_000 - 1000);
+  h.input("late-expired", "Please pause", { source: "typed", receivedAt });
+  h.store.updateInbound("late-expired", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: receivedAt });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:late-expired", { ...route, inboundId: "late-expired", messageId: messageId("late-expired"), phase: "failed", startedAt: receivedAt });
+  await h.router.checkFailedInbound();
+  h.backend.promptBehavior = async () => { throw new Error("ambiguous network error"); }; await h.router.tick();
+  const original = h.backend.prompts[0]!; h.backend.promptBehavior = undefined;
+  setSystemTime(receivedAt + 6 * 3600_000 + 1000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(1);
+  if (newer !== "none") {
+    h.input("newer", "Fresh message", { source: "typed" }); await h.router.tick();
+    if (newer === "running") {
+      // Robob can admit a queued prompt before its user record becomes readable.
+      h.backend.single = true;
+      setSystemTime(receivedAt + 6 * 3600_000 + 61_000);
+      await new Router(h.store, h.backend, h.transport, h.routerOptions).checkFailedInbound();
+      expect(h.store.get<{ messageId: string }>("activeTurn")?.messageId).toBe(messageId("newer"));
+    }
+    h.backend.final("Fresh answer"); await h.router.tick();
+    h.backend.single = undefined;
+    expect(h.backend.prompts).toHaveLength(2);
+  }
+  h.backend.accept(original);
+  h.backend.final("Recovered answer", original);
+  setSystemTime(receivedAt + 7 * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(newer !== "none" ? 2 : 1);
+  expect(h.store.get<string>("batch-phase:late-expired")).toBe("accepted");
+  expect(inbounds(h.store).find(row => row.id === "late-expired")?.state).toBe("done");
+  expect(h.conversations().filter(op => op.text === "Recovered answer")).toHaveLength(1);
+});
+
+test("failed-inbound stale legacy row is logged and handled once across ticks and restart", async () => {
+  const keys: string[] = [];
+  const logs: { event: string; code?: string }[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; },
+    log: (event, code) => { logs.push({ event, code }); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("legacy-stale", "Old instruction", { source: "typed", receivedAt: now - 72 * 3600_000 });
+  h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run("legacy-stale");
+  const reads = spyOn(h.backend, "promptAccepted");
+  await failedTick(h.router);
+  setSystemTime(now + 60_000); await failedTick(h.router);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual([]); expect(h.backend.prompts).toEqual([]); expect(reads).not.toHaveBeenCalled();
+  expect(h.store.inboundFailure("legacy-stale")).toBeUndefined();
+  expect(logs.filter(log => log.event === "failed-inbound-skipped-stale")).toEqual([
+    { event: "failed-inbound-skipped-stale", code: JSON.stringify({ id: "legacy-stale", chat: "owner", age: 72 * 3600_000 }) },
+  ]);
+});
+
+test("failed-inbound old store with 20 legacy rows produces no alerts or replays", async () => {
+  const keys: string[] = [];
+  const events: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; }, log: event => { events.push(event); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  for (let i = 0; i < 20; i++) {
+    const id = `legacy-${i}`;
+    h.input(id, "Old instruction", { source: "typed", receivedAt: now - (3 + i * 27 / 19) * 24 * 3600_000 });
+    h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run(id);
+  }
+  for (let tick = 0; tick < 5; tick++) {
+    setSystemTime(now + tick * 60_000);
+    await failedTick(tick === 4 ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router);
+  }
+  expect(keys).toEqual([]); expect(h.backend.prompts).toEqual([]);
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(20);
+  expect(events).not.toContain("inbound-failed"); expect(events).not.toContain("delivery-watchdog");
+});
+
+test.each(["failed", "done"])("failed-inbound pending alert expires after 48 hours (%s)", async state => {
+  const keys: string[] = [];
+  const events: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return false; }, log: event => { events.push(event); } });
+  const start = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(start);
+  h.input("pending-expiry", "Please pause", { source: "typed" }); h.store.updateInbound("pending-expiry", "failed");
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(keys).toHaveLength(1);
+  if (state === "done") h.store.updateInbound("pending-expiry", "done");
+  setSystemTime(start + 49 * 3600_000);
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await failedTick(restarted);
+  setSystemTime(start + 50 * 3600_000); await failedTick(restarted);
+  expect(keys).toHaveLength(1); expect(h.backend.prompts).toEqual([]);
+  expect(h.store.get("failed-alert-pending:pending-expiry")).toBeNull();
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
+});
+
 // #932: a failed row outlives activeTurn, so recovery cannot depend on that one pointer.
 test("failed-inbound watcher reply retains reason, alerts once and uses the held replay path after rotation", async () => {
   const alerts: { text: string; key: string }[] = [];

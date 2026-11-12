@@ -5,6 +5,9 @@ import { isTapback } from "./group-gate.ts";
 import type { NormalizedInbound, Photon } from "./photon.ts";
 import type { Store } from "./store.ts";
 
+export const FAILED_INBOUND_REPLAY_MAX_AGE_MS = 6 * 60 * 60_000;
+export const FAILED_INBOUND_ALERT_MAX_AGE_MS = 48 * 60 * 60_000;
+
 /** Receipt acknowledgement must not wait for a busy router or the agent's first turn. */
 export async function acknowledgeReceived(store: Store, context: ChatContext, payload: unknown): Promise<void> {
   if (context.chat.kind !== "owner" && context.chat.slug !== "moni") return;

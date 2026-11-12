@@ -18,7 +18,7 @@ import { sessionMarker } from "./session.ts";
 import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, mentionsRobob, observedPreamble } from "./group-gate.ts";
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
-import { criticalWake, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
+import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -662,7 +662,72 @@ export class Router {
 
   private failedScanAt = -Infinity;
 
+  private expireFailedReplay(id: string | undefined): boolean {
+    if (!id) return false;
+    const until = this.store.get<number>(`failed-replay-until:${id}`);
+    if (until === undefined || Date.now() <= until) return false;
+    if (this.store.get(`batch-phase:${id}`) === "accepted") return true;
+    const active = this.store.get<Turn | null>("activeTurn");
+    // A POST already in flight can still land; expiry forbids another POST, not its receipt.
+    if (active?.inboundId === id && this.inflight.has(active.messageId)) return true;
+    this.store.db.transaction(() => {
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      const attempted = active?.inboundId === id ? active : this.store.get<Turn | null>(`failed-delivery:${id}`);
+      // Expiry revokes POST permission; an earlier ambiguous POST may still be admitted later.
+      if (attempted && !this.store.get(`failed-replay-receipt:${id}`)) this.store.set(`failed-replay-receipt:${id}`, attempted);
+      const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
+      for (const member of ids) this.store.db.query("UPDATE inbound SET state = 'failed' WHERE id = ? AND state IN ('processing', 'batched')").run(member);
+      this.store.set(`batch-phase:${id}`, "expired");
+      if (preparing?.id === id) this.store.set("preparingDelivery", null);
+      if (active?.inboundId === id) this.store.set("activeTurn", { ...active, phase: "failed" });
+      if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
+      if (preparing?.id === id || active?.inboundId === id) this.store.set("deliveryOutage", null);
+    }).immediate();
+    return true;
+  }
+
+  private async reconcileExpiredFailedReplays(): Promise<void> {
+    const rows = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null'",
+    ).all();
+    for (const row of rows) {
+      const turn = JSON.parse(row.value) as Turn;
+      if (this.store.get(`batch-phase:${turn.inboundId}`) === "accepted") { this.store.set(row.key, null); continue; }
+      if (!this.current(turn)) continue;
+      let found: string | undefined;
+      for (const id of [turn.messageId, ...turn.earlier ?? []]) {
+        try { if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; } }
+        catch { /* Unknown admission retains the receipt watch, never POST permission. */ }
+      }
+      if (!found) continue;
+      this.store.db.transaction(() => {
+        const active = this.store.get<Turn | null>("activeTurn");
+        // A newer turn keeps the chat; adopt the late receipt after it settles.
+        if (!this.current(turn) || active && active.phase !== "failed" || this.store.get("preparingDelivery")) return;
+        const admitted: Turn = { ...turn, messageId: found!, phase: "running" };
+        this.store.set("activeTurn", admitted);
+        this.landed(admitted);
+        this.store.set(row.key, null);
+      }).immediate();
+    }
+  }
+
+  private skipStaleFailedInbound(id: string, input: NormalizedInbound): boolean {
+    if (this.store.get<boolean>(`failed-stale:${id}`)) return true;
+    const receivedAt = input.receivedAt ?? input.sentAt;
+    if (receivedAt === undefined || Date.now() - receivedAt <= FAILED_INBOUND_ALERT_MAX_AGE_MS) return false;
+    this.store.db.transaction(() => {
+      this.store.set(`failed-stale:${id}`, true);
+      this.store.set(`failed-alert-pending:${id}`, null);
+    }).immediate();
+    this.options.log?.("failed-inbound-skipped-stale", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", age: Date.now() - receivedAt }));
+    return true;
+  }
+
   private async sendFailedAlert(id: string, text: string): Promise<void> {
+    // Pending notifications outlive failed rows, including successful recovery and restart.
+    const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+    if (row && this.skipStaleFailedInbound(id, JSON.parse(row.payload) as NormalizedInbound)) return;
     if (this.store.get<boolean>(`failed-alert:${id}`)) return;
     try {
       if (await this.options.notifyFailure!(text, `bridge-failed:${id}`)) this.store.db.transaction(() => {
@@ -678,6 +743,7 @@ export class Router {
     const now = Date.now();
     if (now - this.failedScanAt < 30_000) return;
     this.failedScanAt = now;
+    await this.reconcileExpiredFailedReplays();
     // A failed notification stays due even if recovery has since delivered the message.
     const pending = this.store.db.query<{ key: string; value: string }, []>(
       "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null'",
@@ -692,6 +758,9 @@ export class Router {
       const input = row.payload as NormalizedInbound;
       const critical = criticalWake(row.id, input.text);
       if (!critical && (synthetic(row.id) || input.source !== "typed")) continue;
+      if (this.skipStaleFailedInbound(row.id, input)) continue;
+      // Failure logging (including legacy backfill) must never refresh the received age.
+      const receivedAt = input.receivedAt ?? input.sentAt;
       const failure = this.store.inboundFailure(row.id);
       const at = failure?.at ?? input.receivedAt ?? input.sentAt;
       if (at === undefined || now - at < 120_000) continue;
@@ -749,24 +818,25 @@ export class Router {
       }
       if (!stillFailed() || (!critical && receipted())) continue;
       if (!failure) this.recordFailure(row.id, "legacy", "Failure predates reason logging", original);
-      if (critical || accepted !== false || parent !== row.id || !original) continue;
+      if (critical || accepted !== false || parent !== row.id || !original || receivedAt === undefined
+        || Date.now() - receivedAt > FAILED_INBOUND_REPLAY_MAX_AGE_MS) continue;
       // Alert delivery was an await too: reconcile again before scheduling a replay.
       if (await admitted() !== false) continue;
       const route = this.store.get<Route | null>("route");
       if (!route) continue;
-      const recovered = this.store.db.transaction(() => {
+      this.store.db.transaction(() => {
         const active = this.store.get<Turn | null>("activeTurn");
         if (!stillFailed() || receipted() || !this.current(route) || this.store.get<PreparingDelivery | null>("preparingDelivery")
-          || (active && active.phase !== "failed") || this.controlArrived(new Set())) return false;
+          || (active && active.phase !== "failed") || this.controlArrived(new Set())
+          || Date.now() - receivedAt > FAILED_INBOUND_REPLAY_MAX_AGE_MS) return;
         this.store.updateInbound(row.id, "processing");
         this.store.set(`batch:${row.id}`, batch ?? { ...input, batchIds: [row.id] });
         this.store.set(`batch-phase:${row.id}`, "preparing");
+        this.store.set(`failed-replay-until:${row.id}`, receivedAt + FAILED_INBOUND_REPLAY_MAX_AGE_MS);
         this.store.set("activeTurn", null);
         this.store.set("preparingDelivery", { id: row.id, startedAt: input.receivedAt ?? at, attemptAt: now - ACCEPT_WAIT_MS,
           attempt: 2, held: true, posted: true } satisfies PreparingDelivery);
-        return true;
       }).immediate();
-      if (recovered) this.watchdogLog("replay", original);
     }
   }
 
@@ -2459,6 +2529,7 @@ export class Router {
       return;
     }
     const interrupted = () => {
+      if (this.expireFailedReplay(row.id)) return true;
       const held = steerAttempt !== undefined && steerAttempt !== null
         || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
       const arrived = held ? this.controlArrived(handled)
@@ -3148,6 +3219,7 @@ export class Router {
     if (!preparing) return;
     const row = this.store.pendingInbound().find(row => row.id === preparing.id);
     if (!row || row.state !== "processing") { this.store.set("preparingDelivery", null); return; }
+    if (this.expireFailedReplay(preparing.id)) return;
     const turn = { inboundId: preparing.id, messageId: `msg_${hash(preparing.id)}` };
     if (this.wakeBatch(preparing.id)) {
       // Same rule as a POSTed wake: it never holds the chat or earns the outage
@@ -3192,6 +3264,7 @@ export class Router {
   }
 
   private async sendDelivery(turn: Turn, body: ResendBody, handled: Set<string>, replay = false): Promise<void> {
+    if (this.expireFailedReplay(body.inboundId)) return;
     if (this.controlArrived(handled)) return;
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
@@ -3218,6 +3291,7 @@ export class Router {
     const absent = await this.reconcile(turn);
     turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "running" || this.controlArrived(handled)) return;
+    if (this.expireFailedReplay(turn.inboundId)) return;
     const stored = this.store.get<ResendBody | null>("resendBody");
     const body = stored && stored.inboundId === turn.inboundId ? stored : undefined;
     const elapsed = Date.now() - (turn.attemptAt ?? turn.startedAt);
