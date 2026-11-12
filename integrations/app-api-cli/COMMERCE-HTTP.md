@@ -533,8 +533,10 @@ rebinds as `-S1` at packing — the exact-track projection and the
 
 All active noon lanes default to saved Mashreq Noon Visa 9546. The only explicit
 fallback is `COMMERCE_CARD_LAST4=2342 commerce ...`, using Marriott Mastercard.
-The caller must establish that 9546 failed/declined and reconcile any ambiguous
-financial send before purchasing with the fallback. There is no automatic retry
+New fallback purchases require a recent 9546 decline recorded by `card-status`.
+Historical recovery remains read-only and needs no new decline. An unresolved
+financial send still owns the account and blocks another purchase on either card.
+There is no automatic retry
 or card switching. Other card values, including cancelled 5542, refuse at startup.
 CVV retrieval and bank-approval notices follow the selected card. Existing flows
 remain bound to their original card; use the original card override for historical
@@ -557,7 +559,10 @@ held; completion also requires the watcher and delivery-card sent receipt.
 Main/Supermall require the selected card to be the noon account default; they
 never switch saved cards. Change that default in the noon app before using a
 different card. NowNow supports explicit saved-card selection and
-`--cvv-from-keychain`. It journals subscription verification and CVV completion
+`--cvv-from-keychain`. Paid placement on 9546 remains gated pending its own
+contract proof; preparation and verification recovery remain available. Do not
+select 2342 to bypass that gate without a recorded 9546 decline.
+NowNow journals subscription verification and CVV completion
 once, keeps secrets in Keychain/RAM, and stops on bank/device challenges.
 Verification is not purchase capture: the order needs exact native details and
 a unique bank purchase for its original card, amount and placement time.

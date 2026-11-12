@@ -339,6 +339,17 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
     with _db() as db:
         flow = _get(db, flow_id)
         _active(flow)
+        if financial:
+            pause = Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home() / '.local/state/ordering-paused')
+            if pause.exists():
+                fail('ORDERING_PAUSED')
+            if flow['app'] == 'noon':
+                if flow['vertical'] == 'nownow' and kind == 'place' and order_card.LAST4 == '9546':
+                    fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
+                try:
+                    order_card.require_purchase_fallback()
+                except RuntimeError as exc:
+                    fail(str(exc))
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')

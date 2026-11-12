@@ -204,7 +204,7 @@ def capabilities():
         'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,
         'selected_card':{'last4':order_card.LAST4,'network':order_card.NETWORK,'bank_app':order_card.BANK_APP},
         'live_paid_proof_card':'2342',
-        'nownow_selected_card_purchase_enabled':True,
+        'nownow_selected_card_purchase_enabled':order_card.LAST4 == '2342',
         'nownow_9546_paid_live_proof':False,
         'marketplace_card_selection':'requires matching default card in noon app',
         'verticals':{
@@ -382,6 +382,8 @@ def order_minutes(args):
 
 
 def order_nownow(args):
+    if not args.prepare_only and order_card.LAST4 == '9546':
+        journal.fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
     """Paid NowNow E2E replay of the captured contract (NNGAANNWEFJMZW8A).
 
     session/create -> edit-product -> validate guard -> edit-payment (saved
@@ -951,6 +953,7 @@ def card_preflight(args):
             if journal.inspect(args.resume_flow)['order_id']:return None
         except Exception:
             pass
+    order_card.require_purchase_fallback()
     status=card_status.check(ORDER_CARD_LAST4)
     return status if status['blocked'] else None
 

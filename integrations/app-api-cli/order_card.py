@@ -9,3 +9,11 @@ LAST4 = _configured()
 CVV_ACCOUNT = {'9546': 'MashreqNoon.card_cvc', '2342': 'Marriott.card_cvc'}[LAST4]
 NETWORK = {'9546': 'visa', '2342': 'mastercard'}[LAST4]
 BANK_APP = {'9546': 'Mashreq app', '2342': 'ENBD X'}[LAST4]
+
+
+def require_purchase_fallback():
+    if LAST4 == '2342':
+        import card_status
+        status = card_status.check('9546')
+        if status.get('state') != 'declined' or status.get('error') != 'CARD_RECENTLY_DECLINED':
+            raise RuntimeError('NOON_FALLBACK_REQUIRES_RECORDED_9546_DECLINE')

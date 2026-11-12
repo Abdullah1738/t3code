@@ -345,6 +345,8 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
                     patch('commerce_redirect.open_dia', side_effect=open_browser) as browser, \
                     patch.object(c.time,'time',lambda:real_time()+offset[0]), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
+                if __import__('order_card').LAST4 == '2342':
+                    __import__('card_status').record_declined('9546', reason='synthetic issuer decline', source='fixture')
                 code=cli.main(['order','minutes','--sku','SYNTHETIC_SHAKE','--cvv-from-keychain',
                                '--label','minutes e2e test'])
                 lines=[json.loads(x) for x in output.getvalue().splitlines() if x] or [{}]
