@@ -21,6 +21,7 @@ from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 SYNC_PROGRESS_S = 60
+RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 
 # Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
@@ -564,6 +565,56 @@ def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeo
     return st
 
 
+class BoxStoppedDuringPush(OffboxError):
+    def __init__(self, box_id: str):
+        super().__init__(f"box stopped during push: {box_id}; nothing ran", box=box_id)
+
+
+def _endpoint(box_id: str) -> str | None:
+    try:
+        config = cfg_path(box_id).read_text()
+    except OSError:
+        return None
+    host = re.search(r"^\s*HostName\s+(\S+)", config, re.M | re.I)
+    port = re.search(r"^\s*Port\s+(\S+)", config, re.M | re.I)
+    return f"{host[1]}:{port[1]}" if host and port else None
+
+
+def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = None):
+    for attempt in range(len(RETRY_PAUSES) + 1):
+        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                           timeout=timeout, input=input)
+        if p.returncode not in (255, 12):
+            return p
+        old = _endpoint(box_id)
+        if attempt < len(RETRY_PAUSES):
+            try:
+                close_master(box_id)
+            except (OffboxError, OSError, subprocess.TimeoutExpired):
+                pass
+            try:
+                setup(box_id)
+            except (OffboxError, OSError, subprocess.TimeoutExpired):
+                pass
+        # sshkey only returns connection details. Read state even when refreshing those details failed.
+        try:
+            state = (api.get(box_id) or {}).get("state")
+        except (OffboxError, OSError, subprocess.TimeoutExpired):
+            state = None
+        if state and state not in api.LIVE_STATES:
+            log(f"push_retry_box_not_running {box_id}")
+            raise BoxStoppedDuringPush(box_id)
+        if attempt == len(RETRY_PAUSES):
+            return p
+        new = _endpoint(box_id)
+        endpoint = f" endpoint={old} -> {new}" if old and new and old != new else ""
+        pause = RETRY_PAUSES[attempt]
+        print(f"offbox: rsync exit {p.returncode} to {box_id}, retry {attempt + 1}/3 in {pause}s",
+              file=sys.stderr, flush=True)
+        log(f"push_retry {box_id} exit={p.returncode} try={attempt + 1}{endpoint}")
+        time.sleep(pause)
+
+
 def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dict:
     # Stage independently of a previous .git file/symlink/directory. A partial
     # metadata transfer must fail the run rather than leave usable stale history.
@@ -574,7 +625,7 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
         cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "--timeout=120",
                "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
                f"{gitdir}/", f"{box_id}:{staging}/"]
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = _run_rsync(box_id, cmd, timeout)
         if p.returncode != 0:
             # Keep rsync's stderr: a dead mount reported here must still classify as dead-mount.
             raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
@@ -677,8 +728,7 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
 def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: str | None = None) -> str:
     """One push rsync: reclaim box-owned files once, skip unreadable local files, else raise. Returns stdout."""
     def run():
-        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
-                              timeout=timeout, input=files)
+        return _run_rsync(box_id, cmd, timeout, input=files)
     p = run()
     if p.returncode == 23 and (denied := _receiver_denied(p.stderr)):
         import sys

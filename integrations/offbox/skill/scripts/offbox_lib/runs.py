@@ -18,7 +18,7 @@ from pathlib import Path
 from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune, prepare
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
-                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
+                     atomic_write_json, db, event, log, new_id, now, offsets_path, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -1153,6 +1153,7 @@ class Runner:
         self.lease_row = None
         self.cold_boxes: set[str] = set()
         self.cold_moved = False
+        self.push_resumed = False
         self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
 
@@ -1311,7 +1312,23 @@ class Runner:
             return replacement
         # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
         with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
-            self._sync_box(con, a, rdir, env_file, body)
+            while True:
+                try:
+                    self._sync_box(con, a, rdir, env_file, body)
+                    break
+                except ssh_sync.BoxStoppedDuringPush:
+                    if self.push_resumed:
+                        raise
+                    self.push_resumed = True
+                    # The pool guard is still held. Bypass _reuse's cached running/master fast path.
+                    row = dict(self.lease_row, state='stopped')
+                    try:
+                        resumed = lease._reuse(con, row, row['size'])
+                        if resumed is None:
+                            raise OffboxError(f"lease {self.box} is no longer available")
+                    except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+                        raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
+                    log(f"push_box_stopped_resumed {self.box}")
         return None
 
     def _check_box(self, con, a, rdir) -> dict | None:
@@ -1386,6 +1403,12 @@ class Runner:
         finally:
             left = api.left()
             tw.join(timeout=max(0, left) if left is not None else None)
+        if not a.no_sync and push_exc is None and err and not ssh_sync.dead_mount(str(err[0])):
+            # Resetting SSH can interrupt the parallel upload even when the file push recovers.
+            err.clear()
+            left = api.left()
+            upload_timeout = 120 if left is None else max(.001, min(120, left))
+            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
