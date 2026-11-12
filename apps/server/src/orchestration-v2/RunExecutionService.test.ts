@@ -14,6 +14,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2Subagent,
@@ -38,6 +39,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
@@ -4246,6 +4248,295 @@ it.effect("interrupts both live turns before failing runs after a shared ingesti
   }),
 );
 
+it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
+  "keeps ownership and capture through %s Stop until process exit is confirmed",
+  (scenario) =>
+    Effect.gen(function* () {
+      const terminationStarted = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      const stopStarted = yield* Deferred.make<void>();
+      const sourceClosed = yield* Ref.make(false);
+      const runFailed = yield* Ref.make(false);
+      const shutdownAttempts = yield* Ref.make(0);
+      const result = yield* captureRootRunTermination({
+        key: `ingest-stop-recovery:${scenario}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            type: "node.updated",
+            driver,
+            node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+          } as unknown as ProviderAdapter.ProviderAdapterV2Event).pipe(
+            Stream.ensuring(Ref.set(sourceClosed, true)),
+          ),
+        ingestNormalized: (input) =>
+          Effect.fail(
+            new ProviderEventIngestor.ProviderEventNormalizeError({
+              providerSessionId: input.providerSessionId,
+              threadId: input.threadId,
+              providerEvent: input.event,
+              cause: "reader unavailable",
+            }),
+          ),
+        interruptTurn: (turn) =>
+          Deferred.succeed(stopStarted, undefined).pipe(
+            Effect.andThen(
+              scenario === "timeout"
+                ? Effect.never
+                : Effect.fail(
+                    new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver,
+                      providerThreadId: turn.providerThread.id,
+                      providerTurnId: turn.providerTurnId,
+                      cause:
+                        "Codex did not start the queued turn within 10 seconds; Stop could not be delivered.",
+                    }),
+                  ),
+            ),
+          ),
+        terminateSession: Effect.gen(function* () {
+          const attempt = yield* Ref.updateAndGet(shutdownAttempts, (n) => n + 1);
+          yield* Deferred.succeed(terminationStarted, undefined);
+          if (scenario === "shutdown-retry" && attempt === 1) {
+            return yield* new ProviderAdapter.ProviderAdapterCloseSessionError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:shutdown-retry"),
+              cause: "exit could not be confirmed",
+            });
+          }
+          yield* Deferred.await(terminated);
+        }),
+        refreshAfterTurn: Ref.set(runFailed, true),
+        afterStart: (closed) =>
+          Effect.gen(function* () {
+            yield* Deferred.await(stopStarted);
+            if (scenario === "timeout") yield* TestClock.adjust("30 seconds");
+            yield* Effect.raceFirst(Deferred.await(terminationStarted), Deferred.await(closed));
+            assert.isFalse(yield* Ref.get(runFailed));
+            assert.isFalse(yield* Ref.get(sourceClosed));
+            assert.isFalse(yield* Deferred.isDone(closed));
+            yield* Deferred.succeed(terminated, undefined);
+            if (scenario === "shutdown-retry") yield* TestClock.adjust("1 second");
+          }),
+      });
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+      assert.equal(yield* Ref.get(shutdownAttempts), scenario === "shutdown-retry" ? 2 : 1);
+    }),
+);
+
+it.effect.each(["delivered", "terminated"] as const)(
+  "drains subscriber cleanup before failing ingestion after %s Stop",
+  (scenario) =>
+    Effect.gen(function* () {
+      const key = `subscriber-cleanup:${scenario}`;
+      const ids = backgroundScenarioIds(key);
+      const queue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+      const ingested = yield* Ref.make<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>>([]);
+      const providerTurn = (
+        status: "running" | "interrupted",
+      ): ProviderAdapter.ProviderAdapterV2Event => ({
+        type: "provider_turn.updated",
+        driver,
+        threadId: ids.threadId,
+        providerTurn: {
+          id: ids.rootProviderTurnId,
+          runAttemptId: ids.attemptId,
+          status,
+        } as OrchestrationV2ProviderTurn,
+      });
+      const cleanup = Queue.offerAll(queue, [
+        providerTurn("interrupted"),
+        rootTerminalEvent(ids, "interrupted"),
+        backgroundTurnItemEvent(ids, "command_execution", "completed", 101),
+      ]).pipe(Effect.asVoid);
+      const result = yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        subscribeEvents: () =>
+          Effect.gen(function* () {
+            yield* Queue.offerAll(queue, [
+              providerTurn("running"),
+              backgroundTurnItemEvent(ids, "command_execution", "running", 101),
+              {
+                type: "node.updated",
+                driver,
+                node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+              } as ProviderAdapter.ProviderAdapterV2Event,
+            ]);
+            const close = Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue)), Effect.asVoid);
+            return { events: Stream.fromQueue(queue).pipe(Stream.ensuring(close)), close };
+          }),
+        ingestNormalized: (input) =>
+          input.event.type === "node.updated"
+            ? Effect.fail(
+                new ProviderEventIngestor.ProviderEventNormalizeError({
+                  providerSessionId: input.providerSessionId,
+                  threadId: input.threadId,
+                  providerEvent: input.event,
+                  cause: "reader failed during ingestion",
+                }),
+              )
+            : Ref.update(ingested, (events) => [...events, input.event]).pipe(Effect.as([])),
+        interruptTurn: (turn) =>
+          scenario === "delivered"
+            ? cleanup
+            : Effect.fail(
+                new ProviderAdapter.ProviderAdapterInterruptError({
+                  driver,
+                  providerThreadId: turn.providerThread.id,
+                  providerTurnId: turn.providerTurnId,
+                  cause: "Stop unavailable",
+                }),
+              ),
+        ...(scenario === "terminated" ? { terminateSession: cleanup } : {}),
+      });
+      const events = yield* Ref.get(ingested);
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "provider_turn.updated")
+          .map((event) => event.providerTurn.status),
+        ["running", "interrupted"],
+      );
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "turn_item.updated")
+          .map((event) => event.turnItem.status),
+        ["running", "completed"],
+      );
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect.each(["delivered", "terminated"] as const)(
+  "retains capture for a failed root's live child until %s Stop after terminal ingestion fails",
+  (scenario) =>
+    Effect.gen(function* () {
+      const key = `failed-root-live-child:${scenario}`;
+      const ids = backgroundScenarioIds(key);
+      const queue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+      const stopStarted = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const closed = yield* Ref.make(false);
+      const runFailed = yield* Ref.make(false);
+      const childFinished = yield* Ref.make(false);
+      const endChild = Deferred.succeed(stopStarted, undefined).pipe(
+        Effect.andThen(Deferred.await(stopped)),
+        Effect.andThen(Queue.offer(queue, subagentEvent(ids, "completed"))),
+        Effect.asVoid,
+      );
+      const result = yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        subscribeEvents: () =>
+          Effect.gen(function* () {
+            yield* Queue.offerAll(queue, [
+              subagentEvent(ids, "running"),
+              {
+                ...rootTerminalEvent(ids, "failed"),
+                childTurnsContinue: true,
+              } as ProviderAdapter.ProviderAdapterV2Event,
+            ]);
+            const close = Ref.set(closed, true).pipe(
+              Effect.andThen(Queue.clear(queue)),
+              Effect.andThen(Queue.end(queue)),
+              Effect.asVoid,
+            );
+            return { events: Stream.fromQueue(queue).pipe(Stream.ensuring(close)), close };
+          }),
+        ingestNormalized: (input) =>
+          input.event.type === "turn.terminal"
+            ? Effect.fail(
+                new ProviderEventIngestor.ProviderEventNormalizeError({
+                  providerSessionId: input.providerSessionId,
+                  threadId: input.threadId,
+                  providerEvent: input.event,
+                  cause: "root terminal storage failed",
+                }),
+              )
+            : input.event.type === "subagent.updated" && input.event.subagent.status === "completed"
+              ? Ref.set(childFinished, true).pipe(Effect.as([]))
+              : Effect.succeed([]),
+        interruptTurn: (turn) =>
+          scenario === "delivered"
+            ? endChild
+            : Effect.fail(
+                new ProviderAdapter.ProviderAdapterInterruptError({
+                  driver,
+                  providerThreadId: turn.providerThread.id,
+                  providerTurnId: turn.providerTurnId,
+                  cause: "Stop unavailable",
+                }),
+              ),
+        ...(scenario === "terminated" ? { terminateSession: endChild } : {}),
+        refreshAfterTurn: Ref.set(runFailed, true),
+        afterStart: (ingestionClosed) =>
+          Effect.gen(function* () {
+            yield* Effect.raceFirst(Deferred.await(stopStarted), Deferred.await(ingestionClosed));
+            assert.isFalse(yield* Ref.get(closed));
+            assert.isFalse(yield* Ref.get(runFailed));
+            yield* Deferred.succeed(stopped, undefined);
+          }),
+      });
+      assert.isTrue(yield* Ref.get(childFinished));
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect("does not kill a shared session after a newer run takes ownership", () =>
+  Effect.gen(function* () {
+    const shutdowns = yield* Ref.make(0);
+    const result = yield* captureRootRunTermination({
+      key: "ingest-stop-recovery:takeover",
+      shouldFinalizeRun: () => Effect.succeed(false),
+      rejectTerminalWrite: true,
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:takeover"),
+            cause: "stream failed",
+          }),
+        ),
+      interruptTurn: (turn) =>
+        Effect.fail(
+          new ProviderAdapter.ProviderAdapterInterruptError({
+            driver,
+            providerThreadId: turn.providerThread.id,
+            providerTurnId: turn.providerTurnId,
+            cause: "old turn unavailable",
+          }),
+        ),
+      terminateSession: Ref.update(shutdowns, (n) => n + 1),
+    });
+    assert.equal(yield* Ref.get(shutdowns), 0);
+    assert.deepEqual(result.observed, []);
+  }),
+);
+
+it.effect("does not terminate a session when storing an observed native completion fails", () =>
+  Effect.gen(function* () {
+    const stops = yield* Ref.make(0);
+    const result = yield* captureRootRunTermination({
+      key: "native-terminal-ingest-failure",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "completed")),
+      ingestNormalized: (input) =>
+        Effect.fail(
+          new ProviderEventIngestor.ProviderEventNormalizeError({
+            providerSessionId: input.providerSessionId,
+            threadId: input.threadId,
+            providerEvent: input.event,
+            cause: "database unavailable",
+          }),
+        ),
+      interruptTurn: () => Ref.update(stops, (n) => n + 1),
+      terminateSession: Ref.update(stops, (n) => n + 1),
+    });
+    assert.equal(yield* Ref.get(stops), 0);
+    assert.include(result.observed, "run:failed");
+  }),
+);
+
 it.effect("does not stop a provider turn that already reached its terminal", () =>
   Effect.gen(function* () {
     const interrupted = yield* Ref.make(0);
@@ -4371,8 +4662,12 @@ function captureRootRunTermination(input: {
     ProviderAdapter.ProviderAdapterV2Event,
     ProviderAdapter.ProviderAdapterV2Error
   >;
+  readonly subscribeEvents?: (
+    ids: BackgroundScenarioIds,
+  ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2EventSubscription>;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly terminateSession?: ProviderAdapter.ProviderAdapterV2SessionRuntime["terminateSession"];
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
@@ -4480,39 +4775,52 @@ function captureRootRunTermination(input: {
         providerSessionId: ProviderSessionId.make(`session:${input.key}`),
         session: {
           events: Stream.empty,
-          subscribeEvents: Effect.succeed({
-            events:
-              input.events?.(ids) ??
-              Stream.fromIterable([
-                ...(input.seedOpenSubagent
-                  ? [
-                      { type: "subagent.updated", driver, subagent: runningSubagent } as const,
-                      {
-                        type: "node.updated",
-                        driver,
-                        node: makeRunOwnedSubagentNodeFixture({ ids, status: "running" }),
-                      } as const,
-                      {
-                        type: "turn_item.updated",
-                        driver,
-                        turnItem: makeRunOwnedSubagentTurnItemFixture({
-                          ids,
-                          providerInstanceId,
-                          childThreadId: ids.childThreadId,
+          subscribeEvents: (
+            input.subscribeEvents?.(ids) ??
+            Effect.succeed({
+              events:
+                input.events?.(ids) ??
+                Stream.fromIterable([
+                  ...(input.seedOpenSubagent
+                    ? [
+                        { type: "subagent.updated", driver, subagent: runningSubagent } as const,
+                        {
+                          type: "node.updated",
                           driver,
-                          status: "running",
-                        }),
-                      } as const,
-                    ]
-                  : []),
-                rootTerminalEvent(ids, "interrupted"),
-              ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
-            close: Deferred.succeed(ingestionDone, undefined).pipe(
-              Effect.andThen(input.onSubscriptionClose ?? Effect.void),
-            ),
-          }),
+                          node: makeRunOwnedSubagentNodeFixture({ ids, status: "running" }),
+                        } as const,
+                        {
+                          type: "turn_item.updated",
+                          driver,
+                          turnItem: makeRunOwnedSubagentTurnItemFixture({
+                            ids,
+                            providerInstanceId,
+                            childThreadId: ids.childThreadId,
+                            driver,
+                            status: "running",
+                          }),
+                        } as const,
+                      ]
+                    : []),
+                  rootTerminalEvent(ids, "interrupted"),
+                ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+              close: Deferred.succeed(ingestionDone, undefined).pipe(
+                Effect.andThen(input.onSubscriptionClose ?? Effect.void),
+              ),
+            })
+          ).pipe(
+            Effect.map((subscription) => ({
+              ...subscription,
+              close: subscription.close.pipe(
+                Effect.andThen(Deferred.succeed(ingestionDone, undefined)),
+              ),
+            })),
+          ),
           startTurn: input.startTurn ?? (() => Effect.void),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
+          ...(input.terminateSession === undefined
+            ? {}
+            : { terminateSession: input.terminateSession }),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {

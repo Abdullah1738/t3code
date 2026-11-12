@@ -42,6 +42,62 @@ it("redacts credentials and URL secrets from provider failures", () => {
   assert.notInclude(failure.message, "sk-abcdefghijklmnop");
 });
 
+it.each([
+  "Cookie: session=cookie-secret; csrf=csrf-secret",
+  "Set-Cookie: session=cookie-secret; HttpOnly",
+  '{"Cookie":"session=cookie-secret"}',
+  '{"refresh_token":"alias-secret"}',
+  "refreshToken=alias-secret",
+  "id_token: alias-secret",
+  "auth-token=alias-secret",
+  '{"session_token":"alias-secret"}',
+  '{"client_secret":"alias-secret"}',
+  "Proxy-Authorization: Basic proxy-secret",
+])("redacts credential headers and token aliases: %s", (credentials) => {
+  const failure = makeProviderFailure({ message: `Provider stream closed.\n${credentials}` });
+  assert.include(failure.message, "Provider stream closed.");
+  for (const secret of ["cookie-secret", "csrf-secret", "alias-secret", "proxy-secret"]) {
+    assert.notInclude(failure.message, secret);
+  }
+});
+
+it.each([1, 2, 3])("redacts credentials in JSON string bodies nested %s times", (depth) => {
+  let body = JSON.stringify({
+    refresh_token: "nested-refresh-secret",
+    Cookie: "session=nested-cookie-secret",
+  });
+  for (let index = 0; index < depth; index++) body = JSON.stringify({ body });
+  const failure = makeProviderFailure({ message: `Upstream stream failed. ${body}` });
+  assert.include(failure.message, "Upstream stream failed.");
+  assert.notInclude(failure.message, "nested-refresh-secret");
+  assert.notInclude(failure.message, "nested-cookie-secret");
+});
+
+it.each([0, 1, 2])(
+  "preserves JSON value boundaries while removing quoted Cookie secrets at depth %s",
+  (depth) => {
+    let body = JSON.stringify({
+      Cookie: 'session="cookie-secret"; csrf=csrf-secret',
+      refresh_token: 'refresh-"quoted-secret"',
+    });
+    for (let i = 0; i < depth; i++) body = JSON.stringify({ body });
+    const failure = makeProviderFailure({ message: `Provider failure: ${body}` });
+    for (const secret of ["cookie-secret", "csrf-secret", "quoted-secret"])
+      assert.notInclude(failure.message, secret);
+    assert.include(failure.message, "Provider failure:");
+  },
+);
+
+it.each(["api_key", "apiKey", "api-key", "API_KEY"])(
+  "redacts escaped API-key aliases in malformed JSON fragments: %s",
+  (alias) => {
+    const body = String.raw`{\"${alias}\":\"abc123\"}`;
+    const failure = makeProviderFailure({ message: `Upstream rejected: ${body}` });
+    assert.notInclude(failure.message, "abc123");
+    assert.include(failure.message, "Upstream rejected:");
+  },
+);
+
 it("replaces unsafe control characters without stripping whitespace", () => {
   const failure = makeProviderFailure({ message: "before\u0000\u0007\t\nafter\u007f" });
 

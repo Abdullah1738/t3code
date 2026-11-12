@@ -30,6 +30,7 @@ import {
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -1025,6 +1026,8 @@ export const layer: Layer.Layer<
           }),
         );
         const rootTerminalSeen = yield* Ref.make(false);
+        const ingestionFailure = yield* Ref.make<Cause.Cause<unknown> | null>(null);
+        const shutdownCleanupDeadline = yield* Deferred.make<Cause.Cause<unknown>>();
         const rootRunFinalized = yield* Ref.make(false);
         const providerThreadOwnerLost = yield* Ref.make(false);
         const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
@@ -1304,6 +1307,7 @@ export const layer: Layer.Layer<
           if (
             terminal !== null &&
             terminal.status !== "completed" &&
+            (yield* Ref.get(ingestionFailure)) === null &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1323,6 +1327,7 @@ export const layer: Layer.Layer<
           if (
             terminal !== null &&
             terminal.status !== "completed" &&
+            (yield* Ref.get(ingestionFailure)) === null &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1359,24 +1364,61 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
-        // ardud: stop a provider turn whose events nobody reads any more.
-        // Only while no root terminal arrived: a settled turn has nothing left.
+        const orphanStopConfirmed = yield* Ref.make(false);
+        const nativeEndConfirmed = Effect.gen(function* () {
+          const terminal = yield* Ref.get(terminalEvent);
+          return (yield* agentTurnsSettled) && (terminal === null || !childTurnsContinue(terminal));
+        });
         const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
           function* (providerThread: OrchestrationV2ProviderThread) {
-            if (yield* Ref.get(rootTerminalSeen)) return;
-            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-            if (providerTurnId === null) return;
-            yield* input.session.interruptTurn({ providerThread, providerTurnId }).pipe(
-              Effect.timeout("30 seconds"),
-              Effect.catchCause((interruptCause) =>
-                Effect.logWarning("orchestration V2 could not stop an orphaned provider turn", {
+            while (!(yield* nativeEndConfirmed) && !(yield* Ref.get(orphanStopConfirmed))) {
+              const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (providerTurnId === null) return;
+              const stopped = yield* input.session
+                .interruptTurn({ providerThread, providerTurnId })
+                .pipe(Effect.timeout("30 seconds"), Effect.exit);
+              if (Exit.isSuccess(stopped)) {
+                yield* Ref.set(orphanStopConfirmed, true);
+                return;
+              }
+              yield* Effect.logWarning(
+                "orchestration V2 could not stop an orphaned provider turn",
+                {
                   runId: input.run.id,
                   threadId: input.run.threadId,
                   providerTurnId,
-                  cause: interruptCause,
-                }),
-              ),
-            );
+                  cause: stopped.cause,
+                },
+              );
+              if (input.shouldFinalizeRun !== undefined) {
+                const current = yield* input
+                  .shouldFinalizeRun()
+                  .pipe(Effect.timeout("10 seconds"), Effect.exit);
+                if (Exit.isSuccess(current) && !current.value) return;
+                if (Exit.isFailure(current)) {
+                  yield* Effect.sleep("1 second");
+                  continue;
+                }
+              }
+              if (input.session.terminateSession !== undefined) {
+                const terminated = yield* input.session.terminateSession.pipe(
+                  Effect.timeout("10 seconds"),
+                  Effect.exit,
+                );
+                if (Exit.isSuccess(terminated)) {
+                  yield* Ref.set(orphanStopConfirmed, true);
+                  return;
+                }
+                yield* Effect.logWarning("orchestration V2 provider shutdown remains unconfirmed", {
+                  runId: input.run.id,
+                  threadId: input.run.threadId,
+                  cause: terminated.cause,
+                });
+              }
+              // A failed Stop or shutdown is not termination evidence. Keep ownership
+              // and the subscription until another bounded attempt confirms it.
+              yield* Effect.sleep("1 second");
+            }
           },
         );
         const providerEventFiber = yield* eventSubscription.events.pipe(
@@ -1458,6 +1500,11 @@ export const layer: Layer.Layer<
           Stream.tap(({ event, accepted }) =>
             Effect.gen(function* () {
               if (!accepted) return;
+              // Native completion remains termination evidence even if persisting it fails.
+              if (event.type === "turn.terminal") {
+                yield* Ref.set(rootTerminalSeen, true);
+                yield* Ref.set(terminalEvent, event);
+              }
               let storedEventCount = 0;
               const deliveredEvent = filterAssistantEvent(
                 event,
@@ -1546,10 +1593,23 @@ export const layer: Layer.Layer<
               if (event.type === "turn.terminal") {
                 yield* Ref.set(terminalEvent, event);
                 yield* Ref.set(rootTerminalSeen, true);
-                yield* finalizeRootRun(event);
+                if ((yield* Ref.get(ingestionFailure)) === null) yield* finalizeRootRun(event);
               }
               yield* trackChildLifecycle(event, deliveredEvent !== null);
-            }),
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  if (Cause.hasInterruptsOnly(cause) || (yield* nativeEndConfirmed))
+                    return yield* Effect.failCause(cause);
+                  yield* Ref.update(ingestionFailure, (previous) => previous ?? cause);
+                  yield* stopOrphanedProviderTurn(yield* Ref.get(latestProviderThread));
+                  if (!(yield* Ref.get(orphanStopConfirmed))) return yield* Effect.failCause(cause);
+                  // Keep consuming the subscription: Stop's terminal/card updates can still
+                  // be queued behind this event, including in the session manager's pump.
+                  yield* Deferred.succeed(shutdownCleanupDeadline, cause);
+                }),
+              ),
+            ),
           ),
           // Also after events this run does not accept, such as a child handed to another run.
           Stream.tap(() =>
@@ -1558,10 +1618,17 @@ export const layer: Layer.Layer<
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+          Stream.interruptWhen(
+            Deferred.await(shutdownCleanupDeadline).pipe(
+              Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
+            ),
+          ),
           Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
+              const failure = yield* Ref.get(ingestionFailure);
+              if (failure !== null) return yield* Effect.failCause(failure);
               const terminal = yield* Ref.get(terminalEvent);
               if (terminal === null) {
                 // A session release interrupts or fails the stream; a clean
