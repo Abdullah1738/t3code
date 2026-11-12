@@ -302,6 +302,9 @@ const CLAUDE_SCRIPT_EXTENSIONS = [".js", ".mjs", ".tsx", ".ts", ".jsx"];
 // Claude can consume a subagent result before the launching turn ends, leaving
 // its notification with no native wake turn to answer the continuation.
 const CLAUDE_WAKE_TURN_START_DEADLINE = "2 minutes";
+// Retained SDK traces: 55 successful compactions, slowest 41.433 s (Haiku).
+// Five minutes allows ample headroom while bounding a silent compaction stall.
+const CLAUDE_COMPACTION_NO_PROGRESS_MS = 5 * 60_000;
 // Claude Code flushes transcript writes every 100 ms, so a workflow member's
 // reply can land after the progress frame that settles it. Its transcript
 // stays the source of its answer this long after it settles.
@@ -3492,6 +3495,8 @@ interface ActiveClaudeTurnContext {
   readonly toolCalls: Map<string, ActiveClaudeToolCall>;
   // A successful status can precede the boundary that supplies its token counts.
   compaction: Extract<OrchestrationV2TurnItem, { type: "compaction" }> | null;
+  compactionWatchdogStop: Deferred.Deferred<void> | null;
+  lastSdkMessageAt: number;
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
@@ -6589,6 +6594,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
         });
 
+        const stopCompactionWatchdog = Effect.fn("ClaudeAdapterV2.stopCompactionWatchdog")(
+          function* (context: ActiveClaudeTurnContext) {
+            const stop = context.compactionWatchdogStop;
+            context.compactionWatchdogStop = null;
+            if (stop !== null) yield* Deferred.succeed(stop, undefined);
+          },
+        );
+
         const performActiveTurnFinalization = Effect.fnUntraced(function* (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly status: Extract<
@@ -6602,6 +6615,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         }) {
           yield* Effect.gen(function* () {
             input.context.acceptingSteers = false;
+            yield* stopCompactionWatchdog(input.context);
             yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
             if (input.context.compaction?.status === "running") {
               yield* emitProviderEvent({
@@ -6609,6 +6623,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 driver: CLAUDE_PROVIDER,
                 turnItem: {
                   ...input.context.compaction,
+                  summary: input.failure?.message ?? "Claude compaction ended without a result.",
                   status: input.status === "completed" ? "failed" : input.status,
                   title:
                     input.status === "completed" || input.status === "failed"
@@ -7499,6 +7514,58 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           return subagent?.task.status === "running" ? settled : null;
         });
 
+        const startCompactionWatchdog = Effect.fn("ClaudeAdapterV2.startCompactionWatchdog")(
+          function* (context: ActiveClaudeTurnContext, liveQuery: ClaudeLiveQueryContext) {
+            yield* stopCompactionWatchdog(context);
+            const stop = yield* Deferred.make<void>();
+            context.compactionWatchdogStop = stop;
+            const compactionId = context.compaction?.id;
+            yield* Effect.gen(function* () {
+              let remaining = CLAUDE_COMPACTION_NO_PROGRESS_MS;
+              while (remaining > 0) {
+                yield* Effect.sleep(remaining);
+                remaining = yield* sdkMessageLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    if (
+                      (yield* Ref.get(activeTurn)) !== context ||
+                      (yield* Ref.get(queryContext)) !== liveQuery ||
+                      liveQuery.stopping ||
+                      context.compaction?.id !== compactionId ||
+                      context.compaction?.status !== "running"
+                    )
+                      return 0;
+                    const idle = (yield* Clock.currentTimeMillis) - context.lastSdkMessageAt;
+                    if (idle < CLAUDE_COMPACTION_NO_PROGRESS_MS)
+                      return CLAUDE_COMPACTION_NO_PROGRESS_MS - idle;
+                    // Fence this process before settling: a late result must not
+                    // complete the failed turn or deliver its queued steers.
+                    context.compactionWatchdogStop = null;
+                    liveQuery.stopping = true;
+                    yield* Ref.set(queryContext, null);
+                    yield* finalizeActiveTurn({
+                      context,
+                      status: "failed",
+                      completedAt: yield* DateTime.now,
+                      failure: makeProviderFailure({
+                        class: "provider_error",
+                        category: "transient",
+                        code: "compaction_no_progress",
+                        message: "Claude compaction made no progress for 5 min.",
+                      }),
+                    });
+                    yield* liveQuery.query.close.pipe(
+                      Effect.timeout("10 seconds"),
+                      Effect.ignore,
+                      Effect.forkIn(sessionScope),
+                    );
+                    return 0;
+                  }),
+                );
+              }
+            }).pipe(Effect.raceFirst(Deferred.await(stop)), Effect.forkIn(sessionScope));
+          },
+        );
+
         const handleSdkMessageFrame = Effect.fnUntraced(function* (input: {
           readonly query: ClaudeAgentSdkQuerySession;
           readonly message: SDKMessage;
@@ -7833,9 +7900,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 message.compact_result === "failed" ? { message: message.compact_error } : null;
             }
             if (context.compaction?.status === "running") {
+              yield* stopCompactionWatchdog(context);
               const now = yield* DateTime.now;
               context.compaction = {
                 ...context.compaction,
+                ...(message.compact_result === "success"
+                  ? {}
+                  : {
+                      summary:
+                        message.compact_error?.trim() ||
+                        (message.compact_result === "failed"
+                          ? "Claude compaction failed without a reason."
+                          : "Claude compaction ended without a result."),
+                    }),
                 status:
                   message.compact_result === "success"
                     ? "completed"
@@ -7897,6 +7974,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               } satisfies OrchestrationV2TurnItem);
             if (message.subtype === "status") {
               context.compaction = compaction;
+              yield* startCompactionWatchdog(context, liveQuery);
               yield* emitProviderEvent({
                 type: "turn_item.updated",
                 driver: CLAUDE_PROVIDER,
@@ -7904,6 +7982,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               });
               return;
             }
+            yield* stopCompactionWatchdog(context);
             if (context.streamUsage !== null) context.streamUsage.usage = null;
             const postTokens = message.compact_metadata.post_tokens;
             const afterTokenCount =
@@ -9007,6 +9086,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const message = input.message;
           const context = yield* Ref.get(activeTurn);
           const liveQuery = yield* Ref.get(queryContext);
+          if (context !== null && liveQuery?.query === input.query) {
+            context.lastSdkMessageAt = yield* Clock.currentTimeMillis;
+          }
           if (
             context?.promptUuid === null &&
             liveQuery?.query === input.query &&
@@ -9830,6 +9912,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               streamUsage: null,
               toolCalls: new Map(),
               compaction: null,
+              compactionWatchdogStop: null,
+              lastSdkMessageAt: yield* Clock.currentTimeMillis,
               ignoredTaskIds: new Set(),
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,

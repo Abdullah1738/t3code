@@ -6986,6 +6986,167 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  describe("compaction progress guard", () => {
+    const start = Effect.fnUntraced(function* (
+      options?: Parameters<typeof makeWakeHarnessWithOptions>[0],
+    ) {
+      const harness = yield* makeWakeHarnessWithOptions(options);
+      const input = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("compaction-guard-attempt"),
+        text: "Continue working.",
+        attachments: [],
+      });
+      yield* harness.runtime.startTurn(input);
+      return { ...harness, input };
+    });
+    const compacting = claudeSdkFrame({
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid: "compaction-guard-start",
+      session_id: WAKE_NATIVE_SESSION,
+    });
+    const compactions = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+      events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+          ? [event.turnItem]
+          : [],
+      );
+    const layers = Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer);
+
+    it.effect.each([false, true])(
+      "keeps queued steers in order with compaction=%s",
+      (withCompaction) =>
+        Effect.gen(function* () {
+          const h = yield* start();
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          if (withCompaction) yield* h.offerAndWait(compacting);
+          for (const text of ["first correction", "second correction"]) {
+            yield* h.runtime.steerTurn({
+              threadId: h.threadId,
+              runId: h.input.runId,
+              providerThread: h.providerThread,
+              providerTurnId: idAllocator.derive.providerTurn({
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeTurnId: `turn:${h.input.attemptId}`,
+              }),
+              message: {
+                createdBy: "agent",
+                creationSource: "mcp",
+                messageId: MessageId.make(text),
+                text,
+                attachments: [],
+              },
+            });
+          }
+          assert.lengthOf(h.offeredMessages, 1);
+          if (withCompaction) {
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "status",
+                status: null,
+                compact_result: "success",
+                uuid: "compaction-guard-success",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "informational",
+                content: "Compaction observed",
+                level: "warning",
+                uuid: "compaction-success-observed",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* Queue.take(h.systemNoticeReceipts);
+            assert.equal(compactions(h.events).at(-1)?.status, "completed");
+            assert.lengthOf(h.offeredMessages, 1);
+          }
+          for (const [index, text] of ["first correction", "second correction"].entries()) {
+            yield* h.offerAndWait(
+              makeResultFrame({ uuid: `segment-${index}`, result: "Segment complete." }),
+            );
+            assert.lengthOf(h.offeredMessages, index + 2);
+            assert.equal(h.offeredMessages[index + 1]?.priority, "later");
+            assert.include(JSON.stringify(h.offeredMessages[index + 1]?.message.content), text);
+            assert.isEmpty(h.terminalEvents());
+          }
+          yield* TestClock.adjust("10 minutes");
+          yield* h.offerAndWait(makeResultFrame({ uuid: "steered-final", result: "Done." }));
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "completed");
+          assert.lengthOf(h.offeredMessages, 3);
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect.each(["upstream stream stopped", "", undefined])(
+      "shows failed compaction reason %s",
+      (reason) =>
+        Effect.gen(function* () {
+          const h = yield* start();
+          yield* h.offerAndWait(compacting);
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: null,
+              compact_result: "failed",
+              ...(reason === undefined ? {} : { compact_error: reason }),
+              uuid: "compaction-guard-failure",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "failed-compaction-final", result: "Done." }),
+          );
+          yield* Queue.take(h.terminalReceipts);
+          assert.equal(
+            compactions(h.events).at(-1)?.summary,
+            reason || "Claude compaction failed without a reason.",
+          );
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect("fails stalled compaction after five minutes without SDK progress", () =>
+      Effect.gen(function* () {
+        const closed = yield* Deferred.make<void>();
+        const h = yield* start({ close: () => Deferred.succeed(closed, undefined) });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("4 minutes");
+        yield* h.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "informational",
+            content: "Still working",
+            level: "info",
+            uuid: "compaction-progress",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* TestClock.adjust("4 minutes");
+        assert.isEmpty(h.terminalEvents());
+        yield* TestClock.adjust("1 minute");
+        yield* Effect.yieldNow;
+        assert.lengthOf(h.terminalEvents(), 1);
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        assert.equal(terminal.failure?.code, "compaction_no_progress");
+        assert.equal(terminal.failure?.message, "Claude compaction made no progress for 5 min.");
+        assert.equal(compactions(h.events).at(-1)?.status, "failed");
+        assert.equal(compactions(h.events).at(-1)?.summary, terminal.failure?.message);
+        yield* Deferred.await(closed);
+        yield* h.offerAndWait(makeResultFrame({ uuid: "late-result", result: "Too late." }));
+        assert.lengthOf(h.terminalEvents(), 1);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+  });
+
   it.effect.each([
     { outcome: "result", turnStatus: "completed", itemStatus: "failed" },
     { outcome: "interrupt", turnStatus: "interrupted", itemStatus: "interrupted" },
