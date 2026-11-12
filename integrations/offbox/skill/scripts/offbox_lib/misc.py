@@ -801,6 +801,10 @@ def logs(run_id: str, do_follow: bool) -> int:
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     _tail(p, 0, True)
     _incomplete_log(r, result)
+    from .runs import settled_steps_code, planned_steps
+    code = settled_steps_code(r, r['exit_code'], catch_up=False)
+    if planned_steps(r) and code is None:
+        return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
         if result in ('complete', 'caught_up'):
             say(f"no output recorded for {r['run_id']} (server history checked)")
@@ -819,7 +823,7 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
-    from .runs import repo_setup_failed
+    from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
     if until is not None and now() >= until:
@@ -836,12 +840,24 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
-    _report_deps_hint(r, r['exit_code'], LOGS_DIR / f"{r['run_id']}.log")
-    out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
-    if r['exit_code'] is None and r['box_id']:
+    code = settled_steps_code(r, r['exit_code'], catch_up=False)
+    _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log")
+    status = r['status']
+    if planned_steps(r) and code is not None and status in ('done', 'failed', 'infra', 'lost'):
+        status = 'done' if code == 0 else 'failed'
+        if (status, code) != (r['status'], r['exit_code']):
+            con = db()
+            try:
+                con.execute("UPDATE runs SET status=?,exit_code=? WHERE run_id=? "
+                            "AND status IN ('done','failed','infra','lost')", (status, code, r['run_id']))
+                con.commit()
+            finally:
+                con.close()
+    out(f"{r['run_id']}: {status} exit={code}")
+    if code is None and r['box_id']:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
-    return r["exit_code"] if r["exit_code"] is not None else 90
+    return code if code is not None else 90
 
 
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
@@ -1000,10 +1016,11 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
-    from .runs import _status_code
+    from .runs import _status_code, settled_steps_code
     code, how = _status_code(st), "boat's process status"
     if code is None:
         code, how = _recover_by(r, log_path, deadline)
+    code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     _tail(log_path, pos, echo)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
@@ -1017,12 +1034,12 @@ def _recover_by(r, log_path, deadline):
     """recover_lost_exit for a wait: the box read gets only what is left of the caller's deadline (20 s without one),
     and an answer that arrives at or past the deadline is not accepted, so nothing is published or settled from it
     (--timeout is 124 and the run is left alone)."""
-    from .runs import recover_lost_exit
+    from .runs import recover_lost_exit, planned_steps
     budget = 20.0 if deadline is None else deadline - now()
     if budget <= 0:
         raise _wait_timeout(r)
     try:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, planned_steps(r), timeout=min(20.0, budget))
     except OffboxError:
         if deadline is not None and now() >= deadline:
             raise _wait_timeout(r) from None
@@ -1248,7 +1265,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
-                       settle_box_wedged, wedged_message)
+                       settle_box_wedged, wedged_message, settled_steps_code)
     try:
         delivered = os.path.getsize(log_path)
     except OSError:
@@ -1273,6 +1290,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         do_pulls(r["box_id"], row, pulls, until=until)
     if until is not None and now() >= until:
         raise _wait_timeout(r)
+    code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
     finish(r['run_id'], code, until=until)
     if dict(r).get('mode') == 'bg' and not _has_data(log_path):
         settled = _run_row(r['run_id'])
@@ -1299,7 +1317,7 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
     from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
-        return r['exit_code'] if r['exit_code'] is not None else 90
+        return _settled(r, echo=echo, locked=True, until=until)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
     return _finalize(r, code, log_path, until=until, echo=echo)

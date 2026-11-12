@@ -451,7 +451,7 @@ def db() -> sqlite3.Connection:
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER"):
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
     if 'wrapper_pid' not in have:

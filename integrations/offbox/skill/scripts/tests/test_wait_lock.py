@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, lease, misc, pool, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, pool, reap, runs, start_check  # noqa: E402
 from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -437,6 +437,145 @@ class WaitLockTests(Isolated):
         rc, out, _ = self.cli_wait(['wait', 'run-x'], Clock())
         self.assertEqual(rc, 3)
         self.assertIn('run-x: failed exit=3', out)
+
+    def test_settled_step_run_requires_every_planned_result(self):
+        if 'step_count' not in {row[1] for row in self.con.execute('PRAGMA table_info(runs)')}:
+            self.con.execute("ALTER TABLE runs ADD COLUMN step_count INTEGER DEFAULT 0")
+        self.con.execute("UPDATE runs SET step_count=4 WHERE run_id='run-x'")
+        self.con.commit()
+        self.end_run(0)
+        log = common.LOGS_DIR / 'run-x.log'
+        log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+        for argv in (['wait', 'run-x'], ['logs', 'run-x'], ['logs', 'run-x', '--follow']):
+            with self.subTest(argv=argv):
+                rc, out, err = self.cli_wait(argv, Clock())
+                self.assertEqual(rc, 90)
+                self.assertIn('steps incomplete: got 2 of 4 step results; remote exit unknown', err)
+                self.assertNotIn('done exit=0', out)
+
+    def test_step_completion_fetches_missing_history_before_accepting_exit(self):
+        self.con.execute("UPDATE runs SET step_count=2,command_id='cmd-x' WHERE run_id='run-x'")
+        self.con.commit()
+        log = common.LOGS_DIR / 'run-x.log'
+        first = b'offbox step 1 rc=0: a\n'
+        last = b'offbox step 2 rc=0: b\n'
+        log.write_bytes(first)
+        runs._commit(log, 0, len(first), len(first))
+        calls = []
+        def history(box, command, stream, offset, **kw):
+            calls.append((stream, offset))
+            data = first + last if stream == 'stderr' else b''
+            return dict(data=data[offset:].decode(), nextOffset=len(data), size=len(data), done=True)
+        with patch.object(api, 'history_logs', side_effect=history):
+            code = misc._finalize(misc._run_row('run-x'), 0, log)
+        self.assertEqual(code, 0)
+        self.assertIn(last, log.read_bytes())
+        self.assertIn(('stderr', len(first)), calls)
+        self.assertEqual(misc._run_row('run-x')['exit_code'], 0)
+
+    def test_finish_never_records_done_for_missing_steps(self):
+        self.con.execute("UPDATE runs SET step_count=4 WHERE run_id='run-x'")
+        self.con.commit()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+        runs.finish('run-x', 0)
+        row = misc._run_row('run-x')
+        self.assertEqual(row['status'], 'infra')
+        self.assertIsNone(row['exit_code'])
+
+    def test_stuck_holder_zero_does_not_bypass_step_validation(self):
+        self.hold_box()
+        self.con.execute("UPDATE runs SET step_count=1 WHERE run_id='run-x'")
+        self.con.commit()
+        self.ended.return_value = dict(running=False, status='exited', exitCode=0)
+        rc, out, err = self.cli_wait(['wait', 'run-x'], Clock())
+        self.assertEqual(rc, 90)
+        self.assertIn('steps incomplete: got 0 of 1', err)
+        self.assertNotIn('exit=0', out)
+
+    def test_all_settlement_paths_reject_incomplete_steps(self):
+        self.con.execute("UPDATE runs SET step_count=2,mode='bg' WHERE run_id='run-x'")
+        self.con.commit()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.write_text('offbox step 1 rc=0: a\n')
+        for path in ('finalize', 'reap', 'start-receipt', 'lost-reconcile'):
+            with self.subTest(path=path), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+                self.con.commit()
+                row = misc._run_row('run-x')
+                if path == 'finalize':
+                    self.assertEqual(misc._finalize(row, 0, log), 90)
+                elif path == 'reap':
+                    with patch.object(api, 'cmd_status', return_value=dict(status='exited', running=False, exitCode=0)):
+                        reap._check_unlocked(self.con, 'bx_a', 'running', False, [])
+                elif path == 'start-receipt':
+                    start_check.settle(self.con, row, start_check.Result('started', 0, 7), 'test receipt')
+                else:
+                    self.con.execute("UPDATE runs SET status='lost' WHERE run_id='run-x'")
+                    self.con.commit()
+                    with patch.object(runs, 'confirmed_lost', return_value=dict(status='exited', exitCode=0)), \
+                            patch.object(api, 'get', return_value=dict(state='running')):
+                        runs.reconcile_lost(self.con, 'bx_a')
+                row = misc._run_row('run-x')
+                self.assertEqual(row['status'], 'infra')
+                self.assertIsNone(row['exit_code'])
+                self.assertIn('steps incomplete: got 1 of 2', err.getvalue())
+
+    def test_run_records_expected_count_before_acquiring_box(self):
+        args = cli.build_parser().parse_args(['run', '--step', 'a', '--step', 'b'])
+        args.steps, args.cmd = args.step, ['; '.join(args.step)]
+        runner = runs.Runner(args, self.me)
+        with patch.object(runs.pool, 'acquire', side_effect=OffboxError('no test box')):
+            with self.assertRaises(OffboxError):
+                runner.start()
+        self.assertEqual(misc._run_row(runner.run_id)['step_count'], 2)
+
+    def test_later_complete_results_recover_an_unknown_step_exit(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+        self.assertEqual(runs.settled_steps_code(misc._run_row('run-x'), None), 0)
+
+    def test_later_log_recovery_preserves_known_process_failures(self):
+        # A missing log tail must not erase a failure learned independently from the process.
+        cases = [(None, 0), (0, 0), (1, 1), (137, 137), (143, 143)]
+        log = common.LOGS_DIR / 'run-x.log'
+        for process_code, expected in cases:
+            with self.subTest(process_code=process_code):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL,known_exit_code=NULL,step_count=2 WHERE run_id='run-x'")
+                self.con.commit()
+                log.write_text('offbox step 1 rc=0: a\n')
+                row = misc._run_row('run-x')
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(misc._finalize(row, process_code, log), 90)
+                log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+                rc, out, _ = self.cli_wait(['wait', 'run-x'], Clock())
+                self.assertEqual(rc, expected)
+                self.assertIn(f"{'done' if expected == 0 else 'failed'} exit={expected}", out)
+
+    def test_maintenance_status_uses_validated_step_exit(self):
+        self.con.execute("UPDATE runs SET step_count=1,mode='bg' WHERE run_id='run-x'")
+        self.con.commit()
+        log = common.LOGS_DIR / 'run-x.log'
+        log.write_text('offbox step 1 rc=7: a\n')
+        for path in ('reap', 'lost-reconcile'):
+            with self.subTest(path=path), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+                self.con.commit()
+                if path == 'reap':
+                    with patch.object(api, 'cmd_status', return_value=dict(status='exited', running=False, exitCode=0)):
+                        reap._check_unlocked(self.con, 'bx_a', 'running', False, [])
+                else:
+                    self.con.execute("UPDATE runs SET status='lost' WHERE run_id='run-x'")
+                    self.con.commit()
+                    with patch.object(runs, 'confirmed_lost', return_value=dict(status='exited', exitCode=0)), \
+                            patch.object(api, 'get', return_value=dict(state='running')):
+                        runs.reconcile_lost(self.con, 'bx_a')
+                row = misc._run_row('run-x')
+                self.assertEqual((row['status'], row['exit_code']), ('failed', 7))
 
     def test_logs_follow_tails_the_holders_log(self):
         self.hold_box()

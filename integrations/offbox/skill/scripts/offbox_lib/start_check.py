@@ -97,14 +97,18 @@ def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOU
 def settle(con, row, result: Result, reason: str, *, until: float | None = None) -> None:
     """End the row, retaining a separate reservation whenever execution is still possible."""
     rid, box = row['run_id'], row['box_id']
+    code = result.code
     if result.code is not None:
         from .runs import do_pulls
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
             do_pulls(box, dict(row), pulls, until=until)
+        from .runs import settled_steps_code
+        code = settled_steps_code(row, code, locked=True, until=until)
     remember_wrapper(con, row, result.pid)
     if result.code is not None:
-        status, error = ('done' if result.code == 0 else 'failed'), None
+        status, error = (('infra', 'steps incomplete') if code is None else
+                         (('done' if code == 0 else 'failed'), None))
     elif result.verdict == 'fenced':
         status, error = 'lost', f'{reason}; never started, nothing ran'
         con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
@@ -115,11 +119,11 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=? "
                 "WHERE run_id=? AND (status IN ('starting','running') OR "
                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
-                (status, result.code, now(), error, rid))
+                (status, code, now(), error, rid))
     if result.code is not None or result.verdict == 'fenced':
         con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
     con.commit()
     if result.code is not None and row['mode'] == 'bg':
         from .misc import _catch_up_finished
         _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
-    event(con, box, 'start_settled', f'{rid} {status} exit={result.code}: {error or reason}')
+    event(con, box, 'start_settled', f'{rid} {status} exit={code}: {error or reason}')
