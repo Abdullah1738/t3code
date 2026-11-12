@@ -528,3 +528,118 @@ not block; pending/unpaid stops); fresh rocket orders bind a `-U<digits>`
 fulfillment unit at the manifest group level (null row shipment ids) that
 rebinds as `-S1` at packing — the exact-track projection and the
 `/orders/active` guard read both accept it.
+
+## Noon card selection (9 November 2026)
+
+All active noon lanes default to saved Mashreq Noon Visa 9546. The only explicit
+fallback is `COMMERCE_CARD_LAST4=2342 commerce ...`, using Marriott Mastercard.
+The caller must establish that 9546 failed/declined and reconcile any ambiguous
+financial send before purchasing with the fallback. There is no automatic retry
+or card switching. Other card values, including cancelled 5542, refuse at startup.
+CVV retrieval and bank-approval notices follow the selected card. Existing flows
+remain bound to their original card; use the original card override for historical
+Minutes/NowNow/Main/Supermall recovery. Food read-only recovery derives its card
+from the retained review and verifies the original journal scope/token hash.
+
+Food HTTP placement supports the automatic saved-card path. `commerce order food`
+prepares and reviews the exact basket, then checks native `session/can-place` for
+explicit false CVV/completion requirements, the original card token, zero wallet,
+and matching totals. The journal consumes placement before its single HTTP send.
+`--prepare-only` never places; `--resume-flow` binds the original basket.
+Real payment intents, CVV or 3DS requirements need the app; no completion is sent.
+`recover-payment` rereads the retained exact order ID after session expiry.
+Capture requires native automatic processing and a unique bank purchase matching
+the original card, AED amount, merchant and placement time. Mashreq 9546 emails
+and EmiratesNBD 2342 SMS are supported. A purchase notification cannot confirm
+two journalled orders. Until capture and acceptance are verified, the card stays
+held; completion also requires the watcher and delivery-card sent receipt.
+
+Main/Supermall require the selected card to be the noon account default; they
+never switch saved cards. Change that default in the noon app before using a
+different card. NowNow supports explicit saved-card selection and
+`--cvv-from-keychain`. It journals subscription verification and CVV completion
+once, keeps secrets in Keychain/RAM, and stops on bank/device challenges.
+Verification is not purchase capture: the order needs exact native details and
+a unique bank purchase for its original card, amount and placement time.
+`recover-payment` uses the retained order ID after checkout expiry; pending
+evidence registers a held tracker. A completed verification can resume the same
+flow without another subscription or completion. Unknown sends stay fenced.
+Customized NowNow modifiers/notes remain unsupported and fail before mutation.
+
+`release-flow` can close a failed NowNow subscription before placement. It reads
+the retained intent and exact retained cart, checks the original account/card,
+requires `payment_failed` / `FAILED` with explicit zero authorized, captured,
+reversed and refunded amounts, and rejects any placement, order ID, unobserved
+send or earlier success evidence. The journal rechecks local history atomically;
+release is terminal and retains the reservation and every consumed operation.
+Food/Main/Supermall have no pre-order authorization contract and continue to
+require exact-order reconciliation. Missing or ambiguous evidence stays fenced.
+
+For a released NowNow cart, `order nownow ... --resume-flow FLOW --prepare-only`
+only rereads the exact original basket and reports `released_cart_review_only`.
+It verifies account availability and normal cart review checks, sends no cart or
+payment mutation, and cannot resume that released flow for purchase. Release
+does not remove the remote cart or authorize a replacement purchase.
+
+9 November live attempt: one White Chocolate 330ml shake prepared at AED26.70.
+9546 required an AED1 card verification. One CLI completion reached Mashreq 3DS;
+the retained redirect was displayed, then reopened once with authorization after
+browser navigation interrupted it. Native status ended `payment_failed`,
+`FAILED`, error 19046 (3D secure authentication failure), with authorized and
+captured amounts both zero. No order placement was sent. Full 9546 purchase and
+capture remain unproven; there was no replacement flow or fallback charge.
+Visa refund code/title matching is synthetic-fixture coverage only. Unfamiliar
+refund wording remains fenced and must be inspected before extending the parser.
+
+### Food automatic app purchase (9 November 2026)
+
+A single owner-authorized Android purchase on Mashreq 9546 completed the existing
+Just Fit Food basket for AED172.80. The capture retained the selected items,
+empty modifier maps, zero wallet contribution, quiet preferences and driver note.
+The session explicitly required neither CVV nor separate completion. Placement
+returned `pending/not_synced` with a null payment client secret; exact tracking
+then progressed from processing to preparing. A Mashreq purchase notification
+independently corroborated the amount, card, merchant and time. The owner tracker
+and delivery card were registered and sent.
+
+No payment-intent completion, CVV submission or 3DS challenge occurred. This
+establishes the automatic Food contract used by the CLI, alongside the 7 November
+HTTP placement. It does not establish NowNow's different payment contract.
+Never manufacture a completion request for an automatic paid order.
+
+NowNow retained cart cleanup: `commerce clear-cart nownow --flow FLOW_UUID`.
+Requires a released flow and the exact retained session/review/account/Home.
+Prepare-only retains this review before returning. Older nonfinancial preparations
+without a retained review can recover it only when the live session matches the
+last journalled cart-read receipt, original basket/Home/card scope and selected-card
+request. Expiry does not permit purchase resume. Missing financial reviews,
+changed carts or missing receipt evidence still refuse cleanup.
+A failed pre-order card verification additionally requires its terminal release
+and fresh exact failed-intent evidence with zero bank amounts. Active account
+flows, later writers, unknown sends and placement history refuse. The native
+`v1/session/delete` POST takes only `sessionCode`; deletion is consumed once,
+then the exact store's active session and recent carts independently prove empty.
+A missing response or failed readback keeps the cleanup flow blocking the account.
+No automatic resend, payment, placement or watcher registration occurs.
+
+### Retained bank redirects
+
+Authorized checkout opens a native 3DS redirect once in a dedicated Dia Personal
+window before asking for bank approval. The attempt is persisted before browser
+I/O; a crash or uncertain open is never automatically retried. Redirect URLs
+travel in memory over pipes, and only hashes are written to the attempt record.
+This applies to NowNow pre-order verification and the Minutes/marketplace
+payment-intent redirect paths. No completion or payment request is replayed.
+
+`commerce await-payment FLOW --minutes 10` supports NowNow pre-order verification
+and remains status-only. Add `--open-redirect` only when authorized to start the
+retained bank challenge. NowNow alerts use the native verification amount (which
+can be AED 1), not the basket total. Successful verification is not purchase
+capture: await-payment never places an order. Resume the same basket separately
+with its original `commerce order nownow ... --resume-flow FLOW` arguments.
+The existing 24-hour preparation limit, fresh basket review, and account fences
+still apply. Pending/redirect status with zero authorized/captured is not terminal
+no-charge proof; release-flow requires the existing exact failed-intent evidence.
+
+`commerce open-flows` lists all unresolved flows, including ACTIVE preparations
+and older payment fences. A listed preparation is not a bank approval request.
