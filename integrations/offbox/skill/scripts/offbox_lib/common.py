@@ -37,6 +37,8 @@ EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps 
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
 RUN_TTL_S = 30 * 60            # ttl while a run is in progress, refreshed every TTL_REFRESH_S
+# A detached or abandoned run must not keep a box billed indefinitely.
+ORPHAN_RUN_MAX_S = 6 * 3600
 # With RUN_TTL_S an attached box survives a ~25 min boat API outage (refresh well inside the 30 min deadline).
 TTL_REFRESH_S = 5 * 60
 TTL_RETRY_S = 30                # retry soon after a failed refresh

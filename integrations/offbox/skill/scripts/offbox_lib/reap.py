@@ -5,7 +5,7 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S, RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, now, say)
 from .identity import thread_get
 
@@ -191,6 +191,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             running_runs = lease.active_runs(con, bid)
             # Failed history reconciliation must not be overwritten by release_if_confirmed's generic lost update.
             if running_runs:
+                _keep_live_runs(con, bid, b, dry)
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
@@ -288,6 +289,38 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if b.get("state") in api.LIVE_STATES and now() - created > IDLE_STOP_S:
             act(bid, "stop", "unregistered offbox box", lambda bid=bid: api.stop(bid))
     return actions
+
+
+def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
+    from .runs import remote_alive
+    if dry or box.get('state') not in api.LIVE_STATES:
+        return
+    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status='running'", (bid,)).fetchall():
+        if now() - (run['start_at'] or 0) >= ORPHAN_RUN_MAX_S:
+            inserted = con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
+                                   (f"run_orphan_cap:{run['run_id']}", '1')).rowcount
+            con.commit()
+            if inserted:
+                event(con, bid, 'run_orphan_cap', run['run_id'])
+            continue
+        if not run['process_id']:
+            continue
+        try:
+            with api.budget(10):
+                st = api.cmd_status(bid, run['process_id'], timeout=5, retries=0)
+                alive = bool(st and st.get('running') is True)
+                # A missing/lost tracker is not evidence of death; #770's wrapper marker is independent.
+                if not alive and (st is None or st.get('status') == 'lost'):
+                    left = api.left()
+                    alive = bool(left and left > 0 and remote_alive(bid, run['run_id'], timeout=min(5, left)) == 'alive')
+                if alive:
+                    # Background startup may have extended the deadline since list_boxes() took its snapshot.
+                    current = api.get(bid)
+                    if current and current.get('state') in api.LIVE_STATES:
+                        lease.ensure_ttl(bid, RUN_TTL_S, current)
+                    return
+        except OffboxError:
+            continue
 
 
 def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:

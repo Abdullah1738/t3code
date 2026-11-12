@@ -18,6 +18,7 @@ class SpuriousLostTests(Isolated):
         self.stack.enter_context(patch.object(api, 'cmd_status', return_value={'status': 'lost', 'running': False}))
         self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         self.stack.enter_context(patch.object(misc, '_catch_up_finished'))
         self.stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
 
