@@ -12,6 +12,8 @@ import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
+import { acquireInstallHold } from "./robob-install-hold.mjs";
+
 const exec = promisify(execFile);
 export const INSTALL_PLAN = [
   "pre-stage",
@@ -702,6 +704,7 @@ async function main(args) {
       );
     },
   };
+  const releaseHold = await acquireInstallHold();
   try {
     await install(ops, { rollback });
   } catch (e) {
@@ -753,15 +756,19 @@ async function main(args) {
     }
     throw e;
   } finally {
-    // Our own unswapped staging copy is useless after a failure; drop it so the
-    // next run does not trip on it, but only while the live app is in place.
-    if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
-      await fs.rm(next, { recursive: true, force: true });
-      if (quitAt !== undefined) await phase("staging_removed", { path: next });
-    }
-    if (mount) {
-      await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
-      await fs.rmdir(mount).catch(() => {});
+    try {
+      // Our own unswapped staging copy is useless after a failure; drop it so the
+      // next run does not trip on it, but only while the live app is in place.
+      if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
+        await fs.rm(next, { recursive: true, force: true });
+        if (quitAt !== undefined) await phase("staging_removed", { path: next });
+      }
+      if (mount) {
+        await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
+        await fs.rmdir(mount).catch(() => {});
+      }
+    } finally {
+      await releaseHold();
     }
   }
 }
