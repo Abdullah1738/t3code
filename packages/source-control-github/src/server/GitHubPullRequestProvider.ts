@@ -10,6 +10,7 @@ import type {
 } from "@t3tools/contracts";
 
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+import { KnownWorkflowRuns } from "./gitHubConditionalChecks.ts";
 import * as GitHubPullRequestApi from "./GitHubPullRequestApi.ts";
 import {
   PullRequestProviderError,
@@ -183,8 +184,8 @@ export const make = Effect.gen(function* () {
     });
 
   const readChecks = (input: ProviderRepositoryRef & { readonly number: number }) =>
-    cli.getPullRequestDetail(input).pipe(
-      Effect.flatMap((pullRequest) =>
+    cli.getPullRequestDetail({ ...input, includeActiveWorkflows: true }).pipe(
+      Effect.flatMap(({ headWorkflowRuns, ...pullRequest }) =>
         (pullRequest.state !== "open" || pullRequest.isCrossRepository !== true
           ? Effect.succeed({
               runs: [] as ReadonlyArray<GitHubWorkflowRunApproval>,
@@ -217,6 +218,12 @@ export const make = Effect.gen(function* () {
                   }),
                 )
         ).pipe(
+          Effect.provideService(
+            KnownWorkflowRuns,
+            headWorkflowRuns === undefined || pullRequest.headSha == null
+              ? null
+              : { headSha: pullRequest.headSha, runs: headWorkflowRuns },
+          ),
           Effect.map((workflowApprovals) => ({
             ...pullRequest,
             author: withAvatar(pullRequest.author, new Map(), input.host),
