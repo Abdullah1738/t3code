@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_version, pool, ssh_sync
+from . import api, capacity, identity, lease, node_version, package_manager, pool, ssh_sync
 from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
@@ -605,18 +605,13 @@ def setup_failed(log_path: Path | None) -> bool:
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 
 
-def missing_deps_hint(root_files: set[str], package_manager: str | None) -> str:
-    manager = package_manager.split("@", 1)[0] if package_manager else ""
-    if manager not in {"pnpm", "bun", "yarn", "npm"}:
-        manager = next((pm for files, pm in (({"pnpm-lock.yaml"}, "pnpm"),
-                                            ({"bun.lock", "bun.lockb"}, "bun"),
-                                            ({"yarn.lock"}, "yarn"),
-                                            ({"package-lock.json"}, "npm")) if files & root_files), "npm")
-    install = {"pnpm": "pnpm install --frozen-lockfile", "bun": "bun install",
-               "yarn": "yarn install --frozen-lockfile",
-               "npm": "npm ci" if "package-lock.json" in root_files else "npm install"}[manager]
+def missing_deps_hint(root: Path) -> str:
+    install = package_manager.hint_command(root)
+    node = node_version.want(root, root)
+    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(root)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
-            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them.")
+            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them."
+            + requirement + " Check the repo's CI install flags and manager version before running.")
 
 
 def box_deps_hint(root: Path, log_path: Path | None) -> str:
@@ -627,13 +622,7 @@ def box_deps_hint(root: Path, log_path: Path | None) -> str:
         marked = False
     if not marked:
         return ""
-    try:
-        root_files = {p.name for p in root.iterdir()}
-    except OSError:
-        root_files = set()
-    manifest = read_json(root / "package.json", {})
-    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
-    return missing_deps_hint(root_files, manager if isinstance(manager, str) else None)
+    return missing_deps_hint(root)
 
 
 def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
@@ -1646,18 +1635,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
 def new_checkout_hint(row: dict, root: Path) -> None:
     if not row.get("_new_checkout") or not (root / "package.json").exists():
         return
-    try:
-        manifest = json.loads((root / "package.json").read_text())
-    except (OSError, ValueError):
-        manifest = {}
-    uses_vp = isinstance(manifest, dict) and any(
-        isinstance(manifest.get(key), dict) and "vite-plus" in manifest[key]
-        for key in ("dependencies", "devDependencies"))
-    install = ("vp i" if uses_vp
-               else "pnpm install --frozen-lockfile" if (root / "pnpm-lock.yaml").exists()
-               else "yarn install" if (root / "yarn.lock").exists()
-               else "npm ci" if (root / "package-lock.json").exists() else "npm install")
-    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
+    install = package_manager.hint_command(root)
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(root))
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:

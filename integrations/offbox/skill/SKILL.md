@@ -16,8 +16,8 @@ Prefix heavy commands with `offbox run --`, from the same directory you'd run th
 
 ```bash
 offbox run -- go test ./...
-offbox run -- npm ci
-offbox run -- npx jest
+# Choose these commands with 'Install with the repo’s package manager' below.
+offbox run -- '<repo-install> && <repo-test>'
 offbox run -- 'docker compose up -d && ./scripts/health.sh'      # one string = run by bash
 offbox run --size xlarge -- make test-integration
 ```
@@ -81,6 +81,47 @@ a child when it names the child itself.
 
 The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
 
+## Install with the repo's package manager
+
+Before installing or writing a review packet, inspect the **pinned checkout's repo root**.
+Record the Node version, manager/version, install command and the files that chose them:
+
+1. Read `package.json` `packageManager` first. `pnpm@x` → `corepack pnpm@x install --frozen-lockfile`;
+   `yarn@x` → `corepack yarn@x install --immutable` (v2+) or `--frozen-lockfile` (v1);
+   `npm@x` → `npm ci` using that npm version. `bun@x` → `bun install --frozen-lockfile` using that Bun version.
+2. Without that field, use the lockfile: `pnpm-lock.yaml` → `corepack pnpm install --frozen-lockfile`;
+   `yarn.lock` → Corepack Yarn (v2+ `--immutable`, v1 `--frozen-lockfile`);
+   `bun.lock` / `bun.lockb` → `bun install --frozen-lockfile`;
+   `package-lock.json` / `npm-shrinkwrap.json` → `npm ci`; none → `npm install`.
+   Resolve contradictory metadata against CI; never generate a different manager's lock to get past an error.
+3. Inspect `.github/workflows` and any setup action it calls. Copy the matching install step's flags,
+   including frozen/immutable, script and workspace options. Use the repo's own bootstrap when required
+   (e.g. `vp i` for this fork). An npm pin without its npm lockfile is a repo prerequisite to resolve, not a
+   reason to run a different manager. Hints cover common literal pins; inspect expressions/matrices yourself.
+4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
+   then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
+   Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
+   on PATH); offbox selects from its installed Nodes using file/engine pins. CI fallback on boxes is #694.
+   If offbox warns no Node matches, fix the run's Node before testing. Log `node --version`.
+   pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
+   (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
+   `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
+5. Run scripts/tools with that same manager and version (`corepack pnpm@10 run lint`,
+   `corepack pnpm@10 exec vitest ...`, `corepack yarn@4 run lint`, `npm run lint`, `bun run lint`).
+   Do not substitute `npm run` / `npx` for pnpm/Yarn/Bun, or download an unpinned test tool.
+
+Borrowed `node_modules` (a symlink to another checkout) is not an install target. pnpm 11 can correctly refuse
+`exec`/scripts with `ERR_PNPM_VERIFY_DEPS_BEFORE_RUN` when the source lock differs. For a narrow local check,
+use the repo's supported Node and `node_modules/.bin/<tool>` (or the pinned pnpm's
+`--config.verify-deps-before-run=false exec`) **only after checking the tool and test-relevant dependency
+versions against the pinned lock**, and name those checks in the evidence. This is a scoped workaround,
+not proof of a clean install. Otherwise install from the pinned lock in the isolated offbox checkout.
+Never install into shared symlinked dependencies. An ovnfs cache view has private writes; it is not that symlink case.
+
+Put the selected install and check in the same `offbox run -- '<repo-install> && <repo-check>'` call.
+Stop on an install failure before reporting later tools as failed code checks. Commands in examples below
+are placeholders unless they name a particular repo; apply this check first.
+
 ## Your box (lease)
 
 A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `--bg` and `offbox wait` instead of a short shell timeout.
@@ -104,8 +145,9 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
-- Put install and command together: `offbox run -- 'npm ci && npx jest ...'` or
-  `offbox run --step 'npm ci' --step 'npx jest ...'`; repeating an install on a box with deps is quick.
+- Put the repo-selected install and command together (see **Install with the repo's package manager**):
+  `offbox run -- '<repo-install> && <repo-check>'`. Use `&&` so an install failure stops dependent checks;
+  `--step` deliberately keeps going after a failed step.
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
@@ -204,8 +246,8 @@ Stopped boxes are free, but boat deletes a stopped box's data 14 days after its 
 are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
 resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
 
-- After an expensive setup (`npm ci`, `go mod download`, harness images pulled, a seeded database), run
-  `offbox save --default --note "npm ci done at <sha>"`. New threads on this repo then start from that state and
+- After an expensive setup (the repo-selected install above, `go mod download`, harness images pulled, a seeded database), run
+  `offbox save --default --note "repo deps installed at <sha>"`. New threads on this repo then start from that state and
   only rsync the delta. `save` briefly stops your lease to capture it (the next run resumes it), costs one machine
   start (~15-25 s), then $0. Names: `offbox save --name pg-seeded`; use one
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
@@ -301,7 +343,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
   ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
   Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
-  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
+  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
   lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - A box wedged after resume (kept image restore stuck and Docker not answering) is stopped and set aside, and the run moves once to another box; offbox release <box> --delete drops it for good.
