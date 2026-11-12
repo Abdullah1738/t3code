@@ -532,11 +532,11 @@ class PaymentTests(unittest.TestCase):
         flow, _ = self.placed(order_status={'status': 'pending'})
         flow.place()
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            db.execute('PRAGMA user_version=4')
+            db.execute('PRAGMA user_version=999')
         with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
             j.open_payments()
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            db.execute('PRAGMA user_version=3')
+            db.execute('PRAGMA user_version=4')
             db.execute('CREATE TABLE payments_v4 (id TEXT)')
         with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
             j.open_payments()

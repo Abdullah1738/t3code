@@ -186,6 +186,8 @@ class FoodFlow:
         return review
 
     def prepare(self):
+        from commerce_pending import register
+        register(self.flow_id, 'food', self.account, self.rows, card_last4=self.card_last4)
         info, items = native.food_menu_raw(self.outlet, self.headers, 15)
         require(info['status']=='open' and info['serviceable'] is True, 'FOOD_OUTLET_UNAVAILABLE')
         validate_choices(self.rows, items)
@@ -239,7 +241,10 @@ def prepare(args):
     raw=json.loads(Path(args.items_file).read_text())
     rows=raw.get('items') if isinstance(raw,dict) else raw
     flow=FoodFlow(args.outlet_code, rows, args.resume_flow)
+    from commerce_pending import cli_review
+    pending=cli_review(flow,args)
     result=flow.prepare()
+    if pending:result['warnings']=pending
     if args.prepare_only:return result
     from noon_food_financial import Coordinator, AutomaticTransport
     from noon_food_recovery import NativeReader, TrackerRegistrar

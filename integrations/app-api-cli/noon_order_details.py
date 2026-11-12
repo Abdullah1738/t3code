@@ -44,6 +44,7 @@ def food(row, order):
             'vendor_name':core.text((row.get('outletInfo') or {}).get('name')),
             'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
+            'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'notes':row.get('notes') if isinstance(row.get('notes'),str) else None,
             'price_breakdown':{k:number(row.get(k)) for k in ('orderSubtotal','orderSubtotalDiscounted','orderDiscount',
                                 'orderDeliveryFee','orderServiceFee','orderSmallOrderFee')},
@@ -104,6 +105,7 @@ def details(order, service, timeout=12):
         image=item.get('imageUrl') or next((m.get('path') for m in media if m.get('type')=='image' and m.get('isAbsolutePath')),None)
         if not image and item.get('images'):image='https://f.nooncdn.com/'+item['images'][0]
         lines.append({'item_code':item.get('itemCode') or item.get('productCode') or item.get('sku'),
+                      'sku_config':item.get('skuConfig'),
                       'name':core.text(item.get('name') or item.get('title')),'qty':int(qty) if qty==int(qty) else qty,
                       'price':price,'line_total':number(item.get('totalPrice')),'notes':notes,
                       'detail':detail,'options':None,'image_url':image,
@@ -111,5 +113,6 @@ def details(order, service, timeout=12):
     return {'ok':True,'app':'noon','order':order,'vertical':service,'vendor_name':store,
             'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
+            'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'items_complete':not extra or extra['declared_item_units']==extra['observed_item_units'],
             'source':'exact_native_order_detail','account_verified':True,**extra}

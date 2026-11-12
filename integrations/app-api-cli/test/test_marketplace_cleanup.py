@@ -114,8 +114,8 @@ class CleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(j.JournalError, 'CLEAR_READBACK_MISMATCH'):
                 cleanup.clear_cart(flow.flow_id, 'supermall', auth=flow.auth, request=harness.request)
         self.assertEqual([name for name, _, _ in harness.calls].count('remove'), 1)
-        with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', flow.account_hash)
+        self.assertTrue(j.require_account_available('noon', flow.account_hash))
+        self.assertTrue(any(row['state']=='FENCED' for row in j.open_payments()))
 
     def test_cookie_rotation_reconciles_before_next_read(self):
         flow, data, fixture = self.source()
@@ -157,15 +157,15 @@ class CleanupTests(unittest.TestCase):
         flow, data, fixture = self.source()
         with self.assertRaisesRegex(market.MarketplaceError, 'TRANSPORT_OUTCOME_UNKNOWN'):
             self.invoke(flow, data, fixture, remove=TimeoutError())
-        with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', flow.account_hash)
+        self.assertTrue(j.require_account_available('noon', flow.account_hash))
+        self.assertTrue(any(row['state']=='FENCED' for row in j.open_payments()))
 
     def test_successful_transport_but_still_populated_stays_fenced(self):
         flow, data, fixture = self.source()
         with self.assertRaisesRegex(j.JournalError, 'CLEAR_READBACK_MISMATCH'):
             self.invoke(flow, data, fixture, reads=[data, data, data], remove=data)
-        with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', flow.account_hash)
+        self.assertTrue(j.require_account_available('noon', flow.account_hash))
+        self.assertTrue(any(row['state']=='FENCED' for row in j.open_payments()))
 
     def test_active_order_and_local_flow_block(self):
         flow, data, fixture = self.source()
@@ -173,8 +173,7 @@ class CleanupTests(unittest.TestCase):
             self.invoke(flow, data, fixture, active=[{'order': 'NACTIVE'}])
         j.open_flow(flow_id=str(uuid.uuid4()), app='noon', vertical='minutes',
                     account_hash=flow.account_hash, scope_hash='a'*64)
-        with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-            self.invoke(flow, data, fixture)
+        self.assertTrue(self.invoke(flow, data, fixture)[0]['cart_empty'])
 
     def test_other_lane_writer_supersedes_even_if_released(self):
         flow, data, fixture = self.source()
