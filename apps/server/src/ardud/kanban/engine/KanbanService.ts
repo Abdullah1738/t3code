@@ -9090,7 +9090,18 @@ const make = Effect.gen(function* () {
         }
         if (role === "cardThread") {
           if (actor._tag !== "thread" || card.activeThreadId !== actor.threadId) {
-            return yield* failWith("denied", `card #${card.number} is not assigned to this thread`);
+            if (!isUnattachedOwnThread(card, actor) || card.stage !== "todo") {
+              return yield* failWith(
+                "denied",
+                `card #${card.number} is not assigned to this thread`,
+              );
+            }
+            if (to !== "needs_review") {
+              return yield* failWith(
+                "denied",
+                `card #${card.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
+              );
+            }
           }
           if (to === "needs_owner" && !options?.question?.trim()) {
             return yield* failWith("invalid", "needs_owner needs the question for the owner");
@@ -9123,7 +9134,11 @@ const make = Effect.gen(function* () {
             `card #${card.number}'s step is yours (${Subtasks.subtaskIds(kanbanStepSubtasks(card))}): do it, or add work subtasks with card_edit, before sending it back to todo`,
           );
         }
-        const moved = yield* moveUnlocked(card, to, role, actor, options ?? {});
+        const source =
+          role === "cardThread" && card.stage === "todo" && isUnattachedOwnThread(card, actor)
+            ? { ...card, reviewStep: 0 }
+            : card;
+        const moved = yield* moveUnlocked(source, to, role, actor, options ?? {});
         yield* laterEvaluatorTurn(card, moved, actor);
         if (to === "needs_review") {
           // The PR read is thread state: a deferred write returns the card without it.
@@ -9236,7 +9251,13 @@ const make = Effect.gen(function* () {
     return { ...fields, blocks: Asks.askOnly(claim.blocks) } satisfies Asks.AskFields;
   });
 
-  /** A card thread acts only on the card it is running. */
+  const isUnattachedOwnThread = (card: KanbanCard, actor: KanbanActor) =>
+    actor._tag === "thread" &&
+    card.activeThreadId === null &&
+    card.workThreadId === actor.threadId &&
+    card.settledAt === null &&
+    (card.stage === "todo" || card.stage === "needs_owner");
+
   const checkCardThread = (card: KanbanCard, actor: KanbanActor, role: Rules.MoveRole) =>
     role === "cardThread" && (actor._tag !== "thread" || card.activeThreadId !== actor.threadId)
       ? failWith("denied", `card #${card.number} is not assigned to this thread`)
@@ -9251,7 +9272,18 @@ const make = Effect.gen(function* () {
           ...messageTextFields(input.blocks ?? []),
         ]);
         const card = yield* cardOf(cardId);
-        yield* checkCardThread(card, actor, role);
+        if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
+        if (
+          role === "cardThread" &&
+          isUnattachedOwnThread(card, actor) &&
+          input.blocking &&
+          card.stage === "todo"
+        ) {
+          return yield* failWith(
+            "denied",
+            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
+          );
+        }
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
         const written = Asks.askFields(input, { blocking: input.blocking });
@@ -9303,7 +9335,7 @@ const make = Effect.gen(function* () {
     savedCardGuard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        yield* checkCardThread(card, actor, role);
+        if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = Asks.findOpenAsk(card, askId);
         if (!ask) return yield* failWith("not-found", `open ask ${askId} on card #${card.number}`);
         const at = yield* nowIso;
@@ -9323,6 +9355,12 @@ const make = Effect.gen(function* () {
           return result.card;
         }
         if (ask.blocking) return yield* failWith("invalid", `${ask.id} already blocks the card`);
+        if (role === "cardThread" && isUnattachedOwnThread(card, actor) && card.stage === "todo") {
+          return yield* failWith(
+            "denied",
+            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
+          );
+        }
         const blocking = Asks.updateAsk(card, ask.id, { blocking: true });
         if (card.stage === "needs_owner") {
           const question = Asks.openBlockingAsk(blocking)?.text ?? ask.text;
