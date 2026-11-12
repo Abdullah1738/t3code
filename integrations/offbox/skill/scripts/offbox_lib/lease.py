@@ -1295,6 +1295,47 @@ def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
         return False
 
 
+def release_hold_if_worker_gone(con, box_id: str) -> bool:
+    """Recheck one prune generation under the box lock; live command runs retain their own reservations."""
+    from . import prune
+    ensure_holds(con)
+    try:
+        with file_lock('box-' + box_id, timeout=0):
+            hold = con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+            if hold is None:
+                return False
+            run_id = hold['run_id']
+            gone = None
+            if not con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                try:
+                    state = api.get(box_id)
+                    if state is None or state.get('state') in api.STOPPED_STATES:
+                        gone = True if _release_locked(con, box_id, run_id) else None
+                    elif state.get('state') in api.LIVE_STATES:
+                        gone = prune.worker_gone(box_id, run_id, max(0, now() - hold['created_at']))
+                except OffboxError:
+                    pass
+            released = False
+            if gone is True:
+                cur = con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+                con.commit()
+                # _release_locked may already have removed this generation on a stopped/gone box.
+                remaining = con.execute("SELECT 1 FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+                released = cur.rowcount > 0 or remaining is None
+            detail = ("worker gone" if released else "worker still running" if gone is False else "unknown, kept")
+            message = f"prune hold {'released' if released else 'kept'} {box_id} run {run_id}: {detail}"
+            log(message)
+            event(con, box_id, 'prune_hold_released' if released else 'prune_hold_kept', message)
+            return released
+    except OffboxError:
+        hold = con.execute("SELECT run_id FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+        if hold:
+            message = f"prune hold kept {box_id} run {hold['run_id']}: unknown, kept (box lock busy)"
+            log(message)
+            event(con, box_id, 'prune_hold_kept', message)
+        return False
+
+
 def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False) -> bool:
     """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
     released with _release_locked, since the lock is not reentrant."""
