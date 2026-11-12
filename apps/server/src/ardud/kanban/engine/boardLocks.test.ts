@@ -8,6 +8,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as BoardLocks from "./boardLocks.ts";
+import * as SavedReply from "../tools/savedReply.ts";
+import { McpSchema } from "effect/ai";
 
 it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
   Effect.gen(function* () {
@@ -758,5 +760,55 @@ it.effect("#882 detached follow-ons own cleanup after their original operation r
     assert.isTrue(Exit.isFailure(yield* Fiber.join(background)));
     assert.deepStrictEqual(cleaned, ["orphan"]);
     yield* locks.board("a", Effect.void);
+  }),
+);
+
+it.effect("saved-reply admission expires before the reply budget and never writes later", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    let written = false;
+    const waiter = yield* Effect.forkChild(
+      SavedReply.protect(
+        locks
+          .board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                written = true;
+              }),
+              true,
+            ),
+          )
+          .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+        "card_update",
+      ).pipe(Effect.exit),
+    );
+    yield* TestClock.adjust(SavedReply.ADMISSION_BUDGET_MS - 1);
+    assert.isUndefined(waiter.pollUnsafe());
+    yield* TestClock.adjust(1);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      assert.include(
+        String(Cause.squash(result.cause)),
+        "Board busy: not written. Safe to retry once.",
+      );
+    }
+    assert.isFalse(written);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
+    yield* locks.exclusive(Effect.void);
+    assert.isFalse(written);
   }),
 );
