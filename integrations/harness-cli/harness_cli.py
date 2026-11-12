@@ -368,6 +368,11 @@ def discover(state: dict | None = None) -> dict:
         latest = latest_version(tool)
         slot = state[tool]
         slot["candidate"] = latest if latest != slot.get("current") else None
+        # When the pin first fell behind; kept while any newer version waits, for the stale alert.
+        if slot["candidate"] is None:
+            slot["candidateSince"] = None
+        elif not slot.get("candidateSince"):
+            slot["candidateSince"] = checked
         slot["checkedAt"] = checked
         report[tool] = {"latest": latest, "current": slot.get("current"),
                         "lastKnownGood": slot.get("lastKnownGood")}
@@ -1989,6 +1994,7 @@ def apply_transition(state: dict, transition: dict) -> None:
     slot["rotationPending"] = transition["tool"] == "codex"
     if transition["op"] == "promote":
         slot["candidate"] = None
+        slot["candidateSince"] = None
         slot["promotedAt"] = transition["promotedAt"]
     notice = transition["notice"]
     if notice is not None:
@@ -2534,10 +2540,33 @@ def auto(*, dry: bool = False) -> dict:
         except HarnessError as exc:
             outcome[tool] = f"stopped: {exc}"
             notify_once(f"{key}:stopped", "error", f"Harness CLI job stopped for {tool} {candidate}: {exc}")
+    for tool in TOOLS:
+        notify_if_stale(tool, outcome.get(tool, ""))
     if load_state()["codex"].get("rotationPending"):
         report["codexRotation"] = rotate_codex(when_idle=True)
     report["outcome"] = outcome
     return report
+
+
+STALE_AFTER = dt.timedelta(hours=24)
+
+
+def notify_if_stale(tool: str, outcome: str) -> None:
+    """One attention notice per version once a newer CLI has waited unpromoted for 24 h.
+
+    Providers can start rejecting the pinned CLI ("requires a newer version") soon after a
+    release, so a candidate that keeps failing its canary must reach Abdullah, not only the log.
+    """
+    slot = load_state()[tool]
+    candidate, since = slot.get("candidate"), slot.get("candidateSince")
+    if not candidate or candidate == slot.get("current") or not since:
+        return
+    first_seen = dt.datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    if dt.datetime.now(dt.timezone.utc) - first_seen < STALE_AFTER:
+        return
+    notify_once(f"harness-cli:{tool}:{candidate}:stale", "attention",
+                f"Harness CLI: {tool} {candidate} is out but not promoted; the pin has been behind "
+                f"since {since} (current {slot.get('current')}). Last run: {outcome or 'no result'}.")
 
 
 def notify_once(key: str, severity: str, text: str) -> None:

@@ -1909,6 +1909,173 @@ class AutoTests(FakeCliTestCase):
         self.assertTrue(hc.load_state()["codex"]["rotationPending"])
 
 
+    def failing_canary(self, tool, version, **_):
+        return {"passed": False, "reasons": ["model rejected"]}
+
+    def backdate_candidates(self, hours: int) -> None:
+        state = hc.load_state()
+        since = (hc.dt.datetime.now(hc.dt.timezone.utc) - hc.dt.timedelta(hours=hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for tool in hc.TOOLS:
+            state[tool]["candidateSince"] = since
+        hc.save_state(state)
+
+    def notice_keys(self) -> list[str]:
+        if not self.notify_log.exists():
+            return []
+        return [line.split("--key ")[-1] for line in self.notify_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_candidate_unpromoted_for_a_day_alerts_once(self) -> None:
+        self.publish_both("2.1.316", "0.166.0")
+        hc.discover()
+        self.backdate_candidates(25)
+        with mock.patch.object(hc, "canary", side_effect=self.failing_canary), \
+             mock.patch.object(hc, "harness_home_hashes", return_value={}):
+            hc.auto()
+            hc.auto()
+        keys = self.notice_keys()
+        self.assertEqual(keys.count("harness-cli:codex:0.166.0:stale"), 1, keys)
+        self.assertEqual(keys.count("harness-cli:claude:2.1.316:stale"), 1, keys)
+        line = next(l for l in self.notify_log.read_text(encoding="utf-8").splitlines()
+                    if "codex:0.166.0:stale" in l)
+        self.assertIn("--severity attention", line)
+        self.assertIn("model rejected", line)
+
+    def test_fresh_candidate_does_not_alert_stale(self) -> None:
+        self.publish_both("2.1.316", "0.166.0")
+        with mock.patch.object(hc, "canary", side_effect=self.failing_canary), \
+             mock.patch.object(hc, "harness_home_hashes", return_value={}):
+            hc.auto()
+        self.assertFalse([k for k in self.notice_keys() if k.endswith(":stale")])
+        self.assertIsNotNone(hc.load_state()["codex"]["candidateSince"])
+
+    def test_newer_release_keeps_first_seen_time(self) -> None:
+        self.publish_both("2.1.316", "0.166.0")
+        hc.discover()
+        self.backdate_candidates(30)
+        since = hc.load_state()["codex"]["candidateSince"]
+        self.publish_both("2.1.316", "0.167.0")
+        hc.discover()
+        state = hc.load_state()
+        self.assertEqual(state["codex"]["candidate"], "0.167.0")
+        self.assertEqual(state["codex"]["candidateSince"], since)
+
+    def test_promotion_resets_the_stale_clock(self) -> None:
+        self.publish_both("2.1.316", "0.166.0")
+        hc.discover()
+        self.backdate_candidates(30)
+        with mock.patch.object(hc, "canary", side_effect=passing_canary), \
+             mock.patch.object(hc, "harness_home_hashes", return_value={}):
+            hc.auto()
+        state = hc.load_state()
+        self.assertIsNone(state["codex"]["candidateSince"])
+        self.assertFalse([k for k in self.notice_keys() if k.endswith(":stale")])
+        self.publish_both("2.1.317", "0.167.0")
+        hc.discover()
+        since = hc.load_state()["codex"]["candidateSince"]
+        age = hc.dt.datetime.now(hc.dt.timezone.utc) - hc.dt.datetime.strptime(
+            since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=hc.dt.timezone.utc)
+        self.assertLess(age, hc.dt.timedelta(minutes=5))
+
+
+
+@unittest.skipUnless(sys.platform == "darwin" and Path("/opt/homebrew/bin/python3").exists()
+                     and shutil.which("rsync"), "install.zsh targets this Mac")
+class InstallScriptTests(unittest.TestCase):
+    """install.zsh in a throwaway HOME with a fake launchctl: the daily agent is part of every deploy."""
+
+    LABEL = "com.ardud.harness-cli"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="harness-cli-install-"))
+        self.pkg = self.tmp / "pkg"
+        self.pkg.mkdir()
+        for name in ("harness_cli.py", "model-manifest.json", "install.zsh"):
+            shutil.copy2(PKG / name, self.pkg / name)
+        for name in ("launchd", "vendor"):
+            if (PKG / name).is_dir():
+                shutil.copytree(PKG / name, self.pkg / name, ignore=shutil.ignore_patterns("__pycache__"))
+        (self.pkg / "tests").mkdir()
+        # The installer refuses a package whose own tests fail; this stands in for the real suite.
+        (self.pkg / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n", encoding="utf-8")
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.log = self.tmp / "launchctl.log"
+        self.mark = self.tmp / "loaded"
+        fake = self.tmp / "launchctl"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'echo "$*" >> "{self.log}"\n'
+            'case "$1" in\n'
+            f'  print) [ -f "{self.mark}" ] ;;\n'
+            f'  bootstrap) touch "{self.mark}" ;;\n'
+            f'  bootout) rm -f "{self.mark}" ;;\n'
+            "esac\n", encoding="utf-8")
+        fake.chmod(0o755)
+        self.plist = self.home / "Library" / "LaunchAgents" / f"{self.LABEL}.plist"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_install(self, *args: str) -> subprocess.CompletedProcess:
+        env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "HARNESS_CLI_LAUNCHCTL": str(self.tmp / "launchctl")}
+        return subprocess.run(["/bin/zsh", "-f", str(self.pkg / "install.zsh"), *args], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def test_default_install_loads_the_daily_agent(self) -> None:
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.plist.read_bytes(), (PKG / "launchd" / f"{self.LABEL}.plist").read_bytes())
+        self.assertTrue(any(c.startswith("bootstrap gui/") and c.endswith(str(self.plist)) for c in self.calls()),
+                        self.calls())
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_reinstall_leaves_a_current_loaded_agent_alone(self) -> None:
+        self.assertEqual(self.run_install().returncode, 0)
+        self.log.unlink()
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([c for c in self.calls() if c.split()[0] in ("bootout", "bootstrap")], self.calls())
+
+    def test_changed_plist_is_reloaded(self) -> None:
+        self.assertEqual(self.run_install().returncode, 0)
+        self.plist.write_text("stale", encoding="utf-8")
+        self.assertEqual(self.run_install("--check").returncode, 1)
+        self.log.unlink()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual([c.split()[0] for c in self.calls() if c.split()[0] != "print"],
+                         ["bootout", "bootstrap"])
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_check_reports_missing_agent(self) -> None:
+        self.assertEqual(self.run_install("--no-agent").returncode, 0)
+        self.assertFalse(self.plist.exists())
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 1)
+        self.assertIn("agent missing", check.stderr)
+        self.assertIn("not loaded", check.stderr)
+
+    def test_check_reports_unloaded_agent(self) -> None:
+        self.assertEqual(self.run_install().returncode, 0)
+        self.mark.unlink()
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 1)
+        self.assertIn("not loaded", check.stderr)
+        self.assertNotIn("agent missing", check.stderr)
+
+    def test_with_agent_flag_still_accepted(self) -> None:
+        result = self.run_install("--with-agent")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.mark.exists())
+
+
 class DiscoverTests(FakeCliTestCase):
     def test_discover_records_candidates_without_touching_current(self) -> None:
         self.set_npm(latest={"@anthropic-ai/claude-code-darwin-arm64": "2.1.316",
