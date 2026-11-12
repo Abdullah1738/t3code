@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, lease, node_version, pool, ssh_sync
+from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
@@ -1227,7 +1227,9 @@ class Runner:
         push_exc = None
         try:
             if not a.no_sync:
-                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
+                                   seed_candidates=candidates)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1265,6 +1267,31 @@ class Runner:
                 say(f"killed remote process {self.pid} on {self.box}")
             except OffboxError as e:
                 say(f"could not kill remote process: {e}")
+
+
+def _seed_candidates(con, box_id: str, current: str, repo_key: str) -> list[str]:
+    """Recent checkouts on this box whose local roots still identify as this repository."""
+    rows = con.execute("""SELECT r.remote_dir, r.repo_root, MAX(COALESCE(r.start_at, 0)) AS last,
+                                 EXISTS (SELECT 1 FROM pool_callers c JOIN pool_members p USING(box_id)
+                                         WHERE c.box_id=r.box_id AND c.repo_root=r.repo_root
+                                           AND c.remote_dir=r.remote_dir AND p.pool_key=?) AS mapped
+                          FROM runs r WHERE r.box_id=? AND r.remote_dir IS NOT NULL AND r.remote_dir<>?
+                          GROUP BY r.remote_dir, r.repo_root ORDER BY last DESC""",
+                       (repo_key, box_id, current)).fetchall()
+    out, checked = [], {}
+    for row in rows:
+        remote, root = row["remote_dir"], row["repo_root"]
+        if not root or not prune.DIR_RE.fullmatch(remote) or remote in out:
+            continue
+        if row["mapped"]:
+            out.append(remote)
+            continue
+        if root not in checked:
+            path = Path(root)
+            checked[root] = path.is_dir() and identity.repo_key(path) == repo_key
+        if checked[root]:
+            out.append(remote)
+    return out
 
 
 def _safe(err: list, fn, *args):

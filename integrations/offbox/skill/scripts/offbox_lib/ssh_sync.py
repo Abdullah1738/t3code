@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 import re
 import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -18,6 +20,8 @@ from . import api, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
+SYNC_PROGRESS_S = 60
+CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 
 # Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
@@ -544,13 +548,13 @@ def _stats(out: str) -> dict:
 
 
 def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeout: float = 3600,
-         includes: list[str] | None = None) -> dict:
+         includes: list[str] | None = None, seed_candidates: list[str] | None = None) -> dict:
     """Mirror root/ to ~/<remote_dir>/ on the box. Deletes remote files removed locally (inside remote_dir only)."""
     if str(root) in ("/", str(Path.home())):
         raise OffboxError(f"refusing to sync {root} (not a repo). cd into a repo first.", code=2)
     t = time.time()
     with git_snapshot.snapshot(root) if with_git else nullcontext(None) as gitdir:
-        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes)
+        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates)
         if gitdir is not None:
             extra = _push_git(box_id, gitdir, remote_dir, timeout)
             for key, value in extra.items():
@@ -583,11 +587,67 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
             log(f"push_git cleanup failed {box_id} {staging}")
 
 
+def _seed(box_id: str, remote_dir: str, candidates: list[str]) -> tuple[bool, str | None]:
+    """Check the destination and ordered candidates in one SSH call; uncertainty never enables a seed."""
+    if not CHECKOUT_DIR.fullmatch(remote_dir):
+        return False, None
+    candidates = [d for d in candidates if CHECKOUT_DIR.fullmatch(d) and d != remote_dir]
+    lines = [f'if test -d "$HOME"/{shlex.quote(remote_dir)}; then echo existing; exit 0; fi', 'echo first']
+    lines += [f'if test -d "$HOME"/{shlex.quote(d)}; then echo {shlex.quote(d)}; exit 0; fi' for d in candidates]
+    try:
+        p = ssh(box_id, "\n".join(lines), timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if p.returncode != 0:
+        return False, None
+    result = p.stdout.decode(errors="replace").splitlines()
+    if not result or result[0] != "first":
+        return False, None
+    sibling = result[1] if len(result) > 1 and result[1] in candidates else None
+    return True, sibling
+
+
+@contextmanager
+def _sync_progress(root: Path, box_id: str, first: bool, sibling: str | None):
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def report():
+        while not stop.wait(SYNC_PROGRESS_S):
+            detail = ", first sync of this checkout" if first else ""
+            if sibling:
+                detail += f", seeded from {sibling}"
+            try:
+                print(f"offbox: still syncing {root.name} -> {box_id} ({int(time.monotonic() - started)} s{detail})",
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                return
+
+    thread = threading.Thread(target=report, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
 def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                includes: list[str] | None) -> dict:
+                includes: list[str] | None, seed_candidates: list[str] | None = None) -> dict:
+    first, sibling = _seed(box_id, remote_dir, seed_candidates) if seed_candidates is not None else (False, None)
+    if sibling:
+        log(f"push_seed {box_id} {remote_dir} from={sibling}")
+    with _sync_progress(root, box_id, first, sibling):
+        return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling)
+
+
+def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
+                      includes: list[str] | None, sibling: str | None) -> dict:
     ssh_cmd = " ".join(shlex.quote(x) for x in ssh_base(box_id))
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
+    if sibling:
+        cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
     out = _rsync(box_id, remote_dir, cmd, timeout)
