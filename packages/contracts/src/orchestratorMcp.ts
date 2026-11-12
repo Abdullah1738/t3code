@@ -724,6 +724,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "caller_unresolved",
+      "delegation_timeout",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",
