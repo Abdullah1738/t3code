@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import redact_guard
 import stat
 import subprocess
 import sys
@@ -253,6 +254,7 @@ class CodexSync:
             r for r in transcript_roots.existing() if r["driver"] == DRIVER]
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
         self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seed_roots = list(self.roots) + list(self.all_roots)
@@ -392,7 +394,7 @@ class CodexSync:
                     self.stats["skipped_seeded"] += 1
                 else:
                     for row in proj.feed(rec, line_no, line_sha=tc.raw_sha1(line)):
-                        batch_rows.append((proj.session_id, *row))
+                        batch_rows.append((proj.session_id, tc.raw_sha1(line), *row))
                 session_key = tc.merge_session_key(session_key, proj.session_id)
             if batch_bytes >= tc.BATCH_BYTES:
                 self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no,
@@ -421,16 +423,18 @@ class CodexSync:
             if raw:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line))
-                     for line, ln in raw],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)))]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                     [(SOURCE, event_session, tid, ts or int(time.time()), spk, text, ctype, model,
-                       json.dumps(m, ensure_ascii=False)) for event_session, tid, spk, ctype, text, model, m, ts in events],
+                     [(SOURCE, event_session, tid, ts or int(time.time()), spk, safe_content, ctype, model, safe_meta)
+                      for event_session, capture_id, tid, spk, ctype, text, model, m, ts in events
+                      for safe_content, safe_meta in [self.redactor.event(
+                          SOURCE, event_session, tid, text, json.dumps(m, ensure_ascii=False), capture_id=(SOURCE,capture_id))]],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tail,
