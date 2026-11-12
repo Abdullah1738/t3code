@@ -576,7 +576,7 @@ const CardWait = tool(
 const CardReviewResult = tool(
   "card_review_result",
   "Record the review verdict",
-  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review. After a connection error, repeating the exact same call (same verdict, findings and head) is safe: an exact repeat of your latest verdict is ignored.",
+  "Review threads only, once per review step: clear (no findings) or findings (each a short, actionable line). Findings send the card back to its work thread; clear moves to the next review step or completes the review. After a connection error, an exact repeat of your latest verdict (same verdict, findings and head) within 10 minutes, if the card has not moved since, is acknowledged with a note naming the original review event; it is not saved again. Later calls from a thread not assigned to the current review step are refused with the stage and step; the verdict is not recorded.",
   {
     verdict: Schema.Literals(["clear", "findings"]),
     findings: Schema.optional(Schema.Array(Schema.String)),

@@ -4029,7 +4029,11 @@ it.effect("ignores a repeated clear with the same normalized head", () =>
       const replay = yield* kanban.reviewResult(reviewThread, "clear", [], " ABC1234 ");
       const after = yield* kanban.card(card.id);
       assert.strictEqual(replay.recorded, false);
-      assert.include(replay.note!, "nothing new written");
+      const firstReview = before.events.findLast((event) => event.kind === "review")!;
+      assert.strictEqual(
+        replay.note,
+        `Already recorded as review event ${firstReview.id} at ${firstReview.at}; not saved again.`,
+      );
       assert.deepStrictEqual(replay.card, first.card);
       assert.deepStrictEqual(after.card, before.card);
       assert.deepStrictEqual(after.events, before.events);
@@ -4057,6 +4061,7 @@ it.effect("ignores repeated findings without bumping the review round", () =>
         "abc1234",
       );
       const before = yield* kanban.card(card.id);
+      const sends = fake.sends.length;
       const replay = yield* kanban.reviewResult(
         reviewThread,
         "findings",
@@ -4066,7 +4071,11 @@ it.effect("ignores repeated findings without bumping the review round", () =>
       const after = yield* kanban.card(card.id);
       assert.strictEqual(first.card.reviewRound, 1);
       assert.strictEqual(replay.recorded, false);
-      assert.include(replay.note!, "nothing new written");
+      const firstReview = before.events.findLast((event) => event.kind === "review")!;
+      assert.strictEqual(
+        replay.note,
+        `Already recorded as review event ${firstReview.id} at ${firstReview.at}; not saved again.`,
+      );
       assert.deepStrictEqual(replay.card, first.card);
       assert.deepStrictEqual(after.card, before.card);
       assert.deepStrictEqual(after.events, before.events);
@@ -4074,11 +4083,16 @@ it.effect("ignores repeated findings without bumping the review round", () =>
         after.events.filter((event) => event.kind === "review"),
         1,
       );
+      assert.strictEqual(fake.sends.length, sends);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
-it.effect("#566 a step-one replay cannot silently consume an unassigned step-two verdict", () =>
+it.effect.each([
+  { age: 0, replayExpected: true },
+  { age: 10 * 60_000, replayExpected: true },
+  { age: 10 * 60_000 + 1, replayExpected: false },
+])("#769 step-one replay at $age ms while step two waits", ({ age, replayExpected }) =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -4098,13 +4112,31 @@ it.effect("#566 a step-one replay cannot silently consume an unassigned step-two
       yield* kanban.dispatchNow;
       const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
       yield* kanban.reviewResult(reviewer, "clear", [], "abc1234");
-      // Reproduce the old send-then-stale state: the next brief arrived without assignment.
-      yield* (yield* KanbanThreads).send({ threadId: reviewer, text: "Review step 2 of 2" });
-      const replay = yield* kanban.reviewResult(reviewer, "clear", [], "abc1234");
-      assert.strictEqual(replay.recorded, false);
-      assert.include(replay.note!, "nothing new written");
       const before = yield* kanban.card(card.id);
+      assert.strictEqual(before.card.stage, "needs_review");
       assert.strictEqual(before.card.reviewStep, 1);
+      yield* TestClock.adjust(age);
+      const sends = fake.sends.length;
+      if (replayExpected) {
+        const replay = yield* kanban.reviewResult(reviewer, "clear", [], "abc1234");
+        const firstReview = before.events.findLast((event) => event.kind === "review")!;
+        assert.strictEqual(replay.recorded, false);
+        assert.strictEqual(
+          replay.note,
+          `Already recorded as review event ${firstReview.id} at ${firstReview.at}; not saved again.`,
+        );
+        assert.deepStrictEqual(replay.card, before.card);
+      } else {
+        const error = yield* kanban
+          .reviewResult(reviewer, "clear", [], "abc1234")
+          .pipe(Effect.flip);
+        assert.strictEqual(error.code, "conflict");
+        assert.include(error.detail, "stage needs_review");
+        assert.include(error.detail, "step 2 of 2 waits for the dispatcher");
+        assert.include(error.detail, "Your verdict was not recorded.");
+      }
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+      assert.strictEqual(fake.sends.length, sends);
       assert.lengthOf(
         before.events.filter((event) => event.kind === "review"),
         1,
@@ -4118,6 +4150,29 @@ it.effect("#566 a step-one replay cannot silently consume an unassigned step-two
         (yield* kanban.card(card.id)).events.filter((event) => event.kind === "review"),
         2,
       );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("#769 refuses a matching verdict after the card moved within ten minutes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      yield* kanban.reviewResult(reviewThread, "clear", [], "abc1234");
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      const before = yield* kanban.card(card.id);
+      const sends = fake.sends.length;
+      const error = yield* kanban
+        .reviewResult(reviewThread, "clear", [], "abc1234")
+        .pipe(Effect.flip);
+      assert.strictEqual(error.code, "conflict");
+      assert.include(error.detail, "stage completed");
+      assert.include(error.detail, "Your verdict was not recorded.");
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+      assert.strictEqual(fake.sends.length, sends);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -4163,7 +4218,9 @@ it.effect("rejects verdict replays that differ or lack a valid head", () =>
           .reviewResult(reviewThread, attempt.verdict, attempt.findings, attempt.head)
           .pipe(Effect.flip);
         assert.strictEqual(error.code, "conflict");
-        assert.strictEqual(error.detail, `card #${card.number} is not in review with this thread`);
+        assert.include(error.detail, `card #${card.number} is not in review with this thread`);
+        assert.include(error.detail, "stage todo");
+        assert.include(error.detail, "Your verdict was not recorded.");
       }
       const after = yield* kanban.card(card.id);
       assert.deepStrictEqual(after.card, before.card);
