@@ -75,6 +75,7 @@ const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DELIVERY_LOG_BODY_LIMIT = 64 * 1024;
 const WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT = 64 * 1024;
 const WEBHOOK_MAX_QUEUED_PER_TASK = 20;
+const MISSED_SLOT_REASON = "Robob unavailable at the scheduled slot.";
 /** Accepted deliveries per task per minute, enforced here as well as on the relay because the tunnel hostname is public too. */
 const WEBHOOK_RATE_LIMIT_PER_MINUTE = 60;
 
@@ -191,6 +192,16 @@ interface ScheduledTaskRow {
   readonly run_count: number;
   readonly webhook_token: string | null;
   readonly webhook_secret: string | null;
+}
+
+interface UnsentSlot {
+  readonly task: Pick<ScheduledTask, "id" | "createdAt" | "lastRunAt" | "schedule" | "runCount">;
+  readonly startedAtIso: string;
+  readonly slotAt: string;
+}
+
+function unsentSlotKey(taskId: string, createdAt: string, startedAtIso: string) {
+  return `${taskId}:${createdAt}:${startedAtIso}`;
 }
 
 interface WebhookDeliveryRow {
@@ -423,6 +434,11 @@ export const layer = Layer.effect(
       task_id TEXT NOT NULL, created_at TEXT NOT NULL, slot_at TEXT NOT NULL,
       recorded_at TEXT NOT NULL, reason TEXT NOT NULL, schedule_json TEXT NOT NULL, catch_up_at TEXT,
       PRIMARY KEY (task_id, created_at, slot_at)
+    )`;
+    yield* sql`CREATE TABLE IF NOT EXISTS ardud_scheduled_task_unsent_slots (
+      task_id TEXT NOT NULL, task_created_at TEXT NOT NULL, started_at TEXT NOT NULL,
+      slot_at TEXT NOT NULL, previous_last_run_at TEXT, previous_run_count INTEGER NOT NULL, schedule_json TEXT NOT NULL, fire_key TEXT NOT NULL,
+      PRIMARY KEY (task_id, task_created_at, started_at)
     )`;
     yield* sql`CREATE INDEX IF NOT EXISTS ardud_scheduled_task_missed_by_catch_up
       ON ardud_scheduled_task_missed_slots(catch_up_at)`;
@@ -768,15 +784,28 @@ export const layer = Layer.effect(
         const reread = yield* Effect.result(findTask(task.id));
         if (Result.isSuccess(reread) && reread.success === null) return;
         const source = Result.isSuccess(reread) && reread.success !== null ? reread.success : task;
-        yield* sql`
+        const spentOnceAt =
+          trigger === "scheduled" && task.schedule.type === "once" ? task.schedule.at : null;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
           UPDATE scheduled_tasks
           SET last_run_status = 'failed',
               last_run_error = ${message},
               next_run_at = ${trigger === "scheduled" ? source.nextRunAt : nextRunAt(source, now)},
+              enabled = CASE WHEN ${spentOnceAt} IS NOT NULL AND next_run_at IS NULL
+                AND json_extract(schedule_json, '$.type') = 'once'
+                AND json_extract(schedule_json, '$.at') = ${spentOnceAt}
+                THEN 0 ELSE enabled END,
               updated_at = ${iso(now)},
               run_count = run_count + 1
-          WHERE task_id = ${task.id} AND last_run_status = 'running'
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt} AND last_run_status = 'running'
         `;
+            if (trigger === "scheduled")
+              yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+            WHERE task_id = ${task.id} AND task_created_at = ${source.createdAt} AND started_at = ${source.lastRunAt}`;
+          }),
+        );
         yield* notifyChanged;
       },
       (effect, task, _message, _trigger) =>
@@ -789,6 +818,133 @@ export const layer = Layer.effect(
           ),
         ),
     );
+
+    const missUnsentSlot = Effect.fn("ScheduledTaskService.missUnsentSlot")(function* (
+      task: UnsentSlot["task"],
+      startedAtIso: string,
+      slotAt: string,
+      now: DateTime.DateTime,
+    ) {
+      const scheduleJson = yield* encodeScheduleJson(task.schedule).pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not encode missed schedule slot.", { taskId: task.id, cause }),
+        ),
+      );
+      const onceAt = task.schedule.type === "once" ? task.schedule.at : null;
+      const expiredOnce =
+        task.schedule.type === "once" &&
+        DateTime.toEpochMillis(now) > lateRunDeadline(task.schedule, DateTime.makeUnsafe(slotAt));
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE scheduled_tasks
+          SET last_run_status = 'missed', last_run_error = ${MISSED_SLOT_REASON},
+            last_run_at = ${task.lastRunAt}, updated_at = ${iso(now)},
+            enabled = CASE WHEN ${expiredOnce ? 1 : 0} = 1
+              AND json_extract(schedule_json, '$.type') = 'once'
+              AND json_extract(schedule_json, '$.at') = ${onceAt}
+              THEN 0 ELSE enabled END
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND last_run_status = 'running' AND last_run_at = ${startedAtIso}
+            AND run_count = ${task.runCount}`;
+            yield* sql`INSERT OR IGNORE INTO ardud_scheduled_task_missed_slots
+          (task_id, created_at, slot_at, recorded_at, reason, schedule_json)
+          SELECT ${task.id}, ${task.createdAt}, ${slotAt}, ${iso(now)}, ${MISSED_SLOT_REASON}, ${scheduleJson}
+          FROM scheduled_tasks WHERE task_id = ${task.id} AND created_at = ${task.createdAt}`;
+            yield* sql`UPDATE ardud_scheduled_task_missed_slots SET catch_up_at = NULL
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND slot_at = ${slotAt} AND catch_up_at = ${startedAtIso}`;
+            yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+              WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND started_at = ${startedAtIso}`;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not record unsent schedule slot.", { taskId: task.id, cause }),
+          ),
+        );
+      yield* notifyChanged;
+    });
+
+    const recordInterruptedDispatch = Effect.fn("ScheduledTaskService.recordInterruptedDispatch")(
+      function* (task: UnsentSlot["task"], startedAtIso: string, now: DateTime.DateTime) {
+        const onceAt = task.schedule.type === "once" ? task.schedule.at : null;
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`UPDATE scheduled_tasks
+          SET last_run_status = 'failed', last_run_error = 'Run was interrupted by a server restart.',
+            updated_at = ${iso(now)}, run_count = run_count + 1,
+            enabled = CASE WHEN ${onceAt} IS NOT NULL AND next_run_at IS NULL
+              AND json_extract(schedule_json, '$.type') = 'once' AND json_extract(schedule_json, '$.at') = ${onceAt}
+              THEN 0 ELSE enabled END
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND last_run_status = 'running' AND last_run_at = ${startedAtIso} AND run_count = ${task.runCount}`;
+              yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+          WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND started_at = ${startedAtIso}`;
+            }),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not recover interrupted schedule dispatch.", {
+                taskId: task.id,
+                cause,
+              }),
+            ),
+          );
+        yield* notifyChanged;
+      },
+    );
+
+    const recoverUnsentSlots = Effect.fn("ScheduledTaskService.recoverUnsentSlots")(function* () {
+      const rows = yield* sql<{
+        task_id: ScheduledTaskId;
+        task_created_at: string;
+        started_at: string;
+        slot_at: string;
+        previous_last_run_at: string | null;
+        previous_run_count: number;
+        schedule_json: string;
+        fire_key: string;
+      }>`SELECT * FROM ardud_scheduled_task_unsent_slots`.pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not load pending schedule dispatches.", { cause }),
+        ),
+      );
+      const blocked = new Set(
+        rows.map((row) => unsentSlotKey(row.task_id, row.task_created_at, row.started_at)),
+      );
+      for (const row of rows) {
+        if ((yield* Ref.get(activeRuns)).has(row.task_id)) continue;
+        yield* Effect.gen(function* () {
+          const schedule = yield* decodeScheduleJson(row.schedule_json);
+          const task = {
+            id: row.task_id,
+            createdAt: row.task_created_at,
+            lastRunAt: row.previous_last_run_at,
+            runCount: row.previous_run_count,
+            schedule,
+          };
+          // A missing receipt is meaningful only when the read succeeds. The
+          // tolerant hasReceipt helper would hide a read failure as absence.
+          const receipt = yield* threadManagement.getCommandReceipt(
+            CommandId.make(`scheduled-task:${row.fire_key}`),
+          );
+          const now = yield* localNow;
+          yield* Option.isSome(receipt)
+            ? recordInterruptedDispatch(task, row.started_at, now)
+            : missUnsentSlot(task, row.started_at, row.slot_at, now);
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Could not recover pending schedule dispatch", {
+              taskId: row.task_id,
+              cause,
+            }),
+          ),
+        );
+      }
+      return blocked;
+    });
 
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
@@ -809,6 +965,8 @@ export const layer = Layer.effect(
         return task;
       }
 
+      let claimed = false;
+      let dispatched = false;
       return yield* Effect.gen(function* () {
         // The in-memory snapshot may be stale: re-read before touching run
         // state. The task may have been deleted, paused, or postponed since
@@ -858,12 +1016,33 @@ export const layer = Layer.effect(
           lateSlot !== undefined &&
           (active.createdAt !== task.createdAt ||
             !isSameSchedule(active.schedule, task.schedule) ||
-            !allowsLateRun(active.schedule) ||
-            DateTime.toEpochMillis(startedAt) >
-              lateRunDeadline(active.schedule, DateTime.makeUnsafe(lateSlot)))
+            !allowsLateRun(active.schedule))
         )
           return active;
-        const claimed = yield* sql
+        const fireKey =
+          webhook === undefined
+            ? lateSlot === undefined
+              ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
+              : `${active.id}:${active.createdAt}:late:${lateSlot}`
+            : `${active.id}:webhook:${webhook.deliveryId}`;
+        const commandId = CommandId.make(`scheduled-task:${fireKey}`);
+        const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
+        // A webhook prompt was rendered from the row when the request arrived.
+        const prompt =
+          lateSlot === undefined
+            ? (webhook?.prompt ?? active.prompt)
+            : `Late run: the ${lateSlot} slot was missed (Robob unavailable). ${active.prompt}`;
+
+        const slotAt = lateSlot ?? active.nextRunAt;
+        const scheduleJson =
+          trigger === "scheduled"
+            ? yield* encodeScheduleJson(active.schedule).pipe(
+                Effect.mapError((cause) =>
+                  taskError("Could not encode schedule claim.", { taskId: task.id, cause }),
+                ),
+              )
+            : null;
+        claimed = yield* sql
           .withTransaction(
             Effect.gen(function* () {
               if (lateSlot !== undefined) {
@@ -873,6 +1052,11 @@ export const layer = Layer.effect(
                 AND slot_at = ${lateSlot} AND catch_up_at IS NULL RETURNING slot_at
             `;
                 if (claimed.length === 0) return false;
+              }
+              if (trigger === "scheduled" && slotAt !== null) {
+                yield* sql`INSERT INTO ardud_scheduled_task_unsent_slots
+                  (task_id, task_created_at, started_at, slot_at, previous_last_run_at, previous_run_count, schedule_json, fire_key)
+                  VALUES (${active.id}, ${active.createdAt}, ${startedAtIso}, ${slotAt}, ${active.lastRunAt}, ${active.runCount}, ${scheduleJson}, ${fireKey})`;
               }
               yield* markRunning(active.id, startedAtIso);
               if (trigger === "scheduled" && lateSlot === undefined && active.nextRunAt !== null) {
@@ -891,27 +1075,30 @@ export const layer = Layer.effect(
         if (!claimed) return active;
         yield* notifyChanged;
 
-        const fireKey =
-          webhook === undefined
-            ? lateSlot === undefined
-              ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
-              : `${active.id}:${active.createdAt}:late:${lateSlot}`
-            : `${active.id}:webhook:${webhook.deliveryId}`;
-        const commandId = CommandId.make(`scheduled-task:${fireKey}`);
-        const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
-        // A webhook prompt was rendered from the row when the request arrived.
-        const prompt =
-          lateSlot === undefined
-            ? (webhook?.prompt ?? active.prompt)
-            : `Late run: the ${lateSlot} slot was missed (Robob unavailable). ${active.prompt}`;
+        // Claiming and notifying can wait on I/O. Recheck at the provider
+        // boundary so a stalled claim cannot turn an old slot into a normal run.
+        const dispatchAt = yield* localNow;
+        if (trigger === "scheduled" && slotAt !== null) {
+          const dueAt = DateTime.makeUnsafe(slotAt);
+          const overdue =
+            lateSlot === undefined
+              ? DateTime.toEpochMillis(dispatchAt) - DateTime.toEpochMillis(dueAt) >
+                missedSlotGraceMs(active.schedule, dueAt)
+              : DateTime.toEpochMillis(dispatchAt) > lateRunDeadline(active.schedule, dueAt);
+          if (overdue) {
+            yield* missUnsentSlot(active, startedAtIso, slotAt, dispatchAt);
+            return (yield* findTask(task.id)) ?? active;
+          }
+        }
 
         // Effect.exit (not Effect.result) so defects and interruptions in the
         // dispatch are also captured and recorded as a failed run instead of
         // aborting before markCompleted.
         if (lateSlot !== undefined) {
           caughtUpThisBoot.add(`${active.id}:${active.createdAt}`);
-          nextCatchUpAt = DateTime.toEpochMillis(yield* localNow) + 30_000;
+          nextCatchUpAt = DateTime.toEpochMillis(dispatchAt) + 30_000;
         }
+        dispatched = true;
         const result =
           active.threadId === null
             ? yield* Effect.exit(
@@ -1004,38 +1191,38 @@ export const layer = Layer.effect(
           });
           // ardud schedules: one transaction, so a crash can't leave a
           // dispatched run that is neither followed nor recorded.
-          yield* followTarget === null
-            ? recordRun
-            : sql
-                .withTransaction(
-                  recordRun.pipe(
-                    Effect.andThen(
-                      runFollower.record({
-                        task: active,
-                        startedAtIso,
-                        fireKey,
-                        prompt,
-                        target: followTarget,
-                      }),
-                    ),
-                  ),
-                )
-                .pipe(
-                  Effect.mapError((cause) =>
-                    cause._tag === "ScheduledTaskError"
-                      ? cause
-                      : taskError("Could not record schedule task run.", {
-                          taskId: task.id,
-                          cause,
-                        }),
-                  ),
-                );
-          if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
+          yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* recordRun;
+                if (followTarget !== null)
+                  yield* runFollower.record({
+                    task: active,
+                    startedAtIso,
+                    fireKey,
+                    prompt,
+                    target: followTarget,
+                  });
+                if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
+                if (trigger === "scheduled")
+                  yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+              WHERE task_id = ${active.id} AND task_created_at = ${active.createdAt} AND started_at = ${startedAtIso}`;
+              }),
+            )
+            .pipe(
+              Effect.mapError((cause) =>
+                cause._tag === "ScheduledTaskError"
+                  ? cause
+                  : taskError("Could not record schedule task run.", { taskId: task.id, cause }),
+              ),
+            );
           yield* notifyChanged;
         }
         return onceSpent ? { ...completed, enabled: false } : completed;
       }).pipe(
-        Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause), trigger)),
+        Effect.onError((cause) =>
+          claimed && dispatched ? releaseStuckRun(task, errorMessage(cause), trigger) : Effect.void,
+        ),
         Effect.ensuring(
           Ref.update(activeRuns, (active) => {
             const next = new Set(active);
@@ -1063,7 +1250,7 @@ export const layer = Layer.effect(
         cursor = nextRunAt(task, due);
       }
       if (slots.length === 0) return;
-      const reason = "Robob unavailable at the scheduled slot.";
+      const reason = MISSED_SLOT_REASON;
       const scheduleJson = yield* encodeScheduleJson(task.schedule);
       yield* sql
         .withTransaction(
@@ -1094,6 +1281,7 @@ export const layer = Layer.effect(
     });
 
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
+      yield* recoverUnsentSlots();
       const now = yield* localNow;
       const tasks = yield* listDueTasks(now).pipe(
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
@@ -1110,12 +1298,7 @@ export const layer = Layer.effect(
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
       for (const task of due) {
-        if (
-          task.nextRunAt === null ||
-          DateTime.toEpochMillis(now) - Date.parse(task.nextRunAt) >
-            missedSlotGraceMs(task.schedule, DateTime.makeUnsafe(task.nextRunAt))
-        )
-          continue;
+        if (task.nextRunAt === null) continue;
         yield* runTask(task, "scheduled").pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
@@ -1186,6 +1369,7 @@ export const layer = Layer.effect(
     // would otherwise be skipped by the due-task filter forever.
     const recovery = yield* Effect.cached(
       Effect.gen(function* () {
+        const unsent = yield* recoverUnsentSlots();
         const rows = yield* selectAllRows();
         // ardud schedules: a dispatched run that is being followed survives the
         // restart; the follower settles it.
@@ -1193,7 +1377,8 @@ export const layer = Layer.effect(
         const stuck = rows.filter(
           (row) =>
             row.last_run_status === "running" &&
-            !followed.has(followKey(row.task_id, row.last_run_at)),
+            !followed.has(followKey(row.task_id, row.last_run_at)) &&
+            !unsent.has(unsentSlotKey(row.task_id, row.created_at, row.last_run_at ?? "")),
         );
         if (stuck.length === 0) return;
         const now = yield* localNow;

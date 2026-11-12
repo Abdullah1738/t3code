@@ -7,10 +7,12 @@ import { afterEach, vi } from "vite-plus/test";
 afterEach(() => vi.unstubAllEnvs());
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
@@ -27,11 +29,26 @@ const boot = <A, E>(
   body: (
     tick: Effect.Effect<void>,
   ) => Effect.Effect<A, E, ScheduledTaskService.ScheduledTaskService | SqlClient.SqlClient>,
-  options: { readOrigin?: Effect.Effect<{ relayHookBaseUrl: null }>; launchTimes?: number[] } = {},
+  options: {
+    readOrigin?: Effect.Effect<{ relayHookBaseUrl: null }>;
+    launchTimes?: number[];
+    afterLaunch?: Effect.Effect<void>;
+    afterTransaction?: Effect.Effect<void>;
+    receipts?: Set<string>;
+    receiptReadFails?: () => boolean;
+  } = {},
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       const sources = new Map<string, Effect.Effect<void>>();
+      const sql = yield* SqlClient.SqlClient;
+      const withTransaction: SqlClient.SqlClient["withTransaction"] = (effect) =>
+        sql.withTransaction(effect).pipe(Effect.tap(() => options.afterTransaction ?? Effect.void));
+      const serviceSql = new Proxy(sql, {
+        get(target, key, receiver) {
+          return key === "withTransaction" ? withTransaction : Reflect.get(target, key, receiver);
+        },
+      });
       const dependencies = Layer.mergeAll(
         NodeCrypto.layer,
         Layer.mock(Scheduler.Scheduler)({
@@ -44,8 +61,10 @@ const boot = <A, E>(
         Layer.mock(ThreadLaunchService.ThreadLaunchService)({
           launch: (input) =>
             Effect.gen(function* () {
+              options.receipts?.add(input.commandId);
               options.launchTimes?.push(DateTime.toEpochMillis(yield* DateTime.now));
               prompts.push(input.initialMessage?.text ?? "");
+              yield* options.afterLaunch ?? Effect.void;
               return {
                 threadId: ThreadId.make(`thread-${prompts.length}`),
                 projection: undefined as never,
@@ -53,7 +72,26 @@ const boot = <A, E>(
               };
             }),
         }),
-        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCommandReceipt: (commandId) =>
+            options.receiptReadFails?.()
+              ? Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId }))
+              : options.receipts?.has(commandId)
+                ? DateTime.now.pipe(
+                    Effect.map((acceptedAt) =>
+                      Option.some({
+                        commandId,
+                        threadId: ThreadId.make("thread-accepted"),
+                        commandType: "thread.create",
+                        acceptedAt,
+                        resultSequence: 1,
+                        status: "accepted" as const,
+                        error: null,
+                      }),
+                    ),
+                  )
+                : Effect.succeed(Option.none()),
+        }),
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
           namedProjectsRoot: "/projects",
           isScratchProject: () => Effect.succeed(false),
@@ -63,6 +101,7 @@ const boot = <A, E>(
       const context = yield* Layer.build(
         ScheduledTaskService.layer.pipe(
           Layer.provide(dependencies),
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, serviceSql)),
           Layer.provide(
             Layer.succeed(
               ScheduledTaskService.ScheduledTaskWebhookOrigin,
@@ -492,4 +531,502 @@ it.effect.each([0, 20_000, 120_000])(
         { launchTimes },
       );
     }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+const dispatchStallCases = [
+  {
+    label: "hourly interval",
+    schedule: { type: "interval", everyMs: 3_600_000 },
+    delayMs: 1_800_000,
+    catchesUp: false,
+    enabled: true,
+  },
+  {
+    label: "hourly cron",
+    schedule: { type: "cron", expression: "0 * * * *", timeZone: "UTC" },
+    delayMs: 1_800_000,
+    catchesUp: false,
+    enabled: true,
+  },
+  {
+    label: "daily inside window",
+    schedule: daily,
+    delayMs: 3_600_000,
+    catchesUp: true,
+    enabled: true,
+  },
+  {
+    label: "daily outside window",
+    schedule: daily,
+    delayMs: 13 * 3_600_000,
+    catchesUp: false,
+    enabled: true,
+  },
+  {
+    label: "once inside window",
+    schedule: { type: "once", at: slot },
+    delayMs: 2 * 3_600_000,
+    catchesUp: true,
+    enabled: false,
+  },
+  {
+    label: "once outside window",
+    schedule: { type: "once", at: slot },
+    delayMs: 25 * 3_600_000,
+    catchesUp: false,
+    enabled: false,
+  },
+];
+
+it.effect.each(
+  dispatchStallCases.flatMap((row) =>
+    ["candidate read", "earlier dispatch", "claim"].map((seam) => ({ ...row, seam })),
+  ),
+)(
+  "rechecks $label after a stalled $seam",
+  ({ label, schedule, delayMs, catchesUp, enabled, seam }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(slot));
+      const prompts: string[] = [];
+      let stalled = false;
+      let pending = false;
+      const stall = Effect.gen(function* () {
+        if (pending && !stalled) {
+          stalled = true;
+          yield* TestClock.adjust(delayMs);
+        }
+      });
+      const readOrigin = stall.pipe(Effect.as({ relayHookBaseUrl: null }));
+      yield* boot(
+        prompts,
+        (tick) =>
+          Effect.gen(function* () {
+            if (seam === "earlier dispatch")
+              yield* seed("0-earlier-dispatch", { type: "interval", everyMs: 3 * 86_400_000 });
+            const id = yield* seed(`1-stalled-${label}`, schedule);
+            pending = true;
+            yield* tick;
+            const service = yield* ScheduledTaskService.ScheduledTaskService;
+            const task = (yield* service.list()).tasks.find((task) => task.id === id)!;
+            assert.isTrue(stalled);
+            assert.equal(
+              prompts.length,
+              (seam === "earlier dispatch" ? 1 : 0) + (catchesUp ? 1 : 0),
+            );
+            assert.equal(task.lastRunStatus, catchesUp ? "running" : "missed");
+            assert.equal(task.enabled, enabled);
+            assert.equal(task.runCount, catchesUp ? 1 : 0);
+            assert.equal(task.missedRuns?.length, 1);
+            assert.equal(task.missedRuns?.[0]?.slotAt, slot);
+            assert.equal(
+              prompts.filter((prompt) => prompt.startsWith(`Late run: the ${slot}`)).length,
+              catchesUp ? 1 : 0,
+            );
+          }),
+        {
+          ...(seam === "candidate read" ? { readOrigin } : {}),
+          ...(seam === "earlier dispatch" ? { afterLaunch: stall } : {}),
+          ...(seam === "claim" ? { afterTransaction: stall } : {}),
+        },
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect.each(
+  [
+    { label: "daily", schedule: daily, ageHours: 11, enabled: true },
+    { label: "once", schedule: { type: "once", at: slot }, ageHours: 23, enabled: false },
+  ].flatMap((row) => ["candidate read", "claim"].map((seam) => ({ ...row, seam }))),
+)(
+  "rechecks an existing $label late window after a stalled $seam",
+  ({ label, schedule, ageHours, enabled, seam }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(slot) + ageHours * 3_600_000);
+      const prompts: string[] = [];
+      let reads = 0;
+      let transactions = 0;
+      let pending = false;
+      const readOrigin = Effect.gen(function* () {
+        if (pending && ++reads === 2 && seam === "candidate read")
+          yield* TestClock.adjust("2 hours");
+        return { relayHookBaseUrl: null };
+      });
+      const afterTransaction = Effect.gen(function* () {
+        if (pending && ++transactions === 2 && seam === "claim") yield* TestClock.adjust("2 hours");
+      });
+      yield* boot(
+        prompts,
+        (tick) =>
+          Effect.gen(function* () {
+            const id = yield* seed(`stalled-late-${label}`, schedule);
+            pending = true;
+            yield* tick;
+            const service = yield* ScheduledTaskService.ScheduledTaskService;
+            const task = (yield* service.list()).tasks.find((task) => task.id === id)!;
+            assert.equal(prompts.length, 0);
+            assert.equal(task.enabled, enabled);
+            assert.equal(task.lastRunStatus, "missed");
+            assert.equal(task.runCount, 0);
+            assert.equal(task.missedRuns?.length, 1);
+            assert.isNull(task.missedRuns?.[0]?.catchUpAt);
+          }),
+        { readOrigin, afterTransaction },
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect.each([
+  {
+    label: "hourly",
+    schedule: { type: "interval", everyMs: 3_600_000 },
+    initialHours: 0,
+    delayHours: 0.5,
+    catchesUp: false,
+    enabled: true,
+  },
+  {
+    label: "daily",
+    schedule: daily,
+    initialHours: 0,
+    delayHours: 1,
+    catchesUp: true,
+    enabled: true,
+  },
+  {
+    label: "once",
+    schedule: { type: "once", at: slot },
+    initialHours: 0,
+    delayHours: 25,
+    catchesUp: false,
+    enabled: false,
+  },
+  {
+    label: "late once",
+    schedule: { type: "once", at: slot },
+    initialHours: 23,
+    delayHours: 2,
+    catchesUp: false,
+    enabled: false,
+  },
+])(
+  "retries failed unsent cleanup for $label without counting a dispatch",
+  ({ label, schedule, initialHours, delayHours, catchesUp, enabled }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(slot) + initialHours * 3_600_000);
+      const prompts: string[] = [];
+      let pending = false;
+      let transactions = 0;
+      const afterTransaction = Effect.gen(function* () {
+        if (pending && ++transactions === (initialHours ? 2 : 1))
+          yield* TestClock.adjust(delayHours * 3_600_000);
+      });
+      yield* boot(
+        prompts,
+        (tick) =>
+          Effect.gen(function* () {
+            const id = yield* seed(`cleanup-${label}`, schedule);
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`CREATE TRIGGER fail_unsent_cleanup BEFORE UPDATE ON scheduled_tasks
+      WHEN OLD.last_run_status = 'running' AND NEW.last_run_status = 'missed'
+      BEGIN SELECT RAISE(FAIL, 'synthetic cleanup failure'); END`;
+            pending = true;
+            yield* tick;
+            const service = yield* ScheduledTaskService.ScheduledTaskService;
+            const failed = (yield* service.list()).tasks.find((task) => task.id === id)!;
+            assert.equal(prompts.length, 0);
+            assert.equal(failed.runCount, 0);
+            yield* sql`DROP TRIGGER fail_unsent_cleanup`;
+            yield* tick;
+            const recovered = (yield* service.list()).tasks.find((task) => task.id === id)!;
+            assert.equal(prompts.length, catchesUp ? 1 : 0);
+            assert.equal(recovered.runCount, catchesUp ? 1 : 0);
+            assert.equal(recovered.enabled, enabled);
+            assert.equal(recovered.lastRunStatus, catchesUp ? "running" : "missed");
+            assert.equal(recovered.missedRuns?.length, 1);
+          }),
+        { afterTransaction },
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("recovers a failed unsent cleanup across reboot without an interrupted-run count", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(slot) + 23 * 3_600_000);
+    const prompts: string[] = [];
+    let pending = false;
+    let transactions = 0;
+    const afterTransaction = Effect.gen(function* () {
+      if (pending && ++transactions === 2) yield* TestClock.adjust("2 hours");
+    });
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* seed("cleanup-reboot", { type: "once", at: slot });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_unsent_cleanup BEFORE UPDATE ON scheduled_tasks
+      WHEN OLD.last_run_status = 'running' AND NEW.last_run_status = 'missed'
+      BEGIN SELECT RAISE(FAIL, 'synthetic cleanup failure'); END`;
+          pending = true;
+          yield* tick;
+        }),
+      { afterTransaction },
+    );
+    yield* boot(prompts, (tick) =>
+      Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        assert.equal((yield* service.list()).tasks[0]?.runCount, 0);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`DROP TRIGGER fail_unsent_cleanup`;
+        yield* tick;
+        const task = (yield* service.list()).tasks[0]!;
+        assert.equal(prompts.length, 0);
+        assert.equal(task.runCount, 0);
+        assert.equal(task.lastRunStatus, "missed");
+        assert.equal(task.enabled, false);
+        assert.isNull(task.nextRunAt);
+        assert.isNull(task.missedRuns?.[0]?.catchUpAt);
+      }),
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("retries unsent cleanup when its durable intent could not be written", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(slot));
+    const prompts: string[] = [];
+    let pending = false;
+    const afterTransaction = Effect.gen(function* () {
+      if (pending) {
+        pending = false;
+        yield* TestClock.adjust("25 hours");
+      }
+    });
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* seed("intent-write-failure", { type: "once", at: slot });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_unsent_intent BEFORE INSERT ON ardud_scheduled_task_unsent_slots
+      BEGIN SELECT RAISE(FAIL, 'synthetic intent failure'); END`;
+          pending = true;
+          yield* tick;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          assert.equal((yield* service.list()).tasks[0]?.runCount, 0);
+          yield* sql`DROP TRIGGER fail_unsent_intent`;
+          yield* tick;
+          const task = (yield* service.list()).tasks[0]!;
+          assert.equal(prompts.length, 0);
+          assert.equal(task.runCount, 0);
+          assert.equal(task.lastRunStatus, "missed");
+          assert.equal(task.enabled, false);
+        }),
+      { afterTransaction },
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("keeps a later manual run when unsent cleanup retries at the same timestamp", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(slot));
+    const prompts: string[] = [];
+    let pending = false;
+    const readOrigin = Effect.gen(function* () {
+      if (pending) {
+        pending = false;
+        yield* TestClock.adjust("30 minutes");
+      }
+      return { relayHookBaseUrl: null };
+    });
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          const id = yield* seed("manual-after-unsent", { type: "interval", everyMs: 3_600_000 });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_unsent_cleanup BEFORE UPDATE ON scheduled_tasks
+      WHEN OLD.last_run_status = 'running' AND NEW.last_run_status = 'missed'
+      BEGIN SELECT RAISE(FAIL, 'synthetic cleanup failure'); END`;
+          pending = true;
+          yield* tick;
+          yield* sql`DROP TRIGGER fail_unsent_cleanup`;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          yield* service.runNow({ id });
+          yield* tick;
+          const task = (yield* service.list()).tasks[0]!;
+          assert.equal(prompts.length, 1);
+          assert.equal(task.runCount, 1);
+          assert.equal(task.lastRunStatus, "running");
+          assert.equal(task.lastRunAt, "2026-11-09T20:30:00.000Z");
+          assert.equal(task.nextRunAt, "2026-11-09T21:30:00.000Z");
+          assert.equal(task.missedRuns?.length, 1);
+        }),
+      { readOrigin },
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect.each([0, 23])(
+  "rolls back a failed claim intent before reboot at age %i h",
+  (initialHours) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(slot) + initialHours * 3_600_000);
+      const prompts: string[] = [];
+      yield* boot(prompts, (tick) =>
+        Effect.gen(function* () {
+          yield* seed("intent-failure-reboot", { type: "once", at: slot });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_unsent_intent BEFORE INSERT ON ardud_scheduled_task_unsent_slots
+      BEGIN SELECT RAISE(FAIL, 'synthetic intent failure'); END`;
+          yield* tick;
+          assert.equal(prompts.length, 0);
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          assert.equal((yield* service.list()).tasks[0]?.runCount, 0);
+          yield* TestClock.adjust((25 - initialHours) * 3_600_000);
+        }),
+      );
+      yield* boot(prompts, (tick) =>
+        Effect.gen(function* () {
+          yield* tick;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          const task = (yield* service.list()).tasks[0]!;
+          assert.equal(prompts.length, 0);
+          assert.equal(task.runCount, 0);
+          assert.equal(task.enabled, false);
+          assert.equal(task.lastRunStatus, "missed");
+          assert.equal(task.missedRuns?.length, 1);
+          assert.isNull(task.missedRuns?.[0]?.catchUpAt);
+        }),
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("counts an accepted dispatch once after reboot without replaying it", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(slot));
+    const prompts: string[] = [];
+    const receipts = new Set<string>();
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* seed("accepted-before-reboot", { type: "once", at: slot });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_dispatch_record BEFORE UPDATE ON scheduled_tasks
+      WHEN NEW.run_count > OLD.run_count
+      BEGIN SELECT RAISE(FAIL, 'synthetic completion failure'); END`;
+          yield* tick;
+          assert.equal(prompts.length, 1);
+          yield* sql`DROP TRIGGER fail_dispatch_record`;
+        }),
+      { receipts },
+    );
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* tick;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          const task = (yield* service.list()).tasks[0]!;
+          assert.equal(prompts.length, 1);
+          assert.equal(task.runCount, 1);
+          assert.equal(task.enabled, false);
+          assert.equal(task.lastRunStatus, "failed");
+          assert.equal(task.missedRuns?.length, 0);
+        }),
+      { receipts },
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect.each([
+  { label: "normal once", schedule: { type: "once", at: slot }, ageHours: 0, enabled: false },
+  { label: "late once", schedule: { type: "once", at: slot }, ageHours: 23, enabled: false },
+  { label: "recurring", schedule: daily, ageHours: 0, enabled: true },
+])(
+  "settles $label when fallback succeeds after follower recording fails",
+  ({ label, schedule, ageHours, enabled }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(slot) + ageHours * 3_600_000);
+      const prompts: string[] = [];
+      const receipts = new Set<string>();
+      yield* boot(
+        prompts,
+        (tick) =>
+          Effect.gen(function* () {
+            yield* seed(`follower-failure-${label}`, schedule);
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`CREATE TRIGGER fail_follower_record BEFORE INSERT ON ardud_scheduled_task_follows
+      BEGIN SELECT RAISE(FAIL, 'synthetic follower failure'); END`;
+            yield* tick;
+            const service = yield* ScheduledTaskService.ScheduledTaskService;
+            const task = (yield* service.list()).tasks[0]!;
+            assert.equal(prompts.length, 1);
+            assert.equal(task.runCount, 1);
+            assert.equal(task.lastRunStatus, "failed");
+            assert.equal(task.enabled, enabled);
+            const pending = yield* sql`SELECT * FROM ardud_scheduled_task_unsent_slots`;
+            assert.equal(pending.length, 0);
+            yield* sql`DROP TRIGGER fail_follower_record`;
+          }),
+        { receipts },
+      );
+      yield* boot(
+        prompts,
+        (tick) =>
+          Effect.gen(function* () {
+            yield* tick;
+            const service = yield* ScheduledTaskService.ScheduledTaskService;
+            const task = (yield* service.list()).tasks[0]!;
+            assert.equal(prompts.length, 1);
+            assert.equal(task.runCount, 1);
+            assert.equal(task.enabled, enabled);
+          }),
+        { receipts },
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("keeps a pending accepted dispatch when receipt reads fail during reboot", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(slot));
+    const prompts: string[] = [];
+    const receipts = new Set<string>();
+    let failRead = false;
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* seed("receipt-read-failure", { type: "once", at: slot });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER fail_dispatch_record BEFORE UPDATE ON scheduled_tasks
+      WHEN NEW.run_count > OLD.run_count
+      BEGIN SELECT RAISE(FAIL, 'synthetic completion failure'); END`;
+          yield* tick;
+          assert.equal(prompts.length, 1);
+          yield* sql`DROP TRIGGER fail_dispatch_record`;
+        }),
+      { receipts },
+    );
+    failRead = true;
+    yield* boot(
+      prompts,
+      (tick) =>
+        Effect.gen(function* () {
+          yield* tick;
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          assert.equal(prompts.length, 1);
+          assert.equal((yield* service.list()).tasks[0]?.runCount, 0);
+          failRead = false;
+          yield* tick;
+          const task = (yield* service.list()).tasks[0]!;
+          assert.equal(prompts.length, 1);
+          assert.equal(task.runCount, 1);
+          assert.equal(task.missedRuns?.length, 0);
+          assert.equal(task.enabled, false);
+        }),
+      { receipts, receiptReadFails: () => failRead },
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
