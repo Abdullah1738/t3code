@@ -1,0 +1,31 @@
+{
+  "case_number": 28,
+  "reporter_id": "robob718",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:d7c94470-a2cc-4964-b550-4f38fd571996",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 141958,
+    "sources": [
+      {
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T20-41-49-01a1d0a3-0ee2-7c13-b466-253ba34dacc7.jsonl",
+        "timestamp": "2026-11-12T16:50:55.851Z",
+        "call_id": "call_7936f373e5274daa88e26f068ce730ca",
+        "call_line": 163,
+        "result_line": 165
+      }
+    ],
+    "attribution_note": "Card says Claude; raw original and reporter timeline prove Codex exec/exec_command. PreToolUse is rejection wording, not the originating harness."
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\np='integrations/robob-guard/guard.py';s=open(p).read();a=s.index('def read_state(path):');b=s.index('\\n\\ndef append_log',a)\ns=s[:a]+'''def read_state(path):\n    state = read_json(path, {})\n    defaults = initial_state()\n    if not isinstance(state, dict):\n        return defaults\n    state = dict(defaults, **state)\n    for key in (\"down_count\", \"backoff_step\", \"failed_reopens\"):\n        if type(state[key]) is not int or state[key] < 0:\n            return defaults\n    for key in (\"last_reopen\", \"failure_episode\", \"crash_episode\"):\n        if state[key] is not None and not finite_number(state[key]):\n            return defaults\n    if (not finite_number(state[\"next_retry\"]) or type(state[\"awaiting_reopen\"]) is not bool\n            or not isinstance(state[\"history\"], list)\n            or any(not finite_number(t) for t in state[\"history\"])\n            or not isinstance(state[\"alerts_sent\"], list)\n            or any(not isinstance(k, str) for k in state[\"alerts_sent\"])\n            or not isinstance(state[\"pending_alerts\"], dict)):\n        return defaults\n    for key, alert in state[\"pending_alerts\"].items():\n        if (not isinstance(key, str) or not isinstance(alert, dict)\n                or alert.get(\"kind\") not in (\"failed-reopen\", \"crash-loop\")\n                or not finite_number(alert.get(\"at\"))):\n            return defaults\n    return state\n''' +s[b:]\ns=s.replace('                    if process_up() or valid_hold(latest,', '                    latest_up = process_up()\\n                    if latest_up or valid_hold(latest,').replace('state, statuses, action = decide(previous, now=now, up=process_up(), boot_time=boot_epoch(),','state, statuses, action = decide(previous, now=now, up=latest_up, boot_time=boot_epoch(),')\nopen(p,'w').write(s)\np='integrations/robob-guard/test_guard.py';s=open(p).read();i=s.index(\"    def test_dead_pid(self):\");s=s[:i]+'''    def test_real_cli_lifecycle_in_temporary_home(self):\n        env=dict(os.environ,HOME=str(self.h.home),PYTHONDONTWRITEBYTECODE='1')\n        helper=str(Path('bin/robob-install-hold').resolve())\n        def call(action,by='cli'):\n            return subprocess.run([helper,action,'--by',by,'--pid',str(self.pid)],env=env,check=True,capture_output=True,text=True,timeout=10)\n        beater=int(call('start').stdout.strip())\n        try:\n            self.assertTrue(guard.pid_alive(beater))\n            self.assertEqual(json.loads(self.h.path.read_text())['by'],'cli')\n            call('beat');call('stop','foreign');self.assertTrue(self.h.path.exists())\n            call('stop');self.assertFalse(self.h.path.exists())\n        finally:\n            self.h.stop('cli',self.pid)\n            try:os.waitpid(beater,os.WNOHANG)\n            except ChildProcessError:pass\n\n''' +s[i:];open(p,'w').write(s)\nPY\nPYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s integrations/robob-guard -v\nnode --check apps/desktop/scripts/install-robob-fast.mjs\ngit diff --check",
+      "workdir": "/Users/ardud/checkouts/robob-guard-718",
+      "sha256": "bc3c857b611e1751bc75d57638cfdd92f76de52cc1692830e9ba28d19812d260"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/t3code-fork",
+  "original_refusal": "statev2 guard: this command was NOT run (owner incident 2026-11-05).\nShell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\nUse Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, or server traces instead. Work on an existing isolated copy. Creating a copy or VACUUM INTO also reads the live file and needs Abdullah's approval first.\nIf only the database can answer, report the exact queries and stop.."
+}
