@@ -332,7 +332,7 @@ def money_books(wd, mc, dry=False):
     data = wd / ('scratch-renewals' if dry else 'scratch-money')
     if not data.exists():
         data.mkdir(mode=0o700, parents=True)
-        for name in ('cases.json', 'questions.json', 'cards.json'):
+        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
             if (mc.DATA / name).exists():
                 shutil.copy2(mc.DATA / name, data / name)
     return data
