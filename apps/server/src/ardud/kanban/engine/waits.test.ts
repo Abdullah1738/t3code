@@ -1187,6 +1187,72 @@ describe("checkWait", () => {
     expect(reason(card(1), request({ on: "push", sinceHead: "a1b2c3d4" }))).toBe("ok");
   });
 
+  const running = card(1, {
+    stage: "working",
+    activeThreadId: worker.threadId,
+    workThreadId: worker.threadId,
+    activeRole: "work",
+  });
+
+  it.each(["ci", "push", "merge"] as const)(
+    "points the own running worker's %s wait with a PR at watch_pull_request",
+    (on) => {
+      expect(reason(running, request({ on }), worker)).toBe(
+        "denied: This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
+      );
+    },
+  );
+
+  it.each([
+    { on: "time", pr: null },
+    { on: "card", pr: null },
+    { on: "owner_go", pr: null },
+    { on: "script", pr: null },
+    { on: "time", pr: PR },
+    { on: "card", pr: PR },
+    { on: "owner_go", pr: PR },
+    { on: "script", pr: PR },
+    { on: "ci", pr: null },
+    { on: "push", pr: null },
+    { on: "merge", pr: null },
+    { on: "ci", pr: undefined },
+    { on: "push", pr: undefined },
+    { on: "merge", pr: undefined },
+    { on: "ci", pr: "" },
+    { on: "push", pr: "" },
+    { on: "merge", pr: "" },
+  ] as const)("points the own running worker's $on wait (pr=$pr) at its evaluator", (patch) => {
+    expect(reason(running, request(patch), worker)).toBe(
+      "denied: This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+    );
+  });
+
+  it.each([
+    { name: "evaluator", actor: evaluator, target: running },
+    { name: "owner", actor: owner, target: running },
+    {
+      name: "other thread",
+      actor: worker,
+      target: { ...running, activeThreadId: "other" as never },
+    },
+    {
+      name: "own reviewer",
+      actor: worker,
+      target: { ...running, stage: "in_review", activeRole: "review" } as KanbanCard,
+    },
+    { name: "unassigned thread", actor: worker, target: { ...running, workThreadId: null } },
+  ])("keeps the running-card refusal for $name", ({ actor, target }) => {
+    expect(reason(target, request(), actor)).toBe(
+      "denied: card #1 has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on",
+    );
+  });
+
+  it("still accepts the worker's wait once its card has no running thread", () => {
+    expect(reason(card(1, { workThreadId: worker.threadId }), request({ on: "ci" }), worker)).toBe(
+      "ok",
+    );
+  });
+
   it("refuses a PR the card doesn't link, a landed one, and a push with no commit to compare", () => {
     expect(reason(card(1), request({ pr: OTHER_PR }))).toBe(
       "invalid: card #1 has no pull request trading-core#513; it has trading-core#512",

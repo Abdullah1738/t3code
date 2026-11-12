@@ -153,10 +153,20 @@ export const PullRequestCoreRepositoryPullRequestHeadRepositoryRepository = Sche
 })
 export interface PullRequestCoreRepositoryPullRequestHeadRepositoryRepository extends Schema.Struct.Type<typeof PullRequestCoreRepositoryPullRequestHeadRepositoryRepository.fields> {}
 
+/** Represents a Git object. */
+export const GitObject = Schema.Struct({
+  __typename: GraphQL.otherTypename<Shared.Typename.GitObject>()([]),
+  /** The Git object ID */
+  oid: Shared.GitObjectID
+})
+export interface GitObject extends Schema.Struct.Type<typeof GitObject.fields> {}
+
 /** Represents a Git reference. */
 export const HeadRefRef = Schema.Struct({
   /** The Node ID of the Ref object */
-  id: Shared.ID
+  id: Shared.ID,
+  /** The object the ref points to. Returns null when object does not exist. */
+  target: Schema.NullOr(GitObject)
 })
 export interface HeadRefRef extends Schema.Struct.Type<typeof HeadRefRef.fields> {}
 
@@ -306,6 +316,8 @@ export interface PullRequestCoreRepositoryPullRequestCommitsNodesCommitStatusChe
 
 /** Represents a Git commit. */
 export const PullRequestCoreRepositoryPullRequestCommitsNodesCommitCommit = Schema.Struct({
+  /** The Git object ID */
+  oid: Shared.GitObjectID,
   /** Check and Status rollup information for this commit. */
   statusCheckRollup: Schema.NullOr(PullRequestCoreRepositoryPullRequestCommitsNodesCommitStatusCheckRollupStatusCheckRollup)
 })
@@ -426,7 +438,7 @@ export const PullRequestCore = GraphQL.query("PullRequestCore", {
       { name: "required", body: "Boolean!" }
     ],
     selections: [
-      { name: "repository", body: ["(owner:$", "owner", " name:$", "name", "){mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission pullRequest(number:$", "number", "){number title url body state isDraft mergeable reviewDecision additions deletions changedFiles createdAt updatedAt mergedAt closedAt headRefName baseRefName baseRefOid headRefOid isCrossRepository headRepositoryOwner{__typename login}headRepository{nameWithOwner viewerPermission}headRef{id}author{__typename login avatarUrl...on User{id name}}autoMergeRequest{mergeMethod}viewerCanUpdate viewerDidAuthor viewerCanUpdateBranch baseRef{compare(headRef:$", "headRef", "){behindBy}}reviewRequests(first:100){nodes{requestedReviewer{__typename...on User{login name}...on Bot{login}...on Team{slug combinedSlug teamName:name teamAvatarUrl:avatarUrl}}}}labels(first:100){nodes{name color}}commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename...", "CheckContext", "}pageInfo{hasNextPage}}}}}}}}"] }
+      { name: "repository", body: ["(owner:$", "owner", " name:$", "name", "){mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission pullRequest(number:$", "number", "){number title url body state isDraft mergeable reviewDecision additions deletions changedFiles createdAt updatedAt mergedAt closedAt headRefName baseRefName baseRefOid headRefOid isCrossRepository headRepositoryOwner{__typename login}headRepository{nameWithOwner viewerPermission}headRef{id target{__typename oid}}author{__typename login avatarUrl...on User{id name}}autoMergeRequest{mergeMethod}viewerCanUpdate viewerDidAuthor viewerCanUpdateBranch baseRef{compare(headRef:$", "headRef", "){behindBy}}reviewRequests(first:100){nodes{requestedReviewer{__typename...on User{login name}...on Bot{login}...on Team{slug combinedSlug teamName:name teamAvatarUrl:avatarUrl}}}}labels(first:100){nodes{name color}}commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{__typename...", "CheckContext", "}pageInfo{hasNextPage}}}}}}}}"] }
     ],
     fragments: [
       { name: "CheckContext", body: ["on StatusCheckRollupContext{__typename...on StatusContext{context state targetUrl createdAt description isRequired(pullRequestNumber:$", "number", ")@include(if:$", "required", ")}...on CheckRun{name status conclusion startedAt completedAt detailsUrl isRequired(pullRequestNumber:$", "number", ")@include(if:$", "required", ")checkSuite{workflowRun{workflow{name}}}}}"] }
@@ -476,6 +488,8 @@ export interface PullRequestCheckContextsRepositoryPullRequestCommitsNodesCommit
 
 /** Represents a Git commit. */
 export const PullRequestCheckContextsRepositoryPullRequestCommitsNodesCommitCommit = Schema.Struct({
+  /** The Git object ID */
+  oid: Shared.GitObjectID,
   /** Check and Status rollup information for this commit. */
   statusCheckRollup: Schema.NullOr(PullRequestCheckContextsRepositoryPullRequestCommitsNodesCommitStatusCheckRollupStatusCheckRollup)
 })
@@ -522,7 +536,7 @@ export const PullRequestCheckContexts = GraphQL.query("PullRequestCheckContexts"
       { name: "after", body: "String" }
     ],
     selections: [
-      { name: "repository", body: ["(owner:$", "owner", " name:$", "name", "){pullRequest(number:$", "number", "){headRefOid commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100 after:$", "after", "){nodes{__typename...", "CheckContext", "}pageInfo{hasNextPage endCursor}}}}}}}}"] }
+      { name: "repository", body: ["(owner:$", "owner", " name:$", "name", "){pullRequest(number:$", "number", "){headRefOid commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100 after:$", "after", "){nodes{__typename...", "CheckContext", "}pageInfo{hasNextPage endCursor}}}}}}}}"] }
     ],
     fragments: [
       { name: "CheckContext", body: ["on StatusCheckRollupContext{__typename...on StatusContext{context state targetUrl createdAt description isRequired(pullRequestNumber:$", "number", ")@include(if:$", "required", ")}...on CheckRun{name status conclusion startedAt completedAt detailsUrl isRequired(pullRequestNumber:$", "number", ")@include(if:$", "required", ")checkSuite{workflowRun{workflow{name}}}}}"] }
@@ -1427,14 +1441,6 @@ export const DefaultBranchRefRef = Schema.Struct({
   name: Schema.String
 })
 export interface DefaultBranchRefRef extends Schema.Struct.Type<typeof DefaultBranchRefRef.fields> {}
-
-/** Represents a Git object. */
-export const GitObject = Schema.Struct({
-  __typename: GraphQL.otherTypename<Shared.Typename.GitObject>()([]),
-  /** The Git object ID */
-  oid: Shared.GitObjectID
-})
-export interface GitObject extends Schema.Struct.Type<typeof GitObject.fields> {}
 
 /** Represents a Git reference. */
 export const RefRef = Schema.Struct({

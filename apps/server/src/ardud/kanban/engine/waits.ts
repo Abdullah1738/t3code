@@ -1180,6 +1180,18 @@ export function checkWait(
   if (card.settledAt !== null) return denied(`${n} is settled`);
   if (card.stage === "verified") return denied(`${n} is verified: nothing left to wait for`);
   if (card.activeThreadId !== null) {
+    if (
+      actor._tag === "thread" &&
+      actor.threadId === card.activeThreadId &&
+      actor.threadId === card.workThreadId &&
+      card.activeRole === "work"
+    ) {
+      return denied(
+        (request.on === "ci" || request.on === "push" || request.on === "merge") && request.pr
+          ? "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you."
+          : "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+      );
+    }
     return denied(
       `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
     );

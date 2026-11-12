@@ -148,6 +148,14 @@ write_units() {
 Environment=TALPID_NET_CLS_MOUNT_DIR=$NET_CLS
 ExecStartPre=/bin/mkdir -p $NET_CLS
 EOF
+  # systemd-networkd deletes policy rules and routes it did not create whenever a link is reconfigured. That
+  # removes Mullvad's rule: the tunnel stays "Connected" and nothing reaches the internet (FAILURE-MODES 3.40).
+  mkdir -p /etc/systemd/networkd.conf.d
+  cat > /etc/systemd/networkd.conf.d/10-offbox-foreign.conf <<EOF
+[Network]
+ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
+EOF
   cat > /etc/systemd/system/offbox-vpn-guard.service <<EOF
 [Unit]
 Description=offbox: nothing but tailnet, LAN and the Mullvad tunnel leaves until Mullvad's lockdown is up
@@ -219,6 +227,12 @@ probe_exit() { curl -4 -sL --max-time 15 -r 0-99 -o /dev/null -w '%{http_code}' 
 cmd_exit_check() {
   local try code st
   [ -e "$ENABLED" ] || return 0
+  # "Connected" without Mullvad's routing rule means something removed it (3.40): a reconnect puts it back.
+  st=$(mullvad status 2>/dev/null || true)
+  if [[ $st == Connected* ]] && ! ip rule show | grep -q 0x6d6f6c65; then
+    logger -p user.err -t offbox-vpn "connected but Mullvad's routing rule is gone; reconnecting"
+    mullvad reconnect --wait >/dev/null 2>&1 || true
+  fi
   # With the residential exit up (home/exit-proxy.sh), boxes reach Google through it; this relay's standing
   # with Google no longer matters and a relay change would only drop connections.
   if systemctl is-active -q offbox-exit-proxy.service 2>/dev/null && [ ! -e /run/offbox-exit-proxy.bypass ]; then return 0; fi
