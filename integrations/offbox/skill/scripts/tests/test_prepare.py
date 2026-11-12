@@ -22,6 +22,7 @@ class PrepareTests(Isolated):
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_PREPARE_DEADLINE_SECONDS': '1'}))
         self.stack.enter_context(patch.object(lease, 'cap_check'))
         self.stack.enter_context(patch.object(pool, '_refresh_background'))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
 
     def create_and_claim(self, lock_seconds, replacement=False):
         clock = FakeClock()

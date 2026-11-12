@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, lease, node_version, pool, ssh_sync
+from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune, prepare
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
@@ -1122,7 +1123,8 @@ class Runner:
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             try:
-                replacement = self._prepare_box(con, a, rdir, env_file, body)
+                with _keep_ttl(self.box):
+                    replacement = self._prepare_box(con, a, rdir, env_file, body)
                 if replacement is not None:
                     pool.release_guard(row)
                     self.lease_row, self.box = replacement, replacement['box_id']
@@ -1198,7 +1200,7 @@ class Runner:
             return replacement
         # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
         with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
-            self._sync_box(a, rdir, env_file, body)
+            self._sync_box(con, a, rdir, env_file, body)
         return None
 
     def _check_box(self, con, a, rdir) -> dict | None:
@@ -1243,7 +1245,7 @@ class Runner:
                 'databases on it can be slow for 5-25 min. For long runs use --bg + offbox wait.')
         return None
 
-    def _sync_box(self, a, rdir, env_file, body):
+    def _sync_box(self, con, a, rdir, env_file, body):
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
         left = api.left()
@@ -1255,7 +1257,9 @@ class Runner:
         try:
             if not a.no_sync:
                 with prepare.phase("push (source read stalled if no transfer progress)", self.box):
-                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                    candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
+                                       seed_candidates=candidates)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1276,10 +1280,14 @@ class Runner:
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
             if reason:
                 raise lease.DeadMount(self.box, reason) from e
-        if push_exc is not None:
-            raise push_exc
-        if err:
-            raise err[0]
+        sync_exc = push_exc if push_exc is not None else err[0] if err else None
+        if sync_exc is not None:
+            if re.search(r"Broken pipe|code 255|\(255\)", str(sync_exc)):
+                state = _boat_state(self.box)
+                if state and state not in api.LIVE_STATES:
+                    raise OffboxError(f"box {self.box} was stopped by boat during the sync ({state}); nothing ran",
+                                      code=EXIT_INFRA) from sync_exc
+            raise sync_exc
 
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
@@ -1296,11 +1304,43 @@ class Runner:
                 say(f"could not kill remote process: {e}")
 
 
+def _seed_candidates(con, box_id: str, current: str, repo_key: str) -> list[str]:
+    """Recent checkouts on this box whose local roots still identify as this repository."""
+    rows = con.execute("""SELECT r.remote_dir, r.repo_root, MAX(COALESCE(r.start_at, 0)) AS last,
+                                 EXISTS (SELECT 1 FROM pool_callers c JOIN pool_members p USING(box_id)
+                                         WHERE c.box_id=r.box_id AND c.repo_root=r.repo_root
+                                           AND c.remote_dir=r.remote_dir AND p.pool_key=?) AS mapped
+                          FROM runs r WHERE r.box_id=? AND r.remote_dir IS NOT NULL AND r.remote_dir<>?
+                          GROUP BY r.remote_dir, r.repo_root ORDER BY last DESC""",
+                       (repo_key, box_id, current)).fetchall()
+    out, checked = [], {}
+    for row in rows:
+        remote, root = row["remote_dir"], row["repo_root"]
+        if not root or not prune.DIR_RE.fullmatch(remote) or remote in out:
+            continue
+        if row["mapped"]:
+            out.append(remote)
+            continue
+        if root not in checked:
+            path = Path(root)
+            checked[root] = path.is_dir() and identity.repo_key(path) == repo_key
+        if checked[root]:
+            out.append(remote)
+    return out
+
+
 def _safe(err: list, fn, *args):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
+
+
+def _boat_state(box_id: str) -> str | None:
+    try:
+        return (api.get(box_id) or {}).get("state")
+    except OffboxError:
+        return None
 
 
 def _ttl_keeper(box_id: str, stop_evt: threading.Event):
@@ -1313,6 +1353,19 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             ok = False
         if stop_evt.wait(TTL_REFRESH_S if ok else TTL_RETRY_S):
             return
+
+
+@contextlib.contextmanager
+def _keep_ttl(box_id: str):
+    stop_evt = threading.Event()
+    keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
+    keeper.start()
+    try:
+        yield
+    finally:
+        stop_evt.set()
+        # GET/PATCH retries can outlive the follower's join bound. Drain them before handing off the TTL.
+        keeper.join()
 
 
 def _echo(stream, b: bytes) -> bool:

@@ -7,6 +7,6 @@
     "robob-cards-enroll": "bin/robob-cards-enroll"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/"
   }
 }

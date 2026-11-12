@@ -147,8 +147,14 @@ it.effect("compact pages read the split boards database, not orchestration stora
       });
       const first = yield* store.feedCards(boardId, { after: 0, limit: 2 });
       const next = yield* store.feedCards(boardId, { after: first.at(-1)!.number, limit: 2 });
-      assert.deepStrictEqual(first.map((row) => row.number), [1, 3]);
-      assert.deepStrictEqual(next.map((row) => row.number), [8]);
+      assert.deepStrictEqual(
+        first.map((row) => row.number),
+        [1, 3],
+      );
+      assert.deepStrictEqual(
+        next.map((row) => row.number),
+        [8],
+      );
       assert.isTrue(
         first.every(
           (row) => row.prompt === "" && row.description === "" && row.wakeNote === "pending",
@@ -445,6 +451,9 @@ it.live(
           ]);
           assert.deepStrictEqual(yield* store.discussion(discussionId), discussion);
           assert.deepStrictEqual(yield* store.discussionByEvaluator("evaluator-1"), discussion);
+          assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator("evaluator-1"), [
+            boardId,
+          ]);
           assert.deepStrictEqual(yield* store.messages(discussionId, { limit: 1 }), [
             evaluatorMessage,
           ]);
@@ -807,3 +816,44 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
     }),
   );
 });
+
+it.effect(
+  "discussion board candidates include every distinct board and follow evaluator ownership",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const evaluator = ThreadId.make("evaluator");
+      const otherBoard = { ...board, id: KanbanBoardId.make("board-2"), slug: "other" };
+      yield* store.putBoard(board);
+      yield* store.putBoard(otherBoard);
+      const first = {
+        id: KanbanDiscussionId.make("disc-1"),
+        boardId,
+        cardId: null,
+        title: "First",
+        evaluatorThreadId: evaluator,
+        participants: [],
+        lastSeq: 0,
+        lastMessageAt: null,
+        createdBy: { _tag: "owner" },
+        createdAt: at,
+        archivedAt: null,
+        titleEditedAt: null,
+        settledAt: null,
+        snoozedUntil: null,
+        pinnedAt: null,
+        reopenedAt: null,
+      } satisfies KanbanDiscussion;
+      const other = { ...first, id: KanbanDiscussionId.make("disc-3"), boardId: otherBoard.id };
+      yield* store.putDiscussion(first);
+      yield* store.putDiscussion({ ...first, id: KanbanDiscussionId.make("disc-2") });
+      yield* store.putDiscussion(other);
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator(evaluator), [
+        boardId,
+        otherBoard.id,
+      ]);
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator("absent"), []);
+      yield* store.putDiscussion({ ...other, evaluatorThreadId: ThreadId.make("replacement") });
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator(evaluator), [boardId]);
+    }).pipe(Effect.provide(TestLayer)),
+);

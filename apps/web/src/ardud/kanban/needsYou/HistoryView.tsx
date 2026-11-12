@@ -1,10 +1,14 @@
 import {
   askAfterAnswer,
+  askFiguresAsOf,
+  askHistoryFacts,
+  askHistoryFigures,
   askOutcome,
   avatarOf,
   diffPieces,
   wordDiff,
   type AskOutcome,
+  type AskUnreadable,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem } from "@t3tools/contracts";
 import { useEffect, type ReactNode } from "react";
@@ -14,6 +18,7 @@ import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { Avatar } from "../parts";
 import { askAsker, loadClosedAsks, useAskStore, type AskSend } from "./askStore";
 import { EvaluatorThreadLink } from "./HandOver";
+import { UnreadableNotice } from "./QueueRail";
 import { sameDay, shortWhen } from "./snoozeTimes";
 import { Bar, Btn, Label, linkClass, type PageLayout } from "./ui";
 
@@ -207,9 +212,31 @@ export function HistoryView(props: {
   onBack: () => void;
   onUndo: () => void;
   onOpenCard: (entry: KanbanAskFeedItem) => void;
+  /** Opens the card of a closed ask this build can't show. */
+  onOpenUnreadable: (ask: AskUnreadable) => void;
 }) {
   const closed = useAskStore((state) => state.closed);
-  const status = useAskStore((state) => state.closedStatus);
+  // Closed asks that came but can't be read: History is then not the whole of it.
+  const unreadable = useAskStore((state) => state.unreadableClosed);
+  const incomplete = unreadable.length > 0;
+  // Known, held from an earlier read, or not known at all: no figure shows without asking
+  // (`askHistoryFigures`). Each part is selected by itself so the selectors stay stable.
+  const feed = useAskStore((state) => state.feed);
+  const feedStatus = useAskStore((state) => state.status);
+  const feedError = useAskStore((state) => state.error);
+  const closedStatus = useAskStore((state) => state.closedStatus);
+  const closedAt = useAskStore((state) => state.closedAt);
+  const closedError = useAskStore((state) => state.closedError);
+  const figures = askHistoryFigures({
+    feed,
+    status: feedStatus,
+    error: feedError,
+    closed,
+    closedStatus,
+    closedAt,
+    closedError,
+  });
+  const asOf = askFiguresAsOf(figures, props.nowMs);
   const sent = useAskStore((state) => state.sent);
   const heldId = useAskStore((state) => state.held?.payload.id ?? null);
   useEffect(() => {
@@ -223,13 +250,12 @@ export function HistoryView(props: {
   });
   const today = rows.filter((row) => sameDay(row.entry.ask.answer!.at, props.nowMs));
   const earlier = rows.filter((row) => !sameDay(row.entry.ask.answer!.at, props.nowMs));
-  const facts: ReadonlyArray<readonly [string, number]> = [
-    ["Answered", today.length],
-    ["With a note", today.filter((row) => row.outcome.note !== null).length],
-    ["Drafts you edited", today.filter((row) => row.outcome.draft !== null).length],
-    ["Waiting on agents", props.waiting],
-    ["Still to answer", props.toAnswer],
-  ];
+  const facts = askHistoryFacts({
+    today,
+    waiting: props.waiting,
+    toAnswer: props.toAnswer,
+    incomplete,
+  });
   const list = (items: typeof rows) => (
     <ul className="flex flex-col gap-3">
       {items.map(({ entry, outcome }) => (
@@ -245,13 +271,25 @@ export function HistoryView(props: {
   );
   const aside = (
     <aside aria-label="Today" className="flex flex-col gap-4 text-sm">
-      <div>
-        <Label className="mb-2">Today</Label>
+      {/* No figures until both reads came back: a number here is a claim. */}
+      <div hidden={figures.state === "unknown"}>
+        <Label className="mb-2">
+          {asOf === null ? "Today" : `Today, ${asOf}. May be out of date.`}
+        </Label>
         <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1.5">
-          {facts.map(([name, value]) => (
+          {facts.map(({ name, value, spoken }) => (
             <div key={name} className="contents">
               <dt>{name}</dt>
-              <dd className="text-end font-medium tabular-nums">{value}</dd>
+              <dd className="text-end font-medium tabular-nums">
+                {spoken === value ? (
+                  value
+                ) : (
+                  <>
+                    <span aria-hidden>{value}</span>
+                    <span className="sr-only">{spoken}</span>
+                  </>
+                )}
+              </dd>
             </div>
           ))}
         </dl>
@@ -271,7 +309,7 @@ export function HistoryView(props: {
       )}
     >
       <div className="flex min-w-0 flex-col gap-3">
-        {closed === null && status !== "error" ? (
+        {figures.state === "unknown" && !figures.failed ? (
           <div aria-busy className="flex flex-col gap-3">
             <p role="status" className="sr-only">
               Loading…
@@ -280,9 +318,21 @@ export function HistoryView(props: {
             <Bar className="h-24 rounded-2xl" />
           </div>
         ) : null}
-        {closed === null && status === "error" ? (
+        {figures.state === "unknown" && figures.failed ? (
           <div role="alert" className="flex flex-col items-start gap-2">
             <p className="font-semibold">Couldn't load History.</p>
+            <p className="text-sm text-(--m-muted)">{figures.error}</p>
+            <Btn size="sm" onClick={() => void loadClosedAsks()}>
+              Retry
+            </Btn>
+          </div>
+        ) : null}
+        {/* Held from an earlier read and not renewed: said first, with when it was read. */}
+        {asOf !== null ? (
+          <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm">
+            <p className="text-(--m-muted)">
+              Can't reach Robob. This is what was last read, {asOf}.
+            </p>
             <Btn size="sm" onClick={() => void loadClosedAsks()}>
               Retry
             </Btn>
@@ -300,13 +350,18 @@ export function HistoryView(props: {
             ))}
           </ul>
         ) : null}
+        {/* Said first: what follows is then not everything he answered. */}
+        <UnreadableNotice asks={unreadable} onOpen={props.onOpenUnreadable} />
         {closed !== null ? (
           <>
             <h2 className="text-xs text-(--m-muted)">Today</h2>
             {today.length > 0 ? (
               list(today)
-            ) : session.length === 0 ? (
-              <p className="pb-2 text-sm text-(--m-muted)">Nothing answered yet today.</p>
+            ) : session.length === 0 && !incomplete ? (
+              // Only when all of History could be read: otherwise "nothing" is not known.
+              <p className="pb-2 text-sm text-(--m-muted)">
+                {asOf === null ? "Nothing answered yet today." : `Nothing answered today, ${asOf}.`}
+              </p>
             ) : null}
             {earlier.length > 0 ? (
               <>

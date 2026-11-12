@@ -559,8 +559,10 @@ describe("iPad layout", () => {
       button.textContent?.includes("Working"),
     )!;
     await act(() => working.click());
-    expect(working.getAttribute("aria-pressed")).toBe("true");
-    expect(switcher!.querySelectorAll('button[aria-pressed="true"]')).toHaveLength(1);
+    // Changing columns remounts the list header; inspect the current switcher.
+    const selected = columnSwitcher()!.querySelectorAll('button[aria-pressed="true"]');
+    expect(selected).toHaveLength(1);
+    expect(selected[0]!.textContent).toContain("Working");
     expect(shortButtons()).toEqual([]);
   });
 });

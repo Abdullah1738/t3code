@@ -153,7 +153,8 @@ export class ControlClient {
   }
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
-    const timeout = AbortSignal.timeout(options.timeoutMs ?? 15_000);
+    // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
+    const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
     let response: Response;
     try {

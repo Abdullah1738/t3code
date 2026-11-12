@@ -88,7 +88,9 @@ const layerSetup = Layer.effectDiscard(
       );
       yield* withStartupPhase(
         "sqlite.history-archive",
-        initializeHistoryArchive(baseFilename).pipe(
+        // ardud: live archive copies are synced by the worker barrier, not by
+        // F_FULLFSYNC on the writer (HistoryArchiveDurabilityMode).
+        initializeHistoryArchive(baseFilename, { durability: "worker" }).pipe(
           Effect.catchTags({ HistoryArchiveMissing: Effect.die }),
         ),
       );
