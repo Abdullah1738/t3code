@@ -155,7 +155,7 @@ CPU niceness is fine to keep in the scripts (`nice -n 10`).
   Snapshots hold replicas of memory.db and opencode_raw.db, plus
   `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
   projects, board, import map, thread index). The full Robob DB is not backed up.
-  Replicas and restic run at nice 10 with normal I/O priority (darwin-background I/O stalls on the USB SSD; see `src/run_limited.py`); limits for replicas and restic backup are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s).
+  Replicas and restic run at utility QoS and nice 10, demoting I/O above 1.5 load/core and restoring it below 0.8. Runs defer above 1.0 load/core or within one hour of boot, unless waiting for the next four-hour launch would put the last success over 24 h old. The cadence is unchanged. Replica/restic caps are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s), extended by time demoted up to `MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD` (10800 s). Replicas with a WAL over 2 GiB, a catch-up marker, or an age over 48 h are reseeded through a checked replacement; a live holder blocks recovery.
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
