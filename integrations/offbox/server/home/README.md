@@ -26,6 +26,7 @@ manual menu entries exist. See "With the KVM" below.
 | `watch-install.zsh` | Mac: which stage is the box in, and what to do when it stays silent |
 | `read-stick-log.zsh` | Mac: summary of what a re-plugged stick recorded |
 | `acceptance.sh` | Day-one checks on the real hardware for everything a VM cannot prove |
+| `mullvad.sh` | Mullvad VPN for the host and every box, with the tailnet and LAN kept outside it ("VPN (Mullvad)" below) |
 | `static-check.sh` | Verification layer A: shellcheck, YAML, cloud-init schema, the ISO's own subiquity + curtin validators, unit tests |
 | `FAILURE-MODES.md` | Verification layer B: every failure, how it shows up headless, what happens by itself, what to do |
 | `vmtest/` | Verification layer C: end-to-end tests in a VM shaped like the box (`vmtest/README.md`) |
@@ -99,6 +100,22 @@ The installed system finds the marker on its next boot, points the firmware at t
   the default after `offbox-boot-health` passed (4 min after boot); security updates install by themselves
   and never restart the machine.
 - `offbox-status` prints the state of all of that in a dozen lines.
+
+## VPN (Mullvad)
+
+Owner, 12 Nov 2026: Mullvad on the box, permanently on. `mullvad.sh` (copied to the server as
+`/usr/local/sbin/offbox-mullvad`) does all of it; its header says why each non-default piece exists.
+
+- The host and every box, Docker inside boxes included, leave through Mullvad (Frankfurt; `MULLVAD_LOCATION`).
+  Tailscale and the local network stay outside the tunnel, so ssh, boatd and the KVM path do not depend on it.
+- Nothing leaves without the tunnel: Mullvad's lockdown mode while its daemon runs, and
+  `offbox-vpn-guard.service` from before the network comes up until Mullvad's rules are in place.
+- It comes back by itself after a restart (auto-connect). Proven with three restarts on install day.
+- A person's browser (offbox-person) is not affected: it already leaves through the Mac's SOCKS route.
+- Set up or rebuild: `scp mullvad.sh root@<server>:/root/ && ssh root@<server> 'bash /root/mullvad.sh install'`,
+  then `security find-generic-password -s mullvad-account -a ardud -w | ssh root@<server> offbox-mullvad login`.
+  The account number lives in the Mac's Keychain (`mullvad-account`) and in the daemon's own state on the server.
+- Check: `offbox-mullvad check` (also part of `acceptance.sh`). Failures: FAILURE-MODES 3.29-3.34.
 
 ## With the KVM
 

@@ -218,6 +218,19 @@ ts=$(tailscale status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*
 [ "$ts" = Running ] && pass "tailscale: Running, $(tailscale ip -4 | head -1)" || fail "tailscale: state ${ts:-not installed}"
 timedatectl show -p NTPSynchronized --value | grep -q yes && pass "clock synchronised (UTC)" || warn "clock not synchronised yet"
 
+# ---------------------------------------------------------------- VPN: everything leaves through Mullvad, the tailnet stays direct
+if command -v mullvad >/dev/null 2>&1; then
+  if [ -x /usr/local/sbin/offbox-mullvad ]; then
+    while IFS= read -r line; do
+      case $line in PASS*) pass "${line#PASS }" ;; FAIL*) fail "${line#FAIL }" ;; *) echo "$line" ;; esac
+    done < <(/usr/local/sbin/offbox-mullvad check || true)
+  else
+    fail "vpn: mullvad is installed but /usr/local/sbin/offbox-mullvad is missing (run home/mullvad.sh install)"
+  fi
+else
+  info "vpn: none on this host (home/mullvad.sh installs Mullvad)"
+fi
+
 # ---------------------------------------------------------------- never-stays-off settings on the real hardware
 wd=$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null)
 wds=$(cat /sys/class/watchdog/watchdog0/state 2>/dev/null)
