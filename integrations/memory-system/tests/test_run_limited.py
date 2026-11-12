@@ -181,14 +181,14 @@ def ready():
     time.sleep(1)
 def delayed_popen(*a, **kw):
     process = real_popen(*a, **kw)
-    ready()
+    if kw.get('start_new_session'): ready()
     return process
 def delayed_replay(*a, **kw):
     if not os.path.exists(marker): ready()
     return real_replay(*a, **kw)
 if phase == 'launch': r.subprocess.Popen = delayed_popen
 else: r.replay_capture = delayed_replay
-sys.exit(r.run([sys.executable, '-c', sys.argv[5], pids, sys.argv[6], phase], 120))
+sys.exit(r.run([sys.executable, '-c', sys.argv[5], pids, sys.argv[6], phase], 120 if phase == 'launch' else 0.3))
 """
         for phase in ("launch", "replay"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
@@ -250,9 +250,211 @@ time.sleep(120)
                     wrapper.communicate(timeout=5)
                 cleanup_fixture(pids_file)
 
+    def run_escaped_fixture(self, patch="", seconds=1, expected=124, double_fork=False):
+        with tempfile.TemporaryDirectory() as directory:
+            pids_file = Path(directory) / "pids"
+            child = """
+import os, signal, sys, time
+sys.stderr.write('noise' * 1000)
+sys.stderr.flush()
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print('ready', flush=True)
+time.sleep(120)
+"""
+            parent = """
+import os, subprocess, sys
+p = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], stdout=subprocess.PIPE, text=True)
+p.stdout.readline()
+open(sys.argv[1], 'w').write(f'{os.getpid()} {p.pid}')
+"""
+            if double_fork:
+                intermediate = """
+import subprocess, sys
+p = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], stdout=subprocess.PIPE, text=True)
+p.stdout.readline()
+open(sys.argv[1], 'w').write(f'{sys.argv[3]} {p.pid}')
+"""
+                parent = f"""
+import os, subprocess, sys, time
+p = subprocess.Popen([sys.executable, '-c', {intermediate!r}, sys.argv[1], sys.argv[2], str(os.getpid())])
+p.wait()
+time.sleep(120)
+"""
+            entry = f"""
+import os, signal, sys
+sys.path.insert(0, {str(SRC)!r})
+import run_limited as r
+r.KILL_GRACE_SECONDS = 0.1
+r.KILL_VERIFY_SECONDS = 1
+{patch}
+sys.exit(r.run([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3]], {seconds}))
+"""
+            try:
+                result = subprocess.run(
+                    [sys.executable, '-c', entry, parent, str(pids_file), child],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected == 125:
+                    pid = int(pids_file.read_text().split()[1])
+                    self.assertIn(f"run_limited: survivors after SIGKILL: {pid} ", result.stderr)
+                    self.assertFalse(fixture_status(pid).startswith('Z'))
+                    self.assertTrue(fixture_status(pid))
+                    self.assertIn(f"survivors after SIGKILL: {pid} ", result.stderr[-600:])
+                else:
+                    self.assert_fixture_stopped(pids_file)
+                return result
+            finally:
+                cleanup_fixture(pids_file)
+
+    def test_timeout_kills_orphan_after_intermediate_reaped(self):
+        self.run_escaped_fixture(double_fork=True)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin original-parent identity regression')
+    def test_timeout_kills_descendant_in_other_group(self):
+        self.run_escaped_fixture()
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin original-parent identity regression')
+    def test_survivor_reported(self):
+        self.run_escaped_fixture(patch="""
+real_kill = r.ChildTree.signal_pid
+def ignore_kill(self, process, sig):
+    if sig != signal.SIGKILL:
+        real_kill(self, process, sig)
+r.ChildTree.signal_pid = ignore_kill
+""", expected=125)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin original-parent identity regression')
+    def test_wrapper_signals_kill_descendant_in_other_group(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                self.run_escaped_fixture(patch=f"""
+real_refresh = r.ChildTree.refresh
+sent = False
+def stop_with_zombie_leader(self):
+    global sent
+    alive = real_refresh(self)
+    if not sent and any(p.pid != self.leader for p in alive):
+        # The leader exits immediately after publishing the grandchild PID.
+        os.waitid(os.P_PID, self.leader, os.WEXITED | os.WNOWAIT)
+        sent = True
+        os.kill(os.getpid(), {int(sig)})
+    return alive
+r.ChildTree.refresh = stop_with_zombie_leader
+""", seconds=120, expected=128 + sig)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin original-parent identity regression')
+    def test_signal_during_final_reap(self):
+        self.run_escaped_fixture(patch="""
+real_refresh = r.ChildTree.refresh
+replayed = False
+in_boundary = False
+real_replay = r.replay_capture
+def replay(*args):
+    global replayed
+    replayed = True
+    return real_replay(*args)
+def hide_until_boundary(self):
+    global in_boundary
+    alive = real_refresh(self)
+    if not replayed:
+        # Force the original normal-exit path while the escaped child lives.
+        if any(p.pid != self.leader for p in alive):
+            os.waitid(os.P_PID, self.leader, os.WEXITED | os.WNOWAIT)
+        return []
+    if not in_boundary:
+        in_boundary = True
+        assert signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        # Past replay's cleanup check, with the leader still unreaped. TERM
+        # becomes pending, then must be handled after the final reap unmasks.
+        os.kill(os.getpid(), signal.SIGTERM)
+    return alive
+r.ChildTree.refresh = hide_until_boundary
+r.replay_capture = replay
+""", seconds=120, expected=143)
+
+    def test_child_spawned_during_term_grace_is_killed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pids_file = Path(directory) / "pids"
+            child = "import os,sys,time; os.setsid(); print('ready',flush=True); time.sleep(120)"
+            parent = """
+import os, signal, subprocess, sys, time
+def on_term(*_):
+    p = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], stdout=subprocess.PIPE, text=True)
+    p.stdout.readline()
+    open(sys.argv[1], 'w').write(f'{os.getpid()} {p.pid}')
+signal.signal(signal.SIGTERM, on_term)
+time.sleep(120)
+"""
+            entry = f"import sys; sys.path.insert(0, {str(SRC)!r}); import run_limited as r; r.KILL_GRACE_SECONDS=.3; sys.exit(r.main())"
+            try:
+                result = subprocess.run(
+                    [sys.executable, '-c', entry, '--seconds', '1', '--', sys.executable,
+                     '-c', parent, str(pids_file), child],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assert_fixture_stopped(pids_file)
+            finally:
+                cleanup_fixture(pids_file)
+
+    def test_reused_pid_not_signalled_or_followed(self):
+        spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        old = runner.ProcessInfo(900001, 1, 900001, 'S', 123, 0, 'owned')
+        reused = runner.ProcessInfo(900001, 1, 900002, 'S', 124, 0, 'unrelated')
+        foreign_child = runner.ProcessInfo(900003, 900001, 900002, 'S', 125, 124, 'unrelated child')
+        tree = runner.ChildTree(old.pid)
+        tree.members[old.pid] = old
+        with mock.patch.object(runner, 'process_table', return_value={old.pid: reused, foreign_child.pid: foreign_child}), \
+             mock.patch.object(runner.os, 'kill') as kill:
+            tree.signal_pid(old, signal.SIGKILL)
+            self.assertEqual(tree.refresh(), [])
+            self.assertNotIn(foreign_child.pid, tree.members)
+            kill.assert_not_called()
+
+    def test_reused_pid_can_be_a_new_descendant(self):
+        spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        leader = runner.ProcessInfo(900001, 1, 900001, 'Z', 123, 0, 'leader')
+        old = runner.ProcessInfo(900002, 900001, 900002, 'Z', 124, 123, 'old')
+        replacement = runner.ProcessInfo(900002, 900001, 900002, 'S', 125, 123, 'new child')
+        tree = runner.ChildTree(leader.pid)
+        tree.members = {leader.pid: leader, old.pid: old}
+        tree.identities = {leader.identity, old.identity}
+        with mock.patch.object(runner, 'process_table', return_value={leader.pid: leader, replacement.pid: replacement}):
+            self.assertEqual(tree.refresh(), [replacement])
+            self.assertEqual(tree.identities, {123, 124, 125})
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin atomic process record regression')
+    def test_native_ownership_does_not_use_stale_ps_ancestry(self):
+        spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        def native(pid, flavor, arg, pointer, size):
+            record = pointer._obj
+            if flavor == 13:
+                record.pid, record.ppid, record.pgid, record.status = pid, 1, 900099, 2
+            else:
+                self.assertEqual(flavor, 17)
+                record.uniqueid, record.parent_uniqueid = 125, 1
+            return size
+        fake_ps = subprocess.CompletedProcess([], 0, '900002 900001 900001 S Thu Nov 12 00:00:00 2026 stale command\n', '')
+        with mock.patch.object(runner.subprocess, 'run', return_value=fake_ps), \
+             mock.patch.object(runner.LIBPROC, 'proc_pidinfo', side_effect=native):
+            record = runner.process_table()[900002]
+            self.assertEqual((record.ppid, record.pgid, record.identity), (1, 900099, 125))
+
     def test_replay_does_not_change_surviving_writer_offset(self):
         spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
         runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
         spec.loader.exec_module(runner)
         with tempfile.TemporaryFile() as capture, tempfile.TemporaryFile() as replay:
             capture.write(b"original")

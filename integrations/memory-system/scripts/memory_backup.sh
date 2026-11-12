@@ -106,6 +106,11 @@ replicate() { # live-path replica-name
     replica_start=$(date +%s)
     rc=0
     out=$(run_bg_limited "$REPLICA_TIMEOUT_S" "$SQRSYNC" -v "$src" "$STAGE/$db" 2>&1) || rc=$?
+    if [ "$rc" -eq 125 ]; then
+      out="replica $db: child survived kill: $(printf '%s' "$out" | tail -c 600)"
+      log "$out"
+      fail replica "$out"
+    fi
     if [ "$rc" -eq 124 ]; then
       [ -z "$out" ] || log "replica $db timeout output: $(printf '%s' "$out" | tail -c 600)"
       fail replica "$db: sqlite3_rsync timed out after $REPLICA_TIMEOUT_S s (disk contention?)"
