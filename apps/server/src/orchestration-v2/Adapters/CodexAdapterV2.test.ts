@@ -3175,6 +3175,95 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("lists every loaded native thread across pages and deduplicates ids", () =>
+    Effect.gen(function* () {
+      const preamble = codexReplayPreamble({
+        nativeThreadId: "loaded-list",
+        nativeTurnId: "unused",
+        prompt: "unused",
+      });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "loaded-list",
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              frame: { id: 3, method: "thread/loaded/list", params: { limit: 100 } },
+            },
+            {
+              type: "emit_inbound",
+              frame: { id: 3, result: { data: ["one", "two"], nextCursor: "page-2" } },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "thread/loaded/list",
+                params: { limit: 100, cursor: "page-2" },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: { id: 4, result: { data: ["two", "three"], nextCursor: null } },
+            },
+          ],
+        }),
+      );
+      assert.deepEqual(yield* harness.runtime.listLoadedNativeThreads!(), ["one", "two", "three"]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("rejects a failed later loaded-list page rather than returning a partial list", () =>
+    Effect.gen(function* () {
+      const preamble = codexReplayPreamble({
+        nativeThreadId: "loaded-list-failure",
+        nativeTurnId: "unused",
+        prompt: "unused",
+      });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "loaded-list-failure",
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              frame: { id: 3, method: "thread/loaded/list", params: { limit: 100 } },
+            },
+            {
+              type: "emit_inbound",
+              frame: { id: 3, result: { data: ["one"], nextCursor: "page-2" } },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "thread/loaded/list",
+                params: { limit: 100, cursor: "page-2" },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: { id: 4, error: { code: -32603, message: "listing unavailable" } },
+            },
+          ],
+        }),
+      );
+      const error = yield* harness.runtime.listLoadedNativeThreads!().pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterProtocolError");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   const exitedAppServerHarness = (scenario: string) => {
     const preamble = codexReplayPreamble({
       nativeThreadId: scenario,
