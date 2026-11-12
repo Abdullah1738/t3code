@@ -18,7 +18,7 @@
 # Copy to the server and run as root (install puts it at /usr/local/sbin/offbox-exit-proxy):
 #   exit-proxy.sh install          sing-box (GitHub, checksum pinned), unit, default name list
 #   exit-proxy.sh set              proxy as host:port:user:password on stdin (SOCKS5 port), then starts it
-#   exit-proxy.sh reload           after editing /etc/offbox/exit-proxy-domains
+#   exit-proxy.sh reload           after editing /etc/offbox/exit-proxy-domains (cuts open box web connections once)
 #   exit-proxy.sh health           used by the timer: bypass the proxy while it is down, use it again when it is back
 #   exit-proxy.sh check            PASS/FAIL lines; exit 1 on any FAIL
 #   exit-proxy.sh off              stop it; every box connection leaves through Mullvad again
@@ -34,6 +34,7 @@ DOMAINS=/etc/offbox/exit-proxy-domains   # one name per line; a name covers its 
 CONF=/etc/offbox/exit-proxy.json         # generated, mode 600 (holds the proxy password)
 BYPASS=/run/offbox-exit-proxy.bypass     # exists = the proxy failed its health probe; names go through Mullvad
 FAILS=/run/offbox-exit-proxy.fails
+GOODS=/run/offbox-exit-proxy.goods
 LISTEN=10.77.0.1                         # incusbr0; a nat "redirect" lands on the incoming interface's address
 PORT=12380
 PROBE_URL=https://dl.google.com/android/repository/repository2-3.xml
@@ -182,14 +183,15 @@ cmd_set() {
   ( umask 077; mkdir -p /etc/offbox
     printf 'EXIT_PROXY_HOST=%q\nEXIT_PROXY_PORT=%q\nEXIT_PROXY_USER=%q\nEXIT_PROXY_PASS=%q\n' "$h" "$p" "$u" "$w" > "$ENVF" )
   unset w
-  rm -f "$BYPASS" "$FAILS"
+  rm -f "$BYPASS" "$FAILS" "$GOODS"
   systemctl restart offbox-exit-proxy.service
   cmd_check
 }
 
 cmd_reload() { write_config; systemctl restart offbox-exit-proxy.service; }
 
-# Three failed probes in a row (6 minutes) turn the bypass on; one good probe turns it off.
+# Three failed probes in a row (6 minutes) turn the bypass on; three good ones in a row turn it off.
+# Each switch restarts sing-box, which cuts the boxes' open web connections once, so it must not flap.
 cmd_health() {
   [ -r "$ENVF" ] || return 0
   systemctl is-enabled -q offbox-exit-proxy.service 2>/dev/null || return 0
@@ -199,11 +201,15 @@ cmd_health() {
     200 | 206)
       rm -f "$FAILS"
       if [ -e "$BYPASS" ]; then
-        rm -f "$BYPASS"
-        logger -t offbox-exit "residential exit answers again; using it"
-        cmd_reload
+        n=$(( $(cat "$GOODS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GOODS"
+        if [ "$n" -ge 3 ]; then
+          rm -f "$BYPASS" "$GOODS"
+          logger -t offbox-exit "residential exit answers again; using it"
+          cmd_reload
+        fi
       fi ;;
     *)
+      rm -f "$GOODS"
       n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAILS"
       if [ "$n" -ge 3 ] && [ ! -e "$BYPASS" ]; then
         : > "$BYPASS"
