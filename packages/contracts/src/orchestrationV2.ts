@@ -43,7 +43,7 @@ import {
   OrchestrationGetTurnDiffInput,
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
-import { ModelSelection } from "./modelSelection.ts";
+import { ModelSelection, ModelSelectionRouting } from "./modelSelection.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -747,6 +747,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   model: Schema.NullOr(Schema.String),
   modelSelection: Schema.optional(ModelSelection),
   completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
+  selectionRouting: Schema.optional(ModelSelectionRouting),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
   status: Schema.Literals([
     "idle",
@@ -3133,6 +3134,7 @@ export const OrchestrationV2Command = Schema.Union([
     idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,
+    selectionRouting: Schema.optional(ModelSelectionRouting),
     runtimeMode: RuntimeMode,
     interactionMode: ProviderInteractionMode,
     workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),

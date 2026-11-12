@@ -9,6 +9,7 @@ import {
   type OrchestratorMcpFailure,
   NodeId,
   OrchestratorMcpTarget,
+  OrchestratorMcpDelegateTaskResult,
   type OrchestrationV2ThreadShell,
   type ScheduledTask,
   ScheduledTaskId,
@@ -65,6 +66,15 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
+const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
+const encodeDelegateTaskResult = Schema.encodeSync(
+  Schema.fromJsonString(OrchestratorMcpDelegateTaskResult),
+);
+const decodeLegacyDelegateTaskResult = Schema.decodeUnknownSync(
+  OrchestratorMcpDelegateTaskResult.mapFields(
+    ({ selectionRouting: _routing, ...fields }) => fields,
+  ),
+);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
@@ -3343,6 +3353,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         type: "select" as const,
         options: ["high", "max"].map((value) => ({ id: value, label: value })),
       });
+      const haiku = "claude-haiku-5-5";
+      const legacyHaiku = `opus/cc/${haiku}`;
       const snapshot = (
         instanceId: ProviderInstanceId,
         driver: string,
@@ -3350,28 +3362,160 @@ describe("OrchestratorMcpService provider resolution", () => {
         optionDescriptors: NonNullable<
           NonNullable<ServerProvider["models"][number]["capabilities"]>["optionDescriptors"]
         >,
+        extraModels: ServerProvider["models"] = [],
       ): ServerProvider => ({
         ...providerSnapshot({ instanceId, driver: ProviderDriverKind.make(driver), model }),
         models: [
           { slug: model, name: model, isCustom: false, capabilities: { optionDescriptors } },
+          ...extraModels,
         ],
       });
-      const legacyProvider = snapshot(opencode, "opencode", "opus/claude-opus-5-5#high", [
-        select("variant"),
-        { id: "fastMode", label: "fastMode", type: "boolean" },
-      ]);
+      const legacyProvider = snapshot(
+        opencode,
+        "opencode",
+        "opus/claude-opus-5-5#high",
+        [select("variant"), { id: "fastMode", label: "fastMode", type: "boolean" }],
+        [
+          {
+            slug: legacyHaiku,
+            name: legacyHaiku,
+            isCustom: false,
+            capabilities: { optionDescriptors: [select("variant")] },
+          },
+        ],
+      );
       const providers = [
-        snapshot(claude, "claudeAgent", "claude-opus-5-5", [
-          select("effort"),
-          { id: "fastMode", label: "fastMode", type: "boolean" },
-        ]),
+        snapshot(
+          claude,
+          "claudeAgent",
+          "claude-opus-5-5",
+          [select("effort"), { id: "fastMode", label: "fastMode", type: "boolean" }],
+          [
+            {
+              slug: haiku,
+              name: haiku,
+              isCustom: false,
+              capabilities: { optionDescriptors: [select("effort")] },
+            },
+          ],
+        ),
         snapshot(codexInstanceId, "codex", "gpt-6.1-sol", [
           select("reasoningEffort"),
           select("serviceTier"),
         ]),
       ];
+      const maxVariant = [{ id: "variant", value: "max" }] as const;
+      const maxEffort = [{ id: "effort", value: "max" }] as const;
+      const nativeParent = { instanceId: claude, model: "claude-opus-5-5" };
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        {
+          name: "reports an explicit legacy Haiku request",
+          mode: "apply",
+          parent: nativeParent,
+          target: { providerInstanceId: opencode, model: legacyHaiku, options: maxVariant },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: legacyHaiku,
+            options: maxVariant,
+          },
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
+        {
+          name: "flag off leaves an explicit legacy request unchanged",
+          mode: "off",
+          parent: nativeParent,
+          target: { providerInstanceId: opencode, model: legacyHaiku, options: maxVariant },
+          routingRequested: null,
+          expected: { instanceId: opencode, model: legacyHaiku, options: maxVariant },
+        },
+        {
+          name: "native target has no remap notice",
+          mode: "apply",
+          parent: nativeParent,
+          target: { providerInstanceId: claude, model: haiku, options: maxEffort },
+          routingRequested: null,
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
+        {
+          name: "reports an inherited legacy Haiku selection",
+          mode: "apply",
+          parent: { instanceId: opencode, model: legacyHaiku, options: maxVariant },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: legacyHaiku,
+            options: maxVariant,
+          },
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
+        {
+          name: "reports a model-only legacy Haiku request from a native parent",
+          mode: "apply",
+          parent: nativeParent,
+          target: { model: legacyHaiku, options: maxVariant },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: legacyHaiku,
+            options: maxVariant,
+          },
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
+        {
+          name: "reports a driver-only inherited legacy Haiku request",
+          mode: "apply",
+          parent: { instanceId: opencode, model: legacyHaiku, options: maxVariant },
+          target: { driverKind: "opencode" },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: legacyHaiku,
+            options: maxVariant,
+          },
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
+        {
+          name: "reports an explicit legacy GPT request",
+          mode: "apply",
+          parent: nativeParent,
+          target: {
+            providerInstanceId: opencode,
+            model: "opus/cx/gpt-6.1-sol",
+            options: maxVariant,
+          },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: "opus/cx/gpt-6.1-sol",
+            options: maxVariant,
+          },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "max" }],
+          },
+        },
+        {
+          name: "reports an explicit non-cc Opus request",
+          mode: "apply",
+          parent: nativeParent,
+          target: {
+            providerInstanceId: opencode,
+            model: "opus/claude-opus-5-5",
+            options: maxVariant,
+          },
+          routingRequested: {
+            providerInstanceId: opencode,
+            model: "opus/claude-opus-5-5",
+            options: maxVariant,
+          },
+          expected: { ...nativeParent, options: maxEffort },
+        },
+        {
+          name: "explicit native target stays unreported when the parent is legacy",
+          mode: "apply",
+          parent: { instanceId: opencode, model: legacyHaiku, options: maxVariant },
+          target: { providerInstanceId: claude, model: haiku },
+          routingRequested: null,
+          expected: { instanceId: claude, model: haiku, options: maxEffort },
+        },
         {
           name: "inherits a saved standard marker without a fast catalog option",
           mode: "apply",
@@ -3582,7 +3726,10 @@ describe("OrchestratorMcpService provider resolution", () => {
         },
       ] as const;
       for (const testCase of cases) {
-        const commands: Array<{ modelSelection: ModelSelection }> = [];
+        const commands: Array<{
+          modelSelection: ModelSelection;
+          selectionRouting?: NonNullable<OrchestratorMcpDelegateTaskResult["selectionRouting"]>;
+        }> = [];
         const task = {
           id: taskId,
           threadId: parentThreadId,
@@ -3597,10 +3744,23 @@ describe("OrchestratorMcpService provider resolution", () => {
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             hasReceipt: () => Effect.succeed(false),
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             getThreadRecords: ((threadId: ThreadId) =>
               Effect.succeed(
                 threadId === parentThreadId
-                  ? parentProjection(commands.length > 0 ? [task] : [], testCase.parent)
+                  ? parentProjection(
+                      commands.length > 0
+                        ? [
+                            {
+                              ...task,
+                              ...(commands[0]?.selectionRouting === undefined
+                                ? {}
+                                : { selectionRouting: commands[0].selectionRouting }),
+                            },
+                          ]
+                        : [],
+                      testCase.parent,
+                    )
                   : {
                       ...childProjection,
                       thread: {
@@ -3611,7 +3771,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               )) as never,
             dispatch: (command) =>
               Effect.sync(() => {
-                commands.push(command as unknown as { modelSelection: ModelSelection });
+                commands.push(command as unknown as (typeof commands)[number]);
                 return {
                   storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
                 } as never;
@@ -3664,6 +3824,48 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.deepEqual(commands[0]?.modelSelection, testCase.expected, testCase.name);
             assert.equal(result.providerInstanceId, testCase.expected.instanceId, testCase.name);
             assert.equal(result.model, testCase.expected.model, testCase.name);
+            if ("routingRequested" in testCase) {
+              if (testCase.routingRequested === null) {
+                assert.isUndefined(result.selectionRouting, testCase.name);
+              } else {
+                assert.deepEqual(
+                  result.selectionRouting?.requested,
+                  testCase.routingRequested,
+                  testCase.name,
+                );
+                assert.equal(result.selectionRouting?.reason, "harness-migration");
+                assert.include(
+                  result.selectionRouting!.message,
+                  `${testCase.routingRequested.providerInstanceId}/${testCase.routingRequested.model}`,
+                );
+                assert.include(
+                  result.selectionRouting!.message,
+                  `${result.providerInstanceId}/${result.model} (${result.providerInstanceId === "codex" ? "reasoningEffort" : "effort"} max)`,
+                );
+                assert.include(result.selectionRouting!.message, "same route as");
+                assert.include(result.selectionRouting!.message, "not a separate fallback");
+              }
+              const status = yield* service.taskStatus(scope, result.taskId);
+              assert.deepEqual(status.selectionRouting, result.selectionRouting, testCase.name);
+              assert.deepEqual(
+                decodeLegacyDelegateTaskResult(result),
+                (() => {
+                  const { selectionRouting: _routing, ...legacy } =
+                    decodeDelegateTaskResult(result);
+                  return legacy;
+                })(),
+              );
+              if (result.selectionRouting !== undefined && result.selectionRouting !== null) {
+                assert.include(encodeDelegateTaskResult(result), result.selectionRouting.message);
+              }
+              const oldReply = { ...result };
+              delete oldReply.selectionRouting;
+              assert.isUndefined(decodeDelegateTaskResult(oldReply).selectionRouting);
+              assert.deepEqual(
+                decodeDelegateTaskResult(result).selectionRouting,
+                result.selectionRouting,
+              );
+            }
           }
         }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
       }

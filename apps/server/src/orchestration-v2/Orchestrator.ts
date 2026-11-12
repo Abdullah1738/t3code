@@ -7260,6 +7260,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         idleTimeoutMs: normalizeIdleTimeout(command.idleTimeoutMs),
         title: command.title ?? null,
         model: command.modelSelection.model,
+        ...(command.selectionRouting === undefined
+          ? {}
+          : { selectionRouting: command.selectionRouting }),
         ...(command.completionWake === undefined ? {} : { completionWake: command.completionWake }),
         status: "running",
         result: null,
