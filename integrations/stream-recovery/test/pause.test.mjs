@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { loadControl, pauseRecovery, resumeRecovery, controlStatus, parseDuration, recoveryElapsed, recoveryFloor, guardRecoveryIo } from '../lib/pause.mjs';
 import { restartScan } from '../lib/restartwatch.mjs';
 import { stallScan } from '../lib/stallwatch.mjs';
-import { act, scan } from '../cli.mjs';
+import { FALLBACK_MS } from '../lib/stall.mjs';
+import { act, gatherThread, scan } from '../cli.mjs';
 import * as realIo from '../lib/io.mjs';
 
 const T0 = Date.parse('2026-11-01T12:00:00Z');
@@ -342,4 +343,115 @@ test('paused time does not make a held coordination pulse stale', async () => {
   await restartScan(f.args(state), f.io);
   assert.ok(f.calls.some(([type]) => type === 'queue.resume'));
   assert.ok(!f.calls.some(([type]) => type === 'queued-run.cancel'));
+});
+
+
+for (const kind of ['ghost', 'robob', 'opencode']) {
+  test(`final pause gate before ${kind} interrupt leaves it recoverable after resume`, async () => {
+    const dir = temp(), f = stallFixture(dir);
+    let thread = { threadId: 't', title: 'Thread', model: { instanceId: 'opencode' },
+      nativeSessionId: 'ses_a', activeRunId: 'run', state: 'running' };
+    f.io.getThread = async () => thread;
+    f.io.activeSessions = async () => new Set(kind === 'ghost' ? [] : ['ses_a']);
+    f.io.activeThreads = async () => kind === 'ghost' ? [thread] : [];
+    f.io.threadByNative = async () => kind === 'robob' ? thread : null;
+    await stallScan(f.args(), f.io);
+    const interruptAt = T0 + 31 * MIN;
+    f.setTime(interruptAt);
+    let injected = false;
+    f.io.readControl = () => {
+      // Insert the pause only after the new stall is recorded, at the final
+      // transport gate. Earlier rechecks cannot cover this interleaving.
+      if (!injected && Object.values(f.state.stalls).some((s) => kind !== 'opencode' || s.ocTries > 0)) {
+        injected = true;
+        writeFileSync(join(dir, 'control.json'), JSON.stringify({ intervals: [{ start: interruptAt, end: null }], reason: 'final gate' }));
+      }
+      return loadControl(dir);
+    };
+    await assert.rejects(stallScan(f.args(), f.io), { code: 'RECOVERY_PAUSED' });
+    assert.equal(injected, true);
+    assert.deepEqual(f.calls, []);
+    const resumeAt = interruptAt + 60 * MIN;
+    await resumeRecovery(dir, resumeAt);
+    f.setTime(resumeAt);
+    await stallScan(f.args(), f.io);
+    assert.deepEqual(f.calls, [kind === 'opencode' ? ['oc', 'ses_a'] : ['robob']]);
+    await stallScan(f.args(), f.io);
+    assert.equal(f.calls.length, 1);
+    thread = { ...thread, activeRunId: null, state: 'idle' };
+    f.io.activeSessions = async () => new Set();
+    f.io.activeThreads = async () => [];
+    f.setTime(resumeAt + MIN);
+    await stallScan(f.args(), f.io);
+    assert.equal(f.calls.filter(([type]) => type === 'oc' || type === 'robob').length, 1);
+    assert.ok(Object.values(f.state.stalls).every((s) => s.done && s.outcome === 'cleared'));
+  });
+}
+
+const staleHeldCases = [
+  { name: 'fresh coord pulse', age: MIN, coordId: true, text: '[coord] pulse', stale: false },
+  { name: 'coord pulse exactly 24 unpaused hours old', age: 24 * 60 * MIN, coordId: true, text: '[coord] pulse', stale: false },
+  { name: 'coord pulse older than 24 unpaused hours', age: 24 * 60 * MIN + 1, coordId: true, text: '[coord] pulse', stale: true },
+  { name: 'old owner message', age: 72 * 60 * MIN, coordId: false, text: 'owner message', stale: false },
+  { name: 'old owner message with coord text', age: 72 * 60 * MIN, coordId: false, text: '[coord] pulse', stale: false },
+  { name: 'old coord ID with owner text', age: 72 * 60 * MIN, coordId: true, text: 'owner message', stale: false },
+];
+for (const row of staleHeldCases) {
+  test(`stream-drop stale-held age excludes a 25-hour pause: ${row.name}`, async () => {
+    const dir = temp(), f = fixture(dir);
+    const resumeAt = T0 + 25 * 60 * MIN;
+    const dropAt = resumeAt - MIN;
+    await pauseRecovery(dir, {}, T0);
+    await resumeRecovery(dir, resumeAt);
+    f.setClock(resumeAt);
+    const queued = { run_id: 'held', held: true, requested_at: iso(T0 - row.age),
+      user_message_id: row.coordId ? 'ardud-control:send:t0:coord%3Apulse' : 'owner' };
+    f.io.queuedRuns = () => [queued];
+    f.io.messageText = () => row.text;
+    f.io.laterRuns = () => [];
+    f.io.ocSession = async () => ({ time: { updated: dropAt } });
+    f.io.ocMessages = async () => ({ messages: [], complete: true });
+    f.io.threadMessageIdsSince = () => [];
+    f.io.ocForms = async () => [];
+    const incident = { id: 'drop-paused', startMs: dropAt, endMs: dropAt, failAllMs: dropAt,
+      runs: [{ thread_id: 't0', run_id: 'cut-t0', ordinal: 1, requested_at: iso(dropAt - MIN), completed_at: iso(dropAt) }], subagents: [] };
+    const g = await gatherThread({ db: null, incident, threadId: 't0', active: new Set(), now: resumeAt }, f.io);
+    const result = await act({ db: null, incident, g }, f.io);
+    assert.equal(result.ok, true);
+    assert.deepEqual(f.calls.filter(([type]) => type === 'queued-run.cancel'), row.stale ? [['queued-run.cancel', 't0']] : []);
+    assert.deepEqual(g.staleHeld.map((r) => r.run_id), row.stale ? ['held'] : []);
+    assert.deepEqual(f.calls.filter(([type]) => type === 'queue.resume'), row.stale ? [] : [['queue.resume', 't0']]);
+  });
+}
+
+
+test('final pause gate on fallback retains the accepted Robob interrupt and retries only OpenCode', async () => {
+  const dir = temp(), f = stallFixture(dir);
+  f.io.activeSessions = async () => new Set(['ses_a']);
+  f.io.threadByNative = async () => ({ threadId: 't', model: { instanceId: 'opencode' },
+    nativeSessionId: 'ses_a', activeRunId: 'run', state: 'running' });
+  f.io.interruptThread = async () => { f.calls.push(['robob']); return { result: 'no_active_run' }; };
+  await stallScan(f.args(), f.io);
+  const interruptAt = T0 + 31 * MIN;
+  f.setTime(interruptAt);
+  let injected = false;
+  f.io.readControl = () => {
+    if (!injected && Object.values(f.state.stalls).some((s) => s.ocTries > 0)) {
+      injected = true;
+      writeFileSync(join(dir, 'control.json'), JSON.stringify({ intervals: [{ start: interruptAt, end: null }], reason: 'fallback gate' }));
+    }
+    return loadControl(dir);
+  };
+  await assert.rejects(stallScan(f.args(), f.io), { code: 'RECOVERY_PAUSED' });
+  assert.deepEqual(f.calls, [['robob']]);
+  const [stall] = Object.values(f.state.stalls);
+  assert.equal(stall.robobResult, 'no_active_run');
+  assert.equal(stall.ocTries, 0);
+  assert.ok(!stall.done);
+  const resumeAt = interruptAt + 60 * MIN;
+  await resumeRecovery(dir, resumeAt);
+  f.setTime(resumeAt + FALLBACK_MS);
+  await stallScan(f.args(), f.io);
+  await stallScan(f.args(), f.io);
+  assert.deepEqual(f.calls, [['robob'], ['oc', 'ses_a']]);
 });

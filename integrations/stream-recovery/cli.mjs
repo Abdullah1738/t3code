@@ -6,7 +6,7 @@ import {
   assistantText, orphanStatus, sessionFromProviderThread, isNestedThreadId,
   providerThreadFor, robobNativeMessageId, truncate, toMs, hhmm,
 } from './lib/detect.mjs';
-import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryFloor, controlStatus, pauseRecovery, resumeRecovery, parseDuration } from './lib/pause.mjs';
+import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed, recoveryFloor, controlStatus, pauseRecovery, resumeRecovery, parseDuration } from './lib/pause.mjs';
 import * as realIo from './lib/io.mjs';
 import { pathToFileURL } from 'node:url';
 import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
@@ -77,7 +77,7 @@ export async function gatherThread({ db, incident, threadId, active, now, verbos
   const recovered = failed.length > 0
     && io.laterRuns(db, threadId, maxOrdinal).some((r) => r.status === 'running' || r.status === 'completed');
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held);
-  const staleHeld = queued.filter((r) => toMs(r.requested_at) < incident.startMs - STALE_HELD_MS
+  const staleHeld = queued.filter((r) => recoveryElapsed(io, toMs(r.requested_at), incident.startMs) > STALE_HELD_MS
     && r.user_message_id?.startsWith(`ardud-control:send:${threadId}:coord%3A`)
     && /^\[coord[\] ]/.test(io.messageText(db, r.user_message_id) ?? ''));
   const held = queued.filter((r) => !staleHeld.includes(r))

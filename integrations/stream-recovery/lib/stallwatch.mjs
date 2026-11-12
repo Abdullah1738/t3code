@@ -87,7 +87,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
       stall.ocTried = now;
     } catch (err) {
-      if (isRecoveryPaused(err)) throw err;
+      if (isRecoveryPaused(err)) {
+        stall.ocTries--;
+        throw err;
+      }
       stall.errors.push(`opencode interrupt: ${errText(err)}`);
       if (stall.ocTries >= MAX_TRIES) stall.ocTried = now;
     }
@@ -225,7 +228,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           await ocStop(stall);
         }
       } catch (err) {
-        if (isRecoveryPaused(err)) throw err;
+        if (isRecoveryPaused(err)) {
+          if (stall.robobResult === undefined) delete state.stalls[id];
+          throw err;
+        }
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }
@@ -310,7 +316,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           Object.assign(stall, { runId: null, note: false });
         }
       } catch (err) {
-        if (isRecoveryPaused(err)) throw err;
+        if (isRecoveryPaused(err)) {
+          if (stall.robobResult === undefined) delete state.stalls[id];
+          throw err;
+        }
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }
