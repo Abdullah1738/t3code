@@ -98,56 +98,93 @@ def _dollar(s: str, i: int, buf: list, subs: list) -> int:
     return i + 1
 
 
-def _ansi_quote(s, i):
-    buf = []
+def _ansi_escape(s, i, zsh_range):
     escapes = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+    controls = 0
+    while zsh_range and s.startswith("\\C-", i) and i + 3 < len(s):
+        controls += 1
+        i += 3
+    if s[i] != "\\" or i + 1 == len(s):
+        literal, end = s[i], i + 1
+    else:
+        c = s[i + 1]
+        patterns = {"x": r"[0-9a-fA-F]{1,2}", "u": r"[0-9a-fA-F]{1,4}", "U": r"[0-9a-fA-F]{1,8}"}
+        m = re.match(patterns[c], s[i + 2:]) if c in patterns else re.match(r"[0-7]{1,3}", s[i + 1:]) if c in "01234567" else None
+        if m:
+            value = int(m.group(0), 16 if c in patterns else 8)
+            if c not in patterns:
+                value &= 0xff
+            literal = chr(value) if value <= 0x10ffff else "\\" + c + m.group(0)
+            end = i + len(m.group(0)) + (2 if c in patterns else 1)
+        else:
+            literal, end = escapes.get(c, c if zsh_range else "\\" + c), i + 2
+    if controls:
+        value = ord(literal[0])
+        for _ in range(controls):
+            value = 127 if value == 63 else value & 31
+        literal = chr(value)
+    return literal, end
+
+
+def _ansi_quote(s, i, zsh_range=False):
+    buf = []
     i += 2
     while i < len(s) and s[i] != "'":
         if s[i] == "\\" and i + 1 < len(s):
-            c = s[i + 1]
-            patterns = {"x": r"[0-9a-fA-F]{1,2}", "u": r"[0-9a-fA-F]{1,4}", "U": r"[0-9a-fA-F]{1,8}"}
-            m = re.match(patterns[c], s[i + 2:]) if c in patterns else re.match(r"[0-7]{1,3}", s[i + 1:]) if c in "01234567" else None
-            if m:
-                value = int(m.group(0), 16 if c in patterns else 8)
-                if c not in patterns:
-                    value &= 0xff
-                buf.append(chr(value) if value <= 0x10ffff else "\\" + c + m.group(0))
-                i += len(m.group(0)) + (2 if c in patterns else 1)
-                continue
-            buf.append(escapes.get(c, "\\" + c))
-            i += 2
+            literal, i = _ansi_escape(s, i, zsh_range)
+            buf.append(literal)
         else:
             buf.append(s[i])
             i += 1
-    return "".join(buf).split("\x00", 1)[0], min(i + 1, len(s))
+    literal = "".join(buf)
+    # zsh expands character ranges before NUL-containing arguments reach an executable.
+    return (literal if zsh_range else literal.split("\x00", 1)[0]), min(i + 1, len(s))
 
 
 def _brace_expands(s, i):
     depth, comma, plain = 1, False, []
+    quoted = False
+    nested = False
     i += 1
     while i < len(s):
         c = s[i]
         if s.startswith("$'", i):
-            _, i = _ansi_quote(s, i)
-            plain.append("\x00")
+            quoted = True
+            literal, i = _ansi_quote(s, i, zsh_range=True)
+            plain.append(literal)
             continue
         if c == "\\":
-            plain.append("\x00")
+            if not s.startswith("\\\n", i):
+                quoted = True
+                plain.append(s[i + 1:i + 2])
             i += 2
             continue
         if c in "'\"":
+            quoted = True
             quote = c
-            plain.append("\x00")
             i += 1
             while i < len(s) and s[i] != quote:
-                i += 2 if quote == '"' and s[i] == "\\" else 1
+                if quote == '"' and s[i] == "\\" and i + 1 < len(s):
+                    if s[i + 1] != "\n":
+                        plain.append(s[i + 1] if s[i + 1] in '"\\$`' else s[i:i + 2])
+                    i += 2
+                else:
+                    plain.append(s[i])
+                    i += 1
         elif c == "{":
             depth += 1
-            plain.append("\x00")
+            nested = True
         elif c == "}":
             depth -= 1
             if not depth:
-                return comma or re.fullmatch(r"(?:-?\d+\.\.-?\d+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.-?\d+)?", "".join(plain)) is not None
+                if comma:
+                    return True
+                if nested:
+                    return False
+                # zsh removes inner quoting for ranges; Bash accepts leading + only in unquoted ranges.
+                contents = "".join(plain)
+                return (re.fullmatch(r"(?:-?[0-9]+\.\.-?[0-9]+|[\s\S]\.\.[\s\S])(?:\.\.-?[0-9]+)?", contents) is not None
+                        or (not quoted and re.fullmatch(r"(?:[+-]?[0-9]+\.\.[+-]?[0-9]+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.[+-]?[0-9]+)?", contents) is not None))
         elif depth == 1:
             comma = comma or c == ","
             plain.append(c)

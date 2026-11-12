@@ -88,47 +88,85 @@ function dollar(s: string, i: number, buf: string[], subs: string[]): number {
   return i + 1
 }
 
-function ansiQuote(s: string, i: number): [string, number] {
-  const buf: string[] = []
+function ansiEscape(s: string, i: number, zshRange: boolean): [string, number] {
   const escapes: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" }
+  let controls = 0
+  while (zshRange && s.startsWith("\\C-", i) && i + 3 < s.length) { controls++; i += 3 }
+  let literal: string
+  let end: number
+  if (s[i] !== "\\" || i + 1 === s.length) { literal = String.fromCodePoint(s.codePointAt(i)!); end = i + literal.length }
+  else {
+    const c = s[i + 1]
+    const patterns: Record<string, RegExp> = { x: /^[0-9a-fA-F]{1,2}/, u: /^[0-9a-fA-F]{1,4}/, U: /^[0-9a-fA-F]{1,8}/ }
+    const m = patterns[c] ? patterns[c].exec(s.slice(i + 2)) : /[0-7]/.test(c) ? /^[0-7]{1,3}/.exec(s.slice(i + 1)) : null
+    if (m) {
+      const decoded = Number.parseInt(m[0], patterns[c] ? 16 : 8)
+      const value = patterns[c] ? decoded : decoded & 0xff
+      literal = value <= 0x10ffff ? String.fromCodePoint(value) : "\\" + c + m[0]
+      end = i + m[0].length + (patterns[c] ? 2 : 1)
+    } else { literal = escapes[c] ?? (zshRange ? c : "\\" + c); end = i + 2 }
+  }
+  if (controls) {
+    let value = literal.codePointAt(0)!
+    for (let k = 0; k < controls; k++) value = value === 63 ? 127 : value & 31
+    literal = String.fromCharCode(value)
+  }
+  return [literal, end]
+}
+
+function ansiQuote(s: string, i: number, zshRange = false): [string, number] {
+  const buf: string[] = []
   i += 2
   while (i < s.length && s[i] !== "'") {
     if (s[i] === "\\" && i + 1 < s.length) {
-      const c = s[i + 1]
-      const patterns: Record<string, RegExp> = { x: /^[0-9a-fA-F]{1,2}/, u: /^[0-9a-fA-F]{1,4}/, U: /^[0-9a-fA-F]{1,8}/ }
-      const m = patterns[c] ? patterns[c].exec(s.slice(i + 2)) : /[0-7]/.test(c) ? /^[0-7]{1,3}/.exec(s.slice(i + 1)) : null
-      if (m) {
-        const decoded = Number.parseInt(m[0], patterns[c] ? 16 : 8)
-        const value = patterns[c] ? decoded : decoded & 0xff
-        buf.push(value <= 0x10ffff ? String.fromCodePoint(value) : "\\" + c + m[0])
-        i += m[0].length + (patterns[c] ? 2 : 1)
-        continue
-      }
-      buf.push(escapes[c] ?? "\\" + c)
-      i += 2
+      const [literal, end] = ansiEscape(s, i, zshRange)
+      buf.push(literal); i = end
     } else { buf.push(s[i]); i++ }
   }
-  return [buf.join("").split("\x00")[0], Math.min(i + 1, s.length)]
+  const literal = buf.join("")
+  // zsh expands character ranges before NUL-containing arguments reach an executable.
+  return [zshRange ? literal : literal.split("\x00")[0], Math.min(i + 1, s.length)]
 }
 
 function braceExpands(s: string, i: number): boolean {
   let depth = 1
   let comma = false
+  let quoted = false
+  let nested = false
   const plain: string[] = []
   i++
   while (i < s.length) {
     const c = s[i]
-    if (s.startsWith("$'", i)) { i = ansiQuote(s, i)[1]; plain.push("\x00"); continue }
-    if (c === "\\") { plain.push("\x00"); i += 2; continue }
+    if (s.startsWith("$'", i)) {
+      quoted = true
+      const [literal, end] = ansiQuote(s, i, true)
+      plain.push(literal); i = end; continue
+    }
+    if (c === "\\") {
+      if (!s.startsWith("\\\n", i)) { quoted = true; plain.push(s.slice(i + 1, i + 2)) }
+      i += 2; continue
+    }
     if (c === "'" || c === '"') {
+      quoted = true
       const quote = c
-      plain.push("\x00")
       i++
-      while (i < s.length && s[i] !== quote) i += quote === '"' && s[i] === "\\" ? 2 : 1
-    } else if (c === "{") { depth++; plain.push("\x00") }
+      while (i < s.length && s[i] !== quote) {
+        if (quote === '"' && s[i] === "\\" && i + 1 < s.length) {
+          if (s[i + 1] !== "\n") plain.push('"\\$`'.includes(s[i + 1]) ? s[i + 1] : s.slice(i, i + 2))
+          i += 2
+        } else { plain.push(s[i]); i++ }
+      }
+    } else if (c === "{") { depth++; nested = true }
     else if (c === "}") {
       depth--
-      if (!depth) return comma || /^(?:-?\d+\.\.-?\d+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.-?\d+)?$/.test(plain.join(""))
+      if (!depth) {
+        if (comma) return true
+        if (nested) return false
+        // zsh removes inner quoting for ranges; Bash accepts leading + only in unquoted ranges.
+        const contents = plain.join("")
+        return /^(?:-?[0-9]+\.\.-?[0-9]+|[\s\S]\.\.[\s\S])(?:\.\.-?[0-9]+)?$/u.test(contents)
+          || (!quoted && /^(?:[+-]?[0-9]+\.\.[+-]?[0-9]+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.[+-]?[0-9]+)?$/.test(contents))
+      }
     } else if (depth === 1) { comma ||= c === ","; plain.push(c) }
     i++
   }
