@@ -184,7 +184,8 @@ class AffinityTests(Isolated):
         get = api.get.side_effect
         def stopping(bid, **kw):
             if bid == 'A' and not self.resumed:
-                return {'state': 'archiving', 'type': 'large'}
+                # Pooled stop waits yield to the queue and re-read, instead of blocking in wait_state.
+                return {'state': 'archiving' if self.clock.t < 1002 else 'archived', 'type': 'large'}
             return get(bid, **kw)
         with patch.object(api, 'get', side_effect=stopping), patch.object(api, 'wait_state', side_effect=wait):
             self.assertEqual(self.acquire(size='xlarge')['box_id'], 'A')

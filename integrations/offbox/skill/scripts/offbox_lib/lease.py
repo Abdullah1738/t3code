@@ -929,6 +929,7 @@ def _wait_unanswered_resume(con, box_id):
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
                       confirm_only: bool = False):
     from . import allocation, prepare
+    allocation.check_queue()
     with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending):
         return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
 
@@ -939,10 +940,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
     def mark_pending():
         con.execute("INSERT OR REPLACE INTO kv(k,v,ts) VALUES (?, ?, ?)", (key, size or "", now()))
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (f"resume_sender:{box_id}", str(os.getpid()), now()))
         con.commit()
 
     def clear_pending():
-        con.execute("DELETE FROM kv WHERE k=?", (key,))
+        con.execute("DELETE FROM kv WHERE k IN (?,?)", (key, f"resume_sender:{box_id}"))
         con.commit()
 
     def confirm(unanswered):
@@ -955,12 +957,18 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         # A read timeout is not a refusal. Only resend if boat confirms the box stayed stopped for the full window.
         seconds = capacity.setting("OFFBOX_RESUME_CONFIRM_SECONDS", 120, minimum=0, maximum=120)
         end = time.monotonic() + seconds
+        from . import allocation
+        queue_left = allocation.queue_left()
+        queue_limited = queue_left is not None and queue_left < seconds
+        if queue_left is not None:
+            end = min(end, time.monotonic() + queue_left)
         last = None
         observed = False
         unreadable = False
         observations = 0
         previous_read = time.monotonic()
         while True:
+            allocation.check_queue()
             left = end - time.monotonic()
             from . import outage
             remaining = outage.allocation_left()
@@ -985,12 +993,15 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 if last is None or last.get('dataExpiredAt'):
                     _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
                     raise _ResumeExpired
+            allocation.check_queue()
             if last is None:
                 unreadable = True
             read_at = time.monotonic()
             if read_at > end or read_at - previous_read > 3:
                 unreadable = True
             previous_read = read_at
+            if last and last.get('state') in api.STOPPING_STATES + ('archiving',):
+                raise ArchivingSkip(f"{box_id} is {last['state']}; waiting for it to settle", code=EXIT_BUSY)
             if last and last.get("state") in api.STARTING_STATES + api.LIVE_STATES:
                 if last.get('state') in api.LIVE_STATES:
                     from . import allocation
@@ -1020,6 +1031,9 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             time.sleep(min(2, max(0, left - 0.05)))
             if left <= 0.05:
                 break
+        if queue_limited:
+            from .pool import PoolBusyError
+            raise PoolBusyError(f"queue time ran out before {box_id}'s resume could be reconciled; nothing ran")
         if not last or not observed or unreadable or observations < 2:
             raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
                                    "nothing ran. Retry later") from unanswered
@@ -1029,16 +1043,13 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         # The persistent marker is written before sending: a killed client cannot forget an ambiguous resume.
         from . import outage
         from . import allocation
-        other = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                            "WHERE l.repo_key=(SELECT repo_key FROM leases WHERE box_id=?) "
-                            "AND l.box_id<>? AND l.state IN ('running','stopped') "
-                            "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1",
-                            (box_id, box_id, BOX_WEDGED_NOTE + '%')).fetchone()
+        other = allocation.abandoned_resumes(con, allocation.key_for(box_id), box_id)
         if other:
-            raise allocation.Unresolved(f"{other[0]} has an unanswered resume; reconcile before sending another")
+            raise allocation.Fenced(f"{other[0]['box_id']} has an unanswered resume; reconcile before sending another")
         if outage.allocation_left() == 0:
             from .pool import PoolBusyError
             raise PoolBusyError("allocation wait expired before resume; nothing ran")
+        allocation.check_queue()
         mark_pending()
         try:
             api.resume(box_id, ttl, size)
@@ -1047,6 +1058,9 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 return e
             clear_pending()
             raise
+        finally:
+            con.execute("UPDATE kv SET v='' WHERE k=?", (f"resume_sender:{box_id}",))
+            con.commit()
         clear_pending()
         return None
 
@@ -1104,8 +1118,12 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
             raise ResumeStuck(message, code=EXIT_BUSY)
         raise OffboxError(message)
 
+    from . import allocation
     try:
         return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
+    except (allocation.Busy, allocation.Fenced) as error:
+        error.resume_retry_box = box_id
+        raise
     except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady):
         raise
     except OffboxError as e:
@@ -1131,9 +1149,14 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         return None
     box_id = row["box_id"]
     from . import allocation
+    pending_grow = con.execute("SELECT v FROM kv WHERE k=?", (f"resize_size:{box_id}",)).fetchone()
+    if pending_grow and _bigger(pending_grow[0], size):
+        size = pending_grow[0]
     allocation.recover_resumes(con, row['repo_key'])
     pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
     if pending:
+        if allocation.resume_inflight(con, box_id):
+            raise allocation.Busy(f"{box_id} resume is in flight; waiting for its caller")
         t = now()
         prior = con.execute("SELECT kind, detail FROM events WHERE box_id=? "
                             "AND kind IN ('lease_resume_from','lease_resume') ORDER BY rowid DESC LIMIT 1",
@@ -1149,6 +1172,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         want = up.get("type") if isinstance(up, dict) else None
         want = want if want in SIZES else row["size"]
         con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
+        if pending_grow and not _bigger(pending_grow[0], want):
+            con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
         con.commit()
         if _bigger(size, want):
             raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
@@ -1165,11 +1190,20 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         else:
             if p.returncode == 0:
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
+                if pending_grow and not _bigger(pending_grow[0], row['size']):
+                    con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
+                    con.commit()
                 return dict(row)
             reason = f"rc={p.returncode}"
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
-    s = api.get(box_id)
+    try:
+        s = api.get(box_id)
+    except api.NetworkError:
+        if allocation.in_queue() and pending_grow and api.left() is not None and api.left() <= 0:
+            raise ArchivingSkip(f"{box_id} status read reached its affinity deadline; waiting in the pool queue",
+                                code=EXIT_BUSY) from None
+        raise
     if s is None or s.get("state") in ("error", "cancelled"):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         allocation.clear_resume(con, box_id)
@@ -1179,9 +1213,12 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
     st = s.get("state")
+    if st in api.STOPPING_STATES:
+        raise ArchivingSkip(f"{box_id} is {st}; skipping it for now", code=EXIT_BUSY)
     if st == "archiving":
-        if skip_archiving:
-            raise ArchivingSkip(f"{box_id} is archiving; skipping it for now", code=EXIT_BUSY)
+        if skip_archiving or allocation.in_queue():
+            action = "skipping it for now" if skip_archiving else "waiting to resume it"
+            raise ArchivingSkip(f"{box_id} is archiving; {action}", code=EXIT_BUSY)
         say(f"{box_id} is stopping; waiting to resume it")
         s = api.wait_state(box_id, api.STOPPED_STATES + api.LIVE_STATES, timeout=ARCHIVING_WAIT_S)
         st = s.get("state")
@@ -1202,13 +1239,17 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         capacity.check(con)
         if before_grow is not None:
             before_grow(box_id)
+        # Keep the grow intent across the pool's archiving skip, even if a smaller caller resumes next.
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (f"resize_size:{box_id}", want, now()))
+        con.commit()
         api.stop(box_id)
         con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
         con.commit()
         event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
         ssh_sync.close_master(box_id)
-        if skip_archiving:
-            raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
+        if skip_archiving or allocation.in_queue():
+            action = "skipping it for now" if skip_archiving else "waiting to resume it"
+            raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; {action}", code=EXIT_BUSY)
         # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
         try:
@@ -1300,6 +1341,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     else:
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
     con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
+    if not _bigger(size, want):
+        con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
     con.commit()
     if st in api.STOPPED_STATES:
         return _resumed_row(con, box_id, want, now() - t, st)
