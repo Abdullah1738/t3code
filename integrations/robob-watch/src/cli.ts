@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
   saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
@@ -12,9 +12,10 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch add --id ID --title TEXT --check CMD [--interval 30] [--mode wake|notify]
                   (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial]
                   [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime] [--owner-only]
+                  [--depends ssd,phone]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, max_consecutive_failures, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID                 full saved context (wakes carry only its start)
@@ -22,6 +23,10 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch test ID                    run the check once on a scratch copy of its state; no delivery
   robob-watch fire-test ID               deliver a clearly-marked test event through the watcher's mode
   robob-watch pause ID | resume ID [--expires ...]   (resume also re-arms a done/expired watcher)
+  robob-watch depends ID ssd,phone|none   set resources needed by the check or its deliveries
+  robob-watch maintenance on --for 2h [--depends ssd,phone] [--reason "SSD swap"]
+  robob-watch maintenance off            end maintenance now
+  robob-watch maintenance                JSON state and held watcher ids
   robob-watch remove ID                  archive and stop it
   robob-watch relay-ok ID --to JID [--eta ISO]   may this fire message JID now? "ok" (exit 0) counts it; "no" exits 3
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
@@ -30,18 +35,19 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
-print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; alert after 5 in a row).
+print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; pause and alert after 5 in a row).
+watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
 e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.`;
 
 class CliError extends Error {}
 
-function duration(value: string): string {
+function duration(value: string, t = Date.now()): string {
   const match = /^(\d+)\s*([mhdw])$/.exec(value.trim());
   if (match) {
     const unit = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[match[2] as "m" | "h" | "d" | "w"];
-    return iso(Date.now() + Number(match[1]) * unit);
+    return iso(t + Number(match[1]) * unit);
   }
   if (Number.isNaN(Date.parse(value))) throw new CliError("--expires must be like 90m, 6h, 14d, 2w or an ISO date");
   return new Date(value).toISOString();
@@ -66,6 +72,17 @@ const ago = (value?: string) => {
   return s < 120 ? `${s}s ago` : s < 7200 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`;
 };
 
+function statusLabel(watcher: Watcher, state: State): string {
+  return state.failure_paused_at ? `paused (failing since ${state.failing_since ?? state.failure_paused_at})`
+    : watcher.paused ? "paused" : state.status;
+}
+
+function dependencies(value: string): Dependency[] {
+  const items = value.split(",").map(item => item.trim());
+  if (!validDepends(items)) throw new CliError('depends must be "ssd", "phone" or "ssd,phone"');
+  return [...new Set(items)];
+}
+
 async function scratchRun(watcher: Watcher) {
   const scratch = mkdtempSync(join(tmpdir(), `robob-watch-${watcher.id}-`));
   try {
@@ -85,6 +102,7 @@ async function main(argv: string[]): Promise<void> {
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" },
+      depends: { type: "string" }, for: { type: "string" }, reason: { type: "string" },
       chat: { type: "string" }, to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
     },
   });
@@ -117,8 +135,11 @@ async function main(argv: string[]): Promise<void> {
       // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
       // outside watcher.json, so no replace can lift one.
       if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
+      if (values.json === undefined && previous?.depends) input.depends = previous.depends;
+      if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;
       if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
+      if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
       let watcher: Watcher;
       try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { throw new CliError((error as Error).message); }
       const dir = watcherDir(watcher.id);
@@ -154,20 +175,49 @@ async function main(argv: string[]): Promise<void> {
         max_fires: watcher.max_fires, serial: watcher.serial, dir, prime }, null, 2));
       return;
     }
+    case "depends": {
+      const w = need(positionals[0]);
+      if (positionals.length !== 2) throw new CliError("depends needs ID and ssd,phone or none");
+      w.depends = positionals[1] === "none" ? [] : dependencies(positionals[1]!);
+      writeJson(join(watcherDir(w.id), "watcher.json"), normalize(w));
+      console.log(JSON.stringify({ id: w.id, depends: w.depends }));
+      return;
+    }
+    case "maintenance": {
+      if (positionals[0] === "on") {
+        if (!values.for) throw new CliError("maintenance on requires --for (maximum 24h)");
+        const t = Date.now();
+        const until = duration(values.for, t);
+        const ms = Date.parse(until) - t;
+        if (ms <= 0 || ms > 86_400_000) throw new CliError("maintenance --for must be in the future and at most 24h");
+        writeJson(MAINTENANCE_FILE, { until, reason: values.reason ?? "", depends: dependencies(values.depends ?? "ssd,phone") });
+      } else if (positionals[0] === "off") {
+        rmSync(MAINTENANCE_FILE, { force: true });
+      } else if (positionals.length) throw new CliError("maintenance accepts on, off, or no action");
+      const maintenance = loadMaintenance();
+      const held = listIds().filter(id => {
+        const w = loadWatcher(id)!;
+        const s = loadState(id);
+        return s.status === "active" && !w.paused && !s.failure_paused_at && heldByMaintenance(w, maintenance);
+      });
+      console.log(JSON.stringify({ maintenance: maintenance ?? null, held }, null, 2));
+      return;
+    }
     case "list": {
       const ids = listIds();
       if (!ids.length) { console.log("No watchers."); return; }
       for (const id of ids) {
         const w = loadWatcher(id)!;
         const s = loadState(id);
-        const status = w.paused ? "paused" : s.status;
+        const status = statusLabel(w, s);
         console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}\n    ${w.title}`);
       }
       return;
     }
     case "show": {
       const w = need(positionals[0]);
-      console.log(JSON.stringify({ watcher: w, state: loadState(w.id), dir: watcherDir(w.id) }, null, 2));
+      const s = loadState(w.id);
+      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id) }, null, 2));
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
       return;
     }
@@ -209,6 +259,14 @@ async function main(argv: string[]): Promise<void> {
         if (w.expires_at && Date.parse(w.expires_at) <= Date.now()) throw new CliError("Watcher is expired; pass --expires to re-arm it");
         s.status = "active";
         s.fires = 0;
+      }
+      if (command === "resume") {
+        delete s.failure_paused_at;
+        s.consecutive_failures = 0;
+        s.failure_alerted = false;
+        delete s.failure_escalated;
+        delete s.failing_since;
+        delete s.last_error;
       }
       s.next_at = 0;
       saveState(w.id, s);
@@ -260,7 +318,7 @@ async function main(argv: string[]): Promise<void> {
       if (!found.length) { console.log("No watchers mention wa draft/send without relays."); return; }
       for (const w of found) {
         const s = loadState(w.id);
-        console.log(`${w.id}  [${w.paused ? "paused" : s.status}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
+        console.log(`${w.id}  [${statusLabel(w, s)}] expires ${w.expires_at?.slice(0, 16) ?? "never"}  created ${w.created_at.slice(0, 16)}${w.trip ? `  trip ${w.trip}` : ""}\n    ${w.title}`);
       }
       console.log("These list no relays. Their fires can message anyone their check or context names; relays (his words) are optional, and add them to get his stops and the ETA throttle.");
       return;

@@ -24,7 +24,7 @@ robob-watch add --id nik-macbook --title "Nik replied on WhatsApp (MacBook order
   --context-file /path/to/context.txt     # or --context "..."
 ```
 
-Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, quiet, trip, relays, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
+Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, max_consecutive_failures, depends, serial, triggers, trigger_gap_s, quiet, trip, relays, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
 
 `add` runs the check once to **prime** it: baseline helpers record what's already there, so old items never fire. Read the `prime` line in the output. If it says "printed (NOT delivered)", your check fires on existing data and needs fixing.
 
@@ -66,9 +66,15 @@ A watcher whose check or context sends WhatsApp (`wa draft`, `wa send`) can name
 
 - A zsh command run in the watcher's dir with `WATCH_DIR` (and `WATCH_ID`) set, PATH including the helpers, a 60s timeout, and no TTY.
 - **Nothing new**: print nothing, exit 0. **Event**: print the event text on stdout, exit 0. Print only what's new and keep it short.
-- **Non-zero exit** counts as a failure: exponential backoff, and after 5 in a row the owner gets one alert (via Telegram). **Escalation (since 4 Oct 2026):** a `wake` watcher that has been failing for 15+ min also **wakes the agent** once per failure run (source `robob-watch <id> failing`, iMessage text as fallback) with the error and repair steps, and its retries stay at most 5 min apart. If you get one of these: fix the cause (e.g. `wa start`), `robob-watch resume <id>`, confirm with `show`, log it and end with `NO_REPLY` unless something was missed or you can't fix it. A **timeout** is treated as transient: it retries at least every 120s (or the interval, if longer) and alerts only once the watcher has been failing 10+ minutes.
+- **Non-zero exit** counts as a failure: exponential backoff, then a pause after 5 consecutive failures by default. `max_consecutive_failures` in watcher.json sets the threshold; `0` keeps backoff-only retries. A success resets the count. A timeout pauses only once failures have also lasted 10+ minutes. The owner gets one pause notice with the last error and resume command; a failed notice send retries while checks stay paused. Wake watchers also wake the agent at pause time (or after 15 min of failures). Fix the cause, run `robob-watch resume <id>` to clear the pause and failure count, and confirm with `show`. Log it and end with `NO_REPLY` unless something was missed or you can't fix it.
 - Keep your own state (baselines, last-seen) in `$WATCH_DIR`. The first run should record a baseline and print nothing.
 - An event that can't be delivered is kept and retried with the same key before the check runs again, so nothing is lost or doubled.
+
+## Maintenance
+
+Before an SSD swap or unplugging the phone, run `robob-watch maintenance on --depends ssd,phone --for 2h --reason "SSD swap"`. `--for` is required, at most 24h; `--depends` defaults to both resources. `robob-watch maintenance` shows the active flag and held watcher ids; `robob-watch maintenance off` ends it early. Expiry resumes checks automatically.
+
+Set `depends: ["ssd"]`, `["phone"]` or both in watcher.json when the check or its delivery needs those resources. For existing watchers use `robob-watch depends <id> ssd,phone` (or `ssd` / `phone`); `robob-watch depends <id> none` clears it. Maintenance holds their checks and pending event deliveries without counting failures or changing the schedule. Other watchers and existing wake heads-ups continue.
 
 ## Helpers (on PATH inside checks)
 
