@@ -290,6 +290,7 @@ interface ActiveOpenCodeTurn {
   admissionMessageId: string | null;
   interrupted: boolean;
   finalized: boolean;
+  readonly stepFinishes: Map<string, { readonly messageId: string; readonly reason: string }>;
   planId: PlanId | null;
   admissionGeneration: number;
   admissionReconciliationGeneration: number | null;
@@ -1145,6 +1146,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 : providerRef(turn.nativeUserMessageId, "weak"),
             status,
             completedAt,
+            finish:
+              [...turn.stepFinishes.values()].findLast(
+                (step) => turn.usage.assistantOwnershipByMessageId.get(step.messageId) === "owned",
+              )?.reason ?? null,
             ...(completedAt === null
               ? {}
               : {
@@ -2243,6 +2248,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             admissionMessageId: null,
             interrupted: false,
             finalized: false,
+            stepFinishes: new Map(),
             planId: null,
             admissionGeneration: 0,
             admissionReconciliationGeneration: null,
@@ -2444,6 +2450,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           if (part.type === "step-finish") {
             const usage = turn.usage;
             const ownership = usage.assistantOwnershipByMessageId.get(part.messageID);
+            // Map insertion order keeps a replayed older step from replacing the newest finish.
+            turn.stepFinishes.set(part.id, { messageId: part.messageID, reason: part.reason });
             if (ownership === "owned") accumulateOpenCodeStepUsage(usage, part);
             else if (
               ownership === "unknown" ||
@@ -3180,6 +3188,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 admissionMessageId,
                 interrupted: false,
                 finalized: false,
+                stepFinishes: new Map(),
                 planId: null,
                 admissionGeneration: state.nextAdmissionGeneration++,
                 admissionReconciliationGeneration: null,

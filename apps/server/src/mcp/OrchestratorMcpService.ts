@@ -550,7 +550,7 @@ function pageIncludesTerminalTaskResult(input: {
   readonly task: OrchestrationV2Subagent;
   readonly target: Pick<
     OrchestrationV2ThreadProjection,
-    "thread" | "runs" | "contextTransfers" | "messages" | "turnItems"
+    "thread" | "runs" | "contextTransfers" | "messages" | "turnItems" | "providerTurns"
   >;
   readonly maxChars: number;
 }): boolean {
@@ -1709,6 +1709,7 @@ const make = Effect.gen(function* () {
           "contextTransfers",
           "subagents",
           "providerThreads",
+          "providerTurns",
           "runtimeRequests",
           "nodes",
         ],
@@ -1730,9 +1731,15 @@ const make = Effect.gen(function* () {
           ? "result_available"
           : "working"
         : progress.state;
+    const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
+    const summaryRun =
+      task.result === null
+        ? taskResultRun
+        : (childControls.runs.find((run) => run.id === resultTransfer?.sourcePoint.runId) ??
+          childRun);
     const resultRunIds = [
       ...new Set(
-        [taskResultRun?.id, terminalRun?.id, childRun?.id].filter(
+        [taskResultRun?.id, terminalRun?.id, childRun?.id, summaryRun?.id].filter(
           (id): id is RunId => id !== undefined,
         ),
       ),
@@ -1773,11 +1780,15 @@ const make = Effect.gen(function* () {
           : taskStatusForRun(taskResultRun ?? childRun) === "queued"
             ? "queued"
             : "running";
+    const projectedResult =
+      summaryRun !== undefined && isTerminalTaskStatus(status)
+        ? subagentResultForRun(childProjection, summaryRun)
+        : null;
     const derivedResult =
       task.result !== null
         ? task.result
         : taskResultRun !== undefined && isTerminalTaskStatus(status)
-          ? subagentResultForRun(childProjection, taskResultRun).text
+          ? (projectedResult?.text ?? null)
           : null;
     const resultTransfers = parentProjection.contextTransfers.filter(
       (transfer) =>
@@ -1793,7 +1804,6 @@ const make = Effect.gen(function* () {
             ? resultTransfers.find((transfer) => transfer.sourcePoint.runId === undefined)
             : undefined) ??
           null);
-    const resultTransfer = taskResultTransfer(parentProjection, childProjection, task) ?? null;
     const terminalStatus = terminalRun === undefined ? null : taskStatusForRun(terminalRun);
     const latestTerminalSummary = canExposeTaskRunResult(terminalRun)
       ? terminalRun.id === childRun?.id
@@ -1857,6 +1867,10 @@ const make = Effect.gen(function* () {
       model: modelSelection.model,
       options: modelSelection.options ?? [],
       summary: derivedResult,
+      resultLooksIncomplete: projectedResult?.incomplete != null,
+      ...(projectedResult?.incomplete == null
+        ? {}
+        : { incompleteReason: projectedResult.incomplete }),
       resultContextTransferId,
       latestTerminalRunId: terminalRun?.id ?? null,
       latestTerminalStatus:
@@ -2995,7 +3009,7 @@ const make = Effect.gen(function* () {
           const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
           const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
           const resultRecords = yield* threadManagement
-            .getThreadRecords(target.thread.id, ["messages", "turnItems"], {
+            .getThreadRecords(target.thread.id, ["messages", "turnItems", "providerTurns"], {
               messageRoles: ["assistant"],
               messageRunIds: resultRunIds,
               turnItemRunIds: resultRunIds,
