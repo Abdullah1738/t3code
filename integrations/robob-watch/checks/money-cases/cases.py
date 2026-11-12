@@ -49,6 +49,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charges  # noqa: E402
+import payments  # noqa: E402
 
 TZ = ZoneInfo('Asia/Dubai')
 DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
@@ -243,7 +244,7 @@ def check_watcher(watcher_id, root=None):
 
 
 UNMATCHED = 'unmatched'
-KINDS = ('charge', 'hold')
+KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected')
 # Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
 ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
        'I stay quiet on it until you answer')
@@ -588,6 +589,146 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
     return changes
 
 
+def payment_matches(case, notice):
+    return (case.get('kind') in ('payment_deadline', 'autopay_expected') and
+            case.get('merchant') == notice['institution'] and case['amount'] == notice['amount'] and
+            case['currency'] == notice['currency'])
+
+
+def payment_close(case, outcome, at, owner=False):
+    case.update(status='closed', closed=stamp(at), outcome=outcome, updated=stamp(at))
+    case['history'].append({'at': stamp(at), 'text': 'closed: ' + outcome, 'owner': owner})
+
+
+def payment_in(book, notice, source, now):
+    source = check_text('source', source)
+    observed = parse_time(notice['at'])
+    matches = [c for c in book['cases'] if payment_matches(c, notice)]
+    if notice['kind'] == 'payment_success':
+        receipts = book.setdefault('payment_successes', [])
+        if not any(r['source'] == source for r in receipts):
+            receipts.append({**notice, 'source': source})
+        book['payment_successes'] = [r for r in receipts if parse_time(r['at']) >= now - KEEP_SENT]
+        closed = []
+        for case in matches:
+            if case['status'] == 'open' and parse_time(case['opened']) <= observed <= deadline_of(case) + dt.timedelta(days=7):
+                payment_close(case, 'payment confirmed by ' + source, now)
+                closed.append(case['id'])
+        return closed
+    due = check_deadline(notice['deadline'])
+    key = '|'.join((notice['kind'], notice['institution'], notice['currency'], notice['amount'], stamp(parse_time(due))))
+    cid = ('pay-' if notice['kind'] == 'payment_deadline' else 'auto-') + hashlib.sha256(key.encode()).hexdigest()[:20]
+    for case in matches:
+        if case['id'] == cid or source in case.get('sources', []) or (
+                case.get('kind') == notice['kind'] and deadline_of(case) == parse_time(due)):
+            if source not in case.setdefault('sources', []):
+                case['sources'].append(source)
+            if notice.get('deadline_basis') != 'scheduled_fallback':
+                case['deadline_basis'] = 'bank_notice'
+            return case['id']
+    # A delayed/replayed failure must not resurrect a payment already confirmed.
+    for receipt in book.get('payment_successes', []):
+        if payment_matches({'kind': 'payment_deadline', 'merchant': receipt['institution'],
+                            'amount': receipt['amount'], 'currency': receipt['currency']}, notice) and \
+                observed <= parse_time(receipt['at']) <= parse_time(due) + dt.timedelta(days=7):
+            return None
+    case = {'id': cid, 'kind': notice['kind'], 'merchant': notice['institution'],
+            'amount': check_amount(notice['amount']), 'currency': check_currency(notice['currency']),
+            'deadline': due, 'due': due if notice['kind'] == 'autopay_expected' else None,
+            'stated_deadline': notice.get('repayment_deadline'), 'sources': [source],
+            'deadline_basis': notice.get('deadline_basis', 'bank_notice'),
+            'charged': observed.date().isoformat(), 'reference': source, 'why': '',
+            'state': 'autopay expected' if notice['kind'] == 'autopay_expected' else 'payment needs confirmation',
+            'next': 'check payment confirmation; close with --outcome paid when confirmed', 'who': 'Abdullah',
+            'watchers': [], 'status': 'open', 'rev': 0, 'cycle': 0,
+            'opened': stamp(observed), 'updated': stamp(now), 'closed': None, 'outcome': None,
+            'history': [{'at': stamp(now), 'text': 'bank notice: ' + source}]}
+    if notice['kind'] == 'payment_deadline':
+        expected = [c for c in matches if c.get('kind') == 'autopay_expected' and c['status'] == 'open' and
+                    -dt.timedelta(hours=1) <= observed - parse_time(c.get('due') or c['deadline']) <= dt.timedelta(days=1)]
+        if expected:
+            parent = min(expected, key=lambda c: abs(observed - parse_time(c.get('due') or c['deadline'])))
+            case['autopay_case'] = parent['id']
+            previous = next((c for c in matches if c['id'] == parent.get('payment_case')), None)
+            if previous and previous['status'] == 'open' and previous.get('deadline_basis') == 'scheduled_fallback' and notice.get('deadline_basis') != 'scheduled_fallback':
+                payment_close(previous, 'superseded by bank deadline ' + cid, now)
+            parent['payment_case'] = cid
+    book['cases'].append(case)
+    return cid
+
+
+def record_payment(data, notice, source, now=None, end=None):
+    now = now or now_dubai()
+    with Locked(data or DATA, wait=lock_wait(end)) as book:
+        return payment_in(book, notice, source, now)
+
+
+def follow_payments(data, now, deadline, find=None, stats=None, end=None):
+    errors = []
+    source = find or (lambda *args, **kwargs: charges.search(*args, **kwargs, stats=stats))
+    write_end = end if end is not None else deadline + 2
+    candidates = [c for c in load(data)['cases'] if c.get('kind') == 'autopay_expected' and c['status'] == 'open'
+                  and now >= parse_time(c.get('due') or c['deadline']) + dt.timedelta(hours=1)]
+    for case in sorted(candidates, key=lambda c: c.get('payment_checked', '')):
+        if deadline - time.time() < 1:
+            break
+        each = min(deadline, time.time() + 4)
+        due = parse_time(case.get('due') or case['deadline'])
+        success = None
+        try:
+            with within(each, LookupTimeout('autopay lookup out of time')):
+                if stats is not None:
+                    stats['lookups'] += 1
+                # One query spans email and SMS. Parse the returned body as a bank notice;
+                # an amount or a success keyword in an unrelated receipt is not confirmation.
+                query = ' OR '.join(f'"{v}"' for v in charges.amounts(case))
+                rows = source(query, since=charges.day(parse_time(case['opened'])),
+                              until=charges.day(now + dt.timedelta(days=1)), n=20, deadline=each)
+                success = None
+                for row in rows[:20]:
+                    if row.get('from_me') or row.get('source') not in ('email', 'mail', 'imessage', 'sms'):
+                        continue
+                    observed = (dt.datetime.fromtimestamp(row['ts'], TZ) if isinstance(row.get('ts'), (float, int))
+                                else moment(row.get('at') or row.get('date')))
+                    if not observed or not parse_time(case['opened']) <= observed <= now:
+                        continue
+                    if payments.institution(str(row.get('sender') or '')) != case['merchant']:
+                        continue
+                    text = ' '.join(str(row.get(k) or '') for k in ('subject', 'snippet', 'text', 'body'))
+                    if not row.get('body') and not row.get('text'):
+                        text = charges.alert_text(charges.show(row, deadline=each, stats=stats))
+                    notice = payments.parse(text, str(row.get('sender') or ''), observed)
+                    if notice and notice['kind'] == 'payment_success' and payment_matches(case, notice):
+                        success = (notice, str(row['id']))
+                        break
+        except (charges.Lookup, LookupTimeout) as e:
+            errors.append(str(e))
+        # No confirmation is still unconfirmed when the archive is unavailable.
+        # Do not claim the debit failed; keep the deadline visible for checking.
+        with Locked(data, wait=lock_wait(write_end)) as book:
+            current = next(c for c in book['cases'] if c['id'] == case['id'])
+            if current['status'] != 'open':
+                continue
+            current['payment_checked'] = stamp(now)
+            if success:
+                payment_in(book, success[0], success[1], now)
+            else:
+                existing = next((c for c in book['cases'] if c.get('kind') == 'payment_deadline' and c['status'] == 'open' and
+                                 payment_matches(c, {'institution': case['merchant'], 'amount': case['amount'],
+                                                     'currency': case['currency']}) and
+                                 (c['id'] == current.get('payment_case') or
+                                  (deadline_of(c) and abs(deadline_of(c) - due) <= dt.timedelta(days=1)))), None)
+                repayment = (existing['deadline'] if existing else current.get('stated_deadline')) or stamp(due + dt.timedelta(hours=3))
+                notice = {'kind': 'payment_deadline', 'institution': case['merchant'],
+                          'currency': case['currency'], 'amount': case['amount'],
+                          'at': case['opened'], 'deadline': repayment, 'deadline_basis': 'scheduled_fallback'}
+                child = existing['id'] if existing else payment_in(book, notice, 'missing-' + case['id'], now)
+                current['payment_case'] = child
+                if child:
+                    next(c for c in book['cases'] if c['id'] == child)['autopay_case'] = case['id']
+    return errors
+
+
 def close(data, case_id, outcome, at=None):
     with Locked(data) as book:
         case = find(book, case_id)
@@ -598,6 +739,14 @@ def close(data, case_id, outcome, at=None):
         # A pre-auth hold that drops off was released, not refunded.
         word = 'released' if case.get('kind') == 'hold' else 'closed'
         case['history'].append({'at': stamp(at), 'text': f'{word}: {outcome}', 'owner': True})
+        if case.get('kind') in ('payment_deadline', 'autopay_expected'):
+            notice = {'institution': case['merchant'], 'amount': case['amount'], 'currency': case['currency']}
+            for other in book['cases']:
+                if other['status'] == 'open' and payment_matches(other, notice) and (
+                        other['id'] in (case.get('autopay_case'), case.get('payment_case')) or
+                        (deadline_of(other) and deadline_of(case) and
+                         abs(deadline_of(other) - deadline_of(case)) <= dt.timedelta(days=1))):
+                    payment_close(other, outcome, at, owner=True)
     with Locked(data, 'questions') as questions:
         for q in questions['questions']:
             if linked_case(q) == case_id:
@@ -666,6 +815,8 @@ def attention(cases, now, sent, root=None, since=None):
     entries = []
     for case in cases:
         if case.get('status') != 'open' or case_owner(case) != 'abdullah':
+            continue
+        if case.get('kind') in ('payment_deadline', 'autopay_expected'):
             continue
         deadline = deadline_of(case)
         cid = case['id']
@@ -782,7 +933,7 @@ def live_keys(cases):
     for case in cases:
         if case.get('status') == 'open':
             cid, rev, cycle = case['id'], case.get('rev', 0), case.get('cycle', 0)
-            keys += [f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|']
+            keys += [f'{cid}|r{rev}|c{cycle}|payment|', f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|']
     return tuple(keys)
 
 
@@ -1286,6 +1437,26 @@ def question_entries(questions, now, sent):
     return entries
 
 
+def payment_entries(cases, now, sent):
+    entries = []
+    for case in sorted(cases, key=lambda c: deadline_of(c) or now):
+        if case.get('kind') != 'payment_deadline' or case['status'] != 'open' or case_owner(case) != 'abdullah':
+            continue
+        due = deadline_of(case)
+        if not due:
+            continue
+        base = f"{case['id']}|r{case.get('rev', 0)}|c{case.get('cycle', 0)}|payment|"
+        # The watcher ticks every 15 min. Start one tick early so a 23:59 deadline
+        # gets its hour-before reminder before the existing 23:00 quiet window.
+        stage = 'deadline' if now >= due else 'hour' if now >= due - dt.timedelta(minutes=75) else 'initial'
+        if stage is None or base + stage in sent:
+            continue
+        head = f"- {case['id']}: {clip(redact(case['merchant']), 80)} {clip(money(case), 40)}"
+        entries.append((head, [(base + stage, f'Payment deadline {day(due)} {due:%H:%M} Dubai; still unconfirmed')],
+                        'Send this payment reminder alone. Confirm paid/done with money-cases close ID --outcome paid.', None))
+    return entries
+
+
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     started = time.time()
     end = started + CHECK_BUDGET
@@ -1332,7 +1503,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             retained_outbox = state.get('outbox')
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'follow', time.time()
-            errors = follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
+            errors = follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
+            errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
@@ -1367,7 +1539,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                         tail = tail + '. ' + next_action
                         case_id = cid
                     combined.append((head, items, tail, case_id))
-                entries = [entry for entry in due if entry[3] not in covered.values()] + combined
+                payment_due = payment_entries(cases, now, handled)
+                entries = payment_due[:1] if payment_due else [entry for entry in due if entry[3] not in covered.values()] + combined
                 phases[phase] = time.time() - phase_at
                 phase, phase_at = 'build_write', time.time()
                 if entries:
@@ -1459,13 +1632,14 @@ def brief(cases, now=None):
         return ''
     due, changed = [], []
     far = dt.datetime.max.replace(tzinfo=TZ)
-    for case in sorted(open_cases, key=lambda c: deadline_of(c) or far):
+    for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', deadline_of(c) or far)):
         deadline = deadline_of(case)
         if deadline is None:
             due.append(f"{case['merchant']} {money(case)} (no valid deadline)")
-        elif deadline <= now + BRIEF_DUE:
+        elif case.get('kind') == 'payment_deadline' or deadline <= now + BRIEF_DUE:
             late = 'overdue since ' if deadline <= now else ''
-            due.append(f"{case['merchant']} {money(case)} ({late}{when(deadline)})")
+            display = f'{day(deadline)} {deadline:%H:%M} Dubai' if case.get('kind') == 'payment_deadline' else when(deadline)
+            due.append(f"{case['merchant']} {money(case)} ({late}{display})")
         elif parse_time(case['updated']) >= now - BRIEF_CHANGED:
             changed.append(f"{case['merchant']} {money(case)}")
     parts = [f'Money: {len(open_cases)} open']

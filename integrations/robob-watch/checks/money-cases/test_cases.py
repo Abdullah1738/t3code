@@ -1612,5 +1612,180 @@ class Cli(Base):
         self.assertTrue((scratch / 'scratch-books' / 'cases.json').exists())
 
 
+
+
+class PaymentDeadlines(Base):
+    def notice(self, text='Your autopay of AED 3,532.73 failed; repay before midnight',
+               when='2026-11-07T21:05', source='mail:wio:1', sender='Wio'):
+        n = mc.payments.parse(text, sender, at(when))
+        self.assertIsNotNone(n)
+        cid = mc.record_payment(self.data, n, source, at(when))
+        return cid
+
+    def test_wio_replay_and_mail_sms_copy_are_one_case(self):
+        cid = self.notice()
+        self.assertEqual(self.notice(), cid)
+        self.assertEqual(self.notice(source='imsg:2'), cid)
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(case['deadline'], '2026-11-07T23:59:00+04:00')
+        self.assertEqual(case['sources'], ['mail:wio:1', 'imsg:2'])
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+
+    def test_hour_and_deadline_are_acknowledged_once_and_standalone(self):
+        cid = self.notice('Your payment of AED 3,532.73 failed; pay by 21:00', when='2026-11-07T18:00')
+        self.case(deadline='2026-11-07')
+        self.assertIn(cid, self.check('2026-11-07T18:01', 'initial'))
+        self.assertNotIn(cid, self.check('2026-11-07T19:44', 'early'))
+        event = self.check('2026-11-07T20:00', 'hour')
+        self.assertIn('Wio AED 3,532.73', event)
+        self.assertIn('21:00', event)
+        self.assertNotIn('acme', event)
+        self.assertNotIn(cid, self.check('2026-11-07T20:15', 'repeat'))
+        self.assertIn(cid, self.check('2026-11-07T21:00', 'due'))
+        self.assertNotIn(cid, self.check('2026-11-08T09:00', 'tomorrow'))
+
+    def test_midnight_reminder_survives_cadence_and_quiet_hours(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:45', 'hour'))
+        self.assertEqual('', self.check('2026-11-07T23:00', 'quiet'))
+        self.assertIn(cid, self.check('2026-11-08T08:00', 'due'))
+        self.assertEqual('', self.check('2026-11-08T08:15', 'again'))
+
+    def test_hour_at_exact_minus_sixty_and_closed_case_never_fires(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:59', 'hour'))
+        mc.close(self.data, cid, 'paid', at('2026-11-07T23:01'))
+        self.assertEqual('', self.check('2026-11-08T08:00', 'after'))
+        self.assertEqual(self.notice(), cid)
+        self.assertEqual('', self.check('2026-11-08T08:15', 'replay'))
+
+    def test_unacknowledged_event_is_rebuilt_without_closed_case(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:59', 'lost', ack=False))
+        mc.close(self.data, cid, 'done', at('2026-11-07T23:00'))
+        self.assertEqual('', self.check('2026-11-08T08:00', 'closed'))
+
+    def test_success_closes_expected_and_deadline_and_replay_stays_closed(self):
+        parent = self.notice('Autopay of AED 3,532.73 is due tonight at 21:00', '2026-11-07T09:09', 'scheduled')
+        child = self.notice()
+        self.notice('Autopay successful: AED 3,532.73', '2026-11-07T22:30', 'success')
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+        self.assertEqual(self.notice(), child)
+        self.assertEqual('', self.check('2026-11-08T08:00'))
+        self.assertEqual({c['id'] for c in mc.load(self.data)['cases']}, {parent, child})
+
+    def test_owner_closes_both_rows(self):
+        parent = self.notice('Autopay of AED 3,532.73 is due tonight at 18:00', '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00')
+        child = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
+        mc.close(self.data, child['id'], 'paid', at('2026-11-07T19:30'))
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+        with patch.object(mc.charges, 'search') as search:
+            self.assertEqual('', self.check('2026-11-08T09:00'))
+            search.assert_not_called()
+        self.assertEqual(mc.find(mc.load(self.data), parent)['status'], 'closed')
+
+    def test_expected_missing_confirmation_escalates_at_due_plus_one(self):
+        self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00', '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.assertEqual('', self.check('2026-11-07T18:59'))
+            search.assert_not_called()
+            self.assertIn('Wio', self.check('2026-11-07T19:00'))
+            self.assertIsNotNone(search.call_args.kwargs['deadline'])
+            event = self.check('2026-11-07T20:00')
+        self.assertIn('Wio', event)
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(cases[1]['deadline'], '2026-11-07T21:00:00+04:00')
+
+    def test_expected_uses_stated_repayment_deadline(self):
+        self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00; repay before midnight if it fails',
+                    '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00')
+        self.assertEqual(mc.load(self.data)['cases'][1]['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_search_success_requires_bank_amount_currency_and_time(self):
+        for row_changes, closes in (({}, True), ({'sender': 'Shop'}, False), ({'body': 'Payment received AED 1.00'}, False),
+                                    ({'body': 'Payment received USD 3,532.73'}, False),
+                                    ({'ts': at('2026-11-06T21:00').timestamp()}, False),
+                                    ({'source': 'whatsapp'}, False), ({'from_me': 1}, False)):
+            with self.subTest(row_changes=row_changes), tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp)
+                n = mc.payments.parse('Autopay of AED 3,532.73 due today at 18:00', 'Wio', at('2026-11-07T09:00'))
+                mc.record_payment(data, n, 'scheduled', at('2026-11-07T09:00'))
+                row = {'id': 'receipt', 'source': 'email', 'sender': 'Wio', 'body': 'Payment received AED 3,532.73',
+                       'ts': at('2026-11-07T18:05').timestamp(), **row_changes}
+                mc.follow_payments(data, at('2026-11-07T19:00'), time.time() + 3, find=lambda *a, **kw: [row])
+                self.assertEqual(mc.load(data)['cases'][0]['status'] == 'closed', closes)
+
+    def test_archive_timeout_still_tracks_an_unconfirmed_payment(self):
+        self.notice('Autopay of AED 3,532.73 due today at 18:00', '2026-11-07T09:00', 'scheduled')
+        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')):
+            self.check('2026-11-07T20:00')
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 2)
+        self.assertIn('confirmation', cases[1]['state'])
+
+    def test_brief_puts_payment_deadline_first(self):
+        self.case(deadline='2026-11-06')
+        self.notice()
+        line = mc.brief(mc.load(self.data)['cases'], at('2026-11-07T22:00'))
+        self.assertLess(line.index('Wio'), line.index('Acme'))
+        self.assertIn('23:59', line)
+
+    def test_owner_paid_closes_cycle_across_message_dates(self):
+        for schedule_day, failure_time, due_clause in (
+                ('2026-11-07T09:00', '2026-11-08T18:05', 'on 8 November 2026 at 18:00'),
+                ('2026-11-07T09:00', '2026-11-08T00:05', 'on 7 November 2026 at 23:00')):
+            with self.subTest(failure_time=failure_time), tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp)
+                parent = mc.payments.parse('Autopay of AED 100.00 scheduled ' + due_clause, 'Wio', at(schedule_day))
+                mc.record_payment(data, parent, 'scheduled', at(schedule_day))
+                failure = mc.payments.parse('Autopay of AED 100.00 failed; repay before midnight', 'Wio', at(failure_time))
+                child = mc.record_payment(data, failure, 'failed', at(failure_time))
+                mc.close(data, child, 'paid', at(failure_time) + dt.timedelta(minutes=1))
+                self.assertEqual({c['status'] for c in mc.load(data)['cases']}, {'closed'})
+                with patch.object(mc.charges, 'search') as search:
+                    mc.follow_payments(data, at(failure_time) + dt.timedelta(hours=2), time.time() + 3)
+                    search.assert_not_called()
+
+    def test_conditional_success_does_not_close_unpaid_case(self):
+        cid = self.notice('Autopay of AED 100.00 failed; repay before midnight')
+        text = 'Autopay of AED 100.00 is scheduled today at 21:00. We will notify you if payment is successful.'
+        self.notice(text, source='conditional')
+        self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open')
+        self.notice('Payment of AED 100.00 has been successfully received.', source='confirmed')
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+
+    def test_slow_lookups_do_not_abort_reminder_generation(self):
+        self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled-1')
+        self.notice('Autopay of AED 200.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled-2')
+        clock = [time.time()]
+        def slow_archive(*args, **kwargs):
+            clock[0] = kwargs['deadline'] + .01
+            raise mc.charges.Lookup('lookup budget exhausted')
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc.charges, 'search', side_effect=slow_archive):
+            event = self.check('2026-11-07T20:00')
+        self.assertIn('Wio', event)
+        self.assertEqual(sum(c['kind'] == 'payment_deadline' for c in mc.load(self.data)['cases']), 2)
+
+    def test_bank_deadline_supersedes_fallback(self):
+        self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00', 'missing')
+        fallback = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
+        bank = self.notice('Autopay of AED 100.00 failed; repay before midnight', '2026-11-07T20:00', 'bank')
+        self.assertEqual(mc.find(mc.load(self.data), fallback['id'])['status'], 'closed')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            event = self.check('2026-11-07T21:00', 'bank-alert')
+        self.assertIn(bank, event)
+        self.assertNotIn(fallback['id'], event)
+        self.assertNotIn('21:00', event)
+        parent = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'autopay_expected')
+        self.assertEqual(parent['payment_case'], bank)
+
+
 if __name__ == '__main__':
     unittest.main()

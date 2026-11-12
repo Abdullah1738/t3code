@@ -1028,5 +1028,154 @@ class ActivityLogBytes(unittest.TestCase):
         self.assertIn('hookah bowl', ctx['recent_activity_newest_first'])
 
 
+
+
+class PaymentNotices(unittest.TestCase):
+    def setUp(self):
+        self.mc = t.load_module('triage_money_cases', t.MONEY_CASES)
+        self.when = t.dt.datetime(2026, 11, 7, 21, 5, tzinfo=t.DUBAI)
+
+    def test_bank_deadline_wording_and_dates(self):
+        rows = [
+            ('Wio', 'Your autopay of AED 3,532.73 failed; repay before midnight', '2026-11-07T23:59:00+04:00'),
+            ('EmiratesNBD', 'Payment due by 08/11/2026 at 9 PM: AED 3,532.73', '2026-11-08T21:00:00+04:00'),
+            ('Mashreq', 'Pay by 8 November 2026 at 21:00 to avoid interest. AED 3,532.73', '2026-11-08T21:00:00+04:00'),
+            ('ADCB', 'Pay by 2026-11-08 at 9:30 pm to avoid a late fee. AED 3,532.73', '2026-11-08T21:30:00+04:00'),
+            ('FAB', 'Payment due by tomorrow 22:00. AED 3,532.73', '2026-11-08T22:00:00+04:00'),
+            ('American Express', 'Pay by Friday to avoid interest. USD 3,532.73', '2026-11-13T23:59:00+04:00'),
+        ]
+        for sender, text, due in rows:
+            with self.subTest(sender=sender):
+                n = self.mc.payments.parse(text, sender, self.when)
+                self.assertEqual(n['kind'], 'payment_deadline')
+                self.assertEqual(n['deadline'], due)
+                self.assertEqual(n['amount'], '3532.73')
+
+    def test_promos_declines_negation_and_ambiguous_amounts(self):
+        rows = [
+            ('Shop', 'Pay before Friday to get 20% off; Wio AED 100.00'),
+            ('Wio', 'Pay before Friday to get 20% off; AED 100.00'),
+            ('Wio', 'Payment not received AED 100.00'),
+            ('Wio', 'Autopay of AED 100.00 failed'),
+            ('Wio', 'Payment received AED 100.00 for your savings account'),
+            ('Wio', 'Payment received AED 100.00 for your current account'),
+            ('Wio', 'Autopay was not successful AED 100.00'),
+            ('Wio', 'Payment failed for purchase at SHOP AED 100.00'),
+            ('Wio', 'Payment due by tonight: balance AED 200.00, minimum AED 100.00'),
+            ('Wio', 'Autopay scheduled at some point: AED 100.00'),
+        ]
+        for sender, text in rows:
+            with self.subTest(text=text):
+                self.assertIsNone(self.mc.payments.parse(text, sender, self.when))
+
+    def test_wio_is_tracked_before_classifier_and_dry_run_writes_nothing(self):
+        item = {'id': 'mail:wio:1', 'source': 'email', 'sender': 'Wio', 'subject': 'Autopay failed',
+                'preview': 'Your autopay of AED 3,532.73 failed; repay before midnight',
+                'ts': self.when.timestamp(), 'list_unsubscribe': True}
+        self.assertIsNone(t.prefilter(item, self.when.timestamp(), []))
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            with patch.object(self.mc, 'DATA', wd / 'no-live-book'), patch.object(t, 'load_module', return_value=self.mc):
+                reasons, error = t.payment_checks([item], self.when.timestamp(), True, wd=wd)
+                self.assertEqual(reasons, {})
+                self.assertIsNone(error)
+                self.assertFalse((wd / 'scratch-money').exists())
+                for source in ('mail:wio:1', 'imsg:2'):
+                    reasons, error = t.payment_checks([{**item, 'id': source}], self.when.timestamp(), False,
+                                                      deadline=time.time() + 3, wd=wd)
+                    self.assertEqual(reasons[source], 'payment_deadline_tracked')
+                    self.assertIsNone(error)
+                self.assertEqual(len(self.mc.load(wd / 'scratch-money')['cases']), 1)
+
+    def test_success_notice_closes_both_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            with patch.object(self.mc, 'DATA', wd / 'no-live-book'), patch.object(t, 'load_module', return_value=self.mc):
+                items = [{'id': str(i), 'source': 'email', 'sender': 'Wio', 'subject': '', 'preview': text,
+                          'ts': self.when.timestamp() + i * 60} for i, text in enumerate((
+                              'Autopay of AED 3,532.73 due tonight at 21:00',
+                              'Autopay of AED 3,532.73 failed; repay before midnight',
+                              'Autopay successful AED 3,532.73'))]
+                reasons, error = t.payment_checks(items, self.when.timestamp() + 180, False, time.time() + 3, wd)
+                self.assertEqual(len(reasons), 3)
+                self.assertIsNone(error)
+                self.assertEqual({c['status'] for c in self.mc.load(wd / 'scratch-money')['cases']}, {'closed'})
+
+    def test_full_mail_deadline_survives_long_preview_and_bulk_header(self):
+        raw = ('From: Wio <alerts@wio.io>\r\nSubject: Account notice\r\n'
+               'List-Unsubscribe: <mailto:leave@wio.io>\r\nContent-Type: text/plain\r\n\r\n' +
+               'Important account information. ' * 20 +
+               'Your autopay of AED 3,532.73 failed; repay before midnight').encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+            item, reason = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        self.assertIsNone(reason)
+        self.assertNotIn('midnight', item['preview'])
+        self.assertEqual(item['payment_notice']['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_failure_cause_never_replaces_repayment_clause(self):
+        for cause in ('due to insufficient funds', 'due to account restrictions', 'because the account is blocked'):
+            for separator in ('; ', '. ', ' '):
+                text = f'Autopay of AED 3,532.73 failed {cause}{separator}Please repay before midnight'
+                with self.subTest(cause=cause, separator=separator):
+                    notice = self.mc.payments.parse(text, 'Wio', self.when)
+                    self.assertEqual(notice['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_success_and_future_wording_matrix(self):
+        rows = [
+            ('Autopay of AED 100.00 will be debited on 8 November 2026 at 18:00.', 'autopay_expected', '2026-11-08T18:00:00+04:00'),
+            ('Autopay of AED 100.00 will be processed on Friday at 18:00.', 'autopay_expected', '2026-11-13T18:00:00+04:00'),
+            ('Your payment of AED 100.00 is due on 8 November 2026 at 18:00.', 'payment_deadline', '2026-11-08T18:00:00+04:00'),
+            ('Autopay of AED 100.00 has been successfully completed.', 'payment_success', None),
+            ('Payment of AED 100.00 has been successfully received.', 'payment_success', None),
+            ('Autopay of AED 100.00 was successfully debited.', 'payment_success', None),
+            ('Autopay of AED 100.00 is scheduled today at 21:00. We will notify you if payment is successful.', 'autopay_expected', '2026-11-07T21:00:00+04:00'),
+        ]
+        for text, kind, deadline in rows:
+            with self.subTest(text=text):
+                notice = self.mc.payments.parse(text, 'Wio', self.when)
+                self.assertIsNotNone(notice)
+                self.assertEqual((notice['kind'], notice['deadline']), (kind, deadline))
+
+    def test_decline_and_nonconfirmation_wording_matrix(self):
+        rows = [
+            'Payment of AED 100 at X with your Wio debit card ending with 1234 was declined',
+            'Your card payment of AED 100.00 to Netflix failed.',
+            'Payment of AED 100.00 at Netflix failed; pay by midnight',
+            'Check whether payment is successful in the app AED 100.00',
+            'We will notify you if payment is successful AED 100.00',
+            'Payment received AED 100.00 has been reversed.',
+            'Payment received AED 100.00 has been returned.',
+            'Payment received AED 100.00 has been cancelled.',
+            'Payment has not been received AED 100.00',
+        ]
+        for text in rows:
+            with self.subTest(text=text):
+                self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
+
+    def test_failure_timestamps_are_not_repayment_deadlines(self):
+        for when in ('today at 20:00', 'tonight at 20:00', 'on 7 November 2026 at 20:00'):
+            for suffix, expected in (('', None), (' Your payment is due by midnight.', '2026-11-07T23:59:00+04:00'),
+                                     (' Please repay before midnight.', '2026-11-07T23:59:00+04:00')):
+                text = f'Autopay of AED 100.00 failed {when} due to insufficient funds.' + suffix
+                with self.subTest(when=when, suffix=suffix):
+                    result = self.mc.payments.parse(text, 'Wio', self.when)
+                    self.assertEqual(result['deadline'] if result else None, expected)
+
+    def test_all_autopay_aliases_share_conditional_guard(self):
+        aliases = ('autopay', 'auto-pay', 'auto pay', 'autodebit', 'auto-debit', 'auto debit',
+                   'automaticdebit', 'automatic-debit', 'automatic debit', 'automatic payment')
+        for alias in aliases:
+            with self.subTest(alias=alias, conditional=False):
+                confirmed = self.mc.payments.parse(f'Your {alias} of AED 100.00 was successful.', 'Wio', self.when)
+                self.assertEqual(confirmed['kind'], 'payment_success')
+            for condition in ('if', 'whether', 'when', 'once', 'until', 'hope'):
+                with self.subTest(alias=alias, conditional=condition):
+                    text = f'We will notify you {condition} your {alias} of AED 100.00 is successful.'
+                    self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
+                    scheduled = f'Your {alias} of AED 100.00 is scheduled today at 21:00. ' + text
+                    self.assertEqual(self.mc.payments.parse(scheduled, 'Wio', self.when)['kind'], 'autopay_expected')
+
+
 if __name__ == '__main__':
     unittest.main()
