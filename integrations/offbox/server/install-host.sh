@@ -237,7 +237,9 @@ incus profile set offbox security.nesting=true security.syscalls.intercept.mknod
 # ---- firewall: boxes reach the internet, never the host's services or the tailnet. Public side: ssh only.
 cat > /etc/nftables.conf <<'EOF'
 #!/usr/sbin/nft -f
-flush ruleset
+# No "flush ruleset": that would also drop Incus NAT and, on the home server, the Mullvad kill switch.
+table inet offbox
+delete table inet offbox
 table inet offbox {
   chain input {
     type filter hook input priority 0; policy drop;
@@ -262,7 +264,9 @@ table inet offbox {
     iifname "incusbr0" oifname "tailscale0" drop
   }
 }
+include "/etc/nftables.d/*.nft"
 EOF
+mkdir -p /etc/nftables.d
 systemctl enable --now nftables >/dev/null
 nft -f /etc/nftables.conf
 systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
