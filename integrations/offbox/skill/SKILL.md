@@ -150,6 +150,8 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+If Robob restarts on the Mac during a foreground run (home box or Boat), the run detaches and keeps going; re-attach with `offbox wait <run-id>` (client exit 95). The home server itself restarting is a separate case (exit 94, below).
+Ctrl-C, Stop and SIGTERM-based timeouts still kill the run; a native SIGKILL cannot be caught by offbox.
 The reaper refreshes the box's deadline while the remote run is confirmed live, even if its starting client is gone, for up to 6 hours from run start.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
 its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
