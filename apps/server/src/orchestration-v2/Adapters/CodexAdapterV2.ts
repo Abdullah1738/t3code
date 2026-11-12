@@ -5802,6 +5802,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             readonly context: ActiveCodexTurnContext;
             readonly status: OrchestrationV2ProviderTurn["status"];
             readonly failureMessage?: string;
+            readonly failureAdditionalDetails?: string;
             readonly failureErrorInfo?: CodexErrorInfo;
             readonly providerRetry?: ActiveCodexProviderRetry;
           }): Effect.fn.Return<CodexRootTerminalEvent> {
@@ -5823,7 +5824,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 failureCode ?? null,
                 input.failureErrorInfo,
               );
-              const failure =
+              const baseFailure =
                 previousFailure !== undefined &&
                 (input.failureMessage === undefined ||
                   input.failureMessage === previousFailure.nativeMessage) &&
@@ -5839,6 +5840,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       class: failureClass,
                       category: completionCategory,
                     });
+              const details = input.failureAdditionalDetails?.trim();
+              const failure = details
+                ? {
+                    ...baseFailure,
+                    message: makeProviderFailure({
+                      message: [input.failureMessage, details].filter(Boolean).join("\n"),
+                    }).message,
+                  }
+                : baseFailure;
               return {
                 type: "turn.terminal",
                 driver: CODEX_PROVIDER,
@@ -5929,6 +5939,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             readonly nativeTurnId: string;
             readonly status: OrchestrationV2ProviderTurn["status"];
             readonly failureMessage?: string;
+            readonly failureAdditionalDetails?: string;
             readonly failureErrorInfo?: CodexErrorInfo;
             readonly providerRetry?: ActiveCodexProviderRetry;
             readonly goalHoldTurn?: OrchestrationV2ProviderTurn;
@@ -6039,6 +6050,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           readonly status: OrchestrationV2ProviderTurn["status"];
           readonly completedAt: DateTime.Utc;
           readonly failureMessage?: string;
+          readonly failureAdditionalDetails?: string;
           readonly failureErrorInfo?: CodexErrorInfo;
         }) =>
           turnTerminalizationPermit.withPermits(1)(
@@ -6322,6 +6334,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ? {}
                 : {
                     failureMessage: payload.turn.error.message,
+                    ...(payload.turn.error.additionalDetails == null
+                      ? {}
+                      : { failureAdditionalDetails: payload.turn.error.additionalDetails }),
                     ...(payload.turn.error.codexErrorInfo == null
                       ? {}
                       : { failureErrorInfo: payload.turn.error.codexErrorInfo }),

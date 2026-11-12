@@ -8384,6 +8384,92 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  it.effect.each([false, true])(
+    "keeps completion error details with redaction (prior notification: %s)",
+    (notification) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const nativeThreadId = `native-completion-details-${notification}`;
+          const nativeTurnId = `turn-completion-details-${notification}`;
+          const transcript = makeCodexReplayTranscript({
+            scenario: "codex-completion-error-details",
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+              ...(notification
+                ? [
+                    {
+                      type: "emit_inbound" as const,
+                      label: "error",
+                      frame: {
+                        method: "error",
+                        params: {
+                          threadId: nativeThreadId,
+                          turnId: nativeTurnId,
+                          willRetry: false,
+                          error: {
+                            message: "Provider request failed.",
+                            codexErrorInfo: "usageLimitExceeded",
+                            additionalDetails: null,
+                          },
+                        },
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "emit_inbound",
+                label: "turn/completed",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: {
+                      ...makeCodexReplayTurn({ id: nativeTurnId, status: "failed" }),
+                      error: {
+                        message: "Provider request failed.",
+                        codexErrorInfo: notification
+                          ? null
+                          : { responseStreamDisconnected: { httpStatusCode: 503 } },
+                        additionalDetails:
+                          "Upstream stream closed. Authorization: Bearer test-secret token=hidden",
+                      },
+                    },
+                  },
+                },
+              },
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              text: "Continue.",
+              attemptId: RunAttemptId.make("attempt-completion-details"),
+            }),
+          );
+          yield* harness.firstTerminal;
+          const terminal = harness.terminalEvents()[0];
+          assert.equal(terminal?.status, "failed");
+          if (terminal?.status !== "failed") return;
+          assert.include(terminal.failure.message, "Provider request failed.");
+          assert.include(terminal.failure.message, "Upstream stream closed.");
+          assert.notInclude(terminal.failure.message, "test-secret");
+          assert.notInclude(terminal.failure.message, "hidden");
+          assert.equal(
+            terminal.failure.code,
+            notification ? "usageLimitExceeded" : "responseStreamDisconnected",
+          );
+          assert.equal(terminal.failure.class, notification ? "usage_limit" : "provider_error");
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
   const FAILED_SCENARIO = "codex-failed-mid-command";
   const FAILED_NATIVE_THREAD = "native-codex-failed-thread";
   const FAILED_NATIVE_TURN = "native-codex-failed-turn";

@@ -4203,6 +4203,49 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
   }),
 );
 
+it.effect("interrupts both live turns before failing runs after a shared ingestion error", () =>
+  Effect.gen(function* () {
+    const requested = yield* Ref.make(0);
+    const failed = yield* Ref.make(0);
+    const bothRequested = yield* Deferred.make<void>();
+    const stopped = yield* Deferred.make<void>();
+    yield* Effect.forEach(
+      ["first", "second"],
+      (key) =>
+        captureRootRunTermination({
+          key: `shared-ingest-failure:${key}`,
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: () =>
+            Stream.fail(
+              new ProviderAdapter.ProviderAdapterEventStreamError({
+                driver,
+                providerSessionId: ProviderSessionId.make("session:shared-reader-failure"),
+                cause: "Database reader retired: a statement ran longer than 120000 ms",
+              }),
+            ),
+          interruptTurn: () =>
+            Effect.gen(function* () {
+              const count = yield* Ref.updateAndGet(requested, (value) => value + 1);
+              if (count === 2) yield* Deferred.succeed(bothRequested, undefined);
+              yield* Deferred.await(stopped);
+            }),
+          refreshAfterTurn: Ref.update(failed, (value) => value + 1),
+          afterStart: () =>
+            key === "second"
+              ? Effect.void
+              : Effect.gen(function* () {
+                  yield* Deferred.await(bothRequested);
+                  assert.equal(yield* Ref.get(failed), 0);
+                  yield* Deferred.succeed(stopped, undefined);
+                }),
+        }),
+      { concurrency: "unbounded" },
+    );
+    assert.equal(yield* Ref.get(requested), 2);
+    assert.equal(yield* Ref.get(failed), 2);
+  }),
+);
+
 it.effect("does not stop a provider turn that already reached its terminal", () =>
   Effect.gen(function* () {
     const interrupted = yield* Ref.make(0);

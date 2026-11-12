@@ -1595,6 +1595,9 @@ export const layer: Layer.Layer<
                 const providerThread = yield* Ref.get(latestProviderThread);
                 const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
                 const openSubagents = yield* Ref.get(openRunOwnedSubagents);
+                // Failing the run revokes its MCP authority. Deliver Stop first so
+                // a live provider cannot keep working after that authority is gone.
+                yield* stopOrphanedProviderTurn(providerThread);
                 yield* writeFinalRunEvents({
                   run: input.run,
                   rootNode: input.rootNode,
@@ -1615,14 +1618,7 @@ export const layer: Layer.Layer<
                   ),
                   failureItemPersisted: false,
                   refreshAfterTurn,
-                }).pipe(
-                  // ardud: the run is failed now, but the provider turn may
-                  // still be running with nobody reading its events. Stop it
-                  // so its process does not run on orphaned and the next send
-                  // is not refused as "previous turn is still running"
-                  // (9 Nov incident). Runs even if the write failed.
-                  Effect.ensuring(stopOrphanedProviderTurn(providerThread)),
-                );
+                });
               }).pipe(
                 Effect.mapError(
                   (writeCause) =>
