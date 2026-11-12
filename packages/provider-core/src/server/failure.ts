@@ -71,6 +71,9 @@ function causeMessage(cause: unknown): string | undefined {
   const seen = new Set<unknown>();
   let category: (typeof PROVIDER_FAILURE_CATEGORIES)[string];
   let reason: string | undefined;
+  // A dead provider process names its exit code and last stderr line, which
+  // is the only clue to why every request on its session failed.
+  let processExit: string | undefined;
   for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
     seen.add(cause);
     try {
@@ -90,6 +93,9 @@ function causeMessage(cause: unknown): string | undefined {
           return stringField(cause, "message");
         case "ContextHandoffDeliveryUncertainError":
           return "T3 could not confirm whether conversation history reached the provider. Retry the turn to recover the session.";
+        case "CodexAppServerProcessExitedError":
+          processExit ??= stringField(cause, "message");
+          break;
         case "ProviderAdapterProtocolError": {
           const typedReason = (cause as Record<string, unknown>).reason;
           if (
@@ -111,7 +117,8 @@ function causeMessage(cause: unknown): string | undefined {
       break;
     }
   }
-  if (category === undefined) return undefined;
+  reason ??= processExit;
+  if (category === undefined) return processExit;
   return reason
     ? `${category.summary}: ${reason}. ${category.guidance}`
     : `${category.summary}. ${category.guidance}`;

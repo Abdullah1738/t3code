@@ -266,3 +266,29 @@ it.effect("keys terminal failure items by provider turn across retries and fallb
     assert.equal(firstAttempt.ordinal, 101);
   }).pipe(Effect.provide(IdAllocator.layer)),
 );
+
+it("names a provider process exit inside or outside a failure category", () => {
+  const processExit = {
+    _tag: "CodexAppServerProcessExitedError",
+    message: "Codex App Server process 86887 exited with code 0: fatal: Bearer abc.def rejected",
+  };
+  for (const [cause, expected] of [
+    [
+      processExit,
+      "Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected",
+    ],
+    [
+      { _tag: "ProviderAdapterEventStreamError", cause: processExit },
+      "The provider event stream closed unexpectedly: Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected. Retry the turn; if it keeps failing, check the provider and server logs.",
+    ],
+    [
+      {
+        _tag: "ProviderAdapterResumeThreadError",
+        cause: { _tag: "ProviderAdapterProtocolError", cause: processExit },
+      },
+      "The provider conversation could not be resumed: Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected. Retry the turn; if it keeps failing, check the provider and server logs.",
+    ],
+  ] as const) {
+    assert.equal(makeProviderFailure({ cause }).message, expected);
+  }
+});

@@ -169,7 +169,10 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
 
   const exitDuringResume = (env: Record<string, string>) =>
     Effect.gen(function* () {
-      const handle = yield* makeHandle({ CODEX_APP_SERVER_TEST_EXIT_ON_METHOD: "thread/resume", ...env });
+      const handle = yield* makeHandle({
+        CODEX_APP_SERVER_TEST_EXIT_ON_METHOD: "thread/resume",
+        ...env,
+      });
       const scope = yield* Scope.make();
       const context = yield* Layer.buildWithScope(CodexClient.layerChildProcess(handle), scope);
       return yield* Effect.gen(function* () {
@@ -177,7 +180,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         yield* client.request("initialize", initializeParams);
         const failure = yield* client.raw
           .request("thread/resume", { threadId: "thread-1" })
-          .pipe(Effect.flip);
+          .pipe(Effect.asVoid, Effect.flip);
         const terminated = yield* client.awaitTermination;
         return { failure, terminated, pid: handle.pid };
       }).pipe(
@@ -185,7 +188,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         Effect.provide(context),
         Effect.ensuring(Scope.close(scope, Exit.void)),
       );
-    });
+    }).pipe(Effect.orDie);
 
   it.effect("names the last stderr line when the App Server exits during a request", () =>
     Effect.gen(function* () {
@@ -229,7 +232,10 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       assert.isAtMost(tail.length, 8_192);
       assert.notInclude(tail, "abc.def-123");
       assert.notInclude(tail, "sk-proj1234567890");
-      assert.match(failure.message, /exited with code 0: fatal: upstream returned 401 for \[redacted\]$/);
+      assert.match(
+        failure.message,
+        /exited with code 0: fatal: upstream returned 401 for \[redacted\]$/,
+      );
     }),
   );
 });

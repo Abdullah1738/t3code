@@ -90,7 +90,7 @@ export const makeTerminationError = (
         }),
       ),
     onSuccess: (code) =>
-      (stderrTail ?? Effect.succeed(undefined)).pipe(
+      (stderrTail ?? Effect.succeed<string | undefined>(undefined)).pipe(
         Effect.map(
           (tail) =>
             new CodexError.CodexAppServerProcessExitedError({

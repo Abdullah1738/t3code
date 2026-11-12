@@ -79,10 +79,12 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexSchema from "effect-codex-app-server/schema";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1613,6 +1615,21 @@ function isSensitiveCodexProtocolKey(key: string): boolean {
   );
 }
 
+// An app-server that exits soon after it started is likely to do so again, so
+// respawns back off instead of hot-looping on every queued request.
+const CODEX_APP_SERVER_STABLE_LIFETIME_MS = 60_000;
+const CODEX_APP_SERVER_RESPAWN_MAX_DELAY_MS = 30_000;
+
+export const codexAppServerRespawnDelayMs = (quickExits: number): number =>
+  quickExits <= 0
+    ? 0
+    : Math.min(1_000 * 2 ** (quickExits - 1), CODEX_APP_SERVER_RESPAWN_MAX_DELAY_MS);
+
+interface CodexAppServerQuickExits {
+  readonly count: number;
+  readonly lastExitAtMs: number;
+}
+
 export const layerAppServerClientFactory: Layer.Layer<
   CodexAppServerClientFactory,
   never,
@@ -1623,10 +1640,20 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const quickExitsByInstance = yield* Ref.make(
+      new Map<ProviderInstanceId, CodexAppServerQuickExits>(),
+    );
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
         const scope = yield* Scope.Scope;
+        const quickExits = (yield* Ref.get(quickExitsByInstance)).get(input.instanceId);
+        if (quickExits !== undefined) {
+          const waitMs =
+            codexAppServerRespawnDelayMs(quickExits.count) -
+            ((yield* Clock.currentTimeMillis) - quickExits.lastExitAtMs);
+          if (waitMs > 0) yield* Effect.sleep(Duration.millis(waitMs));
+        }
         const environment = {
           ...codexAppServerEnvironment(input.environment),
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
@@ -1649,6 +1676,28 @@ export const layerAppServerClientFactory: Layer.Layer<
                 cause,
               }),
           ),
+        );
+        const spawnedAtMs = yield* Clock.currentTimeMillis;
+        // Closing the session interrupts this watcher. Should it still see the
+        // kill, a session under a minute old costs the next spawn one second.
+        yield* handle.exitCode.pipe(
+          Effect.ignore,
+          Effect.andThen(Clock.currentTimeMillis),
+          Effect.flatMap((exitAtMs) =>
+            Ref.update(quickExitsByInstance, (current) => {
+              const next = new Map(current);
+              if (exitAtMs - spawnedAtMs >= CODEX_APP_SERVER_STABLE_LIFETIME_MS) {
+                next.delete(input.instanceId);
+              } else {
+                next.set(input.instanceId, {
+                  count: (current.get(input.instanceId)?.count ?? 0) + 1,
+                  lastExitAtMs: exitAtMs,
+                });
+              }
+              return next;
+            }),
+          ),
+          Effect.forkIn(scope),
         );
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
@@ -1920,7 +1969,26 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           model: input.modelSelection.model,
           now,
         });
-        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const events = yield* Queue.unbounded<
+          ProviderAdapter.ProviderAdapterV2Event,
+          ProviderAdapter.ProviderAdapterEventStreamError
+        >();
+        // Threads share this app-server, so once it exits (cleanly too) the
+        // whole session is dead. Failing the stream makes the session manager
+        // release it; the next request opens a new session on a fresh process.
+        yield* client.awaitTermination.pipe(
+          Effect.flatMap((error) =>
+            Queue.fail(
+              events,
+              new ProviderAdapter.ProviderAdapterEventStreamError({
+                driver: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                cause: error,
+              }),
+            ),
+          ),
+          Effect.forkIn(scope),
+        );
         const rateLimitSnapshot = yield* Ref.make<CodexRateLimitSnapshot | undefined>(undefined);
         const limitedTurnItems = yield* Ref.make(
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),
@@ -6837,7 +6905,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           driver: CODEX_PROVIDER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
-          events: Stream.fromEffectRepeat(Queue.take(events)),
+          events: Stream.fromQueue(events),
           canReuseContextUsage: canReuseCodexContextUsage,
           // Known gap: a subagent that Codex resumes later reads as completed
           // (not pending) between turns, so idle release can win the race
@@ -7227,7 +7295,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
+              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
+                // An exited app-server holds no subscriptions left to drop.
+                Effect.catchTags({
+                  CodexAppServerProcessExitedError: () => Effect.void,
+                  CodexAppServerInputStreamEndedError: () => Effect.void,
+                }),
+              );
             },
             (effect, unloadInput) =>
               effect.pipe(
