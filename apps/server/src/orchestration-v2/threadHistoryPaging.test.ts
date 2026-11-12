@@ -12,6 +12,7 @@ import * as DateTime from "effect/DateTime";
 
 import {
   buildBoundedThreadProjection,
+  boundHistoryRowForTransport,
   boundedTimelineEncodedBytes,
   computeLatestLocalTurnOrdinal,
   decodeThreadHistoryCursor,
@@ -215,7 +216,11 @@ describe("threadHistoryPaging", () => {
       };
       return [prompt, makeRow(turn * 2 + 1)];
     }).flat();
-    const first = selectRecentTimelineWindow({ items, snapshotSequence: 1 });
+    const first = selectRecentTimelineWindow({
+      items,
+      snapshotSequence: 1,
+      policy: { ...THREAD_HISTORY_PAGE_POLICY, maxItems: 1000 },
+    });
     expect(first.items).toHaveLength(300);
     expect(first.items[0]?.sourceItemId).toBe("item-22");
     const older = selectHistoryPageFromCursor({
@@ -264,7 +269,11 @@ describe("threadHistoryPaging", () => {
       inRun(run * 4 + 2, run, notification(`Steer ${run}`)),
       inRun(run * 4 + 3, run),
     ]).flat();
-    const first = selectRecentTimelineWindow({ items, snapshotSequence: 1 });
+    const first = selectRecentTimelineWindow({
+      items,
+      snapshotSequence: 1,
+      policy: { ...THREAD_HISTORY_PAGE_POLICY, maxItems: 1000 },
+    });
     expect(first.items).toHaveLength(150 * 4 - 1);
     expect(first.items[0]?.sourceItemId).toBe(`item-${11 * 4 + 1}`);
     const older = selectHistoryPageFromCursor({
@@ -337,6 +346,148 @@ describe("threadHistoryPaging", () => {
     });
     expect(older.items[0]?.item.type).toBe("user_message");
     expect([...older.items, ...recent.items]).toHaveLength(items.length);
+  });
+
+  it.each([0, 1, 12])(
+    "bounds large tool history with %i person turns and pages to the start",
+    (turns) => {
+      const items = Array.from({ length: 240 }, (_, index) => {
+        const row = makeRow(index, { outputBytes: 80_000 });
+        if (index >= turns) return row;
+        if (row.item.type !== "command_execution") throw new Error("Expected command fixture");
+        return {
+          ...row,
+          item: {
+            ...row.item,
+            type: "user_message",
+            createdBy: "system",
+            creationSource: "server",
+            inputIntent: "turn_start",
+            messageId: MessageId.make(`ardud-control:${index}`),
+            text: "The robob client has restarted. Please resume…",
+            attachments: [],
+          },
+        } as OrchestrationV2ProjectedTurnItem;
+      });
+      const full = makeProjection(items);
+      const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 1 });
+      expect(Buffer.byteLength(JSON.stringify(full))).toBeGreaterThan(16 * 1024 * 1024);
+      expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThanOrEqual(
+        THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+      );
+      expect(bounded.projection.visibleTurnItems.at(-1)?.sourceItemId).toBe(
+        items.at(-1)?.sourceItemId,
+      );
+      let cursor = bounded.historyCursor;
+      let seen = bounded.projection.visibleTurnItems.map((row) => row.sourceItemId);
+      let pages = 0;
+      while (cursor !== null && pages++ < items.length) {
+        const page = selectHistoryPageFromCursor({ items, cursor, snapshotSequence: 1 });
+        expect(page.items.length).toBeLessThanOrEqual(THREAD_HISTORY_PAGE_POLICY.maxItems);
+        expect(Buffer.byteLength(JSON.stringify(page.items))).toBeLessThan(
+          THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+        );
+        seen.unshift(...page.items.map((row) => row.sourceItemId));
+        cursor = page.nextCursor;
+      }
+      expect(cursor).toBeNull();
+      expect(seen).toEqual(items.map((row) => row.sourceItemId));
+    },
+  );
+
+  it("compacts a single oversized newest item before the transport rejects it", () => {
+    const full = makeProjection([assistantRow("x".repeat(18 * 1024 * 1024))]);
+    const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 1 });
+    expect(bounded.projection.visibleTurnItems.at(-1)?.sourceItemId).toBe(
+      full.visibleTurnItems.at(-1)?.sourceItemId,
+    );
+    expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+  });
+
+  it("also bounds oversized control arrays in the emergency snapshot", () => {
+    const full = {
+      ...makeProjection([assistantRow("newest")]),
+      checkpoints: [
+        {
+          id: "checkpoint-1",
+          files: Array.from({ length: 30_000 }, (_, index) => ({
+            path: `${index}${"x".repeat(400)}`,
+          })),
+        },
+      ],
+    } as unknown as ReturnType<typeof makeProjection>;
+    const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 1 });
+    expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+    expect(bounded.projection.visibleTurnItems.at(-1)?.sourceItemId).toBe(
+      full.visibleTurnItems.at(-1)?.sourceItemId,
+    );
+  });
+
+  it("bounds a large control dictionary without recurring", () => {
+    const full = {
+      ...makeProjection([assistantRow("newest")]),
+      runtimeRequests: [
+        {
+          id: "request-large",
+          answers: Object.fromEntries(
+            Array.from({ length: 1024 }, (_, index) => [`answer-${index}`, "x".repeat(10_000)]),
+          ),
+        },
+      ],
+    } as unknown as ReturnType<typeof makeProjection>;
+    const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 1 });
+    expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+    expect(bounded.projection.visibleTurnItems.at(-1)?.sourceItemId).toBe(
+      full.visibleTurnItems.at(-1)?.sourceItemId,
+    );
+  });
+
+  it("preserves a fallback cursor's original position when its anchor disappears", () => {
+    const rows = Array.from({ length: 200 }, (_, index) => makeRow(index));
+    rows[199] = {
+      ...rows[199]!,
+      item: { ...assistantRow("x".repeat(18 * 1024 * 1024)).item, id: rows[199]!.sourceItemId },
+    };
+    const bounded = buildBoundedThreadProjection({
+      projection: makeProjection(rows),
+      snapshotSequence: 1,
+    });
+    expect(decodeThreadHistoryCursor(bounded.historyCursor!).p).toBe(199);
+    const page = selectHistoryPageFromCursor({
+      items: rows.slice(0, -1),
+      cursor: bounded.historyCursor!,
+      snapshotSequence: 1,
+    });
+    expect(page.items.at(-1)?.sourceItemId).toBe(rows[198]?.sourceItemId);
+  });
+
+  it("summarizes oversized collection rows while preserving paging identity", () => {
+    const base = makeRow(0);
+    const row = {
+      ...base,
+      item: {
+        ...base.item,
+        type: "web_search",
+        patterns: ["example"],
+        results: Array.from({ length: 2000 }, (_, index) => ({
+          url: `https://example.com/${index}`,
+          snippet: "x".repeat(10_000),
+        })),
+      },
+    } as OrchestrationV2ProjectedTurnItem;
+    const bounded = boundHistoryRowForTransport(row);
+    expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+    expect(bounded.sourceItemId).toBe(row.sourceItemId);
+    expect(bounded.item.id).toBe(row.item.id);
+    expect(bounded.item.type).toBe("notification");
   });
 
   it("encodes opaque cursors with stable source identity", () => {

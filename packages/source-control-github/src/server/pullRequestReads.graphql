@@ -75,6 +75,7 @@ query PullRequestCore(
       closedAt
       headRefName
       baseRefName
+      baseRefOid
       headRefOid
       isCrossRepository
       headRepositoryOwner {

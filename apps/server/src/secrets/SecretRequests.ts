@@ -30,6 +30,8 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import type { EnvironmentAuthorizationError } from "@t3tools/contracts";
 import type { OwnerProvenance } from "../ardud/auth/provenance.ts";
 import { requireSecretAnswerAuthority, secretStatusOf } from "../ardud/auth/secretAnswers.ts";
+// ardud: a board ask's secret fields, held in memory
+import { makeHeldSecrets, type HoldInput } from "../ardud/auth/heldSecrets.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 
@@ -75,6 +77,20 @@ export class SecretRequests extends Context.Service<
       readonly ref: SecretRef;
       readonly projectId: ProjectId;
     }) => Effect.Effect<string, SecretRequestError>;
+    /**
+     * ardud: keeps a value the owner typed into a board ask, in memory only,
+     * under a new one-use ref that `consume` takes like any other. Same proof
+     * as `answer`: only the paired owner's app session gets a value in.
+     */
+    readonly hold: (
+      input: HoldInput,
+      answeredBy: OwnerProvenance | null,
+    ) => Effect.Effect<
+      { readonly ref: SecretRef; readonly expiresAtMs: number },
+      SecretRequestError | EnvironmentAuthorizationError
+    >;
+    /** ardud: forgets a held value whose ask answer did not go through. */
+    readonly discard: (ref: SecretRef) => Effect.Effect<void>;
   }
 >()("t3/secrets/SecretRequests") {}
 
@@ -196,6 +212,16 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  // ardud: a board ask's secret fields, held in memory
+  const held = makeHeldSecrets();
+  const hold: SecretRequests["Service"]["hold"] = (input, answeredBy) =>
+    requireSecretAnswerAuthority(answeredBy).pipe(Effect.andThen(held.hold(input)));
+  yield* held.sweep.pipe(
+    Effect.delay("1 hour"),
+    Effect.repeat(Schedule.spaced("1 hour")),
+    Effect.forkScoped,
+  );
+
   // get and remove are separate store calls; one consumer at a time keeps two
   // concurrent calls from both reading a ref before either deletes it.
   const consumeLock = yield* Semaphore.make(1);
@@ -215,6 +241,9 @@ const make = Effect.gen(function* () {
   }) {
     if (!REF_PATTERN.test(input.ref))
       return yield* new SecretRequestError({ reason: "invalid_ref" });
+    // ardud: a ref from a board ask is held in memory, for one thread.
+    const fromAsk = yield* held.take(input);
+    if (Option.isSome(fromAsk)) return fromAsk.value;
     const stored = yield* store
       .get(storeName(input.ref))
       .pipe(Effect.mapError((cause) => new SecretRequestError({ reason: "read_failed", cause })));
@@ -264,7 +293,7 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
 
-  return SecretRequests.of({ answer, savedRef, consume });
+  return SecretRequests.of({ answer, savedRef, consume, hold, discard: held.discard });
 });
 
 export const layer = Layer.effect(SecretRequests, make);

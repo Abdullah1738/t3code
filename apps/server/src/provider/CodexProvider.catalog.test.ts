@@ -118,19 +118,19 @@ const solServiceTiers = Effect.fn("solServiceTiers")(function* (ultrafastEntitle
 });
 
 it.layer(NodeServices.layer, { excludeTestServices: true })("Codex catalog discovery", (it) => {
-  it.effect("keeps Ultrafast when another Codex client wrote the shared catalog cache", () =>
+  it.effect("keeps Standard when another Codex client cached Ultrafast", () =>
     Effect.gen(function* () {
-      assert.deepStrictEqual(yield* solServiceTiers(true), ["default", "priority", "ultrafast"]);
+      assert.deepStrictEqual(yield* solServiceTiers(true), ["default"]);
     }).pipe(Effect.scoped),
   );
 
-  it.effect("drops Ultrafast once the account is no longer entitled to it", () =>
+  it.effect("keeps Standard when the account lacks Ultrafast", () =>
     Effect.gen(function* () {
-      assert.deepStrictEqual(yield* solServiceTiers(false), ["default", "priority"]);
+      assert.deepStrictEqual(yield* solServiceTiers(false), ["default"]);
     }).pipe(Effect.scoped),
   );
 
-  it.effect("displays the inherited global Fast tier on every discovered model", () =>
+  it.effect("displays Standard despite an inherited global Fast tier", () =>
     Effect.gen(function* () {
       for (const tier of ["fast", "priority"]) {
         const provider = yield* probeCatalog(false, tier);
@@ -143,10 +143,10 @@ it.layer(NodeServices.layer, { excludeTestServices: true })("Codex catalog disco
           const serviceTier = descriptors.find((descriptor) => descriptor.id === "serviceTier");
           assert.equal(serviceTier?.type, "select");
           if (serviceTier?.type !== "select") return;
-          assert.equal(getProviderOptionCurrentLabel(serviceTier), "Fast");
+          assert.equal(getProviderOptionCurrentLabel(serviceTier), "Standard");
           assert.deepStrictEqual(
             serviceTier.options.filter((option) => option.isDefault).map((option) => option.id),
-            ["priority"],
+            ["default"],
           );
           assert.equal(
             descriptors.find((descriptor) => descriptor.id === "reasoningEffort")?.currentValue,

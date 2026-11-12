@@ -1,4 +1,4 @@
-import { STAGE_LABELS } from "./viewModel.ts";
+import { TILE_COLUMN_LABELS } from "./tilePlace.ts";
 
 /** Stage columns on the board, in display order: active stages, shipped, then Needs Owner. */
 export const BOARD_COLUMNS = [
@@ -13,12 +13,8 @@ export const BOARD_COLUMNS = [
 export type BoardColumnKey = (typeof BOARD_COLUMNS)[number];
 
 export const BOARD_COLUMN_LABELS: Record<BoardColumnKey, string> = {
-  todo: STAGE_LABELS.todo,
-  working: STAGE_LABELS.working,
-  needs_review: STAGE_LABELS.needs_review,
-  in_review: STAGE_LABELS.in_review,
+  ...TILE_COLUMN_LABELS,
   shipped: "Shipped",
-  needs_owner: STAGE_LABELS.needs_owner,
 };
 
 export interface BoardColumnPrefs {

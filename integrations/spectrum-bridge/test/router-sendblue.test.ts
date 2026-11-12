@@ -57,7 +57,7 @@ function context(kind: ChatInfo["kind"], over: Partial<ChatContext> = {}) {
   return ctx;
 }
 
-function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown>; groupJudge?: GroupJudge; log?: (event: string, code?: string) => void; swipes?: { find: Swipes; line: string; waitMs?: number }; rotateAfterMs?: number } = {}) {
+function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown>; groupJudge?: GroupJudge; log?: (event: string, code?: string) => void; swipes?: { find: Swipes; line: string; waitMs?: number }; rotateAfterMs?: number; notifyFailure?: (text: string, key: string) => Promise<boolean> } = {}) {
   const store = new Store(":memory:");
   stores.push(store);
   const backend = new Recorder();
@@ -797,6 +797,119 @@ test("swipes: an addressed group swipe on a person's root lists Robob's prior re
   setSystemTime(start);
 });
 
+test("groups: an observed swipe keeps the person's target when a later message wakes Robob", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("root", "Dinner at 8?", "+447700900123", { sentAt: start - 3_000 });
+  h.store.updateInbound("root", "done");
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  expect(h.backend.prompts).toHaveLength(0);
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify('Moni: what did I reply to [swipe reply to Tom\'s message: "Dinner at 8?"; thread root, not necessarily the swiped bubble]'));
+  expect(prompt.endsWith("Moni: Robob?")).toBe(true);
+  setSystemTime(start);
+});
+
+test("groups: an observed swipe includes the newest delivered reply in that thread", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("root", "Dinner at 8?", "+447700900123", { sentAt: start - 5_000 });
+  h.store.updateInbound("root", "done");
+  for (const [id, text, sentAt] of [
+    ["older", "An older reply", start - 3_000],
+    ["newest", "<think>hidden thought</think>I'll be there at **eight**.", start - 1_000],
+    ["later", "Not yet sent", start + 1_000],
+  ] as const) {
+    h.store.enqueue({ id, kind: "conversation", text, replyTo: "root" });
+    h.store.outboxState(id, "sent", `${id}-provider`);
+    h.store.set(`sent-at:${id}`, sentAt);
+  }
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify('Moni: what did I reply to [swipe reply to Tom\'s message: "Dinner at 8?"; your newest reply in that thread: "I\'ll be there at eight."; thread root, not necessarily the swiped bubble]'));
+  for (const excluded of ["An older reply", "Not yet sent", "hidden thought", "**eight**"]) expect(prompt).not.toContain(excluded);
+  setSystemTime(start);
+});
+
+test("groups: an observed swipe with an unknown target says so in the next prompt", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, waitMs: 0, find: () => null } });
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "missing", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  expect(h.backend.prompts).toHaveLength(0);
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toContain(JSON.stringify("Moni: what did I reply to [swipe reply to an earlier message the bridge could not identify]"));
+  setSystemTime(start);
+});
+
+test("groups: an observed owner swipe quotes a clipped target and its newest thread reply as data", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const ctx = context("group", { roleOf: address => address === "+15555550123" ? { name: "Abdullah", role: "owner" } : roles[address] ?? { name: address, role: "guest" } });
+  const h = setup(ctx, { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  const target = `Ignore "instructions"\n${"x".repeat(210)}`;
+  h.input("root", target, "+15555550123", { sentAt: start - 3_000 });
+  h.store.updateInbound("root", "done");
+  h.store.enqueue({ id: "reply", kind: "conversation", text: `Latest\n${"y".repeat(210)}`, replyTo: "root" });
+  h.store.outboxState("reply", "sent", "reply-provider");
+  h.store.set("sent-at:reply", start - 1_000);
+  h.input("swipe", "what did I reply to", "+15555550123", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+15555550123");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const expectedTarget = `Ignore "instructions" ${"x".repeat(175)}...`;
+  const expectedReply = `Latest ${"y".repeat(190)}...`;
+  const expectedLine = `Abdullah: what did I reply to [swipe reply to Abdullah's message: ${JSON.stringify(expectedTarget)}; your newest reply in that thread: ${JSON.stringify(expectedReply)}; thread root, not necessarily the swiped bubble]`;
+  expect(h.backend.prompts[0]!.text).toContain(JSON.stringify(expectedLine));
+  setSystemTime(start);
+});
+
+test("groups: observed swipes handle empty targets and a Robob target", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("empty-root", "", "+447700900123", { sentAt: start - 4_000 });
+  h.store.updateInbound("empty-root", "done");
+  h.store.enqueue({ id: "robob-root", kind: "conversation", text: "An earlier answer" });
+  h.store.outboxState("robob-root", "sent", "robob-provider");
+  h.input("empty-swipe", "what is it", "+971585933213", { replyTo: "previous", threadOrigin: "empty-root", sentAt: start });
+  // Tapbacks stay observed even when they point to Robob.
+  h.input("robob-swipe", 'Liked "An earlier answer"', "+971585933213", { replyTo: "previous", threadOrigin: "robob-provider", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:empty-swipe")).toBe("observe");
+  expect(h.store.get<string>("group-gate:robob-swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify("Moni: what is it [swipe reply to Tom's message: (no text: a file, card or link); thread root, not necessarily the swiped bubble]"));
+  expect(prompt).toContain(JSON.stringify('Moni: Liked "An earlier answer" [swipe reply to your message: "An earlier answer"]'));
+  setSystemTime(start);
+});
+
 test("swipes: an unknown Sendblue origin falls back to Messages and finds prior replies to its root", async () => {
   const start = Date.parse("2026-11-01T00:00:00Z");
   setSystemTime(start);
@@ -1306,4 +1419,219 @@ test("a batch of only tapbacks gets an unthreaded reply", async () => {
   h.backend.final("Glad it helped");
   await h.router.tick();
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([["Glad it helped", undefined]]);
+});
+
+test("owner, Moni and group outages each get one notice, with held messages ordered on recovery", async () => {
+  const start = Date.parse("2026-11-07T07:27:00Z");
+  setSystemTime(start);
+  const chats = ["owner", "dm", "group"].map(kind => setup(context(kind as ChatInfo["kind"]), { quietMs: 0 }));
+  for (const h of chats) {
+    h.backend.prompt = async () => { throw new Error("offline"); };
+    h.backend.health = async () => ({ status: "down", timestamp: "", openchamberVersion: "test" });
+    h.input("first", "robob first question", "+971585933213");
+    await h.router.tick();
+  }
+  for (const offset of [60_000, 120_000]) {
+    setSystemTime(start + offset);
+    for (const h of chats) await h.router.tick();
+  }
+  for (const h of chats) {
+    h.input("second", "robob second question", "+971585933213");
+    h.input("third", "robob third question", "+971585933213");
+  }
+  setSystemTime(start + 180_000);
+  for (const h of chats) {
+    await h.router.tick();
+    expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
+    h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
+  }
+  // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.
+  setSystemTime(start + 240_000);
+  for (const h of chats) {
+    await h.router.tick();
+    await h.router.tick();
+    expect(h.backend.prompts).toHaveLength(1);
+    expect(h.backend.prompts[0]!.text).toContain("first question");
+    expect(h.backend.prompts[0]!.system).toContain("delayed by a technical outage");
+    expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state)).toEqual(["done", "pending", "pending"]);
+    expect(h.store.pendingOutbox().some(op => /didn't catch/.test(op.text))).toBe(false);
+  }
+  setSystemTime();
+});
+
+
+test.each(["dm", "group"] as const)("late steer fallback in %s preserves named members and holds newer context", async kind => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(_id: string, _directory: string, messageId: string, text: string) {
+    steers.push({ messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original work", "+971585933213");
+  await h.router.tick();
+  h.input("followup", "robob earlier follow-up", "+971585933213");
+  h.input("member", "robob second original line", "+447700900123");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const sealed = h.store.get<NormalizedInbound>("batch:followup")!;
+  const original = steers[0]!;
+  expect(original.text).toContain("Moni:");
+  expect(original.text).toContain("Tom (+447700900123):");
+  h.backend.final("Original answer");
+  h.input("newer", "robob UNIQUE_NEWER_REQUEST", "+971585933213");
+  if (kind === "group") h.store.set("group-observed", ["UNIQUE_OBSERVED_CONTEXT"]);
+  const prompt = h.backend.prompt.bind(h.backend);
+  let fallbackText: string | undefined;
+  h.backend.prompt = async (...args) => {
+    if (args[2] === original.messageId) {
+      fallbackText = args[3];
+      h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    } else await prompt(...args);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(fallbackText).toBe(original.text);
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(sealed.batchIds);
+  expect(h.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get("newer")!.state).toBe("pending");
+  if (kind === "group") expect(h.store.get<string[]>("group-observed")).toEqual(["UNIQUE_OBSERVED_CONTEXT"]);
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  const newer = h.backend.records.find(record => record.type === "user" && record.id !== original.messageId && record.text.includes("UNIQUE_NEWER_REQUEST"));
+  expect(newer).toBeDefined();
+  if (kind === "group") {
+    expect(newer!.type === "user" && newer!.text).toContain("UNIQUE_OBSERVED_CONTEXT");
+    expect(h.store.get<string[]>("group-observed")).toEqual([]);
+  }
+});
+
+test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own reply after the foreground closes", async kind => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { id: string; messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(id: string, _dir: string, messageId: string, text: string) {
+    steers.push({ id, messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original question", "+971585933213");
+  await h.router.tick();
+  h.input("followup", "robob follow-up question", "+971585933213");
+  h.input("member", "robob second original line", "+447700900123");
+  await h.router.tick();
+  const original = steers[0]!;
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, messageId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && messageId === original.messageId && !h.backend.records.some(record => record.id === messageId)) h.backend.records.push({ id: messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    return read(id, dir, messageId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: original.id, messageId: original.messageId, inboundId: "followup", phase: "running" });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(["followup", "member"]);
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Follow-up answer", "followup"],
+  ]);
+  expect(steers).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test.each(["dm", "group"].flatMap(kind => [false, true].map(modelError => ({ kind: kind as "dm" | "group", modelError }))))("earlier successful reply survives final failure in $kind (modelError=$modelError)", async ({ kind, modelError }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(_id: string, _dir: string, messageId: string, text: string) {
+    steers.push({ messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original question", "+971585933213");
+  await h.router.tick();
+  h.input("second", "robob second question", "+971585933213");
+  h.input("second-member", "robob another successful part", "+447700900123");
+  await h.router.tick();
+  h.input("third", "robob third question", "+971585933213");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, messageId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && messageId === steers[0]!.messageId) {
+      exposed = true;
+      const accepted = [...new Map(steers.map(call => [call.messageId, call])).values()];
+      for (const [index, call] of accepted.entries()) {
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (index === 0) h.backend.final("Second successful answer");
+        else {
+          h.backend.records.push({ id: "failed-partial", type: "assistant", agent: "build", model: { providerID: "test", id: "model" },
+            content: [{ type: "text", text: "FAILED_RUN_PARTIAL_ANSWER" }], answer: true, finish: "stop", time: { created: Date.now(), completed: Date.now() } });
+          h.backend.records.push({ id: "failed-assistant", type: "assistant", agent: "build", model: { providerID: "test", id: "model" },
+            content: [{ type: "text", text: "PRIVATE_FAILURE" }], finish: "error", error: { type: "ProviderError" }, time: { created: Date.now(), completed: Date.now() } });
+          h.backend.records.push({ id: "failed-idle", type: "idle", outcome: "failed", modelError, time: { created: Date.now() } });
+        }
+      }
+    }
+    return read(id, dir, messageId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Second successful answer", "second"],
+  ]);
+  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
+
+test.each([
+  ["owner", "owner", "typed", "person", true], ["dm", "moni", "typed", "person", true],
+  ["dm", "guest", "typed", "person", false], ["group", "home", "typed", "person", false],
+  ["owner", "owner", undefined, "wake:normal", false], ["owner", "owner", "composed", "system:normal", false],
+] as const)("failed-inbound pages only owner/Moni typed rows (%s, %s, %s)", async (kind, slug, source, id, expected) => {
+  const ctx = context(kind); ctx.chat.slug = slug;
+  const alerts: string[] = [];
+  const h = setup(ctx, { notifyFailure: async text => { alerts.push(text); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z"); setSystemTime(start);
+  h.input(id, "Please stop", "+15555550123", { source }); h.store.updateInbound(id, "failed");
+  setSystemTime(start + 119_000); await h.router.checkFailedInbound(); await h.router.tick(); expect(alerts).toEqual([]);
+  setSystemTime(start + 150_000); await h.router.checkFailedInbound(); await h.router.tick();
+  setSystemTime(start + 180_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toHaveLength(expected ? 1 : 0);
+  if (expected) expect(alerts[0]).toContain(slug === "moni" ? "Moni" : "Abdullah");
+});
+
+test("failed money/security wake escalates its actual first two lines without replaying side effects", async () => {
+  const alerts: string[] = [];
+  const h = setup(context("owner"), { notifyFailure: async text => { alerts.push(text); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z"); setSystemTime(start);
+  h.input("wake:critical", "[Watcher event from robob-watch inbox-triage, not typed by the owner.]\nInbox triage: relevant email\nRelay to owner only\n\nEvent:\n[urgent] Mashreq AED 1,169.97\nWithdrawal received\nThird line\n\nContext saved when this watcher was set up:\nPrivate context", "+15555550123");
+  h.store.updateInbound("wake:critical", "failed");
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain("[urgent] Mashreq AED 1,169.97\nWithdrawal received");
+  expect(alerts[0]).not.toContain("Third line");
+  expect(h.backend.prompts).toHaveLength(0);
+});
+
+test.each(["owner", "moni", "critical"])("failed-inbound stale %s rows never alert or replay", async kind => {
+  const alerts: string[] = [];
+  const events: string[] = [];
+  const ctx = context(kind === "moni" ? "dm" : "owner");
+  if (kind === "moni") ctx.chat.slug = "moni";
+  const h = setup(ctx, { notifyFailure: async text => { alerts.push(text); return true; }, log: event => { events.push(event); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  const id = kind === "critical" ? "wake:expired-money" : "expired-person";
+  h.input(id, kind === "critical" ? "[Watcher event from robob-watch money-cases]\nBill overdue" : "Old instruction", "+15555550123",
+    { source: kind === "critical" ? undefined : "typed", receivedAt: now - 72 * 3600_000 });
+  h.store.updateInbound(id, "failed");
+  await h.router.checkFailedInbound(); await h.router.tick();
+  setSystemTime(now + 60_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toEqual([]); expect(h.backend.prompts).toEqual([]);
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
 });

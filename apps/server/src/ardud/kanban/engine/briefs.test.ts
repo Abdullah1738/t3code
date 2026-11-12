@@ -7,7 +7,13 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { evaluatorBrief, reviewBrief, workBrief, type EvaluatorPurpose } from "./briefs.ts";
+import {
+  evaluatorBrief,
+  nudgeWorkText,
+  reviewBrief,
+  workBrief,
+  type EvaluatorPurpose,
+} from "./briefs.ts";
 
 const model = { instanceId: ProviderInstanceId.make("opencode"), model: "example" };
 const board: KanbanBoard = {
@@ -68,6 +74,23 @@ const card: KanbanCard = {
 };
 
 describe("board briefs", () => {
+  it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
+    expect(nudgeWorkText([card])).toContain(
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
+    );
+  });
+
+  it("lets newly dispatched workers end their turn while watching PR CI", () => {
+    const brief = workBrief(board, card, null);
+    expect(brief).toContain(
+      "Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on.",
+    );
+    expect(brief).toContain("For a deploy or anything else, wait inside your turn.");
+    expect(brief).not.toContain("Never end a turn while a card of yours is in Working");
+    expect(brief).not.toContain("Wait for CI or a deploy inside the turn");
+    expect(brief).not.toContain("Each time you stop with a card in Working you are nudged");
+  });
+
   it("includes the file-first instructions with a request", () => {
     const brief = evaluatorBrief(board, { kind: "request", text: "Owner's exact request" });
     expect(brief).toContain(

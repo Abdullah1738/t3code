@@ -1,15 +1,30 @@
 import { Link } from "@tanstack/react-router";
-import { ChevronDownIcon, ChevronUpIcon, XIcon } from "lucide-react";
+import {
+  ArrowRightIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  DotIcon,
+  OctagonXIcon,
+  PauseIcon,
+  PlayIcon,
+  TimerOffIcon,
+  XIcon,
+} from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   askViews,
+  cardHistory,
+  cardStateView,
   cardView,
+  drawerCard,
   modelName,
   modelVariant,
   STAGE_LABELS,
   subtaskOwnerLabel,
   subtaskSteps,
+  type CardHistoryLine,
+  type CardStateView,
   type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -34,9 +49,10 @@ import { cn } from "../../lib/utils";
 import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { boardViewFor, useBoardClock } from "./useBoardClock";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
-import { PrGlyph } from "./CardTile";
+import { clockTime, PrGlyph, TileWhy } from "./CardTile";
 import { Chat, Composer } from "./Chat";
 import {
   kanban,
@@ -86,10 +102,22 @@ export function CardDrawer(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const { boardId, state } = props;
-  const card = state.cards.get(props.cardId);
+  const feedCard = state.cards.get(props.cardId);
   const detail = useCardDetail(boardId, props.cardId);
+  // The feed's copy has no description or prompt and trims long texts; the card read
+  // on its own has them. Until it arrives the drawer shows a placeholder, not "empty".
+  const shown = feedCard === undefined ? null : drawerCard(feedCard, detail?.card);
+  const card = shown?.card;
+  const loaded = shown?.loaded ?? false;
+  const fullCard = detail?.card;
+  useEffect(() => {
+    // Search can read this card's description from now on.
+    if (fullCard !== undefined) boardViewFor(boardId).learn(fullCard);
+  }, [boardId, fullCard]);
   const detailFeed = useFeed(kanban.card(boardId, props.cardId));
   const nowMs = useNowMs();
+  // The board's own clock and cache: the header says what the card's tile says.
+  const boardClock = useBoardClock();
   const [tab, setTab] = useState<DrawerTab>("details");
   const panelRef = useRef<HTMLElement>(null);
 
@@ -159,8 +187,10 @@ export function CardDrawer(props: {
     };
   }, []);
 
-  if (!card) return null;
+  if (!card || !feedCard) return null;
   const view = cardView(card, state, nowMs);
+  const placed = boardViewFor(boardId).place(state, boardClock, props.cardId);
+  const where = placed === null ? null : cardStateView(feedCard, placed.place, placed.unblocks);
   const comments = (detail?.events ?? []).filter((event) => event.kind === "comment");
   const threads = detail?.threads ?? [];
   const linear = card.links.find((link) => link.kind === "linear");
@@ -182,7 +212,7 @@ export function CardDrawer(props: {
         className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[540px] flex-col bg-(--m-raised) px-5.5 pt-4 shadow-xl ring-1 ring-(--m-rule) outline-none"
       >
         {/* Header scrolls and shrinks first on short windows, so the tabs and tab content stay in the drawer. */}
-        <div className="flex min-h-0 shrink flex-col overflow-y-auto">
+        <div className="flex min-h-0 shrink flex-col overflow-y-auto overscroll-contain max-sm:max-h-[48dvh]">
           <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
             <Pri priority={card.priority} />
             <span className="tabular-nums">#{card.number}</span>
@@ -234,13 +264,13 @@ export function CardDrawer(props: {
                 onClick={() => {
                   // Read before settling: once settled, the card leaves the Verified list.
                   const after = props.steps?.afterSettle ?? null;
-                  void runAction("Couldn't settle the card", () =>
-                    kanban.settleCard(card.id),
-                  ).then((ok) => {
-                    if (!ok) return;
-                    if (after !== null) props.onStepCard(after);
-                    else props.onClose();
-                  });
+                  void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
+                    (ok) => {
+                      if (!ok) return;
+                      if (after !== null) props.onStepCard(after);
+                      else props.onClose();
+                    },
+                  );
                 }}
                 className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               >
@@ -251,7 +281,7 @@ export function CardDrawer(props: {
               type="button"
               onClick={props.onClose}
               aria-label="Close"
-              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:size-11"
             >
               <XIcon className="size-4" />
             </button>
@@ -261,11 +291,20 @@ export function CardDrawer(props: {
           </h2>
           {card.description ? (
             <CardDescription key={card.description} text={card.description} />
+          ) : !loaded && !detailFeed.failure ? (
+            <div
+              role="status"
+              aria-label="Loading the description…"
+              className="mt-1 flex flex-col gap-2"
+            >
+              <span className="h-3 w-4/5 rounded-full bg-(--m-chip)" />
+              <span className="h-3 w-3/5 rounded-full bg-(--m-chip)" />
+            </div>
           ) : null}
           <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
-            <Chip>
+            <Chip className={where?.needsYou ? "text-(--m-warning)" : ""}>
               <Glyph kind={stageGlyph(card.stage)} />
-              {view.stageLabel}
+              {where?.column ?? view.stageLabel}
             </Chip>
             {view.goal ? <Chip>{view.goal.name}</Chip> : null}
             {view.pr ? (
@@ -277,6 +316,7 @@ export function CardDrawer(props: {
             {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
             <Chip>{view.model.name}</Chip>
           </div>
+          {where ? <CardState view={where} /> : null}
           <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         </div>
         <Tabs
@@ -293,7 +333,7 @@ export function CardDrawer(props: {
         {detailFeed.failure ? (
           <p role="status" className="mt-2 flex items-center gap-3 text-sm text-(--m-muted)">
             <span className="min-w-0 flex-1 truncate">
-              Couldn't load threads and comments. {kanbanErrorMessage(detailFeed.failure.error)}
+              Couldn't load the full card. {kanbanErrorMessage(detailFeed.failure.error)}
             </span>
             <button
               type="button"
@@ -405,13 +445,10 @@ function Details(props: {
       (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
     if (confirmed) patch({ removeLinks: [link.url] });
   };
-  const moves = props.events
-    .filter((event) => event.kind === "moved")
-    .slice(-6)
-    .toReversed();
+  const history = cardHistory(props.events);
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto py-4">
+    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-4">
       <dl className="grid grid-cols-[112px_1fr] items-center gap-x-4 gap-y-3 text-sm">
         <Fact label="Stage">
           <Menu>
@@ -567,29 +604,147 @@ function Details(props: {
                 title={patchNote}
                 onClick={() => patch({ stalled: false })}
               >
-                Clear
+                {/* Clearing a failure lets the board start the card again; the Model row reroutes it. */}
+                {card.stalled.by._tag === "system" ? "Restart" : "Clear"}
               </QuietButton>
             </span>
           </Fact>
         ) : null}
       </dl>
       <Subtasks card={card} />
-      {moves.length > 0 ? (
-        <ol className="mt-6 flex flex-col gap-2 text-sm">
-          {moves.map((event) => (
-            <li key={event.id} className="grid grid-cols-[64px_1fr] gap-3">
-              <span className="text-xs text-(--m-muted) tabular-nums">
-                {ageView(event.at, props.nowMs)?.label ?? ""}
-              </span>
-              <span>
-                {event.fromStage ? STAGE_LABELS[event.fromStage] : "New"} →{" "}
-                {event.toStage ? STAGE_LABELS[event.toStage] : ""}
+      <History lines={history} nowMs={props.nowMs} />
+    </div>
+  );
+}
+
+/** What the card waits on and what it holds up: the tile's own words, with room to read them. */
+function CardState(props: { view: CardStateView }) {
+  const { view } = props;
+  // A failed or idle card is not waiting on anything: the label says what it is doing.
+  const label =
+    view.line?.icon === "stop"
+      ? "Stopped"
+      : view.line?.icon === "retry"
+        ? "Retrying"
+        : "Waiting on";
+  return (
+    // On a phone the label sits over its value: beside it the value wrapped to five lines.
+    <dl className="mb-3.5 grid grid-cols-[112px_1fr] items-start gap-x-4 gap-y-2 text-sm max-sm:grid-cols-1 max-sm:gap-y-0.5 pointer-coarse:text-base max-sm:[&>dd:not(:last-child)]:mb-2">
+      <dt className="text-(--m-muted)">{label}</dt>
+      <dd className="min-w-0">
+        {view.line ? (
+          <TileWhy line={view.line} clamp={false} roomy />
+        ) : (
+          <span className={view.needsYou ? "font-medium text-(--m-warning)" : undefined}>
+            {view.plain}
+          </span>
+        )}
+      </dd>
+      {view.unblocks > 0 ? (
+        <>
+          <dt className="text-(--m-muted)">Unblocks</dt>
+          <dd className="tabular-nums">
+            {view.unblocks.toLocaleString("en-US")} {view.unblocks === 1 ? "card" : "cards"}
+          </dd>
+        </>
+      ) : null}
+    </dl>
+  );
+}
+
+/** How many history lines show before "N earlier". */
+const HISTORY_PREVIEW = 8;
+
+const HISTORY_ICONS = {
+  move: ArrowRightIcon,
+  wait: PauseIcon,
+  wake: PlayIcon,
+  expired: TimerOffIcon,
+  flag: OctagonXIcon,
+  plain: DotIcon,
+} as const;
+
+const HISTORY_TONES: Record<CardHistoryLine["kind"], string> = {
+  move: "text-(--m-muted)",
+  wait: "text-(--m-muted)",
+  wake: "text-(--m-accent-text)",
+  expired: "text-(--m-warning)",
+  flag: "text-(--m-negative)",
+  plain: "text-(--m-muted)",
+};
+
+const HISTORY_ACTORS: Record<CardHistoryLine["actor"], string | null> = {
+  owner: "You",
+  thread: "Worker",
+  evaluator: "Evaluator",
+  script: "Script",
+  // The board itself: saying so on every line it wrote is noise.
+  system: null,
+};
+
+/** The card's moves, waits and flags, newest first. */
+function History(props: { lines: ReadonlyArray<CardHistoryLine>; nowMs: number }) {
+  const [all, setAll] = useState(false);
+  if (props.lines.length === 0) return null;
+  const shown = all ? props.lines : props.lines.slice(0, HISTORY_PREVIEW);
+  const earlier = props.lines.length - shown.length;
+  return (
+    <section className="mt-6" aria-label="History">
+      <h3 className="mb-2 text-sm font-medium">History</h3>
+      <ol className="flex flex-col gap-2 text-sm pointer-coarse:text-base">
+        {shown.map((line) => {
+          const Icon = HISTORY_ICONS[line.kind];
+          const actor = HISTORY_ACTORS[line.actor];
+          return (
+            <li key={line.id} className="grid grid-cols-[112px_1fr] gap-x-4 max-sm:grid-cols-1">
+              <time
+                dateTime={line.at}
+                className="pt-0.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-sm"
+              >
+                {clockTime(line.at, props.nowMs)}
+              </time>
+              <span className="flex min-w-0 items-start gap-1.5">
+                <Icon
+                  aria-hidden
+                  className={cn("mt-0.75 size-3.5 shrink-0", HISTORY_TONES[line.kind])}
+                />
+                <span className="min-w-0 wrap-break-word">
+                  {line.parts.map((part, index) =>
+                    typeof part === "string" ? (
+                      part
+                    ) : (
+                      <time key={index} dateTime={part.at}>
+                        {clockTime(part.at, props.nowMs)}
+                      </time>
+                    ),
+                  )}
+                  {actor ? (
+                    <>
+                      {" "}
+                      <span className="whitespace-nowrap text-(--m-muted)">· {actor}</span>
+                    </>
+                  ) : null}
+                  {line.moved ? (
+                    <span className="block text-xs text-(--m-muted) pointer-coarse:text-sm">
+                      {line.moved}
+                    </span>
+                  ) : null}
+                </span>
               </span>
             </li>
-          ))}
-        </ol>
+          );
+        })}
+      </ol>
+      {earlier > 0 ? (
+        <button
+          type="button"
+          onClick={() => setAll(true)}
+          className="mt-2 h-7 rounded-lg text-sm text-(--m-muted) tabular-nums outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
+        >
+          {earlier.toLocaleString("en-US")} earlier
+        </button>
       ) : null}
-    </div>
+    </section>
   );
 }
 
@@ -743,7 +898,7 @@ function StepButton(props: {
             disabled={target === null}
             onClick={() => target !== null && props.onStep(target)}
             aria-label={props.label}
-            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40"
+            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40 pointer-coarse:size-11"
           />
         }
       >

@@ -23,7 +23,10 @@ import type {
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
-import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
+import {
+  latestExecutedRun,
+  latestRootProviderFailure,
+} from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -42,6 +45,12 @@ export interface KanbanThreadPr {
   readonly url: string;
   readonly title: string | null;
   readonly state: "open" | "draft" | "merged" | "closed";
+  /** Its head commit while the thread watches the PR (the watch keeps it current); null otherwise. */
+  readonly head?: string | null;
+  /** Checks on the head as last synced; null when none were reported. */
+  readonly checks?: "passing" | "failing" | "pending" | null;
+  /** When its state and checks were last synced from the host; null when never. */
+  readonly at?: string | null;
 }
 
 export interface KanbanThreadView {
@@ -54,8 +63,10 @@ export interface KanbanThreadView {
   readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
-  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches don't count: they never end. */
+  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
+  /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
+  readonly prWatches: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
   readonly archived: boolean;
 }
@@ -76,6 +87,8 @@ export interface KanbanSendInput {
   readonly key?: string;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
+  /** Steer only an existing turn; never start an idle thread. */
+  readonly mode?: "steer";
 }
 
 /**
@@ -86,8 +99,8 @@ export interface KanbanThreadsShape {
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
   /** Like view, but a failed read fails: null means the thread is gone. */
   readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
-  /** The model the thread runs now, or null when the thread is gone. */
-  readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
+  /** The selected model, or the active run's recorded model when requested. */
+  readonly model: (threadId: ThreadId, activeRun?: boolean) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
   // runId names the executed run, so a repeated notification of the same run is recognised.
   readonly lastFailure: (threadId: ThreadId) => Effect.Effect<
@@ -127,8 +140,18 @@ export interface KanbanThreadsShape {
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
-  readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
-  readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
+  readonly setModel: (
+    threadId: ThreadId,
+    model: ModelSelection,
+  ) => Effect.Effect<void, KanbanThreadError>;
+  /** Cancels only this queued brief; false means it may already be acting. */
+  readonly cancelQueued: (threadId: ThreadId, runId: string) => Effect.Effect<boolean>;
+  /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
+  readonly interrupt: (
+    threadId: ThreadId,
+    reason: string,
+    cancelQueued?: boolean,
+  ) => Effect.Effect<void, KanbanThreadError>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -147,11 +170,7 @@ const detailOf = (error: unknown) =>
 export const viewStateOf = (
   shell: Pick<
     OrchestrationV2ThreadShell,
-    | "pendingRuntimeRequest"
-    | "activityRunStatus"
-    | "status"
-    | "updatedAt"
-    | "latestRunCompletedAt"
+    "pendingRuntimeRequest" | "activityRunStatus" | "status" | "updatedAt" | "latestRunCompletedAt"
   >,
 ): { readonly state: ControlThreadState; readonly quietSince: DateTime.Utc } => {
   const request = shell.pendingRuntimeRequest;
@@ -168,6 +187,14 @@ export const backgroundWorkOf = (
   (shell.pendingBackgroundTasks ?? []).filter(
     (task) =>
       !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
+  ).length;
+
+export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>
+  (shell.pullRequests ?? []).filter(
+    (pr) =>
+      pr.watch !== undefined &&
+      pr.source !== "stack-dismissed" &&
+      (pr.snapshot === null || pr.snapshot.state === "open"),
   ).length;
 
 const make = Effect.gen(function* () {
@@ -191,6 +218,7 @@ const make = Effect.gen(function* () {
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
               backgroundWork: backgroundWorkOf(shell),
+              prWatches: prWatchesOf(shell),
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,
@@ -201,6 +229,10 @@ const make = Effect.gen(function* () {
                     : pr.snapshot.state === "open" && pr.snapshot.isDraft
                       ? "draft"
                       : pr.snapshot.state,
+                // Only a live watch: an ended one's head may be commits behind.
+                head: pr.watch?.headSha ?? null,
+                checks: pr.snapshot?.checksState ?? null,
+                at: pr.snapshot?.syncedAt ?? null,
               })),
             },
       ),
@@ -212,11 +244,25 @@ const make = Effect.gen(function* () {
   const view: KanbanThreadsShape["view"] = (threadId) =>
     find(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
 
-  const model: KanbanThreadsShape["model"] = (threadId) =>
+  const model: KanbanThreadsShape["model"] = (threadId, activeRun = false) =>
     threads.getThreadShell(threadId).pipe(
-      Effect.map((shell) =>
-        shell === null || shell.deletedAt !== null ? null : shell.modelSelection,
-      ),
+      Effect.flatMap((shell) => {
+        if (shell === null || shell.deletedAt !== null) return Effect.succeed(null);
+        if (!activeRun) return Effect.succeed(shell.modelSelection);
+        if (shell.activeRunId === null) return Effect.succeed(null);
+        return threads
+          .getThreadRecords(threadId, ["runs"])
+          .pipe(
+            Effect.map(
+              (records) =>
+                records.runs.find(
+                  (run) =>
+                    run.id === shell.activeRunId &&
+                    ["preparing", "starting", "running", "waiting"].includes(run.status),
+                )?.modelSelection ?? null,
+            ),
+          );
+      }),
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
@@ -243,7 +289,9 @@ const make = Effect.gen(function* () {
           ? null
           : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
       }),
-      Effect.mapError((error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) })),
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) }),
+      ),
     );
   const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
     findLastFailure(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
@@ -349,7 +397,8 @@ const make = Effect.gen(function* () {
         text: input.text,
         attachments: [],
         ...(input.model ? { modelSelection: input.model } : {}),
-        mode: "auto",
+        mode: input.mode ?? "auto",
+        ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
         createdBy: "system",
         creationSource: "server",
       });
@@ -374,7 +423,10 @@ const make = Effect.gen(function* () {
       }
       if (modelSelectionsEqual(shell.modelSelection, model)) return;
       yield* threads.dispatch({
-        type: model.instanceId === shell.providerInstanceId ? "thread.model-selection.set" : "provider.switch",
+        type:
+          model.instanceId === shell.providerInstanceId
+            ? "thread.model-selection.set"
+            : "provider.switch",
         commandId: commandId("model"),
         threadId,
         modelSelection: model,
@@ -387,18 +439,63 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const cancelQueued: KanbanThreadsShape["cancelQueued"] = Effect.fn("KanbanThreads.cancelQueued")(
+    function* (threadId, runId) {
+      const run = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      if (run?.status !== "queued") return false;
+      yield* threads.dispatch({
+        type: "queued-run.cancel",
+        commandId: commandId("cancel"),
+        threadId,
+        runId: run.id,
+      });
+      const after = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      return after?.status === "cancelled";
+    },
+    Effect.catchCause(() => Effect.succeed(false)),
+  );
+
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
-    function* (threadId, reason) {
+    function* (threadId, reason, cancelQueued = false) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null) return;
-      yield* threads.interruptThread({
-        projectId: shell.projectId,
+      if (!cancelQueued) {
+        yield* threads.interruptThread({
+          projectId: shell.projectId,
+          commandId: commandId("stop"),
+          threadId,
+          reason,
+        });
+        return;
+      }
+      // Stop holds the queue atomically with the interrupt. interruptThread alone
+      // ignores queued runs, allowing an abandoned launch to start afterwards.
+      yield* threads.dispatch({
+        type: "thread.stop",
         commandId: commandId("stop"),
         threadId,
         reason,
       });
+      const stopped = yield* threads.getThreadRecords(threadId, ["runs"]);
+      for (const run of stopped.runs) {
+        if (run.status !== "queued") continue;
+        yield* threads.dispatch({
+          type: "queued-run.cancel",
+          commandId: commandId("cancel"),
+          threadId,
+          runId: run.id,
+        });
+      }
     },
-    Effect.catchCause(() => Effect.void),
+    Effect.mapError((error) =>
+      isKanbanThreadError(error)
+        ? error
+        : new KanbanThreadError({ operation: "interrupt", detail: detailOf(error) }),
+    ),
   );
 
   return KanbanThreads.of({
@@ -412,6 +509,7 @@ const make = Effect.gen(function* () {
     launch,
     send,
     setModel,
+    cancelQueued,
     interrupt,
   });
 });

@@ -19,9 +19,12 @@ describe("Forgejo comment watch boundary", () => {
     failedChecks: [],
     passed: false,
     passedChecks: [],
+    passedPending: [],
     remarksThrough: "2026-10-10T19:52:40.000Z",
     remarkIds: ["29061"],
     conflicting: false,
+    conflictHead: null,
+    conflictWokeFor: null,
     wakes: 2,
   } satisfies ThreadPullRequestWatch;
   const finalDetail = {

@@ -64,50 +64,54 @@ export function CardDetail(props: {
   const [createdId, setCreatedId] = useState<string | null>(null);
   if (card === undefined) return <EmptyLine label="This card is gone." />;
 
-  const header = (
-    <View className="gap-3 pb-1">
-      <CardHeader
-        card={card}
-        state={props.state}
-        nowMs={props.nowMs}
-        onClose={props.onClose}
-        stepper={props.stepper}
-        onOpenGoal={props.onOpenGoal}
-        onAnswer={() => setTab("discussion")}
-      />
-      <UnderlineTabs
-        accessibilityLabel="Card"
-        className="-mx-4"
-        tabs={[
-          { value: "details", label: "Details" },
-          { value: "discussion", label: "Discussion" },
-          { value: "threads", label: "Threads" },
-        ]}
-        selected={tab}
-        onSelect={setTab}
-      />
-    </View>
+  const cardHeader = (
+    <CardHeader
+      card={card}
+      state={props.state}
+      nowMs={props.nowMs}
+      onClose={props.onClose}
+      stepper={props.stepper}
+      onOpenGoal={props.onOpenGoal}
+      onAnswer={() => setTab("discussion")}
+    />
+  );
+  const tabs = (
+    <UnderlineTabs
+      accessibilityLabel="Card"
+      className="-mx-4"
+      tabs={[
+        { value: "details", label: "Details" },
+        { value: "discussion", label: "Discussion" },
+        { value: "threads", label: "Threads" },
+      ]}
+      selected={tab}
+      onSelect={setTab}
+    />
   );
 
   if (tab === "discussion") {
     const discussionId = card.discussionId ?? createdId;
     return (
-      <Chat
-        key={card.id}
-        boardId={props.boardId}
-        state={props.state}
-        discussionId={discussionId}
-        ensureDiscussion={async () => {
-          const discussion = await kanbanClient().cardDiscussion(props.boardId, card.id);
-          setCreatedId(discussion.id);
-          return discussion.id;
-        }}
-        nowMs={props.nowMs}
-        bottomInset={props.bottomInset}
-        onOpenCard={props.onOpenCard}
-        header={header}
-        startAtEnd={false}
-      />
+      <View className="flex-1">
+        <View style={{ maxHeight: "40%" }}>
+          <ScrollView contentContainerClassName="px-4 pt-2">{cardHeader}</ScrollView>
+        </View>
+        <View className="px-4 pb-1 pt-3">{tabs}</View>
+        <Chat
+          key={card.id}
+          boardId={props.boardId}
+          state={props.state}
+          discussionId={discussionId}
+          ensureDiscussion={async () => {
+            const discussion = await kanbanClient().cardDiscussion(props.boardId, card.id);
+            setCreatedId(discussion.id);
+            return discussion.id;
+          }}
+          nowMs={props.nowMs}
+          bottomInset={props.bottomInset}
+          onOpenCard={props.onOpenCard}
+        />
+      </View>
     );
   }
 
@@ -117,7 +121,10 @@ export function CardDetail(props: {
       contentContainerClassName="gap-3 px-4 pt-2"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
     >
-      {header}
+      <View className="gap-3 pb-1">
+        {cardHeader}
+        {tabs}
+      </View>
       {tab === "details" ? (
         <CardFacts
           card={card}

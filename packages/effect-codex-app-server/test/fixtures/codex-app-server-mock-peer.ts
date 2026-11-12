@@ -34,6 +34,15 @@ const handleMethod = (message: Record<string, unknown>) => {
     return;
   }
 
+  if (method === process.env.CODEX_APP_SERVER_TEST_EXIT_ON_METHOD) {
+    const flood = Number(process.env.CODEX_APP_SERVER_TEST_EXIT_STDERR_FLOOD_BYTES ?? 0);
+    const finalStderr = process.env.CODEX_APP_SERVER_TEST_EXIT_STDERR ?? "";
+    process.stderr.write(`${"x".repeat(Number.isFinite(flood) ? flood : 0)}${finalStderr}`, () => {
+      process.exit(0);
+    });
+    return;
+  }
+
   switch (method) {
     case "initialize": {
       // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone mock peer process has no Effect runtime.

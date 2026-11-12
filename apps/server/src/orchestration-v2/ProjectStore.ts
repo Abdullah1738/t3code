@@ -127,7 +127,11 @@ export const make = Effect.gen(function* () {
       WHERE ${sql.and([
         ...(request.includeDeleted ? [] : [sql`deleted_at IS NULL`]),
         ...(request.projectId === undefined ? [] : [sql`project_id = ${request.projectId}`]),
-        ...(request.projectIds === undefined ? [] : [sql.in("project_id", request.projectIds)]),
+        ...(request.projectIds === undefined
+          ? []
+          : [
+              sql`project_id IN (SELECT value FROM json_each(${JSON.stringify(request.projectIds)}))`,
+            ]),
         ...(request.workspaceRoot === undefined
           ? []
           : [sql`workspace_root = ${request.workspaceRoot}`]),

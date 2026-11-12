@@ -171,6 +171,9 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
+      ...(authorized.verifiedDescriptor
+        ? { verifiedDescriptor: authorized.verifiedDescriptor }
+        : {}),
       target,
     } satisfies PreparedConnection;
   });
@@ -190,6 +193,9 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
         httpBaseUrl: authorized.httpBaseUrl,
         socketUrl: authorized.socketUrl,
         httpAuthorization: authorized.httpAuthorization,
+        ...(authorized.verifiedDescriptor
+          ? { verifiedDescriptor: authorized.verifiedDescriptor }
+          : {}),
         target,
       } satisfies PreparedConnection;
     },
@@ -265,6 +271,9 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
+      ...(authorized.verifiedDescriptor
+        ? { verifiedDescriptor: authorized.verifiedDescriptor }
+        : {}),
       target,
     } satisfies PreparedConnection;
   });
@@ -286,7 +295,7 @@ export const make = Effect.gen(function* () {
       "connection.environment.id": target.environmentId,
       "connection.target.kind": target._tag,
     });
-    const prepared = yield* (() => {
+    const prepared: PreparedConnection = yield* (() => {
       switch (target._tag) {
         case "PrimaryConnectionTarget":
           return primary(target);
@@ -298,12 +307,15 @@ export const make = Effect.gen(function* () {
           return ssh({ ...entry, target });
       }
     })();
-    const descriptor = yield* fetchRemoteEnvironmentDescriptor({
-      httpBaseUrl: prepared.httpBaseUrl,
-    }).pipe(
-      Effect.mapError(mapRemoteEnvironmentError),
-      Effect.provideService(HttpClient.HttpClient, httpClient),
-    );
+    const descriptor =
+      prepared.verifiedDescriptor?.httpBaseUrl === prepared.httpBaseUrl
+        ? prepared.verifiedDescriptor.descriptor
+        : yield* fetchRemoteEnvironmentDescriptor({
+            httpBaseUrl: prepared.httpBaseUrl,
+          }).pipe(
+            Effect.mapError(mapRemoteEnvironmentError),
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+          );
     if (descriptor.environmentId !== target.environmentId) {
       return yield* environmentMismatchError({
         expected: target.environmentId,

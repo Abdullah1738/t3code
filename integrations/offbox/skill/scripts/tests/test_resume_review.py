@@ -210,7 +210,6 @@ class BringUpOutageTests(Isolated):
                 patch.object(cli, 'time', clock.time), patch.object(outage, 'time', clock.time), \
                 patch.object(outage, 'now', lambda: clock.t), patch.object(api, 'get', side_effect=get), \
                 patch.object(api, 'probe', return_value='no answer'), \
-                patch('offbox_lib.localfirst.decide', return_value='test'), \
                 patch.object(lease.ssh_sync, 'cfg_path', return_value=self.tmp_path()), \
                 patch.object(lease, 'acquire_private') as create, patch.object(api, 'resume') as resume, \
                 patch.object(runs, 'run_remote', side_effect=remote), patch.object(fallback, 'note_infra_failure'), \
@@ -249,7 +248,6 @@ class BringUpOutageTests(Isolated):
                 with patch.object(cli, 'time', clock.time), patch.object(outage, 'time', clock.time), \
                         patch.object(outage, 'now', lambda: clock.t), patch.object(api, 'get', side_effect=get), \
                         patch.object(api, 'probe', return_value=None) as probe, \
-                        patch('offbox_lib.localfirst.decide', return_value='test'), \
                         patch.object(lease.ssh_sync, 'cfg_path', return_value=self.tmp_path()), \
                         patch.object(lease.ssh_sync, 'setup'), patch.object(lease.ssh_sync, 'wait_ssh'), \
                         patch.object(lease, 'ensure_ttl'), patch.object(lease, 'acquire_private') as create, \

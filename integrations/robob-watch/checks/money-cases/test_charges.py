@@ -500,12 +500,12 @@ class Explain(unittest.TestCase):
                        find=Finder([{'id': 1, 'ts': ts('2026-10-23T23:50'), 'sender': 'acme', 'subject': 'acme 5.00'}]))
         self.assertEqual(r['verdict'], 'ask')
 
-    def test_lookups_that_fail_are_reported_and_it_asks(self):
+    def test_lookups_that_fail_are_reported_and_block_asking(self):
         def broken(*a, **k):
             raise ch.Lookup('msgs exit 1')
         r = ch.explain(CHARGE, at('2026-10-23T23:47'), at('2026-10-24T00:37'), find=broken, said=broken)
-        self.assertEqual(r['verdict'], 'ask')
-        self.assertEqual(len(r['errors']), 3)
+        self.assertEqual(r['verdict'], 'unverified')
+        self.assertEqual(len(r['errors']), 2)
         with self.assertRaises(ch.Lookup):
             ch.left(0, 5)
 

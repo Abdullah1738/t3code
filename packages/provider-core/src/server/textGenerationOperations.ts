@@ -34,7 +34,24 @@ export interface Request<S extends Schema.Top> {
    * runner that cannot guarantee read-only tools fails rather than answering blind.
    */
   readonly investigate?: { readonly timeoutMs: number } | undefined;
+  /** See `JsonGenerationInput.timeoutMs`: overrides the investigation and driver limits. */
+  readonly timeoutMs?: number | null | undefined;
 }
+
+/**
+ * The wall-clock limit a CLI runner applies to `request`, or null for none: the request's own
+ * `timeoutMs`, else the investigation's, else the driver's default.
+ */
+export const requestTimeoutMs = (
+  request: Pick<Request<Schema.Top>, "timeoutMs" | "investigate">,
+  defaultMs: number,
+): number | null => {
+  const ms =
+    request.timeoutMs === undefined
+      ? (request.investigate?.timeoutMs ?? defaultMs)
+      : request.timeoutMs;
+  return ms === null || !Number.isFinite(ms) ? null : ms;
+};
 
 const INVESTIGATION_TIMEOUT_MS = 15 * 60_000;
 

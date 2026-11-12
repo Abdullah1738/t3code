@@ -1,0 +1,12 @@
+[Unit]
+Description=offbox: network, sshd and automatic restart in emergency/rescue mode
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/offbox-emergency
+
+[Install]
+WantedBy=emergency.target rescue.target

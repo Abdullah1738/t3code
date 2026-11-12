@@ -41,6 +41,8 @@ function invalidOptions(
       continue;
     }
     seen.add(option.id);
+    // Legacy selections retain this enforced marker after fast mode leaves the catalog.
+    if (option.id === "fastMode" && option.value === false) continue;
     if (descriptors === undefined) continue;
     const descriptor = descriptors.find((candidate) => candidate.id === option.id);
     if (descriptor === undefined) {

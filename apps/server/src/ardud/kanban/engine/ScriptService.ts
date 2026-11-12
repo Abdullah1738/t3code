@@ -7,6 +7,10 @@
  * The lines they print with a `kanban` key become cards, discussion posts,
  * pool sizes, subtask ticks, hand-backs and card moves (see scripts.ts), and
  * every run keeps its output for the scripts page.
+ *
+ * A script can also be a wait's check: cards parked with `on: "script"` are
+ * handed to their script in one run per pass (`checkWaits`), outside the board
+ * lock, and what it prints ends or holds each wait.
  */
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
@@ -19,6 +23,7 @@ import {
   KanbanDiscussionId,
   KanbanError,
   KanbanScriptId,
+  kanbanWaiting,
   type KanbanActor,
   type KanbanBoard,
   type KanbanCard,
@@ -34,6 +39,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -44,12 +50,14 @@ import * as Stream from "effect/Stream";
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
-import { KanbanService } from "./KanbanService.ts";
+import { KanbanService, type WaitAnswerFor } from "./KanbanService.ts";
 import { modelSelectionResult } from "./defaults.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
 import * as Text from "./text.ts";
+import { KanbanWaitPrs } from "./waitPrs.ts";
+import * as Waits from "./waits.ts";
 
 /** A run past this is killed with its whole process group. */
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -96,8 +104,14 @@ export interface KanbanScriptsShape {
     scriptId: KanbanScript["id"],
     trigger: string,
   ) => Effect.Effect<KanbanScriptRun, KanbanError>;
-  /** Starts the scheduled scripts that are due. */
+  /** Starts the scheduled scripts that are due, and the wait checks once waits are live. */
   readonly tick: Effect.Effect<void, KanbanError>;
+  /**
+   * One pass over the cards waiting on a script: each script whose rest is
+   * over runs once with all its cards on stdin, and its output answers them.
+   * Runs outside the board lock; `tick` calls it once waits are live.
+   */
+  readonly checkWaits: Effect.Effect<void, KanbanError>;
   /**
    * Starts event scripts as board changes come in, from the moment this
    * returns until the scope closes.
@@ -151,6 +165,15 @@ interface Pending {
   readonly event: string | null;
 }
 
+/** The cards one check run was asked about, and what it reads on stdin. */
+interface WaitBatch {
+  readonly cards: ReadonlyArray<KanbanCard>;
+  readonly stdin: string;
+}
+
+/** The trigger a wait-check run is recorded with. */
+export const WAIT_CHECK_TRIGGER = "wait-check";
+
 // A script that is running: `done` completes when this run ends, and `next` is
 // the one run asked for while it ran (the newest ask wins).
 interface Slot {
@@ -176,6 +199,17 @@ const make = Effect.gen(function* () {
   ];
   const store = yield* KanbanStore;
   const service = yield* KanbanService;
+  // Host readings for the PRs script waits point at; without the reader a
+  // check still gets the states on the card's own links.
+  const waitPrs = yield* Effect.serviceOption(KanbanWaitPrs);
+  if (Waits.WAITS_ENGINE_WIRED && Option.isNone(waitPrs)) {
+    yield* Effect.logWarning(
+      "board scripts: no wait PR reader is provided, so script checks only see PR states already on their cards",
+    );
+  }
+  // When each script last ran its checks, by board and name. In memory: a
+  // restart checks once more, which costs one run.
+  const waitChecks = new Map<string, number>();
   const scope = yield* Effect.scope;
   // One run per script. A slot is taken, and handed to the next run, in one
   // step, so nothing can land between a run ending and the next one starting.
@@ -431,6 +465,139 @@ const make = Effect.gen(function* () {
     return notes;
   });
 
+  // Applies what the script printed about waits. A check run also answers for
+  // the cards it printed nothing about: no line is a hold, and a run that
+  // failed is a failed check for each of them. The answers go to the board in
+  // one write (`answerWaits`), which reads the board once however many cards
+  // wait on the script; a park line is its own write, so the answers printed
+  // before it are applied first.
+  const applyWaits = Effect.fn("KanbanScripts.applyWaits")(function* (
+    script: KanbanScript,
+    lines: ReadonlyArray<Scripts.WaitLine>,
+    check: WaitBatch | null,
+    failed: string | null,
+  ) {
+    const notes: Array<string> = [];
+    if (lines.length === 0 && check === null) return notes;
+    const actor: KanbanActor = { _tag: "script", scriptId: script.id };
+    const answered = new Set<string>();
+    // The waits this check was asked about, as they were when its input was built.
+    // An answer is for that wait: if the card waits on another one by now (the
+    // same script with other args, say), it is dropped.
+    const asked = new Map(
+      (check?.cards ?? []).flatMap((card) =>
+        card.wait === undefined ? [] : [[card.id as string, Waits.waitIdentity(card.wait)]],
+      ),
+    );
+    const askedByNumber = new Map((check?.cards ?? []).map((card) => [card.number, card.id]));
+    // Answers not yet sent, each with the card number its note names (null: no note).
+    // One refused before it is sent has no answer, only the reason.
+    let pending: Array<
+      | { readonly answer: WaitAnswerFor; readonly line: number | null }
+      | { readonly answer: null; readonly line: number; readonly refused: string }
+    > = [];
+    const flush = Effect.gen(function* () {
+      if (pending.length === 0) return;
+      const sending = pending;
+      pending = [];
+      const answers = sending.flatMap((entry) => (entry.answer === null ? [] : [entry.answer]));
+      const result =
+        answers.length === 0
+          ? null
+          : yield* Effect.result(service.answerWaits(script.boardId, answers, actor));
+      let sent = 0;
+      for (const entry of sending) {
+        if (entry.answer === null) {
+          notes.push(`Refused for card #${entry.line}: ${entry.refused}`);
+          continue;
+        }
+        const index = sent;
+        sent += 1;
+        if (result === null) continue;
+        const outcome = Result.isSuccess(result) ? result.success[index] : undefined;
+        // The card may have moved on while the script ran; for a card the script
+        // printed nothing about, that refusal is not news.
+        if (entry.line === null) continue;
+        notes.push(
+          outcome?.ok === true
+            ? outcome.text
+            : `Refused for card #${entry.line}: ${
+                outcome?.detail ??
+                (Result.isFailure(result) ? result.failure.detail : "nothing changed")
+              }`,
+        );
+      }
+    });
+    for (const line of lines) {
+      if (line._tag === "park") {
+        yield* flush;
+        const card = yield* io(store.cardByNumber(script.boardId, line.card));
+        if (!card) {
+          notes.push(`Refused for card #${line.card}: No card #${line.card} on this board.`);
+          continue;
+        }
+        const target =
+          line.waitsOn === null
+            ? null
+            : yield* io(store.cardByNumber(script.boardId, line.waitsOn));
+        if (line.waitsOn !== null && target === null) {
+          notes.push(`Couldn't park card #${line.card}: No card #${line.waitsOn} on this board.`);
+          continue;
+        }
+        const parked = yield* Effect.result(
+          service.waitCard(card.id, { ...line.request, card: target?.id ?? null }, actor),
+        );
+        notes.push(
+          Result.isSuccess(parked)
+            ? `Card #${line.card} now waits (${line.request.on}).`
+            : `Couldn't park card #${line.card}: ${parked.failure.detail}`,
+        );
+        continue;
+      }
+      const askedId = askedByNumber.get(line.card);
+      // A check answers for the cards it was asked about and no other. A card that
+      // started waiting on this script while the check ran was never in its input, so
+      // whatever the script printed for it (a cached line, say) says nothing about its
+      // wait. A wake line is the way to end a wait from outside its check.
+      if (line._tag === "answer" && check !== null && askedId === undefined) {
+        pending.push({
+          line: line.card,
+          answer: null,
+          refused: `this check was not asked about card #${line.card}, so it cannot answer for it. Its wait, if it has one on this script, is checked on the next run; a wake line ends a wait from outside its check.`,
+        });
+        continue;
+      }
+      // Answered, as far as the rest of this run goes, whatever the board makes of it.
+      if (line._tag === "answer" && askedId !== undefined) answered.add(askedId);
+      pending.push({
+        line: line.card,
+        answer:
+          line._tag === "wake"
+            ? { card: line.card, answer: line.answer, script: null, expect: line.wait }
+            : {
+                card: line.card,
+                answer: line.answer,
+                script: script.name,
+                expect: askedId === undefined ? null : (asked.get(askedId) ?? null),
+              },
+      });
+    }
+    for (const card of check?.cards ?? []) {
+      if (answered.has(card.id)) continue;
+      pending.push({
+        line: null,
+        answer: {
+          card: card.id,
+          answer: failed === null ? { result: "hold" } : { result: "fail", reason: failed },
+          script: script.name,
+          expect: asked.get(card.id) ?? null,
+        },
+      });
+    }
+    yield* flush;
+    return notes;
+  });
+
   // Reads the record again under the lock and changes only what the caller
   // owns, so a toggle can't undo a run's lastRun, or the other way round.
   const update = Effect.fn("KanbanScripts.update")(function* (
@@ -507,9 +674,11 @@ const make = Effect.gen(function* () {
     script: KanbanScript,
     run: KanbanScriptRun,
     event: string | null,
+    check: WaitBatch | null,
   ) {
     const interpreter = Scripts.interpreterFor(script.path);
     if (interpreter === null || !(yield* isFile(script.path))) {
+      yield* applyWaits(script, [], check, `There is no script at ${script.path}`);
       return yield* close(script, run, null, `There is no script at ${script.path}.`);
     }
     const current = yield* settings.getSettings.pipe(Effect.mapError(asKanbanError));
@@ -527,9 +696,14 @@ const make = Effect.gen(function* () {
       },
       timeoutMs: RUN_TIMEOUT_MS,
       outputBytes: STDOUT_LIMIT,
+      stdin: check?.stdin,
     });
     const parsed = Scripts.parseOutput(result.stdout);
-    const notes = yield* apply(script, parsed.commands);
+    const broke = Scripts.checkRunProblem(script.name, result, RUN_TIMEOUT_MS);
+    const notes = [
+      ...(yield* apply(script, parsed.commands)),
+      ...(yield* applyWaits(script, parsed.waits, check, broke)),
+    ];
     const problems = [
       result.spawnError === null ? null : `It didn't start: ${result.spawnError}`,
       result.timedOut ? `Stopped after ${RUN_TIMEOUT_MS / 60_000} minutes.` : null,
@@ -563,9 +737,10 @@ const make = Effect.gen(function* () {
     trigger: string,
     event: string | null,
     done: Deferred.Deferred<void>,
+    check: WaitBatch | null = null,
   ): Effect.Effect<KanbanScriptRun, KanbanError> =>
     open(script, trigger).pipe(
-      Effect.tap((run) => Effect.forkIn(finish(script, run, event, done), scope)),
+      Effect.tap((run) => Effect.forkIn(finish(script, run, event, done, check), scope)),
       Effect.onError(() => release(script.id, done)),
     );
 
@@ -611,8 +786,9 @@ const make = Effect.gen(function* () {
     run: KanbanScriptRun,
     event: string | null,
     done: Deferred.Deferred<void>,
+    check: WaitBatch | null,
   ): Effect.Effect<void> =>
-    execute(script, run, event).pipe(
+    execute(script, run, event, check).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("board script run failed", {
           scriptId: script.id,
@@ -761,6 +937,107 @@ const make = Effect.gen(function* () {
         ),
       );
     }
+    // Inert until the board's own wait pass is live: a wait a script ended
+    // would otherwise wake a card the planner doesn't yet hold back.
+    if (Waits.WAITS_ENGINE_WIRED) yield* checkWaits;
+  });
+
+  // One script's checks for one board: the cards waiting on it, and the run that asks about them.
+  const checkScript = Effect.fn("KanbanScripts.checkScript")(function* (
+    board: KanbanBoard,
+    name: string,
+    cards: ReadonlyArray<KanbanCard>,
+    scripts: ReadonlyArray<KanbanScript>,
+    now: number,
+  ) {
+    const batch = cards.filter(
+      (card) => kanbanWaiting(card) && card.wait?.on === "script" && card.wait.script === name,
+    );
+    const key = `${board.id}\n${name}`;
+    const last = waitChecks.get(key);
+    if (last !== undefined && now - last < Waits.scriptCheckEveryMs(batch)) return;
+    const found = scripts.filter((script) => script.name === name);
+    const script = found.length === 1 ? found[0] : undefined;
+    if (script === undefined || !script.enabled) {
+      waitChecks.set(key, now);
+      const reason =
+        script !== undefined
+          ? `The ${name} script is turned off`
+          : found.length === 0
+            ? `This board has no script named ${name}`
+            : `This board has ${found.length} scripts named ${name}`;
+      yield* Effect.result(
+        service.answerWaits(
+          board.id,
+          batch.map((card) => ({
+            card: card.id,
+            answer: { result: "fail" as const, reason },
+            script: name,
+            expect: card.wait === undefined ? null : Waits.waitIdentity(card.wait),
+          })),
+          { _tag: "system", component: "wait-checks" },
+        ),
+      );
+      return;
+    }
+    const done = yield* Deferred.make<void>();
+    const byId = new Map(cards.map((card) => [card.id as string, card]));
+    const links = batch.flatMap((card) =>
+      card.links.flatMap((link) =>
+        link.kind === "pr" && link.state !== null
+          ? [{ url: link.url, state: link.state, at: link.checkedAt }]
+          : [],
+      ),
+    );
+    const prs = Option.isSome(waitPrs)
+      ? (yield* waitPrs.value.read(Waits.waitPrRequests(batch, board, links))).readings
+      : [];
+    const inputs = batch.flatMap((card) => {
+      const input = Waits.checkInput(
+        card,
+        { nowMs: now, prs, cards: byId },
+        { chainLength: Rules.chainFor(board, card)?.steps.length ?? 1 },
+      );
+      return input === null ? [] : [input];
+    });
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        // Its own run is going: the checks wait for the next pass rather than queue behind it.
+        if (!(yield* claim(script.id, done))) return;
+        waitChecks.set(key, now);
+        yield* launch(script, WAIT_CHECK_TRIGGER, null, done, {
+          cards: batch,
+          stdin: JSON.stringify(inputs),
+        });
+      }),
+    );
+  });
+
+  const checkWaits: KanbanScriptsShape["checkWaits"] = Effect.gen(function* () {
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    for (const board of yield* io(store.boards)) {
+      if (board.archivedAt !== null) continue;
+      const cards = yield* io(store.cards(board.id));
+      const names = new Set(
+        cards.flatMap((card) =>
+          kanbanWaiting(card) && card.wait?.on === "script" ? [card.wait.script ?? ""] : [],
+        ),
+      );
+      if (names.size === 0) continue;
+      const scripts = yield* io(store.scripts(board.id));
+      for (const name of names) {
+        // Each script on its own, so one bad record can't stop the ones after it.
+        yield* checkScript(board, name, cards, scripts, now).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("board script wait check did not run", {
+              boardId: board.id,
+              script: name,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+      }
+    }
   });
 
   const listen: KanbanScriptsShape["listen"] = Effect.gen(function* () {
@@ -849,6 +1126,7 @@ const make = Effect.gen(function* () {
     setEnabled,
     run,
     tick,
+    checkWaits,
     listen,
     recover,
     idle,

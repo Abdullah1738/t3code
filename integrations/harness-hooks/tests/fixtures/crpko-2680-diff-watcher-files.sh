@@ -1,0 +1,2 @@
+diff -u tmp/card-1749/verify_builder_env.py.before-approved-diagnostics tmp/card-1749/verify_builder_env.py
+rg --files /Users/ardud/.local/share /Users/ardud/.config/opencode -g 'watchers.json' -g '!node_modules/**' -g '!opencode.db*' -g '!statev2.sqlite*' 2>/dev/null | head -15

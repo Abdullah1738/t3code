@@ -1,3 +1,4 @@
+import { allocateAction, bindActionValue, markAction } from "../actionTelemetry.ts";
 import { KANBAN_WS_METHODS, type EnvironmentId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -85,11 +86,27 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
             onSome: (session) => {
               const method = session.client[tag] as unknown as (
                 payload: unknown,
+                options?: { headers: Record<string, string> },
               ) => Stream.Stream<unknown, unknown>;
-              return method(input).pipe(
-                Stream.catchCause((cause) =>
-                  isTransportFailure(cause) ? Stream.empty : Stream.failCause(cause),
-                ),
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  const action = yield* allocateAction(tag);
+                  let ready = false;
+                  return method(input, { headers: { "x-robob-action-id": action.id } }).pipe(
+                    Stream.tap((value) =>
+                      Effect.sync(() => {
+                        if (!ready) {
+                          bindActionValue(value, action);
+                          ready = true;
+                          markAction(action, "state-ready");
+                        }
+                      }),
+                    ),
+                    Stream.catchCause((cause) =>
+                      isTransportFailure(cause) ? Stream.empty : Stream.failCause(cause),
+                    ),
+                  );
+                }),
               );
             },
           }),

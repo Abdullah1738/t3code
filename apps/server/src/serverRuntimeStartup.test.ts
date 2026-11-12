@@ -1,3 +1,4 @@
+import { emptyDelegatedRecoveryCounts } from "./ardud/observability/StartupPhaseLog.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
@@ -63,6 +64,7 @@ it.effect.each([
   "launch-failure",
   "project-failure",
   "slow-recovery",
+  "stuck-delegated",
 ] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -73,6 +75,13 @@ it.effect.each([
       const events: ServerLifecycleStreamEvent[] = [];
       const records: Array<{ phase: string; outcome: string; durationMs?: number }> = [];
       const logger: StartupPhaseLog.StartupPhaseLog["Service"] = {
+        snapshot: () => ({
+          bootId: "test-boot",
+          pid: 0,
+          phases: [],
+          droppedRecords: 0,
+          persistenceFailed: false,
+        }),
         start: (phase) => {
           records.push({ phase, outcome: "start" });
         },
@@ -145,8 +154,15 @@ it.effect.each([
           prepareForShutdown: Effect.void,
           reconcile: () => Effect.succeed(recovery),
         }),
-        Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
-        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          recoverDelegatedTasks:
+            scenario === "stuck-delegated"
+              ? Deferred.succeed(recoveryStarted, undefined).pipe(Effect.andThen(Effect.never))
+              : Effect.succeed(emptyDelegatedRecoveryCounts),
+        }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          shutdown: Effect.void,
+        }),
         Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
         Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: Effect.never }),
         Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({
@@ -248,6 +264,11 @@ it.effect.each([
       );
       yield* Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+        yield* Effect.yieldNow;
+        assert.isFalse(
+          yield* Deferred.isDone(recoveryStarted),
+          "recovery stays parked before listen",
+        );
         yield* startup.markHttpListening;
         if (scenario === "slow-recovery") {
           yield* Deferred.await(recoveryStarted);
@@ -276,6 +297,27 @@ it.effect.each([
         }
         const ready = yield* Effect.exit(startup.awaitCommandReady);
         assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
+        if (scenario === "stuck-delegated") {
+          yield* Deferred.await(recoveryStarted);
+          assert.isTrue(events.some((event) => event.type === "ready"));
+          const recoveryStart = records.findIndex(
+            (record) => record.phase === "orchestration-v2.delegated-tasks.recover",
+          );
+          assert.isAbove(
+            recoveryStart,
+            records.findIndex(
+              (record) => record.phase === "ready.publish" && record.outcome === "success",
+            ),
+          );
+          assert.isAbove(
+            recoveryStart,
+            records.findIndex(
+              (record) =>
+                record.phase === "orchestration-v2.effect-worker.start" &&
+                record.outcome === "success",
+            ),
+          );
+        }
         const welcome = events.find((event) => event.type === "welcome");
         if (scenario === "project-failure") {
           assert.isUndefined(welcome);
@@ -303,18 +345,11 @@ it.effect("starts without scanning or rebuilding projection history", () =>
     const result = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
       importLegacyShells: record("import"),
       recover: record("recover").pipe(Effect.as({ closedRequests: 2 })),
-      recoverDelegatedTasks: record("delegated"),
       startEffectWorker: record("worker"),
       autoBootstrap: record("bootstrap").pipe(Effect.as({ projectId: "project-1" })),
     });
 
-    assert.deepEqual(yield* Ref.get(calls), [
-      "import",
-      "recover",
-      "delegated",
-      "worker",
-      "bootstrap",
-    ]);
+    assert.deepEqual(yield* Ref.get(calls), ["recover", "import", "worker", "bootstrap"]);
     assert.deepEqual(result, {
       recovery: { closedRequests: 2 },
       bootstrap: { projectId: "project-1" },
@@ -573,4 +608,26 @@ it.effect("enabled startup telemetry records zero counts when projection fails",
       { event: "server.boot.heartbeat", properties: { threadCount: 0, projectCount: 0 } },
     ]);
   }),
+);
+
+it.effect("closes admissions again after a ready server begins shutdown", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const gate = yield* ServerRuntimeStartup.makeCommandGate;
+      yield* gate.signalCommandReady;
+      yield* gate.awaitCommandReady;
+      yield* gate.failCommandReady(
+        new ServerRuntimeStartup.ServerRuntimeStartupError({
+          mode: "web",
+          host: "127.0.0.1",
+          port: 3773,
+          cause: "shutdown",
+        }),
+      );
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(gate.awaitCommandReady)));
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(gate.enqueueCommand(Effect.die("must not run")))),
+      );
+    }),
+  ),
 );

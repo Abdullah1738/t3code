@@ -1,4 +1,4 @@
-import { CommandId } from "@t3tools/contracts";
+import { CommandId, type ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -106,7 +106,7 @@ export const layerExecutor: Layer.Layer<
         switch (effect.request.type) {
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
-            return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
+            return continueRestartedRun({ threadId: effect.threadId, sourceRunId, queued: effect.request.queued }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
               Effect.tapError(() =>
@@ -160,6 +160,7 @@ export const layerExecutor: Layer.Layer<
             return providerTurnStart
               .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
               .pipe(
+                Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -272,6 +273,8 @@ export const layerExecutor: Layer.Layer<
                     ) {
                       return yield* error;
                     }
+                    // Board-held workers may hear a live steer but must never be woken by it.
+                    if (effect.request.activeTurnOnly) return;
                     const projection = yield* threads.getThreadRecords(
                       effect.threadId,
                       ["messages", "runs"],
@@ -576,6 +579,9 @@ export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
   readonly awaitControlWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly runThreadOnce?: (
+    threadId: ThreadId,
+  ) => Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
@@ -707,13 +713,23 @@ export const layerWithOptions = (
 
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
-        function* (excludeRestartContinuations = false, controlLane = false) {
+        function* (excludeRestartContinuations = false, controlLane = false, threadId?: ThreadId) {
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
               workerId,
+              ...(threadId === undefined ? {} : { threadId }),
               leaseDurationMs,
               excludeRestartContinuations,
-              ...(controlLane ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES } : {}),
+              ...(controlLane
+                ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
+                : threadId !== undefined
+                  ? {
+                      onlyEffectTypes: [
+                        "provider-runtime.continue",
+                        "provider-turn.start",
+                      ] as const,
+                    }
+                  : {}),
             }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
@@ -820,7 +836,12 @@ export const layerWithOptions = (
           }
           return true;
         },
-        (effect, _excludeRestartContinuations?: boolean, _controlLane?: boolean) =>
+        (
+          effect,
+          _excludeRestartContinuations?: boolean,
+          _controlLane?: boolean,
+          _threadId?: ThreadId,
+        ) =>
           effect.pipe(
             Effect.mapError((cause) =>
               isOrchestrationEffectWorkerError(cause)
@@ -834,6 +855,7 @@ export const layerWithOptions = (
         awaitWork: outbox.awaitAvailable,
         awaitControlWork: outbox.awaitControlAvailable,
         runOnce: runOnce(),
+        runThreadOnce: (threadId) => runOnce(false, false, threadId),
         runRecoveryOnce: runOnce(true),
         runControlOnce: runOnce(false, true),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
@@ -894,52 +916,55 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Post-commit notifications are the low-latency path. `availableAt` is the
       // durable retry schedule, and the long liveness poll only recovers from a
       // missed in-process notification or work inserted by another process.
-      const runWorker = (controlLane: boolean) => Effect.gen(function* () {
-        while (true) {
-          const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
-            Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Orchestration effect worker failed", cause).pipe(
-                Effect.as("failed" as const),
+      const runWorker = (controlLane: boolean) =>
+        Effect.gen(function* () {
+          while (true) {
+            const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
+              Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Orchestration effect worker failed", cause).pipe(
+                  Effect.as("failed" as const),
+                ),
               ),
-            ),
-          );
-          if (outcome === "worked") {
-            yield* Effect.yieldNow;
-            continue;
-          }
-          if (outcome === "failed") {
-            // A due row can remain visible when a claim UPDATE fails. Do not
-            // feed that past deadline back into the scheduler and retry at the
-            // one-millisecond floor; let transient database failures cool off.
-            yield* Effect.sleep(Duration.millis(Math.min(1_000, livenessPollIntervalMs)));
-            continue;
-          }
+            );
+            if (outcome === "worked") {
+              yield* Effect.yieldNow;
+              continue;
+            }
+            if (outcome === "failed") {
+              // A due row can remain visible when a claim UPDATE fails. Do not
+              // feed that past deadline back into the scheduler and retry at the
+              // one-millisecond floor; let transient database failures cool off.
+              yield* Effect.sleep(Duration.millis(Math.min(1_000, livenessPollIntervalMs)));
+              continue;
+            }
 
-          const nextClaimableAt = yield* (controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning(
-                "Failed to read the next orchestration effect deadline",
-                cause,
-              ).pipe(Effect.as(Option.none<DateTime.Utc>())),
-            ),
-          );
-          const now = DateTime.toEpochMillis(yield* DateTime.now);
-          const sleepMs = Option.match(nextClaimableAt, {
-            onNone: () => livenessPollIntervalMs,
-            onSome: (availableAt) => {
-              const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
-              return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
-            },
-          });
-          yield* Effect.raceFirst(
-            (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
-              Effect.as("notified" as const),
-            ),
-            Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
-          );
-        }
-      });
+            const nextClaimableAt = yield* (
+              controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  "Failed to read the next orchestration effect deadline",
+                  cause,
+                ).pipe(Effect.as(Option.none<DateTime.Utc>())),
+              ),
+            );
+            const now = DateTime.toEpochMillis(yield* DateTime.now);
+            const sleepMs = Option.match(nextClaimableAt, {
+              onNone: () => livenessPollIntervalMs,
+              onSome: (availableAt) => {
+                const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
+                return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
+              },
+            });
+            yield* Effect.raceFirst(
+              (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
+                Effect.as("notified" as const),
+              ),
+              Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
+            );
+          }
+        });
 
       return yield* Effect.all(
         [

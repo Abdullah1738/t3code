@@ -11,9 +11,9 @@ import {
 export const OrchestrationThreadSearchSource = Schema.Literals(["user", "assistant"]);
 export type OrchestrationThreadSearchSource = typeof OrchestrationThreadSearchSource.Type;
 
-// The server's SQLite client is synchronous and single-connection. Bound both
-// scan input and response size so a search cannot monopolize that connection.
+// Bound input and response sizes; the server scans in slices with a time budget.
 export const OrchestrationSearchThreadsInput = Schema.Struct({
+  projectId: Schema.optionalKey(ProjectId),
   query: TrimmedString.check(Schema.isMinLength(2), Schema.isMaxLength(200)),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 }))),
 });
@@ -30,6 +30,10 @@ export type OrchestrationThreadSearchMatch = typeof OrchestrationThreadSearchMat
 
 export const OrchestrationSearchThreadsResult = Schema.Struct({
   matches: Schema.Array(OrchestrationThreadSearchMatch),
+  complete: Schema.optionalKey(Schema.Boolean),
+  // Oldest timestamp examined, not a chronological coverage guarantee: imported
+  // messages can have older timestamps than their insertion order.
+  searchedBackTo: Schema.optionalKey(IsoDateTime),
 });
 export type OrchestrationSearchThreadsResult = typeof OrchestrationSearchThreadsResult.Type;
 

@@ -47,10 +47,10 @@ CREATE TRIGGER IF NOT EXISTS episodic_fts_insert AFTER INSERT ON episodic_events
 END;
 
 CREATE TRIGGER IF NOT EXISTS episodic_fts_delete AFTER DELETE ON episodic_events BEGIN
-    DELETE FROM episodic_fts WHERE rowid = old.id;
+    INSERT INTO episodic_fts(episodic_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS episodic_fts_update AFTER UPDATE ON episodic_events BEGIN
-    DELETE FROM episodic_fts WHERE rowid = old.id;
+    INSERT INTO episodic_fts(episodic_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO episodic_fts(rowid, content) VALUES (new.id, new.content);
 END;

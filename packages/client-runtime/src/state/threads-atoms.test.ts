@@ -310,6 +310,41 @@ describe("createEnvironmentThreadStateAtoms", () => {
     }),
   );
 
+  it.effect("reload asks the server again instead of resuming a retained delete", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const unmount = h.registry.mount(h.stateAtom);
+      const first = yield* Queue.take(h.subscriptions);
+      yield* Queue.offer(first.events, {
+        kind: "event",
+        sequence: 8,
+        event: {
+          id: EventId.make("deleted-1"),
+          type: "thread.deleted",
+          threadId: THREAD_ID,
+          occurredAt: THREAD.thread.updatedAt,
+          payload: { ...THREAD.thread, deletedAt: THREAD.thread.updatedAt },
+        },
+      });
+      yield* observeState(h.registry, h.stateAtom, (state) => state.status === "deleted");
+      expect(h.counts().httpLoads).toBe(1);
+
+      // A plain refresh resumes the retained delete and never asks the server.
+      h.registry.refresh(h.rawAtoms.stateAtom(h.ref.environmentId, h.ref.threadId));
+      yield* observeState(h.registry, h.stateAtom, (state) => state.status === "deleted");
+      expect(h.counts().httpLoads).toBe(1);
+
+      h.rawAtoms.reload(h.registry, h.ref.environmentId, h.ref.threadId);
+      const next = yield* Queue.take(h.subscriptions);
+      expect(next.afterSequence).toBe(SNAPSHOT.snapshotSequence);
+      yield* Queue.offer(next.events, { kind: "synchronized" });
+      yield* observeState(h.registry, h.stateAtom, (state) => state.status === "live");
+      expect(h.counts().httpLoads).toBe(2);
+      unmount();
+      yield* Deferred.await(next.closed);
+    }),
+  );
+
   it.effect("keeps warm data when the raw atom family's weak entry is collected", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();

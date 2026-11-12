@@ -42,6 +42,62 @@ it("redacts credentials and URL secrets from provider failures", () => {
   assert.notInclude(failure.message, "sk-abcdefghijklmnop");
 });
 
+it.each([
+  "Cookie: session=cookie-secret; csrf=csrf-secret",
+  "Set-Cookie: session=cookie-secret; HttpOnly",
+  '{"Cookie":"session=cookie-secret"}',
+  '{"refresh_token":"alias-secret"}',
+  "refreshToken=alias-secret",
+  "id_token: alias-secret",
+  "auth-token=alias-secret",
+  '{"session_token":"alias-secret"}',
+  '{"client_secret":"alias-secret"}',
+  "Proxy-Authorization: Basic proxy-secret",
+])("redacts credential headers and token aliases: %s", (credentials) => {
+  const failure = makeProviderFailure({ message: `Provider stream closed.\n${credentials}` });
+  assert.include(failure.message, "Provider stream closed.");
+  for (const secret of ["cookie-secret", "csrf-secret", "alias-secret", "proxy-secret"]) {
+    assert.notInclude(failure.message, secret);
+  }
+});
+
+it.each([1, 2, 3])("redacts credentials in JSON string bodies nested %s times", (depth) => {
+  let body = JSON.stringify({
+    refresh_token: "nested-refresh-secret",
+    Cookie: "session=nested-cookie-secret",
+  });
+  for (let index = 0; index < depth; index++) body = JSON.stringify({ body });
+  const failure = makeProviderFailure({ message: `Upstream stream failed. ${body}` });
+  assert.include(failure.message, "Upstream stream failed.");
+  assert.notInclude(failure.message, "nested-refresh-secret");
+  assert.notInclude(failure.message, "nested-cookie-secret");
+});
+
+it.each([0, 1, 2])(
+  "preserves JSON value boundaries while removing quoted Cookie secrets at depth %s",
+  (depth) => {
+    let body = JSON.stringify({
+      Cookie: 'session="cookie-secret"; csrf=csrf-secret',
+      refresh_token: 'refresh-"quoted-secret"',
+    });
+    for (let i = 0; i < depth; i++) body = JSON.stringify({ body });
+    const failure = makeProviderFailure({ message: `Provider failure: ${body}` });
+    for (const secret of ["cookie-secret", "csrf-secret", "quoted-secret"])
+      assert.notInclude(failure.message, secret);
+    assert.include(failure.message, "Provider failure:");
+  },
+);
+
+it.each(["api_key", "apiKey", "api-key", "API_KEY"])(
+  "redacts escaped API-key aliases in malformed JSON fragments: %s",
+  (alias) => {
+    const body = String.raw`{\"${alias}\":\"abc123\"}`;
+    const failure = makeProviderFailure({ message: `Upstream rejected: ${body}` });
+    assert.notInclude(failure.message, "abc123");
+    assert.include(failure.message, "Upstream rejected:");
+  },
+);
+
 it("replaces unsafe control characters without stripping whitespace", () => {
   const failure = makeProviderFailure({ message: "before\u0000\u0007\t\nafter\u007f" });
 
@@ -266,3 +322,58 @@ it.effect("keys terminal failure items by provider turn across retries and fallb
     assert.equal(firstAttempt.ordinal, 101);
   }).pipe(Effect.provide(IdAllocator.layer)),
 );
+
+it("names a provider process exit inside or outside a failure category", () => {
+  const processExit = {
+    _tag: "CodexAppServerProcessExitedError",
+    message: "Codex App Server process 86887 exited with code 0: fatal: Bearer abc.def rejected",
+  };
+  for (const [cause, expected] of [
+    [
+      processExit,
+      "Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected",
+    ],
+    [
+      { _tag: "ProviderAdapterEventStreamError", cause: processExit },
+      "The provider event stream closed unexpectedly: Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected. Retry the turn; if it keeps failing, check the provider and server logs.",
+    ],
+    [
+      {
+        _tag: "ProviderAdapterResumeThreadError",
+        cause: { _tag: "ProviderAdapterProtocolError", cause: processExit },
+      },
+      "The provider conversation could not be resumed: Codex App Server process 86887 exited with code 0: fatal: Bearer [REDACTED] rejected. Retry the turn; if it keeps failing, check the provider and server logs.",
+    ],
+  ] as const) {
+    assert.equal(makeProviderFailure({ cause }).message, expected);
+  }
+});
+
+it("classifies a provider usage limit anywhere in the cause chain over a generic class", () => {
+  const limitedExit = {
+    _tag: "CodexAppServerProcessExitedError",
+    message: "Codex App Server process 7 exited with code 1: You've hit your usage limit.",
+    providerUsageLimit: { resetAt: "2026-11-16T05:47:00.000Z" },
+  };
+  for (const cause of [
+    { _tag: "ProviderAdapterEventStreamError", cause: limitedExit },
+    { _tag: "ProviderAdapterEnsureThreadError", cause: Cause.fail(limitedExit) },
+  ]) {
+    const failure = makeProviderFailure({ cause, class: "provider_error" });
+    assert.equal(failure.class, "usage_limit");
+    assert.equal(failure.resetAt, "2026-11-16T05:47:00.000Z");
+  }
+  const unknownReset = makeProviderFailure({
+    cause: { ...limitedExit, providerUsageLimit: { resetAt: null } },
+    class: "provider_error",
+  });
+  assert.equal(unknownReset.class, "usage_limit");
+  assert.isUndefined(unknownReset.resetAt);
+  assert.equal(
+    makeProviderFailure({
+      cause: { _tag: "X", providerUsageLimit: "yes" },
+      class: "provider_error",
+    }).class,
+    "provider_error",
+  );
+});

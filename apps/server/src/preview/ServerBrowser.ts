@@ -308,6 +308,7 @@ interface ServerTab {
   colorScheme: PreviewAppearancePreference;
   zoomFactor: number;
   loading: boolean;
+  pendingNavigation: { url: string; startedAt: number; committed: boolean } | null;
   closing: boolean;
   recording: Recording | null;
   initialNavigation: Promise<void> | null;
@@ -776,6 +777,7 @@ const make = Effect.gen(function* () {
       colorScheme: "system",
       zoomFactor: 1,
       loading: false,
+      pendingNavigation: null,
       closing: false,
       recording: null,
       recordingStart: null,
@@ -797,13 +799,17 @@ const make = Effect.gen(function* () {
       navigationGenerations.set(request, ++tab.navigationGeneration);
       clearAbortedNavigation(tab);
       tab.loading = true;
+      tab.pendingNavigation = { url: request.url(), startedAt: Date.now(), committed: false };
       report(tab, { _tag: "Loading", url: request.url().slice(0, 2048), title: "" });
     });
     page.on("load", () => {
       tab.loading = false;
+      tab.pendingNavigation = null;
       void reportLoaded(tab);
     });
     page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame() && tab.pendingNavigation)
+        tab.pendingNavigation.committed = true;
       // Same-document navigations (SPA routes) fire no load event.
       if (frame === page.mainFrame() && !tab.loading) void reportLoaded(tab);
       if (!desktop) void recordFrameCopies(tab, frame);
@@ -826,6 +832,7 @@ const make = Effect.gen(function* () {
       // superseded by any tracked one.
       const generation = navigationGenerations.get(request) ?? 0;
       if (generation !== tab.navigationGeneration) return;
+      tab.pendingNavigation = null;
       // An aborted navigation is usually a download; its `download` event settles the status.
       if (errorText.includes("ERR_ABORTED")) {
         const url = request.url();
@@ -1452,12 +1459,31 @@ const make = Effect.gen(function* () {
     });
   };
 
-  const withCaptureLock = <A>(tab: ServerTab, operation: () => Promise<A>): Promise<A> => {
+  const withCaptureLock = async <A>(
+    tab: ServerTab,
+    operation: () => Promise<A>,
+    waitTimeoutMs?: number,
+  ): Promise<A> => {
+    let abandoned = false;
+    const acquired = Promise.withResolvers<void>();
     const run = tab.captureLock.then(() => {
+      if (abandoned) return Promise.reject(new Error("Capture queue wait expired."));
+      acquired.resolve();
       if (tab.closing) throw new Error("The preview tab closed.");
       return operation();
     });
     tab.captureLock = run.then(constVoid, constVoid);
+    if (waitTimeoutMs === undefined) return run;
+    try {
+      await ServerBrowserPage.within(
+        acquired.promise,
+        waitTimeoutMs,
+        "Preview capture queue is blocked by an earlier capture or recording",
+      );
+    } catch (cause) {
+      abandoned = true;
+      throw cause;
+    }
     return run;
   };
 
@@ -1524,26 +1550,40 @@ const make = Effect.gen(function* () {
   };
 
   const withScreencastsPaused = <A>(tab: ServerTab, capture: () => Promise<A>): Promise<A> =>
-    withCaptureLock(tab, async () => {
-      tab.capturing += 1;
-      const recording = tab.recording;
-      try {
-        await Promise.all([
-          ...[...tab.viewers].map((viewer) => viewer.pause()),
-          recording?.session.send("Page.stopScreencast").catch(constVoid),
-        ]);
-        return await capture();
-      } finally {
-        tab.capturing -= 1;
+    withCaptureLock(
+      tab,
+      async () => {
+        tab.capturing += 1;
+        const recording = tab.recording;
+        try {
+          await ServerBrowserPage.within(
+            Promise.all([
+              ...[...tab.viewers].map((viewer) => viewer.pause()),
+              recording?.session.send("Page.stopScreencast").catch(constVoid),
+            ]),
+            2_000,
+            "Snapshot could not pause the preview streams",
+          );
+          return await capture();
+        } finally {
+          tab.capturing -= 1;
 
-        await Promise.all([
-          ...[...tab.viewers].map((viewer) => viewer.resume()),
-          recording && tab.recording === recording
-            ? recording.session.send("Page.startScreencast", RECORDING_SCREENCAST).catch(constVoid)
-            : undefined,
-        ]);
-      }
-    });
+          await ServerBrowserPage.within(
+            Promise.all([
+              ...[...tab.viewers].map((viewer) => viewer.resume()),
+              recording && tab.recording === recording
+                ? recording.session
+                    .send("Page.startScreencast", RECORDING_SCREENCAST)
+                    .catch(constVoid)
+                : undefined,
+            ]),
+            2_000,
+            "Snapshot could not resume the preview streams",
+          ).catch(constVoid);
+        }
+      },
+      2_000,
+    );
 
   const stopRecording = (tab: ServerTab) =>
     withCaptureLock(tab, async () => {
@@ -1706,6 +1746,15 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const assertSnapshotReady = (tab: ServerTab) => {
+    const pending = tab.pendingNavigation;
+    if (pending)
+      throw new ServerBrowserPage.ServerBrowserOperationError(
+        "PreviewAutomationTimeoutError",
+        `Snapshot cannot start: page still loading ${pending.url} after ${Date.now() - pending.startedAt}ms (${pending.committed ? "document committed, waiting for load" : "waiting for main document response/commit"}).`,
+      );
+  };
+
   const runOperation = async (request: PreviewAutomationRequest): Promise<unknown> => {
     const input = request.input;
     switch (request.operation) {
@@ -1855,6 +1904,8 @@ const make = Effect.gen(function* () {
       }
     }
     const tab = await requireTab(request);
+    // A readiness:none navigation holds the action queue until commit.
+    if (request.operation === "snapshot") assertSnapshotReady(tab);
     // Closing must unblock an action waiting on a dialog, without queueing behind it.
     if (request.operation === "close") {
       if (tab.control.agentId !== request.agentSessionId)
@@ -1936,7 +1987,13 @@ const make = Effect.gen(function* () {
         return {
           tabId: tab.tabId,
           setting,
-          viewport: tab.page.viewportSize() ?? UNATTACHED_FILL_VIEWPORT,
+          viewport: tab.desktop
+            ? await ServerBrowserPage.waitForViewport(
+                tab.cdp,
+                fixedViewportSize(setting),
+                setting._tag === "fill",
+              )
+            : (layoutSize(tab) ?? UNATTACHED_FILL_VIEWPORT),
         };
       }
       case "setColorScheme": {
@@ -1948,12 +2005,15 @@ const make = Effect.gen(function* () {
         return { tabId: tab.tabId, colorScheme };
       }
       case "snapshot": {
-        return withScreencastsPaused(tab, () =>
+        assertSnapshotReady(tab);
+        const captureImage = (input as { captureImage?: boolean }).captureImage !== false;
+        const capture = () =>
           ServerBrowserPage.snapshot({
             ...tab,
+            captureImage,
             renderScale: tab.desktop ? "display" : RENDER_SCALE,
-          }),
-        );
+          });
+        return captureImage ? withScreencastsPaused(tab, capture) : capture();
       }
       case "click": {
         const clickInput = input as PreviewAutomationClickInput;

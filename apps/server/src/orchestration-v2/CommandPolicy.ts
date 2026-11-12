@@ -133,6 +133,8 @@ export function resolveMessageDispatchIntent(
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
 ): MessageDispatchMode {
+  // This target is fixed: maintenance and delivery intent must not turn it into a wake.
+  if (requestedMode.type === "steer_active" && requestedMode.activeTurnOnly) return requestedMode;
   const mode = resolveDeliveryIntent(projection, requestedMode, deliveryIntent);
   if (mode.type !== "steer_active") return mode;
   // Compaction and sign-out turns cannot take steering input. A message sent

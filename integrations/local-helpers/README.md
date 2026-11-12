@@ -65,6 +65,66 @@ Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
 
+## Quint
+
+`bin/quint` installs as `~/.local/bin/quint`. Run bounded `quint verify` on
+the Mac, rather than offbox. The wrapper checks `java -version` for Java 21+
+in `QUINT_JAVA_HOME` (an invalid explicit override fails), Homebrew's
+`/opt/homebrew/opt/openjdk`, then `/usr/libexec/java_home -v '21+'`.
+Install a missing JDK with `brew install openjdk`. It finds the real CLI via
+`QUINT_BIN`, PATH (skipping itself and symlinks to itself), then
+`~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
+on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
+
+Verify without `--server-endpoint` gets a free local port. Explicit endpoints
+must name a free `localhost:<port>` or `127.0.0.1:<port>`; the wrapper starts its
+own server there and never attaches to an existing server. Other commands pass
+through. `QUINT_APALACHE_ARCHIVE` selects the reviewed archive (default
+`~/.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz`); a missing or
+mismatched archive/JAR fails before starting Java. Each verify uses a private
+temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
+the pinned JAR available to TLC. Quint-side launch/download attempts fail even
+if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
+completion or signals. Port ownership is checked with `lsof` before Quint runs.
+
+CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
+The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
+Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet peers can reach it for the run's duration. The Mac firewall was disabled (block-all disabled, stealth off) on 12 Nov; a loopback source patch is a separate follow-up.
+`QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
+Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
+
+Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
+nvm before `~/.local/bin`. Until approved PATH changes and installation, call
+the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
+`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
+archive from this change; shipping both and fixing PATH is a separate task.
+
+Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
+remote calls including one pre-command failure): Quint 0.33.1 downloads
+`https://github.com/apalache-mc/apalache/releases/download/v0.62.4/apalache.tgz`
+without checking the HTTP status before tar extraction. `curl -sSIL` and
+Node fetch both returned **504, text/html, 92 bytes**; `file` identified HTML
+starting with `<html><body><h1>504 Gateway Time-out</h1>`. This reproduces the
+invalid-archive cause: GitHub's error response is passed to tar as a tgz.
+It is independent of Java. Successful downloads on other boxes are consistent
+with an intermittent asset failure. Use the Mac's managed cached backend;
+for diagnosing a fresh download use `curl --fail --location`, then `file`
+and `tar tzf` before extraction. A manual cache transfer must use the approved
+patched distribution, not an unguarded stock 0.62.4 download.
+
+The separate offbox signature `Unrecognized VM option 'G1PeriodicGCInterval'`
+indicates an older JVM (Java 11 in the reports); Apalache requires Java 21+.
+Run verify on the Mac for either signature. The box's apt history records
+`openjdk-11-jdk` in the base image install. Offbox selects `crpko-go` for
+crpko-devops (`skill/scripts/offbox_lib/lease.py`); that template doesn't
+provision Java. Saved pool state explains variation: this probe had an
+additional Ubuntu `openjdk-21-jre-headless` package and Java 21 selected via
+`update-alternatives`; its install provenance wasn't in apt history.
+Proposal only: add `openjdk-21-jdk-headless` to `skill/templates/crpko-go.sh`
+and select its java alternative, then refresh the crpko-devops pool's saved
+template/state. Existing saved boxes need that refresh too. No pool or
+template changes are made here; prefer the Mac unless it proves insufficient.
+
 Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.fund/s/<token>/` from
 127.0.0.1:18793 (its config.json `shareOrigin`). `cards-tunnel` runs the named Cloudflare tunnel that forwards
 there; both agents idle until the tunnel exists. One time, after Abdullah ran `cloudflared tunnel login` and
@@ -90,3 +150,34 @@ no watchdog state. `ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
 `ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
 `ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
 seconds or a command returning epoch seconds for an advancing test clock.
+
+`apalache/build-patched.sh` builds Apalache 0.62.4 (`7954daf7563a69cce9d0b89c8542e40bf46f7c6e`) with all gRPC modules at 1.75.0 and protobuf/protoc 3.25.8; ScalaPB stays at 0.11.20.
+Rebuild on Linux/JDK 21: `offbox run --remote -- 'JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 integrations/local-helpers/apalache/build-patched.sh'` (requires git, curl, Python 3 and sha256sum).
+Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f`.
+The recipe checks resolved dependencies and reflection bytecode, records the JAR hash, and retains v1alpha reflection for quint 0.33.1; installation and wrapper selection are separate.
+Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; this version binds `*:<n>` and has no checker `--hostname` option.
+As of 9 Nov 2026, upstream main has no dependency fix after 0.62.4; the upstream issue draft is on Robob card #787 and has not been filed.
+
+## Repo Node and pnpm selection
+
+`python3 integrations/local-helpers/install-node-pin.py` prints the exact proposed
+shell-file and helper diffs without writing. After approval, run the same command
+with `--install` from a clean revision on `origin/main`; `--check` reports drift.
+The installer preserves existing shell-file contents and keeps backups.
+
+The helper selects the highest installed nvm Node satisfying the nearest
+`.nvmrc` or `.node-version` and `engines.node`, falling back to engines when the
+file pin is unavailable. pnpm uses the `packageManager` major, or the lockfile
+format (v9 prefers pnpm 10, then 9). It reads installed package metadata and the
+Corepack cache, runs the selected cached CLI directly, and never installs a
+runtime or downloads a package manager. Missing versions produce an explicit
+install hint. The safe-chain pnpm function remains in place.
+
+zsh uses chpwd/preexec hooks and a DEBUG trap for noninteractive snapshot PATH
+restoration; Bash wraps cd/pushd/popd (preserving existing functions) and passes BASH_ENV to its children. Start a fresh shell
+after changing a pin in the current directory. Unpinned directories retain
+the incoming PATH. `zsh -f` and fresh `bash --noprofile --norc` without BASH_ENV
+explicitly bypass shell setup; they need the helper sourced by their caller.
+
+Focused verification:
+`PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s integrations/local-helpers/tests -p test_repo_node_pin.py`.

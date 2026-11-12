@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, validAppUrl, validFileName, validMimeType } from "./cli.ts";
 import { chatKey, GROUP_APP_REFUSAL, type ChatKey } from "./line.ts";
 import { isEffect, type Photon, type ReactionKind } from "./photon.ts";
-import type { Router } from "./router.ts";
+import { replyText, type Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
   validToken } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
@@ -132,11 +132,11 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
     const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation };
     const key = `api:${prefix}:${id}`;
     const spec = JSON.stringify(operation);
-    const saved = store.get<{ spec: string }>(key);
+    const saved = store.get<{ spec: string; queuedAt?: number }>(key);
     if (saved && saved.spec !== spec) throw new ApiError(409);
     prepare?.();
     const created = store.enqueue(operation);
-    store.set(key, { spec });
+    store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
   return { id, created };
@@ -160,8 +160,28 @@ function sendSpec(id: string, route: { id: string; generation: number }, content
 /** The id of an identical, already-accepted send on the live route; undefined for anything new or conflicting. */
 function sendReplay(store: Store, dedupeKey: string, route: { id: string; generation: number }, content: SessionContent): string | undefined {
   const id = `send:${hash(dedupeKey)}`;
-  const saved = store.get<{ spec: string }>(`api:send:${id}`)?.spec;
-  return saved !== undefined && saved === sendSpec(id, route, content) ? id : undefined;
+  const saved = store.get<{ spec: string; operationId?: string }>(`api:send:${id}`);
+  return saved?.spec === sendSpec(id, route, content) ? saved.operationId ?? id : undefined;
+}
+
+/** Preserve /send's key/content identity while reusing the acknowledgement already queued by this turn. */
+function reuseEarlyReply(store: Store, dedupeKey: string, route: { id: string; generation: number }, content: SessionContent): string | undefined {
+  return store.db.transaction(() => {
+    const live = store.get<{ id: string; generation: number } | null>("route");
+    if (live?.id !== route.id || live.generation !== route.generation) throw new ApiError(409);
+    const turn = store.get<{ id: string; generation: number; earlyText?: string; earlyOutbox?: string } | null>("activeTurn");
+    if (turn?.id !== route.id || turn.generation !== route.generation || !turn.earlyOutbox
+      || !turn.earlyText || replyText(content.text).trim() !== replyText(turn.earlyText).trim()) return;
+    const operation = store.getOperation(turn.earlyOutbox);
+    if (!operation || operation.sessionId !== route.id || operation.generation !== route.generation
+      || operation.subject !== content.subject || operation.effect !== content.effect) return;
+    const id = `send:${hash(dedupeKey)}`;
+    const spec = sendSpec(id, route, content);
+    const saved = store.get<{ spec: string }>(`api:send:${id}`);
+    if (saved && saved.spec !== spec) throw new ApiError(409);
+    store.set(`api:send:${id}`, { spec, operationId: operation.id });
+    return operation.id;
+  }).immediate();
 }
 
 /** True when the key is already accepted with different content (queueSession answers 409 for this). */
@@ -281,6 +301,8 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (existing) return json({ id: existing, created: false }, 200);
         // A stored key with different content is a conflict, reported before any rule is applied.
         if (sendConflict(store, dedupeKey, route, content)) throw new ApiError(409);
+        const early = reuseEarlyReply(store, dedupeKey, route, content);
+        if (early) return json({ id: early, created: false }, 200);
         const hit = replyCheck?.(text);
         if (hit && mayBounce(store, turnKey)) {
           noteBounce(store, turnKey);

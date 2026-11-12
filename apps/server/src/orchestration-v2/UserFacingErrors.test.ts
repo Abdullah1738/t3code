@@ -8,6 +8,12 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
 import { toPersistenceSqlError } from "../persistence/Errors.ts";
+import { CommandId, ThreadId, ProviderInstanceId } from "@t3tools/contracts";
+import { CommandPolicyCapabilityUnsupportedError } from "./CommandPolicy.ts";
+import {
+  OrchestratorDispatchError,
+  OrchestratorCommandPreviouslyRejectedError,
+} from "./Orchestrator.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 
 describe("userFacingDispatchErrorMessage", () => {
@@ -61,6 +67,33 @@ describe("userFacingDispatchErrorMessage", () => {
       "Grok cannot rewind its conversation, so this checkpoint cannot be restored on this thread.",
     );
   });
+
+  it.each(["claudeAgent", "pi"])(
+    "keeps the %s restart reason on first call and replay",
+    (provider) => {
+      const commandId = CommandId.make("command:restart-rejected");
+      const reason = `${provider === "claudeAgent" ? "Claude" : "Pi"} cannot restart an active run. Use t3_thread_interrupt, then send the message.`;
+      const error = new OrchestratorDispatchError({
+        commandId,
+        commandType: "message.dispatch",
+        cause: new CommandPolicyCapabilityUnsupportedError({
+          commandId,
+          threadId: ThreadId.make("thread:restart-rejected"),
+          providerInstanceId: ProviderInstanceId.make(provider),
+          capability: "interrupt_restart_steering",
+          detail: "required interrupt-and-restart",
+        }),
+      });
+      assert.equal(userFacingDispatchErrorMessage(error), reason);
+      const replay = new OrchestratorCommandPreviouslyRejectedError({
+        commandId,
+        commandType: "message.dispatch",
+        detail: reason,
+      });
+      assert.include(userFacingDispatchErrorMessage(replay), `previously rejected: ${reason}`);
+      assert.notInclude(replay.message, "Failed to dispatch orchestration command");
+    },
+  );
 
   it("uses explicit detail fields as user-facing messages", () => {
     assert.equal(

@@ -284,7 +284,7 @@ it.effect.each(["crash", "prepared"] as const)(
 );
 
 it.effect.each(["startup", "shutdown"] as const)(
-  "%s cancels queued buffered wakes and holds durable messages",
+  "%s preserves queued buffered wakes and durable messages",
   (trigger) =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -342,20 +342,23 @@ it.effect.each(["startup", "shutdown"] as const)(
         new Set([...bufferedThreads, ...durableThreads]),
       );
       const summary = yield* recovery.reconcile(trigger);
-      assert.equal(summary.terminalizedRuns, 1);
+      assert.equal(summary.terminalizedRuns, 0);
       for (const threadId of bufferedThreads) {
         const projection = yield* projections.getThreadProjection(threadId);
-        assert.equal(projection.runs[0]?.status, "cancelled");
-        assert.isNotNull(projection.runs[0]?.completedAt);
-        assert.isNull(projection.runs[0]?.queuePosition);
+        assert.equal(projection.runs[0]?.status, "queued");
+        assert.isNull(projection.runs[0]?.completedAt);
+        assert.equal(projection.runs[0]?.queuePosition, 1);
         assert.equal(projection.runs[1]?.status, "completed");
       }
       for (const threadId of durableThreads) {
         const projection = yield* projections.getThreadProjection(threadId);
         assert.equal(projection.runs[0]?.status, "queued");
-        assert.isTrue(projection.runs[0]?.queueHeld);
+        assert.notEqual(projection.runs[0]?.queueHeld, true);
       }
-      assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), []);
+      assert.deepEqual(
+        new Set(yield* projections.getRecoveryThreadIds("runtime")),
+        new Set([...bufferedThreads, ...durableThreads]),
+      );
     }).pipe(Effect.provide(layerRecoveryTest)),
 );
 
@@ -395,7 +398,12 @@ it.effect("stops a session its thread detached, which kept its live status", () 
       occurredAt: now,
       payload: { providerSessionId, detachedAt: now, reason: "Thread settled." },
     });
-    assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), [threadId]);
+    // Shared sessions are reconciled globally, including detached bindings.
+    assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), []);
+    assert.deepEqual(
+      (yield* projections.getLiveSharedProviderSessions()).map(({ session }) => session.id),
+      [providerSessionId],
+    );
 
     const summary = yield* recovery.reconcile("startup");
 
@@ -788,8 +796,15 @@ it.effect("includes shared sessions and provider-owned background rosters in rec
     });
     assert.deepEqual(
       new Set(yield* projections.getRecoveryThreadIds("runtime")),
-      new Set([first, second, roster, prepared]),
+      new Set([roster, prepared]),
     );
+    // One global session row, regardless of the number of bound threads.
+    assert.deepEqual(
+      (yield* projections.getLiveSharedProviderSessions()).map(({ session }) => session.id),
+      [providerSessionId],
+    );
+    const rosterState = yield* projections.getRuntimeRecoveryProjection(roster);
+    assert.equal(rosterState.providerThreads[0]?.pendingBackgroundTasks?.[0]?.taskId, "background");
     const preparedState = yield* projections.getRuntimeRecoveryProjection(prepared);
     assert.deepEqual(
       preparedState.providerSessions.map((session) => session.id),
@@ -873,7 +888,7 @@ it.effect("reads the run that owns a background roster, not a queued or resumed 
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("wakes the run whose subagent lost its shell, past a wake cut before it started", () =>
+it.effect("prioritizes a preparation cut while retaining the prior run background note", () =>
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
@@ -903,7 +918,7 @@ it.effect("wakes the run whose subagent lost its shell, past a wake cut before i
       },
     });
     const settledRun = yield* createRun(threadId, "completed", { providerThreadId });
-    yield* createRun(threadId, "starting", {
+    const preparingRun = yield* createRun(threadId, "starting", {
       ordinal: 2,
       providerThreadId,
       startedAt: null,
@@ -943,7 +958,7 @@ it.effect("wakes the run whose subagent lost its shell, past a wake cut before i
     const effects = yield* sql<{ readonly effect_id: string }>`
       SELECT effect_id FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
     `;
-    assert.deepEqual(effects, [{ effect_id: `effect:restart-continuation:${settledRun}` }]);
+    assert.deepEqual(effects, [{ effect_id: `effect:restart-continuation:${preparingRun}` }]);
     const projection = yield* projections.getThreadProjection(threadId);
     assert.deepEqual(projection.runs[0]?.restartCancelledBackgroundWork, [
       { kind: "subagent", label: "sleep 150 (subagent agent)", id: "agent" },
@@ -1186,4 +1201,51 @@ it.effect("finds unreadable turn items in every history store, page by page", ()
       new Set([coldThread, baseThread]),
     );
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["preparing", "starting"] as const)(
+  "persists exactly one preparation continuation across repeated %s recovery",
+  (status) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = yield* createThread(`preparation-${status}`);
+      const runId = yield* createRun(threadId, status, { startedAt: null });
+      // Repeated preparation represents SIGTERM followed by a kill before cleanup.
+      yield* recovery.prepareForShutdown;
+      yield* recovery.prepareForShutdown;
+      yield* recovery.reconcile("startup");
+      yield* recovery.reconcile("startup");
+      const rows = yield* sql<{ effect_id: string }>`
+      SELECT effect_id FROM orchestration_v2_effect_outbox
+      WHERE thread_id = ${threadId} AND effect_type = 'provider-runtime.continue'
+    `;
+      assert.deepEqual(rows, [{ effect_id: `effect:restart-continuation:${runId}` }]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs[0]?.status, "cancelled");
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect("publishes per-thread readiness after commit before global recovery completes", () =>
+  Effect.gen(function* () {
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const sql = yield* SqlClient.SqlClient;
+    const a = yield* createThread("early-a");
+    const b = yield* createThread("early-b");
+    yield* createRun(a, "preparing");
+    yield* createRun(b, "preparing");
+    const seen: string[] = [];
+    yield* recovery.recover.pipe(
+      Effect.provideService(ProviderRuntimeRecovery.ReconciledThreadContinuation, (threadId) =>
+        Effect.gen(function* () {
+          const rows = yield* sql<{
+            status: string;
+          }>`SELECT status FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}`;
+          assert.equal(rows[0]?.status, "cancelled");
+          seen.push(threadId);
+        }),
+      ),
+    );
+    assert.deepEqual(seen.sort(), [a, b].sort());
+  }).pipe(Effect.provide(layerRecoveryTest)),
 );

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./ownedProcessTree": "./src/ownedProcessTree.ts",
     "./githubMarkdownLinks": {
       "types": "./src/githubMarkdownLinks.ts",
       "import": "./src/githubMarkdownLinks.ts"
@@ -379,6 +380,7 @@
       "types": "./src/claudeCompaction.ts",
       "import": "./src/claudeCompaction.ts"
     },
+    "./nodeSqliteReaderProcess": "./src/nodeSqliteReaderProcess.ts",
     "./nodeSqliteClient": {
       "types": "./src/nodeSqliteClient.ts",
       "import": "./src/nodeSqliteClient.ts"

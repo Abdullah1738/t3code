@@ -18,6 +18,7 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -174,6 +175,8 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
     left.remarksThrough === right.remarksThrough &&
     left.remarkIds.join("\n") === right.remarkIds.join("\n") &&
     left.conflicting === right.conflicting &&
+    left.conflictHead === right.conflictHead &&
+    left.conflictWokeFor === right.conflictWokeFor &&
     left.wakes === right.wakes
   );
 }
@@ -286,9 +289,20 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (target: WatchTarget) =>
+  const giveUp = (
+    target: WatchTarget,
+    failures: number,
+    error: Option.Option<PullRequestService.PullRequestError>,
+  ) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
+      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive read ${failures === 1 ? "failure" : "failures"}.${Option.match(
+        error,
+        {
+          onNone: () => "",
+          onSome: (failure) =>
+            ` Last error: ${failure.message}${failure._tag === "PullRequestUnavailableError" ? ` (${failure.reason})` : ""}`,
+        },
+      )} Check it yourself, and call watch_pull_request to watch it again.`,
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
@@ -485,7 +499,14 @@ export const make = Effect.gen(function* () {
       if (isRateLimited(read.cause)) return;
       const failures = (readFailures.get(group.key) ?? 0) + 1;
       readFailures.set(group.key, failures);
-      if (failures >= READ_FAILURE_LIMIT && (yield* eachTarget(group, giveUp))) {
+      const error = Cause.findErrorOption(read.cause);
+      // Unavailable reasons require a tool, credential or host configuration change.
+      const unavailable =
+        Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
+      if (
+        (unavailable || failures >= READ_FAILURE_LIMIT) &&
+        (yield* eachTarget(group, (target) => giveUp(target, failures, error)))
+      ) {
         readFailures.delete(group.key);
       }
       return yield* Effect.failCause(read.cause);
@@ -532,34 +553,56 @@ export const make = Effect.gen(function* () {
       fingerprint: group.fingerprint,
       inFlight:
         detail.mergeability === "unknown" ||
+        group.targets.some(({ watch }) => {
+          const next = evaluatePullRequestWatch(watch, detail, null).next;
+          return next.conflictHead !== null && !next.conflicting;
+        }) ||
         detail.checks.some((check) => check.status === "pending"),
       remarksComplete: plan.activity ? remarks !== null : (last?.remarksComplete ?? false),
       watches: new Set(group.targets.map(watchKey)),
       status: fingerprint?.status ?? null,
       remarks: fingerprint?.remarks ?? null,
     });
-    yield* eachTarget(group, (target) => {
-      const report = evaluatePullRequestWatch(target.watch, detail, remarks);
-      if (report.changes.length > 0) {
-        const wake = pullRequestWatchMessage({
-          number: target.link.number,
-          url: target.link.url,
-          baseBranch: detail.baseBranch,
-          headSha: report.next.headSha,
-          report,
-        });
-        // An ending watch keeps what this pass saw, so watching again starts from it.
-        return (
-          report.exhausted
-            ? record(target, null, wake, report.next)
-            : record(target, report.next, wake)
-        ).pipe(
-          Effect.tap(() => woke(target)),
-          Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
-        );
-      }
-      return watchesEqual(report.next, target.watch) ? Effect.void : record(target, report.next);
-    });
+    yield* eachTarget(
+      group,
+      Effect.fn("PullRequestWatchReactor.sendReport")(function* (target: WatchTarget) {
+        let report = evaluatePullRequestWatch(target.watch, detail, remarks);
+        if (report.changes.some((change) => change.kind === "conflicting")) {
+          const current = yield* projections.getThread(target.thread.id);
+          const watch = current?.pullRequests?.find(
+            (link) => threadPullRequestKeyOf(link) === threadPullRequestKeyOf(target.link),
+          )?.watch;
+          if (watch === undefined || watch.startedAt !== target.watch.startedAt) return;
+          const changes = report.changes.filter(
+            (change) => change.kind !== "conflicting" || change.headSha === watch.headSha,
+          );
+          // A head that moved while reading must not be overwritten by this older report.
+          if (changes.length !== report.changes.length) {
+            if (changes.length === 0) return;
+            report = { ...report, changes, next: watch };
+          }
+        }
+        if (report.changes.length > 0) {
+          const wake = pullRequestWatchMessage({
+            number: target.link.number,
+            url: target.link.url,
+            baseBranch: detail.baseBranch,
+            headSha: detail.headSha ?? null,
+            report,
+          });
+          // An ending watch keeps what this pass saw, so watching again starts from it.
+          return yield* (
+            report.exhausted
+              ? record(target, null, wake, report.next)
+              : record(target, report.next, wake)
+          ).pipe(
+            Effect.tap(() => woke(target)),
+            Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
+          );
+        }
+        if (!watchesEqual(report.next, target.watch)) yield* record(target, report.next);
+      }),
+    );
   });
 
   const sweep = Effect.gen(function* () {
@@ -631,6 +674,7 @@ export const make = Effect.gen(function* () {
   }).pipe(
     Effect.catchCause(logFailure("pull request watch sweep failed", {})),
     Effect.withSpan("PullRequestWatchReactor.sweep"),
+    NodeSqliteClient.backgroundReads,
   );
 
   const start: PullRequestWatchReactor["Service"]["start"] = () =>

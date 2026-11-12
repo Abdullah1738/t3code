@@ -50,6 +50,7 @@ const makeFake = Effect.gen(function* () {
               quietSince: "2026-10-27T10:00:00.000Z",
               runStartedAt: null,
               backgroundWork: 0,
+              prWatches: 0,
               prs: [],
               archived: false,
             };
@@ -74,6 +75,7 @@ const makeFake = Effect.gen(function* () {
       compactRun: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );
@@ -115,12 +117,7 @@ const writeKept = (attachmentsDir: string, segment: string, name: string, bytes:
   });
 
 /** A pending upload written the way the upload endpoint would store it. */
-const writePending = (
-  attachmentsDir: string,
-  name: string,
-  mimeType: string,
-  bytes: string,
-) =>
+const writePending = (attachmentsDir: string, name: string, mimeType: string, bytes: string) =>
   Effect.gen(function* () {
     const path = yield* Path.Path;
     const fs = yield* FileSystem.FileSystem;
@@ -137,33 +134,46 @@ const writePending = (
     return attachment;
   });
 
-it.effect("posting a pending file stores a board-owned id, the file exists and the pending file stays", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const config = yield* ServerConfig.ServerConfig;
-      const kanban = yield* KanbanService.KanbanService;
-      const board = yield* kanban.ensureBoard({
-        slug: "attach",
-        name: "Attach",
-        defaultProjectId: ProjectId.make("project-1"),
-      });
-      const discussion = yield* kanban.createDiscussion(board.id, "Files", owner);
-      const pending = yield* writePending(config.attachmentsDir, "report.pdf", "application/pdf", "pdf-bytes");
+it.effect(
+  "posting a pending file stores a board-owned id, the file exists and the pending file stays",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "attach",
+          name: "Attach",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        const discussion = yield* kanban.createDiscussion(board.id, "Files", owner);
+        const pending = yield* writePending(
+          config.attachmentsDir,
+          "report.pdf",
+          "application/pdf",
+          "pdf-bytes",
+        );
 
-      yield* kanban.post(discussion.id, owner, [{ _tag: "attachment", attachment: pending }]);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "attachment", attachment: pending }]);
 
-      const messages = yield* kanban.messages(discussion.id);
-      const stored = messages.at(-1)?.blocks[0];
-      if (stored?._tag !== "attachment") return assert.fail("expected an attachment block");
-      assert.notStrictEqual(stored.attachment.id, pending.id);
-      const fs = yield* FileSystem.FileSystem;
-      const storedPath = resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment: stored.attachment })!;
-      const pendingPath = resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment: pending })!;
-      assert.isTrue(yield* fs.exists(storedPath));
-      assert.isTrue(yield* fs.exists(pendingPath));
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+        const messages = yield* kanban.messages(discussion.id);
+        const stored = messages.at(-1)?.blocks[0];
+        if (stored?._tag !== "attachment") return assert.fail("expected an attachment block");
+        assert.notStrictEqual(stored.attachment.id, pending.id);
+        const fs = yield* FileSystem.FileSystem;
+        const storedPath = resolveAttachmentPath({
+          attachmentsDir: config.attachmentsDir,
+          attachment: stored.attachment,
+        })!;
+        const pendingPath = resolveAttachmentPath({
+          attachmentsDir: config.attachmentsDir,
+          attachment: pending,
+        })!;
+        assert.isTrue(yield* fs.exists(storedPath));
+        assert.isTrue(yield* fs.exists(pendingPath));
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("the text the agent receives carries the absolute path of the stored file", () =>
@@ -178,7 +188,12 @@ it.effect("the text the agent receives carries the absolute path of the stored f
         defaultProjectId: ProjectId.make("project-1"),
       });
       const discussion = yield* kanban.createDiscussion(board.id, "Shots", owner);
-      const pending = yield* writePending(config.attachmentsDir, "photo.png", "image/png", "png-bytes");
+      const pending = yield* writePending(
+        config.attachmentsDir,
+        "photo.png",
+        "image/png",
+        "png-bytes",
+      );
 
       yield* kanban.post(discussion.id, owner, [{ _tag: "attachment", attachment: pending }]);
 
@@ -192,7 +207,9 @@ it.effect("the text the agent receives carries the absolute path of the stored f
       const path = yield* Path.Path;
       assert.isTrue(path.isAbsolute(storedPath));
       // The agent receives the text; it must carry the path it can open.
-      const delivered = [...(yield* Ref.get(fake.threads)).values()].flatMap((thread) => thread.messages);
+      const delivered = [...(yield* Ref.get(fake.threads)).values()].flatMap(
+        (thread) => thread.messages,
+      );
       assert.isTrue(delivered.some((text) => text.includes(storedPath)));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -210,8 +227,18 @@ it.effect("another thread's id is refused as invalid and nothing is stored", () 
       });
       const config = yield* ServerConfig.ServerConfig;
       const discussion = yield* kanban.createDiscussion(board.id, "Foreign", owner);
-      const otherThread = yield* writeKept(config.attachmentsDir, "thread-abc", "secret.pdf", "%PDF");
-      const otherBoard = yield* writeKept(config.attachmentsDir, "kanban-other-board", "plan.pdf", "%PDF");
+      const otherThread = yield* writeKept(
+        config.attachmentsDir,
+        "thread-abc",
+        "secret.pdf",
+        "%PDF",
+      );
+      const otherBoard = yield* writeKept(
+        config.attachmentsDir,
+        "kanban-other-board",
+        "plan.pdf",
+        "%PDF",
+      );
       const missing = {
         type: "file" as const,
         id: createAttachmentId(`kanban-${board.id}`, "pdf")!,
@@ -249,7 +276,9 @@ it.effect("re-posting a board-owned id works", () =>
       const first = (yield* kanban.messages(discussion.id)).at(-1)?.blocks[0];
       if (first?._tag !== "attachment") return assert.fail("expected an attachment block");
 
-      yield* kanban.post(discussion.id, owner, [{ _tag: "attachment", attachment: first.attachment }]);
+      yield* kanban.post(discussion.id, owner, [
+        { _tag: "attachment", attachment: first.attachment },
+      ]);
       assert.strictEqual((yield* kanban.messages(discussion.id)).length, 2);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

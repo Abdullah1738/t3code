@@ -145,6 +145,7 @@ export interface ThreadManagementSendInput {
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
+  readonly activeTurnOnly?: boolean;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -184,6 +185,7 @@ export interface ThreadManagementInterruptInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly attemptId?: RunAttemptId;
+  readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
 }
 
@@ -354,7 +356,12 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
-  readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getThreadRecords: <K extends ProjectionRecordField>(
+    threadId: ThreadId,
+    fields: ReadonlyArray<K>,
+    filter?: ProjectionRecordFilter,
+    options?: { readonly projectionOnly: boolean },
+  ) => Effect.Effect<ProjectionRecords<K>, Orchestrator.OrchestratorV2Error>;
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -382,11 +389,15 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
   readonly getShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
+    /** Only these threads, read with one indexed IN list (control live lists). */
+    readonly threadIds?: ReadonlyArray<string>;
   }) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     readonly afterThreadId?: string;
+    readonly recentFirst?: boolean;
     readonly limit?: number;
+    readonly omitIdleSubagents?: boolean;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
@@ -707,8 +718,6 @@ const make = Effect.gen(function* () {
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
     options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
   ) {
-    yield* ensureCommandTranscripts(command);
-
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
     const readReceipt = <A>(
@@ -728,6 +737,8 @@ const make = Effect.gen(function* () {
     if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
     const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
     if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    yield* ensureCommandTranscripts(command);
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
@@ -972,28 +983,50 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    const target = yield* getProjectThreadRecords(
+      input,
+      input.mode === "restart"
+        ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
+        : ["runs", "providerTurns"],
+    );
     const steerableRun = latestSteerableRun(target);
-    // ardud: an accepted send can be retried after its run finishes or the thread archives.
-    // Only the orchestrator replays the receipt; never turn a missing receipt into a new send.
+    // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
         ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
         : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
           ? new ThreadManagementNoSteerableRunError({ threadId: input.threadId, mode: input.mode })
           : undefined;
+    const readReceipt = (commandId: CommandId) =>
+      receipts.getByCommandId(commandId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new Orchestrator.OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "message.dispatch",
+              cause,
+            }),
+        ),
+      );
     const receipt =
-      preflightError === undefined
-        ? Option.none()
-        : yield* receipts
-            .getByCommandId(input.commandId)
-            .pipe(Effect.orElseSucceed(() => Option.none()));
-    const replay =
-      Option.isSome(receipt) &&
-      receipt.value.status === "accepted" &&
-      receipt.value.commandType === "message.dispatch" &&
-      receipt.value.threadId === input.threadId;
-    if (preflightError !== undefined && !replay) {
+      input.mode === "restart" || preflightError !== undefined
+        ? yield* readReceipt(input.commandId)
+        : Option.none();
+    // The original command owns replay and conflict checks, before any interrupt side effect.
+    const replay = Option.isSome(receipt);
+    const interruptCommandId = CommandId.make(`${input.commandId}:restart-interrupt`);
+    const interruptReceipt =
+      !replay && input.mode === "restart" ? yield* readReceipt(interruptCommandId) : Option.none();
+    const interruptedForRestart =
+      Option.isSome(interruptReceipt) &&
+      interruptReceipt.value.status === "accepted" &&
+      interruptReceipt.value.commandType === "run.interrupt" &&
+      interruptReceipt.value.threadId === input.threadId;
+    if (
+      preflightError !== undefined &&
+      !replay &&
+      !(interruptedForRestart && target.thread.archivedAt === null)
+    ) {
       return yield* preflightError;
     }
     let dispatchMode: Extract<
@@ -1002,6 +1035,9 @@ const make = Effect.gen(function* () {
     >["dispatchMode"];
     if (replay) {
       dispatchMode = { type: "start_immediately" };
+    } else if (interruptedForRestart) {
+      // A retry can arrive after interrupt committed but before the message did.
+      dispatchMode = { type: "queue_after_active" };
     } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {
         return yield* new ThreadManagementNoSteerableRunError({
@@ -1009,10 +1045,42 @@ const make = Effect.gen(function* () {
           mode: input.mode,
         });
       }
-      dispatchMode = {
-        type: input.mode === "steer" ? "steer_active" : "restart_active",
-        targetRunId: steerableRun.id,
-      };
+      const providerThread =
+        input.mode === "restart"
+          ? target.providerThreads.find(
+              (candidate) => candidate.id === steerableRun.providerThreadId,
+            )
+          : undefined;
+      const capabilities =
+        input.mode === "restart"
+          ? target.providerSessions.find(
+              (candidate) => candidate.id === providerThread?.providerSessionId,
+            )?.capabilities.turns
+          : undefined;
+      if (
+        input.mode === "restart" &&
+        capabilities?.supportsSteeringByInterruptRestart === false &&
+        capabilities.supportsInterrupt &&
+        capabilities.supportsQueuedMessages
+      ) {
+        yield* orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: interruptCommandId,
+          threadId: input.threadId,
+          runId: steerableRun.id,
+          fenced: true,
+          ...(steerableRun.activeAttemptId === null
+            ? {}
+            : { expectedAttemptId: steerableRun.activeAttemptId }),
+        });
+        dispatchMode = { type: "queue_after_active" };
+      } else {
+        dispatchMode = {
+          type: input.mode === "steer" ? "steer_active" : "restart_active",
+          targetRunId: steerableRun.id,
+          ...(input.mode === "steer" && input.activeTurnOnly ? { activeTurnOnly: true } : {}),
+        };
+      }
     } else if (input.mode === "auto" && steerableRun !== undefined) {
       dispatchMode = { type: "steer_active", targetRunId: steerableRun.id };
     } else {
@@ -1065,12 +1133,12 @@ const make = Effect.gen(function* () {
       });
     }
     const delivery: ThreadManagementSendResult["delivery"] =
-      turnItem === null || turnItem.inputIntent === "queued_turn"
-        ? "queued"
-        : turnItem.inputIntent === "turn_start"
-          ? "started"
-          : input.mode === "restart"
-            ? "restarted"
+      input.mode === "restart"
+        ? "restarted"
+        : turnItem === null || turnItem.inputIntent === "queued_turn"
+          ? "queued"
+          : turnItem.inputIntent === "turn_start"
+            ? "started"
             : "steered";
     return { dispatch: dispatched, projection, message, run, turnItem, delivery };
   });
@@ -1247,6 +1315,9 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        ...(input.delegatedTaskStall === undefined
+          ? {}
+          : { delegatedTaskStall: input.delegatedTaskStall }),
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(input.runId === undefined
           ? {}
@@ -1423,8 +1494,8 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.getTurnItem(input)),
         Effect.map((item) => ({ item: item === null ? null : projectTurnItemForDetail(item) })),
       ),
-    getThreadRecords: (threadId, fields, filter) =>
-      ensureProjectionTranscript(threadId).pipe(
+    getThreadRecords: (threadId, fields, filter, options) =>
+      (options?.projectionOnly ? Effect.void : ensureProjectionTranscript(threadId)).pipe(
         Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
       ),
     getThreadProjection,

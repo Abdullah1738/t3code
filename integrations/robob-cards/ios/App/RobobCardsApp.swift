@@ -50,6 +50,13 @@ struct InstalledView: View {
                 Text("You can close this app. Nothing else to set up.")
                     .font(.body)
                     .foregroundStyle(.secondary)
+                if #available(iOS 17.0, *), Bundle.main.builtInPlugInsURL.map({
+                    FileManager.default.fileExists(atPath: $0.appendingPathComponent("RobobCardsWidgets.appex").path)
+                }) == true {
+                    Text("Widgets: long-press the home screen, +, Robob Cards")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                }
                 Text(Self.versionText)
                     .font(.footnote)
                     .foregroundStyle(.tertiary)

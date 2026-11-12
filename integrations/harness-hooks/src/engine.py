@@ -28,6 +28,7 @@ import urllib.request
 
 import desktop_lease
 import statev2_guard
+import rootwide_search_guard
 
 
 HOME = Path.home()
@@ -67,6 +68,7 @@ _LOG_RULES = {
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
+    "rootwide-search",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -109,6 +111,7 @@ def _log(**record):
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
             "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
+            "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -1116,10 +1119,21 @@ def decide(event, harness):
         if command:
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+            try:
+                root = rootwide_search_guard.classify(command, command_cwd)
+            except Exception as error:
+                # A search-parser failure must not disable the independent DB,
+                # offbox or coord policies later in this hook.
+                error_type = type(error).__name__
+                root = None
+            if root:
+                result = {"decision": "deny", "reason": rootwide_search_guard.reason(root, command_cwd),
+                          "context": {"rule": "rootwide-search"}}
+                return result
             # The live DB rule is independent of native identity and offbox/coord
             # availability, so a service outage cannot disable this local check.
             try:
-                hit = statev2_guard.classify(command, command_cwd)
+                hit, cause = statev2_guard.classify_detail(command, command_cwd)
             except Exception as error:
                 error_type = type(error).__name__
                 result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
@@ -1127,7 +1141,13 @@ def decide(event, harness):
                 return result
             if hit:
                 reason = statev2_guard.UNRESOLVED_REASON if hit == "live-database-script-unresolved" else statev2_guard.REASON
-                result = {"decision": "deny", "reason": reason, "context": {"rule": hit}}
+                context = {"rule": hit}
+                if hit == "live-database-script-unresolved" and cause:
+                    reason = ("statev2 guard: this command was NOT run. Could not check an explicit script invocation: "
+                              f"{cause}. Resolved workdir: {command_cwd}. Run the script by a literal path, write scripts "
+                              "with apply_patch rather than a heredoc in the same command, or split the steps; do not bypass the guard.")
+                    context["cause"] = cause
+                result = {"decision": "deny", "reason": reason, "context": context}
                 return result
         native, _, _ = _native(event, harness)
         if native:
@@ -1212,7 +1232,7 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-             identity_source=identity.get("identity_source"),
+             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
              command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 

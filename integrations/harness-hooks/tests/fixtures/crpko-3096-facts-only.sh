@@ -1,0 +1,3 @@
+cat >> /Volumes/ExternalSSD/crpko-devops/tmp/vector-dl-3096/facts.md <<'EOF'
+Main-dev unit 2/4 job 128705637846 failed after its Vector step succeeded. Exact log: 2026-11-08T10:44:28.9592020Z TAP version 13; 2026-11-08T11:34:29.0212820Z node --test scripts/test-deploy-private-ecs-release.mjs: spawnSync /opt/hostedtoolcache/node/22.23.4/x64/bin/node ETIMEDOUT. Single command hit the shard runner's 50-minute subprocess limit. Other tests continued; shard exited1 at12:00:26Z. No assertion failure output in that command. Log main-dev-unit2.log and extracted main-dev-deploy-private-failure.log. Unit3/4 passed, unit4/4 still running at12:01Z. Failed shard should be retried on same head after run completion, without code changes.
+EOF

@@ -5,11 +5,25 @@ No corpus, identity resolution or model imports are allowed on this path.
 import json
 import os
 from pathlib import Path
-from recall_rules import RuleIndex, evaluate_conflict
+from recall_rules import RuleIndex, evaluate_conflict, filter_facts, dedupe_facts
 from recall_classifier import deterministic
 
 
-def preflight(tool, arguments, cwd, path=None):
+def rule_preflight_enabled():
+    """The pattern-matched rule index is off unless RECALL_RULE_PREFLIGHT=1.
+
+    Owner, 2026-11-10: recall informs; it doesn't block tool calls or add rule
+    notes from regex-extracted skill/transcript rules (the Crpko main-dev rule
+    blocked pushes on the Robob fork). The code and recall_rules.db stay so the
+    flag can restore it: set it for the recall server LaunchAgent and the hook
+    environment.
+    """
+    return os.environ.get('RECALL_RULE_PREFLIGHT', '').strip() == '1'
+
+
+def preflight(tool, arguments, cwd, path=None, session_id=None):
+    if not rule_preflight_enabled():
+        return [], None
     path = Path(path or os.environ.get('RECALL_RULES_DB', str(Path.home() / '.local/share/memory-system/data/recall_rules.db')))
     if isinstance(arguments, str):
         if tool.lower().split('__')[-1] in {'apply_patch', 'patch'}:
@@ -27,11 +41,17 @@ def preflight(tool, arguments, cwd, path=None):
     if messages:
         # Literal recipient/branch prohibitions retain precedence.
         index = RuleIndex(path)
-        rules = index.applicable(cwd, tool, arguments, candidates_only=True)
+        recipients = {arguments[k].casefold() for k in ('recipient', 'to', 'contact', 'chat', 'chat_name')
+                      if isinstance(arguments.get(k), str) and arguments[k]}
+        rules = [r for r in filter_facts(index.applicable(cwd, tool, arguments, candidates_only=True),
+                                       " ".join(messages), session_id)
+                 if not recipients or not r.get("recipient") or r["recipient"].casefold() in recipients]
+        rules = dedupe_facts(rules)
         conflict = evaluate_conflict(rules, tool, arguments, cwd)
         if conflict:
             return rules, {**conflict, 'sources': conflict.get('citations', []), 'note': None}
-        facts = index.search_facts(messages, cwd)
+        facts = [r for r in index.search_facts(messages, cwd, session_id=session_id)
+                 if not r.get('recipient') or any(rule['id'] == r['id'] for rule in rules)]
         if facts:
             result = check(messages, facts)
             if result['decision'] == 'allow' and not result.get('note'):
@@ -41,10 +61,13 @@ def preflight(tool, arguments, cwd, path=None):
                 result['note'], selected = rule_note(guidance)
                 result['sources'] = [r['citation'] for r in selected]
             return facts, result
+        return rules, None
     local = deterministic(tool, arguments) is False
-    rules = RuleIndex(path).applicable(cwd, tool, arguments, explicit_only=local, candidates_only=True)
+    rules = filter_facts(RuleIndex(path).applicable(cwd, tool, arguments, explicit_only=local, candidates_only=True),
+                         json.dumps(arguments), session_id)
     # These are the only sources that may produce tool notes. Global imported
     # prose alone is not a reason to spend a network round trip.
+    rules = dedupe_facts(rules)
     rules = [r for r in rules if r.get('path_matched') or r.get('provenance') == 'explicit' or r.get('constraints')
              or r.get('provenance') == 'owner_correction' and r.get('recipient')]
     conflict = evaluate_conflict(rules, tool, arguments, cwd)
@@ -71,7 +94,7 @@ def main():
     import sys
     body = json.load(sys.stdin)
     try:
-        rules, conflict = preflight(body['tool'], body.get('arguments'), body.get('cwd', ''))
+        rules, conflict = preflight(body['tool'], body.get('arguments'), body.get('cwd', ''), session_id=body.get('session_id'))
         print(json.dumps({'candidate': bool(rules), 'result': conflict or local_note(rules)}))
     except Exception:
         # Only literal, cited conflicts fail closed. Optional context fails open.

@@ -43,6 +43,7 @@ describe("threadRouteIsHydrating", () => {
       }),
     ).toBe(false);
     expect(threadRouteIsHydrating({ ...settled, detailStatus: "deleted" })).toBe(false);
+    expect(threadRouteIsHydrating({ ...settled, detailStatus: "not-found" })).toBe(false);
   });
 
   it("prioritizes terminal outcomes over unrelated hydration", () => {

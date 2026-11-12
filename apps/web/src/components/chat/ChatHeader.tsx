@@ -38,6 +38,7 @@ import { cn } from "~/lib/utils";
 import { useClientSettings } from "../../hooks/useSettings";
 
 interface ChatHeaderProps {
+  readOnly?: boolean;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   activeThreadTitle: string;
@@ -66,6 +67,7 @@ export function resolveRenameCommit(input: {
 // double-click interval.
 const TITLE_MENU_OPEN_DELAY_MS = 500;
 export const ChatHeader = memo(function ChatHeader({
+  readOnly = false,
   activeThreadEnvironmentId,
   activeThreadId,
   activeThreadTitle,
@@ -83,10 +85,11 @@ export const ChatHeader = memo(function ChatHeader({
   const breadcrumbContainerRef = useRef<HTMLDivElement>(null);
   const [collapseParentTitle, setCollapseParentTitle] = useState(false);
   const activeThreadRef = scopeThreadRef(activeThreadEnvironmentId, activeThreadId);
-  const canOperateThread = useEnvironmentScope(
+  const hasOperateScope = useEnvironmentScope(
     activeThreadEnvironmentId,
     AuthOrchestrationOperateScope,
   );
+  const canOperateThread = hasOperateScope && !readOnly;
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -153,6 +156,7 @@ export const ChatHeader = memo(function ChatHeader({
   const startRename = () => {
     if (
       !isServerThread ||
+      readOnly ||
       !readEnvironmentScope(activeThreadEnvironmentId, AuthOrchestrationOperateScope)
     )
       return;
@@ -165,7 +169,8 @@ export const ChatHeader = memo(function ChatHeader({
   };
   const commitRename = (title: string) => {
     setRenaming(null);
-    if (!readEnvironmentScope(activeThreadEnvironmentId, AuthOrchestrationOperateScope)) return;
+    if (readOnly || !readEnvironmentScope(activeThreadEnvironmentId, AuthOrchestrationOperateScope))
+      return;
     const resolution = resolveRenameCommit({ title, originalTitle: activeThreadTitle });
     if (resolution.action === "reject-empty") {
       toastManager.add({ type: "warning", title: "Thread title cannot be empty" });
@@ -187,7 +192,7 @@ export const ChatHeader = memo(function ChatHeader({
     });
   };
   const { openMenu, closeMenu } = useThreadActionMenu({
-    threadRef: isServerThread ? activeThreadRef : null,
+    threadRef: isServerThread && !readOnly ? activeThreadRef : null,
     projectCwd: activeProjectCwd,
     onStartRename: startRename,
   });
@@ -235,6 +240,7 @@ export const ChatHeader = memo(function ChatHeader({
     startRename();
   };
   const handleHeaderContextMenu = (event: ReactMouseEvent) => {
+    if (readOnly) return;
     if (renamingTitle !== null) return;
     if (!isServerThread && onOpenProjectSettings === undefined) return;
     cancelPendingTitleMenu();

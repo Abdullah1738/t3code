@@ -8,6 +8,7 @@ import {
   type KanbanStage,
 } from "@t3tools/contracts";
 
+import { reviewRetryNote } from "./retries.ts";
 import { MAX_BATCH } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
 import { subtaskIds, subtaskLines } from "./subtasks.ts";
@@ -53,7 +54,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,
-    "- Never end a turn while a card of yours is in Working: move it to needs_review, ask with card_ask (blocking when you can't go on), flag it, or keep working. Wait for CI or a deploy inside the turn. Each time you stop with a card in Working you are nudged.",
+    "- While a card of yours is in Working, keep working, move it to needs_review, ask with card_ask (blocking when you can't go on), or flag it. Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on. For a deploy or anything else, wait inside your turn.",
     "- If you can't continue (missing access, broken env), call card_flag with the reason: the card goes back to To Do and the evaluator is told.",
     "- Messages from the card discussion arrive here. Answer them with discussion_post; plain replies in this thread are not seen there.",
     "- Read the board wiki (wiki_read) for lessons that apply to this work.",
@@ -177,7 +178,11 @@ export const reviewBrief = (
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
   const continuing = card.reviewStep > 0 && !freshThread;
+  // A review the board restarted after a failed run or a missing verdict says so first.
+  const retried = freshThread ? null : reviewRetryNote(card);
   return lines(
+    retried,
+    retried === null ? null : "",
     continuing
       ? `The previous review step came back clear. This is step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, on a different model: check the same change again with fresh eyes, using the context above.`
       : `You are the reviewer for a card on the "${board.name}" Missions board. Review step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, round ${card.reviewRound + 1}.`,
@@ -186,9 +191,8 @@ export const reviewBrief = (
     continuing ? null : "",
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
-    freshThread && card.wakeNote?.trim()
-      ? `\nNote for this review:\n${card.wakeNote.trim()}`
-      : null,
+    // A reviewer woken on its own thread (a wait that ended, new commits) needs the note too.
+    card.wakeNote?.trim() ? `\nNote for this review:\n${card.wakeNote.trim()}` : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
@@ -282,6 +286,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     "- Read everything: board_get, card_search (cards by words or #number, settled ones too), card_get, discussions, the wiki, the cards' threads (t3_thread_read), past sessions (recall), the web, Dia for logged-in pages.",
     "- Cards: card_create, card_edit, card_move (any stage except working/in_review, which the dispatcher owns), card_flag, comments and links.",
     "- Asking the owner: card_ask puts a question on a card; it shows in his Needs Owner list and the card's discussion, and his answer comes back to you. Async by default: the card and its thread go on. Make it blocking (blocking on card_ask, or card_ask_change later) only when nothing can move until he answers; the card then waits in Needs Owner and goes back where it was with his answer. Give options when the answers are known (an approval: Approve, Change, Drop). The owner can make an async ask blocking himself, and drop asks. Drop your own asks with card_ask_change once they no longer matter.",
+    "- Parking a card: card_wait says what a card with no running thread waits on (push, merge, ci, card, time, owner_go, or a board script's check), and the board wakes whoever is next when it ends. Use it instead of a stalled flag or a 'waiting for X' comment. Use a script wait when a program can check the thing and no built-in fits (a Linear issue's state, a deploy): name the script and pass args. Use a time wait with a recheck note only when nothing can check it for you, and set the next one when woken. If the same recheck comes up twice, ask for a script.",
     "- Packets: a card's prompt is all its work thread gets, and the cheapest model may write the code from it. So every card you create gets a tight packet as its prompt: what to do and why, what you read for it (sessions, PRs, the code, the architecture) boiled down, the files and functions to touch, the steps, the tests to add or run, and when it's done. Detailed enough that the writer never has to guess or go looking. Cards a thread or a script makes start with your packet subtask: read what they point at, rewrite the prompt with card_edit, add the plan, then mark it done.",
     "- Subtasks: every card you create, on your own or because the owner asked, gets its plan as subtasks (subtasks on card_create), so nobody has to guess what comes next. Lay out the whole flow: the work, its review, and what follows, such as merge and deploy, telling whoever reported it, updating linked tickets or pinging someone, a read-back. Leave out what isn't needed. Same step means any order. Add or change subtasks with card_edit when you learn more or the owner asks; give a plan to any card that has none. Anything outward (a message, a Linear or ticket update, a merge or deploy) is always an evaluator subtask, never the worker's. Do the evaluator's subtasks of the step a card is on and mark them with subtask_done; the dispatcher leaves a card alone while its step is only yours, and you are told when a card's step becomes yours. A subtask follows every other rule: if the board says a message needs the owner's approval, ask him with card_ask (blocking, with options); his answer comes back to you, and the card goes back where it was. The subtask stays open until it's sent. A card reaches verified only when every subtask is done or skipped.",
     "- Pick order: the dispatcher takes todo cards by priority (a card holding up a more urgent one counts as that urgent), then the one holding up the most other cards, and never a blocked one. Set each card's priority yourself, 1 (urgent) to 4 (low), and blockedBy from what it waits on.",
@@ -347,7 +352,7 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Wait for CI or a deploy inside your turn instead of ending it.`;
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.`;
 };
 
 export const runFailedText = (

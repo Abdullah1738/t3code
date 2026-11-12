@@ -503,6 +503,7 @@ describe("pull request detail decoding", () => {
             headRefName: "feat/detail",
             baseRefName: "main",
             headRefOid: "abc123",
+            baseRefOid: "base123",
             isCrossRepository: false,
             headRepositoryOwner: null,
             headRepository: null,
@@ -615,6 +616,12 @@ describe("pull request detail decoding", () => {
       ),
       commits: page.commits ?? [],
     }));
+
+  it("keeps the base SHA reported by the existing core read", () => {
+    const result = decodePullRequestCoreJson(coreJson([], { baseRefOid: "f77c1992e5e9" }));
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result)) expect(result.success.baseSha).toBe("f77c1992e5e9");
+  });
 
   it("maps check-run status and commit-status state onto one vocabulary", () => {
     const detail = detailOf([

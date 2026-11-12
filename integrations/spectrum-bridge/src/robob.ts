@@ -516,6 +516,7 @@ export class RobobBackend implements ChatBackend {
     if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
     for (const step of steps) {
       const finish = this.finished.get(step.id);
+      if (finish === "tool-calls") step.continued = true;
       // A step's own finish can prove that tools ran (`tool-calls`), but it can't prove that none did:
       // an unresolved step (the synthetic error record) or an `error` finish says nothing. So only
       // `ran` is merged here. The run-level answer from markRunEvidence stays authoritative otherwise.

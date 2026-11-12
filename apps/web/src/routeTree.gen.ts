@@ -34,6 +34,7 @@ import { Route as SettingsAppearanceRouteImport } from './routes/settings.appear
 import { Route as ProjectsProjectKeyRouteImport } from './routes/projects.$projectKey'
 import { Route as ChatPullRequestsRouteImport } from './routes/_chat.pull-requests'
 import { Route as ChatNewRouteImport } from './routes/_chat.new'
+import { Route as ChatNeedsYouRouteImport } from './routes/_chat.needs-you'
 import { Route as ChatImessageChatSlugRouteImport } from './routes/_chat.imessage.$chatSlug'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatBoardsBoardIdRouteImport } from './routes/_chat.boards.$boardId'
@@ -164,6 +165,11 @@ const ChatNewRoute = ChatNewRouteImport.update({
   path: '/new',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatNeedsYouRoute = ChatNeedsYouRouteImport.update({
+  id: '/needs-you',
+  path: '/needs-you',
+  getParentRoute: () => ChatRoute,
+} as any)
 const ChatImessageChatSlugRoute = ChatImessageChatSlugRouteImport.update({
   id: '/imessage/$chatSlug',
   path: '/imessage/$chatSlug',
@@ -194,6 +200,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRouteWithChildren
   '/usage': typeof UsageRoute
   '/welcome': typeof WelcomeRoute
+  '/needs-you': typeof ChatNeedsYouRoute
   '/new': typeof ChatNewRoute
   '/pull-requests': typeof ChatPullRequestsRoute
   '/projects/$projectKey': typeof ProjectsProjectKeyRoute
@@ -223,6 +230,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRouteWithChildren
   '/usage': typeof UsageRoute
   '/welcome': typeof WelcomeRoute
+  '/needs-you': typeof ChatNeedsYouRoute
   '/new': typeof ChatNewRoute
   '/pull-requests': typeof ChatPullRequestsRoute
   '/projects/$projectKey': typeof ProjectsProjectKeyRoute
@@ -255,6 +263,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRouteWithChildren
   '/usage': typeof UsageRoute
   '/welcome': typeof WelcomeRoute
+  '/_chat/needs-you': typeof ChatNeedsYouRoute
   '/_chat/new': typeof ChatNewRoute
   '/_chat/pull-requests': typeof ChatPullRequestsRoute
   '/projects/$projectKey': typeof ProjectsProjectKeyRoute
@@ -288,6 +297,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/usage'
     | '/welcome'
+    | '/needs-you'
     | '/new'
     | '/pull-requests'
     | '/projects/$projectKey'
@@ -317,6 +327,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/usage'
     | '/welcome'
+    | '/needs-you'
     | '/new'
     | '/pull-requests'
     | '/projects/$projectKey'
@@ -348,6 +359,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/usage'
     | '/welcome'
+    | '/_chat/needs-you'
     | '/_chat/new'
     | '/_chat/pull-requests'
     | '/projects/$projectKey'
@@ -560,6 +572,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatNewRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/needs-you': {
+      id: '/_chat/needs-you'
+      path: '/needs-you'
+      fullPath: '/needs-you'
+      preLoaderRoute: typeof ChatNeedsYouRouteImport
+      parentRoute: typeof ChatRoute
+    }
     '/_chat/imessage/$chatSlug': {
       id: '/_chat/imessage/$chatSlug'
       path: '/imessage/$chatSlug'
@@ -592,6 +611,7 @@ declare module '@tanstack/react-router' {
 }
 
 interface ChatRouteChildren {
+  ChatNeedsYouRoute: typeof ChatNeedsYouRoute
   ChatNewRoute: typeof ChatNewRoute
   ChatPullRequestsRoute: typeof ChatPullRequestsRoute
   ChatIndexRoute: typeof ChatIndexRoute
@@ -602,6 +622,7 @@ interface ChatRouteChildren {
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
+  ChatNeedsYouRoute: ChatNeedsYouRoute,
   ChatNewRoute: ChatNewRoute,
   ChatPullRequestsRoute: ChatPullRequestsRoute,
   ChatIndexRoute: ChatIndexRoute,

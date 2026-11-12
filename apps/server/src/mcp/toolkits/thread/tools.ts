@@ -17,7 +17,6 @@ import {
   ThreadId,
   RunId,
   NonNegativeInt,
-  ProjectId,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Schema from "effect/Schema";
@@ -243,10 +242,9 @@ const ThreadTransfersTool = Tool.make("t3_thread_transfers", {
 const ThreadSearchTool = Tool.make("t3_thread_search", {
   ...commandTool,
   description:
-    "Fallback only: for past-session or history search, use the recall MCP first (recall_ask, recall_search, recall_read); it covers every session across apps. Use this tool only when recall has nothing recent enough. Search active thread titles and content with the app's existing bounded search. Matches are limited to one project (projectId, else the calling thread's project) out of the global top matches, so this may return fewer than limit. A caller outside a T3 thread that omits projectId searches every project. No pagination or exhaustive-result guarantee.",
+    "Fallback only: for past-session or history search, use the recall MCP first (recall_ask, recall_search, recall_read); it covers every session across apps. Use this tool only when recall has nothing recent enough. Search finished user and assistant messages in active threads with a 5 s scan budget. Matches are limited to one project (projectId, else the calling thread's project). When complete is false the answer is partial; searchedBackTo is the oldest timestamp examined (insertion order can differ from message time). Narrow the query or pass a project. A caller outside a T3 thread that omits projectId searches every project. No pagination or exhaustive-result guarantee.",
   parameters: Schema.Struct({
     ...OrchestrationSearchThreadsInput.fields,
-    projectId: Schema.optional(ProjectId),
   }),
   success: OrchestrationSearchThreadsResult,
   dependencies: [...commandTool.dependencies, ThreadSearch.ThreadSearch],

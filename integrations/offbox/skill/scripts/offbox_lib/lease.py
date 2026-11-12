@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, log, month_key, new_id, now, read_json, say)
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+                     file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -272,6 +272,8 @@ def idle_for(con, box_id: str, size: str | None, snap: dict | None = None) -> in
 
 
 def cap_check() -> None:
+    if api.BACKEND != "boat":
+        return   # the spend cap is about boat.dev's bill; runs on our own server cost nothing
     cap = read_json(CAP_PATH, {})
     if cap.get("capped"):
         raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap ${cap.get('cap', 500):.0f}). New leases are refused.",
@@ -302,20 +304,25 @@ def pick_template(root: Path, repo_key: str) -> str:
 def find_lease(con, owner: str, root: str):
     capacity.schema(con)
     # A box with an unconfirmed prune worker is never handed back, not even to its own caller.
+    # On the home server only this token's own boxes (mine()): another owner's box is not ours to hand out.
     mapped = con.execute("SELECT l.*, c.remote_dir AS caller_dir FROM pool_callers c JOIN leases l USING(box_id) "
-                         "WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') "
+                         f"WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') AND {mine('l')} "
                          "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)", (owner, root)).fetchone()
     if mapped:
         out = dict(mapped)
         out['remote_dir'] = out.pop('caller_dir')
         return out
     return con.execute("SELECT * FROM leases WHERE owner=? AND repo_root=? AND state IN ('running','stopped') "
+                       f"AND {mine('leases')} "
                        "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=leases.box_id) "
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
 
 def active_runs(con, box_id: str) -> int:
-    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND status IN ('starting','running')",
+    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+                       "OR EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) "
+                       "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
+                       "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
                        (box_id,)).fetchone()[0]
 
 
@@ -345,7 +352,9 @@ def idle_ttl(box_id: str) -> None:
     con = db()
     if active_runs(con, box_id):
         return
-    row = con.execute("SELECT size FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    row = con.execute("SELECT size, note FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    if row and row['note'] == BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH':
+        return
     ttl = idle_for(con, box_id, row["size"] if row else None)
     if docker_recent(con, box_id):
         # Grace past the reaper's limit so its stop (which archives Docker images first) usually wins over boat's ttl.
@@ -409,11 +418,24 @@ def supply_size(want: str | None, floor: str = "large") -> str | None:
 def resume_size(con, row, size: str | None) -> str:
     """The size _reuse resumes a stopped row at: the requested size when it is bigger than the natural one."""
     nat = natural_size(con, row)
-    return size if _bigger(size, nat) else nat
+    return plan_size(con, size if _bigger(size, nat) else nat)
+
+
+def plan_size(con, sz: str | None) -> str | None:
+    """`sz`, or the biggest size below it that the current Boat plan has (the $20 plan has no xlarge)."""
+    if not sz or capacity.plan_allows(con, sz):
+        return sz
+    for n in reversed(SIZES):
+        if _rank(n) < _rank(sz) and capacity.plan_allows(con, n):
+            say(f"Boat's current plan has no {sz} machines; using {n}")
+            return n
+    return sz
 
 
 def _fit_new(sz: str, size: str | None) -> str:
     """A new box's size, one size smaller while boat has no machines of `sz`. Explicit --size waits instead."""
+    with contextlib.closing(db()) as pcon:
+        sz = plan_size(pcon, sz)
     fit = supply_size(sz, size or "large")
     if fit is None:
         raise api.SupplyOut(sz, None, f"supply for size {sz} is over until {iso(capacity.supply_until(sz))}",
@@ -428,20 +450,31 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 
     Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
     deleted the template's data."""
+    from . import home
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
     name = box_name(me, rk)
+    fresh_on_standby = False
     if not fresh:
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
-            brow = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
-            if not brow:
+            brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
+            if not brow and home.only_on_home("bases", "name=?", (full,)):
+                # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
+                say(f"saved base '{full}' exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
+                base = None
+                fresh_on_standby = True
+            elif not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
-                               "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
+                               f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
+            if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
+                say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
         if brow:
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
@@ -454,10 +487,15 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             say(f"default base {brow['name']} is gone (boat deleted its data); using the repo template")
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
-        trow = con.execute("SELECT * FROM templates WHERE name=?", (tname,)).fetchone()
+        # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
+        # which would mark it gone. Such a caller starts from a fresh box instead.
+        trow = con.execute(f"SELECT * FROM templates WHERE name=? AND {mine()}", (tname,)).fetchone()
         if not trow and tname != "generic":
-            trow = con.execute("SELECT * FROM templates WHERE name='generic'").fetchone()
-            if trow:
+            trow = con.execute(f"SELECT * FROM templates WHERE name='generic' AND {mine()}").fetchone()
+            if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
+                say(f"template {tname} exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
+            elif trow:
                 say(f"template {tname} not built yet; using generic")
         if trow:
             sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
@@ -527,6 +565,9 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
+    except BaseException:
+        _retire_recipe_box(box_id, pid, f"{name} recipe interrupted before completion")
+        raise
     touch(box_id)
     event(db(), box_id, "lease_recipe", f"{name} exit={code} {round(now() - t)}s")
     if code == 0:
@@ -554,7 +595,11 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    th.join(timeout_s)
+    try:
+        th.join(timeout_s)
+    except BaseException:
+        stop_evt.set()
+        raise
     if th.is_alive():
         stop_evt.set()
         th.join(_FOLLOW_STOP_S)
@@ -569,12 +614,17 @@ _FOLLOW_STOP_S = 160
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
-    from . import outage
+    from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
-    with outage.accepted_machine():
+    with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
-        ssh_sync.setup(box_id)
-        ssh_sync.wait_ssh(box_id)
+        try:
+            ssh_sync.setup(box_id)
+            ssh_sync.wait_ssh(box_id)
+        except capacity.CapacityError:
+            raise
+        except OffboxError as e:
+            raise BoxNotReady(box_id, s, e) from e
         if recipe:
             run_recipe(box_id, recipe, box_held=box_held)
         elif fresh:
@@ -584,6 +634,9 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    row = con.execute('SELECT note FROM leases WHERE box_id=?', (box_id,)).fetchone()
+    if row and (row['note'] or '').startswith(BOX_WEDGED_NOTE):
+        return
     if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
         raise ResumeUnresolved(f"{box_id} has an unanswered resume; refresh deferred")
     capacity.check(con)
@@ -627,6 +680,8 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         t = now()
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)
         box_id = s["id"]
+        from . import prepare
+        prepare.identify(box_id)
         hold = None
         if pooled:
             hold = file_lock(f"box-{box_id}", timeout=0)
@@ -645,19 +700,44 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
+def _relocate_base_checkout(con, box_id: str, base_dir: str, remote_dir: str, *, box_held: bool) -> None:
+    guard = contextlib.nullcontext() if box_held else file_lock(f"box-{box_id}", timeout=120)
+    with guard:
+        if active_runs(con, box_id):
+            raise OffboxError(f"{box_id} has an active run; refusing to relocate its base checkout")
+        # Gradle's project execution history contains absolute input paths. Invalidate it before the atomic move,
+        # so interruption cannot leave a relocated checkout with the old history. User-home caches stay warm.
+        command = f'''set -e
+src="$HOME"/{shlex.quote(base_dir)}
+dst="$HOME"/{shlex.quote(remote_dir)}
+if [ -d "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
+  find "$src" -name .gradle \\( -type d -o -type l \\) -prune -exec rm -rf -- {{}} +
+  mkdir -p "$(dirname "$dst")"
+  mv -- "$src" "$dst"
+  printf 'offbox-base-checkout-relocated\\n'
+fi'''
+        result = ssh_sync.ssh(box_id, command, timeout=120)
+        if result.returncode:
+            raise OffboxError(f"base checkout relocation failed on {box_id}: "
+                              f"{result.stderr.decode(errors='replace')[-300:]}")
+        if b"offbox-base-checkout-relocated\n" in result.stdout:
+            event(con, box_id, "base_checkout_cleared", f"{base_dir} -> {remote_dir}: project .gradle metadata")
+
+
 def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False,
                 since: float | None = None) -> dict:
     rdir = remote_dir_for(me["repo_root"])
     is_recipe = source.startswith("recipe:")
-    # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
-    # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
-    # one can hand out as ready. The reaper deletes such rows (see reap._reap).
-    state = "bringing_up" if is_recipe else "running"
+    relocating = bool(base_dir and base_dir != rdir)
+    # An interrupted recipe or relocation may still be changing the box remotely. Keep it out of selection until
+    # completion is confirmed; the reaper deletes abandoned bring-ups under the acquisition's lock.
+    state = "bringing_up" if is_recipe or relocating else "running"
+    # token_owner: whose API token made the box. On the home server only that token can see it (common.mine).
     con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
-                   repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at, token_owner)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
-                 me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
+                 me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t, token_owner()))
     con.commit()
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
@@ -667,9 +747,8 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
             api.rename(box_id, box_name(me, me["repo_key"]))
         except OffboxError:
             pass
-        if base_dir and base_dir != rdir:
-            ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
-                                 f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
+        if relocating:
+            _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
         if is_recipe:
@@ -757,22 +836,41 @@ class DeadMount(OffboxError):
         self.box_id, self.reason = box_id, reason
 
 
-def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
-    con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{DEAD_MOUNT_NOTE} {reason}"[:200], box_id))
-    con.commit()
-    event(con, box_id, "lease_dead_mount", reason)
+def set_aside(con, box_id: str, kind: str, reason: str, run_id: str | None = None) -> bool:
+    """Remove a broken box from selection before trying to stop it. Never archive images or delete its disk."""
+    # A terminal run is no longer reconciled by the pool/reaper. Its marker must commit in the same transaction,
+    # before any event logging, TTL update, resume bookkeeping or network stop can be interrupted.
+    with con:
+        con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{kind}: {reason}"[:500], box_id))
+        if run_id:
+            con.execute("UPDATE runs SET error='box wedged before the command', status='infra', exit_code=NULL, "
+                        "end_at=? WHERE run_id=? AND status IN ('starting','running')", (now(), run_id))
+            con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, 'box_wedged', reason[:2000]))
+    from . import allocation
+    allocation.clear_resume(con, box_id)
+    event_kind = "lease_" + kind.replace('-', '_')
+    event(con, box_id, event_kind, reason)
+    if run_id:
+        event(con, box_id, 'run_end', f'{run_id} status=infra exit=None; box wedged before the command')
     try:
-        ssh_sync.close_master(box_id)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    try:
-        api.stop(box_id)
-    except OffboxError as e:
+        return stop_box(con, box_id, f"set aside: {kind}", images=False, locked=True)
+    except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
         # The reaper's idle stop catches it later; a dead box must not block the run from moving on.
-        event(con, box_id, "lease_dead_mount_stop_failed", str(e)[:300])
-        return
-    con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
-    con.commit()
+        event(con, box_id, event_kind + "_stop_failed", str(e)[:300])
+        return False
+
+
+def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
+    set_aside(con, box_id, DEAD_MOUNT_NOTE.rstrip(':'), reason)
+
+
+class BoxNotReady(OffboxError):
+    """Boat confirmed the machine is live, but its SSH setup/readiness failed."""
+
+    def __init__(self, box_id: str, state: dict, cause: OffboxError):
+        super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
+                         code=cause.code, started=cause.started, outage=cause.outage)
+        self.box_id, self.state = box_id, state
 
 
 class ResumeUnresolved(OffboxError):
@@ -799,6 +897,11 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         while True:
             left = end - time.time()
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
                 con.commit()
@@ -816,13 +919,17 @@ def _wait_unanswered_resume(con, box_id):
                 from . import allocation
                 allocation.clear_resume(con, box_id)
                 return
-            time.sleep(min(2, max(0, end - time.time())))
+            pause = min(2, max(0, end - time.time()))
+            budget_left = api.left()
+            if budget_left is not None:
+                pause = min(pause, max(0, budget_left))
+            time.sleep(pause)
 
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
                       confirm_only: bool = False):
-    from . import allocation
-    with allocation.guard(box_id, reconcile=pending):
+    from . import allocation, prepare
+    with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending):
         return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
 
 
@@ -839,6 +946,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         con.commit()
 
     def confirm(unanswered):
+        from . import prepare
+        with prepare.phase("resume_confirm", box_id):
+            return confirm_state(unanswered)
+
+    def confirm_state(unanswered):
         log(f"resume_unanswered {box_id}")
         # A read timeout is not a refusal. Only resend if boat confirms the box stayed stopped for the full window.
         seconds = capacity.setting("OFFBOX_RESUME_CONFIRM_SECONDS", 120, minimum=0, maximum=120)
@@ -854,6 +966,13 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    from . import prepare
+                    prepare.check(reserve=0.05)
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if left <= 0:
                 break
             try:
@@ -887,6 +1006,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
                                        "nothing ran. Retry later") from unanswered
@@ -907,7 +1031,9 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         from . import allocation
         other = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                             "WHERE l.repo_key=(SELECT repo_key FROM leases WHERE box_id=?) "
-                            "AND l.box_id<>? AND l.state IN ('running','stopped') LIMIT 1", (box_id, box_id)).fetchone()
+                            "AND l.box_id<>? AND l.state IN ('running','stopped') "
+                            "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1",
+                            (box_id, box_id, BOX_WEDGED_NOTE + '%')).fetchone()
         if other:
             raise allocation.Unresolved(f"{other[0]} has an unanswered resume; reconcile before sending another")
         if outage.allocation_left() == 0:
@@ -980,18 +1106,39 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
 
     try:
         return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady):
         raise
     except OffboxError as e:
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
+def _resumed_row(con, box_id, size, elapsed, prior_state):
+    previous = con.execute("SELECT kind FROM events WHERE box_id=? AND kind IN ('lease_resume','lease_resize_stop') "
+                           "ORDER BY rowid DESC LIMIT 1", (box_id,)).fetchone()
+    resized = bool(previous and previous[0] == 'lease_resize_stop')
+    event(con, box_id, "lease_resume", f"{elapsed:.1f}s size={size} from={prior_state} resized={int(resized)}")
+    row = dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
+    row['_cold_resume'] = 'archived' if prior_state == 'archived' else 'resized' if resized else None
+    row['_resumed_at'] = now()
+    return row
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
+    # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
+    current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
+    if not current or current['state'] not in ('running', 'stopped') or \
+            (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+        return None
     box_id = row["box_id"]
     from . import allocation
     allocation.recover_resumes(con, row['repo_key'])
     pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
     if pending:
+        t = now()
+        prior = con.execute("SELECT kind, detail FROM events WHERE box_id=? "
+                            "AND kind IN ('lease_resume_from','lease_resume') ORDER BY rowid DESC LIMIT 1",
+                            (box_id,)).fetchone()
+        prior_state = prior['detail'] if prior and prior['kind'] == 'lease_resume_from' else row['state']
         pending_size = pending[0] if pending[0] in SIZES else None
         try:
             confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True,
@@ -1005,13 +1152,23 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         con.commit()
         if _bigger(size, want):
             raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
-        return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
-    # Fast path: lease marked running and the ssh master answers -> no API calls at all.
+        return _resumed_row(con, box_id, want, now() - t, prior_state)
+    # A local master can outlive the remote machine, so verify a round trip before trusting the cached endpoint.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
-        p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-O", "check", box_id], capture_output=True, timeout=10)
-        if p.returncode == 0:
-            ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
-            return dict(row)
+        try:
+            p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-o", "ConnectTimeout=5", box_id, "true"],
+                               capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            reason = "timeout"
+        except OSError:
+            reason = "oserror"
+        else:
+            if p.returncode == 0:
+                ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
+                return dict(row)
+            reason = f"rc={p.returncode}"
+        ssh_sync.close_master(box_id)
+        event(con, box_id, "ssh_master_stale", reason)
     s = api.get(box_id)
     if s is None or s.get("state") in ("error", "cancelled"):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
@@ -1043,14 +1200,14 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                                               f"{iso(capacity.supply_until(want))}", tried=False)
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
+        if before_grow is not None:
+            before_grow(box_id)
         api.stop(box_id)
+        con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+        con.commit()
+        event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+        ssh_sync.close_master(box_id)
         if skip_archiving:
-            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
-            # bigger size once boat reports it archived.
-            ssh_sync.close_master(box_id)
-            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-            con.commit()
-            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
             raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
         # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
@@ -1093,6 +1250,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
+        # Retain the last observed boat state across an unanswered resume and the next allocator call.
+        event(con, box_id, 'lease_resume_from', st)
         def request_resume(retry=True):
             nonlocal want
             try:
@@ -1130,10 +1289,11 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
-        event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
+        except BoxNotReady:
+            raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)
@@ -1141,6 +1301,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
     con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
     con.commit()
+    if st in api.STOPPED_STATES:
+        return _resumed_row(con, box_id, want, now() - t, st)
     return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
 
 
@@ -1179,6 +1341,9 @@ def settle_stranded_runs(con, box_id: str) -> int:
     """Mark the box's starting/running runs lost. Call only once boat has confirmed the box is gone or stopped, so
     no process can still be running them. A run that outlived its client (no one left to end it) is then not
     counted as active forever. Caller holds 'box-<id>'. Returns how many runs were settled."""
+    con.execute("INSERT OR IGNORE INTO kv(k,v) SELECT 'lost_confirmed:' || run_id, '1' FROM runs "
+                "WHERE box_id=? AND status IN ('starting','running','lost')", (box_id,))
+    con.execute("DELETE FROM kv WHERE k IN (SELECT 'start_unknown:' || run_id FROM runs WHERE box_id=?)", (box_id,))
     cur = con.execute("UPDATE runs SET status='lost', end_at=? WHERE box_id=? AND status IN ('starting','running')",
                       (now(), box_id))
     con.commit()
@@ -1219,6 +1384,47 @@ def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
                 return False
             return _release_locked(con, box_id, run_id)
     except OffboxError:
+        return False
+
+
+def release_hold_if_worker_gone(con, box_id: str) -> bool:
+    """Recheck one prune generation under the box lock; live command runs retain their own reservations."""
+    from . import prune
+    ensure_holds(con)
+    try:
+        with file_lock('box-' + box_id, timeout=0):
+            hold = con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+            if hold is None:
+                return False
+            run_id = hold['run_id']
+            gone = None
+            if not con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                try:
+                    state = api.get(box_id)
+                    if state is None or state.get('state') in api.STOPPED_STATES:
+                        gone = True if _release_locked(con, box_id, run_id) else None
+                    elif state.get('state') in api.LIVE_STATES:
+                        gone = prune.worker_gone(box_id, run_id, max(0, now() - hold['created_at']))
+                except OffboxError:
+                    pass
+            released = False
+            if gone is True:
+                cur = con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+                con.commit()
+                # _release_locked may already have removed this generation on a stopped/gone box.
+                remaining = con.execute("SELECT 1 FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+                released = cur.rowcount > 0 or remaining is None
+            detail = ("worker gone" if released else "worker still running" if gone is False else "unknown, kept")
+            message = f"prune hold {'released' if released else 'kept'} {box_id} run {run_id}: {detail}"
+            log(message)
+            event(con, box_id, 'prune_hold_released' if released else 'prune_hold_kept', message)
+            return released
+    except OffboxError:
+        hold = con.execute("SELECT run_id FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+        if hold:
+            message = f"prune hold kept {box_id} run {hold['run_id']}: unknown, kept (box lock busy)"
+            log(message)
+            event(con, box_id, 'prune_hold_kept', message)
         return False
 
 

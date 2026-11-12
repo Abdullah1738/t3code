@@ -32,9 +32,11 @@ import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
 import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import {
   applyShellStreamEvent,
+  mergeShellSnapshotPage,
   mergeShellSnapshotProjects,
   reuseUnchangedThreadShells,
   sameThreadPullRequests,
+  type ShellPageCoverage,
 } from "./shellReducer.ts";
 import { type EnvironmentCatalogState, enabledEnvironmentIds } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -95,6 +97,8 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   const synchronizedServerVersion = yield* Ref.make<string | null>(null);
   const lastAuthoritativeSession = yield* Ref.make<RpcSession | null>(null);
   const activeSubscriptionSession = yield* Ref.make<RpcSession | null>(null);
+  // Rows the paged load in progress has delivered; see mergeShellSnapshotPage.
+  const pageCoverage = yield* Ref.make<ShellPageCoverage>(null);
   const latestLiveSnapshot = yield* Ref.make<Option.Option<OrchestrationV2ShellSnapshot>>(
     Option.none(),
   );
@@ -188,13 +192,14 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     const initial = yield* SubscriptionRef.get(state);
     const activeSession = yield* Ref.get(activeSubscriptionSession);
     let waiting = yield* Ref.get(awaitingCompletion);
+    let coverage = yield* Ref.get(pageCoverage);
     let next = initial;
     let snapshotSession: RpcSession | null = null;
     for (const [session, item] of items) {
       if (session !== activeSession) continue;
       if (item.kind === "synchronized") {
         waiting = false;
-        if (Option.isSome(next.snapshot)) {
+        if (Option.isSome(next.snapshot) && next.snapshot.value.page?.nextAfter == null) {
           const serverVersion = yield* session.initialConfig.pipe(
             Effect.map((config) => config.environment.serverVersion),
             Effect.orElseSucceed(() => null),
@@ -208,34 +213,52 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined) {
         yield* Ref.set(synchronizedSnapshot, false);
       }
-      const nextSnapshot =
-        item.kind === "snapshot"
-          ? mergeShellSnapshotProjects(
-              Option.getOrNull(next.snapshot),
-              item.snapshot,
-              item.resolvedRepositoryIdentityRoots === undefined
-                ? undefined
-                : {
-                    resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots,
-                  },
-            )
-          : Option.match(next.snapshot, {
-              onNone: () => null,
-              onSome: (snapshot) =>
-                item.sequence > snapshot.snapshotSequence
-                  ? applyShellStreamEvent(snapshot, item)
-                  : snapshot,
-            });
+      let nextSnapshot: OrchestrationV2ShellSnapshot | null;
+      if (item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined) {
+        const page = mergeShellSnapshotPage(
+          Option.getOrNull(next.snapshot),
+          item.snapshot,
+          coverage,
+        );
+        coverage = page.coverage;
+        nextSnapshot = page.snapshot;
+      } else
+        nextSnapshot =
+          item.kind === "snapshot"
+            ? mergeShellSnapshotProjects(Option.getOrNull(next.snapshot), item.snapshot, {
+                resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots ?? [],
+              })
+            : Option.match(next.snapshot, {
+                onNone: () => null,
+                // The reducer decides what an applied sequence still accepts (missing ancestor
+                // rows sent at their asking subagent's sequence).
+                onSome: (snapshot) => applyShellStreamEvent(snapshot, item),
+              });
       if (nextSnapshot === null) continue;
       if (item.kind === "snapshot" && item.snapshot.page?.nextAfter == null)
         snapshotSession = session;
+      // A complete list from the server is as resumable as one the marker confirmed: the
+      // socket replays from its sequence either way. Without this, a session that ended
+      // before its marker (a reconnect, a foreground resume) loaded every page again.
+      if (
+        item.kind === "snapshot" &&
+        item.resolvedRepositoryIdentityRoots === undefined &&
+        nextSnapshot.page?.nextAfter == null
+      ) {
+        const config = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
+        if (config?.shellResumeAcrossSessions === true) {
+          yield* Ref.set(synchronizedServerVersion, config.environment.serverVersion);
+          yield* Ref.set(synchronizedSnapshot, true);
+        }
+      }
       next = {
         snapshot: Option.some(nextSnapshot),
-        status: waiting ? "synchronizing" : "live",
+        status: waiting || nextSnapshot.page?.nextAfter != null ? "synchronizing" : "live",
         error: Option.none(),
       };
     }
     yield* Ref.set(awaitingCompletion, waiting);
+    yield* Ref.set(pageCoverage, coverage);
     if (next === initial) return;
     if (pendingLinkIds !== undefined && Option.isSome(next.snapshot)) {
       pendingLinkRows = new Set(
@@ -335,10 +358,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         yield* Ref.set(activeSubscriptionSession, session);
         const initialConfig = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
         const supportsCompletionMarker = initialConfig?.shellResumeCompletionMarker === true;
-        const shellPages =
-          initialConfig?.shellSnapshotPagination === true
-            ? { acceptShellPages: true as const }
-            : {};
+        const omitIdleSubagents = yield* ShellSnapshotLoader.OmitIdleSubagents;
+        const shellPages = {
+          ...(initialConfig?.shellSnapshotPagination === true
+            ? { acceptShellPages: true as const, recentFirst: true as const }
+            : {}),
+          ...(omitIdleSubagents ? { omitIdleSubagents: true as const } : {}),
+        };
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
 
@@ -355,7 +381,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               (yield* Ref.get(synchronizedSnapshot)) &&
               (yield* Ref.get(synchronizedServerVersion)) ===
                 initialConfig.environment.serverVersion));
-        yield* Ref.set(synchronizedSnapshot, false);
+        // Servers that keep lists resumable across sessions (shellResumeAcrossSessions) do
+        // not need the flag cleared per attempt: a partial list is refused above, a stream
+        // error clears it, and an interrupted replay leaves the list at a sequence the next
+        // session can resume from.
+        if (initialConfig?.shellResumeAcrossSessions !== true) {
+          yield* Ref.set(synchronizedSnapshot, false);
+        }
         let canResume = hasAuthoritativeSnapshot;
         let current = yield* SubscriptionRef.get(state);
         if (!hasAuthoritativeSnapshot || Option.isNone(current.snapshot)) {
@@ -373,7 +405,17 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               }),
             ),
           );
-          const httpSnapshot = yield* snapshotLoader.load(prepared);
+          const httpSnapshot = yield* snapshotLoader.load(
+            prepared,
+            (page) =>
+              applyItems(
+                [[session, { kind: "snapshot", snapshot: withoutDeferredPullRequests(page) }]],
+                new Set(page.loadPullRequests ? page.threads.map((thread) => thread.id) : []),
+              ),
+            initialConfig === null
+              ? undefined
+              : { serverVersion: initialConfig.environment.serverVersion },
+          );
           if (Option.isSome(httpSnapshot)) {
             yield* cancelActiveFill;
             const previous = yield* SubscriptionRef.get(state);

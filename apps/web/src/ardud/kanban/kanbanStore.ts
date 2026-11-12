@@ -1,5 +1,6 @@
+import { paintActionValue } from "@t3tools/client-runtime/ardud/kanban";
 import { useAtomValue } from "@effect/atom-react";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -30,11 +31,25 @@ export const kanban = createKanbanClient(
     registry: appAtomRegistry,
     environmentId: primaryEnvironmentIdAtom,
   }),
-  { keepAliveMs: 2 * 60_000 },
+  // Reopening after the feed closed waits on a new board snapshot (seconds on a busy
+  // server, ~11 MB), so a board or discussion stays live for ten minutes after leaving it.
+  { keepAliveMs: 10 * 60_000 },
 );
 
 function useStore<T>(store: SnapshotStore<T>): T | undefined {
   return useSyncExternalStore(store.subscribe, store.get);
+}
+
+// Two frames cross a browser paint opportunity; cleanup cancels stale commits.
+function usePaint(value: unknown, phase: "board-painted" | "discussion-painted") {
+  useEffect(() => paintActionValue(value, phase, (callback) => {
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
+    return () => cancelAnimationFrame(frame);
+  }), [value, phase]);
+  useEffect(() => paintActionValue(value, "authoritative-paint", (callback) => {
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
+    return () => cancelAnimationFrame(frame);
+  }), [value]);
 }
 
 /** Every board with its list counts; no board feed opens for them. */
@@ -85,14 +100,18 @@ const NO_OWNER: SnapshotStore<null> = {
 };
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
-  return useStore(kanban.board(boardId));
+  const value = useStore(kanban.board(boardId));
+  usePaint(value, "board-painted");
+  return value;
 }
 
 export function useMessages(
   boardId: string,
   discussionId: string,
 ): ReadonlyArray<KanbanMessage> | undefined {
-  return useStore(kanban.messages(boardId, discussionId));
+  const value = useStore(kanban.messages(boardId, discussionId));
+  usePaint(value, "discussion-painted");
+  return value;
 }
 
 export function useCardDetail(boardId: string, cardId: string): KanbanCardDetail | undefined {
@@ -136,6 +155,13 @@ export interface FeedState {
 export function useFeed(store: SnapshotStore<unknown>): FeedState {
   const failure = useSyncExternalStore(store.subscribe, store.failure);
   return { failure, retry: store.retry };
+}
+
+/** The server's code for a refused call ("not-found", "denied"), when it sent one. */
+export function kanbanErrorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("code" in error)) return null;
+  const code = (error as { readonly code: unknown }).code;
+  return typeof code === "string" ? code : null;
 }
 
 export function kanbanErrorMessage(error: unknown): string {

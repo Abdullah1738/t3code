@@ -43,7 +43,7 @@ import {
   OrchestrationGetTurnDiffInput,
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
-import { ModelSelection } from "./modelSelection.ts";
+import { ModelSelection, ModelSelectionRouting } from "./modelSelection.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -553,6 +553,12 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+const OrchestrationV2DelegatedTaskStall = Schema.Struct({
+  idleTimeoutMs: Schema.Finite,
+  lastProgressAt: Schema.DateTimeUtc,
+  lastProgressKind: Schema.String,
+});
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -573,6 +579,7 @@ export const OrchestrationV2Run = Schema.Struct({
   contextHandoffId: Schema.NullOr(ContextHandoffId),
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
+  delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
@@ -581,6 +588,12 @@ export const OrchestrationV2Run = Schema.Struct({
     Schema.Struct({
       threadId: ThreadId,
       planId: PlanId,
+    }),
+  ),
+  transientRecovery: Schema.optional(
+    Schema.Struct({
+      firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
+      since: IsoDateTime,
     }),
   ),
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
@@ -734,6 +747,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   model: Schema.NullOr(Schema.String),
   modelSelection: Schema.optional(ModelSelection),
   completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
+  selectionRouting: Schema.optional(ModelSelectionRouting),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
   status: Schema.Literals([
     "idle",
@@ -745,6 +759,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
     "cancelled",
     "interrupted",
   ]),
+  idleTimeoutMs: Schema.optional(Schema.Finite),
+  failureReason: Schema.optional(Schema.Literal("stalled")),
   progress: Schema.optional(Schema.String),
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
   result: Schema.NullOr(Schema.String),
@@ -884,6 +900,7 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
   seededHistory: Schema.optional(OrchestrationV2SeededHistory),
+  successfulModels: Schema.optional(Schema.Array(Schema.String)),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -2077,6 +2094,12 @@ export type OrchestrationV2AppThreadJson = typeof OrchestrationV2AppThreadJson.T
 
 export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => ({
   ...fields,
+  delegatedTaskStall: Schema.optional(
+    OrchestrationV2DelegatedTaskStall.mapFields((fields) => ({
+      ...fields,
+      lastProgressAt: Schema.DateTimeUtcFromString,
+    })),
+  ),
   requestedAt: Schema.DateTimeUtcFromString,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -2956,7 +2979,12 @@ export const OrchestrationV2Command = Schema.Union([
         type: Schema.Literal("defer_start"),
         workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
       }),
-      Schema.Struct({ type: Schema.Literal("steer_active"), targetRunId: RunId }),
+      Schema.Struct({
+        type: Schema.Literal("steer_active"),
+        targetRunId: RunId,
+        /** Drop the steer if its turn ends; never start a follow-up or restart. */
+        activeTurnOnly: Schema.optional(Schema.Boolean),
+      }),
       Schema.Struct({ type: Schema.Literal("restart_active"), targetRunId: RunId }),
       Schema.Struct({ type: Schema.Literal("queue_after_active") }),
       Schema.Struct({ type: Schema.Literal("start_immediately") }),
@@ -3008,6 +3036,7 @@ export const OrchestrationV2Command = Schema.Union([
     runId: RunId,
     reason: Schema.optional(Schema.String),
     holdQueue: Schema.optional(Schema.Boolean),
+    delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
     expectedAttemptId: Schema.optional(RunAttemptId),
     fenced: Schema.optional(Schema.Boolean),
   }),
@@ -3102,8 +3131,10 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,
+    selectionRouting: Schema.optional(ModelSelectionRouting),
     runtimeMode: RuntimeMode,
     interactionMode: ProviderInteractionMode,
     workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
@@ -3394,6 +3425,16 @@ export type OrchestrationV2GetThreadProjectionInput =
 
 export const OrchestrationV2SubscribeShellInput = Schema.Struct({
   acceptShellPages: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Leave out subagents idle for a week with no live descendant (the web sidebar never lists
+   * them; they stay readable by id). Clients that need every thread row omit it.
+   */
+  omitIdleSubagents: Schema.optionalKey(Schema.Boolean),
+  /**
+   * With acceptShellPages: send the most recently updated threads as the first page, then
+   * every page by thread id. Rows of the first page arrive again; clients merge by id.
+   */
+  recentFirst: Schema.optionalKey(Schema.Boolean),
   afterSequence: Schema.optionalKey(NonNegativeInt),
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });

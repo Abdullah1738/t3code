@@ -33,6 +33,8 @@ export type MessageRecord =
       type: "assistant";
       content: AssistantContent[];
       finish?: string;
+      /** A native step continued into tools; separate from a text-only record's execution finish. */
+      continued?: boolean;
       /**
        * Whether this step called tools, when the backend can tell (Robob reads it from
        * OpenCode's step finish). `unknown` means the backend can't prove either way.

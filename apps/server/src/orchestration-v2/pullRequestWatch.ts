@@ -18,7 +18,7 @@ export type PullRequestWatchChange =
   | { readonly kind: "checks-failed"; readonly failed: ReadonlyArray<PullRequestCheck> }
   | { readonly kind: "checks-passed"; readonly count: number; readonly required: boolean }
   | { readonly kind: "remarks"; readonly remarks: ReadonlyArray<PullRequestComment> }
-  | { readonly kind: "conflicting" };
+  | { readonly kind: "conflicting"; readonly headSha: string; readonly baseSha?: string };
 
 export interface PullRequestWatchReport {
   readonly changes: ReadonlyArray<PullRequestWatchChange>;
@@ -32,7 +32,10 @@ const isFailedCheck = (check: PullRequestCheck) =>
 
 export function evaluatePullRequestWatch(
   watch: ThreadPullRequestWatch,
-  detail: Pick<PullRequestDetail, "headSha" | "checks" | "mergeability" | "viewer" | "author">,
+  detail: Pick<
+    PullRequestDetail,
+    "headSha" | "baseSha" | "checks" | "mergeability" | "viewer" | "author"
+  >,
   remarks: ReadonlyArray<PullRequestComment> | null,
 ): PullRequestWatchReport {
   const changes: Array<PullRequestWatchChange> = [];
@@ -43,6 +46,7 @@ export function evaluatePullRequestWatch(
   let failedChecks = headMoved ? [] : watch.failedChecks;
   let passed = headMoved ? false : watch.passed;
   let passedChecks = headMoved ? [] : watch.passedChecks;
+  let passedPending = headMoved ? [] : watch.passedPending;
   if (detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
     const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
@@ -57,11 +61,19 @@ export function evaluatePullRequestWatch(
     // A required job created and finished between two passes is never seen pending. Without
     // required checks, any check counts, and advisory bots keep adding passed ones: no wake.
     const gateGrew = required.length > 0 && gateNames.some((name) => !told.includes(name));
-    if (passedNow && (!passed || gateGrew)) {
+    const previousGate = new Set(passedPending);
+    const confirmed =
+      required.length > 0 ||
+      (new Set(gateNames).size === previousGate.size &&
+        gateNames.every((name) => previousGate.has(name)));
+    if (passedNow && confirmed && (!passed || gateGrew)) {
       changes.push({ kind: "checks-passed", count: gate.length, required: required.length > 0 });
     }
-    passed = passedNow;
-    passedChecks = passedNow ? gateNames : [];
+    passedPending = required.length === 0 && passedNow ? gateNames : [];
+    passed = passedNow && (passed || confirmed);
+    passedChecks = passed ? gateNames : [];
+  } else {
+    passedPending = [];
   }
 
   const own = (detail.viewer ?? detail.author?.login)?.toLowerCase();
@@ -84,12 +96,29 @@ export function evaluatePullRequestWatch(
     ...atLatest.map((remark) => remark.id),
   ];
 
-  if (detail.mergeability === "conflicting" && !watch.conflicting) {
-    changes.push({ kind: "conflicting" });
+  // Unknown keeps a pending confirmation; only a clean read clears it.
+  let conflicting = headMoved ? false : watch.conflicting;
+  let conflictHead = headMoved ? null : watch.conflictHead;
+  let conflictWokeFor = watch.conflictWokeFor;
+  if (detail.mergeability === "mergeable") {
+    conflicting = false;
+    conflictHead = null;
+  } else if (detail.mergeability === "conflicting" && headSha !== null && !conflicting) {
+    const key = detail.baseSha ? `${headSha}:${detail.baseSha}` : headSha;
+    if (conflictHead === headSha) {
+      conflicting = true;
+      if (conflictWokeFor !== key) {
+        changes.push({
+          kind: "conflicting",
+          headSha,
+          ...(detail.baseSha ? { baseSha: detail.baseSha } : {}),
+        });
+        conflictWokeFor = key;
+      }
+    } else {
+      conflictHead = headSha;
+    }
   }
-  // "unknown" is GitHub still computing after a push; only a clean answer clears a conflict.
-  const conflicting =
-    detail.mergeability === "unknown" ? watch.conflicting : detail.mergeability === "conflicting";
 
   const commentsOnly = changes.length > 0 && changes.every((change) => change.kind === "remarks");
   const progress = headMoved || (changes.length > 0 && !commentsOnly);
@@ -102,9 +131,12 @@ export function evaluatePullRequestWatch(
       failedChecks,
       passed,
       passedChecks,
+      passedPending,
       remarksThrough,
       remarkIds,
       conflicting,
+      conflictHead,
+      conflictWokeFor,
       wakes,
     },
     exhausted: commentsOnly && wakes >= PULL_REQUEST_WATCH_WAKE_LIMIT,
@@ -154,7 +186,9 @@ function changeLines(
         }),
       ];
     case "conflicting":
-      return [`- The branch now conflicts with ${context.baseBranch}.`];
+      return [
+        `- The branch now conflicts with ${context.baseBranch} (head ${change.headSha.slice(0, 7)}${change.baseSha ? `, GitHub base ${change.baseSha.slice(0, 7)}` : ""}).`,
+      ];
   }
 }
 

@@ -1,0 +1,10 @@
+[
+  {
+    "spec": "sync",
+    "step": "step",
+    "invariant": "invariant",
+    "expectedFailure": false,
+    "status": 0,
+    "ok": true
+  }
+]

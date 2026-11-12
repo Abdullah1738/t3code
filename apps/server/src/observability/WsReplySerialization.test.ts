@@ -28,6 +28,26 @@ describe("WebSocket reply serialization", () => {
     ).toThrow("16 MiB limit");
     expect(entries).toMatchObject([{ kind: "ws", name: "kanban.subscribe", rejected: true }]);
   });
+  it("includes the thread id for rejected thread subscription snapshots", () => {
+    const entries: unknown[] = [];
+    const parser = WsReplySerialization.wrap(
+      RpcSerialization.json,
+      { record: (entry) => entries.push(entry) },
+      new Set(["orchestration.subscribeThread"]),
+    ).makeUnsafe();
+    parser.decode(
+      JSON.stringify({
+        _tag: "Request",
+        id: "thread",
+        tag: "orchestration.subscribeThread",
+        payload: { threadId: "thread:long" },
+      }),
+    );
+    expect(() =>
+      parser.encode({ _tag: "Chunk", requestId: "thread", values: ["x".repeat(17 * 1024 * 1024)] }),
+    ).toThrow("16 MiB limit");
+    expect(entries).toMatchObject([{ threadId: "thread:long", rejected: true }]);
+  });
   it("records UTF-8 bytes without encoding a response twice", () => {
     const payload = { _tag: "Exit", body: "🔒".repeat(300_000), token: "private" };
     const original = RpcSerialization.json.makeUnsafe().encode(payload)!;

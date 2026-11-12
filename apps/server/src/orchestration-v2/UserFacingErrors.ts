@@ -42,7 +42,7 @@ const CAPABILITY_REJECTION_MESSAGES: Record<string, (provider: string) => string
   active_steering: (p) =>
     `${p} cannot redirect an active run. Stop it first, then send the message.`,
   interrupt_restart_steering: (p) =>
-    `${p} cannot redirect an active run. Stop it first, then send the message.`,
+    `${p} cannot restart an active run. Use t3_thread_interrupt, then send the message.`,
   interrupt: (p) => `${p} cannot stop a run once it has started.`,
   native_fork: (p) => `${p} cannot fork this thread natively.`,
   fork_from_turn: (p) => `${p} cannot fork from an earlier point in this thread.`,

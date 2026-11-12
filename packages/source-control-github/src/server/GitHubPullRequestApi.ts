@@ -1,5 +1,11 @@
 import { removeAgentCredits } from "@t3tools/source-control-core/server/mergeMessage";
-import { KnownWorkflowRuns, makeChecksRevalidator } from "./gitHubConditionalChecks.ts";
+import {
+  KnownWorkflowRuns,
+  WorkflowRunSchema,
+  isActiveWorkflowRun,
+  makeChecksRevalidator,
+  type KnownWorkflowRun,
+} from "./gitHubConditionalChecks.ts";
 import { runGitHubStackAction, type GitHubStackActionError } from "./githubStackActions.ts";
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
@@ -475,7 +481,16 @@ export class GitHubPullRequestApi extends Context.Service<
       readonly repository: string;
       readonly host: string;
       readonly number: number;
-    }) => Effect.Effect<GitHubPullRequestCore, GitHubPullRequestApiError>;
+      readonly includeActiveWorkflows?: boolean;
+    }) => Effect.Effect<
+      GitHubPullRequestCore & {
+        readonly headWorkflowRuns?: {
+          readonly runs: ReadonlyArray<KnownWorkflowRun>;
+          readonly complete: boolean;
+        };
+      },
+      GitHubPullRequestApiError
+    >;
 
     readonly getPullRequestPreview: (input: {
       readonly cwd: string;
@@ -881,6 +896,13 @@ interface RestReadInput<A> {
   readonly operation: string;
   readonly path: string;
   readonly decode: (raw: string) => Result.Result<A, unknown>;
+}
+
+function workflowCheckIdentity(name: string | null | undefined, url: string | null | undefined) {
+  return {
+    name: name?.trim() || null,
+    runId: url?.match(/\/actions\/runs\/(\d+)(?:[/?#]|$)/)?.[1] ?? null,
+  };
 }
 
 /** @public Service construction is part of the canonical Effect module API. */
@@ -1383,6 +1405,39 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const readHeadWorkflowRuns = Effect.fn("GitHubPullRequestApi.readHeadWorkflowRuns")(
+    function* (input: {
+      readonly cwd: string;
+      readonly host: string;
+      readonly repository: string;
+      readonly headSha: string;
+    }) {
+      const { owner, name } = parseRepositorySelector(input.repository);
+      const operation = "listHeadWorkflowRuns";
+      const response = yield* api.rest({
+        host: input.host,
+        operation,
+        path: `repos/${owner}/${name}/actions/runs?head_sha=${encodeURIComponent(input.headSha)}&per_page=100`,
+      });
+      const page = yield* decodeWith(
+        input.cwd,
+        operation,
+        Schema.decodeUnknownResult(
+          Schema.fromJsonString(Schema.Struct({ workflow_runs: Schema.Array(WorkflowRunSchema) })),
+        ),
+        response.body,
+      );
+      return {
+        runs: page.workflow_runs,
+        // A full page without a next link is still uncertain; approval detection must reconcile it.
+        complete:
+          !response.truncated &&
+          page.workflow_runs.length < 100 &&
+          !/rel="next"/.test(response.headers["link"] ?? ""),
+      };
+    },
+  );
+
   const getPullRequestDetail: GitHubPullRequestApi["Service"]["getPullRequestDetail"] = (input) => {
     const { owner, name } = parseRepositorySelector(input.repository);
     const operation = "getPullRequestDetail";
@@ -1398,29 +1453,106 @@ export const make = Effect.gen(function* () {
           })
           .pipe(
             graphql({ ...input, operation, allowReserve }),
-            Effect.map(toPullRequestCore),
-            Effect.flatMap(found({ ...input, operation })),
-            // Past a hundred checks the first page would let the rest imply success, so the whole
-            // rollup is walked instead.
-            Effect.filterOrElse(
-              (core) => !core.checksTruncated,
-              (core) =>
-                readAllCheckContexts(input, allowReserve).pipe(
-                  Effect.filterOrFail(
-                    (all) => all.headSha === core.headSha,
-                    () =>
-                      readError(
-                        input.cwd,
-                        operation,
-                        new Error("Pull request head changed while reading checks."),
+            Effect.map((result) => ({
+              core: toPullRequestCore(result),
+              workflowChecks: (
+                result.repository?.pullRequest?.commits.nodes?.[0]?.commit.statusCheckRollup
+                  ?.contexts.nodes ?? []
+              ).flatMap((check) =>
+                check?.__typename === "CheckRun"
+                  ? [
+                      workflowCheckIdentity(
+                        check.checkSuite.workflowRun?.workflow.name,
+                        check.detailsUrl,
                       ),
-                  ),
-                  Effect.map((all) => ({
-                    ...core,
-                    ...pullRequestChecksFromContexts(all.contexts),
-                    checksTruncated: all.truncated,
-                  })),
+                    ]
+                  : [],
+              ),
+            })),
+            Effect.flatMap(({ core, workflowChecks }) =>
+              found({ ...input, operation })(core).pipe(
+                Effect.map((core) => ({ core, workflowChecks })),
+              ),
+            ),
+            Effect.flatMap(({ core, workflowChecks }) =>
+              // Past a hundred checks, use every page for workflow matching too.
+              (!core.checksTruncated
+                ? Effect.succeed({ core, workflowChecks })
+                : readAllCheckContexts(input, allowReserve).pipe(
+                    Effect.filterOrFail(
+                      (all) => all.headSha === core.headSha,
+                      () =>
+                        readError(
+                          input.cwd,
+                          operation,
+                          new Error("Pull request head changed while reading checks."),
+                        ),
+                    ),
+                    Effect.map((all) => ({
+                      core: {
+                        ...core,
+                        ...pullRequestChecksFromContexts(all.contexts),
+                        checksTruncated: all.truncated,
+                      },
+                      workflowChecks: all.contexts.flatMap((check) =>
+                        check.name == null
+                          ? []
+                          : [workflowCheckIdentity(check.workflowName, check.detailsUrl)],
+                      ),
+                    })),
+                  )
+              ).pipe(
+                Effect.flatMap(({ core, workflowChecks }) =>
+                  Effect.gen(function* () {
+                    if (
+                      !input.includeActiveWorkflows ||
+                      core.state !== "open" ||
+                      core.headSha == null
+                    )
+                      return core;
+                    const known = yield* KnownWorkflowRuns;
+                    const headWorkflowRuns =
+                      known?.headSha === core.headSha
+                        ? known
+                        : yield* readHeadWorkflowRuns({ ...input, headSha: core.headSha }).pipe(
+                            Effect.orElseSucceed(() => null),
+                          );
+                    if (headWorkflowRuns === null) return core;
+                    const runs = headWorkflowRuns.runs;
+                    // A known ID wins over a same-named workflow from another run.
+                    const unidentifiedWorkflows = new Set(
+                      workflowChecks.flatMap((check) =>
+                        check.runId === null ? (check.name ?? []) : [],
+                      ),
+                    );
+                    const runIds = new Set(workflowChecks.flatMap((check) => check.runId ?? []));
+                    const pending = runs.filter(
+                      (run) =>
+                        isActiveWorkflowRun(run) &&
+                        !unidentifiedWorkflows.has(run.name?.trim() ?? "") &&
+                        !runIds.has(String(run.id)),
+                    );
+                    return {
+                      ...core,
+                      headWorkflowRuns,
+                      checksState:
+                        pending.length > 0 && core.checksState !== "failing"
+                          ? ("pending" as const)
+                          : core.checksState,
+                      checks: [
+                        ...core.checks,
+                        ...pending.map((run) => ({
+                          name: run.name?.trim() || `Workflow run ${run.id}`,
+                          status: "pending" as const,
+                          description: null,
+                          url: run.html_url?.trim() || null,
+                          required: false,
+                        })),
+                      ],
+                    };
+                  }),
                 ),
+              ),
             ),
           ),
       ),
@@ -1474,11 +1606,12 @@ export const make = Effect.gen(function* () {
       readonly headBranch: string;
     }) {
       const known = yield* KnownWorkflowRuns;
-      if (known !== null && known.headSha === input.headSha) {
+      if (known !== null && known.complete && known.headSha === input.headSha) {
         return known.runs.flatMap((run) =>
           // A run waiting on a maintainer reports `completed` with an `action_required`
           // conclusion; the `status=action_required` query matches either.
           (run.conclusion === "action_required" || run.status === "action_required") &&
+          (run.event == null || run.event === "pull_request") &&
           run.head_branch === input.headBranch
             ? [
                 {

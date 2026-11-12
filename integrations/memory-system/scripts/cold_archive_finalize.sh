@@ -10,6 +10,9 @@
 set -uo pipefail
 
 ROOT="$HOME/.local/share/memory-system"
+if [ "${RECALL_FENCED:-}" != 1 ]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/src/redact_lock.py" /bin/bash "$0" "$@"
+fi
 LOGS="$ROOT/logs"
 STATUS="$LOGS/cold_finalize.json"
 LOG="$LOGS/cold_finalize.log"

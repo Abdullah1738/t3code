@@ -924,6 +924,8 @@ export const make = Effect.gen(function* () {
             ...authScopeResponse(session.scopes),
             sessionMethod: session.method,
             ...(session.expiresAt ? { expiresAt: DateTime.toUtc(session.expiresAt) } : {}),
+            // ardud: the same reading of the session the board's owner check makes.
+            owner: session.origin?._tag === "owner",
           }) satisfies AuthSessionState,
       ),
       Effect.catchIf(isServerAuthCredentialError, () =>
@@ -1308,14 +1310,29 @@ export const make = Effect.gen(function* () {
       );
     };
 
+  // ardud:
+  // Whether a listed session is the owner's. A failed lookup leaves it unsaid
+  // instead of calling an owner device a stranger.
+  const ownerStanding = (sessionId: AuthSessionId) =>
+    isOwnerSession(sessionId).pipe(
+      Effect.map((owner) => ({ owner })),
+      Effect.catch(() => Effect.succeed({})),
+    );
   const listClientSessions: EnvironmentAuth["Service"]["listClientSessions"] = (currentSessionId) =>
     listSessions().pipe(
-      Effect.map((clientSessions) =>
-        clientSessions.map((clientSession): AuthClientSession => ({
-          ...clientSession,
-          ...authScopeResponse(clientSession.scopes),
-          current: clientSession.sessionId === currentSessionId,
-        })),
+      Effect.flatMap((clientSessions) =>
+        Effect.forEach(clientSessions, (clientSession) =>
+          ownerStanding(clientSession.sessionId).pipe(
+            Effect.map(
+              (standing): AuthClientSession => ({
+                ...clientSession,
+                ...authScopeResponse(clientSession.scopes),
+                current: clientSession.sessionId === currentSessionId,
+                ...standing,
+              }),
+            ),
+          ),
+        ),
       ),
       Effect.withSpan("EnvironmentAuth.listClientSessions"),
     );

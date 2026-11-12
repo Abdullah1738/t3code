@@ -5,6 +5,7 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schedule from "effect/Schedule";
+import * as Semaphore from "effect/Semaphore";
 import * as NodeWorkerThreads from "node:worker_threads";
 
 import { forkParked } from "../../serverActivation.ts";
@@ -12,10 +13,22 @@ import { archiveFilename } from "./historyArchiveSql.ts";
 
 export class HistoryArchiveDurability extends Context.Service<
   HistoryArchiveDurability,
-  { readonly flushHistorySource: Effect.Effect<boolean> }
+  {
+    /** Main's committed history is on disk (F_FULLFSYNC) before the archive copies it. */
+    readonly flushHistorySource: Effect.Effect<boolean>;
+    /**
+     * Every archive commit made so far is on disk (F_FULLFSYNC) before main deletes the
+     * hot row. The live writer commits archive copies without any sync of its own, so
+     * this is the only barrier between "copied" and "deleted".
+     */
+    readonly syncArchive: Effect.Effect<boolean>;
+  }
 >()("t3/ardud/persistence/archiveCheckpoint/HistoryArchiveDurability") {}
 
 // Kept in an evaluated worker so bundled builds need no worker file on disk.
+// A complete PASSIVE checkpoint (checkpointed === log) syncs the WAL, copies every
+// frame into the database file and syncs that file, all with F_FULLFSYNC here, off
+// the event loop and off the writer connection.
 const source = `
 const { parentPort, workerData } = require('node:worker_threads');
 const { DatabaseSync } = require('node:sqlite');
@@ -38,17 +51,27 @@ parentPort.on('message', ({ id, operation }) => {
   parentPort.postMessage({ id, ok });
 });`;
 
-// Main NORMAL commits must reach disk before the archive's FULL copy can outlive
-// them. This barrier and periodic archive checkpoints never run on the writer.
+/** A reader holding an older archive snapshot only blocks the barrier briefly. */
+const SYNC_ARCHIVE_ATTEMPTS = 4;
+const SYNC_ARCHIVE_RETRY = "250 millis";
+
+// Main NORMAL commits must reach disk before the archive copy can outlive them, and
+// the archive copy must reach disk before main deletes the row. Both barriers and
+// the periodic archive checkpoints run in this worker, never on the writer.
 export const archiveCheckpointLayer = (filename: string) =>
   Layer.effect(
     HistoryArchiveDurability,
     Effect.gen(function* () {
       const clock = yield* Clock.Clock;
       const now = () => clock.currentTimeMillisUnsafe();
+      // One operation at a time; a barrier waits for an in-flight periodic checkpoint
+      // instead of failing because the worker happened to be busy.
+      const serial = yield* Semaphore.make(1);
       let worker: NodeWorkerThreads.Worker | undefined;
       let pending: { readonly id: number; readonly complete: (ok: boolean) => void } | undefined;
       let requestId = 0;
+      // Only a broken worker (error, exit, hang) backs off respawning. A checkpoint that
+      // could not finish (a pinned reader) is reported to the caller, which paces itself.
       let retryAt = 0;
       let retryDelay = 1000;
       let warnAfter = 0;
@@ -62,6 +85,11 @@ export const archiveCheckpointLayer = (filename: string) =>
           worker = undefined;
         }),
       );
+
+      const workerFailed = () => {
+        retryAt = now() + retryDelay;
+        retryDelay = Math.min(retryDelay * 2, 30_000);
+      };
 
       const request = Effect.fn("HistoryArchiveDurability.checkpoint")(
         (operation: "checkpoint" | "flush-main") =>
@@ -80,8 +108,7 @@ export const archiveCheckpointLayer = (filename: string) =>
                 const failed = () => {
                   if (worker !== instance) return;
                   worker = undefined;
-                  retryAt = now() + retryDelay;
-                  retryDelay = Math.min(retryDelay * 2, 30_000);
+                  workerFailed();
                   const waiting = pending;
                   pending = undefined;
                   waiting?.complete(false);
@@ -91,12 +118,7 @@ export const archiveCheckpointLayer = (filename: string) =>
                   if (worker !== instance || pending?.id !== result.id) return;
                   const waiting = pending;
                   pending = undefined;
-                  if (result.ok) {
-                    retryDelay = 1000;
-                  } else {
-                    retryAt = now() + retryDelay;
-                    retryDelay = Math.min(retryDelay * 2, 30_000);
-                  }
+                  retryDelay = 1000;
                   instance.unref();
                   waiting.complete(result.ok === true);
                 });
@@ -104,8 +126,7 @@ export const archiveCheckpointLayer = (filename: string) =>
                 instance.on("exit", failed);
                 instance.unref();
               } catch {
-                retryAt = now() + retryDelay;
-                retryDelay = Math.min(retryDelay * 2, 30_000);
+                workerFailed();
                 resume(Effect.succeed(false));
                 return;
               }
@@ -120,8 +141,7 @@ export const archiveCheckpointLayer = (filename: string) =>
             } catch {
               pending = undefined;
               worker = undefined;
-              retryAt = now() + retryDelay;
-              retryDelay = Math.min(retryDelay * 2, 30_000);
+              workerFailed();
               instance.unref();
               void instance.terminate();
               resume(Effect.succeed(false));
@@ -130,13 +150,13 @@ export const archiveCheckpointLayer = (filename: string) =>
               if (pending?.id !== id) return;
               pending = undefined;
               worker = undefined;
-              retryAt = now() + retryDelay;
-              retryDelay = Math.min(retryDelay * 2, 30_000);
+              workerFailed();
               instance.unref();
               void instance.terminate();
             });
           }).pipe(
             Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.succeed(false) }),
+            serial.withPermits(1),
             Effect.tap((ok) => {
               if (ok || now() < warnAfter) return Effect.void;
               warnAfter = now() + 30_000;
@@ -156,6 +176,13 @@ export const archiveCheckpointLayer = (filename: string) =>
         ),
       );
       const flushHistorySource = request("flush-main");
-      return HistoryArchiveDurability.of({ flushHistorySource });
+      const syncArchive = Effect.gen(function* () {
+        for (let attempt = 1; attempt <= SYNC_ARCHIVE_ATTEMPTS; attempt++) {
+          if (yield* request("checkpoint")) return true;
+          if (attempt < SYNC_ARCHIVE_ATTEMPTS) yield* Effect.sleep(SYNC_ARCHIVE_RETRY);
+        }
+        return false;
+      });
+      return HistoryArchiveDurability.of({ flushHistorySource, syncArchive });
     }),
   );

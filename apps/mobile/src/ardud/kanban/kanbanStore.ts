@@ -70,9 +70,7 @@ export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined
 }
 
 /** Every thread a board started, cards and evaluators alike, kept current by the list. */
-export function useKanbanBoardThreads(
-  boardId: string,
-): ReadonlyArray<KanbanThreadRow> | undefined {
+export function useKanbanBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow> | undefined {
   return useStore(kanbanClient().threads(boardId));
 }
 

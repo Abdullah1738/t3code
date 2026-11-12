@@ -1,11 +1,21 @@
 import {
+  KANBAN_AGING_MAX_STEPS,
+  KANBAN_AGING_STEP_MS,
   KANBAN_BACKLOG,
+  KANBAN_BOOST_FLOOR,
   KANBAN_DONE_STAGES,
+  KANBAN_FANOUT_STEPS,
   KANBAN_THREAD_STAGES,
+  kanbanCardFlow,
   kanbanCardModels,
   kanbanHeldUpBy,
+  kanbanBoardClock,
   kanbanPickOrder,
+  kanbanRetryNotBefore,
+  kanbanSchedule,
   kanbanScriptStep,
+  kanbanDeciding,
+  kanbanWaiting,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
@@ -102,6 +112,7 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return no(`dispatcher cannot move ${from} -> ${to}`);
     case "cardThread":
       if (from === "working" && (to === "needs_review" || to === "needs_owner")) return ok;
+      if (from === "todo" && card.activeThreadId === null && to === "needs_review") return ok;
       return no(
         `a card thread can move working -> needs_review or needs_owner, not ${from} -> ${to}`,
       );
@@ -245,15 +256,23 @@ export function workerQuietDue(
 /** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
 export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
 
-/** A thread whose turn ended while its own subagents or background tasks still run, within the grace. */
+export const PR_WATCH_GRACE_MS = 6 * 60 * 60 * 1000;
+
+/** An idle thread waiting on its own background work or PR watch, within that work's grace. */
 export function waitingOnBackground(
-  view: { readonly state: string; readonly quietSince: string; readonly backgroundWork: number },
+  view: {
+    readonly state: string;
+    readonly quietSince: string;
+    readonly backgroundWork: number;
+    readonly prWatches: number;
+  },
   nowMs: number,
 ): boolean {
   return (
     view.state === "idle" &&
-    view.backgroundWork > 0 &&
-    nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS
+    ((view.backgroundWork > 0 && nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS) ||
+      // Reviewers never hold PR watches, so this shared guard needs no role check.
+      (view.prWatches > 0 && nowMs - Date.parse(view.quietSince) < PR_WATCH_GRACE_MS))
   );
 }
 
@@ -406,6 +425,27 @@ function weightedModel(
   return tied[index]?.model ?? null;
 }
 
+/**
+ * How To-Do is ordered, and the numbers a board shows for it. The rule lives in the
+ * contracts package because the To-Do column lists cards in the order the dispatcher
+ * takes them; these are the names the engine uses.
+ *
+ * A startable card is picked by rank, then by how many open cards it unblocks, then
+ * by how long it has sat in To-Do. Its rank is its own priority, or that of the most
+ * urgent open card it unblocks (the whole chain), lifted one step when it unblocks
+ * FANOUT_STEPS[0] cards and two at FANOUT_STEPS[1], and one step per AGING_STEP_MS
+ * it has been startable (at most AGING_MAX_STEPS). Lifts stop at BOOST_FLOOR: only a
+ * card the owner marked P1, or one that unblocks a P1 card, ranks as P1.
+ */
+export const AGING_STEP_MS = KANBAN_AGING_STEP_MS;
+export const AGING_MAX_STEPS = KANBAN_AGING_MAX_STEPS;
+export const FANOUT_STEPS = KANBAN_FANOUT_STEPS;
+export const BOOST_FLOOR = KANBAN_BOOST_FLOOR;
+/** Rank, unblock count and waiting time of every open card, from one pass over the blocking graph. */
+export const schedule = kanbanSchedule;
+/** One card's place in the queue: what it unblocks, whether it is ready, what it waits on. */
+export const cardFlow = kanbanCardFlow;
+
 export interface Dispatch {
   readonly cardId: KanbanCard["id"];
   readonly role: "work" | "review";
@@ -446,13 +486,23 @@ export function poolThreads(
 }
 
 /**
- * Fill free pool slots: reviews first (oldest first), then todo in pick
- * order, skipping blocked, settled and backlog cards. Lowering a pool below what is
+ * Fill free pool slots by effective urgency, reviews before todos at the same rank.
+ * Within each role, pick order uses rank, holds, then oldest first.
+ * Skip blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
  * A card with no work thread yet starts on its highest-weight model with a
  * free slot; `pick(n)` returns an index below n to break a tie.
+ *
+ * Not before: a card whose run failed waits in its queue for its one retry and
+ * is not started until its backoff is over (kanbanRetryNotBefore). It holds no
+ * slot meanwhile, and once due it is a card like any other: same rank, same
+ * age, same wait for a free slot.
+ *
+ * `nowMs` is the one clock both the retry backoff and the aging of waiting cards
+ * are measured against. The dispatcher passes the real time. Left out (tests, a
+ * caller with no clock) it is the board's newest card stamp (kanbanBoardClock).
  */
 export function planDispatch(
   board: KanbanBoard,
@@ -460,6 +510,8 @@ export function planDispatch(
   pools: ReadonlyArray<KanbanPool>,
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
+  nowMs?: number,
+  attempted: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -475,65 +527,149 @@ export function planDispatch(
   const free = new Map<string, number>();
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const clock = nowMs ?? kanbanBoardClock(cards);
+  const retryHeld = (card: KanbanCard) => {
+    const notBefore = kanbanRetryNotBefore(card);
+    return notBefore !== null && notBefore > clock;
+  };
   const waiting = cards.filter(
     (card) =>
+      !attempted.has(card.id) &&
       (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
+      !retryHeld(card) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
-      !kanbanWaitsOnEvaluator(card),
+      !kanbanWaitsOnEvaluator(card) &&
+      // Parked on a wait: the tick wakes it when the wait ends.
+      !kanbanWaiting(card) &&
+      // Its wait ended and its evaluator decides what it does next.
+      !kanbanDeciding(card, clock),
   );
   const reviews = waiting
     .filter((card) => card.stage === "needs_review")
-    .toSorted((a, b) => a.movedAt.localeCompare(b.movedAt));
+    .map((card) => ({ card, role: "review" as const }));
+  const ranking = kanbanSchedule(cards, { nowMs: clock });
+  const pickOrder = kanbanPickOrder(cards, { nowMs: clock });
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .toSorted(kanbanPickOrder(cards));
+    .map((card) => ({ card, role: "work" as const }));
+  const priority = ({ card }: (typeof reviews)[number] | (typeof todos)[number]) =>
+    ranking.get(card.id)?.rank ?? card.priority;
+  const queue = [...reviews, ...todos].toSorted(
+    (a, b) =>
+      priority(a) - priority(b) ||
+      (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),
+  );
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 
   const plan: Array<Dispatch> = [];
-  for (const [role, list] of [
-    ["review", reviews],
-    ["work", todos],
-  ] as const) {
-    for (const card of list) {
-      // Once a card has a work thread it stays on that thread's model.
-      const model =
-        role === "work" && card.workThreadId === null
-          ? weightedModel(card, pools, free, pick)
-          : nextModel(board, card);
-      if (model === null) continue;
-      const key = poolFor(pools, model)?.key;
-      if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
-      let thread = role === "work" ? card.workThreadId : null;
-      const fresh = thread !== null && busyElsewhere(thread, key);
-      // A new thread can't take a card its old thread's own work still holds up.
-      if (fresh && isBlocked(card, byId, null)) continue;
-      if (fresh) thread = null;
-      if (thread !== null && kept !== null && cards.some(
-        (other) => other.activeThreadId === thread && !kept.has(other.id),
-      )) continue;
-      const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
-      if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
-      if (!joins) {
-        const left = free.get(key) ?? 0;
-        if (left <= 0) continue;
-        free.set(key, left - 1);
-      }
-      if (thread !== null) {
-        carrying.set(thread, (carrying.get(thread) ?? 0) + 1);
-        const set = holding.get(key) ?? new Set<string>();
-        set.add(thread);
-        holding.set(key, set);
-      }
-      plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
+  for (const { role, card } of queue) {
+    // Once a card has a work thread it stays on that thread's model.
+    const model =
+      role === "work" && card.workThreadId === null
+        ? weightedModel(card, pools, free, pick)
+        : nextModel(board, card);
+    if (model === null) continue;
+    const key = poolFor(pools, model)?.key;
+    if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
+    let thread = role === "work" ? card.workThreadId : null;
+    const fresh = thread !== null && busyElsewhere(thread, key);
+    // A new thread can't take a card its old thread's own work still holds up.
+    if (fresh && isBlocked(card, byId, null)) continue;
+    if (fresh) thread = null;
+    if (
+      thread !== null &&
+      kept !== null &&
+      cards.some((other) => other.activeThreadId === thread && !kept.has(other.id))
+    )
+      continue;
+    const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
+    if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
+    if (!joins) {
+      const left = free.get(key) ?? 0;
+      if (left <= 0) continue;
+      free.set(key, left - 1);
     }
+    if (thread !== null) {
+      carrying.set(thread, (carrying.get(thread) ?? 0) + 1);
+      const set = holding.get(key) ?? new Set<string>();
+      set.add(thread);
+      holding.set(key, set);
+    }
+    plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
   }
   return plan;
+}
+
+/** Same provider, model and options, whatever order their keys were written in. */
+const canonical = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(canonical)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(
+          Object.keys(value)
+            .toSorted()
+            .map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
+        )
+      : value;
+const sameModel = (a: ModelSelection, b: ModelSelection): boolean =>
+  JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+
+/**
+ * Whether a planned start still holds against fresh state. A card whose row
+ * changed since planning waits for the next pass, and the board's gates,
+ * the card's blockers and the pool's room are checked again. `holds` must not
+ * count this start's own reservation.
+ */
+export function confirmDispatch(
+  board: KanbanBoard,
+  planned: KanbanCard,
+  cards: ReadonlyArray<KanbanCard>,
+  pools: ReadonlyArray<KanbanPool>,
+  holds: ReadonlyMap<string, string>,
+  dispatch: Dispatch,
+): boolean {
+  if (board.archivedAt !== null || board.setup?.status === "running") return false;
+  if (board.pause && !board.pause.keep.includes(dispatch.cardId)) return false;
+  const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const card = byId.get(dispatch.cardId);
+  if (!card || JSON.stringify(card) !== JSON.stringify(planned)) return false;
+  // The plan's model came from the board as it was then. A review chain (or a step's
+  // model) changed since would send this start to a reviewer the current chain no longer
+  // names. A card already on a work thread stays on that thread's model, as when planned.
+  if (
+    (dispatch.role === "review" || card.workThreadId !== null) &&
+    !sameModel(nextModel(board, card), dispatch.model)
+  )
+    return false;
+  if (
+    dispatch.role === "work" &&
+    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+  )
+    return false;
+  const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;
+  if (
+    thread !== null &&
+    board.pause &&
+    cards.some((other) => other.activeThreadId === thread && !board.pause!.keep.includes(other.id))
+  )
+    return false;
+  const pool = pools.find((candidate) => candidate.key === dispatch.pool);
+  if (!pool || pool.slots <= 0 || poolFor(pools, dispatch.model)?.key !== pool.key) return false;
+  const holding = poolThreads(cards, holds).get(dispatch.pool) ?? new Set<string>();
+  if (dispatch.joins) {
+    if (thread === null || !holding.has(thread)) return false;
+    const carrying = cards.filter(
+      (other) => other.activeRole === "work" && other.activeThreadId === thread,
+    ).length;
+    return carrying < MAX_BATCH;
+  }
+  return pool.slots - holding.size > 0;
 }
 
 /** What a work thread brings to a claim. */
@@ -548,6 +684,8 @@ export interface ClaimContext {
   readonly slots: number;
   /** The board's pools, to find the pool each of the card's models runs on. */
   readonly pools?: ReadonlyArray<KanbanPool>;
+  /** Now: a card held for its evaluator is let go when the time to decide runs out. */
+  readonly nowMs?: number;
 }
 
 /**
@@ -571,6 +709,16 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
     return no(`card #${card.number} is flagged stalled: ${card.stalled.reason}`);
   }
   if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
+  if (kanbanWaiting(card)) {
+    return no(
+      `card #${card.number} is waiting (${card.wait?.note.trim() || card.wait?.on}): the board wakes it when that ends; clear the wait with card_wait first to take it now`,
+    );
+  }
+  if (kanbanDeciding(card, ctx.nowMs)) {
+    return no(
+      `card #${card.number} is held for its evaluator, who was told its wait ended (${card.deciding?.why}): it carries on when that evaluator's turn ends`,
+    );
+  }
   if (kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,

@@ -572,9 +572,12 @@ describe("derivePendingBackgroundWork kinds", () => {
       failedChecks: [],
       passed: false,
       passedChecks: [],
+      passedPending: [],
       remarksThrough: "2026-10-05T00:00:00.000Z",
       remarkIds: [],
       conflicting: false,
+      conflictHead: null,
+      conflictWokeFor: null,
       wakes: 0,
     };
     const link = (

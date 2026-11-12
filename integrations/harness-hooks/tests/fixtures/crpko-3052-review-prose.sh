@@ -1,0 +1,10 @@
+python3 - <<'PY'
+from pathlib import Path
+src=Path('/Volumes/ExternalSSD/board-wt/backoffice-core-487/tmp/review-487'); dest=Path('tmp/reviews/backoffice-core-487')
+for name in ['ci-run.sh','probes.txt','overflow.txt']:
+ p=src/name;(dest/name).write_bytes(p.read_bytes());p.unlink()
+src.rmdir();src.parent.rmdir()
+p=dest/'verdict.md';s=p.read_text().replace('Offbox probes completed; CI-command rerun and PostgreSQL integration pending final results.','Corrected offbox run `run-1108-132319-9b88` completed **exit 0**: `bash tmp/review-487/ci-run.sh check` (make check) **exit 0**, followed by `bash tmp/review-487/ci-run.sh test-registry-dynamodb` (make test-registry-dynamodb with PostgreSQL 16 and DynamoDB Local) **exit 0**. `test-ready`: 26022 passed, 943 skipped, 752 subtests (110.05s); `test-impl-spec`: 843 passed (4.69s). Formatting, lint, strict pyright, guard and both generated artifact checks all passed. Full log: [offbox-ci-exact.log](/Volumes/ExternalSSD/crpko-devops/tmp/reviews/backoffice-core-487/offbox-ci-exact.log).\n\n`run-1108-131109-fe96` step 1, `uv run python -c \'exec(open("tmp/review-487/probes.txt").read())\'`, **exit 0**: confirmed findings 1/2 and inherited startup note with isolated test values. `offbox ssh bx_vdwnuxdz -- <overflow.txt>` probe **exit 0**, confirmed finding 4 through 17 real control-reader queries, treasury list and risk handler. Probe sources and exact service/CI commands are retained in [probes.txt](/Volumes/ExternalSSD/crpko-devops/tmp/reviews/backoffice-core-487/probes.txt), [overflow.txt](/Volumes/ExternalSSD/crpko-devops/tmp/reviews/backoffice-core-487/overflow.txt), and [ci-run.sh](/Volumes/ExternalSSD/crpko-devops/tmp/reviews/backoffice-core-487/ci-run.sh).\n\nDedicated fourteen-file PostgreSQL integration result pending.')
+p.write_text(s)
+PY
+git -C /Volumes/ExternalSSD/board-wt/backoffice-core-487 status --short

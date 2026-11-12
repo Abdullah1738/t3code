@@ -9,10 +9,12 @@ import re
 import shlex
 import sqlite3
 import time
+import uuid
 from contextlib import closing
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
+from recall_fact_scope import TranscriptContext, normalized, durable, comparison_text, automation, owner_body, directive_body, standing_text, task_metadata
 
 
 SCHEMA = """
@@ -25,8 +27,9 @@ CREATE TABLE IF NOT EXISTS rule_sources (
   source_key TEXT PRIMARY KEY, rule_id INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
   citation TEXT NOT NULL, provenance TEXT NOT NULL, priority INTEGER NOT NULL,
   source_session TEXT NOT NULL, source_event INTEGER, source_path TEXT NOT NULL,
-  source_timestamp REAL NOT NULL
+  source_timestamp REAL NOT NULL, generation TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS rule_transcript_generations(source_path TEXT PRIMARY KEY, active_generation TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS rule_sources_rule ON rule_sources(rule_id, priority DESC);
 CREATE INDEX IF NOT EXISTS rule_sources_path ON rule_sources(source_path);
 CREATE TABLE IF NOT EXISTS rule_keys (
@@ -188,23 +191,18 @@ def _file_scope(path: Path, text: str) -> str:
 
 def _owner_text(text: str, metadata: dict) -> str:
     if (metadata.get("createdBy") in ("system", "assistant") or metadata.get("synthetic")
-            or metadata.get("is_subagent") or metadata.get("parent_id")
-            or str(metadata.get("title", "")).lower().startswith("subagent:")):
+            or task_metadata(metadata) or metadata.get('origin') in ('automation', 'watcher')):
         return ""
-    guidance_end = "[End of channel guidance. The owner's message follows.]"
-    if guidance_end in text:
-        text = text.split(guidance_end, 1)[1]
-    if text.lstrip().startswith(("You are a subagent", "[coord]", "[crw]", "[Watcher event",
-                                "# AGENTS.md instructions", "<user_instructions>")):
+    text = owner_body(text)
+    if automation(text) or text.lstrip().startswith(("# AGENTS.md instructions", "<user_instructions>")):
         return ""
-    return re.sub(r"<(system-reminder|recall|skill_content|environment_context)\b[^>]*>.*?</\1>",
-                  "", text, flags=re.S)
+    return text
 
 
 def _owner_correction(text: str) -> bool:
-    text = text.replace("’", "'")
-    text = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", text)
-    text = re.sub(r"^\s*(?:\[Abdullah\]\s*|(?:please|actually|no)[,:]?\s+)", "", text, flags=re.I)
+    text = directive_body(text)
+    if re.match(r"a revision\b[^\n]*new essay", text, re.I):
+        return True
     if not _CORRECTION.search(text):
         return False
     return bool(re.match(
@@ -521,6 +519,57 @@ def _has_explicit(path, generation):
         return bool(con.execute("SELECT 1 FROM rule_sources WHERE provenance='explicit' LIMIT 1").fetchone())
 
 
+def scoped_fact(record, text, session_id=None):
+    compared = comparison_text(record['text'], text)
+    sources = record.get('sources', [])
+    if sources and all(s['provenance'] == 'owner_correction' for s in sources) and not durable(compared):
+        sessions = set(record.get('sessions', [])) | {s['source_session'] for s in sources}
+        if not session_id or session_id not in sessions:
+            independent = comparison_text(compared, '')
+            compared = independent if independent != compared and durable(independent) else ''
+    if not compared:
+        return None
+    return {**record, 'text': compared,
+            'constraints': _constraints(compared) if compared != record['text'] else record.get('constraints', []),
+            'triggers': {**record.get('triggers', {}), 'text': compared}}
+
+
+def fact_applies(record, text, session_id=None):
+    return scoped_fact(record, text, session_id) is not None
+
+
+def filter_facts(records, text, session_id=None):
+    return [fact for record in records if (fact := scoped_fact(record, text, session_id)) is not None]
+
+
+def dedupe_facts(records):
+    def authority(r):
+        return (r.get('priority', 0), r.get('source_timestamp', 0), r.get('source_event') or -1, r['id'])
+    unique = {}
+    for record in records:
+        key = normalized(record['text'])
+        if key not in unique or authority(record) > authority(unique[key]):
+            unique[key] = record
+    return list(unique.values())
+
+
+class _RuleConnection(sqlite3.Connection):
+    has_generations = False
+
+
+def _active_source_clause(con):
+    if not con.has_generations:
+        return "1"
+    return "(s.provenance!='owner_correction' OR s.generation=COALESCE((SELECT active_generation FROM rule_transcript_generations g WHERE g.source_path=s.source_path),''))"
+
+
+def _active_generation(con, path):
+    if not con.has_generations:
+        return ''
+    row = con.execute("SELECT active_generation FROM rule_transcript_generations WHERE source_path=?", (path,)).fetchone()
+    return row[0] if row else ''
+
+
 class RuleIndex:
     def __init__(self, path):
         self.path = Path(path).expanduser().absolute()
@@ -533,12 +582,15 @@ class RuleIndex:
 
     def _connect(self, readonly: bool = False):
         if readonly:
-            con = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.05)
+            con = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.05, factory=_RuleConnection)
             con.execute("PRAGMA query_only=ON")
+            con.execute("BEGIN")
         else:
-            con = sqlite3.connect(self.path, timeout=0.1)
+            con = sqlite3.connect(self.path, timeout=0.1, factory=_RuleConnection)
             con.execute("PRAGMA foreign_keys=ON")
         con.row_factory = sqlite3.Row
+        con.has_generations = (any(r[1] == 'generation' for r in con.execute('PRAGMA table_info(rule_sources)'))
+                               and con.execute("SELECT 1 FROM sqlite_master WHERE name='rule_transcript_generations'").fetchone() is not None)
         return con
 
     def _put(self, con, text, scope, actions, recipient, source):
@@ -546,23 +598,38 @@ class RuleIndex:
         actions = sorted(set(actions if actions is not None else _actions(text, constraints)))
         scope = _path(scope) if scope.startswith(("/", "~")) else scope.lower().strip()
         recipient = recipient or _recipient(text)
-        digest = hashlib.sha256(_json([text, scope, actions, recipient.lower()]).encode()).hexdigest()
+        generation = source.get('generation', _active_generation(con, source.get('path', ''))) if source['provenance'] == 'owner_correction' else ''
+        identity = ([normalized(text), scope, source.get('session', ''), generation]
+                    if source['provenance'] == 'owner_correction' else [text, scope, actions, recipient.lower()])
+        digest = hashlib.sha256(_json(identity).encode()).hexdigest()
         now = time.time()
-        old = con.execute("SELECT id FROM rules WHERE dedup_hash=?", (digest,)).fetchone()
+        old = con.execute("SELECT * FROM rules WHERE dedup_hash=?", (digest,)).fetchone()
+        if old and source['provenance'] == 'owner_correction':
+            strongest = con.execute("SELECT source_timestamp,source_event FROM rule_sources WHERE rule_id=? "
+                                    "ORDER BY source_timestamp DESC,source_event DESC LIMIT 1", (old['id'],)).fetchone()
+            if strongest and (source.get('timestamp', now), source.get('event') or -1) < (strongest[0], strongest[1] or -1):
+                text, recipient = old['text'], old['recipient']
+                actions, constraints = json.loads(old['actions']), json.loads(old['constraints_json'])
+
         con.execute(
             "INSERT INTO rules(dedup_hash,text,scope,actions,recipient,constraints_json,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(dedup_hash) DO UPDATE SET updated_at=excluded.updated_at",
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(dedup_hash) DO UPDATE SET text=excluded.text,actions=excluded.actions,recipient=excluded.recipient,"
+            "constraints_json=excluded.constraints_json,updated_at=excluded.updated_at",
             (digest, text, scope, _json(actions), recipient, _json(constraints), now, now),
         )
         rule_id = con.execute("SELECT id FROM rules WHERE dedup_hash=?", (digest,)).fetchone()[0]
+        columns = "source_key,rule_id,citation,provenance,priority,source_session,source_event,source_path,source_timestamp"
+        values = (source['key'] + (':generation:' + generation if generation else ''), rule_id,
+                  source['citation'], source['provenance'], source['priority'], source.get('session', ''),
+                  source.get('event'), source.get('path', ''), source.get('timestamp', now))
+        if con.has_generations:
+            columns += ',generation'
+            values += (generation,)
         con.execute(
-            "INSERT INTO rule_sources VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET "
-            "rule_id=excluded.rule_id,citation=excluded.citation,provenance=excluded.provenance,"
-            "priority=excluded.priority,source_timestamp=excluded.source_timestamp",
-            (source["key"], rule_id, source["citation"], source["provenance"], source["priority"],
-             source.get("session", ""), source.get("event"), source.get("path", ""), source.get("timestamp", now)),
-        )
-        keys = [(rule_id, "scope", scope)] + [(rule_id, "action", action.lower()) for action in actions]
+            "INSERT INTO rule_sources(" + columns + ") VALUES(" + ','.join('?' for _ in values) + ") "
+            "ON CONFLICT(source_key) DO UPDATE SET rule_id=excluded.rule_id,citation=excluded.citation,"
+            "provenance=excluded.provenance,priority=excluded.priority,source_timestamp=excluded.source_timestamp", values)
+        keys = [(rule_id, "session", sid) for sid in source.get("sessions", [])] + [(rule_id, "scope", scope)] + [(rule_id, "action", action.lower()) for action in actions]
         # Recipient triggers must survive an unknown tool/action classification.
         keys.extend((rule_id, "path", value) for value in _path_triggers(text) if "file.write" in actions)
         keys.extend((rule_id, "recipient", token) for token in _tokens(recipient))
@@ -579,10 +646,12 @@ class RuleIndex:
         result["constraints"] = json.loads(result.pop("constraints_json"))
         sources = [dict(source) for source in con.execute(
             "SELECT citation,provenance,priority,source_session,source_event,source_timestamp "
-            "FROM rule_sources WHERE rule_id=? ORDER BY priority DESC,source_timestamp DESC,citation", (row["id"],)
+            "FROM rule_sources s WHERE rule_id=? AND " + _active_source_clause(con) + " ORDER BY priority DESC,source_timestamp DESC,source_event DESC,citation", (row["id"],)
         )]
         if sources:
             result.update(sources[0])
+        result["sessions"] = [r[0] for r in con.execute(
+            "SELECT value FROM rule_keys WHERE rule_id=? AND kind='session'", (row['id'],))]
         result["citations"] = [source["citation"] for source in sources]
         result["sources"] = sources
         result["triggers"] = {"actions": result["actions"], "recipient": result["recipient"], "text": result["text"]}
@@ -647,6 +716,34 @@ class RuleIndex:
             con.execute("DELETE FROM rules WHERE NOT EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=rules.id)")
         return stats
 
+    def _publish_transcript_replay(self, con, path, stats, deadline):
+        if con.execute("SELECT 1 FROM rule_transcript_replay WHERE source_path=? LIMIT 1", (path,)).fetchone():
+            return None
+        build = con.execute("SELECT payload FROM rule_transcript_staging WHERE source_path=? AND event_id=0", (path,)).fetchone()
+        if not build:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        # Pages compile into an inactive generation. Publishing only switches a
+        # pointer, so a small tick never has to repeat an unbounded rebuild.
+        con.execute("INSERT OR REPLACE INTO rule_transcript_generations VALUES(?,?)", (path, build[0]))
+        con.execute("DELETE FROM rule_transcript_staging WHERE source_path=?", (path,))
+        return True
+
+    def _cleanup_transcript_generations(self, con, path, deadline):
+        if time.monotonic() >= deadline:
+            return
+        active = _active_generation(con, path)
+        build = con.execute("SELECT payload FROM rule_transcript_staging WHERE source_path=? AND event_id=0", (path,)).fetchone()
+        rows = con.execute("SELECT source_key,rule_id FROM rule_sources WHERE provenance='owner_correction' "
+                           "AND source_path=? AND generation NOT IN (?,?) LIMIT 128",
+                           (path, active, build[0] if build else active)).fetchall()
+        con.executemany("DELETE FROM rule_sources WHERE source_key=?", [(r[0],) for r in rows])
+        if rows:
+            ids = sorted({r[1] for r in rows})
+            con.execute("DELETE FROM rules WHERE id IN (" + ','.join('?' for _ in ids) + ") "
+                        "AND NOT EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=rules.id)", ids)
+
     def import_transcripts(self, source_path, max_rows=2000, seconds=2.0) -> dict:
         """Explicit source only. Each committed page advances an ID cursor, including skipped rows."""
         import robob_readonly
@@ -664,21 +761,79 @@ class RuleIndex:
             source.row_factory = sqlite3.Row
             source.execute("PRAGMA query_only=ON")
             source.set_progress_handler(lambda: int(time.monotonic() >= end), 1000)
+            if not remaining or time.monotonic() >= end:
+                return stats
+            try:
+                context = TranscriptContext(source)
+            except sqlite3.OperationalError as exc:
+                if "interrupt" in str(exc):
+                    return stats
+                raise
+            if not any(r[1] == 'generation' for r in con.execute('PRAGMA table_info(rule_sources)')):
+                con.execute("ALTER TABLE rule_sources ADD COLUMN generation TEXT NOT NULL DEFAULT ''")
+            con.execute("CREATE TABLE IF NOT EXISTS rule_transcript_generations(source_path TEXT PRIMARY KEY, active_generation TEXT NOT NULL)")
+            con.execute("CREATE INDEX IF NOT EXISTS rule_sources_generation ON rule_sources(source_path,generation,provenance)")
+            con.execute("CREATE INDEX IF NOT EXISTS rule_sources_latest ON rule_sources(rule_id,source_timestamp DESC,source_event DESC)")
+            con.has_generations = True
+            # Re-derive previously promoted events without restarting the corpus
+            # scan. Stage bounded pages before publishing their replacement atomically.
+            con.executescript("""
+                CREATE TABLE IF NOT EXISTS rule_transcript_policy(source_path TEXT PRIMARY KEY, identity TEXT, version INTEGER);
+                CREATE TABLE IF NOT EXISTS rule_transcript_replay(source_path TEXT, event_id INTEGER,
+                    PRIMARY KEY(source_path,event_id));
+                CREATE TABLE IF NOT EXISTS rule_transcript_staging(source_path TEXT,event_id INTEGER,block_key TEXT,payload TEXT,
+                    PRIMARY KEY(source_path,event_id,block_key));
+                CREATE TABLE IF NOT EXISTS rule_session_kinds(source_path TEXT,session_id TEXT,PRIMARY KEY(source_path,session_id));
+            """)
+            with con:
+                policy = con.execute("SELECT identity,version FROM rule_transcript_policy WHERE source_path=?", (str(path),)).fetchone()
+                policy_identity = identity + "|" + context.signature
+                source_changed = policy and policy['identity'].split('|', 1)[0] != identity
+                if not policy or policy['identity'] != policy_identity or policy['version'] != 5:
+                    if not source_changed:
+                        con.execute("INSERT OR IGNORE INTO rule_transcript_replay SELECT source_path,source_event FROM rule_sources "
+                                    "WHERE provenance='owner_correction' AND source_path=? AND source_event IS NOT NULL AND generation=?", (str(path), _active_generation(con, str(path))))
+                    else:
+                        con.execute("DELETE FROM rule_transcript_replay WHERE source_path=?", (str(path),))
+                        con.execute("INSERT OR REPLACE INTO rule_transcript_generations VALUES(?,?)", (str(path), uuid.uuid4().hex))
+                        con.execute("DELETE FROM rule_session_kinds WHERE source_path=?", (str(path),))
+                    con.execute("DELETE FROM rule_transcript_staging WHERE source_path=?", (str(path),))
+                    if not source_changed and con.execute("SELECT 1 FROM rule_sources WHERE provenance='owner_correction' AND source_path=? LIMIT 1", (str(path),)).fetchone():
+                        con.execute("INSERT OR REPLACE INTO rule_transcript_staging VALUES(?,0,'@pending',?)", (str(path), uuid.uuid4().hex))
+                    con.execute("INSERT OR REPLACE INTO rule_transcript_policy VALUES(?,?,5)", (str(path), policy_identity))
+            context.rejected_sessions = {r[0] for r in con.execute("SELECT session_id FROM rule_session_kinds WHERE source_path=?", (str(path),))}
             previous = con.execute("SELECT identity,last_id FROM rule_import_progress WHERE source_path=?", (str(path),)).fetchone()
             cursor = previous["last_id"] if previous and previous["identity"] == identity else 0
+            with con:
+                if self._publish_transcript_replay(con, str(path), stats, end) is False:
+                    stats['cursor'] = cursor
+                    return stats
             while remaining and time.monotonic() < end:
                 try:
+                    replay = [r[0] for r in con.execute(
+                        "SELECT event_id FROM rule_transcript_replay WHERE source_path=? ORDER BY event_id LIMIT ?",
+                        (str(path), min(remaining, 128)))]
+                    predicate = "id IN (" + ",".join("?" for _ in replay) + ")" if replay else "id>?"
+                    params = replay if replay else [cursor]
+                    source_column = "source," if 'source' in context.columns else ""
                     rows = source.execute(
-                        "SELECT id,session_id,timestamp,speaker,content_type,metadata_json,"
+                        "SELECT " + source_column + "id,session_id,timestamp,speaker,content_type,metadata_json,"
                         "CASE WHEN speaker='user' AND content_type='text' THEN substr(content,1,65537) ELSE '' END AS content "
-                        "FROM episodic_events WHERE id>? ORDER BY id LIMIT ?", (cursor, min(remaining, 128))
+                        "FROM episodic_events WHERE " + predicate + " ORDER BY id LIMIT ?", (*params, min(remaining, 128))
                     ).fetchall()
                 except sqlite3.OperationalError as exc:
                     if "interrupt" in str(exc):
                         break
                     raise
+                if not rows and replay:
+                    with con:
+                        con.executemany("DELETE FROM rule_transcript_replay WHERE source_path=? AND event_id=?",
+                                        [(str(path), event) for event in replay])
+                        published = self._publish_transcript_replay(con, str(path), stats, end)
+                    if published is False:
+                        break
+                    continue
                 if not rows:
-                    stats["complete"] = True
                     break
                 with con:
                     for row in rows:
@@ -690,7 +845,23 @@ class RuleIndex:
                             metadata = {}
                         if not isinstance(metadata, dict):
                             metadata = {}
-                        text = _owner_text(row["content"], metadata)
+                        text = _owner_text(row['content'], metadata)
+                        opening = row['speaker'] == 'user' and (context.task_opening(row['content']) or task_metadata(metadata))
+                        candidate = opening or row['speaker'] == 'user' and any(_owner_correction(block) for _, _, block in _blocks(text))
+                        try:
+                            sessions, rejected = context.get(row) if candidate else ({row['session_id']}, False)
+                        except sqlite3.OperationalError as exc:
+                            if "interrupt" in str(exc):
+                                break
+                            raise
+                        if (opening or rejected) and not sessions.issubset(context.rejected_sessions):
+                            context.rejected_sessions.update(sessions)
+                            context.cache.clear()
+                            con.executemany("INSERT OR IGNORE INTO rule_session_kinds VALUES(?,?)", [(str(path), sid) for sid in sessions])
+                            con.execute("DELETE FROM rule_sources WHERE provenance='owner_correction' AND source_path=? AND source_session IN (" + ','.join('?' for _ in sessions) + ")", (str(path), *sorted(sessions)))
+                            con.execute("DELETE FROM rules WHERE NOT EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=rules.id)")
+                        if rejected or opening:
+                            text = ""
                         cwd = metadata.get("cwd", metadata.get("dir", metadata.get("directory", "")))
                         cwd = cwd if isinstance(cwd, str) else ""
                         citation = f"{row['session_id']}#e{row['id']}"
@@ -702,33 +873,47 @@ class RuleIndex:
                         # A capped last paragraph may be incomplete; don't promote its fragment.
                         if len(text) > 65536:
                             text = text[:text.rfind("\n\n", 0, 65536)] if "\n\n" in text[:65536] else ""
-                        for _, _, block in _blocks(text):
+                        for first, _, block in _blocks(text):
                             if not _owner_correction(block):
                                 continue
                             scope = _scope_hint(block, _path(cwd))
-                            _, added = self._put(con, block, scope, None, "", {
+                            source_record = {
                                 "key": f"transcript:{path}:{row['id']}:" + hashlib.sha256(block.encode()).hexdigest(),
                                 "citation": citation, "provenance": "owner_correction", "priority": 95,
-                                "session": row["session_id"], "event": row["id"], "path": str(path),
+                                "session": row["session_id"], "sessions": sorted(sessions), "event": row["id"], "path": str(path),
                                 "timestamp": row["timestamp"],
-                            })
+                            }
+                            build = con.execute("SELECT payload FROM rule_transcript_staging WHERE source_path=? AND event_id=0", (str(path),)).fetchone() if replay else None
+                            source_record['generation'] = build[0] if build else _active_generation(con, str(path))
+                            _, added = self._put(con, block, scope, None, "", source_record)
                             stats["imported" if added else "deduplicated"] += 1
-                        cursor = row["id"]
+                        if replay:
+                            con.execute("DELETE FROM rule_transcript_replay WHERE source_path=? AND event_id=?", (str(path), row['id']))
+                        else:
+                            cursor = row["id"]
                         stats["rows"] += 1
                         remaining -= 1
                     con.execute("INSERT OR REPLACE INTO rule_import_progress VALUES(?,?,?,?)",
                                 (str(path), identity, cursor, time.time()))
+                    published = self._publish_transcript_replay(con, str(path), stats, end) if replay else None
+                if published is False:
+                    break
+            with con:
+                self._cleanup_transcript_generations(con, str(path), end)
             stats["cursor"] = cursor
             # This is an indexed existence probe, not a corpus count or scan.
             if time.monotonic() < end:
                 try:
-                    stats["complete"] = source.execute("SELECT 1 FROM episodic_events WHERE id>? LIMIT 1", (cursor,)).fetchone() is None
+                    stats["complete"] = (source.execute("SELECT 1 FROM episodic_events WHERE id>? LIMIT 1", (cursor,)).fetchone() is None
+                                         and con.execute("SELECT 1 FROM rule_transcript_replay WHERE source_path=? LIMIT 1", (str(path),)).fetchone() is None
+                                         and con.execute("SELECT 1 FROM rule_transcript_staging WHERE source_path=? LIMIT 1", (str(path),)).fetchone() is None
+                                         and con.execute("SELECT 1 FROM rule_sources WHERE provenance='owner_correction' AND source_path=? AND generation<>? LIMIT 1", (str(path), _active_generation(con, str(path)))).fetchone() is None)
                 except sqlite3.OperationalError as exc:
                     if "interrupt" not in str(exc):
                         raise
         return stats
 
-    def search_facts(self, messages, cwd, limit=8):
+    def search_facts(self, messages, cwd, limit=8, session_id=None):
         """Bounded search of saved facts, independent of their action labels.
 
         The derived index is small. Search text as well as token keys because
@@ -743,18 +928,35 @@ class RuleIndex:
         with closing(self._connect(readonly=True)) as con:
             deadline = time.monotonic()+.08
             con.set_progress_handler(lambda: int(time.monotonic()>deadline), 1000)
-            rows = con.execute("SELECT * FROM rules WHERE scope IN ("+",".join("?" for _ in scopes)+") LIMIT 4000", sorted(scopes)).fetchall()
+            ancestors = sorted(scopes - {""})
+            aliases = con.execute("SELECT scope FROM rule_aliases WHERE repo=? OR path IN (" +
+                                  ",".join("?" for _ in ancestors) + ")",
+                                  (Path(_path(cwd)).name.lower(), *ancestors)).fetchall()
+            scopes.update(r[0] for r in aliases)
+            if any(part.lower().startswith('crpko') for part in Path(_path(cwd)).parts):
+                scopes.add('crpko')
+            rows = con.execute("SELECT r.* FROM rules r WHERE scope IN ("+",".join("?" for _ in scopes)+") "
+                               "AND EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=r.id AND " + _active_source_clause(con) + ") LIMIT 4000", sorted(scopes)).fetchall()
             tokens = [(_tokens(r['text']) - _STOP - generic) for r in rows]
-            frequency = {t: sum(t in ts for ts in tokens) for t in terms}
+            token_groups = {}
+            for row, ts in zip(rows, tokens):
+                token_groups.setdefault(normalized(row['text']), set()).update(ts)
+            frequency = {t: sum(t in ts for ts in token_groups.values()) for t in terms}
             matches = []
             for row, ts in zip(rows, tokens):
                 overlap = terms & ts
-                distinctive = {t for t in overlap if frequency[t] <= max(3, len(rows)*.025)}
+                distinctive = {t for t in overlap if frequency[t] <= max(3, len(token_groups)*.025)}
                 if not distinctive or row['text'].lstrip().startswith('---'): continue
                 record = self._record(con, row)
+                record = scoped_fact(record, text, session_id)
+                if record is None:
+                    continue
                 if record.get('citation'):
                     matches.append((len(distinctive), len(overlap), record))
-            return [r for _, _, r in sorted(matches, key=lambda x:(-x[0],-x[1],-x[2].get('priority',0),x[2]['id']))[:limit]]
+            representatives = {r['id'] for r in dedupe_facts([match[2] for match in matches])}
+            ranked = sorted((m for m in matches if m[2]['id'] in representatives),
+                            key=lambda x:(-x[0],-x[1],-x[2].get('priority',0),x[2]['id']))
+            return [r for _, _, r in ranked[:limit]]
 
     def applicable(self, cwd, tool, arguments, *, explicit_only=False, candidates_only=False) -> list[dict]:
         arguments = _arguments(arguments)
@@ -789,6 +991,7 @@ class RuleIndex:
                 scopes.update(local_scopes)
             params = list(sorted(scopes))
             sql = "SELECT r.* FROM rules r WHERE r.id IN (SELECT rule_id FROM rule_keys WHERE kind='scope' AND value IN (" + ",".join("?" for _ in params) + "))"
+            sql += " AND EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=r.id AND " + _active_source_clause(con) + ")"
             if candidates_only:
                 sql += " AND (r.id IN (SELECT rule_id FROM rule_keys WHERE kind='path') OR (r.actions LIKE '%file.write%' AND r.text LIKE '%harness-config-parity%') OR r.constraints_json != '[]' OR r.id IN (SELECT rule_id FROM rule_sources WHERE provenance='explicit') OR (r.recipient != '' AND r.id IN (SELECT rule_id FROM rule_sources WHERE provenance='owner_correction')))"
             if explicit_only and not write_paths:

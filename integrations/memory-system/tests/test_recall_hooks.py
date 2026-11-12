@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -98,12 +99,17 @@ class NativeAdapterTests(unittest.TestCase):
         index = RulesFixture(self.root).index()
         index.remember('Keep PR comments brief.', actions=['comment'], source_session='owner')
         self.env['RECALL_RULES_DB'] = str(index.path)
+        # Adapter tests below exercise the dormant rule path; the default is off.
+        self.env['RECALL_RULE_PREFLIGHT'] = '1'
+        self.flag = patch.dict(os.environ, RECALL_RULE_PREFLIGHT='1')  # in-process fixture engine
+        self.flag.start()
         self.env.pop("CODEX_THREAD_ID", None)
         self.server.requests, self.server.identity_calls, self.server.recall_runs = [], [], []
         self.server.real_engine, self.server.engine_results = False, []
         self.server.delay, self.server.notes, self.server.cited = 0, False, True
 
     def tearDown(self):
+        self.flag.stop()
         self.tmp.cleanup()
 
     def event(self, kind="UserPromptSubmit", **values):
@@ -117,6 +123,24 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         return json.loads(result.stdout)["hookSpecificOutput"] if result.stdout.strip() else None
+
+    def test_default_hooks_never_deny_or_note_from_the_rule_index(self):
+        from test_recall_project import Layouts
+        repos = Layouts(self.root / "layouts")
+        self.env.pop('RECALL_RULE_PREFLIGHT')
+        os.environ.pop('RECALL_RULE_PREFLIGHT')
+        self.server.real_engine = True
+        cases = [(str(repos.fork), "git push origin HEAD:main"),
+                 (str(repos.checkout), "git push origin HEAD:refs/heads/main"),
+                 (str(self.root), f"cd {repos.checkout} && git push --dry-run origin HEAD:main"),
+                 # Denied by the fixture corpus when the flag is on.
+                 ("/Users/test/trading-core", "git push origin HEAD:main")]
+        for harness in ("claude", "codex"):
+            for cwd, command in cases:
+                with self.subTest(harness=harness, command=command):
+                    self.assertIsNone(self.call(harness, kind="PreToolUse", cwd=cwd, tool_input={"command": command}))
+                    self.assertIsNone(self.call(harness, kind="PostToolUse", cwd=cwd, tool_input={"command": command}))
+        self.assertEqual([], self.server.requests)
 
     def test_acceptance_real_native_adapters(self):
         for harness in ("claude", "codex"):
@@ -282,10 +306,10 @@ class RecallManifestTests(unittest.TestCase):
         claude = generator.claude_hooks(generator.hooks_for_harness(recall, "claude"))
         codex = generator.codex_hooks_json(generator.hooks_for_harness(recall, "codex"))["hooks"]
         self.assertEqual(codex, generator.codex_hooks_json(generator.hooks_for_harness(recall, "codex-cu"))["hooks"])
-        self.assertEqual(set(claude), {"UserPromptSubmit", "PreToolUse", "PreCompact", "SessionStart", "PostToolUse", "PostToolUseFailure"})
-        self.assertEqual(set(codex), {"UserPromptSubmit", "PreToolUse", "PreCompact", "PostCompact", "SessionStart", "PostToolUse"})
+        self.assertEqual(set(claude), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
+        self.assertEqual(set(codex), {"UserPromptSubmit", "PostToolUse", "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
         for hook in recall:
-            self.assertEqual(hook["timeoutSec"], 4 if hook["event"] == "PreToolUse" else 2)
+            self.assertEqual(hook["timeoutSec"], 15)
 
 
 class InstallerTests(unittest.TestCase):

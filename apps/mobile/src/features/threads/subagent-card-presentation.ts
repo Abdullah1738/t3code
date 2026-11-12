@@ -3,7 +3,9 @@ import type { OrchestrationV2Subagent } from "@t3tools/contracts";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import * as DateTime from "effect/DateTime";
 
-export function subagentCardDetail(detail: string | null): string | null {
+export function subagentCardDetail(detail: string | null, providerManaged = false): string | null {
+  // There is no child conversation to open, so this row is the result surface.
+  if (providerManaged) return detail?.trim() || null;
   if (!detail || /^Child task ended with status\b/i.test(detail)) return null;
   return (
     detail
