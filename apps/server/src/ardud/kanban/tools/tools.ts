@@ -877,6 +877,25 @@ const BoardOpen = tool(
   { readonly: false },
 );
 
+const ReportBug = tool(
+  "report_bug",
+  "Report a bug",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its open card. A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  {
+    boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
+    title: describe(TrimmedNonEmptyString, "Short bug title to search for."),
+    evidence: describe(TrimmedNonEmptyString, "What broke, with errors, run ids or log paths."),
+    cardHint: Schema.optional(describe(TrimmedNonEmptyString, "Known card number, e.g. #722.")),
+  },
+  {
+    appendedTo: Schema.optional(TrimmedNonEmptyString),
+    deduped: Schema.optional(Schema.Boolean),
+    candidates: Schema.optional(Records),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+  },
+  { readonly: false },
+);
+
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
@@ -946,4 +965,5 @@ export const KanbanToolkit = Toolkit.make(
   WikiWrite,
   BoardOpen,
   EvaluatorStart,
+  ReportBug,
 );

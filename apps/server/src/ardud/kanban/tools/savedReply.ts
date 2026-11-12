@@ -12,6 +12,7 @@ export const TOOLS = new Set([
   "card_edit",
   "card_ask_change",
   "evaluator_start",
+  "report_bug",
   "discussion_post",
 ]);
 
@@ -25,20 +26,29 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const fallback = (timedOut = false) => {
     const details =
       receipt?.kind === "card"
-        ? { card: { id: receipt.card.id, number: receipt.card.number, stage: receipt.card.stage } }
+        ? {
+            card: { id: receipt.card.id, number: receipt.card.number, stage: receipt.card.stage },
+            ...(tool === "report_bug" ? { appendedTo: `#${receipt.card.number}` } : {}),
+          }
         : receipt?.kind === "evaluator"
           ? { threadId: receipt.threadId }
           : receipt?.kind === "message"
             ? { message: { discussionId: receipt.message.discussionId, seq: receipt.message.seq } }
             : {};
     const message =
-      tool === "discussion_post"
+      tool === "report_bug"
         ? receipt === undefined
-          ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
-          : "Saved; discussion_read for details."
-        : receipt === undefined
-          ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
-          : "Saved; card_get for details.";
+          ? "Bug report reply timed out; a sighting or evaluator may have been saved. Check card_get and board threads before retrying."
+          : receipt.kind === "evaluator"
+            ? "Saved; the returned threadId identifies the request evaluator. Do not submit another report."
+            : "Saved; the sighting is on appendedTo. Read it with card_get."
+        : tool === "discussion_post"
+          ? receipt === undefined
+            ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
+            : "Saved; discussion_read for details."
+          : receipt === undefined
+            ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
+            : "Saved; card_get for details.";
     return Effect.logWarning("kanban saved write reply unavailable", {
       timedOut,
       saved: receipt !== undefined,
@@ -62,7 +72,15 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   return yield* effect.pipe(
     Effect.provideService(SavedWrite.observer, (saved) => {
       parent(saved);
-      if (tool === "evaluator_start") {
+      if (tool === "report_bug") {
+        if (
+          saved.kind === "evaluator" ||
+          (saved.kind === "card" &&
+            (receipt === undefined ||
+              (receipt.kind === "card" && saved.card.id === receipt.card.id)))
+        )
+          receipt = saved;
+      } else if (tool === "evaluator_start") {
         if (saved.kind === "evaluator") receipt = saved;
       } else if (tool === "discussion_post") {
         if (
