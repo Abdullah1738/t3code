@@ -32,7 +32,7 @@ setup() { # fake-or-real sqlite3_rsync
   echo x > "$T/repo/live/config"
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
   # the live install ships src/ (incl. the transcript manifest tool) next to the script
-  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$HERE/src/robob_readonly.py" "$R/src/"
+  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$HERE/src/robob_readonly.py" "$HERE/src/backup_control.py" "$HERE/src/backup_replica.py" "$HERE/src/redact_lock.py" "$R/src/"
   # Never invoke the Dropbox API in this test, even when restic succeeds.
   printf 'print("{\\"test\\": true}")\n' > "$R/src/dropbox_mirror.py"
   old=$(( $(date +%s) - 3 * 86400 ))
@@ -58,7 +58,7 @@ run() {
     MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
     MEMORY_BACKUP_REPLICA_TIMEOUT_S="${MEMORY_BACKUP_REPLICA_TIMEOUT_S:-5400}" \
     MEMORY_BACKUP_PASSWORD_COMMAND='printf fixture-password' MEMORY_BACKUP_CACHE_DIR="$T/cache" \
-    MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
+    MEMORY_BACKUP_LOAD_OVERRIDE=0.1 MEMORY_BACKUP_UPTIME_OVERRIDE=86400 MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
 }
 st() { /opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["stage"], d["ok"])' "$R/logs/backup_last.json"; }
 
@@ -96,10 +96,13 @@ rm -rf "$T"
 
 # A failed kill must be distinguishable from an ordinary timeout, and cannot retry.
 setup fake
+cp "$R/src/run_limited.py" "$R/src/fixture_run_limited.py"
 cat > "$R/src/run_limited.py" <<'PYCODE'
+from fixture_run_limited import *
 import sys
-print("run_limited: survivors after SIGKILL: 999999 fixture", file=sys.stderr)
-raise SystemExit(125)
+if __name__ == '__main__':
+    print("run_limited: survivors after SIGKILL: 999999 fixture", file=sys.stderr)
+    raise SystemExit(125)
 PYCODE
 run
 [ "$(st)" = "replica False" ] && grep -q 'replica memory.db: child survived kill:.*survivors after SIGKILL' "$R/logs/backup_last.json" \
