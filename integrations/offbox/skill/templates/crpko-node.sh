@@ -22,6 +22,12 @@ sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq r
   sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync >/dev/null
 sudo apt-get clean
 
+sudo tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null <<'EOF'
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=1024
+EOF
+sudo sysctl --system >/dev/null
+
 # Warm the npm cache with the heavy, shared parts of the Expo/RN/Jest toolchain (versions float; cache still helps).
 mkdir -p /tmp/warm && cd /tmp/warm
 npm init -y >/dev/null

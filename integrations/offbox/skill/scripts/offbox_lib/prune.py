@@ -79,7 +79,12 @@ def script(dirs: list[str], run_id: str) -> str:
              'mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0',
              f't="$HOME/.offbox/trash/{run_id}"', 'mkdir -p "$t" || exit 0',
              # Probe classes: 0 moved, 5 settled (absent or not a real dir), 4 busy, anything else left.
-             'one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; mv "$1" "$2"; exit $? ) & p=$!; '
+             'one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; '
+             # Reserve a second for mv: a watchman timeout must not consume the remaining probe budget.
+             f'w=$(({BUDGET_S}-SECONDS-1)); [ "$w" -le 5 ] || w=5; [ "$w" -gt 0 ] || w=0.1; '
+             'if command -v watchman >/dev/null 2>&1; then '
+             'timeout --foreground -s KILL "$w" watchman watch-del "$1" >/dev/null 2>&1 || true; fi; '
+             'mv "$1" "$2"; exit $? ) & p=$!; '
              # kill -0 on the negative pgid checks every member of the group, not only the leader.
              f'while kill -0 -- -"$p" 2>/dev/null; do '
              f'if [ "$SECONDS" -ge {BUDGET_S} ]; then kill -KILL -- -"$p" 2>/dev/null; k=0; '

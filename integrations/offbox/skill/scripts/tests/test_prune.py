@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import api, cli, common, prune, runs  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
+from test_watch_repair import TIMEOUT  # noqa: E402
 
 
 def add_run(con, box, remote_dir, ago_s, status="done", n=[0]):
@@ -163,6 +164,79 @@ class ScriptTests(NoNetwork):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)  # the stalled child was killed and reaped before the script returned
             self.addCleanup(_kill_group_quietly, pid)
+
+
+class WatchPruneTests(NoNetwork):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.bins = self.home / 'bin'
+        self.bins.mkdir()
+        self.tool('timeout', TIMEOUT)
+        self.stack.enter_context(patch.object(prune, 'BACKGROUND', 'true'))
+
+    def tool(self, name, body):
+        path = self.bins / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+    def execute(self, dirs, prefix=''):
+        return subprocess.run(['/bin/bash', '-c', prefix + prune.script(dirs, 'watch-prune')],
+                              env={'HOME': str(self.home), 'PATH': f'{self.bins}:/usr/bin:/bin'},
+                              capture_output=True, text=True, timeout=15)
+
+    def test_watch_del_precedes_each_move_and_skips_non_dirs(self):
+        dirs = ['w/a-aaaaaa', "w/it's-bbbbbb"]
+        for d in dirs:
+            (self.home / d).mkdir(parents=True)
+        (self.home / 'w/link-cccccc').symlink_to(self.home / dirs[0])
+        self.tool('watchman', '''#!/bin/bash
+[ "$1" = watch-del ] && [ -d "$2" ] || exit 2
+echo "watch $2" >> "$HOME/order"
+exit 1
+''')
+        self.tool('mv', '''#!/bin/bash
+echo "move $1" >> "$HOME/order"
+exec /bin/mv "$@"
+''')
+        result = self.execute(dirs + ['w/link-cccccc', 'w/absent-dddddd'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'order').read_text().splitlines(),
+                         [entry for d in dirs for entry in (f'watch {self.home / d}', f'move {self.home / d}')])
+        self.assertEqual(result.stdout.splitlines(), [f'pruned {d}' for d in dirs] +
+                         ['skip w/link-cccccc', 'skip w/absent-dddddd', 'done watch-prune'])
+
+    def test_hanging_watchman_leaves_move_and_done_marker_successful(self):
+        for initial_seconds in (0, 5, 7):
+            with self.subTest(initial_seconds=initial_seconds):
+                d = f'w/hang{initial_seconds}-aaaaaa'
+                (self.home / d).mkdir(parents=True)
+                self.tool('watchman', '''#!/bin/bash
+echo $$ > "$HOME/watch.pid"
+trap '' TERM
+exec /bin/sleep 30
+''')
+                started = time.monotonic()
+                result = self.execute([d], prefix=f'SECONDS={initial_seconds}\n')
+                elapsed = time.monotonic() - started
+                self.assertEqual((result.returncode, result.stdout.splitlines()),
+                                 (0, [f'pruned {d}', 'done watch-prune']), result.stderr)
+                self.assertEqual((self.home / '.offbox/done/watch-prune').read_text(), 'ok\n')
+                self.assertFalse((self.home / d).exists())
+                self.assertLess(elapsed, 6, 'watch cleanup may wait at most five seconds')
+                pid = int((self.home / 'watch.pid').read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_exhausted_budget_does_not_start_watchman(self):
+        (self.home / 'w/a-aaaaaa').mkdir(parents=True)
+        self.tool('watchman', '#!/bin/bash\necho unexpected > "$HOME/watch-called"\n')
+        result = self.execute(['w/a-aaaaaa'], prefix=f'SECONDS={prune.BUDGET_S}\n')
+        self.assertEqual(result.stdout.splitlines(), ['left w/a-aaaaaa', 'done watch-prune'])
+        self.assertFalse((self.home / 'watch-called').exists())
+        self.assertTrue((self.home / 'w/a-aaaaaa').is_dir())
 
 
 def _kill_group_quietly(pid: int) -> None:
