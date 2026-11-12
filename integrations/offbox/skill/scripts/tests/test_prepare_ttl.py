@@ -24,6 +24,7 @@ class PrepareTtlTests(Isolated):
         stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: boat called')))
         self.get = stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
         self.threads = {}
+        self.real_ensure_ttl = lease.ensure_ttl
         self.ttl = stack.enter_context(patch.object(lease, 'ensure_ttl', side_effect=self.refresh))
         stack.enter_context(patch.object(runs, 'TTL_REFRESH_S', self.interval))
         stack.enter_context(patch.object(runs, 'TTL_RETRY_S', self.interval))
@@ -222,3 +223,84 @@ class PrepareTtlTests(Isolated):
     def test_boat_state_helper_is_standalone(self):
         self.assertEqual(runs._boat_state('bxA'), 'running')
         self.get.assert_called_once_with('bxA')
+
+    def delayed_refresh_handoff(self, phase, fail_prepare=False):
+        entered, release, joining, exited = (threading.Event() for _ in range(4))
+        keepers, assignments, errors = [], [], []
+        prepare_error = OffboxError('prepare failed', code=90)
+        handoff_ttl = 1200 if fail_prepare else runs.BG_TTL_S
+        real_join = threading.Thread.join
+
+        def delayed_request():
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('test did not release the delayed API request')
+            if phase.endswith('_error'):
+                raise OffboxError('delayed boat error')
+
+        def get(box):
+            keepers.append(threading.current_thread())
+            if phase.startswith('get'):
+                delayed_request()
+            # Snapshot predates the handoff, so it cannot protect the longer background TTL.
+            return {'state': 'running'}
+
+        def set_ttl(box, ttl):
+            if threading.current_thread() in keepers and phase.startswith('patch'):
+                delayed_request()
+            assignments.append(ttl)
+            return {}
+
+        def observe_join(thread, timeout=None):
+            if thread in keepers:
+                joining.set()
+            return real_join(thread, timeout)
+
+        def prepare_then_handoff():
+            try:
+                try:
+                    with runs._keep_ttl('bxA'):
+                        if not entered.wait(2):
+                            raise AssertionError('keeper never reached the API')
+                        if fail_prepare:
+                            raise prepare_error
+                except OffboxError as error:
+                    if error is not prepare_error:
+                        raise
+                exited.set()
+                api.set_ttl('bxA', handoff_ttl)
+            except BaseException as error:
+                errors.append(error)
+
+        self.get.side_effect = get
+        self.ttl.side_effect = self.real_ensure_ttl
+        with patch.object(api, 'set_ttl', side_effect=set_ttl), \
+                patch.object(runs, '_KEEPER_JOIN_S', 0), \
+                patch.object(threading.Thread, 'join', observe_join):
+            owner = threading.Thread(target=prepare_then_handoff)
+            owner.start()
+            try:
+                self.assertTrue(joining.wait(2), 'preparation never began keeper cleanup')
+                # Hold the API beyond the old join bound: no next owner may set a TTL yet.
+                escaped = exited.wait(0.05)
+            finally:
+                release.set()
+                owner.join(2)
+                for keeper in keepers:
+                    keeper.join(2)
+            self.assertFalse(owner.is_alive())
+            self.assertTrue(all(not keeper.is_alive() for keeper in keepers))
+            self.assertEqual(errors, [])
+            self.assertFalse(escaped, f'preparation exited during its TTL refresh: {assignments}')
+            expected = [handoff_ttl] if phase.endswith('_error') else [runs.RUN_TTL_S, handoff_ttl]
+            self.assertEqual(assignments, expected)
+
+    def test_delayed_refresh_cannot_overwrite_background_ttl(self):
+        for phase in ('get', 'patch', 'get_error', 'patch_error'):
+            with self.subTest(phase=phase):
+                self.delayed_refresh_handoff(phase)
+
+    def test_failed_prepare_drains_delayed_refresh_before_idle_ttl(self):
+        for phase in ('get', 'patch', 'get_error', 'patch_error'):
+            with self.subTest(phase=phase):
+                self.delayed_refresh_handoff(phase, fail_prepare=True)

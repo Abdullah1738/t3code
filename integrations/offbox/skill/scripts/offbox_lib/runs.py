@@ -1335,7 +1335,8 @@ def _keep_ttl(box_id: str):
         yield
     finally:
         stop_evt.set()
-        keeper.join(_KEEPER_JOIN_S)
+        # GET/PATCH retries can outlive the follower's join bound. Drain them before handing off the TTL.
+        keeper.join()
 
 
 def _echo(stream, b: bytes) -> bool:
