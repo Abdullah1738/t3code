@@ -249,6 +249,7 @@ table inet offbox {
     iifname "incusbr0" udp dport { 53, 67 } accept
     iifname "incusbr0" tcp dport 53 accept
     iifname "incusbr0" icmp type echo-request accept
+    iifname "incusbr0" tcp dport 12380 accept comment "box web traffic redirected to the exit proxy (home/exit-proxy.sh)"
     iifname "incusbr0" drop
     udp dport 41641 accept
     tcp dport 22 accept

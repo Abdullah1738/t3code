@@ -27,6 +27,7 @@ manual menu entries exist. See "With the KVM" below.
 | `read-stick-log.zsh` | Mac: summary of what a re-plugged stick recorded |
 | `acceptance.sh` | Day-one checks on the real hardware for everything a VM cannot prove |
 | `mullvad.sh` | Mullvad VPN for the host and every box, with the tailnet and LAN kept outside it ("VPN (Mullvad)" below) |
+| `exit-proxy.sh` | Residential exit for the names that refuse VPN addresses ("Residential exit" below) |
 | `static-check.sh` | Verification layer A: shellcheck, YAML, cloud-init schema, the ISO's own subiquity + curtin validators, unit tests |
 | `FAILURE-MODES.md` | Verification layer B: every failure, how it shows up headless, what happens by itself, what to do |
 | `vmtest/` | Verification layer C: end-to-end tests in a VM shaped like the box (`vmtest/README.md`) |
@@ -118,6 +119,27 @@ Owner, 12 Nov 2026: Mullvad on the box, permanently on. `mullvad.sh` (copied to 
 - Some Mullvad exit addresses are refused by Google's download server (Go, Android SDK): a timer runs
   `offbox-mullvad exit-check` every 10 minutes and takes another relay when that happens.
 - Check: `offbox-mullvad check` (also part of `acceptance.sh`). Failures: FAILURE-MODES 3.29-3.35.
+
+## Residential exit
+
+Owner, 13 Nov 2026: "buy a residential proxy and use that as the exit". `exit-proxy.sh` (on the server:
+`/usr/local/sbin/offbox-exit-proxy`) sends box connections to the names in `/etc/offbox/exit-proxy-domains`
+through one static residential address; everything else still leaves through Mullvad.
+
+- Why only a list: the address is "unlimited" under a fair-use policy, and the server pulls far more than any
+  such policy allows (22 GB in 87 minutes on 13 Nov). The list starts with `dl.google.com` and `go.dev`.
+  Add a name only when a site refuses the VPN address, then `offbox-exit-proxy reload`.
+- The address: IPRoyal "ISP Dedicated", 1 address, premium ("zero fraud score"), ordered for Germany, registered
+  to a UK residential provider (Glide). $5.40 per 30 days, renews by itself on the Marriott card. Account
+  me@abdullah.fund (Google sign-in), order 88357237. Credentials: Mac Keychain `offbox-exit-proxy`/`iproyal`
+  (`host:httpport:user:password`; SOCKS5 is port 12324) and `/etc/offbox/exit-proxy.env` on the server.
+- It is reached through the Mullvad tunnel, so the home line never talks to the proxy directly.
+- sing-box on the host reads the server name of each box connection to ports 80/443 and picks the exit.
+  The redirect exists only while sing-box runs. Proxy down: its names go back through Mullvad by themselves.
+- The host itself (apt, image builds, GitHub) does not use it.
+- Set up or rebuild: `scp exit-proxy.sh root@<server>:/root/ && ssh root@<server> 'bash /root/exit-proxy.sh install'`,
+  then the `offbox-exit-proxy set` line in FAILURE-MODES 3.37.
+- Check: `offbox-exit-proxy check` (also part of `acceptance.sh`). Failures: FAILURE-MODES 3.37-3.38.
 
 ## With the KVM
 

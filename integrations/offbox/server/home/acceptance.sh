@@ -230,6 +230,12 @@ if command -v mullvad >/dev/null 2>&1; then
 else
   info "vpn: none on this host (home/mullvad.sh installs Mullvad)"
 fi
+# Residential exit for the names that refuse VPN addresses (home/exit-proxy.sh).
+if [ -x /usr/local/sbin/offbox-exit-proxy ]; then
+  while IFS= read -r line; do
+    case $line in PASS*) pass "${line#PASS }" ;; FAIL*) fail "${line#FAIL }" ;; *) echo "$line" ;; esac
+  done < <(/usr/local/sbin/offbox-exit-proxy check || true)
+fi
 
 # ---------------------------------------------------------------- never-stays-off settings on the real hardware
 wd=$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null)

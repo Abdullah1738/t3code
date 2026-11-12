@@ -257,6 +257,11 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   not reachable from a box. A tunnel that stays down for 2 minutes makes the server report itself not ok, and
   runs go to Boat like in any other outage; a run caught in that gap fails on its downloads, run it again
   (server side: `server/home/README.md`, "VPN (Mullvad)").
+- A few sites refuse VPN addresses outright. Box connections to the names on the server's list (now
+  `dl.google.com` and `go.dev`: Go toolchains, Android SDK) leave through one residential address instead. If
+  another site refuses a home box (403/404/captcha there, fine from the Mac), don't work around it: report the
+  host name so it can go on the list (`server/home/README.md`, "Residential exit"). The list stays short
+  because that address has a traffic limit.
 - At home every owner has their own token and it only sees that owner's boxes, saved states and templates. Plain
   `offbox` (reap, pools, `release`, `ssh`, `ports`, `logs`, `wait`, `kill`) only acts on our own. A box or run id
   of a person's box is refused with exit 2 ("belongs to moni ..."), nothing changed: go through `offbox-person`.

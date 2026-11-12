@@ -26,7 +26,9 @@
 #    starts no box after a reboot.
 #  - box DNS to any outside resolver is redirected to the host's (Mullvad refuses DNS to anything but its own).
 #  - exit-check: dl.google.com answers 404 for Go toolchain and Android SDK downloads from some Mullvad exit
-#    addresses (5 of 14 Frankfurt relays on 12 Nov; it varies per connection, not per provider).
+#    addresses (5 of 14 Frankfurt relays on 12 Nov; it varies per connection, not per provider). Since 13 Nov
+#    boxes reach those names through a residential address (home/exit-proxy.sh); exit-check is the fallback
+#    while that proxy is down.
 set -euo pipefail
 
 VERSION=${MULLVAD_VERSION:-2026.5}
@@ -217,6 +219,9 @@ probe_exit() { curl -4 -sL --max-time 15 -r 0-99 -o /dev/null -w '%{http_code}' 
 cmd_exit_check() {
   local try code st
   [ -e "$ENABLED" ] || return 0
+  # With the residential exit up (home/exit-proxy.sh), boxes reach Google through it; this relay's standing
+  # with Google no longer matters and a relay change would only drop connections.
+  if systemctl is-active -q offbox-exit-proxy.service 2>/dev/null && [ ! -e /run/offbox-exit-proxy.bypass ]; then return 0; fi
   for try in 1 2 3 4 5 6 7 8; do
     st=$(mullvad status 2>/dev/null || true)
     [[ $st == Connected* ]] || return 0
@@ -291,7 +296,12 @@ cmd_check() {
   j=$(curl -4 -s --max-time 15 https://am.i.mullvad.net/json || true)
   echo "$j" | grep -q '"mullvad_exit_ip":true' && ok "host leaves through Mullvad ($(echo "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p'))" || no "host does not leave through Mullvad"
   j=$(probe_exit)
-  case $j in 200 | 206) ok "exit address accepted by dl.google.com (Go and Android SDK downloads)" ;; *) no "dl.google.com answers ${j:-nothing} from this exit address: box Go/Android setup fails until 'offbox-mullvad exit-check' finds another relay" ;; esac
+  case $j in
+    200 | 206) ok "exit address accepted by dl.google.com (Go and Android SDK downloads)" ;;
+    *) if systemctl is-active -q offbox-exit-proxy.service 2>/dev/null && [ ! -e /run/offbox-exit-proxy.bypass ]; then
+         echo "INFO vpn: dl.google.com answers ${j:-nothing} from this relay; boxes use the residential exit for it"
+       else no "dl.google.com answers ${j:-nothing} from this exit address: box Go/Android setup fails until 'offbox-mullvad exit-check' finds another relay"; fi ;;
+  esac
   box=$(incus list -f csv -c n,s 2>/dev/null | awk -F, '$2=="RUNNING"{print $1; exit}')
   if [ -n "$box" ]; then
     j=$(incus exec "$box" -- curl -4 -s --max-time 15 https://am.i.mullvad.net/json 2>/dev/null || true)
