@@ -22,6 +22,14 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("accepts finite idle timeout overrides independently of the wait budget", () => {
+    for (const idleTimeoutMs of [0, 1, 60_000, 120_000, 8_000_000]) {
+      expect(
+        decodeDelegateTaskInput({ task: "Review", idleTimeoutMs, timeoutMs: 10 }).idleTimeoutMs,
+      ).toBe(idleTimeoutMs);
+    }
+    expect(() => decodeDelegateTaskInput({ task: "Review", idleTimeoutMs: Number.NaN })).toThrow();
+  });
   it("accepts explicit worktree isolation and keeps shared delegation as the default", () => {
     expect(decodeDelegateTaskInput({ task: "Review changes" }).isolation).toBeUndefined();
     expect(

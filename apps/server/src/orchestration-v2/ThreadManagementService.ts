@@ -185,6 +185,7 @@ export interface ThreadManagementInterruptInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly attemptId?: RunAttemptId;
+  readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
 }
 
@@ -1305,6 +1306,9 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        ...(input.delegatedTaskStall === undefined
+          ? {}
+          : { delegatedTaskStall: input.delegatedTaskStall }),
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(input.runId === undefined
           ? {}

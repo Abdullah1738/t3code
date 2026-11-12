@@ -65,6 +65,112 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 );
 
 describe("OrchestratorMcpService", () => {
+  it.effect("a terminal stalled run is reported correctly before parent finalization", () =>
+    Effect.gen(function* () {
+      const parentThreadId = ThreadId.make("stall-race-parent");
+      const childThreadId = ThreadId.make("stall-race-child");
+      const taskId = NodeId.make("stall-race-task");
+      const runId = RunId.make("stall-race-run");
+      const at = DateTime.makeUnsafe("2026-11-12T01:00:00Z");
+      const acknowledgements: Array<string> = [];
+      const parent = {
+        thread: { id: parentThreadId },
+        runs: [],
+        contextTransfers: [],
+        subagents: [
+          {
+            id: taskId,
+            threadId: parentThreadId,
+            origin: "app_owned",
+            childThreadId,
+            driver: "codex",
+            model: "test",
+            result: null,
+            status: "running",
+            completionDelivery: { state: "pending" },
+          },
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const child = {
+        thread: { id: childThreadId },
+        contextTransfers: [],
+        runtimeRequests: [],
+        providerThreads: [],
+        subagents: [],
+        turnItems: [],
+        runs: [
+          {
+            id: runId,
+            ordinal: 1,
+            delegatedTaskId: taskId,
+            status: "interrupted",
+            startedAt: at,
+            completedAt: at,
+            delegatedTaskStall: {
+              idleTimeoutMs: 60_000,
+              lastProgressAt: at,
+              lastProgressKind: "assistant_text",
+            },
+          },
+        ],
+        messages: [
+          {
+            id: MessageId.make("partial"),
+            runId,
+            role: "assistant",
+            text: "Partial work",
+            createdAt: at,
+            updatedAt: at,
+          },
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: (id) => Effect.succeed(id === parentThreadId ? parent : child),
+          delegatedTaskResultPending: () => Effect.succeed(false),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              acknowledgements.push(command.type);
+              return {} as never;
+            }),
+        }),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const result = yield* service.taskStatus(
+          {
+            environmentId: EnvironmentId.make("stall-race-env"),
+            requestNamespace: "stall-race",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "stall-race",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          },
+          taskId,
+        );
+        assert.equal(result.status, "failed");
+        assert.equal(result.failureReason, "stalled");
+        assert.equal(result.latestTerminalStatus, "failed");
+        assert.match(result.summary!, /^Stalled:/);
+        assert.include(result.summary!, "Partial work");
+        assert.equal(result.lastProgressAt, DateTime.formatIso(at));
+        assert.deepEqual(acknowledgements, ["delegated_task.completion-delivery.acknowledge"]);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
   it.effect("retries terminal acknowledgement with a fresh command id", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");

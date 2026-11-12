@@ -1,3 +1,4 @@
+import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
   CommandId,
   type RunId,
@@ -71,6 +72,7 @@ import {
   mergeSelection,
   resolveSelection,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -996,6 +998,9 @@ function timelineItem(input: {
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const progressGuard = yield* Effect.serviceOption(
+    DelegatedTaskProgressGuard.DelegatedTaskProgressGuard,
+  );
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
@@ -1753,7 +1758,7 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(threadManagementFailure)));
     const workState =
       task.result !== null ? "result_available" : heldForRestart ? "working" : taskWorkState;
-    const status =
+    const reportedStatus =
       task.result !== null
         ? taskStatusForRun(
             task.status === "completed" ||
@@ -1768,11 +1773,23 @@ const make = Effect.gen(function* () {
           : taskStatusForRun(taskResultRun ?? childRun) === "queued"
             ? "queued"
             : "running";
+    const resultRun = taskResultRun ?? childRun;
+    const stall = isTerminalTaskStatus(reportedStatus) ? resultRun?.delegatedTaskStall : undefined;
+    const status = stall === undefined ? reportedStatus : "failed";
+    const resultText = (run: OrchestrationV2Run) => {
+      const partial = subagentResultForRun(childProjection, run);
+      return run.delegatedTaskStall === undefined
+        ? partial.text
+        : stalledSummary(
+            run.delegatedTaskStall,
+            partial.messageId === null && partial.turnItemId === null ? null : partial.text,
+          );
+    };
     const derivedResult =
       task.result !== null
         ? task.result
         : taskResultRun !== undefined && isTerminalTaskStatus(status)
-          ? subagentResultForRun(childProjection, taskResultRun).text
+          ? resultText(taskResultRun)
           : null;
     const resultTransfers = parentProjection.contextTransfers.filter(
       (transfer) =>
@@ -1789,11 +1806,16 @@ const make = Effect.gen(function* () {
             : undefined) ??
           null);
     const resultTransfer = taskResultTransfer(parentProjection, childProjection, task) ?? null;
-    const terminalStatus = terminalRun === undefined ? null : taskStatusForRun(terminalRun);
+    const terminalStatus =
+      terminalRun === undefined
+        ? null
+        : terminalRun.delegatedTaskStall === undefined
+          ? taskStatusForRun(terminalRun)
+          : "failed";
     const latestTerminalSummary = canExposeTaskRunResult(terminalRun)
       ? terminalRun.id === childRun?.id
         ? derivedResult
-        : subagentResultForRun(childProjection, terminalRun).text
+        : resultText(terminalRun)
       : null;
     const resultContextTransferId = resultTransfer?.id ?? null;
     const latestTerminalResultContextTransferId = resultTransferForRun(terminalRun)?.id ?? null;
@@ -1851,6 +1873,19 @@ const make = Effect.gen(function* () {
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,
       options: modelSelection.options ?? [],
+      ...(Option.isSome(progressGuard)
+        ? progressGuard.value.status(task.childThreadId)
+        : { lastProgressAt: null, lastProgressKind: null, thinkingSince: null }),
+      ...(stall === undefined
+        ? {}
+        : {
+            lastProgressAt: DateTime.formatIso(stall.lastProgressAt),
+            lastProgressKind: stall.lastProgressKind,
+            thinkingSince: null,
+          }),
+      ...((task.failureReason ?? (stall === undefined ? undefined : "stalled")) === undefined
+        ? {}
+        : { failureReason: "stalled" as const }),
       summary: derivedResult,
       resultContextTransferId,
       latestTerminalRunId: terminalRun?.id ?? null,
@@ -2454,6 +2489,7 @@ const make = Effect.gen(function* () {
           parentRunId: parentRun.id,
           parentNodeId: parentRun.rootNodeId,
           task: taskPrompt(input),
+          ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
           runtimeMode,

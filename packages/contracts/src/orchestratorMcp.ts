@@ -184,6 +184,10 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
     description:
       "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child.",
   }),
+  idleTimeoutMs: Schema.optional(Schema.Finite).annotate({
+    description:
+      "No-progress limit for the child, including follow-ups. 0 or omitted uses 15 minutes; other values clamp to 1 minute–2 hours. Thinking and provider retries do not count as progress.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   runtimeMode: Schema.optional(
     OrchestratorMcpRuntimeMode.annotate({
@@ -235,6 +239,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
         "Stored model option selections for the child run, or its thread before a run starts. Omitted selections use provider defaults.",
     }),
   ),
+  failureReason: Schema.optional(Schema.Literal("stalled")),
+  lastProgressAt: Schema.optional(Schema.NullOr(Schema.String)),
+  lastProgressKind: Schema.optional(Schema.NullOr(Schema.String)),
+  thinkingSince: Schema.optional(Schema.NullOr(Schema.String)),
   summary: Schema.NullOr(Schema.String),
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
