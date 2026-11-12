@@ -29,6 +29,9 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import * as SteerDeliveryFailure from "../ardud/orchestration/SteerDeliveryFailure.ts";
+import * as EventSink from "./EventSink.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -85,6 +88,8 @@ export const layerExecutor: Layer.Layer<
   | ThreadManagementService.ThreadManagementService
   | ServerSettings.ServerSettingsService
   | McpSessionRegistry.McpSessionRegistry
+  | EventSink.EventSinkV2
+  | ProjectionStore.ProjectionStoreV2
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -100,6 +105,8 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
     const mcpRegistry = yield* McpSessionRegistry.McpSessionRegistry;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
@@ -339,6 +346,21 @@ export const layerExecutor: Layer.Layer<
                         }),
                       );
                   }),
+                ),
+                Effect.tapError(() =>
+                  willRetry
+                    ? Effect.void
+                    : SteerDeliveryFailure.persist(effect).pipe(
+                        Effect.provideService(EventSink.EventSinkV2, eventSink),
+                        Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+                        Effect.retry({ times: 2 }),
+                        Effect.catchCause(() =>
+                          Effect.logWarning(
+                            "orchestration-v2.effect-worker.steer-delivery-notice-failed",
+                            { effectId: effect.id, threadId: effect.threadId },
+                          ),
+                        ),
+                      ),
                 ),
                 Effect.mapError(
                   (cause) =>

@@ -27,6 +27,8 @@ import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as EventSink from "./EventSink.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -165,6 +167,8 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EventSink.EventSinkV2)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(

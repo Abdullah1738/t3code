@@ -500,6 +500,8 @@ export function layerWithRegistry<Error>(
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.provide(
       Layer.mergeAll(
+        layerStores,
+        layerEventSinkProvided,
         layerRunFinalizationServiceProvided,
         McpSessionRegistryTestkit.layer,
         layerCheckpointRollbackServiceProvided,
