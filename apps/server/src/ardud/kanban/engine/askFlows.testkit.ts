@@ -60,6 +60,7 @@ export const makeFake = Effect.gen(function* () {
           quietSince: "2026-11-10T10:00:00.000Z",
           runStartedAt: null,
           backgroundWork: 0,
+          prWatches: 0,
           prs: [],
           archived: false,
         };

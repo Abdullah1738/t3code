@@ -160,6 +160,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         quietSince: iso(T0),
         runStartedAt: null,
         backgroundWork: 0,
+        prWatches: 0,
         prs: prs.get(threadId) ?? [],
         archived: false,
       };

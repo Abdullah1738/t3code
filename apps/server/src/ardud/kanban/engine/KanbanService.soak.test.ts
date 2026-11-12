@@ -520,6 +520,7 @@ const makeThreads = (watch: Watch) => {
         quietSince: at,
         runStartedAt: thread.running ? at : null,
         backgroundWork: 0,
+        prWatches: 0,
         prs: prs.get(threadId) ?? [],
         archived: false,
       };

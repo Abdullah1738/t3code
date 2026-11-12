@@ -93,6 +93,7 @@ const makeThreads = Effect.gen(function* () {
         quietSince: at,
         runStartedAt: thread.running ? at : null,
         backgroundWork: 0,
+        prWatches: 0,
         prs: [],
         archived: false,
       };

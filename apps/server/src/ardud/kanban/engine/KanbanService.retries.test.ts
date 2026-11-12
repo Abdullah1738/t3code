@@ -67,6 +67,7 @@ const makeFake = () => {
             quietSince: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
             runStartedAt: null,
             backgroundWork: 0,
+            prWatches: 0,
             prs: [],
             archived: false,
           }
