@@ -43,6 +43,7 @@ _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
+STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
@@ -331,7 +332,7 @@ def _read_response(response, deadline):
 
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
-    from . import allocation
+    from . import allocation, pool
     if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
         return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
     box_id = path.split("/")[2] if path != "/sandboxes" else None
@@ -354,12 +355,13 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
         except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
             # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
-            if pending:
+            if pending and not isinstance(e, pool.PoolBusyError):
                 raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
                                             "Retry its original source and size later") from e
-            with contextlib.closing(db()) as con:
-                con.execute("DELETE FROM kv WHERE k=?", (key,))
-                con.commit()
+            if not pending:
+                with contextlib.closing(db()) as con:
+                    con.execute("DELETE FROM kv WHERE k=?", (key,))
+                    con.commit()
             raise
         except OffboxError as e:
             raise allocation.Unresolved(str(e)) from e
@@ -419,7 +421,23 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
     uncertain_start = False
+
+    def check_start_queue(request_id=None):
+        if not is_start:
+            return
+        from . import allocation
+        try:
+            allocation.check_queue()
+        except capacity.CapacityError as error:
+            if request_id:
+                capacity.complete(request_id, "not_sent")
+            if uncertain_start:
+                raise allocation.Unresolved("a previous machine start was unanswered before queue expiry; "
+                                            "its retained request still needs reconciliation; nothing ran") from error
+            raise
+
     while True:
+        check_start_queue()
         attempt += 1
         req_timeout = timeout
         # During an outage allocation retry, bound network calls only until a machine is accepted. Bring-up
@@ -451,6 +469,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 raise OffboxError("a previous create/fork was unanswered before the local start limit; "
                                   "nothing ran. Retry its retained key later") from e
             raise
+        check_start_queue(request_id)
         if _DEADLINE is not None:
             # capacity.reserve may wait on SQLite (BEGIN IMMEDIATE, 30 s busy timeout): recompute what is left now,
             # and never send a request whose budget is already gone.
@@ -470,6 +489,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
         try:
             if scope is not None:
                 scope.check()
+            check_start_queue(request_id)
             with _open(req, timeout=req_timeout) as r:
                 raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
