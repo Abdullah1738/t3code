@@ -854,7 +854,7 @@ def _wait_timeout(r) -> OffboxError:
 
 def _not_started(r) -> str:
     if r['mode'] == 'local':
-        return f"{r['run_id']} runs on this Mac (local-first), not on a box"
+        return f"{r['run_id']} runs on this Mac (local fallback), not on a box"
     if not r['box_id']:
         return f"{r['run_id']} has no box yet (queued for a pool box)"
     return f"{r['run_id']} has {r['box_id']} but its command hasn't started yet"

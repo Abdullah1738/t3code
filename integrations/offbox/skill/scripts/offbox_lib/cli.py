@@ -156,27 +156,9 @@ def cmd_run(a, me) -> int:
     if not a.cmd:
         say("usage: offbox run [opts] -- <cmd...>  or  offbox run --step CMD [--step CMD ...]")
         return 2
-    from . import localfirst
-    try:
-        why = localfirst.decide(a, me, os.getcwd())
-    except Exception as e:  # noqa: BLE001 - any doubt means the box
-        why = f"local-first check failed: {e!r}"
-    if why is None:
-        try:
-            code = localfirst.run(a, me, a.steps)
-        except localfirst.Rerun as e:
-            # The sandbox blocked something the check needs (a fixture write, a socket). It changed nothing
-            # outside its private dir, so the box gets the same command; no local fallback after that.
-            say(f"the local run failed and the Mac sandbox may be why ({str(e)[:160]}); rerunning it on the box")
-            log(f"remote: sandbox blocked: {e}")
-            a.remote = True
-            code = None
-            why = "sandbox blocked the local run"
-        if code is not None:
-            return code
-        if not a.remote:
-            why = "could not start locally"
-    log(f"remote: {why}")
+    # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
+    # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
+    log("remote")
     from . import home
     if home.may_fail_over():
         # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.

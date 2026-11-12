@@ -112,7 +112,6 @@ class Unconfigured(HomeFiles):
         me = {"owner": "t", "repo_root": "/r", "repo_key": "r"}
         boom = AssertionError("home code reached on a Boat-only install")
         with patch.object(home, "probe", side_effect=boom), patch.object(home, "fail_over", side_effect=boom), \
-                patch("offbox_lib.localfirst.decide", return_value="not a light command"), \
                 patch.object(runs, "run_remote", return_value=7) as rr, patch.object(cli, "log"), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(cli.cmd_run(a, me), 7)
@@ -229,7 +228,6 @@ class Failover(HomeFiles):
             self.execs.append((argv, env))
             raise self.Exec()
         self.stack.enter_context(patch.object(os, "execve", execve))
-        self.stack.enter_context(patch("offbox_lib.localfirst.decide", return_value="not a light command"))
         self.stack.enter_context(patch.object(cli, "log"))
         self.me = {"owner": "t", "repo_root": "/r", "repo_key": "r"}
 
@@ -368,7 +366,7 @@ class PersonNeverOnBoat(HomeFiles):
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         a = cli.build_parser().parse_args(["run", "--no-fallback", "--remote", "--", "true"])
         gone = api.NetworkError("offbox server API unreachable")
-        with patch("offbox_lib.localfirst.decide", return_value="remote"), patch.object(cli, "log"), \
+        with patch.object(cli, "log"), \
                 patch.object(runs, "run_remote", side_effect=gone), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.cmd_run(a, {"owner": "person:moni", "repo_root": "/p", "repo_key": "moni"}), 93)
 
@@ -615,6 +613,25 @@ class ReapBothBackends(HomeFiles):
                 patch.object(common, "_BACKEND", "boat"):
             cli._reap_other_backend(False)
 
+
+
+class HomePoolIsAQueue(unittest.TestCase):
+    """Owner, 13 Nov 2026: no caps at home; a full pool is a queue and callers wait for a slot."""
+
+    def test_home_waits_a_day_for_a_slot_and_boat_keeps_its_numbers(self):
+        import importlib.util
+        from offbox_lib import pool
+        clean = {k: v for k, v in os.environ.items() if k not in ("OFFBOX_POOL_WAIT_SECONDS", "OFFBOX_POOL_SIZE")}
+        with patch.dict(os.environ, clean, clear=True):
+            with patch.object(pool, "backend", return_value="server"):
+                self.assertEqual((pool.wait_seconds(), pool.wait_max(), pool.pool_size()), (86400, 86400, 8))
+            with patch.object(pool, "backend", return_value="boat"):
+                self.assertEqual((pool.wait_seconds(), pool.wait_max(), pool.pool_size()), (600, 1200, 4))
+        with patch.dict(os.environ, {"OFFBOX_POOL_SIZE": "500", "OFFBOX_POOL_WAIT_SECONDS": "30"}), \
+                patch.object(pool, "backend", return_value="server"):
+            self.assertEqual((pool.wait_seconds(), pool.pool_size()), (30, 64))
+        self.assertEqual((pool._span(59), pool._span(5400), pool._span(86400)), ("59s", "1h30m", "24h00m"))
+        self.assertIsNone(importlib.util.find_spec("offbox_lib.localfirst"), "the local-first lane is retired")
 
 if __name__ == "__main__":
     unittest.main()

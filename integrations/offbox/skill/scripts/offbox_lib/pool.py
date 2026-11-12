@@ -10,11 +10,16 @@ import time
 from . import capacity, prepare
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      kv_get, kv_set, now, say)
+from .common import backend
 from .common import mine as token_mine  # `mine` is a local name here (the caller's own boxes)
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
 WAIT_MAX_S = 1200
+# At home a full pool is a queue, not a refusal (owner, 13 Nov 2026: no caps, agents wait for a slot). The server
+# has its own memory queue behind this one. The numbers above are for the Boat standby, where a box costs money.
+HOME_WAIT_S = 86400
+HOME_POOL_SIZE, HOME_POOL_MAX = 8, 64
 PROGRESS_EVERY_S = 60
 AFFINITY_WAIT_S = 60
 # A create slot is claimed under the pool lock and the box is made after it. A slot whose process died is dropped at
@@ -29,21 +34,42 @@ class PoolBusyError(capacity.CapacityError):
         super().__init__(msg, code=EXIT_BUSY)
 
 
+def at_home() -> bool:
+    return backend() == "server"
+
+
+def wait_max() -> int:
+    return HOME_WAIT_S if at_home() else WAIT_MAX_S
+
+
 def wait_seconds() -> int:
-    return capacity.setting("OFFBOX_POOL_WAIT_SECONDS", WAIT_DEFAULT_S, minimum=0, maximum=WAIT_MAX_S)
+    return capacity.setting("OFFBOX_POOL_WAIT_SECONDS", HOME_WAIT_S if at_home() else WAIT_DEFAULT_S, minimum=0,
+                            maximum=wait_max())
+
+
+def pool_size() -> int:
+    """Boxes one repository pool may have. More callers than that wait for one of them."""
+    if at_home():
+        return capacity.setting("OFFBOX_POOL_SIZE", HOME_POOL_SIZE, maximum=HOME_POOL_MAX)
+    return capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
+
+
+def _span(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds}s" if seconds < 3600 else f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
 
 
 def queue_state(con, key, run_id=None):
     """(busy boxes, pool cap, other waiting callers, held idle boxes). Waiters are approximate: a
     'starting' run with no box yet whose checkout already maps to this pool."""
-    cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
+    cap = pool_size()
     busy = con.execute("""SELECT COUNT(DISTINCT r.box_id) FROM runs r JOIN pool_members p USING(box_id)
         WHERE p.pool_key=? AND r.status IN ('starting','running')""", (key,)).fetchone()[0]
     waiting = con.execute("""SELECT COUNT(*) FROM runs r WHERE r.status='starting' AND r.box_id IS NULL
         AND r.run_id<>? AND r.start_at>? AND (r.repo_root IN (SELECT repo_root FROM leases WHERE repo_key=?)
           OR r.repo_root IN (SELECT c.repo_root FROM pool_callers c JOIN pool_members p USING(box_id)
                              WHERE p.pool_key=?))""",
-                          (run_id or "", now() - WAIT_MAX_S, key, key)).fetchone()[0]
+                          (run_id or "", now() - wait_max(), key, key)).fetchone()[0]
     held = con.execute("""SELECT COUNT(*) FROM prune_holds h JOIN pool_members p USING(box_id)
         JOIN leases l USING(box_id) WHERE p.pool_key=? AND l.state IN ('running','stopped')
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=h.box_id AND r.status IN ('starting','running'))""",
@@ -73,7 +99,7 @@ def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | Non
             except OffboxError as e:
                 raise PoolBusyError(f"repository pool busy for {key}: other offbox runs kept its pool lock for the whole "
                                     f"{wait}s queue wait. Nothing ran (exit {EXIT_BUSY}, not an infra failure): retry, or "
-                                    f"raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})") from e
+                                    f"raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})") from e
             yield
         finally:
             if acquired:
@@ -126,7 +152,7 @@ def _source_member(con, key, source) -> bool:
 
 
 def _room(con, key) -> bool:
-    return len(members(con, key)) + _pending(con, key) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
+    return len(members(con, key)) + _pending(con, key) < pool_size()
 
 
 def own_boxes(con, me):
@@ -588,18 +614,20 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
             busy, cap, waiting, held = queue_state(con, key, run_id)
             raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} busy, {held} held by checkout cleanup for "
                                 f"{int(t-started)}s; remote queue timed out. Nothing ran (exit {EXIT_BUSY}, not an "
-                                f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})")
+                                f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})")
         if isinstance(last_error, api.BoatAtCapacity):
             raise last_error
         if t >= next_progress:
             busy, cap, waiting, held = queue_state(con, key, run_id)
             if not said:
                 say(f"queued for a {key} pool box: {busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting; "
-                    f"will wait up to {wait}s" + (f" ({last_error})" if last_error else "") +
-                    f". Use a tool timeout above {wait}s or run this in a background shell.")
+                    f"will wait up to {_span(wait)}" + (f" ({last_error})" if last_error else "") +
+                    (". It starts by itself when a box is free: leave it waiting, do not retry or kill it. For a long "
+                     "wait use --bg and `offbox wait <run>`." if at_home() else
+                     f". Use a tool timeout above {wait}s or run this in a background shell."))
                 said = True
             else:
-                say(f"still queued for a {key} pool box: waited {int(t-started)}s of {wait}s, "
+                say(f"still queued for a {key} pool box: waited {_span(t-started)} of {_span(wait)}, "
                     f"{busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting")
             next_progress = t + PROGRESS_EVERY_S
         time.sleep(min(2, max(0, deadline-time.monotonic())))

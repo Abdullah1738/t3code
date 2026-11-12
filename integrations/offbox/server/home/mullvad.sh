@@ -9,6 +9,7 @@
 #   mullvad.sh login              account number on stdin; connects, then auto-connect + lockdown + boot guard on
 #   mullvad.sh check              PASS/FAIL lines; exit 1 on any FAIL
 #   mullvad.sh off                emergency: guard off, lockdown off, disconnect (traffic goes out directly again)
+#   mullvad.sh exit-check         take another relay when Google refuses this exit address (timer, every 10 min)
 #   mullvad.sh guard-on | guard-release    used by the two systemd units below
 #
 # mullvad.net, api.mullvad.net and repository.mullvad.net are blocked on UAE lines (TLS reset), so the
@@ -24,6 +25,8 @@
 #  - the daemon's cgroup v1 net_cls mount is moved out of /sys/fs/cgroup (TALPID_NET_CLS_MOUNT_DIR), or Incus
 #    starts no box after a reboot.
 #  - box DNS to any outside resolver is redirected to the host's (Mullvad refuses DNS to anything but its own).
+#  - exit-check: dl.google.com answers 404 for Go toolchain and Android SDK downloads from some Mullvad exit
+#    addresses (5 of 14 Frankfurt relays on 12 Nov; it varies per connection, not per provider).
 set -euo pipefail
 
 VERSION=${MULLVAD_VERSION:-2026.5}
@@ -32,6 +35,7 @@ LOCATION=${MULLVAD_LOCATION:-de fra}                    # lowest latency from Du
 MARKS=/etc/nftables.d/offbox-vpn.nft
 ENABLED=/etc/offbox/vpn-enabled                         # exists = the VPN is meant to be on; the boot guard needs it
 SELF=/usr/local/sbin/offbox-mullvad
+PROBE_URL=https://dl.google.com/android/repository/repository2-3.xml   # 404 from an exit address Google refuses
 NET_CLS=/run/offbox-mullvad-net-cls                     # where the daemon may mount its cgroup v1 hierarchy
 
 install_pkg() {
@@ -172,8 +176,30 @@ ExecStart=$SELF guard-release
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > /etc/systemd/system/offbox-vpn-exit-check.service <<EOF
+[Unit]
+Description=offbox: take another Mullvad relay when Google refuses this exit address
+ConditionPathExists=$ENABLED
+After=mullvad-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=$SELF exit-check
+EOF
+  cat > /etc/systemd/system/offbox-vpn-exit-check.timer <<EOF
+[Unit]
+Description=offbox: check the VPN exit address
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=600
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
   systemctl enable offbox-vpn-guard.service offbox-vpn-guard-release.service >/dev/null 2>&1
+  systemctl enable --now offbox-vpn-exit-check.timer >/dev/null 2>&1
 }
 
 settings() {
@@ -182,6 +208,32 @@ settings() {
   mullvad lan set allow >/dev/null                 # LAN ssh, the KVM, and host <-> box traffic on incusbr0
   mullvad anti-censorship set mode auto >/dev/null # plain WireGuard is not reliable on UAE lines
   mullvad dns set default >/dev/null
+}
+
+probe_exit() { curl -4 -sL --max-time 15 -r 0-99 -o /dev/null -w '%{http_code}' "$PROBE_URL" 2>/dev/null || true; }
+
+# A refused exit breaks every box's Go and Android setup, so changing relay is worth the dropped connections.
+# No answer at all (000) is not this check's business: the tunnel or the line is down and lockdown handles that.
+cmd_exit_check() {
+  local try code st
+  [ -e "$ENABLED" ] || return 0
+  for try in 1 2 3 4 5 6 7 8; do
+    st=$(mullvad status 2>/dev/null || true)
+    [[ $st == Connected* ]] || return 0
+    code=$(probe_exit)
+    case $code in
+      200 | 206)
+        [ "$try" = 1 ] || logger -t offbox-vpn "exit address accepted by dl.google.com after $((try - 1)) relay change(s)"
+        return 0 ;;
+      403 | 404)
+        logger -t offbox-vpn "dl.google.com answers $code from this exit address; taking another relay (try $try)"
+        mullvad reconnect --wait >/dev/null 2>&1 || true
+        sleep 3 ;;
+      *) return 0 ;;
+    esac
+  done
+  logger -p user.err -t offbox-vpn "no exit address dl.google.com accepts after 8 relay changes"
+  return 1
 }
 
 cmd_install() {
@@ -238,6 +290,8 @@ cmd_check() {
   nft list table inet offbox_vpn_guard >/dev/null 2>&1 && no "boot guard is still loaded: Mullvad's lockdown rules never came up" || ok "boot guard handed over to Mullvad's rules"
   j=$(curl -4 -s --max-time 15 https://am.i.mullvad.net/json || true)
   echo "$j" | grep -q '"mullvad_exit_ip":true' && ok "host leaves through Mullvad ($(echo "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p'))" || no "host does not leave through Mullvad"
+  j=$(probe_exit)
+  case $j in 200 | 206) ok "exit address accepted by dl.google.com (Go and Android SDK downloads)" ;; *) no "dl.google.com answers ${j:-nothing} from this exit address: box Go/Android setup fails until 'offbox-mullvad exit-check' finds another relay" ;; esac
   box=$(incus list -f csv -c n,s 2>/dev/null | awk -F, '$2=="RUNNING"{print $1; exit}')
   if [ -n "$box" ]; then
     j=$(incus exec "$box" -- curl -4 -s --max-time 15 https://am.i.mullvad.net/json 2>/dev/null || true)
@@ -262,5 +316,6 @@ case "${1:-}" in
   off) cmd_off ;;
   guard-on) guard_on ;;
   guard-release) guard_release ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  exit-check) cmd_exit_check ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
 esac

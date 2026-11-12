@@ -568,22 +568,6 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(me["driver"], "opencode")
         self.assertEqual(me["owner"], "thread-oc")
 
-    def test_local_first_run_carries_the_resolved_robob_thread_not_the_shell_value(self):
-        from offbox_lib import localfirst
-
-        class Args:
-            env = []
-
-        with patch.dict(os.environ, {"OFFBOX_ROBOB_THREAD": "stale-from-shell", "OPENCODE_SESSION_ID": "ses_x"}):
-            env = localfirst.local_env(Args(), "run-x", "/nonexistent", None,
-                                       {"robobThreadId": OTHER, "driver": "codex"})
-        self.assertEqual(env["OFFBOX_ROBOB_THREAD"], OTHER)
-        self.assertEqual(env["OFFBOX_NATIVE_DRIVER"], "codex")
-        with patch.dict(os.environ, {"OFFBOX_ROBOB_THREAD": "stale-from-shell"}):
-            unresolved = localfirst.local_env(Args(), "run-x", "/nonexistent", None, {"robobThreadId": None})
-        self.assertNotIn("OFFBOX_ROBOB_THREAD", unresolved)
-
-
 class SharedSessionOwnerTests(unittest.TestCase):
     """A Claude parent and two children share one session id. Their owner strings are the same, so they must not
     select, reuse, release or exempt each other's leases. Each check runs the real selector against a real row."""

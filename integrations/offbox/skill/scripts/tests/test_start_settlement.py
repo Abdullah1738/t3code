@@ -9,7 +9,7 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, cli, common, fallback, lease, localfirst, misc, outage, pool, reap, runs, ssh_sync, start_check
+from offbox_lib import api, cli, common, fallback, lease, misc, outage, pool, reap, runs, ssh_sync, start_check
 from test_capacity import Isolated
 
 
@@ -97,7 +97,6 @@ class StartPaths(Isolated):
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
         self.stack.enter_context(patch.object(lease, 'touch'))
         self.stack.enter_context(patch.object(start_check, 'GRACE_S', 0))
-        self.stack.enter_context(patch.object(localfirst, 'decide', return_value='remote'))
         self.stack.enter_context(patch.object(fallback, 'note_infra_failure'))
         self.local = self.stack.enter_context(patch.object(fallback, 'run_local'))
 

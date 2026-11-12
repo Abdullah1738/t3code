@@ -3,10 +3,11 @@ name: remote-compute
 description: Use for any heavy test suite, dependency install, build or Docker/compose/testcontainers work - it runs on an offbox machine (the home offbox server when one is set up, else a boat.dev VM) via `offbox run -- <cmd>`, not on Abdullah's Mac.
 ---
 
-# remote-compute: heavy work runs on boat via offbox
+# remote-compute: heavy work runs on the offbox server
 
-Abdullah's Mac (M4 Max) sits at load 100+ when agents run test suites, installs and Docker stacks locally. Since
-2026-10-13 that work runs on boat.dev VMs (EU, x86_64 Ubuntu 24.04, Docker included) through `offbox`. A gate
+Abdullah's Mac (M4 Max) sits at load 100+ when agents run test suites, installs and Docker stacks locally. That
+work runs through `offbox` on boxes (x86_64 Ubuntu 24.04, Docker included): since 12 Nov 2026 on his own server at
+home, unmetered and uncapped, with boat.dev VMs as the standby when it is down (see "Home server, Boat standby"). A gate
 (worker C's plugin + Docker shim) denies heavy commands that don't go through offbox. Owner decisions and the
 interface contract: `/Users/ardud/.robob/scratch/2026-10-13-we-often-run-simulations-tests-24789d2f/plan.md`.
 
@@ -30,30 +31,16 @@ dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl
 **Where it runs.** With no home server set up (no `~/.local/share/offbox/server.json`, or `"disabled": true` in
 it), everything below is boat.dev, as it always was. With one, see "Home server, Boat standby".
 
-**Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
-`offbox run` itself runs these locally (niced, max 4 at once) and prints `offbox: light command: running on this Mac`:
-single-package `go test -run X` (`-count` <= 3), `go vet`/`go build -o /dev/null` of 1-3 packages (6 per run at
-most), `gofmt -l`, `go version|env|list`, alone or in `--step`s / `bash -c` with read-only pipe filters (`grep`,
-`head`, `tail`, `sort`, `sed -n`, ...) and `tee /tmp/x`. Packages must be `./relative` paths inside the repo, and
-neither they nor any module package they import may have OS/arch-specific files or build tags (`_linux.go`,
-`//go:build linux`): the Mac would build different code. Tests that read `.env` need `--include .env`; tests in a
-module that uses testcontainers go to the box. Go flags and env are an allowlist (`-run -v -race -count -timeout
--tags -short`, `GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=goX.Y`); `-exec`, `-toolexec`, `-gcflags`, `-coverprofile`,
-`-bench`, `-C` and friends send the run to the box. Anything else (python, node, uv, make, git, scripts, docker,
-`cd`, subshells, loops, heredocs, repo-file redirects, `/proc`, reading `/tmp` left by an earlier box run) still goes
-to the box, as do runs with `--bg`, `--no-sync`, `--pull`, `--base`, `--fresh`, `--template`, a Mac whose CPUs are
-over 80% busy (load averages alone mislead on macOS: ~30 with 60% idle is normal here), or a
-repo that used Docker on the box in the last 2 h; so do go.mod files with local-path `replace`s and nested modules,
-and a `go.work` above the repo is ignored (`GOWORK=off`) because it never reaches the box. Local runs use the box's
-Go version (`GOTOOLCHAIN`), a small allowlisted environment (no AWS profile, tokens or service URLs), a dead
-`FDB_CLUSTER_FILE`/`DOCKER_HOST`, and a macOS sandbox: writes only to a private run dir (your `/tmp/x` paths are
-mapped into it, fresh each run) and the Go caches, never to the repo; no reads of `~` or secret files (`.env`, keys)
-unless `--include`d; no unix sockets, local UDP or local service ports. When the run ends, everything it started is
-killed. A failed local check is rerun on the box by itself when the output says `Operation not permitted` or the
-tested package writes files (`os.WriteFile`, `os.Create`, ...). Other code that hides a blocked write, or
-third-party modules with Mac-only behaviour, can still differ: if a local failure looks wrong or Mac-specific, rerun
-with `offbox run --remote -- ...`, which always uses the box and never falls back to the Mac.
-`OFFBOX_LOCAL_FIRST=0` only turns local-first off.
+**No caps, no meter (owner, 13 Nov 2026).** The home server costs nothing per run and has no spend cap, no start
+limits and no usage limit: use it as much as the work needs. When it is full, runs queue (first the repo's pool on
+the Mac, then the server's own memory queue) and start by themselves. A queued run prints `queued for a ... pool
+box` or `offbox-server: waiting for memory`: **leave it waiting**. Do not kill it, retry it, shrink the job or move
+it to the Mac because of a queue. For a wait that may outlast your tool call, start it with `--bg` and collect it
+with `offbox wait <run>`.
+
+**Every `offbox run` goes to a box.** The local-first lane (light Go checks on the Mac, 2026-10-19) is retired: it
+existed to save boat.dev minutes. `OFFBOX_LOCAL_FIRST` no longer does anything. A narrow check the gate allows can
+still be run directly on the Mac without offbox; that is your choice, not a cost rule.
 
 Heavy = `go test` (multi-package or no `-run`), `pytest` on a dir or with `-n`, `jest`/`vitest` (whole suite),
 `npm ci`/`npm install`/`pnpm install`/`yarn install`, `docker run/build/compose up`, testcontainers, `gradlew`,
@@ -95,9 +82,10 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   an auto-sized typecheck, may get another pool box, so install and run in the same call (examples below). Old
   checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
   last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
-- A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
-  Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–16; raised from 8 for TorSSH by Abdullah, 12 Nov 2026) and
-  `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
+- A busy pool is a queue (progress line every 60 s). At home the run waits for a free box for up to 24 h and then
+  starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). On the Boat standby it waits **up to 600 seconds**
+  and then returns **92** (nothing ran; retry), with 4 boxes (`OFFBOX_POOL_SIZE` 1-16; raised from 8 for TorSSH by
+  Abdullah, 12 Nov 2026) and `OFFBOX_POOL_WAIT_SECONDS` 0-1200. Sizes are minimums on pooled boxes; a larger warm box is reused.
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if a run on the box started a container in
   the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
   counts) or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
@@ -155,8 +143,8 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
-| `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
-| `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
+| `--no-fallback` | return 90/91 instead of falling back to a local run |
+| `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
 | `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
 
@@ -290,7 +278,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   A simple single-line pipeline such as `yes | head -1` succeeds when only non-last stages exit with SIGPIPE (141);
   compound scripts and uncertain shell syntax keep strict pipefail so skipped checks cannot look successful.
   An explicit trailing `; echo EXIT=$?` or `|| true` can still mask failure; offbox flags that choice on the exit line.
-  A local-first run prints `offbox: local exit N` instead; same exit-code rules.
+  A run that fell back to the Mac prints `offbox: local exit N` instead; same exit-code rules.
 - (nightly 2026-10-19) **Several checks in one run: use `--step`**, one per command, instead of chaining
   `a | tee x | tail; b; grep ...`. 18 Oct: 4+ Crpko lanes read `remote exit 1` from a trailing grep on clean runs,
   or a blank PIPESTATUS gate.
@@ -302,14 +290,15 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
-- **92** = every pool box stayed busy for the whole queue wait (or other runs held the pool's lock that long). Nothing
-  ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
+- **92** = every pool box stayed busy for the whole queue wait (24 h at home, 10 min on the Boat standby; or other
+  runs held the pool's lock that long). Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
 - **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
-- **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
+- **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
+  exists on the standby (the home server has no cap). Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
   semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.

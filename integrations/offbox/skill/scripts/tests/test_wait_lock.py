@@ -622,8 +622,8 @@ class NoBoxYetTests(WaitLockTests):
         self.assertGreater(lease.active_runs(self.con, 'bx_a'), 0)
         self.assert_no_crash()
 
-    def test_nobox_wait_on_a_local_first_run_waits_for_its_end(self):
-        # Local-first runs never have a box: wait polls the row and returns the recorded code.
+    def test_nobox_wait_on_a_local_run_waits_for_its_end(self):
+        # Local (fallback) runs never have a box: wait polls the row and returns the recorded code.
         self.con.execute("UPDATE runs SET mode='local', status='running', process_id=55 WHERE run_id='run-x'")
         self.con.commit()
         with patch.object(runs, 'follow', side_effect=AssertionError('local runs have no box')):
