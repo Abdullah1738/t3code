@@ -700,14 +700,38 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
+def _relocate_base_checkout(con, box_id: str, base_dir: str, remote_dir: str, *, box_held: bool) -> None:
+    guard = contextlib.nullcontext() if box_held else file_lock(f"box-{box_id}", timeout=120)
+    with guard:
+        if active_runs(con, box_id):
+            raise OffboxError(f"{box_id} has an active run; refusing to relocate its base checkout")
+        # Gradle's project execution history contains absolute input paths. Invalidate it before the atomic move,
+        # so interruption cannot leave a relocated checkout with the old history. User-home caches stay warm.
+        command = f'''set -e
+src="$HOME"/{shlex.quote(base_dir)}
+dst="$HOME"/{shlex.quote(remote_dir)}
+if [ -d "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
+  find "$src" -name .gradle \\( -type d -o -type l \\) -prune -exec rm -rf -- {{}} +
+  mkdir -p "$(dirname "$dst")"
+  mv -- "$src" "$dst"
+  printf 'offbox-base-checkout-relocated\\n'
+fi'''
+        result = ssh_sync.ssh(box_id, command, timeout=120)
+        if result.returncode:
+            raise OffboxError(f"base checkout relocation failed on {box_id}: "
+                              f"{result.stderr.decode(errors='replace')[-300:]}")
+        if b"offbox-base-checkout-relocated\n" in result.stdout:
+            event(con, box_id, "base_checkout_cleared", f"{base_dir} -> {remote_dir}: project .gradle metadata")
+
+
 def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False,
                 since: float | None = None) -> dict:
     rdir = remote_dir_for(me["repo_root"])
     is_recipe = source.startswith("recipe:")
-    # A recipe-sourced box is 'bringing_up' until its recipe has finished: pools and reuse only take
-    # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
-    # one can hand out as ready. The reaper deletes such rows (see reap._reap).
-    state = "bringing_up" if is_recipe else "running"
+    relocating = bool(base_dir and base_dir != rdir)
+    # An interrupted recipe or relocation may still be changing the box remotely. Keep it out of selection until
+    # completion is confirmed; the reaper deletes abandoned bring-ups under the acquisition's lock.
+    state = "bringing_up" if is_recipe or relocating else "running"
     # token_owner: whose API token made the box. On the home server only that token can see it (common.mine).
     con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
                    repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at, token_owner)
@@ -723,9 +747,8 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
             api.rename(box_id, box_name(me, me["repo_key"]))
         except OffboxError:
             pass
-        if base_dir and base_dir != rdir:
-            ssh_sync.ssh(box_id, f"if [ -d ~/{base_dir} ] && [ ! -e ~/{rdir} ]; then mkdir -p ~/$(dirname {rdir}) "
-                                 f"&& mv ~/{base_dir} ~/{rdir}; fi", timeout=60)
+        if relocating:
+            _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
         if is_recipe:
@@ -1102,8 +1125,9 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
-    current = con.execute('SELECT note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
-    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+    current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
+    if not current or current['state'] not in ('running', 'stopped') or \
+            (current['note'] or '').startswith(BOX_WEDGED_NOTE):
         return None
     box_id = row["box_id"]
     from . import allocation
