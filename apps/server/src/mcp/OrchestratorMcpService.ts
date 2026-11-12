@@ -719,6 +719,48 @@ function stableCommandId(input: {
   );
 }
 
+function delegationCommandId(
+  scope: McpThreadInvocationScope,
+  parent: Pick<OrchestrationV2ThreadProjection, "subagents">,
+  key: string,
+): CommandId {
+  // Old receipts used the credential namespace. Recover those tasks too, so
+  // rotating a credential during an upgrade does not duplicate accepted work.
+  for (const task of parent.subagents) {
+    if (
+      task.origin !== "app_owned" ||
+      task.threadId !== scope.thread.threadId ||
+      !task.id.startsWith("node:delegated-task:")
+    )
+      continue;
+    let command: string;
+    try {
+      command = decodeURIComponent(task.id.slice("node:delegated-task:".length));
+    } catch {
+      continue;
+    }
+    const parts = command.split(":");
+    if (
+      parts.length === 5 &&
+      parts[0] === "command" &&
+      parts[1] === "mcp" &&
+      parts[3] === "delegate-task" &&
+      parts[4] === stablePart(key)
+    )
+      return CommandId.make(command);
+  }
+  return CommandId.make(
+    [
+      "command",
+      "mcp",
+      "delegate-task",
+      stablePart(scope.environmentId),
+      stablePart(scope.thread.threadId),
+      stablePart(key),
+    ].join(":"),
+  );
+}
+
 function stableThreadId(input: {
   readonly scope: McpInvocationScope;
   readonly requestKey: string;
@@ -1753,6 +1795,7 @@ const make = Effect.gen(function* () {
     acknowledgeTerminal: boolean | "background" = false,
     acknowledgementOperation = "task-status-acknowledge",
     onProgress?: (value: Partial<OrchestratorMcpDelegateTaskResult>) => void,
+    observe?: (result: OrchestratorMcpDelegateTaskResult) => Effect.Effect<void>,
   ): Effect.fn.Return<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure> {
     yield* requireCapability(scope);
     const parentProjection = yield* threadManagement
@@ -2027,6 +2070,7 @@ const make = Effect.gen(function* () {
           : pendingTaskApproval(childControls, task.id, childRun),
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
+    if (observe !== undefined) yield* observe(response);
     if (
       acknowledgeTerminal &&
       isTerminalTaskStatus(status) &&
@@ -2069,6 +2113,9 @@ const make = Effect.gen(function* () {
           ),
           Effect.forkIn(serviceScope),
         );
+      } else if (observe !== undefined) {
+        const delivery = yield* acknowledge.pipe(Effect.forkIn(serviceScope));
+        yield* Fiber.join(delivery);
       } else {
         yield* acknowledge;
       }
@@ -2076,46 +2123,42 @@ const make = Effect.gen(function* () {
     return response;
   });
 
-  const waitForTask = Effect.fn("OrchestratorMcpService.waitForTask")(
-    function* (scope: McpThreadInvocationScope, taskId: NodeId, _timeoutMs: number) {
-      const streamError = (error: unknown) =>
-        failure(
-          "orchestration_error",
-          `Unable to watch delegated task ${taskId}: ${errorMessage(error)}`,
-        );
-      // Sequences are global, so one cursor taken before the first read
-      // replays anything either thread records after it.
-      const afterSequence = yield* threadManagement
-        .getThreadEventSequence(scope.thread.threadId)
-        .pipe(Effect.mapError(streamError));
-      const initial = yield* readTask(scope, taskId, false, true);
-      if (endsTaskWait(initial)) {
-        return Option.some(initial);
-      }
-      // One stream per event type, so transcript events never fill a buffer.
-      return yield* Stream.mergeAll(
-        TASK_WAKE_EVENTS.map(({ thread, eventType }) =>
-          threadManagement.streamStoredEventsFrom({
-            threadId: thread === "parent" ? scope.thread.threadId : initial.childThreadId,
-            afterSequence,
-            eventType,
-          }),
-        ),
-        { concurrency: "unbounded" },
-      ).pipe(
-        Stream.mapError(streamError),
-        Stream.mapEffect(() => readTask(scope, taskId, false, true)),
-        Stream.filter(endsTaskWait),
-        Stream.runHead,
+  const waitForTask = Effect.fn("OrchestratorMcpService.waitForTask")(function* (
+    scope: McpThreadInvocationScope,
+    taskId: NodeId,
+    observe?: (result: OrchestratorMcpDelegateTaskResult) => Effect.Effect<void>,
+  ) {
+    const streamError = (error: unknown) =>
+      failure(
+        "orchestration_error",
+        `Unable to watch delegated task ${taskId}: ${errorMessage(error)}`,
       );
-    },
-    (effect, _scope, _taskId, timeoutMs) =>
-      effect.pipe(
-        McpDeadline.awaitInterruptibly,
-        Effect.timeoutOption(Duration.millis(timeoutMs)),
-        Effect.map(Option.flatten),
+    // Sequences are global, so one cursor taken before the first read
+    // replays anything either thread records after it.
+    const afterSequence = yield* threadManagement
+      .getThreadEventSequence(scope.thread.threadId)
+      .pipe(Effect.mapError(streamError));
+    const initial = yield* readTask(scope, taskId, false, true, undefined, undefined, observe);
+    if (endsTaskWait(initial)) {
+      return Option.some(initial);
+    }
+    // One stream per event type, so transcript events never fill a buffer.
+    return yield* Stream.mergeAll(
+      TASK_WAKE_EVENTS.map(({ thread, eventType }) =>
+        threadManagement.streamStoredEventsFrom({
+          threadId: thread === "parent" ? scope.thread.threadId : initial.childThreadId,
+          afterSequence,
+          eventType,
+        }),
       ),
-  );
+      { concurrency: "unbounded" },
+    ).pipe(
+      Stream.mapError(streamError),
+      Stream.mapEffect(() => readTask(scope, taskId, false, true, undefined, undefined, observe)),
+      Stream.filter(endsTaskWait),
+      Stream.runHead,
+    );
+  });
 
   const scheduledTaskRunModes = Effect.fn("OrchestratorMcpService.scheduledTaskRunModes")(
     function* (task: ScheduledTask) {
@@ -2579,11 +2622,7 @@ const make = Effect.gen(function* () {
       const providers = yield* bounded("catalog", loadProviders);
       const key = yield* bounded("request_key", requestKey(input.clientRequestId));
       retryKey = key;
-      const commandId = stableCommandId({
-        scope,
-        requestKey: key,
-        operation: "delegate-task",
-      });
+      const commandId = delegationCommandId(scope, parent, key);
       const isRetryOfAcceptedDelegation = yield* bounded(
         "receipt",
         threadManagement.hasReceipt(commandId),
@@ -2699,65 +2738,115 @@ const make = Effect.gen(function* () {
       const childRunEvent = result.storedEvents.find(
         (stored) => stored.event.type === "run.created" && stored.event.threadId === childThreadId,
       );
-      if (
+      if (childThreadId === null) {
+        return yield* failure("orchestration_error", "Accepted delegation has no child thread.");
+      }
+      const childRun =
+        childRunEvent?.event.type === "run.created" ? childRunEvent.event.payload : undefined;
+      const snapshot = yield* Ref.make<OrchestratorMcpDelegateTaskResult>({
+        taskId,
+        childThreadId,
+        childRunId: childRun?.id ?? null,
+        childNodeId: taskId,
+        status: "running",
+        startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
+        startPending: childRun?.startedAt == null,
+        workState: "working",
+        hasPendingChildRuns: false,
+        providerInstanceId: taskEvent.event.payload.providerInstanceId,
+        model: taskEvent.event.payload.model,
+        options: childRun?.modelSelection?.options ?? target.modelSelection.options ?? [],
+        summary: null,
+        resultContextTransferId: null,
+        latestTerminalRunId: null,
+        latestTerminalStatus: null,
+        latestTerminalSummary: null,
+        latestTerminalResultContextTransferId: null,
+        hasPendingQuestion: false,
+        pendingApproval: null,
+        waitTimedOut: input.mode === "wait",
+      });
+      // Preparation belongs to the service, not the transport request. A timed
+      // out caller must not cancel work whose command already committed.
+      const preparation =
         childThreadId !== null &&
         childRunEvent?.event.type === "run.created" &&
         childRunEvent.event.payload.workspacePreparation !== undefined
-      ) {
-        yield* bounded(
-          "workspace_preparation",
-          threadLaunch.prepareRun({
-            commandId,
-            threadId: childThreadId,
-            runId: childRunEvent.event.payload.id,
-          }),
-          taskId,
-        );
-      }
-
-      if (input.mode !== "wait") {
-        return yield* bounded("result", readTask(scope, taskId, false, true), taskId);
-      }
-      const timeoutMs = yield* remainingWaitMs(waitStartedAt, input.timeoutMs);
-      const waited = yield* waitForTask(scope, taskId, timeoutMs);
-      if (Option.isSome(waited) && isTerminalTaskStatus(waited.value.status)) {
-        return waited.value;
-      }
-      // An incomplete wait gives up delivery: upgrade so a later terminal
-      // wakes the parent even mid-turn.
-      yield* threadManagement
-        .dispatch({
-          type: "delegated_task.wake-policy",
-          commandId: stableCommandId({
-            scope,
-            requestKey: key,
-            operation: "delegate-task-wake-policy",
-          }),
-          parentThreadId: scope.thread.threadId,
-          taskId,
-          completionWake: "always",
-        })
-        .pipe(
-          (effect) => bounded("wake_policy", effect, taskId),
-          Effect.catch((error) =>
-            Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-              taskId,
-              outcome:
-                error._tag === "OrchestratorCommandPreviouslyRejectedError"
-                  ? "previously_rejected"
-                  : "dispatch_failed",
-              error,
-            }),
+          ? yield* threadLaunch
+              .prepareRun({
+                commandId,
+                threadId: childThreadId,
+                runId: childRunEvent.event.payload.id,
+              })
+              .pipe(Effect.forkIn(serviceScope))
+          : undefined;
+      const observe = (value: OrchestratorMcpDelegateTaskResult) => Ref.set(snapshot, value);
+      const continuation = yield* Effect.gen(function* () {
+        if (preparation !== undefined) yield* Fiber.join(preparation);
+        if (input.mode !== "wait")
+          return yield* readTask(scope, taskId, false, true, undefined, undefined, observe);
+        const waited = yield* waitForTask(scope, taskId, observe);
+        if (Option.isSome(waited)) return waited.value;
+        return { ...(yield* Ref.get(snapshot)), waitTimedOut: true };
+      }).pipe(Effect.forkIn(serviceScope));
+      const response = yield* Fiber.join(continuation).pipe(
+        Effect.timeoutOption(
+          Duration.millis(
+            yield* remainingWaitMs(
+              waitStartedAt,
+              input.mode === "wait" ? input.timeoutMs : MAX_WAIT_TIMEOUT_MS,
+            ),
           ),
-          Effect.catchCause((cause) =>
-            Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-              taskId,
-              outcome: "defect",
-              cause,
+        ),
+        // A disconnect must not leave an event subscription behind. Interrupt
+        // observation without joining a potentially blocked read or writer.
+        Effect.ensuring(
+          Fiber.interrupt(continuation).pipe(Effect.forkIn(serviceScope), Effect.asVoid),
+        ),
+      );
+      const answer = Option.isSome(response)
+        ? response.value
+        : {
+            ...(yield* Ref.get(snapshot)),
+            waitTimedOut: input.mode === "wait",
+          };
+      // Upgrading delivery cannot be on the response deadline: a slow writer
+      // must not hide the identity of an already accepted task.
+      if (input.mode === "wait" && (answer.waitTimedOut || !isTerminalTaskStatus(answer.status))) {
+        yield* threadManagement
+          .dispatch({
+            type: "delegated_task.wake-policy",
+            commandId: stableCommandId({
+              scope,
+              requestKey: key,
+              operation: "delegate-task-wake-policy",
             }),
-          ),
-        );
-      return yield* bounded("result", readTask(scope, taskId, Option.isNone(waited), true), taskId);
+            parentThreadId: scope.thread.threadId,
+            taskId,
+            completionWake: "always",
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                taskId,
+                outcome:
+                  error._tag === "OrchestratorCommandPreviouslyRejectedError"
+                    ? "previously_rejected"
+                    : "dispatch_failed",
+                error,
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                taskId,
+                outcome: "defect",
+                cause,
+              }),
+            ),
+            Effect.forkIn(serviceScope),
+          );
+      }
+      return answer;
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");

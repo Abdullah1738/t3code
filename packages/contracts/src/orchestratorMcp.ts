@@ -229,7 +229,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   ),
   startPending: Schema.optional(Schema.Boolean).annotate({
     description:
-      "True means the child's provider turn has not started yet (waiting for a server worker); it is not executing.",
+      "True means the child's provider turn has not been observed starting yet (including pending run creation, workspace preparation or a server worker); keep taskId for later status reads.",
   }),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
   hasPendingChildRuns: Schema.Boolean,
@@ -528,7 +528,8 @@ export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Finite).annotate({
-    description: "Total wait budget from call start, including lookup. Defaults to and is capped at 4 minutes 30 seconds.",
+    description:
+      "Total wait budget from call start, including lookup. Defaults to and is capped at 4 minutes 30 seconds.",
   }),
 });
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
@@ -685,7 +686,10 @@ export const OrchestratorMcpRequestSecretInput = Schema.Struct({
   }),
   timeoutMs: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 60 * 60 * 1_000 })),
-  ).annotate({ description: "Total wait budget from call start, including setup. Defaults to and is capped at 4 minutes 30 seconds." }),
+  ).annotate({
+    description:
+      "Total wait budget from call start, including setup. Defaults to and is capped at 4 minutes 30 seconds.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId).annotate({
     description:
       "Reuse when retrying a call that lost its result, so the user sees one card and its answer is returned again. Use a new id to ask again after timed_out or cancelled.",
