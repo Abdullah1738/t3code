@@ -1609,7 +1609,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? activeProviderThread
         : storedQueuedProviderThread;
       const providerThreadChanged = queuedProviderThread.id !== providerThreadId;
-      const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
+      const restartWait = yield* projectionStore.getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(
+          `turn-item:restart-pacing:${queuedRun.restartContinuationOfRunId ?? queuedRun.id}`,
+        ),
+      });
+      // A fresh message can put a paced run back in the queue more than once.
+      // Each promotion needs executable work even if the old effect settled.
+      const commandId =
+        restartWait === null
+          ? CommandId.make(`command:system:start-queued:${queuedRun.id}`)
+          : yield* idAllocator.allocate.command({
+              fixtureName: "restart-pacing",
+              commandName: "start-queued",
+            });
       const now = yield* DateTime.now;
       const selectionChanged = !modelSelectionsEqual(
         projection.thread.modelSelection,
@@ -4955,6 +4969,69 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    let restartPacingBypassed = false;
+    if (countsAsUserTurn(command) && command.scheduledTaskId === undefined) {
+      for (const run of projection.runs) {
+        if (
+          run.status !== "starting" ||
+          projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId)
+        )
+          continue;
+        const sourceRunId = run.restartContinuationOfRunId ?? run.id;
+        const wait = yield* projectionStore
+          .getTurnItem({
+            threadId: command.threadId,
+            itemId: TurnItemId.make(`turn-item:restart-pacing:${sourceRunId}`),
+          })
+          .pipe(mapDispatchError(command));
+        if (wait === null || wait.type !== "notification" || wait.status !== "waiting") continue;
+        const now = yield* DateTime.now;
+        // A paced provider start has not touched the harness yet. Put its saved
+        // input back in the normal queue so a fresh person turn can start now.
+        const queued = yield* emit(
+          events,
+          command,
+        )({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...run,
+            status: "queued",
+            startedAt: null,
+            completedAt: null,
+            queueHeld: false,
+            queuePosition:
+              Math.max(
+                0,
+                ...projection.runs
+                  .filter((candidate) => candidate.status === "queued")
+                  .map((candidate) => candidate.queuePosition ?? candidate.ordinal),
+              ) + 1,
+          },
+        });
+        projection = applyToProjection(projection, queued);
+        const cleared = yield* emit(
+          events,
+          command,
+        )({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          ...(wait.runId === null ? {} : { runId: wait.runId }),
+          occurredAt: now,
+          payload: {
+            ...wait,
+            status: "completed",
+            completedAt: now,
+            updatedAt: now,
+            summary: "Queued after your new message",
+          },
+        });
+        projection = applyToProjection(projection, cleared);
+        restartPacingBypassed = true;
+      }
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -5162,11 +5239,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection,
       command.modelSelection ?? projection.thread.modelSelection,
     );
-    let dispatchMode = resolveMessageDispatchIntent(
-      projection,
-      command.dispatchMode,
-      command.deliveryIntent,
-    );
+    let dispatchMode =
+      restartPacingBypassed && command.dispatchMode.type !== "defer_start"
+        ? { type: "start_immediately" as const }
+        : resolveMessageDispatchIntent(projection, command.dispatchMode, command.deliveryIntent);
     if (dispatchMode.type === "steer_active") {
       const targetRunId = dispatchMode.targetRunId;
       const target = projection.runs.find((run) => run.id === targetRunId);

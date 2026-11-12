@@ -1,3 +1,4 @@
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -917,7 +918,7 @@ it.effect("prioritizes a preparation cut while retaining the prior run backgroun
         lastError: null,
       },
     });
-    const settledRun = yield* createRun(threadId, "completed", { providerThreadId });
+    yield* createRun(threadId, "completed", { providerThreadId });
     const preparingRun = yield* createRun(threadId, "starting", {
       ordinal: 2,
       providerThreadId,
@@ -1226,7 +1227,7 @@ it.effect.each(["preparing", "starting"] as const)(
     }).pipe(Effect.provide(layerRecoveryTest)),
 );
 
-it.effect("publishes per-thread readiness after commit before global recovery completes", () =>
+it.effect("publishes startup callbacks after all recovery transactions commit", () =>
   Effect.gen(function* () {
     const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
     const sql = yield* SqlClient.SqlClient;
@@ -1242,10 +1243,56 @@ it.effect("publishes per-thread readiness after commit before global recovery co
             status: string;
           }>`SELECT status FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}`;
           assert.equal(rows[0]?.status, "cancelled");
+          const pending = yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id IN (${a}, ${b}) AND status != 'cancelled'`;
+          assert.equal(pending[0]?.count, 0);
           seen.push(threadId);
         }),
       ),
     );
     assert.deepEqual(seen.sort(), [a, b].sort());
   }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect(
+  "captures pacing at construction and registers retained shutdown wakes before callbacks",
+  () => {
+    const registered: string[] = [];
+    const registry = Layer.succeed(RestartPacing.RestartPacing, {
+      register: (input) =>
+        Effect.sync(() => {
+          registered.push(input.sourceRunId);
+        }),
+      acquire: () => Effect.succeed(0),
+      acquireRun: () => Effect.succeed(0),
+      dispatched: () => Effect.void,
+    });
+    return Effect.gen(function* () {
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const runs: RunId[] = [];
+      for (const name of ["retained-worker", "retained-owner"]) {
+        const threadId = yield* createThread(name);
+        const runId = yield* createRun(threadId, "preparing", { startedAt: null });
+        runs.push(runId);
+        yield* outbox.enqueue([
+          {
+            id: `effect:restart-continuation:${runId}`,
+            commandId: CommandId.make(`command:restart-prepare:${runId}`),
+            threadId,
+            request: { type: "provider-runtime.continue", sourceRunId: runId },
+          },
+        ]);
+      }
+      yield* recovery
+        .reconcile("startup")
+        .pipe(
+          Effect.provideService(ProviderRuntimeRecovery.ReconciledThreadContinuation, () =>
+            Effect.sync(() => assert.deepEqual(registered.toSorted(), runs.toSorted())),
+          ),
+        );
+      assert.deepEqual(registered.toSorted(), runs.toSorted());
+    }).pipe(Effect.provide(layerRecoveryTest.pipe(Layer.provide(registry))));
+  },
 );
