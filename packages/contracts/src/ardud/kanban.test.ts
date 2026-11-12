@@ -677,7 +677,7 @@ const scriptSubtask = (
   id: string,
   step: number,
   text: string,
-  owner: "script" | "evaluator" | "work",
+  owner: "script" | "evaluator" | "work" | "review",
   state: "open" | "done" = "open",
 ) => ({
   id,
@@ -1083,4 +1083,42 @@ describe("KanbanCard wait", () => {
       true,
     );
   });
+});
+
+describe("worker dispatch uses the current step", () => {
+  it.each(["evaluator", "script", "review"] as const)(
+    "does not let owner/system notes bypass a %s step",
+    (owner) => {
+      const subtasks = [
+        scriptSubtask("s7", 3, "Hold", owner),
+        scriptSubtask("s4", 4, "Later work", "work"),
+      ];
+      expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: "Owner says go", subtasks })).toBe(
+        true,
+      );
+    },
+  );
+  it("allows findings only at the review step, including fresh-thread notes", () => {
+    const note = "Fresh thread: earlier context ended.\n\nReview findings (round 1):\n- Fix rate";
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: note,
+        subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+      }),
+    ).toBe(false);
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: note,
+        subtasks: [scriptSubtask("s3", 3, "Merge", "evaluator")],
+      }),
+    ).toBe(true);
+  });
+});
+
+it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
+  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s2", 2, "Review", "review")] })).toBe(false);
+  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s3", 3, "Hold", "evaluator"), scriptSubtask("s4", 4, "Review", "review")] })).toBe(true);
+  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s3", 3, "Hold", "script"), scriptSubtask("s4", 4, "Review", "review")] })).toBe(true);
 });

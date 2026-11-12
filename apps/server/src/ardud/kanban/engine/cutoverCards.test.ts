@@ -542,3 +542,37 @@ it.effect(
     );
   },
 );
+
+it("refuses worker cutover restoration while an evaluator step precedes work", () => {
+  const result = planCutoverCardRestore(
+    fixture({
+      card: {
+        ...stopped,
+        wakeNote: "Owner replied",
+        subtasks: [
+          {
+            id: "s7",
+            step: 3,
+            text: "Wait for QA",
+            owner: "evaluator",
+            state: "open",
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+          {
+            id: "s4",
+            step: 4,
+            text: "Later work",
+            owner: "work",
+            state: "open",
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+        ],
+      },
+    }),
+  );
+  assert.isFalse(result.ok);
+});

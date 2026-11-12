@@ -649,7 +649,9 @@ export function confirmDispatch(
     return false;
   if (
     dispatch.role === "work" &&
-    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+    (kanbanWaitsOnEvaluator(card) ||
+      isBlocked(card, byId) ||
+      (dispatch.fresh && isBlocked(card, byId, null)))
   )
     return false;
   const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;

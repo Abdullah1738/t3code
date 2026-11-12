@@ -9,6 +9,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   evaluatorBrief,
+  claimBrief,
+  wakeText,
   nudgeWorkText,
   reviewBrief,
   workBrief,
@@ -135,6 +137,50 @@ describe("board briefs", () => {
       expect(brief).toContain("Preserve the routed model and effort exactly in target.options");
       expect(brief).toContain("Do not pass an `agent` selector");
       expect(brief).toContain("The board review thread alone records card_review_result");
+    }
+  });
+});
+
+describe("current-step plan rendering", () => {
+  it("replaces legacy frozen plans in fresh, reused and claimed briefs", () => {
+    const oldPlan =
+      "Next on the plan:\nSubtasks (same step means any order; a step opens when the ones before are done or skipped):\n- s2 step 2, worker (now): Removed work\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.";
+    const current = {
+      ...card,
+      wakeNote: `Owner says keep the rate.\n\n${oldPlan}\n\nLater owner words.`,
+      subtasks: [
+        {
+          id: "s7",
+          step: 3,
+          text: "Wait for QA",
+          owner: "evaluator" as const,
+          state: "open" as const,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+        {
+          id: "s4",
+          step: 4,
+          text: "Current work",
+          owner: "work" as const,
+          state: "open" as const,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    };
+    for (const brief of [
+      workBrief(board, current, null),
+      wakeText(current),
+      claimBrief(current, null, current.wakeNote),
+    ]) {
+      expect(brief).not.toContain("Removed work");
+      expect(brief).toContain("evaluator (now): Wait for QA");
+      expect(brief).toContain("worker (later): Current work");
+      expect(brief).toContain("Owner says keep the rate.");
+      expect(brief).toContain("Later owner words.");
     }
   });
 });

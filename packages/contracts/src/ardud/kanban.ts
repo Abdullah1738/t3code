@@ -960,6 +960,8 @@ export const KanbanCard = Schema.Struct({
   /** Position in the review chain while in review; reset when findings send it back. */
   reviewStep: NonNegativeInt,
   reviewRound: NonNegativeInt,
+  /** Findings remain actionable through worker retries after the delivery note is consumed. */
+  reviewFindingsPending: Schema.optional(Schema.Boolean),
   activeThreadId: Schema.NullOr(ThreadId),
   activeRole: Schema.NullOr(Schema.Literals(["work", "review"])),
   /** Pool key (instance/model#level) the active thread holds a slot in. */
@@ -1237,16 +1239,27 @@ export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean =>
 };
 
 /**
- * A todo card the dispatcher leaves alone because its step is the
- * evaluator's or a board script's. One with a wake note still goes back to
- * its worker: review findings and the owner's words have to reach it.
+ * Unplanned cards retain the legacy workflow. Planned work uses the same open
+ * step as subtask_done; a note never grants work on a later step. Findings
+ * leave the review subtask open, so that review-only step is the one exception.
+ * Its durable verdict bit survives note consumption, retries and fresh threads;
+ * the header fallback supports cards saved before that bit existed.
  */
+export const kanbanWorkStep = (card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">): boolean => {
+  if (card.subtasks.length === 0) return true;
+  const open = kanbanStepSubtasks(card);
+  return (
+    open.some((subtask) => subtask.owner === "work") ||
+    (open.length > 0 &&
+      open.every((subtask) => subtask.owner === "review") &&
+      (card.reviewFindingsPending === true || /(?:^|\n)Review findings \(round \d+\):/.test(card.wakeNote ?? "")))
+  );
+};
+
+/** A todo card whose current step cannot be assigned to a worker. */
 export const kanbanWaitsOnEvaluator = (
-  card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks">,
-): boolean =>
-  card.stage === "todo" &&
-  card.wakeNote === null &&
-  (kanbanEvaluatorStep(card) || kanbanScriptStep(card));
+  card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks" | "reviewFindingsPending">,
+): boolean => card.stage === "todo" && !kanbanWorkStep(card);
 
 /** Stages past the work: a card here no longer blocks anything or waits on anything. */
 export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([

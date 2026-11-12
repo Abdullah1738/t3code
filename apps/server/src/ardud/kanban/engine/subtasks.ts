@@ -298,9 +298,20 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }
 
-/** The wake note that sends a card's worker to its next step. */
-export const nextStepNote = (card: Pick<KanbanCard, "subtasks">, lead = "") =>
-  `${lead}Next on the plan:\n${subtaskLines(card)}\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
+/** Only the lead is stored; briefs render the plan from the card at delivery. */
+export const nextStepNote = (lead = "") =>
+  `${lead}Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
+
+/** Remove plans frozen by older releases, retaining text before and after them. */
+export const wakeLead = (note: string | null): string | null => {
+  const lead = note
+    ?.replace(
+      /Next on the plan:\nSubtasks \(same step means any order;[\s\S]*?Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review\./g,
+      "",
+    )
+    .trim();
+  return lead || null;
+};
 
 /** Ids of open subtasks, for refusals: "s1, s3". */
 export const subtaskIds = (subtasks: ReadonlyArray<KanbanSubtask>) =>

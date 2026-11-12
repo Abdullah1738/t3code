@@ -11,7 +11,7 @@ import {
 import { reviewRetryNote } from "./retries.ts";
 import { MAX_BATCH } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
-import { subtaskIds, subtaskLines } from "./subtasks.ts";
+import { subtaskIds, subtaskLines, wakeLead } from "./subtasks.ts";
 
 const lines = (...parts: ReadonlyArray<string | null | false | undefined>) =>
   parts.filter((part): part is string => typeof part === "string").join("\n");
@@ -40,7 +40,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "",
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
-    card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
+    wakeLead(card.wakeNote) ? `\nWaiting for this card:\n${wakeLead(card.wakeNote)}` : null,
     "",
     "How the board works:",
     '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, evaluator_start (kind "request" only).',
@@ -77,7 +77,7 @@ export const claimBrief = (card: KanbanCard, goal: KanbanGoal | null, note: stri
     "",
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
-    note?.trim() ? `\nWaiting for this card:\n${note.trim()}` : null,
+    wakeLead(note) ? `\nWaiting for this card:\n${wakeLead(note)}` : null,
     "",
     `Pass card "#${card.number}" to card_update, card_move, card_flag and subtask_done for this card. Attach its PRs yourself with card_update (links) before moving it to needs_review: with several cards on this thread the board can't tell which PR is whose.`,
   );
@@ -156,9 +156,13 @@ export const handBackText = (
 
 /** Sent when the dispatcher wakes an existing work thread. */
 export const wakeText = (card: KanbanCard) =>
-  card.wakeNote?.trim()
-    ? lines(`Card #${card.number} is back with you.`, "", card.wakeNote.trim())
-    : `Card #${card.number} is back with you. Continue the work, then card_move to needs_review when done.`;
+  lines(
+    `Card #${card.number} is back with you.`,
+    "",
+    wakeLead(card.wakeNote),
+    subtaskLines(card),
+    "Continue the work, then card_move to needs_review when done.",
+  );
 
 /** Given to the fresh thread that takes over a card whose thread got too long. */
 export const FRESH_THREAD_NOTE = lines(
@@ -192,7 +196,7 @@ export const reviewBrief = (
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
     // A reviewer woken on its own thread (a wait that ended, new commits) needs the note too.
-    card.wakeNote?.trim() ? `\nNote for this review:\n${card.wakeNote.trim()}` : null,
+    wakeLead(card.wakeNote) ? `\nNote for this review:\n${wakeLead(card.wakeNote)}` : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
