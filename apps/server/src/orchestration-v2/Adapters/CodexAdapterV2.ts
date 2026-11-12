@@ -7415,6 +7415,38 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               ),
           ),
+          listLoadedNativeThreads: Effect.fn("CodexAdapterV2.listLoadedNativeThreads")(
+            function* () {
+              const ids = new Set<string>();
+              const cursors = new Set<string>();
+              let cursor: string | undefined;
+              do {
+                const page = yield* client.request("thread/loaded/list", {
+                  limit: 100,
+                  ...(cursor === undefined ? {} : { cursor }),
+                });
+                for (const id of page.data) ids.add(id);
+                cursor = page.nextCursor ?? undefined;
+                if (cursor !== undefined && cursors.has(cursor)) {
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Codex loaded-thread listing repeated a cursor",
+                  });
+                }
+                if (cursor !== undefined) cursors.add(cursor);
+              } while (cursor !== undefined);
+              return [...ids];
+            },
+            Effect.mapError((cause) =>
+              cause._tag === "ProviderAdapterProtocolError"
+                ? cause
+                : new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Failed to list loaded Codex threads",
+                    cause: normalizeCodexCause(cause),
+                  }),
+            ),
+          ),
           // Dropping this connection's subscription lets the shared app-server
           // shut the native thread (and its MCP servers) down once it is idle.
           unloadThread: Effect.fn("CodexAdapterV2.unloadThread")(
