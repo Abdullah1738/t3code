@@ -151,6 +151,7 @@ describe("prWatchesOf", () => {
       failedChecks: [],
       passed: false,
       passedChecks: [],
+      passedPending: [],
       remarksThrough: FINISHED_AT,
       remarkIds: [],
       conflicting: false,

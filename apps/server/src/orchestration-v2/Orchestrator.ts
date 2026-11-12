@@ -3476,6 +3476,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     failedChecks: [],
                     passed: false,
                     passedChecks: [],
+                    passedPending: [],
                     conflicting: false,
                     // Watching again must not repeat check or conflict news the last watch told.
                     ...(existing.endedWatch && {

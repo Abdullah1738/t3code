@@ -19,6 +19,7 @@ const watch = (overrides: Partial<ThreadPullRequestWatch> = {}): ThreadPullReque
   failedChecks: [],
   passed: false,
   passedChecks: [],
+  passedPending: [],
   remarksThrough: STARTED,
   remarkIds: [],
   conflicting: false,
@@ -134,9 +135,83 @@ describe("evaluatePullRequestWatch", () => {
       detail({ checks: [check("test", "success")] }),
       noRemarks,
     );
-    assert.deepEqual(first.changes, [{ kind: "checks-passed", count: 1, required: false }]);
+    assert.deepEqual(first.changes, []);
+    const confirmed = evaluatePullRequestWatch(
+      first.next,
+      detail({ checks: [check("test", "success")] }),
+      noRemarks,
+    );
+    assert.deepEqual(confirmed.changes, [{ kind: "checks-passed", count: 1, required: false }]);
     const both = detail({ checks: [check("test", "success"), check("lint", "success")] });
-    assert.deepEqual(evaluatePullRequestWatch(first.next, both, noRemarks).changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(confirmed.next, both, noRemarks).changes, []);
+  });
+
+  it("requires two matching green passes without required checks", () => {
+    const green = detail({ checks: [check("A", "success"), check("B", "success")] });
+    const first = evaluatePullRequestWatch(watch(), green, noRemarks);
+    assert.deepEqual(first.changes, []);
+    assert.deepEqual(first.next.passedPending, ["A", "B"]);
+    assert.isFalse(first.next.passed);
+    const second = evaluatePullRequestWatch(
+      first.next,
+      { ...green, checks: green.checks.toReversed() },
+      noRemarks,
+    );
+    assert.deepEqual(second.changes, [{ kind: "checks-passed", count: 2, required: false }]);
+    assert.deepEqual(evaluatePullRequestWatch(second.next, green, noRemarks).changes, []);
+  });
+
+  it("does not report passed on 217c50a while Terraform is queued", () => {
+    const queued = detail({
+      headSha: "217c50acf103b1add10865275cc20dd692b04c42",
+      checks: [check("Kafka broker-rights", "success"), check("Terraform", "pending")],
+    });
+    const first = evaluatePullRequestWatch(watch(), queued, noRemarks);
+    assert.deepEqual(first.changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(first.next, queued, noRemarks).changes, []);
+    assert.deepEqual(first.next.passedPending, []);
+  });
+
+  it("restarts confirmation when a later workflow appears", () => {
+    const early = detail({ checks: [check("A", "success")] });
+    const first = evaluatePullRequestWatch(watch(), early, noRemarks);
+    const queued = detail({ checks: [check("A", "success"), check("B", "pending")] });
+    const second = evaluatePullRequestWatch(first.next, queued, noRemarks);
+    assert.deepEqual(second.changes, []);
+    assert.deepEqual(second.next.passedPending, []);
+    const green = detail({ checks: [check("A", "success"), check("B", "success")] });
+    const third = evaluatePullRequestWatch(second.next, green, noRemarks);
+    assert.deepEqual(third.changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(third.next, green, noRemarks).changes, [
+      { kind: "checks-passed", count: 2, required: false },
+    ]);
+  });
+
+  it("restarts confirmation for a different green gate, a missing read, or a new head", () => {
+    const green = detail({ checks: [check("A", "success")] });
+    const first = evaluatePullRequestWatch(watch(), green, noRemarks);
+    const changed = evaluatePullRequestWatch(
+      first.next,
+      detail({ checks: [check("B", "success")] }),
+      noRemarks,
+    );
+    assert.deepEqual(changed.changes, []);
+    assert.deepEqual(changed.next.passedPending, ["B"]);
+    const missing = evaluatePullRequestWatch(first.next, detail({ checks: [] }), noRemarks);
+    assert.deepEqual(missing.next.passedPending, []);
+    assert.deepEqual(evaluatePullRequestWatch(missing.next, green, noRemarks).changes, []);
+    const pushed = evaluatePullRequestWatch(
+      first.next,
+      { ...green, headSha: "bbbbbbbbbb" },
+      noRemarks,
+    );
+    assert.deepEqual(pushed.changes, []);
+    const emptyPush = evaluatePullRequestWatch(
+      first.next,
+      detail({ headSha: "bbbbbbbbbb", checks: [] }),
+      noRemarks,
+    );
+    assert.deepEqual(emptyPush.next.passedPending, []);
   });
 
   it("does not wake a watch saved before passed checks were recorded", () => {

@@ -7854,6 +7854,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             failedChecks: [],
             passed: false,
             passedChecks: [],
+            passedPending: [],
             remarksThrough: DateTime.formatIso(at),
             remarkIds: [],
             conflicting: false,
