@@ -48,6 +48,17 @@ export class MigrateDevDbSourceMissingError extends Schema.TaggedError<MigrateDe
   }
 }
 
+export class MigrateDevDbSourceEmptyError extends Schema.TaggedError<MigrateDevDbSourceEmptyError>()(
+  "MigrateDevDbSourceEmptyError",
+  {
+    sourcePath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Source database '${this.sourcePath}' is empty (no tables). Pass --source <path to a real statev2.sqlite>, or skip migrate-dev-db and let the dev server create a fresh database in the worktree .t3.`;
+  }
+}
+
 export class MigrateDevDbSourceIsDestinationError extends Schema.TaggedError<MigrateDevDbSourceIsDestinationError>()(
   "MigrateDevDbSourceIsDestinationError",
   {
@@ -233,11 +244,16 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
   const schema = yield* sql<{ type: string; name: string; sql: string }>`
     SELECT type, name, sql FROM src.sqlite_master
     WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`;
+  const tables = schema.filter((entry) => entry.type === "table");
+  if (tables.length === 0) {
+    return yield* new MigrateDevDbSourceEmptyError({ sourcePath });
+  }
+  const sequenceTables = yield* sql`
+    SELECT name FROM src.sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`;
   const threadColumns = yield* sql<{ name: string; notnull: number }>`
     SELECT m.name, c."notnull" FROM src.sqlite_master m, pragma_table_info(m.name, 'src') c
     WHERE m.type = 'table' AND c.name = 'thread_id'`;
   const threadIdNullable = new Map(threadColumns.map((row) => [row.name, row.notnull === 0]));
-  const tables = schema.filter((entry) => entry.type === "table");
   const filtered = tables.some((table) => table.name === "orchestration_v2_projection_threads");
 
   yield* sql.withTransaction(
@@ -267,8 +283,10 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
         yield* sql.unsafe(`INSERT INTO main."${name}" SELECT * FROM src."${name}" ${filter}`)
           .unprepared;
       }
-      yield* sql`DELETE FROM main.sqlite_sequence`;
-      yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
+      if (sequenceTables.length > 0) {
+        yield* sql`DELETE FROM main.sqlite_sequence`;
+        yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
+      }
       for (const entry of schema) {
         if (entry.type !== "table") yield* sql.unsafe(entry.sql).unprepared;
       }
@@ -439,6 +457,9 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   if (!(yield* fs.exists(sourcePath))) {
     return yield* new MigrateDevDbSourceMissingError({ sourcePath });
   }
+  if ((yield* fs.stat(sourcePath)).size === 0n) {
+    return yield* new MigrateDevDbSourceEmptyError({ sourcePath });
+  }
   const [canonicalBaseDir, canonicalSharedHome] = yield* Effect.all([
     fs.realPath(baseDir).pipe(Effect.orElseSucceed(() => baseDir)),
     fs.realPath(sharedHome).pipe(Effect.orElseSucceed(() => sharedHome)),
@@ -478,7 +499,12 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     yield* Console.log(`Copying visible threads from ${sourcePath} (read-only)...`);
     yield* copySourceSlice(sourcePath).pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
-      wrapPhase("snapshot", sourcePath),
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new MigrateDevDbPhaseError({ phase: "snapshot", databasePath: sourcePath, cause }),
+          ),
+      }),
     );
 
     // Migrate before pruning: a source older than this checkout would
