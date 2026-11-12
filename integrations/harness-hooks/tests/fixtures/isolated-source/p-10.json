@@ -1,0 +1,31 @@
+{
+  "file": "rollout-2026-11-11T13-00-21-01a1c9d6-3438-7453-8d0d-8af2c36a542e.jsonl",
+  "timestamp": "2026-11-11T10:47:27.126Z",
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "payload": {
+    "type": "custom_tool_call",
+    "id": "ctc_0b002a45130f4543016af447b5f24c87d09fea0299e00954f5",
+    "status": "completed",
+    "call_id": "call_676da6a5e5e24788b4f52057572afabf",
+    "name": "exec",
+    "input": "text(await tools.exec_command({cmd:\"sed -n '1058,1076p' app/service/logging.py\\nsed -n '328,355p' tests/worker/notifications/test_modes.py\\nrg -n 'notification_content_store' tests/worker/notifications/test_modes.py\\n git status --short\",\"workdir\":\"/Users/ardud/checkouts/notif-content-2371\",\"max_output_tokens\":1000}));\ntext(await tools.exec_command({cmd:\"git show origin/native-v1:app/worker/notifications/processing.py > tmp/base-processing.py\\ncat > tmp/full-check.sh <<'EOF'\\nset -euo pipefail\\nuv sync --all-extras --dev --frozen\\nch=$(docker run -d -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1::8123 clickhouse/clickhouse-server:26.8.14.3)\\ntrap 'docker rm -f \\\"$ch\\\" >/dev/null' EXIT\\nport=$(docker port \\\"$ch\\\" 8123/tcp | cut -d: -f2)\\nexport CLICKHOUSE_INTEGRATION_URL=\\\"http://127.0.0.1:$port/\\\"\\nexport CLICKHOUSE_INTEGRATION_HOST=\\\"http://127.0.0.1:$port\\\"\\nexport CLICKHOUSE_INTEGRATION_USERNAME=default CLICKHOUSE_INTEGRATION_PASSWORD=\\\"\\\"\\nfor n in $(seq 1 40); do\\n  if curl -fsS \\\"$CLICKHOUSE_INTEGRATION_URL\\\" >/dev/null; then break; fi\\n  sleep 1\\ndone\\nmake check\\nEOF\\ncat > tmp/base-proof.sh <<'EOF'\\nset -euo pipefail\\ncp app/worker/notifications/processing.py tmp/head-processing.py\\ncp tmp/base-processing.py app/worker/notifications/processing.py\\ntrap 'cp tmp/head-processing.py app/worker/notifications/processing.py' EXIT\\nset +e\\nbash tmp/content-test.sh > tmp/base-proof.log 2>&1\\nstatus=$?\\nset -e\\ncat tmp/base-proof.log\\nif [ \\\"$status\\\" -eq 0 ]; then echo 'base unexpectedly passed'; exit 1; fi\\nEOF\",\"workdir\":\"/Users/ardud/checkouts/notif-content-2371\",\"max_output_tokens\":1000}));\n",
+    "internal_chat_message_metadata_passthrough": {
+      "turn_id": "01a1c9d6-4dc5-7771-8c10-461d06df5324",
+      "create_time": 1794394038.0315387
+    }
+  },
+  "commands": [
+    {
+      "cmd": "sed -n '1058,1076p' app/service/logging.py\nsed -n '328,355p' tests/worker/notifications/test_modes.py\nrg -n 'notification_content_store' tests/worker/notifications/test_modes.py\n git status --short",
+      "workdir": "/Users/ardud/checkouts/notif-content-2371",
+      "sha256": "4c5ffa276de63c87633f5ed2bc7e32898afabd8de325f67b7c2b56fb3e42c4a9"
+    },
+    {
+      "cmd": "git show origin/native-v1:app/worker/notifications/processing.py > tmp/base-processing.py\ncat > tmp/full-check.sh <<'EOF'\nset -euo pipefail\nuv sync --all-extras --dev --frozen\nch=$(docker run -d -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1::8123 clickhouse/clickhouse-server:26.8.14.3)\ntrap 'docker rm -f \"$ch\" >/dev/null' EXIT\nport=$(docker port \"$ch\" 8123/tcp | cut -d: -f2)\nexport CLICKHOUSE_INTEGRATION_URL=\"http://127.0.0.1:$port/\"\nexport CLICKHOUSE_INTEGRATION_HOST=\"http://127.0.0.1:$port\"\nexport CLICKHOUSE_INTEGRATION_USERNAME=default CLICKHOUSE_INTEGRATION_PASSWORD=\"\"\nfor n in $(seq 1 40); do\n  if curl -fsS \"$CLICKHOUSE_INTEGRATION_URL\" >/dev/null; then break; fi\n  sleep 1\ndone\nmake check\nEOF\ncat > tmp/base-proof.sh <<'EOF'\nset -euo pipefail\ncp app/worker/notifications/processing.py tmp/head-processing.py\ncp tmp/base-processing.py app/worker/notifications/processing.py\ntrap 'cp tmp/head-processing.py app/worker/notifications/processing.py' EXIT\nset +e\nbash tmp/content-test.sh > tmp/base-proof.log 2>&1\nstatus=$?\nset -e\ncat tmp/base-proof.log\nif [ \"$status\" -eq 0 ]; then echo 'base unexpectedly passed'; exit 1; fi\nEOF",
+      "workdir": "/Users/ardud/checkouts/notif-content-2371",
+      "sha256": "079fa25acb07bfe55cb02a0205bfb71e283c0915c73064e067bade713a2869ed"
+    }
+  ],
+  "case": "p",
+  "hook_provenance": "Reconstructed native Bash.command + cwd; raw hook stdin was not retained."
+}

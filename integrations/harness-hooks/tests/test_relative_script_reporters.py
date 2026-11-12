@@ -16,6 +16,7 @@ import claude
 import codex
 import code_mode_fixture
 import engine
+import isolated_source_cases
 
 LIVE = '/Users/x/.robob/userdata/statev2.sqlite'
 OPENCODE = '/Users/x/.local/share/opencode/opencode.db'
@@ -67,6 +68,58 @@ class RelativeScriptReporterTests(unittest.TestCase):
     def event(self, command, tool='exec_command'):
         return {'hook_event_name':'PreToolUse', 'tool_name':tool, 'cwd':'/unrelated/session/directory',
                 'tool_input':{'cmd' if tool == 'exec_command' else 'command':command, 'workdir':str(self.root)}}
+
+    def test_isolated_source_reporters_through_native_hook_entry_points(self):
+        fixtures = sorted((FIXTURES.parent / 'isolated-source').glob('*.json'))
+        with patch.object(os.path, 'realpath', side_effect=lambda p, *a, **kw: os.path.abspath(p)), patch.object(Path, 'stat', side_effect=FileNotFoundError):
+            for file in fixtures:
+                row = json.loads(file.read_text())
+                if row['payload']['name'] == 'exec':
+                    decoded = code_mode_fixture.commands(row['payload']['input'], row['session_cwd'])
+                    for call in row['commands']:
+                        self.assertIn((call['cmd'], call['workdir']), decoded)
+                for call in row['commands']:
+                    self.assertEqual(hashlib.sha256(call['cmd'].encode()).hexdigest(), call['sha256'])
+                    cwd = call['workdir'] or row['session_cwd']
+                    # The Codex runtime invokes the native hook as Bash.command;
+                    # the exec_command shape also proves workdir beats cwd.
+                    for harness, tool in [('codex', 'Bash'), ('codex', 'exec_command'), ('claude', 'Bash')]:
+                        event = {'hook_event_name':'PreToolUse', 'tool_name':tool, 'cwd':cwd,
+                                 'tool_input':{'cmd' if tool == 'exec_command' else 'command':call['cmd']}}
+                        if tool == 'exec_command':
+                            event['cwd'] = '/unrelated/session/directory'
+                            event['tool_input']['workdir'] = cwd
+                        with self.subTest(fixture=file.name, harness=harness, tool=tool):
+                            self.check(event, harness=harness)
+                            # Independent real executed statement after inert
+                            # data must still be checked by every adapter.
+                            key = 'cmd' if tool == 'exec_command' else 'command'
+                            event['tool_input'][key] += '\npython3 -c ' + repr(f'open({LIVE!r}).read()')
+                            self.check(event, 'live-database-read', harness)
+
+    def test_isolated_migration_and_heredoc_controls_through_hook(self):
+        source = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
+        self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
+        self.write('package.json', json.dumps({'scripts':{'migrate-dev-db':'node apps/server/scripts/migrate-dev-db.ts'}}))
+        (self.root / 'link.sqlite').symlink_to(Path.home() / '.robob/userdata/statev2.sqlite')
+        for label, command, expected in isolated_source_cases.cases(self.root):
+            for harness, tool in [('codex', 'exec_command'), ('claude', 'Bash')]:
+                with self.subTest(case=label, command=command, harness=harness):
+                    self.check(self.event(command, tool), expected, harness)
+
+    def test_mktemp_shell_fixture_and_near_misses_through_hooks(self):
+        source = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('integrations/memory-system/tests/test_backup_replica.sh', source.read_text())
+        for harness in ('codex', 'claude'):
+            for command in ('bash integrations/memory-system/tests/test_backup_replica.sh',
+                            '/bin/bash ' + str(self.root / 'integrations/memory-system/tests/test_backup_replica.sh')):
+                self.check(self.event(command), harness=harness)
+                with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+                    self.check(self.event(command), 'live-database-script', harness)
+            for source, expected in isolated_source_cases.mktemp_scripts():
+                self.write('tmp/fixture.sh', source)
+                with self.subTest(source=source, harness=harness):
+                    self.check(self.event('bash tmp/fixture.sh'), expected, harness)
 
     def test_exact_3464_code_mode_call(self):
         fixture = json.loads((FIXTURES / '3464.json').read_text())

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import engine
 import statev2_guard as guard
 import code_mode_fixture
+import isolated_source_cases
 
 LIVE = "/Users/x/.robob/userdata/statev2.sqlite"
 READ = "live-database-read"
@@ -55,6 +56,61 @@ class GuardTests(unittest.TestCase):
         for command, expected in rows:
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
+
+    def test_isolated_migrate_source_and_note_case_matrix(self):
+        source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node apps/server/scripts/migrate-dev-db.ts'}}))
+        (self.root / 'link.sqlite').symlink_to(Path.home() / '.robob/userdata/statev2.sqlite')
+        for label, command, expected in isolated_source_cases.cases(self.root):
+            with self.subTest(case=label, command=command):
+                self.assertEqual(guard.classify_detail(command, str(self.root))[0], expected)
+
+    def test_migration_exemption_is_pinned_to_source_and_plain_node_invocation(self):
+        source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        original = source.read_text()
+        self.write('apps/server/scripts/migrate-dev-db.ts', original)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node apps/server/scripts/migrate-dev-db.ts'}}))
+        invocation = 'node apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+        self.assertIsNone(self.classify(invocation))
+        self.assertEqual(self.classify('node --test apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite'), SCRIPT)
+        self.write('apps/server/scripts/migrate-dev-db.ts', original + '\nrequire("fs").readFileSync(' + repr(LIVE) + ');\n')
+        self.assertEqual(self.classify(invocation), SCRIPT)
+        self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite --base-dir /tmp/dev-home'), SCRIPT)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node other.ts'}}))
+        self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite'), UNRESOLVED)
+
+    def test_exact_isolated_source_reporters_are_data(self):
+        fixture_dir = Path(__file__).with_name('fixtures') / 'isolated-source'
+        fixtures = sorted(fixture_dir.glob('*.json'))
+        # Freeze all historical roots; stat/open behavior is exercised above
+        # against the real migration source and controlled temporary scripts.
+        with patch.object(os.path, 'realpath', side_effect=lambda p, *a, **kw: os.path.abspath(p)), patch.object(Path, 'stat', side_effect=FileNotFoundError):
+            for fixture in fixtures:
+                row = json.loads(fixture.read_text())
+                for call in row['commands']:
+                    with self.subTest(case=row['case'], fixture=fixture.name):
+                        self.assertEqual(guard.classify_detail(call['cmd'], call['workdir'] or row['session_cwd']), (None, None))
+
+    def test_mktemp_fixture_rooted_shell_source_and_near_misses(self):
+        source = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('integrations/memory-system/tests/test_backup_replica.sh', source.read_text())
+        for command in ('bash integrations/memory-system/tests/test_backup_replica.sh',
+                        '/bin/bash ' + str(self.root / 'integrations/memory-system/tests/test_backup_replica.sh')):
+            with self.subTest(case='w', command=command):
+                self.assertIsNone(self.classify(command))
+        self.assertEqual(self.classify('sed -i "s/mktemp/echo/g" integrations/memory-system/tests/test_backup_replica.sh; bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.assertEqual(self.classify('BASH_ENV=/tmp/preload.sh bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.write('tmp/fixtu\nre.sh', source.read_text())
+        self.assertEqual(self.classify('bash tmp/fixtu\\\nre.sh'), SCRIPT)
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+            self.assertEqual(self.classify('bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.write('integrations/memory-system/tests/test_backup_replica.sh', source.read_text() + '\n# changed body\n')
+        self.assertEqual(self.classify('bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        for source, expected in isolated_source_cases.mktemp_scripts():
+            self.write('tmp/fixture.sh', source)
+            with self.subTest(source=source):
+                self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
 
     def test_heredoc_data_and_execution(self):
         body = "import hashlib, pathlib, subprocess\n# it's a diff check\nprint('ok')\n"
