@@ -151,7 +151,7 @@ CPU niceness is fine to keep in the scripts (`nice -n 10`).
   Reference copy: `scripts/com.abdullah.recall.plist`.
 - `com.abdullah.memory-health` - health check every 15 min (capture, recall,
   backups, disk; also the health and Moni backups going stale after 13 h), Telegram on failure
-- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox.
+- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox. `deploy.zsh memory-system` installs its HOME-templated plist (refuses to interrupt a running backup). Memory-health alerts once per unloaded/stale incident and once on recovery; memory is stale after 9 h, health/Moni after 13 h. Deferral status explains a stale memory backup without extending the deadline. `MEMORY_BACKUP_NOTIFY_CMD` overrides the notifier command prefix for tests; severity, key and text flags are appended.
   Snapshots hold replicas of memory.db and opencode_raw.db, plus
   `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
   projects, board, import map, thread index). The full Robob DB is not backed up.

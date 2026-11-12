@@ -31,7 +31,8 @@ class OtherBackups(unittest.TestCase):
         self.health = os.path.join(root, "health-backup", "backup_last.json")
         self.person_dir = os.path.join(root, "offbox-person", "state")
         patches = [mock.patch.object(hc, "HEALTH_BACKUP_STATUS", self.health),
-                   mock.patch.object(hc, "PERSON_BACKUP_DIR", self.person_dir)]
+                   mock.patch.object(hc, "PERSON_BACKUP_DIR", self.person_dir),
+                   mock.patch.object(hc, "launchd_exit", return_value=(None, 0, True))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
