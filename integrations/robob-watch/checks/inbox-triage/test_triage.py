@@ -1463,6 +1463,60 @@ class PaymentNotices(unittest.TestCase):
                         self.assertEqual(len(self.mc.load(wd / 'scratch-money')['cases']), int(active))
                         self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
 
+    def test_timed_no_charge_bulk_mail_tracks_renewals_but_unqualified_negation_does_not(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        rows = [
+            ('You will not be charged until your renewal date', True),
+            ('You will not be charged before this date', True),
+            ('You will not be billed again until then', True),
+            ("You won't be charged until then", True),
+            ('You won’t be charged before your renewal date', True),
+            ('You will not be debited again before this date', True),
+            ('You will not be charged USD 118.80 before your renewal date', True),
+            ('You will not be billed prior to your renewal date', True),
+            ('Until then, you will not be charged', True),
+            ('Until your renewal date, you will not be charged', True),
+            ('Before contacting support, please note that you will not be charged again', False),
+            ('Before updating your card, please note that you will not be billed again', False),
+            ('Until you contact support, please note that you will not be charged again', False),
+            ('Before the renewal date, contact support, please note that you will not be charged again', False),
+            ('You will not be charged again, before contacting support please read our help page', False),
+            ('You will not be billed again, before updating your card read our instructions', False),
+            ('You will not be debited, until you contact support please read the FAQ', False),
+            ('You will not be charged before contacting support please read the FAQ', False),
+            ('You will not be charged again, before tomorrow please read our help page', False),
+            ('You will not be billed again, until next month please contact support', False),
+            ('You will not be debited, before your renewal date update your card', False),
+            ('You will not be charged again, before tomorrow', True),
+            ('You will not be charged until your renewal date, please read our help page', True),
+            ('You will not be charged until your next billing cycle', True),
+            ('You will not be billed before the next renewal date', True),
+            ('You will not be billed again until next month', True),
+            ('You will not be charged', False),
+            ('You will not be billed again', False),
+            ('Your subscription is cancelled before this date', False),
+            ('Auto-renewal is disabled until then', False),
+            ('You will not be charged and your subscription is cancelled before this date', False),
+        ]
+        for suffix, active in rows:
+            for padding in ('', 'Additional account information. ' * 20):
+                with self.subTest(suffix=suffix, long_body=bool(padding)), tempfile.TemporaryDirectory() as tmp:
+                    item, reason = self.renewal_mail(first + padding + suffix, 'Account notice',
+                                                   'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n')
+                    self.assertEqual(reason, None if active else 'bulk')
+                    wd = Path(tmp)
+                    with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                        reasons, error = t.renewal_checks([item] if reason is None else [], self.when.timestamp(), False, wd=wd)
+                        self.assertIsNone(error)
+                        self.assertEqual(reasons, {item['id']: 'renewal_case'} if active else {})
+                        cases = self.mc.load(wd / 'scratch-money')['cases']
+                        self.assertEqual(len(cases), int(active))
+                        if active:
+                            self.assertEqual(cases[0]['deadline'], '2026-11-11')
+                        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
     def test_full_body_cancellation_or_ambiguity_cannot_be_overruled_by_preview(self):
         first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
                  'using card ending in 5542. ')

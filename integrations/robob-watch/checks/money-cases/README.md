@@ -52,6 +52,8 @@ Inbox triage opens a charge case when a renewal notice names a dead card, one am
 
 Generic plan or billing labels use the sender's identity. Email fallback retains the full domain so shared display names and mail subdomains cannot merge vendors; long case slugs include a hash. Body merchant names are used when they agree with the supplied sender, or when no sender was supplied. An explicitly cancelled or disabled renewal stays with ordinary triage; cancellation instructions, conditional consequences and cancelled-card notices do not suppress an upcoming renewal. A standalone “will be charged” notice also needs subscription, membership, recurring-service or product-tier plan context.
 
+No-charge wording bounded by “until” or “before” the billing date describes when charging starts and preserves the stated renewal. Unqualified no-charge statements and explicit cancellation or disabled-renewal states still prevent automatic case creation.
+
 The case keeps the original renewal date and exact mailbox identity separately from its readable name. Later wording changes reuse that case, including after closure or a deadline update. An SMS merchant can match one unique mailbox-domain label in either arrival order; the first corroborating email binds its mailbox identity and records the source without reopening it. Ambiguous matches stay in ordinary triage. If distinct identities share a readable slug, a hash of the exact identity distinguishes their case IDs.
 
 ## Bank payment deadlines

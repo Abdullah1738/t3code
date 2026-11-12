@@ -645,7 +645,7 @@ def renewal_disabled(text):
     entity = r'auto[ -]?renew(?:al)?|subscription|renewal|membership|plan|card'
     negative = re.compile(r'\b(?:not|never|no longer|no|without|[a-z]+n[’\']t)\s+'
                           r'(?:(?:be|been|being|to|set to|going to|scheduled to|ever|currently|[a-z]+ly)\s+){0,5}'
-                          r'(?:auto[ -]?)?(?:renew(?:ed|s|al)?|charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?)\b', re.I)
+                          r'(?:auto[ -]?)?(?P<verb>renew(?:ed|s|al)?|charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?)\b', re.I)
     state = re.compile(r'(?:^|\b(?:is|was|has|have|had|remains|stays)\s+|[:=]\s*)'
                        r'(?:(?:already|been|set to|[a-z]+ly|still|now)\s+){0,5}'
                        r'(?:cancell?ed|disabled|deactivated|turned off|switched off|off)\b', re.I)
@@ -668,7 +668,29 @@ def renewal_disabled(text):
                 for match in state.finditer(tail.lstrip()):
                     if not re.search(r'\bcard\b', part[subject.end():offset + match.start()], re.I):
                         assertions.append((lo + offset + match.start(), lo + offset + match.end(), lo))
-            assertions += [(lo + m.start(), lo + m.end(), lo) for m in negative.finditer(part)]
+            for match in negative.finditer(part):
+                if re.fullmatch(r'charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?', match['verb'], re.I):
+                    tail = clause[lo + match.end():].lstrip()
+                    amount = payments.MONEY.match(tail)
+                    if amount:
+                        tail = tail[amount.end():]
+                    date_ref = (r'(?:then|(?:this|that) date|(?:your|the|next)(?: next)? '
+                                r'(?:renewal|billing|payment) (?:date|cycle|period)|today|tomorrow|'
+                                r'next (?:week|month|year)|' + RENEWAL_DATE.pattern + r')')
+                    # "Not charged until renewal" schedules billing; it doesn't
+                    # cancel the renewal. Only qualify this billing assertion.
+                    timing = re.match(r'\s*(?:(?:again|at all|anything|any amount)\s*)?(?P<comma>,?)\s*'
+                                      r'(?:until|before|prior to)\s+' + date_ref + r'(?=$|[\s,.;!?])', tail, re.I)
+                    if timing:
+                        # After a comma, a date followed by another action can start
+                        # independent advice ("before tomorrow please read...").
+                        if not timing['comma'] or not re.search(r'\w', tail[timing.end():]):
+                            continue
+                    if re.fullmatch(r'\s*(?:until|before|prior to)\s+' + date_ref +
+                                    r'\s*,?\s*(?:you|we|your card|your account)\s+'
+                                    r'(?:(?:will|are|is|do|does|have|has)\s+)?', clause[:lo + match.start()], re.I):
+                        continue
+                assertions.append((lo + match.start(), lo + match.end(), lo))
             for match in re.finditer(r'\b(?:cancell?ed|disabled|deactivated|turned off|switched off) '
                                      r'(?:your |the )?(?:' + entity + r')\b', part, re.I):
                 if not re.search(r'\b(?:not|never|no longer|[a-z]+n[’\']t)\b', part[:match.start()], re.I) and not re.search(r'\bcard$', match[0], re.I):

@@ -1714,6 +1714,58 @@ class Renewals(Base):
                 text = f'Your ElevenLabs Pro subscription {wording} USD 118.80 on 11 Nov 2026 using card ending in 5542'
                 self.assertIsNone(mc.renewal(text, 'ElevenLabs', subject='Next billing date: 11 Nov 2026'))
 
+    def test_timed_no_charge_statements_preserve_the_stated_renewal(self):
+        rows = [
+            ('You will not be charged until your renewal date', True),
+            ('You will not be charged before this date', True),
+            ('You will not be billed again until then', True),
+            ("You won't be charged until then", True),
+            ('You won’t be charged before your renewal date', True),
+            ('You will not be debited again before this date', True),
+            ('You will not be billed at all until then', True),
+            ('You will not be charged anything before this date', True),
+            ('You will not be charged USD 118.80 before your renewal date', True),
+            ('You will not be charged until 11 Nov 2026', True),
+            ('You will not be billed again, until then', True),
+            ('You will not be billed prior to your renewal date', True),
+            ('Until then, you will not be charged', True),
+            ('Before this date you will not be billed again', True),
+            ('Until your renewal date, you will not be charged', True),
+            ('Before 11 Nov 2026, you will not be billed', True),
+            ('Before contacting support, please note that you will not be charged again', False),
+            ('Before updating your card, please note that you will not be billed again', False),
+            ('Until you contact support, please note that you will not be charged again', False),
+            ('Before the renewal date, contact support, please note that you will not be charged again', False),
+            ('You will not be charged again, before contacting support please read our help page', False),
+            ('You will not be billed again, before updating your card read our instructions', False),
+            ('You will not be debited, until you contact support please read the FAQ', False),
+            ('You will not be charged before contacting support please read the FAQ', False),
+            ('You will not be charged again, before tomorrow please read our help page', False),
+            ('You will not be billed again, until next month please contact support', False),
+            ('You will not be debited, before your renewal date update your card', False),
+            ('You will not be charged again, before tomorrow', True),
+            ('You will not be billed again, until next month', True),
+            ('You will not be charged until your renewal date, please read our help page', True),
+            ('You will not be charged until your next billing cycle', True),
+            ('You will not be billed before the next renewal date', True),
+            ('You will not be billed before tomorrow', True),
+            ('You will not be billed again until next month', True),
+            ('You will not be charged', False),
+            ('You will not be billed again', False),
+            ('You will not be debited', False),
+            ('Your subscription is cancelled before this date', False),
+            ('Auto-renewal is disabled until then', False),
+            ('You will not be charged and your subscription is cancelled before this date', False),
+            ('You will not be billed; contact support before this date', False),
+        ]
+        for suffix, active in rows:
+            with self.subTest(suffix=suffix):
+                notice = mc.renewal(self.text + '. ' + suffix, 'ElevenLabs')
+                self.assertEqual(notice is not None, active)
+                if notice:
+                    self.assertEqual(notice['date'], '2026-11-11')
+                    self.assertEqual(notice['last4'], '5542')
+
     def test_long_senderless_slug_collisions_keep_distinct_exact_names(self):
         mc.card_dead(self.data, '5542', 'cancelled')
         ids = []
