@@ -174,17 +174,18 @@ export function Chat(props: {
   const scrollY = useRef(0);
   const previousDiscussion = useRef({ boardId, discussionId });
   const reversed = useMemo(() => newestFirst(messages), [messages]);
-  const historyGesture = useMemo(createHistoryGesture, [boardId, discussionId]);
+  const historyGesture = useMemo(() => createHistoryGesture(), [boardId, discussionId]);
   const earlierAction = useBoardAction();
+  const runEarlier = earlierAction.run;
   const readEarlier = useMemo(
     () =>
       createEarlierPageLoader(() => {
         if (discussionId === null) return Promise.resolve(false);
-        return earlierAction.run("Couldn't load earlier messages", () =>
+        return runEarlier("Couldn't load earlier messages", () =>
           kanbanClient().loadEarlier(boardId, discussionId),
         );
       }),
-    [boardId, discussionId, earlierAction.run],
+    [boardId, discussionId, runEarlier],
   );
   const choiceDrafts = useMemo(() => createRowStateStore<ChoiceDraft>(), [boardId, discussionId]);
   const expandedBlocks = useMemo(() => createRowStateStore<boolean>(), [boardId, discussionId]);
