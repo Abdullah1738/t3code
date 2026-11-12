@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, log, month_key, new_id, now, read_json, say)
+                     file_lock, iso, log, mine, month_key, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -304,14 +304,16 @@ def pick_template(root: Path, repo_key: str) -> str:
 def find_lease(con, owner: str, root: str):
     capacity.schema(con)
     # A box with an unconfirmed prune worker is never handed back, not even to its own caller.
+    # On the home server only this token's own boxes (mine()): another owner's box is not ours to hand out.
     mapped = con.execute("SELECT l.*, c.remote_dir AS caller_dir FROM pool_callers c JOIN leases l USING(box_id) "
-                         "WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') "
+                         f"WHERE c.owner=? AND c.repo_root=? AND l.state IN ('running','stopped') AND {mine('l')} "
                          "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)", (owner, root)).fetchone()
     if mapped:
         out = dict(mapped)
         out['remote_dir'] = out.pop('caller_dir')
         return out
     return con.execute("SELECT * FROM leases WHERE owner=? AND repo_root=? AND state IN ('running','stopped') "
+                       f"AND {mine('leases')} "
                        "AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=leases.box_id) "
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
@@ -458,7 +460,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
-            brow = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
+            brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
                 # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
                 say(f"saved base '{full}' exists only on the home offbox server, which is down: "
@@ -469,7 +471,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
-                               "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
+                               f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
             if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
                 say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
                     "using a plain Boat box for this run")
@@ -485,9 +487,11 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             say(f"default base {brow['name']} is gone (boat deleted its data); using the repo template")
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
-        trow = con.execute("SELECT * FROM templates WHERE name=?", (tname,)).fetchone()
+        # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
+        # which would mark it gone. Such a caller starts from a fresh box instead.
+        trow = con.execute(f"SELECT * FROM templates WHERE name=? AND {mine()}", (tname,)).fetchone()
         if not trow and tname != "generic":
-            trow = con.execute("SELECT * FROM templates WHERE name='generic'").fetchone()
+            trow = con.execute(f"SELECT * FROM templates WHERE name='generic' AND {mine()}").fetchone()
             if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
                 say(f"template {tname} exists only on the home offbox server, which is down: "
                     "using a plain Boat box for this run")
@@ -704,11 +708,12 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
     # running/stopped leases, so a process killed mid-bring-up (Ctrl-C, SIGTERM, a tool timeout) leaves a row no
     # one can hand out as ready. The reaper deletes such rows (see reap._reap).
     state = "bringing_up" if is_recipe else "running"
+    # token_owner: whose API token made the box. On the home server only that token can see it (common.mine).
     con.execute("""INSERT OR REPLACE INTO leases (box_id, owner, thread_id, session_id, thread_title, manager_thread,
-                   repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   repo_root, repo_key, remote_dir, size, source, state, created_at, last_used_at, token_owner)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (box_id, me["owner"], me.get("thread"), me.get("session"), me.get("title"), me.get("manager"),
-                 me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t))
+                 me["repo_root"], me["repo_key"], rdir, sz, source, state, t, t, token_owner()))
     con.commit()
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:

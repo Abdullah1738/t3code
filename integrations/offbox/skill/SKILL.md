@@ -253,6 +253,10 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
   first standby run of a repo is a cold one.
 - Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
+- At home every owner has their own token and it only sees that owner's boxes, saved states and templates. Plain
+  `offbox` (reap, pools, `release`, `ssh`, `ports`, `logs`, `wait`, `kill`) only acts on our own. A box or run id
+  of a person's box is refused with exit 2 ("belongs to moni ..."), nothing changed: go through `offbox-person`.
+  A person's new box starts fresh, never from our templates or saved states.
 - The Boat cap, `offbox spend` and the start limits below apply to standby runs only. offbox reads Boat's plan
   from its API: on a plan without xlarge machines a standby run that asks for `--size xlarge` gets `large` with
   one line, and the start limits follow the plan (85% of what it includes).

@@ -10,6 +10,7 @@ import time
 from . import capacity, prepare
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      kv_get, kv_set, now, say)
+from .common import mine as token_mine  # `mine` is a local name here (the caller's own boxes)
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
@@ -107,8 +108,10 @@ WEDGED_LIKE = f"{BOX_WEDGED_NOTE}%"
 
 
 def members(con, key):
+    # token_mine(): on the home server a pool only holds this token owner's boxes, even when two owners' checkouts share
+    # a repository key. Another owner's box answers 404 to our token, which reads as "gone".
     return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
-        WHERE p.pool_key=? AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
+        WHERE p.pool_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE)).fetchall()
@@ -135,8 +138,8 @@ def own_boxes(con, me):
 
 def candidates(con, key, size, source, me=None):
     # Existing boxes count toward the cap once adopted; surplus legacy boxes are left intact.
-    rows = con.execute("""SELECT l.*, p.pool_key FROM leases l LEFT JOIN pool_members p USING(box_id)
-        WHERE l.repo_key=? AND l.state IN ('running','stopped')
+    rows = con.execute(f"""SELECT l.*, p.pool_key FROM leases l LEFT JOIN pool_members p USING(box_id)
+        WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped')
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
@@ -267,7 +270,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
     while True:
         lease.cap_check()
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                              "WHERE l.repo_key=? AND l.state IN ('running','stopped') "
+                              f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
                               "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone()
         if create_first or (pending and pending['box_id'] in unusable):
             pending = None
@@ -348,7 +351,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     con.commit()
                     rows, can_create = [], True
                 pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
-                                      "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
+                                      f"ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? AND {token_mine('l')} "
                                       "AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ? "
                                       "LIMIT 1", (key, WEDGED_LIKE)).fetchone()
                 if pending:
@@ -683,7 +686,7 @@ def try_warm(me, size, source, exclude, run_id):
 def _recheck_prune_holds(con, key) -> bool:
     """SSH stays outside the pool lock; callers share a per-box 60 second probe throttle."""
     from . import lease
-    rows = con.execute("SELECT h.box_id FROM prune_holds h JOIN leases l USING(box_id) WHERE l.repo_key=?",
+    rows = con.execute(f"SELECT h.box_id FROM prune_holds h JOIN leases l USING(box_id) WHERE l.repo_key=? AND {token_mine('l')}",
                        (key,)).fetchall()
     released = False
     for row in rows:
@@ -735,8 +738,9 @@ def _refresh_background(con, key, pull_artifacts=True):
     """Detached runs have no lock holder; reclaim completed slots without waiting for the reaper."""
     from . import api, runs
     from .misc import _catch_up_finished
-    rows = con.execute("""SELECT r.* FROM runs r JOIN leases l USING(box_id)
-        WHERE l.repo_key=? AND r.mode='bg' AND r.status IN ('running','lost') AND r.process_id IS NOT NULL""", (key,)).fetchall()
+    rows = con.execute(f"""SELECT r.* FROM runs r JOIN leases l USING(box_id)
+        WHERE l.repo_key=? AND {token_mine('l')} AND r.mode='bg' AND r.status IN ('running','lost')
+        AND r.process_id IS NOT NULL""", (key,)).fetchall()
     for row in rows:
         if api.left() is not None and api.left() <= 0:
             break

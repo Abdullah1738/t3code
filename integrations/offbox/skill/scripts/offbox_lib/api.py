@@ -18,7 +18,8 @@ import urllib.parse
 import urllib.request
 import weakref
 
-from .common import OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, token_owner
+from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, owner_scoped, require_mine,
+                     token_owner)
 from . import capacity
 
 BACKEND = backend()
@@ -368,8 +369,27 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
         return result
 
 
+_OWN_BOXES: set[tuple[str, str]] = set()   # (token owner, box) pairs already checked in this process
+
+
+def _own_box(path: str) -> None:
+    """Last line of defence on the home server: no request is sent for a box our records give to another owner.
+    Her box answers 404 to our token, and callers read a 404 as "the box is gone" (common.require_mine). Selection
+    already leaves such leases out; this covers a box id that reaches the API some other way."""
+    if not owner_scoped() or not path.startswith("/sandboxes/"):
+        return
+    box_id = path.split("/")[2].split("?")[0]
+    seen = (token_owner(), box_id)
+    if not box_id or seen in _OWN_BOXES:
+        return
+    with contextlib.closing(db()) as con:
+        require_mine(con, box_id)
+    _OWN_BOXES.add(seen)
+
+
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    _own_box(path)
     scope = _REQUEST_SCOPE.get()
     with scope.request() if scope is not None else contextlib.nullcontext():
         return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
@@ -592,6 +612,7 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
     """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): the
     socket is shut at that moment (see _shut_at) and every line is checked against it, so no read, keepalive or
     partial line outlives it; the stream then raises StreamDeadline."""
+    _own_box(path)
     req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + _key(),
                                                       "Accept": "application/x-ndjson"})
     if deadline is not None:

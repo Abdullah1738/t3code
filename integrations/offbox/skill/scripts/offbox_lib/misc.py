@@ -18,7 +18,8 @@ from pathlib import Path
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
-                     offsets_path, out, read_json, say, silence)
+                     offsets_path, out, read_json, require_mine, say, silence)
+from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
 
 WAIT_POLL_S = 5
@@ -115,15 +116,19 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
     con = db()
     capacity.schema(con)
     if box_id:
+        # Another owner's box on the home server answers 404 to this token: a stop or delete would read that as
+        # "gone" and retire a lease whose box is alive. Refused before anything (ssh included) reaches the box.
+        require_mine(con, box_id)
         rows = con.execute("SELECT * FROM leases WHERE box_id=? AND state IN ('running','stopped','resume_stalled')", (box_id,)).fetchall()
     elif mine:
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') AND (owner=? OR box_id IN "
-                           "(SELECT box_id FROM pool_callers WHERE owner=?))", (me['owner'],me['owner'])).fetchall()
+                           f"(SELECT box_id FROM pool_callers WHERE owner=?)) AND {token_mine()}",
+                           (me['owner'],me['owner'])).fetchall()
     else:
         row = lease.find_lease(con, me['owner'], me['repo_root'])
         if row is None:
             row = con.execute("SELECT l.* FROM leases l JOIN prune_holds h USING(box_id) "
-                              "WHERE l.state IN ('running','stopped') AND ((l.owner=? AND l.repo_root=?) OR "
+                              f"WHERE l.state IN ('running','stopped') AND {token_mine('l')} AND ((l.owner=? AND l.repo_root=?) OR "
                               "EXISTS (SELECT 1 FROM pool_callers c WHERE c.box_id=l.box_id AND c.owner=? "
                               "AND c.repo_root=?)) ORDER BY l.last_used_at DESC LIMIT 1",
                               (me['owner'], me['repo_root'], me['owner'], me['repo_root'])).fetchone()
@@ -206,6 +211,7 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
         raise OffboxError(f"run {rid} is a local run (no box); kill its process on this Mac instead", code=2)
+    _require_my_run(r)
     if not r["box_id"] or not r["process_id"]:
         raise OffboxError(f"run {rid} never got a box process (no box_id/process_id). Nothing remote to stop; "
                           "if the client is gone the reaper marks it lost (`offbox reap`).", code=2)
@@ -245,9 +251,10 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
 def resolve_box(me: dict, box_id: str | None) -> str:
     # Ports uses this for both explicit IDs and the caller's lease; refuse before either selection.
     require_proven(me, "this box action")
-    if box_id:
-        return box_id
     con = db()
+    if box_id:
+        require_mine(con, box_id)
+        return box_id
     r = lease.find_lease(con, me["owner"], me["repo_root"])
     if not r:
         raise OffboxError("no lease for this thread + repo (run `offbox run -- true` to create one)", code=2)
@@ -264,6 +271,7 @@ def ssh_shell(me: dict, box_id: str | None, cmd: list[str]) -> int:
         box_id = row["box_id"]
         rdir = row["remote_dir"]
     else:
+        require_mine(db(), box_id)
         s = api.get(box_id)
         if not s or s.get("state") not in api.LIVE_STATES:
             raise OffboxError(f"{box_id} is not running", code=2)
@@ -370,6 +378,13 @@ def _run_row(run_id: str):
     if not r:
         raise OffboxError(f"no run {run_id}", code=2)
     return r
+
+
+def _require_my_run(r) -> None:
+    """logs, wait and kill ask the box about the run. On another owner's box every answer is 404, which would
+    settle a live run as lost: refuse before asking (common.require_mine)."""
+    if r["box_id"]:
+        require_mine(db(), r["box_id"])
 
 
 def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live: bool = False) -> str:
@@ -578,6 +593,7 @@ def _refresh_running_ttl(r, until=None) -> None:
 
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
+    _require_my_run(r)
     p = LOGS_DIR / f"{r['run_id']}.log"
     if r['status'] == 'lost' and r['box_id']:
         if do_follow:
@@ -615,6 +631,7 @@ def logs(run_id: str, do_follow: bool) -> int:
 
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
+    _require_my_run(r)
     if r["status"] not in ("starting", "running", "lost") or (r['status'] == 'lost' and not r['box_id']):
         return _settled(r)
     return _wait_locked(r, echo=False, timeout=timeout)
