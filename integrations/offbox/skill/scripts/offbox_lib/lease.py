@@ -347,7 +347,9 @@ def idle_ttl(box_id: str) -> None:
     con = db()
     if active_runs(con, box_id):
         return
-    row = con.execute("SELECT size FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    row = con.execute("SELECT size, note FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    if row and row['note'] == BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH':
+        return
     ttl = idle_for(con, box_id, row["size"] if row else None)
     if docker_recent(con, box_id):
         # Grace past the reaper's limit so its stop (which archives Docker images first) usually wins over boat's ttl.

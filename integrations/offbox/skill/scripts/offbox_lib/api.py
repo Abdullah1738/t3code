@@ -141,6 +141,10 @@ class RequestScope:
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.sockets = weakref.WeakSet()
+        self.mutation_body = None
+        self.pending = set()
+        self.settled = threading.Event()
+        self.settled.set()
 
     def check(self):
         if self.parent is not None:
@@ -155,10 +159,34 @@ class RequestScope:
             self.check()
             self.sockets.add(sock)
 
-    def cancel(self):
+    def sending(self, data):
+        owner = self.parent or self
+        with owner.lock:
+            self.check()
+            if self.mutation_body is not None and data == self.mutation_body:
+                # Mark before sendall: cancellation may race its return after the server received every byte.
+                owner.pending.add(self)
+                owner.settled.clear()
+
+    def reading(self):
+        owner = self.parent or self
+        with owner.lock:
+            if self in owner.pending:
+                return  # A stopped sender may still confirm its delivered mutation during the drain grace.
+        self.check()
+
+    def acknowledge(self):
+        owner = self.parent or self
+        with owner.lock:
+            owner.pending.discard(self)
+            if not owner.pending:
+                owner.settled.set()
+
+    def cancel(self, preserve_mutations=False):
         with self.lock:
             self.stopped.set()
-            sockets = list(self.sockets)
+            protected = {sock for request in self.pending for sock in request.sockets} if preserve_mutations else set()
+            sockets = [sock for sock in self.sockets if sock not in protected]
         for sock in sockets:
             _shutdown(sock)
 
@@ -192,6 +220,7 @@ class _CancellableConnection:
         # A connect/DNS/TLS operation may finish after cancellation. Never send on that late connection.
         try:
             scope.attach(self.sock)
+            scope.sending(data)
             super().send(data)
         except BaseException:
             self.close()
@@ -257,9 +286,9 @@ def _check_deadline(deadline: float, method: str, path: str) -> None:
 def _read_response(response, deadline):
     scope = _REQUEST_SCOPE.get()
     if scope is not None:
-        scope.check()
+        scope.reading()
         sock = _response_socket(response)
-        if sock is not None:
+        if sock is not None and sock not in scope.sockets:
             scope.attach(sock)
     fired = threading.Event()
     dog = _shut_at(response, deadline, fired) if deadline is not None else None
@@ -273,7 +302,7 @@ def _read_response(response, deadline):
         if deadline is not None and (fired.is_set() or time.time() > deadline):
             raise TimeoutError("deadline passed while reading boat response")
         if scope is not None:
-            scope.check()
+            scope.reading()
         return raw
     finally:
         if dog:
@@ -373,6 +402,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             _check_deadline(deadline, method, path)
             req_timeout = min(req_timeout, max(0.001, deadline - time.time()))
         req = urllib.request.Request(url, data=data, method=method, headers=h)
+        if scope is not None and method == 'PATCH' and isinstance(body, dict) and 'ttlSeconds' in body:
+            scope.mutation_body = data
         try:
             request_id = capacity.reserve(path.rsplit("/", 1)[-1],
                                           path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
@@ -403,6 +434,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             with _open(req, timeout=req_timeout) as r:
                 raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
+                if scope is not None:
+                    scope.acknowledge()
                 if request_id:
                     capacity.complete(request_id, "accepted", (result.get("sandbox") or {}).get("id"))
                 return result

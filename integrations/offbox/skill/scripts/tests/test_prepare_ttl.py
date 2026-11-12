@@ -1,6 +1,7 @@
 """Offline preparation keepalive and stopped-box diagnostics."""
 import contextlib
 import io
+import json
 import socket
 import sys
 import threading
@@ -250,6 +251,120 @@ class PrepareTtlTests(Isolated):
                     keeper.join(1)
             self.assertTrue(all(not t.is_alive() for t in keepers))
             opened.assert_not_called()
+            self.assertFalse(self.con.execute("SELECT 1 FROM events WHERE kind='ttl_unconfirmed'").fetchone())
+
+    def delayed_server_patch(self, resolves, expires=False):
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        accepted, cancelling, apply_old = (threading.Event() for _ in range(3))
+        assignments, failures = [], []
+        original_open, original_cancel = api._open, api.RequestScope.cancel
+
+        def backend():
+            try:
+                with server.makefile('rb') as stream:
+                    self.assertTrue(stream.readline().startswith(b'PATCH '))
+                    headers = {}
+                    while (line := stream.readline()) != b'\r\n':
+                        key, value = line.decode().split(':', 1)
+                        headers[key.lower()] = value.strip()
+                    ttl = json.loads(stream.read(int(headers['content-length'])))['ttlSeconds']
+                    accepted.set()
+                    self.assertTrue(cancelling.wait(2))
+                    self.assertTrue(apply_old.wait(2))
+                    assignments.append(('bxA', ttl))
+                    try:
+                        server.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}')
+                    except OSError:
+                        pass
+            except BaseException as error:
+                failures.append(error)
+
+        def cancel(scope, *args, **kwargs):
+            if scope.parent is None:
+                cancelling.set()
+                if resolves:
+                    apply_old.set()
+            return original_cancel(scope, *args, **kwargs)
+
+        def opened(request, timeout):
+            if threading.current_thread() is threading.main_thread():
+                assignments.append((request.full_url.rsplit('/', 1)[-1], json.loads(request.data)['ttlSeconds']))
+                return io.BytesIO(b'{"sandbox":{}}')
+            return original_open(request, timeout)
+
+        def push(box, *args, **kwargs):
+            if box == 'bxA':
+                self.assertTrue(accepted.wait(2), 'keeper PATCH never fully reached the server')
+            return {}
+
+        self.get.side_effect = lambda box: {'state': 'running'} if box == 'bxA' else {
+            'state': 'running', 'archiveAfter': '2099-01-01T00:00:00Z'}
+        self.ttl.side_effect = self.real_ensure_ttl
+        self.push.side_effect = push
+        self.rows[0]['_prepare_end'] = time.monotonic() + 0.3
+        if expires:
+            self.probe.side_effect = lambda *a, **kw: (accepted.wait(2), threading.Event().wait(2))
+        worker = threading.Thread(target=backend)
+        with patch.object(api, 'API', 'http://boat.invalid'), patch.object(api, '_key', return_value='offline'), \
+                patch.object(api, 'call', side_effect=api._call), patch.object(api, '_open', side_effect=opened), \
+                patch.object(api.urllib.request, 'getproxies', return_value={}), \
+                patch.object(api._HTTPConnection, 'connect', lambda connection: setattr(connection, 'sock', client)), \
+                patch.object(api.RequestScope, 'cancel', cancel), prepare.attempts():
+            worker.start()
+            started = time.monotonic()
+            try:
+                if expires:
+                    prepare.move_once(OffboxError('previous box failed'))
+                    with self.assertRaises(OffboxError) as raised:
+                        self.runner.start()
+                    self.assertIn('stuck in bring_up on bxA', str(raised.exception))
+                    self.assertLess(time.monotonic() - started, 0.8)
+                    self.command.assert_not_called()
+                    self.assertIsNone(self.con.execute('SELECT box_id FROM runs WHERE run_id=?',
+                                                      (self.runner.run_id,)).fetchone()[0])
+                    with patch.object(lease, 'idle_ttl') as idle:
+                        runs.finish(self.runner.run_id, None, 'infra')
+                        idle.assert_not_called()
+                    self.assertEqual(self.acquire.call_count, 1, 'unconfirmed TTL bypassed move-once limit')
+                    row = self.rows[1]
+                else:
+                    row = self.runner.start()
+                if resolves:
+                    self.assertEqual(row['box_id'], 'bxA')
+                    self.assertEqual(assignments, [('bxA', runs.RUN_TTL_S)])
+                else:
+                    self.assertLess(time.monotonic() - started, 0.8)
+                    self.assertEqual(row['box_id'], 'bxB', 'unconfirmed PATCH was handed to command start')
+                    if not expires:
+                        self.assertEqual(self.command.call_args.args[0], 'bxB')
+                    self.assertNotIn('bxA', [r['box_id'] for r in runs.pool.members(self.con, 'repo')])
+                    old = dict(self.con.execute("SELECT * FROM leases WHERE box_id='bxA'").fetchone())
+                    self.assertIsNone(lease._reuse(self.con, old, None), 'stale selection reused fenced box')
+                    self.assertTrue(self.con.execute("SELECT 1 FROM events WHERE kind='ttl_unconfirmed' "
+                                                     "AND box_id='bxA'").fetchone())
+                    lease.idle_ttl('bxA')
+                    self.assertEqual(assignments, [], 'idle TTL was assigned to the fenced box')
+                self.assertTrue(lease.ensure_ttl(row['box_id'], runs.BG_TTL_S, {'state': 'running'}))
+                apply_old.set()
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(dict(assignments)[row['box_id']], runs.BG_TTL_S)
+            finally:
+                cancelling.set()
+                apply_old.set()
+                worker.join(2)
+
+    def test_delivered_patch_is_fenced_before_replacement_and_background_handoff(self):
+        self.delayed_server_patch(resolves=False)
+
+    def test_delivered_patch_acknowledged_in_grace_precedes_background_handoff(self):
+        self.delayed_server_patch(resolves=True)
+
+    def test_expired_prepare_with_delivered_patch_preserves_failure_and_fence(self):
+        self.delayed_server_patch(resolves=False, expires=True)
 
     def test_probe_prune_and_no_sync_env_upload_are_kept_alive(self):
         for stage, result in ((self.probe, (None, None)), (self.prune, runs.prune.Result()), (self.put, None)):

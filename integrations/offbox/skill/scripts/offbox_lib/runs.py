@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune, prepare
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
 
 BG_TTL_S = 6 * 3600
@@ -1117,40 +1117,52 @@ class Runner:
             options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
             row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
                                               run_id=self.run_id, **options)
+            replacement = None
             self.lease_row = row
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            keeper_scope = None
+            if row.get('_prepare_end') is None:
+                row['_prepare_end'] = prepare.Budget(self.box).end
             try:
-                with _keep_ttl(self.box):
+                with _keep_ttl(self.box, row['_prepare_end']) as keeper_scope:
                     replacement = self._prepare_box(con, a, rdir, env_file, body)
                 if replacement is not None:
                     pool.release_guard(row)
                     self.lease_row, self.box = replacement, replacement['box_id']
                     continue
                 break
-            except prepare.Stalled as e:
+            except (prepare.Stalled, TtlUnconfirmed) as e:
                 self.record(box_id=None)
                 self.cold_boxes.add(self.box)
                 pool.release_guard(row)
-                self.lease_row = self.box = replacement = None
-                prepare.move_once(e)
+                self.lease_row = self.box = None
+                if replacement is None:
+                    prepare.move_once(e)
                 say(f"{e}; trying another box")
             except lease.DeadMount as e:
                 replacement = None
                 dead_attempts += 1
                 dead = self.box
                 self.record(box_id=None)  # our run row must not point at the box we stop
-                lease.set_aside_dead_mount(con, dead, e.reason)
+                ttl_confirmed = keeper_scope is None or keeper_scope.settled.is_set()
+                if ttl_confirmed:
+                    lease.set_aside_dead_mount(con, dead, e.reason)
                 pool.release_guard(row)
                 self.lease_row = self.box = None
                 if dead_attempts == 2:
                     raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
                                       "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
                 prepare.move_once(e)
-                say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
+                action = 'stopped and set aside' if ttl_confirmed else 'set aside'
+                say(f"{dead} has a dead filesystem ({e.reason}): {action} (offbox list --all shows it). "
                     "Trying another box")
+            except BaseException:
+                if keeper_scope is not None and not keeper_scope.settled.is_set():
+                    self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
+                raise
         try:
             w = node_version.want(self.root, self.cwd)
             node_block = node_version.block(w) if w else ""
@@ -1355,10 +1367,16 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             return
 
 
+class TtlUnconfirmed(OffboxError):
+    def __init__(self, box_id):
+        super().__init__(f'{box_id} has an unconfirmed auto-stop update; set aside; nothing ran')
+
+
 @contextlib.contextmanager
-def _keep_ttl(box_id: str):
+def _keep_ttl(box_id: str, prepare_end=None):
     stop_evt = threading.Event()
     requests = api.RequestScope(5)
+    end = prepare_end if prepare_end is not None else prepare.Budget(box_id).end
 
     def refresh():
         with requests.active():
@@ -1366,13 +1384,28 @@ def _keep_ttl(box_id: str):
 
     keeper = threading.Thread(target=refresh, daemon=True)
     keeper.start()
+    failed = False
     try:
-        yield
+        yield requests
+    except BaseException:
+        failed = True
+        raise
     finally:
         stop_evt.set()
+        requests.cancel(preserve_mutations=True)
+        requests.settled.wait(max(0, min(1, end - time.monotonic())))
         requests.cancel()
         # Socket reads wake on cancel. A stuck DNS/Keychain lookup may remain, but cannot send a late PATCH.
         keeper.join(1)
+        if not requests.settled.is_set():
+            # Reuse the existing persistent selection fence; keep the disk and let normal idle stopping handle it.
+            with contextlib.closing(db()) as con:
+                con.execute('UPDATE leases SET note=? WHERE box_id=?',
+                            (BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH', box_id))
+                con.commit()
+                event(con, box_id, 'ttl_unconfirmed', 'keeper PATCH sent without acknowledgement; box set aside')
+            if not failed:
+                raise TtlUnconfirmed(box_id)
 
 
 def _echo(stream, b: bytes) -> bool:
