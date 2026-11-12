@@ -281,10 +281,20 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0, _stdin=False):
                 return path, directory, approved
         return None, directory, approved
 
+    def inspect_cwds(words, directories, approved, piped):
+        next_directories, next_approved = set(), approved
+        for cwd_option in sorted(directories, key=lambda value: value or ""):
+            hit, next_directory, next_approved = inspect(words, cwd_option, approved, piped)
+            if hit:
+                return hit, directories, approved
+            next_directories.add(next_directory)
+        return None, frozenset(next_directories), next_approved
+
+    directories = frozenset({directory})
     piped, inherited_stdin, pipeline = False, _stdin, None
     # An async AND/OR list runs in a child shell. Its checkpoint precedes the
     # whole list, not just the last command immediately before '&'.
-    list_state = stage_state = (directory, approved)
+    list_state = stage_state = (directories, approved)
     previous_separator = None
     for token in [*tokens, ";"]:
         if token == "\n" and not words and previous_separator in {"|", "|&", "&&", "||"}:
@@ -294,7 +304,7 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0, _stdin=False):
             words.append(token)
             continue
         if token in {";", "&&", "||", "|", "|&", "&", "\n", "(", ")", "{", "}"}:
-            hit, directory, approved = inspect(words, directory, approved, piped or inherited_stdin)
+            hit, directories, approved = inspect_cwds(words, directories, approved, piped or inherited_stdin)
             if hit:
                 return hit
             words = []
@@ -302,31 +312,33 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0, _stdin=False):
             if token in {"(", "{"}:
                 # A compound command is one pipeline stage. Its body has its
                 # own lists/pipelines; keep the outer stage's entry checkpoint.
-                scopes.append((token, directory, approved, list_state, stage_state,
+                scopes.append((token, directories, approved, list_state, stage_state,
                                pipeline, piped, inherited_stdin))
                 inherited_stdin = inherited_stdin or piped
                 piped, pipeline = False, None
-                list_state = stage_state = (directory, approved)
+                list_state = stage_state = (directories, approved)
                 continue
             if token in {"|", "|&"}:
                 pipeline = pipeline or stage_state
-                directory, approved = pipeline
+                directories, approved = pipeline
                 stage_state = pipeline
                 piped = True
                 continue
             if pipeline:
-                directory, approved = pipeline
+                parent_directories, approved = pipeline
+                # Keep both cwds because a final pipeline stage may run in the parent shell.
+                directories = directories | parent_directories
                 pipeline = None
             piped = False
             if token == "&":
-                directory, approved = list_state
+                directories, approved = list_state
             if token in {")", "}"} and scopes:
-                (opening, parent_directory, parent_approved, list_state, stage_state,
+                (opening, parent_directories, parent_approved, list_state, stage_state,
                  pipeline, piped, inherited_stdin) = scopes.pop()
                 if opening == "(":
-                    directory, approved = parent_directory, parent_approved
+                    directories, approved = parent_directories, parent_approved
             else:
-                stage_state = (directory, approved)
+                stage_state = (directories, approved)
                 if token in {";", "\n", "&"}:
                     list_state = stage_state
         else:

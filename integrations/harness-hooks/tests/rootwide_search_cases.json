@@ -1392,7 +1392,7 @@
   {
     "command": "printf hi | { cd /Users/ardud/checkouts; }; rg --files",
     "cwd": "/Users/ardud/checkouts/task-1",
-    "root": null,
+    "root": "/Users/ardud/checkouts",
     "case_class": "pipeline last cwd in"
   },
   {
@@ -1404,7 +1404,7 @@
   {
     "command": "printf hi | { { cd /Users/ardud/checkouts; }; }; rg --files",
     "cwd": "/Users/ardud/checkouts/task-1",
-    "root": null,
+    "root": "/Users/ardud/checkouts",
     "case_class": "pipeline last cwd in"
   },
   {
@@ -1698,5 +1698,23 @@
     "cwd": "/Users/ardud/checkouts",
     "root": "/Users/ardud/checkouts",
     "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | { cd /Users/ardud/checkouts; }; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "round3 last-stage cwd into root"
+  },
+  {
+    "command": "printf hi | { cd /tmp; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "round3 last-stage cwd away from root"
+  },
+  {
+    "command": "printf hi | { export AGENT_GUARD_APPROVED=owner-approved; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "round3 last-stage grant ignored"
   }
 ]
