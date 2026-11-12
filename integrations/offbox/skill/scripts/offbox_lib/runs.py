@@ -455,6 +455,60 @@ LDCACHE_REPAIR = r'''(
   fi
 ) || true'''
 
+# Warm boxes retain watchman roots across runs; exhaustion poisons the server until it restarts.
+WATCH_REPAIR = r'''(
+  _offbox_proc=${OFFBOX_INOTIFY_PROC_DIR:-/proc/sys/fs/inotify}
+  _offbox_config=
+  _offbox_failed=0
+  for _offbox_limit in max_user_watches:524288 max_user_instances:1024; do
+    _offbox_name=${_offbox_limit%:*}
+    _offbox_floor=${_offbox_limit#*:}
+    _offbox_value=$(cat "$_offbox_proc/$_offbox_name" 2>/dev/null) || continue
+    case $_offbox_value in ''|*[!0-9]*) continue;; esac
+    if [ "$_offbox_value" -lt "$_offbox_floor" ]; then
+      _offbox_value=$_offbox_floor
+      sudo -n sysctl -q -w "fs.inotify.$_offbox_name=$_offbox_value" >/dev/null 2>&1 || _offbox_failed=1
+    fi
+    _offbox_config="${_offbox_config}fs.inotify.$_offbox_name=$_offbox_value
+"
+  done
+  if [ -n "$_offbox_config" ] &&
+     [ "$(cat /etc/sysctl.d/90-offbox-inotify.conf 2>/dev/null)" != "${_offbox_config%$'\n'}" ]; then
+    printf '%s' "$_offbox_config" | sudo -n tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null 2>&1 || _offbox_failed=1
+  fi
+  if [ "$_offbox_failed" -ne 0 ]; then
+    echo 'offbox: inotify limit repair failed (sudo -n); continuing' >&2
+  fi
+  if command -v watchman >/dev/null 2>&1; then
+    _offbox_watch=$(timeout 10 watchman watch-list 2>&1) || true
+    case $_offbox_watch in
+      *'Watchman needs your help'*|*poison*)
+        # A healthy root path can contain these words. Keep JSON errors and surrounding diagnostics only.
+        _offbox_watch=$(printf '%s' "$_offbox_watch" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+for i, char in enumerate(raw):
+    if char != "{":
+        continue
+    try:
+        response, end = json.JSONDecoder().raw_decode(raw, i)
+    except ValueError:
+        continue
+    if "roots" in response or "error" in response:
+        raw = raw[:i] + str(response.get("error", "")) + raw[end:]
+        break
+print(raw)
+' 2>/dev/null) || _offbox_watch=
+        case $_offbox_watch in
+          *'Watchman needs your help'*|*poison*)
+            if timeout 10 watchman shutdown-server >/dev/null 2>&1; then
+              echo 'offbox: watchman was poisoned (inotify limit); restarted it' >&2
+            fi;;
+        esac;;
+    esac
+  fi
+) || true'''
+
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 BOX_WEDGED_MARKER = "offbox-box-wedged"
 COMMAND_STARTED_MARKER = "offbox-command-started:"
@@ -1054,6 +1108,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               'trap ' + shlex.quote(deps_check) + ' EXIT',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
+              WATCH_REPAIR,
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
