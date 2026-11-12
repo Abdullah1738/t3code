@@ -334,7 +334,7 @@ export const workerQuestionText = (
 
 /** Handed to an evaluator that asked on a card before the card discussion got its own evaluator. */
 export const cardHandoffText = (cardNumber: number, discussionId: string, threadId: string) =>
-  `The owner followed up in the discussion of card #${cardNumber} (${discussionId}), and it now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; if you know something it needs, post it in that discussion.`;
+  `The discussion of card #${cardNumber} (${discussionId}) now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; only post if you have information the new evaluator doesn't already have on the card or in the discussion.`;
 
 /** Start text for a new card evaluator: the evaluators that asked there first may have acted already. */
 export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
