@@ -16,13 +16,14 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   location_reaper  5-min cua-driver MCP cleanup runs without errors
   msgs      message archive (com.ardud.message-archive) still reads chat.db
 
-Writes logs/health_last.json and logs/memory_check.log. Sends a Telegram
-alert when a check starts failing (once per check per day while it keeps
-failing) and an all-clear when it recovers. --dry-run prints and never
-notifies.
+Writes logs/health_last.json and logs/memory_check.log. Most checks alert on
+failure and daily while failing; muse_lag alerts after two consecutive
+failures and once per incident. --dry-run prints and never notifies.
 """
 import argparse
+import fcntl
 import glob
+import hashlib
 import json
 import math
 import os
@@ -31,6 +32,8 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -46,11 +49,15 @@ STATE = os.path.join(LOGS, "health_state.json")
 LAST = os.path.join(LOGS, "health_last.json")
 BUN = os.path.join(HOME, ".bun/bin/bun")
 TG_CLI = os.path.join(HOME, ".local/share/telegram-bridge/src/cli.ts")
+TG_DB = os.path.join(HOME, ".config/telegram-bridge/state.sqlite")
+SPECTRUM_CLI = os.path.join(HOME, ".local/share/spectrum-bridge/src/cli.ts")
+SPECTRUM_DB = os.path.join(HOME, ".config/spectrum-bridge/state.sqlite")
 
 SYNC_MAX_AGE = 15 * 60          # tick every 120 s
 LAG_GRACE_MS = 30 * 60 * 1000   # settle window is 10 min
 LAG_MAX = 3
 MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
+CAPTURE_IMESSAGE_AGE = 6 * 3600
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
@@ -84,7 +91,8 @@ def launchd_exit(label):
 def stage_status(name):
     """logs/<name>_last.json written by scripts/stage_lib.sh."""
     try:
-        return json.load(open(os.path.join(LOGS, f"{name}_last.json")))
+        with open(os.path.join(LOGS, f"{name}_last.json")) as f:
+            return json.load(f)
     except Exception:
         return None
 
@@ -903,9 +911,169 @@ CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag)
 
 
 def notify(severity, text, key):
-    r = subprocess.run([BUN, TG_CLI, "notify", "--source", "Memory health", "--severity", severity,
-                        "--text", text, "--key", key], capture_output=True, text=True, timeout=60)
-    return r.returncode == 0
+    try:
+        env = os.environ.copy()
+        env.pop("BUN_INSPECT", None)
+        r = subprocess.run([BUN, TG_CLI, "notify", "--source", "Memory health", "--severity", severity,
+                            "--text", text, "--key", key], capture_output=True, text=True, timeout=60, env=env)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def notify_capture_imessage(key):
+    """Queue one plain line on the owner's current conversation route."""
+    try:
+        with closing(ro(SPECTRUM_DB)) as db:
+            row = db.execute("SELECT value FROM kv WHERE key = 'route'").fetchone()
+        route = json.loads(row[0]) if row else None
+        session = route.get("id") if isinstance(route, dict) else None
+        if not isinstance(session, str) or not session:
+            return False
+        generation = route.get("generation")
+        if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 0:
+            session = f"{session}@{generation}"
+        env = os.environ.copy()
+        env.pop("BUN_INSPECT", None)
+        r = subprocess.run([BUN, SPECTRUM_CLI, "send", "--session", session, "--key", key,
+                            "--text", "Memory capture has not completed successfully for 6 hours; new sessions may not be saved."],
+                           capture_output=True, text=True, timeout=60, env=env)
+        return r.returncode == 0
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+        return False
+
+
+def telegram_delivered(key):
+    # Queue acceptance is not delivery: the bridge may send later items while
+    # an earlier one is in backoff. Gate each recovery on provider acceptance.
+    try:
+        outbox_id = "notify:" + hashlib.sha256(key.encode()).hexdigest()
+        with closing(ro(TG_DB)) as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT state FROM outbox WHERE id = ?", (outbox_id,)).fetchone()
+            checkpoint = db.execute("SELECT value FROM kv WHERE key = ?", (f"chunk:{outbox_id}:0",)).fetchone()
+        if row is not None and row[0] == "sent":
+            return True
+        if checkpoint is None:
+            return False
+        accepted = json.loads(checkpoint[0])
+        return isinstance(accepted, dict) and accepted.get("accepted") is True
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+
+
+def muse_problem_safe_to_skip(key):
+    """A definite failed/cancelled send cannot put a late problem after recovery."""
+    try:
+        outbox_id = "notify:" + hashlib.sha256(key.encode()).hexdigest()
+        with closing(ro(TG_DB)) as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT state, attempts FROM outbox WHERE id = ?", (outbox_id,)).fetchone()
+            mark = db.execute("SELECT value FROM kv WHERE key = ?", (f"sendAmbiguous:{outbox_id}",)).fetchone()
+            checkpoint = db.execute("SELECT value FROM kv WHERE key = ?", (f"chunk:{outbox_id}:0",)).fetchone()
+        if row is None:
+            return False
+        if checkpoint is not None:
+            return False
+        if row == ("cancelled", 0) and mark is None:
+            return True
+        return row[0] == "failed" and mark is not None and json.loads(mark[0]) is False
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+
+
+def capture_last_success(now):
+    # stage_lib writes this marker before capture_last.json; use the newest
+    # valid marker so an interrupted status-file write cannot hide recovery.
+    values = []
+    marker = os.path.join(LOGS, "state", "capture.last_ok")
+    def read_marker():
+        try:
+            with open(marker) as f:
+                values.append(float(f.read().strip()))
+        except (OSError, ValueError):
+            pass
+    read_marker()
+    st = stage_status("capture")
+    if isinstance(st, dict):
+        try:
+            values.append(float(st.get("last_ok_ts") or 0))
+        except (TypeError, ValueError):
+            pass
+    # The success marker is written before the status JSON. Re-read after the
+    # latter so a success during the first read does not look like an outage.
+    read_marker()
+    # stage_lib can complete between sampling now and reading the marker.
+    read_now = max(now, time.time())
+    return max((v for v in values if math.isfinite(v) and 0 < v <= read_now), default=None)
+
+
+def capture_notice(state, now):
+    """Keep an incident stable across runs, including missing status files."""
+    prev = state.get("capture_imessage") or {}
+    if not isinstance(prev, dict):
+        prev = {}
+    last_ok = capture_last_success(now)
+    now = max(now, int(time.time()))
+    since = prev.get("since")
+    if not isinstance(since, (int, float)) or not math.isfinite(since) or since > now:
+        since = None
+    observed = prev.get("last_ok")
+    first_seen = prev.get("first_seen", since)
+    # Discovering an old marker after an unmarked outage is evidence of the
+    # same outage, not a new capture success.
+    if since is not None and observed is None and last_ok is not None and last_ok <= first_seen:
+        prev["last_ok"] = last_ok
+        prev["since"] = min(since, last_ok)
+        since = prev["since"]
+        observed = last_ok
+    if since is None or (last_ok is not None and (observed is None or last_ok > observed)):
+        # No success marker at startup: count from first observation, not epoch.
+        since = last_ok if last_ok is not None else now
+        # Existing watcher/health state may already prove a long outage.
+        if last_ok is None:
+            candidates = [since]
+            sync = state.get("failing", {}).get("sync", {})
+            if isinstance(sync, dict):
+                candidates.append(sync.get("since"))
+            since = min((v for v in candidates if isinstance(v, (int, float))
+                         and math.isfinite(v) and 0 < v <= now), default=now)
+        prev = {"since": since, "last_ok": last_ok, "first_seen": now,
+                "incident_id": uuid.uuid4().hex, "sent": False}
+    state["capture_imessage"] = prev
+    return prev if now - since >= CAPTURE_IMESSAGE_AGE and not prev.get("sent") else None
+
+
+def capture_send_retryable(incident_id):
+    # Requeue only a definite non-delivery: cancellation can race an in-flight
+    # RPC, so a checkpoint or ambiguous attempt rules out a new key.
+    try:
+        key = f"memory-capture-stall:{incident_id}"
+        outbox_id = "send:" + hashlib.sha256(key.encode()).hexdigest()
+        with closing(ro(SPECTRUM_DB)) as db:
+            # Read both tables from one snapshot; the bridge writes dispatch
+            # markers and the sending transition in a single transaction.
+            db.execute("BEGIN")
+            row = db.execute("SELECT state, attempts FROM outbox WHERE id = ?", (outbox_id,)).fetchone()
+            marks = dict(db.execute("SELECT key, value FROM kv WHERE key IN (?, ?) OR key GLOB ?",
+                (f"firstAttempt:{outbox_id}", f"sendAmbiguous:{outbox_id}", f"chunk:{outbox_id}:*")))
+        if row is None or row[0] not in ("cancelled", "failed"):
+            return False
+        if any(k.startswith(f"chunk:{outbox_id}:") for k in marks):
+            return False
+        ambiguity = marks.get(f"sendAmbiguous:{outbox_id}")
+        if row == ("cancelled", 0) and not marks:
+            return True
+        return ambiguity is not None and json.loads(ambiguity) is False
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+
+
+def save_state(state):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
 
 
 def main():
@@ -915,6 +1083,20 @@ def main():
     global DRY_RUN
     DRY_RUN = args.dry_run
 
+    # launchd normally serializes runs; this also protects a manual run and
+    # the fixed state-file temp name from overlapping scheduled checks.
+    if not args.dry_run:
+        with open(STATE + ".lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            run_checks(args)
+    else:
+        run_checks(args)
+
+
+def run_checks(args):
     results = {}
     for name, fn in CHECKS:
         try:
@@ -924,13 +1106,38 @@ def main():
         results[name] = {"ok": ok, "msg": msg}
 
     try:
-        state = json.load(open(STATE))
+        with open(STATE) as f:
+            state = json.load(f)
     except Exception:
         state = {}
     failing = state.get("failing", {})
+    old_failing = dict(failing)
     today = time.strftime("%Y%m%d")
+    now = int(time.time())
     new_fail, recovered = [], []
     for name, r in results.items():
+        if name == "muse_lag":
+            prev = failing.get(name)
+            if not r["ok"]:
+                prev = prev or {}
+                # Existing notified_day records are already open incidents.
+                notified = prev.get("notified", bool(prev.get("notified_day")))
+                count = prev.get("consecutive_failures", 1 if prev else 0) + 1
+                failing[name] = {"since": prev.get("since", now), "msg": r["msg"],
+                                 "incident_id": prev.get("incident_id") or uuid.uuid4().hex,
+                                 "consecutive_failures": count, "notified": notified,
+                                 "attempted": prev.get("attempted", notified),
+                                 "legacy_notified": prev.get("legacy_notified", bool(prev.get("notified_day"))),
+                                 "notice_msg": prev.get("notice_msg")}
+            elif prev:
+                notified = prev.get("notified", bool(prev.get("notified_day")))
+                if notified or prev.get("attempted", False) or prev.get("consecutive_failures", 0) >= 2:
+                    incident_id = prev.get("incident_id") or uuid.uuid4().hex
+                    state.setdefault("muse_recoveries", []).append({"incident_id": incident_id,
+                        "msg": prev.get("notice_msg") or prev.get("msg", "Muse capture was behind"), "notified": notified,
+                        "legacy_notified": prev.get("legacy_notified", bool(prev.get("notified_day")))})
+                failing.pop(name)
+            continue
         if not r["ok"]:
             prev = failing.get(name)
             if not prev or prev.get("notified_day") != today:
@@ -946,6 +1153,23 @@ def main():
         print(json.dumps(summary, indent=1))
         return
 
+    state["failing"] = failing
+    # Preserve the prior state of legacy checks until their existing send path
+    # runs, while committing the incident keys needed for safe retries.
+    def save_incidents():
+        pending = dict(state)
+        pending_failing = dict(old_failing)
+        if "muse_lag" in results:
+            if "muse_lag" in failing:
+                pending_failing["muse_lag"] = failing["muse_lag"]
+            else:
+                pending_failing.pop("muse_lag", None)
+        pending["failing"] = pending_failing
+        save_state(pending)
+
+    # Persist the new incident keys before any potentially ambiguous send.
+    save_incidents()
+
     if new_fail:
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
@@ -957,14 +1181,81 @@ def main():
         text = "Memory system recovered: " + ", ".join(recovered) + "."
         notify("info", text, f"memory-health:recovered:{int(time.time())}:{','.join(recovered)}")
 
-    state["failing"] = failing
-    for path, obj in ((STATE, state), (LAST, summary)):
-        tmp = path + ".tmp"
-        json.dump(obj, open(tmp, "w"), indent=1)
-        os.replace(tmp, path)
+    # Finish the legacy path before additional notifications can block it.
+    save_state(state)
+    old_failing = dict(failing)
+
+    tmp = LAST + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(summary, f, indent=1)
+    os.replace(tmp, LAST)
     with open(os.path.join(LOGS, "memory_check.log"), "w") as f:
         f.write("ok\n" if summary["ok"] else
                 "".join(f"FAIL {n}: {r['msg']}\n" for n, r in results.items() if not r["ok"]))
+
+    for recovery in list(state.get("muse_recoveries", [])):
+        incident_id = recovery["incident_id"]
+        if not recovery["notified"]:
+            # A timeout can mean the bridge accepted the problem even though
+            # the client did not get the response. Replay the same key before
+            # its recovery, even if the check has already become healthy.
+            if not notify("attention", f"Memory system problem:\n- muse_lag: {recovery['msg']}",
+                          f"memory-health:muse_lag:{incident_id}"):
+                break
+            recovery["notified"] = True
+            save_incidents()
+        problem_key = f"memory-health:muse_lag:{incident_id}"
+        if not recovery.get("legacy_notified") and not telegram_delivered(problem_key):
+            if not muse_problem_safe_to_skip(problem_key):
+                break
+            state["muse_recoveries"].remove(recovery)
+            save_incidents()
+            continue
+        recovery_key = recovery.setdefault("recovery_key", f"memory-health:muse_lag:recovered:{incident_id}")
+        if recovery.get("recovery_notified") and muse_problem_safe_to_skip(recovery_key):
+            recovery_key = f"memory-health:muse_lag:recovered:{incident_id}:{uuid.uuid4().hex}"
+            recovery["recovery_key"] = recovery_key
+            recovery["recovery_notified"] = False
+            save_incidents()
+        if not recovery.get("recovery_notified"):
+            if not notify("info", "Memory system recovered: muse_lag.", recovery_key):
+                break
+            recovery["recovery_notified"] = True
+            save_incidents()
+        if not telegram_delivered(recovery_key):
+            break
+        state["muse_recoveries"].remove(recovery)
+        save_incidents()
+    muse = failing.get("muse_lag")
+    if muse and not state.get("muse_recoveries") and muse["consecutive_failures"] >= 2 and not muse["notified"]:
+        # Record the attempt first: the process may die after the bridge accepts
+        # it, then see a recovery on the next run.
+        muse["attempted"] = True
+        muse["notice_msg"] = muse.get("notice_msg") or muse["msg"]
+        save_incidents()
+        if notify("attention", f"Memory system problem:\n- muse_lag: {muse['notice_msg']}",
+                  f"memory-health:muse_lag:{muse['incident_id']}"):
+            muse["notified"] = True
+            save_incidents()
+
+    save_state(state)
+    # This path is deliberately last: an unavailable iMessage bridge must not
+    # prevent the health results or Telegram alerts from being recorded.
+    try:
+        now = int(time.time())
+        capture = capture_notice(state, now) if "sync" in results else None
+        if ("sync" in results
+                and now - state["capture_imessage"]["since"] >= CAPTURE_IMESSAGE_AGE
+                and capture_send_retryable(state["capture_imessage"]["incident_id"])):
+            capture = state["capture_imessage"]
+            capture["incident_id"] = uuid.uuid4().hex
+            capture["sent"] = False
+        save_state(state)
+        if capture and notify_capture_imessage(f"memory-capture-stall:{capture['incident_id']}"):
+            capture["sent"] = True
+            save_state(state)
+    except Exception as e:
+        print(f"capture iMessage check failed: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

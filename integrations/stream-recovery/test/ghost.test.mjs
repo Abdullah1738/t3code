@@ -10,7 +10,8 @@ const SES = 'ses_g';
 const STALL_ID = `st-${SES}-20261029T193739Z`;
 const ghostThread = (over = {}) => ({
   threadId: 'thread:433', title: '#433 External PR', state: 'running', activeRunId: 'run:8',
-  nativeSessionId: SES, pendingRequest: null, archived: false, origin: null, ...over,
+  nativeSessionId: SES, pendingRequest: null, archived: false, origin: null,
+  parentThreadId: null, relationshipToParent: null, ...over,
 });
 const idleTail = (createdMs) => [{ type: 'assistant', time: { created: createdMs }, content: [] }];
 
@@ -126,14 +127,13 @@ test('happy path: waits out the 15 min, interrupts once through Robob, sends one
   assert.match(fake.calls.sendToThread[0].text, /Robob showed a turn running/);
   assert.equal(state.stalls[STALL_ID].outcome, 'cleared');
   assert.equal(state.stalls[STALL_ID].done, true);
-  assert.equal(fake.calls.telegram.length, 1);
-  assert.equal(fake.calls.telegram[0].severity, 'info');
+  assert.equal(fake.calls.telegram.length, 0);
   assert.deepEqual(fake.calls.unexpected, []);
 
   await stallScan({ state, now: scan2 + 2 * MIN, log }, fake.io);
   assert.equal(fake.calls.interruptThread.length, 1);
   assert.equal(fake.calls.sendToThread.length, 1);
-  assert.equal(fake.calls.telegram.length, 1);
+  assert.equal(fake.calls.telegram.length, 0);
   assert.deepEqual(fake.calls.unexpected, []);
 });
 
@@ -182,7 +182,7 @@ test('an imessage thread is interrupted, cleared, and gets no carry-on note', as
   fake.io.activeThreads = async () => [];
   await stallScan({ state, now: T0 + 21 * MIN, log }, fake.io);
   assert.equal(fake.calls.sendToThread.length, 0);
-  assert.equal(fake.calls.telegram.length, 1);
+  assert.equal(fake.calls.telegram.length, 0);
   assert.equal(state.stalls[STALL_ID].outcome, 'cleared');
 });
 
@@ -192,7 +192,7 @@ test('after 3 acted stalls on one session in 24h a new ghost is only reported', 
   const { log } = logs();
   for (let i = 0; i < MAX_PER_DAY; i++) {
     state.stalls[`old-${i}`] = {
-      ses: SES, action: 'robob', at: new Date(T0 - (i + 1) * MIN).toISOString(), done: true, outcome: 'cleared',
+      ses: SES, threadId: 'thread:433', action: 'robob', at: new Date(T0 - (i + 1) * MIN).toISOString(), done: true, outcome: 'cleared',
     };
   }
   await stallScan({ state, now: T0, log }, fake.io);
