@@ -161,8 +161,11 @@ class ChildTree:
                     continue
                 parent = self.members.get(process.ppid)
                 current_parent = table.get(process.ppid)
+                # Rows can span parent PID reuse; a native parent identity
+                # outranks PPID even when the earlier parent row still matches.
                 owned = (process.parent_identity in self.identities or
-                         (parent is not None and current_parent is not None and
+                         (process.parent_identity is None and
+                          parent is not None and current_parent is not None and
                           parent.identity == current_parent.identity) or
                          process.pgid == self.leader)
                 leader = self.members.get(self.leader)

@@ -431,6 +431,46 @@ time.sleep(120)
             self.assertEqual(tree.refresh(), [replacement])
             self.assertEqual(tree.identities, {123, 124, 125})
 
+    def test_parent_identity_controls_mixed_time_snapshot_membership(self):
+        spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        leader = runner.ProcessInfo(900001, 1, 900001, 'Z', 123, 0, 'leader')
+        parent = runner.ProcessInfo(900002, 900001, 900002, 'S', 124, 123, 'owned parent')
+        # Parent identity, PPID, current parent's identity, admitted/signalled.
+        cases = [
+            ('native contradicts stale PPID', 999, parent.pid, parent.identity, False),
+            ('native zero is present', 0, parent.pid, parent.identity, False),
+            ('native matches owned parent', parent.identity, parent.pid, parent.identity, True),
+            ('native survives reparenting', parent.identity, 1, parent.identity, True),
+            ('native survives parent PID reuse', parent.identity, parent.pid, 999, True),
+            ('no native identity uses PPID', None, parent.pid, parent.identity, True),
+            ('PPID fallback rejects reused parent', None, parent.pid, 999, False),
+        ]
+        for name, parent_identity, ppid, current_parent_identity, expected in cases:
+            with self.subTest(case=name):
+                tree = runner.ChildTree(leader.pid)
+                tree.members = {leader.pid: leader, parent.pid: parent}
+                tree.identities = {leader.identity, parent.identity}
+                current_parent = parent if current_parent_identity == parent.identity else runner.ProcessInfo(
+                    parent.pid, 1, 900099, 'S', current_parent_identity, 0, 'unrelated parent',
+                )
+                child = runner.ProcessInfo(900003, ppid, 900099, 'S', 125, parent_identity, 'child')
+                # The old parent's earlier record can coexist with a later
+                # record of the replacement parent's unrelated child.
+                table = {leader.pid: leader, parent.pid: current_parent, child.pid: child}
+                def snapshot(pid=None):
+                    return table if pid is None else {pid: table[pid]}
+                with mock.patch.object(runner, 'process_table', side_effect=snapshot), \
+                     mock.patch.object(runner.os, 'kill') as kill:
+                    alive = tree.refresh()
+                    for process in alive:
+                        tree.signal_pid(process, signal.SIGKILL)
+                    self.assertEqual(child in alive, expected)
+                    self.assertEqual(child.pid in tree.members, expected)
+                    self.assertEqual(mock.call(child.pid, signal.SIGKILL) in kill.call_args_list, expected)
+
     @unittest.skipUnless(sys.platform == 'darwin', 'Darwin atomic process record regression')
     def test_native_ownership_does_not_use_stale_ps_ancestry(self):
         spec = importlib.util.spec_from_file_location("run_limited_test", RUNNER)
