@@ -315,7 +315,9 @@ def find_lease(con, owner: str, root: str):
 
 
 def active_runs(con, box_id: str) -> int:
-    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND status IN ('starting','running')",
+    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+                       "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
+                       "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
                        (box_id,)).fetchone()[0]
 
 
@@ -1252,6 +1254,8 @@ def settle_stranded_runs(con, box_id: str) -> int:
     """Mark the box's starting/running runs lost. Call only once boat has confirmed the box is gone or stopped, so
     no process can still be running them. A run that outlived its client (no one left to end it) is then not
     counted as active forever. Caller holds 'box-<id>'. Returns how many runs were settled."""
+    con.execute("INSERT OR IGNORE INTO kv(k,v) SELECT 'lost_confirmed:' || run_id, '1' FROM runs "
+                "WHERE box_id=? AND status IN ('starting','running','lost')", (box_id,))
     cur = con.execute("UPDATE runs SET status='lost', end_at=? WHERE box_id=? AND status IN ('starting','running')",
                       (now(), box_id))
     con.commit()

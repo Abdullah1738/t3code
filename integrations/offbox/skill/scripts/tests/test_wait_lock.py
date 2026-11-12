@@ -872,7 +872,7 @@ class TakeoverPublishTests(unittest.TestCase):
         frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
         seen = {}
 
-        def pause_at_finish(run_id, code, status=None):
+        def pause_at_finish(run_id, code, status=None, *, until=None):
             # Runs after the replacement log is published and before the row is marked settled. The second waiter
             # runs now: it must see the replacement, because the row is not settled yet.
             seen['log_at_finish'] = log.read_bytes()

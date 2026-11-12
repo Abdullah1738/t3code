@@ -272,7 +272,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
-  repo and run that. If boat loses track of a run that already ended (status `lost`), offbox reads the exit code the run left on the box (`~/.offbox/exit/<run>.rc`) or, for `--step` runs, the step lines when every step reported; only when neither exists is it 90.
+  repo and run that. Boat's `lost` is checked against retained command history, then the wrapper's exit file
+  (`~/.offbox/exit/<run>.rc`), then its PID marker on the box. A live process stays reserved and followed;
+  an SSH failure or missing legacy PID marker is unknown, so it cannot settle the run as lost or free its lease.
+  Only a confirmed missing process with no saved exit returns 90. `offbox wait` on a wrongly-lost run recovers
+  its saved exit code and corrects the row, or re-attaches while its process is alive. After a confirmed loss,
+  inspect the box with `offbox ssh <box>` before rerunning.
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
 
 ## Troubleshooting

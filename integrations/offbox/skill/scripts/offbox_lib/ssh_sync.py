@@ -655,7 +655,7 @@ def _missing_pull(code: int, error: str) -> bool:
     return missing
 
 
-def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path) -> dict:
+def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
     if path.startswith("/") or ".." in Path(path).parts:
@@ -667,7 +667,7 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path)
     dest.mkdir(parents=True, exist_ok=True)
     cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
            f"{box_id}:{rbase}/{path}", f"{dest}/"]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:
