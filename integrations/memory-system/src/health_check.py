@@ -784,7 +784,9 @@ def _boot_id():
 def _msgs_failing():
     try:
         with open(STATE) as f:
-            return "msgs" in json.load(f).get("failing", {})
+            failing = json.load(f).get("failing", {})
+        # A queued all-clear must not latch an already recovered archive.
+        return "msgs" in failing and not failing["msgs"].get("recovery_pending")
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -968,6 +970,15 @@ def notify_backup(name, text, incident, recovered=False):
         return False
 
 
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -983,35 +994,44 @@ def main():
             ok, msg = False, f"check crashed: {type(e).__name__}: {e}"
         results[name] = {"ok": ok, "msg": msg}
 
+    state_read_error = None
     try:
         with open(STATE) as f:
             state = json.load(f)
-    except Exception:
+    except FileNotFoundError:
         state = {}
+    except (OSError, ValueError) as error:
+        state = {}
+        state_read_error = error
     failing = state.get("failing", {})
+    previous_failing = failing.copy()
     backup_recoveries = state.get("backup_recoveries", [])
     today = time.strftime("%Y%m%d")
-    new_fail, recovered = [], []
+    new_fail, recovered, backup_alerts = [], [], []
     for name, r in results.items():
         if name in BACKUP_INCIDENTS:
             prev = failing.get(name, {})
             if not r["ok"]:
                 incident = prev.get("since", time.time_ns())
                 sent = prev.get("incident_notified", bool(prev.get("notified_day")))
-                if not args.dry_run and not sent:
-                    sent = notify_backup(name, r["msg"], incident)
-                failing[name] = {"since": incident, "msg": r["msg"], "incident_notified": sent}
+                failing[name] = {"since": incident, "msg": r["msg"], "incident_notified": sent,
+                                 "alert_text": prev.get("alert_text", prev.get("msg", r["msg"]))}
+                if not sent:
+                    backup_alerts.append(name)
             elif prev:
-                if prev.get("incident_notified", bool(prev.get("notified_day"))):
-                    backup_recoveries.append({"name": name, "incident": prev["since"],
-                                              "text": f"{BACKUP_INCIDENTS[name]} recovered at "
-                                                      f"{time.strftime('%Y-%m-%d %H:%M')}: {r['msg']}"})
+                # A reserved alert may have reached Telegram before its local
+                # acknowledgement was saved, so recovery also covers that case.
+                backup_recoveries.append({"name": name, "incident": prev["since"],
+                                          "text": f"{BACKUP_INCIDENTS[name]} recovered at "
+                                                  f"{time.strftime('%Y-%m-%d %H:%M')}: {r['msg']}"})
                 # Recovery happened even if its notice can't be delivered yet.
                 # A later outage must start a new incident with a new alert.
                 failing.pop(name)
             continue
         if not r["ok"]:
             prev = failing.get(name)
+            if prev and prev.get("recovery_pending"):
+                prev = None
             if not prev or prev.get("notified_day") != today:
                 new_fail.append(name)
             failing[name] = {"since": (prev or {}).get("since", int(time.time())),
@@ -1025,8 +1045,23 @@ def main():
         print(json.dumps(summary, indent=1))
         return
 
-    backup_recoveries = [rec for rec in backup_recoveries
-                         if not notify_backup(rec["name"], rec["text"], rec["incident"], recovered=True)]
+    if (backup_alerts or backup_recoveries) and state_read_error is None:
+        # Reserve keys and payloads before backup sends, keeping ordinary
+        # all-clears pending in case a backup notification interrupts this run.
+        state["failing"] = {**failing, **{name: {**previous_failing[name], "recovery_pending": True}
+                                        for name in recovered}}
+        state["backup_recoveries"] = backup_recoveries
+        try:
+            write_json(STATE, state)
+        except OSError:
+            # A full disk must not suppress the ordinary disk/sync alerts below.
+            pass
+        else:
+            for name in backup_alerts:
+                incident = failing[name]
+                incident["incident_notified"] = notify_backup(name, incident["alert_text"], incident["since"])
+            backup_recoveries = [rec for rec in backup_recoveries
+                                 if not notify_backup(rec["name"], rec["text"], rec["incident"], recovered=True)]
     if new_fail:
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
@@ -1036,15 +1071,15 @@ def main():
                 failing[n]["notified_day"] = today
     if recovered:
         text = "Memory system recovered: " + ", ".join(recovered) + "."
-        notify("info", text, f"memory-health:recovered:{int(time.time())}:{','.join(recovered)}")
+        if not notify("info", text, f"memory-health:recovered:{int(time.time())}:{','.join(recovered)}"):
+            failing.update({name: {**previous_failing[name], "recovery_pending": True} for name in recovered})
 
+    if state_read_error is not None:
+        raise state_read_error
     state["failing"] = failing
     state["backup_recoveries"] = backup_recoveries
     for path, obj in ((STATE, state), (LAST, summary)):
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(obj, f, indent=1)
-        os.replace(tmp, path)
+        write_json(path, obj)
     with open(os.path.join(LOGS, "memory_check.log"), "w") as f:
         f.write("ok\n" if summary["ok"] else
                 "".join(f"FAIL {n}: {r['msg']}\n" for n, r in results.items() if not r["ok"]))
