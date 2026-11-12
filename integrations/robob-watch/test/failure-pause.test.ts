@@ -256,3 +256,60 @@ test("pause escalation completion cannot undo a concurrent resume", async () => 
   expect(f.state("paused-wake").failure_paused_at).toBeUndefined();
   expect(f.state("paused-wake").failure_escalated).toBeUndefined();
 });
+
+const maintenanceFailureCases = (["ssd", "phone"] as const).flatMap(resource =>
+  (["exit", "timeout"] as const).flatMap(failure =>
+    (["off", "expiry"] as const).map(end => [resource, failure, end] as const)));
+
+test.each(maintenanceFailureCases)("in-flight maintenance failure: %s %s %s", async (resource, failure, end) => {
+  const f = fixture({ ROBOB_WATCH_CHECK_TIMEOUT_MS: "3000" });
+  f.add("inflight", {
+    mode: "wake", depends: [resource],
+    ...(end === "expiry" ? { max_consecutive_failures: 0 } : {}),
+    check: 'echo run >> "$WATCH_DIR/runs"; [[ -f "$WATCH_DIR/healthy" ]] && exit 0; while [[ ! -f "$WATCH_DIR/release" ]]; do sleep 0.02; done; '
+      + (failure === "exit" ? 'echo resource missing >&2; exit 1' : 'sleep 30'),
+  });
+  const streak = { ...f.state("inflight"), consecutive_failures: 4, next_at: 0,
+    failing_since: new Date(Date.now() - 16 * 60_000).toISOString(), last_error: "previous failure" };
+  f.save("inflight", streak);
+  const child = f.start();
+  await until(() => f.runs("inflight") === 1);
+  expect(f.cli("maintenance", "on", "--depends", resource, "--for", "1h").exitCode).toBe(0);
+  await until(() => f.readLog(child).includes("maintenance started"));
+  writeFileSync(f.path("inflight", "release"), "");
+  await until(() => f.state("inflight").consecutive_failures !== 4
+    || (existsSync(f.path("inflight", "log"))
+      && readFileSync(f.path("inflight", "log"), "utf8").includes("check failure ignored during maintenance")));
+  expect(f.state("inflight")).toMatchObject(streak);
+  expect(f.state("inflight").failure_paused_at).toBeUndefined();
+  expect(f.state("inflight").failure_escalated).toBeUndefined();
+  expect(f.readCalls()).toHaveLength(0);
+  expect(existsSync(f.path("inflight", ".run-ok"))).toBe(false);
+
+  writeFileSync(f.path("inflight", "healthy"), "");
+  if (end === "off") expect(f.cli("maintenance", "off").exitCode).toBe(0);
+  else writeFileSync(join(f.root, "maintenance.json"), JSON.stringify({ until: new Date(0).toISOString(), reason: "expired", depends: [resource] }));
+  await until(() => f.runs("inflight") === 2 && f.state("inflight").consecutive_failures === 0);
+  await f.stop(child);
+  expect(f.state("inflight").failure_paused_at).toBeUndefined();
+  expect(f.state("inflight").failing_since).toBeUndefined();
+  expect(f.readCalls()).toHaveLength(0);
+}, 20_000);
+
+test.each(["other resource", "no dependency"])("maintenance still counts unrelated in-flight failures: %s", async dependency => {
+  const f = fixture({ ROBOB_WATCH_CHECK_TIMEOUT_MS: "5000" });
+  f.add("unrelated", {
+    ...(dependency === "other resource" ? { depends: ["phone"] } : {}),
+    check: 'echo run >> "$WATCH_DIR/runs"; while [[ ! -f "$WATCH_DIR/release" ]]; do sleep 0.02; done; exit 1',
+  });
+  f.save("unrelated", { ...f.state("unrelated"), consecutive_failures: 4, failing_since: new Date().toISOString() });
+  const child = f.start(); await until(() => f.runs("unrelated") === 1);
+  expect(f.cli("maintenance", "on", "--depends", "ssd", "--for", "1h").exitCode).toBe(0);
+  await until(() => f.readLog(child).includes("maintenance started"));
+  writeFileSync(f.path("unrelated", "release"), "");
+  await until(() => f.state("unrelated").failure_alerted);
+  await f.stop(child);
+  expect(f.state("unrelated").consecutive_failures).toBe(5);
+  expect(f.state("unrelated").failure_paused_at).toBeString();
+  expect(f.readCalls()).toHaveLength(1);
+});

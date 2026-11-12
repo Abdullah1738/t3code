@@ -187,12 +187,20 @@ async function tickOne(id: string): Promise<void> {
   });
   if (!result) return;
   let fresh = loadState(id);
-  if (!loadWatcher(id) || fresh.status !== "active") return;
+  const current = loadWatcher(id);
+  if (!current || fresh.status !== "active") return;
   fresh.last_run_ms = result.ms;
   const queued = now() - t - result.ms;
   if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s`);
   const ackRun = () => { try { writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
   if (result.timedOut || result.code !== 0) {
+    // Maintenance can remove a resource after admission; this failure must not pause an otherwise healthy check.
+    if (heldByMaintenance(current, maintenance)) {
+      fresh.next_at = 0;
+      saveState(id, fresh);
+      log(id, "check failure ignored during maintenance");
+      return;
+    }
     fresh.consecutive_failures += 1;
     if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
     fresh.last_error = result.timedOut ? `timed out after ${CHECK_TIMEOUT_MS / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
