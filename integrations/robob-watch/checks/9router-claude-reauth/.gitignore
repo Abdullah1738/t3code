@@ -1,0 +1,10 @@
+.phase
+supervisor-state.json
+state.json
+log
+.run-ok
+supervisor.lock
+recovery.lease*
+ENABLE_REQUIRED
+RECOVERY_ENABLED
+*.tmp
