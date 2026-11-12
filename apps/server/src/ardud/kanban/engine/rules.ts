@@ -568,7 +568,7 @@ export function planDispatch(
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
-    // Once a card has a work thread it stays on that thread's model.
+    // An existing work thread follows the card's pinned model.
     const model =
       role === "work" && card.workThreadId === null
         ? weightedModel(card, pools, free, pick)

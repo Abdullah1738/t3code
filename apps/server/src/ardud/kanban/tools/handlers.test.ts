@@ -1591,17 +1591,30 @@ it.effect("MCP model writes resolve legacy selections only under the apply flag"
     );
 
     const edited = yield* call(evaluator, "card_edit", { card: card.id, model: haiku });
-    assert.isFalse(edited.isError, edited.text);
+    assert.isTrue(edited.isError, edited.text);
+    assert.include(edited.text, "selection routing rewrites");
     assert.strictEqual(
       (yield* kanban.card(KanbanCardId.make(card.id))).card.model.model,
-      "claude-haiku-5-5",
+      "claude-opus-5-5",
     );
+    const nativeHaiku = { instanceId: "claudeAgent", model: "claude-haiku-5-5", effort: "max" };
+    const applied = yield* call(evaluator, "card_edit", { card: card.id, model: nativeHaiku });
+    assert.isFalse(applied.isError, applied.text);
 
-    const weighted = yield* call(evaluator, "card_edit", {
+    const refusedList = yield* call(evaluator, "card_edit", {
       card: card.id,
       models: [
         { ...opus, weight: 2 },
         { ...haiku, weight: 1 },
+      ],
+    });
+    assert.isTrue(refusedList.isError, refusedList.text);
+    assert.include(refusedList.text, "selection routing rewrites");
+    const weighted = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      models: [
+        { instanceId: "claudeAgent", model: "claude-opus-5-5", effort: "high", weight: 2 },
+        { ...nativeHaiku, weight: 1 },
       ],
     });
     assert.isFalse(weighted.isError, weighted.text);

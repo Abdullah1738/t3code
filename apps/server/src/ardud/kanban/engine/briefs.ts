@@ -412,3 +412,6 @@ export const writerPrompt = (card: Pick<KanbanCard, "prompt" | "title" | "descri
     "Task:",
     card.prompt || card.description || card.title,
   );
+
+export const threadModelDiffersText = (card: KanbanCard, reason: string) =>
+  `Card #${card.number} was not started: ${reason}. It is flagged stalled. Fix the thread's model or card_edit the card's model, then clear the flag with card_flag stalled false and say in the card's discussion what you changed.`;
