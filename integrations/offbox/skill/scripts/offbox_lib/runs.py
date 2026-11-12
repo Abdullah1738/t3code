@@ -17,11 +17,13 @@ from pathlib import Path
 
 from . import api, capacity, identity, lease, node_tools, node_version, pool, ssh_sync
 from . import prune, prepare
-from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
+RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
+RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",
@@ -1553,6 +1555,10 @@ def _close(frames) -> None:
 _KEEPER_JOIN_S = 65
 
 
+class _ClientSignal(KeyboardInterrupt):
+    """Unwind to stop/detach without waiting on a network-bound TTL keeper."""
+
+
 def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
     """Commit a checkpoint after a chunk is flushed to the local log: the remote offsets and the log length they match.
     A holder that dies before this write leaves the chunk past logBytes, so a takeover trusts only logBytes."""
@@ -1910,7 +1916,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         stop_evt.set()
         _close(frames)  # closes the HTTP response (api.stream reads it inside `with`)
         # The keeper's ensure_ttl can sit in a 60 s request; a waiter past its deadline must not wait on it.
-        keeper.join(_KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        join_s = 0 if isinstance(sys.exc_info()[1], _ClientSignal) else (
+            _KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        keeper.join(join_s)
         if lf:
             lf.close()
         if mf:
@@ -2038,13 +2046,51 @@ def _run_attempt(a, me: dict) -> int:
         pool.release_guard(rn.lease_row)
 
 
+def _host_restarting(signum) -> bool:
+    if signum not in (signal.SIGTERM, signal.SIGHUP):
+        return False
+    try:
+        marker = json.loads(RESTART_MARKER.read_text())
+        return (isinstance(marker, dict) and type(marker.get('pid')) is int and marker['pid'] > 0
+                and type(marker.get('at')) in (int, float) and 0 <= now() - marker['at'] < RESTART_MARKER_MAX_S)
+    except (OSError, ValueError):
+        return False
+
+
+def _detach(rn, signum) -> int:
+    # Keep start_at: detaching must not restart #866's orphan age allowance.
+    rn.record(mode='bg')
+    message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "
+               f"Re-attach: offbox wait {rn.run_id}")
+    rn.log_path.parent.mkdir(parents=True, exist_ok=True)
+    ck = read_json(offsets_path(rn.log_path), {})
+    with open(rn.log_path, 'ab') as f:
+        # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
+        if ck:
+            f.truncate(ck['logBytes'])
+            f.seek(0, os.SEEK_END)
+        f.write(f"\noffbox: {message}\n".encode())
+        length = f.tell()
+    _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
+    say(message)
+    log(message)
+    try:
+        row = db().execute('SELECT start_at FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        remaining = max(0, int(ORPHAN_RUN_MAX_S - (now() - (row['start_at'] or 0)))) if row else 0
+        if remaining:
+            lease.ensure_ttl(rn.box, min(BG_TTL_S, remaining), api.get(rn.box))
+    except OffboxError as e:
+        say(f"could not extend {rn.box}'s deadline: {e}; the reaper will retry")
+    return EXIT_DETACHED
+
+
 def _run_remote(a, rn) -> int:
     interrupted = {"sig": None}
 
     def on_sig(signum, _frame):
-        interrupted["sig"] = signum
-        rn.kill()
-        raise KeyboardInterrupt
+        if interrupted['sig'] is None:
+            interrupted["sig"] = signum
+            raise _ClientSignal
 
     # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
     # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
@@ -2080,10 +2126,15 @@ def _run_remote(a, rn) -> int:
         except Interrupted:
             finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             raise
-        except KeyboardInterrupt:
-            # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
-            rn.record(error='interrupted; awaiting confirmed remote termination')
-            return 130
+    except KeyboardInterrupt:
+        if rn.started and rn.box and _host_restarting(interrupted['sig']):
+            return _detach(rn, interrupted['sig'])
+        rn.kill()
+        if not rn.started:
+            raise
+        # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
+        rn.record(error='interrupted; awaiting confirmed remote termination')
+        return 130
     finally:
         for s, h in old.items():
             signal.signal(s, h)

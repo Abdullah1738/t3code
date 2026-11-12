@@ -27,7 +27,8 @@ Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) 
 Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "offbox: local exit N"); 90 infra/start-limit
 failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally.
 With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
-94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once)."""
+94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once).
+95 Robob restarted: the remote run detached and keeps going (offbox wait <run-id>)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
