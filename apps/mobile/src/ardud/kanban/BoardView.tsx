@@ -213,11 +213,7 @@ export function BoardView(props: {
   const filterRow = (
     <View className="gap-2.5">
       {setup ? (
-        <SetupStrip
-          setup={setup}
-          onViewSetup={props.onViewSetup}
-          onEndSetup={props.onEndSetup}
-        />
+        <SetupStrip setup={setup} onViewSetup={props.onViewSetup} onEndSetup={props.onEndSetup} />
       ) : null}
       {pause ? <PauseStrip pause={pause} onLiftPause={props.onLiftPause} /> : null}
       <View className="flex-row items-center gap-2">
@@ -409,7 +405,10 @@ function TabsBoard(props: {
 type BoardMode = "stages" | "threads";
 
 /** Stages and Threads, shared by every board layout. */
-function ViewSwitch(props: { readonly mode: BoardMode; readonly onSelect: (mode: BoardMode) => void }) {
+function ViewSwitch(props: {
+  readonly mode: BoardMode;
+  readonly onSelect: (mode: BoardMode) => void;
+}) {
   return (
     <UnderlineTabs
       accessibilityLabel="View"
@@ -436,7 +435,8 @@ function BoardThreadsList(props: {
 }) {
   const rows = useKanbanBoardThreads(props.boardId);
   if (rows === undefined) return null;
-  if (rows.length === 0) return <Text className="text-sm text-foreground-muted">No threads yet.</Text>;
+  if (rows.length === 0)
+    return <Text className="text-sm text-foreground-muted">No threads yet.</Text>;
   return (
     <View className="gap-5">
       <ThreadGroup
@@ -474,7 +474,12 @@ function ThreadGroup(props: {
       ) : (
         <>
           {running.map((row) => (
-            <ThreadRow key={row.threadId} row={row} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
+            <ThreadRow
+              key={row.threadId}
+              row={row}
+              nowMs={props.nowMs}
+              onOpenThread={props.onOpenThread}
+            />
           ))}
           {ended.length === 0 ? null : (
             <EndedRows rows={ended} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
@@ -501,7 +506,12 @@ function EndedRows(props: {
       />
       {open
         ? props.rows.map((row) => (
-            <ThreadRow key={row.threadId} row={row} nowMs={props.nowMs} onOpenThread={props.onOpenThread} />
+            <ThreadRow
+              key={row.threadId}
+              row={row}
+              nowMs={props.nowMs}
+              onOpenThread={props.onOpenThread}
+            />
           ))
         : null}
     </View>
@@ -661,9 +671,15 @@ function ColumnsBoard(props: {
   };
 
   // A hidden column's rail shows it again.
-  const showColumn = (key: BoardColumnKey) => onColumnAction(columnActionId({ kind: "toggle", key }));
+  const showColumn = (key: BoardColumnKey) =>
+    onColumnAction(columnActionId({ kind: "toggle", key }));
 
-  const stageColumn = (key: BoardColumnKey, label: string, count: number, body: React.ReactNode) => (
+  const stageColumn = (
+    key: BoardColumnKey,
+    label: string,
+    count: number,
+    body: React.ReactNode,
+  ) => (
     <View key={key} className="flex-row">
       <View style={{ width: widthOf(key) }}>
         <StageHead label={label} count={count} />
@@ -734,7 +750,11 @@ function ColumnsBoard(props: {
     return stageColumn(key, BOARD_COLUMN_LABELS[key], stageCount(key), stageBody(key));
   });
 
-  const stages = <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>{stageItems}</View>;
+  const stages = (
+    <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
+      {stageItems}
+    </View>
+  );
 
   const ownerContent = (
     <ColumnScroll bottomInset={props.bottomInset}>
@@ -847,7 +867,10 @@ function ColumnsBoard(props: {
         </View>
       )}
       {props.mode === "threads" ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}>
+        <ScrollView
+          className="flex-1"
+          contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
+        >
           <View className="px-4 pt-1">
             <BoardThreadsList
               boardId={props.state.board.id}
@@ -866,7 +889,10 @@ function ColumnsBoard(props: {
  * The Columns menu: one on/off item per column (Needs Owner too), then Show
  * all and Reset widths. Hidden columns stay hidden through a width reset.
  */
-function columnMenuActions(prefs: BoardColumnPrefs, layout: Extract<BoardLayout, { kind: "columns" }>) {
+function columnMenuActions(
+  prefs: BoardColumnPrefs,
+  layout: Extract<BoardLayout, { kind: "columns" }>,
+) {
   const keys: ReadonlyArray<BoardColumnKey> = [...STAGE_COLUMN_KEYS, "needs_owner"];
   const items = keys.map((key) => {
     const hidden = prefs.hidden.includes(key);
@@ -880,7 +906,11 @@ function columnMenuActions(prefs: BoardColumnPrefs, layout: Extract<BoardLayout,
   const sized = Object.keys(prefs.widths).length > 0;
   return [
     ...items,
-    { id: columnActionId({ kind: "show-all" }), title: "Show all", attributes: { keepsMenuPresented: true } },
+    {
+      id: columnActionId({ kind: "show-all" }),
+      title: "Show all",
+      attributes: { keepsMenuPresented: true },
+    },
     ...(sized || layout.hidden.length > 0
       ? [{ id: columnActionId({ kind: "reset" }), title: "Reset widths" }]
       : []),

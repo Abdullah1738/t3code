@@ -36,10 +36,12 @@ import type { FilePreviewSource } from "../../components/FilePreviewModal.types"
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
-import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
 import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
+import { PageLinkOffer } from "../common/PageLinkOffer";
+import { pageNavigation } from "../common/pageNavigation";
+import { newPageToken, pageShell, readPageMessage } from "../common/pageShell";
 import {
   kanbanClient,
   useKanbanBoardCard,
@@ -50,6 +52,7 @@ import {
   cardGlyph,
   choiceView,
   firstSendText,
+  blockReadsWhole,
   groupBlockRuns,
   isLoadableImageUrl,
   nextTypingExpiry,
@@ -425,7 +428,7 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
  * board's link, a missing record) stays inert, as on web. Read when a link is
  * pressed, so messages don't redraw on every board change.
  */
-function resolveKanbanLinkFor(boardId: string): ResolveKanbanLink {
+export function resolveKanbanLinkFor(boardId: string): ResolveKanbanLink {
   return (href) => {
     const link = parseKanbanLink(href);
     const state = kanbanClient().board(boardId).get();
@@ -457,12 +460,19 @@ function useMarkRead(
   }, [boardId, discussionId, focused, lastSeq, readSeq, unread]);
 }
 
-function MessageView(props: {
+export function MessageView(props: {
   readonly boardId: string;
+  /** Null where the message is shown outside its discussion's feed: its picks then answer nothing. */
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
+  /**
+   * Reads this message whole, for a screen that shows it outside its
+   * discussion's feed (an ask's discussion). It only reads: a big block cut
+   * short by the feed gets its "Show full" without the message's picks coming alive.
+   */
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
   const { message } = props;
   const time = clockLabel(message.createdAt, props.nowMs);
@@ -473,6 +483,7 @@ function MessageView(props: {
       message={message}
       resolveKanbanLink={resolveKanbanLinkFor(props.boardId)}
       onOpenCard={props.onOpenCard}
+      onLoadFull={props.onLoadFull}
     />
   );
   if (message.author._tag === "owner") {
@@ -509,6 +520,7 @@ function Blocks(props: {
   readonly message: KanbanMessage;
   readonly resolveKanbanLink: ResolveKanbanLink;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
   return groupBlockRuns(props.message.blocks).map((run) =>
     run.kind === "attachments" ? (
@@ -533,20 +545,26 @@ function BlockView(props: {
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
-  const { block } = props;
+  const { block, boardId, discussionId, onLoadFull } = props;
   const stateKey = `${props.message.seq}:${props.blockIndex}`;
+  // The screen's own reader first; else the discussion's feed reads it whole.
+  const loadFull =
+    onLoadFull ??
+    (discussionId === null
+      ? undefined
+      : (seq: number) => kanbanClient().expandMessage(boardId, discussionId, seq));
   if (
-    (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
-    block.truncated &&
-    props.discussionId !== null
+    loadFull !== undefined &&
+    blockReadsWhole(block, true) &&
+    (block._tag === "md" || block._tag === "collapse" || block._tag === "html")
   ) {
     return (
       <TruncatedBlock
         block={block}
-        boardId={props.boardId}
-        discussionId={props.discussionId}
         seq={props.message.seq}
+        onLoadFull={loadFull}
         resolveKanbanLink={props.resolveKanbanLink}
       />
     );
@@ -596,7 +614,7 @@ function BlockView(props: {
 }
 
 /** Consecutive attachments share one wrapping row. */
-function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
+export function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
   return (
     <View className="flex-row flex-wrap gap-2">
       {props.attachments.map((attachment) => (
@@ -678,7 +696,7 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
   );
 }
 
-function Collapse(props: {
+export function Collapse(props: {
   readonly title: string;
   readonly text: string;
   readonly resolveKanbanLink: ResolveKanbanLink;
@@ -716,7 +734,7 @@ function Collapse(props: {
   );
 }
 
-function QuietButton(props: {
+export function QuietButton(props: {
   readonly label: string;
   readonly disabled?: boolean;
   readonly onPress: () => void;
@@ -736,9 +754,8 @@ function QuietButton(props: {
 /** A big block sent as a preview, with a button that reads the message in full. */
 function TruncatedBlock(props: {
   readonly block: Extract<KanbanBlock, { _tag: "md" | "collapse" | "html" }>;
-  readonly boardId: string;
-  readonly discussionId: string;
   readonly seq: number;
+  readonly onLoadFull: (seq: number) => Promise<void>;
   readonly resolveKanbanLink: ResolveKanbanLink;
 }) {
   const { block } = props;
@@ -764,9 +781,7 @@ function TruncatedBlock(props: {
         label={action.pending ? "Loading…" : `Show full (${size})`}
         disabled={action.pending}
         onPress={() =>
-          void action.run("Couldn't load the message", () =>
-            kanbanClient().expandMessage(props.boardId, props.discussionId, props.seq),
-          )
+          void action.run("Couldn't load the message", () => props.onLoadFull(props.seq))
         }
       />
     </View>
@@ -802,13 +817,22 @@ function LiveHtml(props: {
   readonly height: number | null;
 }) {
   const height = Math.min(HTML_MAX_HEIGHT, props.height ?? HTML_DEFAULT_HEIGHT);
-  // The page draws in place; links it follows open outside the app. Frames
-  // inside it (iOS asks for those too) load where they are.
+  // A web link the page tried to follow, waiting for his tap.
+  const [offered, setOffered] = useState<string | null>(null);
+  // The page is text an agent wrote: it draws in place and goes nowhere by
+  // itself. It is never the WebView's own document: it sits in the one
+  // sandboxed frame of a shell the app writes (`pageShell`), which cannot be
+  // navigated, posted from or left, whatever the WebView asks the app. A web
+  // link he taps in it is only offered under the page.
+  const [token] = useState(newPageToken);
+  const shell = pageShell({ html: props.html, token, title: props.title ?? undefined });
+  // The second layer (`pageNavigation`), for what the WebView does ask about.
+  // The origin whitelist stays "*" on purpose: a URL outside it is opened by
+  // the WebView library itself, with no question asked.
   const onNavigate = useCallback((request: WebViewNavigation & { isTopFrame?: boolean }) => {
-    if (request.url === "about:blank" || request.url.startsWith("data:")) return true;
-    if (request.isTopFrame === false) return true;
-    void tryOpenExternalUrl(request.url, "html-render");
-    return false;
+    const verdict = pageNavigation(request);
+    if (verdict._tag === "offer") setOffered(verdict.url);
+    return verdict._tag === "load";
   }, []);
   return (
     <View className="gap-1.5">
@@ -817,15 +841,35 @@ function LiveHtml(props: {
       ) : null}
       <View className="overflow-hidden rounded-[12px] bg-screen" style={{ height }}>
         <WebView
-          source={{ html: props.html }}
+          source={{ html: shell }}
           originWhitelist={["*"]}
+          onMessage={(event) => {
+            const message = readPageMessage(event.nativeEvent.data, token);
+            if (message?._tag === "link") setOffered(message.url);
+          }}
           onShouldStartLoadWithRequest={onNavigate}
+          onOpenWindow={(event) => {
+            const verdict = pageNavigation({ url: event.nativeEvent.targetUrl });
+            if (verdict._tag === "offer") setOffered(verdict.url);
+          }}
           setSupportMultipleWindows={false}
+          javaScriptCanOpenWindowsAutomatically={false}
+          allowsLinkPreview={false}
+          dataDetectorTypes="none"
           incognito
+          cacheEnabled={false}
+          domStorageEnabled={false}
+          sharedCookiesEnabled={false}
+          thirdPartyCookiesEnabled={false}
+          allowFileAccess={false}
+          allowFileAccessFromFileURLs={false}
+          allowUniversalAccessFromFileURLs={false}
+          geolocationEnabled={false}
           nestedScrollEnabled
           style={{ backgroundColor: "transparent" }}
         />
       </View>
+      {offered !== null ? <PageLinkOffer url={offered} onDone={() => setOffered(null)} /> : null}
     </View>
   );
 }
@@ -867,10 +911,14 @@ function ChoiceBlock(props: {
   const mine = current?.choice ?? view.mine;
   const text = current?.text ?? "";
   const poll = block.style === "poll";
+  // Shown outside its discussion's feed (under an ask, or as an earlier
+  // version of one) there is nowhere to send an answer: it is only read.
+  const readOnly = props.discussionId === null;
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
   const locked =
-    !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
+    readOnly ||
+    (!poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true));
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
   const pending = draft?.pending === true;
@@ -1067,7 +1115,7 @@ function ChoiceBlock(props: {
   );
 }
 
-function CardBlock(props: {
+export function CardBlock(props: {
   readonly boardId: string;
   readonly cardId: string;
   readonly onOpenCard: (cardId: string) => void;
@@ -1141,12 +1189,32 @@ interface ComposerScope {
   live: boolean;
 }
 
-function Composer(props: {
+/**
+ * Deletes server copies of uploads nobody holds any more, through the caller's gate when
+ * there is one. A delete that is refused or fails is not tried again: the server drops an
+ * upload no message took.
+ */
+const forgetUploads = (
+  environment: EnvironmentId,
+  ids: ReadonlyArray<string>,
+  gate: (() => string | null) | undefined,
+) => void releasePendingAttachmentUploads(environment, ids, gate).catch(() => undefined);
+
+export function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
   readonly ensureDiscussion: (firstText: string) => Promise<string>;
   readonly bottomInset: number;
   readonly onSent: () => void;
+  /** Sends the blocks somewhere other than the discussion: a reply on an ask. */
+  readonly post?: ((blocks: KanbanBlock[]) => Promise<void>) | undefined;
+  readonly placeholder?: string | undefined;
+  /**
+   * Under an ask: why nothing may be written to the server now, or null (the
+   * ask scope's gate). Asked before a file's upload is created, before its
+   * bytes go and before every delete of one.
+   */
+  readonly writeBlocked?: (() => string | null) | undefined;
 }) {
   const [text, setText] = useState("");
   const [drafts, setDrafts] = useState<ReadonlyArray<ComposerDraft>>([]);
@@ -1167,12 +1235,17 @@ function Composer(props: {
 
   // Live drafts and the in-flight send batch, read by the unmount cleanup, which runs once.
   const draftsRef = useRef(drafts);
-  draftsRef.current = drafts;
   // Files of a send whose post has not settled yet. They are out of `drafts` by then, so the
   // unmount cleanup reads them here; they are released only after the post settles.
   const sendingRef = useRef<ReadonlyArray<ComposerDraft>>([]);
   const environmentRef = useRef(environmentId);
-  environmentRef.current = environmentId;
+  const gateRef = useRef(props.writeBlocked);
+  // Kept after each render, not during it: the cleanup below runs later and reads the last ones.
+  useEffect(() => {
+    draftsRef.current = drafts;
+    environmentRef.current = environmentId;
+    gateRef.current = props.writeBlocked;
+  });
   const scope = useRef<ComposerScope>({ live: true });
   useEffect(() => {
     const current = scope.current;
@@ -1184,7 +1257,7 @@ function Composer(props: {
       const uploads = draftsRef.current.flatMap((draft) =>
         draft.uploaded === null ? [] : [draft.uploaded.id],
       );
-      if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
+      if (id !== null && uploads.length > 0) forgetUploads(id, uploads, gateRef.current);
       void releaseUnusedComposerAttachmentFiles(draftsRef.current.map((draft) => draft.local));
     };
   }, []);
@@ -1199,6 +1272,7 @@ function Composer(props: {
       attachments: [local],
       supportsImageUploads: true,
       signal: controller.signal,
+      writeGate: props.writeBlocked,
     })
       .then((result) => {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
@@ -1206,7 +1280,7 @@ function Composer(props: {
         if (stored === undefined || storedId === undefined) throw new Error("Upload cancelled.");
         if (controller.signal.aborted || !owner.live) {
           // Removed or unmounted while uploading: the server copy has no owner, so drop it.
-          void releasePendingAttachmentUploads(environment, [storedId]);
+          forgetUploads(environment, [storedId], gateRef.current);
           return;
         }
         patch(local.id, (current) => ({ ...current, uploaded: stored as StoredAttachment }));
@@ -1266,7 +1340,7 @@ function Composer(props: {
     removed.controller.abort();
     setDrafts((current) => current.filter((draft) => draft.local.id !== id));
     if (removed.uploaded !== null && environmentId !== null) {
-      void releasePendingAttachmentUploads(environmentId, [removed.uploaded.id]);
+      forgetUploads(environmentId, [removed.uploaded.id], gateRef.current);
     }
     void releaseUnusedComposerAttachmentFiles([removed.local]);
   };
@@ -1283,6 +1357,7 @@ function Composer(props: {
     setField((key) => key + 1);
     void action
       .run("Couldn't send", async () => {
+        if (props.post) return props.post(sendBlocks(body, stored));
         const discussionId =
           props.discussionId ?? (await props.ensureDiscussion(firstSendText(body, stored)));
         await kanbanClient().post(props.boardId, discussionId, sendBlocks(body, stored));
@@ -1302,7 +1377,7 @@ function Composer(props: {
             draft.uploaded === null ? [] : [draft.uploaded.id],
           );
           if (environmentRef.current !== null && ids.length > 0) {
-            void releasePendingAttachmentUploads(environmentRef.current, ids);
+            forgetUploads(environmentRef.current, ids, gateRef.current);
           }
           void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
           return;
@@ -1344,7 +1419,7 @@ function Composer(props: {
           accessibilityLabel="Message"
           value={text}
           onChangeText={setText}
-          placeholder="Message"
+          placeholder={props.placeholder ?? "Message"}
           placeholderTextColorClassName="accent-foreground-muted"
           className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
         />

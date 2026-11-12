@@ -14,6 +14,13 @@ import { loadLocalAttachmentPreview } from "./localAttachmentPreview";
 import { downloadAndShareAttachment, shareLocalAttachment } from "./attachmentDownload";
 import { useRefreshAssetUrl } from "../state/assets";
 import { attachmentDocumentPresentation } from "./attachmentDocumentPresentation";
+// ardud: each wait below has a time limit; at it the request is dropped and Retry is offered
+import {
+  FILE_ADDRESS_TIME_LIMIT_MS,
+  FILE_LOAD_STALLED_TEXT,
+  LOCAL_FILE_LOAD_STALLED_TEXT,
+  fileViewerTimeLimitMs,
+} from "../ardud/common/fileViewer";
 
 const isLocalUri = (uri: string) => /^(file|content):/.test(uri);
 
@@ -62,6 +69,8 @@ export function useAttachmentDocument(input: {
   const [sharing, setSharing] = useState(false);
   const uri = input.attachment ? localUri : remoteUri;
   const attachment = input.attachment;
+  // ardud: how long a file on the phone is waited for
+  const localTimeLimitMs = fileViewerTimeLimitMs(input.sizeBytes);
   useEffect(() => {
     if (attachment) return;
     let cancelled = false;
@@ -70,6 +79,12 @@ export function useAttachmentDocument(input: {
     setRemoteUri(null);
     setError(null);
     textReadUrl.current = null;
+    // ardud: an address that does not come in time is given up, and what comes late is dropped
+    const deadline = setTimeout(() => {
+      if (cancelled) return;
+      cancelled = true;
+      setError(FILE_LOAD_STALLED_TEXT);
+    }, FILE_ADDRESS_TIME_LIMIT_MS);
     void refresh()
       .then((url) => {
         if (cancelled) return;
@@ -80,9 +95,11 @@ export function useAttachmentDocument(input: {
       .catch((cause: unknown) => {
         if (!cancelled)
           setError(cause instanceof Error ? cause.message : "The attachment is unavailable.");
-      });
+      })
+      .finally(() => clearTimeout(deadline));
     return () => {
       cancelled = true;
+      clearTimeout(deadline);
     };
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Retry must reauthorize the remote file.
   }, [attachment, refresh, revision]);
@@ -96,6 +113,12 @@ export function useAttachmentDocument(input: {
     setContentError(null);
     const controller = new AbortController();
     let release: (() => void) | undefined;
+    // ardud: the same limit for a file on the phone
+    const deadline = setTimeout(() => {
+      if (controller.signal.aborted) return;
+      controller.abort();
+      setError(LOCAL_FILE_LOAD_STALLED_TEXT);
+    }, localTimeLimitMs);
     void loadLocalAttachmentPreview(attachment, controller.signal)
       .then((file) => {
         if (!file) return;
@@ -107,13 +130,15 @@ export function useAttachmentDocument(input: {
       .catch((cause: unknown) => {
         if (!controller.signal.aborted)
           setError(cause instanceof Error ? cause.message : "The local file is unavailable.");
-      });
+      })
+      .finally(() => clearTimeout(deadline));
     return () => {
       controller.abort();
+      clearTimeout(deadline);
       release?.();
     };
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Retry must reacquire a local file lease after a failed load.
-  }, [attachment, revision]);
+  }, [attachment, revision, localTimeLimitMs]);
   const needsText = kind === "text" || kind === "markdown" || (kind === "html" && !rendered);
   const sizeBytes = input.sizeBytes;
   useEffect(() => {
@@ -146,6 +171,15 @@ export function useAttachmentDocument(input: {
             },
           });
         })();
+    // ardud: and for reading a file's text
+    const deadline = setTimeout(
+      () => {
+        if (controller.signal.aborted) return;
+        controller.abort();
+        setContentError(FILE_LOAD_STALLED_TEXT);
+      },
+      fileViewerTimeLimitMs(Math.min(sizeBytes, FILE_TEXT_PREVIEW_MAX_BYTES)),
+    );
     void response
       .then((value) => readFilePreviewResponse(value, controller.signal))
       .then((value) => {
@@ -154,8 +188,12 @@ export function useAttachmentDocument(input: {
       .catch((cause: unknown) => {
         if (!controller.signal.aborted)
           setContentError(cause instanceof Error ? cause.message : "Could not read this file.");
-      });
-    return () => controller.abort();
+      })
+      .finally(() => clearTimeout(deadline));
+    return () => {
+      controller.abort();
+      clearTimeout(deadline);
+    };
   }, [uri, needsText, revision, sizeBytes, refresh]);
   const share = async () => {
     if (!uri || sharing) return;

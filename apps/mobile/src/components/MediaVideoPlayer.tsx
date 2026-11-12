@@ -18,6 +18,8 @@ function LoadedMediaVideo(props: {
   readonly resolvePlaybackUri?: () => Promise<string | null>;
   readonly playRequested: boolean;
   readonly paused: boolean;
+  // ardud: the longest one loading attempt may take; without it there is no limit
+  readonly loadTimeLimitMs?: number;
 }) {
   const focused = useIsFocused();
   const fullscreenVideoOpen = useFullscreenVideoOpen();
@@ -26,7 +28,11 @@ function LoadedMediaVideo(props: {
   const fullscreen = useRef(false);
   const [attempt, setAttempt] = useState(0);
   // Expo's Android player also reports completed playback as idle.
-  const [loadState, setLoadState] = useState<"pending" | "complete" | "error">("pending");
+  // ardud: `stalled` is an attempt stopped at its time limit
+  const [loadState, setLoadState] = useState<"pending" | "complete" | "error" | "stalled">(
+    "pending",
+  );
+  const loadAttempt = useRef<AbortController | null>(null);
   const player = useVideoPlayer(null, (player) => {
     player.staysActiveInBackground = false;
     player.bufferOptions = { preferredForwardBufferDuration: 5 };
@@ -55,8 +61,26 @@ function LoadedMediaVideo(props: {
     return () => subscription.remove();
   }, [focused, player, paused]);
 
+  // ardud: an attempt that is still fetching its address, opening the file or
+  // loading it at the time limit is stopped, and Retry is offered. One limit
+  // covers the whole attempt; leaving the screen clears it.
+  const loading = loadState === "pending" || (loadState === "complete" && status === "loading");
+  const loadTimeLimitMs = props.loadTimeLimitMs;
+  useEffect(() => {
+    if (loadTimeLimitMs === undefined || !loading) return;
+    const timer = setTimeout(() => {
+      loadAttempt.current?.abort();
+      setLoadState("stalled");
+      player.pause();
+      void player.replaceAsync(null).catch(() => undefined);
+    }, loadTimeLimitMs);
+    return () => clearTimeout(timer);
+  }, [loadTimeLimitMs, loading, player]);
+  // end ardud
+
   useEffect(() => {
     const controller = new AbortController();
+    loadAttempt.current = controller;
     setLoadState("pending");
     // A renewed signature is used on Retry, not as a reason to reset the native player.
     void loadSource(controller.signal).then(
@@ -87,9 +111,13 @@ function LoadedMediaVideo(props: {
         }}
         allowsPictureInPicture={false}
       />
-      {loadState === "error" || (loadState === "complete" && status === "error") ? (
+      {loadState === "error" ||
+      loadState === "stalled" ||
+      (loadState === "complete" && status === "error") ? (
         <View className="absolute inset-0 items-center justify-center gap-2 bg-black px-4">
-          <AppText className="text-center text-sm text-white/80">Video unavailable</AppText>
+          <AppText className="text-center text-sm text-white/80">
+            {loadState === "stalled" ? "The video hasn't loaded" : "Video unavailable"}
+          </AppText>
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Retry video"
@@ -119,6 +147,8 @@ interface MediaVideoPlayerProps {
   readonly autoPlay?: boolean;
   readonly paused?: boolean;
   readonly actionsSource?: MediaActionsSource;
+  // ardud: see `LoadedMediaVideo`
+  readonly loadTimeLimitMs?: number;
 }
 
 function MediaVideoPlayerContent(props: MediaVideoPlayerProps) {
@@ -139,6 +169,7 @@ function MediaVideoPlayerContent(props: MediaVideoPlayerProps) {
           resolvePlaybackUri={props.resolvePlaybackUri}
           playRequested={!props.expanded || props.autoPlay === true}
           paused={(props.paused ?? false) || mediaActions.sharing}
+          loadTimeLimitMs={props.loadTimeLimitMs}
         />
       ) : (
         <MediaActionsMenu media={mediaActions} inModal={props.expanded} style={{ flex: 1 }}>

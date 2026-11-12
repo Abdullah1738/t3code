@@ -18,6 +18,7 @@ import {
   type KanbanWatchEvent,
   type KanbanWikiPage,
   type ModelSelection,
+  tolerateUnknownKanbanBlocks,
 } from "@t3tools/contracts";
 
 import {
@@ -241,6 +242,9 @@ export function createKanbanClient(
   transport: KanbanTransport,
   options: SnapshotStoreOptions = {},
 ): KanbanClient {
+  // An app can be older than its server: one block of a kind it doesn't know
+  // must not cost it the whole card or message.
+  tolerateUnknownKanbanBlocks();
   const feeds = new Map<string, BoardFeed>();
   // Followers (see `follow`) waiting to join a board's next feed.
   const rejoins = new Map<string, Set<() => void>>();
