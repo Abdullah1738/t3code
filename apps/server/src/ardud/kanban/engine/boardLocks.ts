@@ -4,6 +4,8 @@ import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import { KanbanError } from "@t3tools/contracts";
 
+import * as SavedWrite from "./savedWrite.ts";
+
 // A board-wide writer excludes card writers; independent card writers share the gate.
 const BOARD_PERMITS = 1_000_000;
 
@@ -66,6 +68,9 @@ export const MAY_HAVE_APPLIED =
   "Board changed after this call started work; it may have been applied. Check t3_thread_list / card_get before retrying.";
 
 export const WRITE_WAIT_MS = 120_000;
+export const writeWaitMs = Context.Reference("KanbanBoardWriteWaitMs", {
+  defaultValue: () => WRITE_WAIT_MS,
+});
 
 const retryPolicy = Context.Reference("KanbanBoardRetryPolicy", {
   defaultValue: () => ({ reruns: 8, backoffMs: 0 }),
@@ -106,19 +111,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const check = (op: Operation) =>
     op.stale ? Effect.die(new BoardStateChanged(op.committed)) : Effect.void;
   const wait = <A>(op: Operation, effect: Effect.Effect<A>) =>
-    effect.pipe(
-      Effect.timeoutOrElse({
-        duration: WRITE_WAIT_MS,
-        orElse: () =>
-          Effect.die(
-            new KanbanError({
-              code: "conflict",
-              detail: op.committed
-                ? MAY_HAVE_APPLIED
-                : "Board busy: not written. Safe to retry once.",
-            }),
-          ),
-      }),
+    Effect.flatMap(writeWaitMs, (duration) =>
+      effect.pipe(
+        Effect.timeoutOrElse({
+          duration,
+          orElse: () =>
+            Effect.die(
+              new KanbanError({
+                code: "conflict",
+                detail: op.committed
+                  ? MAY_HAVE_APPLIED
+                  : "Board busy: not written. Safe to retry once.",
+              }),
+            ),
+        }),
+      ),
     );
   const version = (held: Held) =>
     held.cardId === undefined
@@ -286,6 +293,9 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           if (!dependencies.has(resource))
             dependencies.set(resource, boardOf(boardId).resources.get(resource) ?? 0);
         }
+        // Mark before entering masked SQL: a timeout must not promise a safe retry
+        // while a transaction or its cleanup can still apply the write.
+        if (write) yield* SavedWrite.committing;
         const result = yield* write ? effect : restore(effect);
         if (write) {
           op.committed = true;
@@ -353,6 +363,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         if (!readOnly) {
           op.committed = true;
           op.sideEffect = true;
+          yield* SavedWrite.committing;
         }
         const result = yield* Effect.exit(restore(Effect.interruptible(effect)));
         // Re-acquire on failures too: a caller may catch one and continue changing state.

@@ -1677,6 +1677,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban saved write post-commit work failed", { cause }),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2558,6 +2559,7 @@ const make = Effect.gen(function* () {
                         return rest;
                       }),
                     ),
+                    Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
                     Effect.forkIn(scope),
                   )
                 : Effect.void,
@@ -2616,6 +2618,7 @@ const make = Effect.gen(function* () {
       Effect.ensuring(
         Ref.update(groupsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2701,6 +2704,7 @@ const make = Effect.gen(function* () {
       Effect.ensuring(
         Ref.update(goalsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2779,6 +2783,7 @@ const make = Effect.gen(function* () {
       Effect.ensuring(
         Ref.update(proposalsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2914,6 +2919,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3903,6 +3909,7 @@ const make = Effect.gen(function* () {
                 ),
               ),
               Effect.retry(Schedule.spaced("5 seconds")),
+              Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
               Effect.forkIn(scope),
             );
           }),
@@ -4619,6 +4626,7 @@ const make = Effect.gen(function* () {
     else if (state !== null)
       yield* runOwnerDrain(discussionId, state).pipe(
         NodeSqliteClient.backgroundReads,
+        Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
         Effect.forkIn(scope),
       );
     return waiter;
@@ -11287,6 +11295,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban mark read failed", { discussionId, cause }),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -11476,6 +11485,7 @@ const make = Effect.gen(function* () {
           return yield* sweepOwnerRoutes(30_000).pipe(Effect.delay("1 minute"), Effect.forever);
         }),
       ),
+      Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
       Effect.forkIn(scope),
     );
   }

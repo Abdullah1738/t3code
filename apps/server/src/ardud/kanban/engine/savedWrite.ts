@@ -11,6 +11,14 @@ export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWr
   defaultValue: () => () => {},
 });
 
+// Separate from receipts: recovery filters receipts by their target entity.
+export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCommitting", {
+  defaultValue: () => () => {},
+});
+
+// Runs at every store write; the enclosing lock operation already supplies its span.
+export const committing = Effect.flatMap(commitObserver, (observe) => Effect.sync(observe));
+
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
   (yield* observer)(saved);
 });

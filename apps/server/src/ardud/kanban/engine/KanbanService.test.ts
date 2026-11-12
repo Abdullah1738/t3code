@@ -67,6 +67,8 @@ import {
 import * as Rules from "./rules.ts";
 import * as BoardLocks from "./boardLocks.ts";
 import * as SavedWrite from "./savedWrite.ts";
+import * as SavedReply from "../tools/savedReply.ts";
+import { McpSchema } from "effect/ai";
 import * as Scribe from "./scribe.ts";
 import * as KanbanService from "./KanbanService.ts";
 import type { KanbanScriptsShape } from "./ScriptService.ts";
@@ -20054,5 +20056,78 @@ it.effect("#882 overlapping needs-owner moves publish one ask sequence", () =>
         withOwnerRouteMode(testLayer(fake.layer, undefined, undefined, observed), "deferred"),
       ),
     );
+  }),
+);
+
+it.effect("an MCP-started drain gives a later owner route the background admission budget", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const locks = yield* BoardLocks.make();
+    const firstEntered = yield* Deferred.make<void>();
+    const firstRelease = yield* Deferred.make<void>();
+    const secondEntered = yield* Deferred.make<void>();
+    const delivered = yield* Deferred.make<void>();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let admissionFailures = 0;
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            input.text.includes("First MCP route")
+              ? Deferred.succeed(firstEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(firstRelease)),
+                  Effect.andThen(real.send(input)),
+                )
+              : input.text.includes("Later owner route")
+                ? Deferred.succeed(secondEntered, undefined).pipe(
+                    Effect.andThen(locks.independent(locks.board("delivery", real.send(input)))),
+                    Effect.onError(() =>
+                      Effect.sync(() => {
+                        admissionFailures += 1;
+                      }),
+                    ),
+                    Effect.tap(() => Deferred.succeed(delivered, undefined)),
+                  )
+                : real.send(input),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Live" });
+      const channel = yield* kanban.createDiscussion(board.id, "Background budget", owner);
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Ready" },
+      ]);
+      yield* SavedReply.protect(
+        kanban
+          .post(channel.id, owner, [{ _tag: "md", text: "First MCP route" }])
+          .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+        "discussion_post",
+      );
+      yield* Deferred.await(firstEntered);
+      // This non-MCP post joins the drain that inherited the first call's context.
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Later owner route" }]);
+      const holder = yield* Effect.forkChild(
+        locks.board(
+          "delivery",
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ),
+      );
+      yield* Deferred.await(held);
+      yield* Deferred.succeed(firstRelease, undefined);
+      yield* Deferred.await(secondEntered);
+      yield* TestClock.adjust(SavedReply.ADMISSION_BUDGET_MS + 1);
+      assert.strictEqual(admissionFailures, 0);
+      assert.isFalse(yield* Deferred.isDone(delivered));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* Deferred.await(delivered);
+      const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("Later owner route")).length, 1);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(gated), "deferred")));
   }),
 );
