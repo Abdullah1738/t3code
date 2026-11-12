@@ -2,6 +2,8 @@
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -32,13 +34,17 @@ class InstallTests(unittest.TestCase):
             (live / 'watcher.json').write_text(json.dumps(old))
             with patch.object(installer.subprocess, 'run') as run, patch.dict(os.environ, {'BUN_INSPECT': 'remove-me'}):
                 installer.install(live=live, data=data)
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 3)
             args, kwargs = run.call_args_list[0]
             self.assertIn('--replace', args[0])
             self.assertIn('--no-prime', args[0])
             self.assertNotIn('BUN_INSPECT', kwargs['env'])
             definition = json.loads(kwargs['input'])
             self.assertEqual(definition['interval_s'], 300)
+            fast = json.loads(run.call_args_list[-1].kwargs['input'])
+            self.assertEqual(fast['interval_s'], 15)
+            self.assertFalse(fast['paused'])
+            self.assertIn('--fast-only', fast['check'])
             self.assertTrue(definition['paused'])
             self.assertIsNone(definition['expires_at'])
             self.assertEqual(definition['created_by_session'], 'private-session')
@@ -47,6 +53,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((live / 'check.lock').stat().st_ino, inode)
             for name in installer.SOURCE_FILES:
                 self.assertEqual((live / name).read_bytes(), (installer.SOURCE / name).read_bytes())
+                self.assertEqual((live.parent / 'inbox-triage-fastpath' / name).read_bytes(), (installer.SOURCE / name).read_bytes())
 
     def test_fresh_install_seeds_templates_without_runtime_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,6 +66,20 @@ class InstallTests(unittest.TestCase):
             for name, ext in [('prefs', 'md'), ('noise', 'json'), ('settings', 'json')]:
                 self.assertEqual((data / f'{name}.{ext}').read_bytes(), (installer.SOURCE / f'{name}.template.{ext}').read_bytes())
 
+    def test_fast_watcher_scratch_copy_can_launch_without_a_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live, data = Path(tmp) / 'live', Path(tmp) / 'data'
+            with patch.object(installer.subprocess, 'run') as run:
+                installer.install(live=live, data=data)
+                definition = json.loads(run.call_args.kwargs['input'])
+            scratch = Path(tmp) / 'isolated' / 'scratch'
+            shutil.copytree(live.parent / 'inbox-triage-fastpath', scratch)
+            result = subprocess.run(['/bin/zsh', '-c', definition['check'] + ' --help'], cwd=scratch,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('--fast-only', result.stdout)
+            self.assertFalse((scratch / 'cursor.json').exists())
+
     def test_paused_install_does_not_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, data = Path(tmp) / 'live', Path(tmp) / 'data'
@@ -66,8 +87,8 @@ class InstallTests(unittest.TestCase):
             (live / 'watcher.json').write_text('{"paused":true}')
             with patch.object(installer.subprocess, 'run') as run:
                 installer.install(live=live, data=data)
-            run.assert_called_once()
-            self.assertTrue(json.loads(run.call_args.kwargs['input'])['paused'])
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(json.loads(c.kwargs['input'])['paused'] for c in run.call_args_list))
 
 
 if __name__ == '__main__':
