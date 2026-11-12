@@ -1,10 +1,12 @@
 """Offline preparation keepalive and stopped-box diagnostics."""
 import contextlib
 import io
+import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from http.client import HTTPResponse
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,6 +23,7 @@ class PrepareTtlTests(Isolated):
     def setUp(self):
         super().setUp()
         stack = self.stack
+        self.real_get = api.get
         stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
         stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: boat called')))
         self.get = stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
@@ -152,6 +155,101 @@ class PrepareTtlTests(Isolated):
 
     def test_expiry_drains_keeper_before_replacement_without_another_deadline(self):
         self.deadline_drain(fail_prepare=True)
+
+    def test_expiry_cancels_blocked_keeper_response_before_releasing_box(self):
+        for blocked_method in ('GET', 'PATCH'):
+            with self.subTest(method=blocked_method):
+                self.runner = runs.Runner(self.runner.a, self.me)
+                entered, rescued = threading.Event(), threading.Event()
+                reader, writer = socket.socketpair()
+                self.addCleanup(reader.close)
+                self.addCleanup(writer.close)
+                writer.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx')
+                response = HTTPResponse(reader)
+                response.begin()
+                self.addCleanup(response.close)
+                keepers, methods = [], []
+
+                def open_response(req, **kwargs):
+                    methods.append(req.method)
+                    keepers.append(threading.current_thread())
+                    if req.method == blocked_method:
+                        # This request is deliberately sent before the readiness guard starts.
+                        self.assertIsNone(api.left())
+                        entered.set()
+                        return response
+                    return io.BytesIO(b'{"sandbox":{"state":"running"}}')
+
+                original = self.runner._prepare_box
+
+                def prepare_box(*args):
+                    self.assertTrue(entered.wait(2))
+                    self.rows[0]['_prepare_end'] = time.monotonic() + 0.15
+                    return original(*args)
+
+                def rescue():
+                    rescued.set()
+                    writer.close()
+
+                timer = threading.Timer(1.2, rescue)
+                self.acquire.side_effect = None
+                self.acquire.return_value = self.rows[0]
+                self.get.side_effect = self.real_get
+                self.ttl.side_effect = self.real_ensure_ttl
+                with patch.object(api, 'call', side_effect=api._call), \
+                        patch.object(api, '_key', return_value='offline'), \
+                        patch.object(api, '_open', side_effect=open_response), \
+                        patch.object(self.runner, '_prepare_box', side_effect=prepare_box), \
+                        patch.object(self.runner, '_check_box', side_effect=lambda *a: threading.Event().wait(2)), \
+                        patch.object(runs.pool, 'release_guard') as release, prepare.attempts():
+                    prepare.move_once(OffboxError('previous box failed'))
+                    timer.start()
+                    started = time.monotonic()
+                    try:
+                        with self.assertRaises(OffboxError) as raised:
+                            self.runner.start()
+                        self.assertIn('stuck in bring_up on bxA', str(raised.exception))
+                        self.assertLess(time.monotonic() - started, 0.8)
+                        self.assertFalse(rescued.is_set(), 'keeper required manual response release')
+                        self.assertTrue(all(not t.is_alive() for t in keepers))
+                        self.assertEqual(methods, ['GET'] if blocked_method == 'GET' else ['GET', 'PATCH'])
+                        release.assert_called_once_with(self.rows[0])
+                        self.command.assert_not_called()
+                    finally:
+                        timer.cancel()
+                        writer.close()
+                        timer.join()
+
+    def test_bounded_drain_cancels_a_keeper_stuck_before_api_send(self):
+        entered, release = threading.Event(), threading.Event()
+        keepers = []
+
+        def key():
+            keepers.append(threading.current_thread())
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError('key lookup not released')
+            return 'offline'
+
+        self.get.side_effect = self.real_get
+        self.ttl.side_effect = self.real_ensure_ttl
+        with patch.object(api, 'call', side_effect=api._call), \
+                patch.object(api, '_key', side_effect=key), \
+                patch.object(api, '_open', side_effect=AssertionError('cancelled keeper sent a request')) as opened:
+            started = time.monotonic()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    with runs._keep_ttl('bxA'):
+                        self.assertTrue(entered.wait(1))
+                        raise KeyboardInterrupt
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertTrue(keepers[0].is_alive(), 'test did not hold the lookup beyond the join bound')
+            finally:
+                release.set()
+                for keeper in keepers:
+                    keeper.join(1)
+            self.assertTrue(all(not t.is_alive() for t in keepers))
+            opened.assert_not_called()
 
     def test_probe_prune_and_no_sync_env_upload_are_kept_alive(self):
         for stage, result in ((self.probe, (None, None)), (self.prune, runs.prune.Result()), (self.put, None)):

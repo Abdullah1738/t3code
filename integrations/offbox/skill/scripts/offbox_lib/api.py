@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import http.client
 import json
 import re
 import os
@@ -13,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 
 from .common import OffboxError, EXIT_INFRA, db, iso_ts, log
 from . import capacity
@@ -125,6 +128,98 @@ def _never_delivered(status: int, code: str, msg: str) -> bool:
 # A time budget for a bounded maintenance pass (the reaper's upkeep). While set, every request's timeout is capped
 # to the time left and retries stop once it is spent, so the pass cannot outrun its caller's limit.
 _DEADLINE: float | None = None
+_REQUEST_SCOPE = contextvars.ContextVar('boat_request_scope', default=None)
+
+
+class RequestScope:
+    """Cancel a worker's requests without changing another thread's API budget."""
+
+    def __init__(self, seconds: float, parent=None):
+        self.seconds = seconds
+        self.end = time.time() + seconds
+        self.parent = parent
+        self.stopped = threading.Event()
+        self.lock = threading.Lock()
+        self.sockets = weakref.WeakSet()
+
+    def check(self):
+        if self.parent is not None:
+            self.parent.check()
+        if self.stopped.is_set():
+            raise OffboxError('boat API worker cancelled')
+
+    def attach(self, sock):
+        if self.parent is not None:
+            self.parent.attach(sock)
+        with self.lock:
+            self.check()
+            self.sockets.add(sock)
+
+    def cancel(self):
+        with self.lock:
+            self.stopped.set()
+            sockets = list(self.sockets)
+        for sock in sockets:
+            _shutdown(sock)
+
+    @contextlib.contextmanager
+    def active(self):
+        token = _REQUEST_SCOPE.set(self)
+        try:
+            yield
+        finally:
+            _REQUEST_SCOPE.reset(token)
+
+    @contextlib.contextmanager
+    def request(self):
+        request = RequestScope(self.seconds, parent=self)
+        timer = threading.Timer(self.seconds, request.cancel)
+        timer.daemon = True
+        timer.start()
+        try:
+            with request.active():
+                yield
+        finally:
+            timer.cancel()
+
+
+class _CancellableConnection:
+    def send(self, data):
+        scope = _REQUEST_SCOPE.get()
+        scope.check()
+        if self.sock is None:
+            self.connect()
+        # A connect/DNS/TLS operation may finish after cancellation. Never send on that late connection.
+        try:
+            scope.attach(self.sock)
+            super().send(data)
+        except BaseException:
+            self.close()
+            raise
+
+
+class _HTTPConnection(_CancellableConnection, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_CancellableConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_HTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_HTTPSConnection, req, context=self._context)
+
+
+def _open(req, timeout):
+    if _REQUEST_SCOPE.get() is None:
+        return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler()).open(req, timeout=timeout)
 
 
 @contextlib.contextmanager
@@ -160,6 +255,12 @@ def _check_deadline(deadline: float, method: str, path: str) -> None:
 
 
 def _read_response(response, deadline):
+    scope = _REQUEST_SCOPE.get()
+    if scope is not None:
+        scope.check()
+        sock = _response_socket(response)
+        if sock is not None:
+            scope.attach(sock)
     fired = threading.Event()
     dog = _shut_at(response, deadline, fired) if deadline is not None else None
     try:
@@ -171,6 +272,8 @@ def _read_response(response, deadline):
             raise
         if deadline is not None and (fired.is_set() or time.time() > deadline):
             raise TimeoutError("deadline passed while reading boat response")
+        if scope is not None:
+            scope.check()
         return raw
     finally:
         if dog:
@@ -219,9 +322,22 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
 
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    scope = _REQUEST_SCOPE.get()
+    with scope.request() if scope is not None else contextlib.nullcontext():
+        return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+
+
+def _request(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
+             retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable).
     `deadline` (time.time()-style) caps every attempt, the retry pauses and the connect retries; past it the call
     raises OffboxError without sending. `connect_retries=0` disables the not-delivered connect retries."""
+    scope = _REQUEST_SCOPE.get()
+    if scope is not None:
+        scope.check()
+        end = scope.end
+        deadline = end if deadline is None else min(end, deadline)
+        retries = connect_retries = 0
     if _DEADLINE is not None:
         retries = 0
         deadline = _DEADLINE if deadline is None else min(deadline, _DEADLINE)
@@ -282,7 +398,9 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 raise OffboxError(f"deadline passed before sending {method} {path}")
             req_timeout = min(req_timeout, max(0.001, room))
         try:
-            with urllib.request.urlopen(req, timeout=req_timeout) as r:
+            if scope is not None:
+                scope.check()
+            with _open(req, timeout=req_timeout) as r:
                 raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
                 if request_id:
@@ -353,7 +471,7 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 raise OffboxError("create/fork was unanswered and may have been accepted; "
                                   "nothing ran. Check boat before retrying")
             raise ApiError(e.code, code, msg, retryable)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
             if request_id:
                 capacity.complete(request_id, "uncertain")
                 uncertain_start = True
@@ -387,23 +505,31 @@ class StreamDeadline(OffboxError):
     """The caller's absolute deadline passed while reading a stream (possibly during silence or keepalives)."""
 
 
+def _response_socket(r):
+    # HTTPError wraps HTTPResponse, adding one fp layer compared with a successful urlopen response.
+    response = r.fp if isinstance(r, urllib.error.HTTPError) else r
+    return getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+
+
+def _shutdown(sock):
+    try:
+        # The base method: SSLSocket.shutdown would also drop the SSL object under the blocked reader.
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 def _shut_at(r, deadline: float, fired: threading.Event) -> threading.Timer | None:
     """Shut the stream's socket down at `deadline`. A read blocked in recv (silence, or a partial line trickling in a
     byte at a time) wakes at once; the socket's own timeout restarts on every byte, so it cannot bound a read.
     shutdown, not close: closing a socket does not wake a recv already blocked on it."""
-    # HTTPError wraps HTTPResponse, adding one fp layer compared with a successful urlopen response.
-    response = r.fp if isinstance(r, urllib.error.HTTPError) else r
-    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    sock = _response_socket(r)
     if sock is None:
         return None
 
     def fire():
         fired.set()
-        try:
-            # The base method: SSLSocket.shutdown would also drop the SSL object under the blocked reader.
-            socket.socket.shutdown(sock, socket.SHUT_RDWR)
-        except OSError:
-            pass
+        _shutdown(sock)
     t = threading.Timer(max(0.0, deadline - time.time()), fire)
     t.daemon = True
     t.start()

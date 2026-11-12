@@ -1358,14 +1358,21 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
 @contextlib.contextmanager
 def _keep_ttl(box_id: str):
     stop_evt = threading.Event()
-    keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
+    requests = api.RequestScope(5)
+
+    def refresh():
+        with requests.active():
+            _ttl_keeper(box_id, stop_evt)
+
+    keeper = threading.Thread(target=refresh, daemon=True)
     keeper.start()
     try:
         yield
     finally:
         stop_evt.set()
-        # GET/PATCH retries can outlive the follower's join bound. Drain them before handing off the TTL.
-        keeper.join()
+        requests.cancel()
+        # Socket reads wake on cancel. A stuck DNS/Keychain lookup may remain, but cannot send a late PATCH.
+        keeper.join(1)
 
 
 def _echo(stream, b: bytes) -> bool:
