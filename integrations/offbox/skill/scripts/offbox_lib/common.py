@@ -153,9 +153,11 @@ def warn_loud(msg: str) -> None:
 class OffboxError(Exception):
     """Raised for failures; code 90 = infra (fallback allowed), 91 = cap, 92 = pool busy, 2 = usage."""
 
-    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False, outage: bool = False):
+    def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False, outage: bool = False,
+                 run_id: str | None = None, box: str | None = None):
         super().__init__(msg)
         self.code = code
+        self.run_id, self.box = run_id, box
         self.started = started   # True once the remote command may have started (no local fallback then)
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 

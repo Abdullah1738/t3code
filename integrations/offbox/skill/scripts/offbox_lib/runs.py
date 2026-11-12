@@ -787,7 +787,11 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
                      + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
                      + 'OFFBOX_EXIT_RECORD')
-    marker = ('mkdir -p "$HOME/.offbox/exit" && '
+    marker = ('mkdir -p "$HOME/.offbox/claim" || exit 97; '
+              f'mkdir "$HOME/.offbox/claim/{run_id}" 2>/dev/null || exit 98; '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{run_id}/pid" || exit 97; '
+              f'date +%s > "$HOME/.offbox/claim/{run_id}/epoch" || exit 97; '
+              'mkdir -p "$HOME/.offbox/exit" && '
               f'printf "%s\\n" "$1" > "$HOME/.offbox/exit/{run_id}.pid"')
     # Pass the wrapper's PID: the supervised writer has a different PID and may outlive its deadline.
     marker_block = ('python3 - "$$" <<\'OFFBOX_PID_RECORD\'\n' + BOUNDED_PROCESS
@@ -796,6 +800,9 @@ def exit_recording_command(script: str, run_id: str) -> str:
     outer = "\n".join([
         marker_block,
         '__offbox_rc=$?',
+        'if [ "$__offbox_rc" = 98 ]; then',
+        f'  rm -f "$HOME/.offbox/env/{run_id}.env"; echo offbox-claim-refused >&2; exit 98',
+        'fi',
         'if [ "$__offbox_rc" -ne 0 ]; then',
         '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
         '  __offbox_rc=97',
@@ -1141,6 +1148,7 @@ class Runner:
         self.box = None
         self.pid = None
         self.started = False
+        self.recovered_code = None
         self.killed = False
         self.lease_row = None
         self.cold_boxes: set[str] = set()
@@ -1170,6 +1178,7 @@ class Runner:
                     (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                      cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
+        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
         con.commit()
         say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
         event(con, None, "run_pending", self.run_id)
@@ -1241,15 +1250,16 @@ class Runner:
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                repo_key=me["repo_key"])
+        from . import start_check
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
             r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
-        except api.ApiError as e:
+        except (api.ApiError, api.NetworkError) as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
-            if (e.status or 0) in REFUSED_STATUSES or (e.status or 0) in api.CF_NOT_DELIVERED:
+            if getattr(e, "status", None) in (*REFUSED_STATUSES, *api.CF_NOT_DELIVERED):
                 self.started = False
                 if e.api_code in ("sandbox_not_ready", "machine_not_running"):
                     # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
@@ -1264,6 +1274,26 @@ class Runner:
                     # Usage error, not infra: no infra alert, no retry, no fallback.
                     raise OffboxError(f"{e}: the command is too long for one exec; put it in a script file "
                                       "in the repo and run that", code=2) from e
+            elif isinstance(e, api.NetworkError) or 500 <= (e.status or 0) < 600:
+                time.sleep(start_check.GRACE_S)
+                result = start_check.check(self.box, self.run_id)
+                if result.code is not None:
+                    self.pid, self.recovered_code = result.pid, result.code
+                    self.record(process_id=self.pid, status='running')
+                    say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
+                        + start_check.hint(self.box, self.run_id))
+                    return row
+                current = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+                start_check.settle(con, current, result, f'{e} on start')
+                if result.verdict == 'fenced':
+                    self.started = False
+                    event(con, self.box, 'cmd_start_lost', f'{self.run_id}: {e}; fenced')
+                    raise OffboxError(f'{self.run_id} on {self.box}: never got the command ({e}). Nothing ran',
+                                      outage=True, run_id=self.run_id, box=self.box) from e
+                raise OffboxError(f'{self.run_id} on {self.box}: start unknown: {e}; '
+                                  f'ssh check failed or command may still be running; '
+                                  + start_check.hint(self.box, self.run_id),
+                                  started=True, run_id=self.run_id, box=self.box) from e
             raise
         self.pid = r["processId"]
         self.started = True
@@ -1895,6 +1925,7 @@ def _run_attempt(a, me: dict) -> int:
         return _run_remote(a, rn)
     except OffboxError as e:
         e.started = e.started or rn.started
+        e.run_id, e.box = rn.run_id, rn.box
         raise
     except KeyboardInterrupt:
         if not rn.started:
@@ -1904,7 +1935,8 @@ def _run_attempt(a, me: dict) -> int:
         if not rn.started:
             finish(rn.run_id, None, 'infra')
         rn.record(error=str(e)[:500])
-        raise OffboxError(f"remote run error: {type(e).__name__}: {e}", started=rn.started) from e
+        raise OffboxError(f"remote run error: {type(e).__name__}: {e}", started=rn.started,
+                          run_id=rn.run_id, box=rn.box) from e
     finally:
         pool.release_guard(rn.lease_row)
 
@@ -1929,6 +1961,15 @@ def _run_remote(a, rn) -> int:
                 finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             rn.record(error=str(e)[:500])
             raise
+        if a.bg and rn.recovered_code is not None:
+            from . import start_check
+            con = db()
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+            start_check.settle(con, row, start_check.Result('started', rn.recovered_code, rn.pid),
+                               'start receipt recovered')
+            finish(rn.run_id, rn.recovered_code)
+            print(rn.run_id)
+            return 0
         if a.bg:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
             # IDLE_STOP_S after the process ends (it checks process status itself).
@@ -1938,7 +1979,7 @@ def _run_remote(a, rn) -> int:
             return 0
         code = None
         try:
-            code = rn.stream()
+            code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
         except KeyboardInterrupt:
             # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
             rn.record(error='interrupted; awaiting confirmed remote termination')
@@ -1964,6 +2005,15 @@ def _run_remote(a, rn) -> int:
             after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
         raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
                           f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
+    if code == 98 and rn.log_path.exists() and 'offbox-claim-refused' in rn.log_path.read_text(errors='replace'):
+        from . import start_check
+        con = db()
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        if row:
+            start_check.settle(con, row, start_check.Result(), 'duplicate start claim refused (exit 98)')
+        finish(rn.run_id, None, 'infra')
+        raise OffboxError(f'{rn.run_id} on {rn.box}: start claim refused (exit 98); nothing ran',
+                          started=True, run_id=rn.run_id, box=rn.box)
     if repo_setup_failed(code, rn.log_path):
         rn.started = False
         rn.record(error="repo toolchain setup failed (exit 98)")

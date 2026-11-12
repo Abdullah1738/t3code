@@ -530,7 +530,9 @@ def logs(run_id: str, do_follow: bool) -> int:
         _incomplete_log(r, result)
         if r['mode'] != 'local':
             if not r['box_id'] or not r['process_id']:
-                say(f"{_not_started(r)}; no output yet. Follow it with: offbox logs {r['run_id']} --follow")
+                from .start_check import hint
+                check = ('; check: ' + hint(r['box_id'], r['run_id'])) if r['box_id'] else ''
+                say(f"{_not_started(r)}; no output yet. Follow it with: offbox logs {r['run_id']} --follow{check}")
             st = p.stat() if p.exists() else None
             written = time.strftime('%H:%M:%S', time.localtime(st.st_mtime)) if st else 'never'
             say(f"{r['run_id']} is still running; this local copy ({st.st_size if st else 0} bytes, last written "
@@ -567,7 +569,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
     _report_deps_hint(r, r['exit_code'], LOGS_DIR / f"{r['run_id']}.log")
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     if r['exit_code'] is None and r['box_id']:
-        say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
+        from .start_check import hint
+        say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
 
@@ -624,8 +627,13 @@ def _wait_locked(r, echo, timeout=None):
     from .runs import _ended, reconcile_lost
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
+    if db().execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{r['run_id']}",)).fetchone():
+        r = _wait_start_receipt(r, deadline)
     if r['status'] != 'lost':
         r = _wait_for_start(r, deadline)
+    if (r['status'] == 'lost' and db().execute(
+            "SELECT 1 FROM kv WHERE k=? AND v='fenced'", (f"lost_confirmed:{r['run_id']}",)).fetchone()):
+        return _settled(r, echo=echo, until=deadline)
     if r['status'] not in ('starting', 'running', 'lost') or not r['box_id']:
         return _settled(r, echo=echo, until=deadline)
     _refresh_running_ttl(r, deadline)
@@ -788,6 +796,48 @@ def _client_alive(pid: int | None, start_at: float | None) -> bool:
     return began is None or start_at is None or began <= start_at + 2
 
 
+def _wait_start_receipt(row, deadline):
+    """Recover a dead client's unrecorded start under the same lock as run/reap."""
+    from . import start_check
+    con = db()
+    while True:
+        if deadline is not None and now() >= deadline:
+            raise _wait_timeout(row)
+        try:
+            guard = file_lock('box-' + row['box_id'], timeout=0)
+            guard.__enter__()
+        except OffboxError:
+            pass
+        else:
+            try:
+                row = _run_row(row['run_id'])
+                if row['status'] not in ('starting', 'running'):
+                    return row
+                budget = start_check.SSH_TIMEOUT_S if deadline is None else min(start_check.SSH_TIMEOUT_S, max(0, deadline-now()))
+                result = start_check.check(row['box_id'], row['run_id'],
+                                           claim=start_check.claims_enabled(con, row['run_id']), timeout=budget)
+                if deadline is not None and now() >= deadline:
+                    raise _wait_timeout(row)
+                if result.code is not None or result.verdict == 'fenced':
+                    start_check.settle(con, row, result, 'client ended before the command was recorded as started', until=deadline)
+                    say(f"{row['run_id']} on {row['box_id']}: "
+                        + (f"ran, exit {result.code}; live output unavailable" if result.code is not None
+                           else 'never started, nothing ran') + '; ' + start_check.hint(row['box_id'], row['run_id'], result.pid))
+                    return _run_row(row['run_id'])
+                if result.verdict == 'unknown':
+                    start_check.settle(con, row, result, 'client ended before the command was recorded as started')
+                    raise OffboxError(f"{row['run_id']} on {row['box_id']}: start unknown; offbox reap or check: "
+                                      + start_check.hint(row['box_id'], row['run_id']), started=True,
+                                      run_id=row['run_id'], box=row['box_id'])
+                con.execute("UPDATE runs SET status='running', process_id=COALESCE(?,process_id) WHERE run_id=?",
+                            (result.pid, row['run_id']))
+                con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f"start_unattached:{row['run_id']}", '1'))
+                con.commit()
+            finally:
+                guard.__exit__(None, None, None)
+        time.sleep(WAIT_POLL_S if deadline is None else max(0, min(WAIT_POLL_S, deadline-now())))
+
+
 def _wait_for_start(r, deadline):
     """Poll a run row until it has a box and a started command (box_id and process_id), or settles; return that row.
     A run queued for a pool box has no box_id, and one still syncing has no process_id: there is no box lock to
@@ -808,10 +858,7 @@ def _wait_for_start(r, deadline):
                 say(f"{cur['run_id']}: its offbox client (pid {pid}) ended before it got a box; never started, "
                     "nothing ran")
                 continue
-            # It had a box, so the start request may have reached boat: leave the row to the reaper.
-            raise OffboxError(f"{cur['run_id']}: its offbox client (pid {pid}) ended on {cur['box_id']} before the "
-                              "command was recorded as started, so there is nothing to follow. `offbox reap` settles "
-                              "the row; check `offbox list` before running it again", code=EXIT_INFRA)
+            return _wait_start_receipt(cur, deadline)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {_not_started(cur)} (nothing was stopped). "
                               f"Wait again: offbox wait {cur['run_id']}", code=EXIT_WAIT_TIMEOUT)
