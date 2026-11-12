@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- private SQLite reader process transport.
 import * as NodeUtil from "node:util";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
@@ -214,12 +215,15 @@ export const makeAuthReader = Effect.fnUntraced(function* (
         readonly connection: Connection;
         readonly started: Promise<ReaderStartup>;
         readonly isOpening: () => boolean;
+        readonly failure: () => string | undefined;
+        readonly retire: (reason: string) => void;
         /** Acquisitions waiting for this process to open. */
         waiters: number;
       }
     | undefined;
   const runtimes = new Set<ReaderRuntime>();
   let retiring: Promise<unknown> = Promise.resolve();
+  let retirementReason: string | undefined;
   let nextRequestId = 0;
 
   const start = () => {
@@ -353,6 +357,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       clearInterval(watchdog);
       running = undefined;
       stoppedMessage = message;
+      retirementReason = message;
       announce({ type: "unavailable", message });
       if (current?.worker === worker) current = undefined;
       retiring = worker.terminate();
@@ -655,7 +660,15 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       stop("Database auth reader retired: transaction interrupted or failed");
       return retiring;
     });
-    current = { worker, connection, started, isOpening: () => opening, waiters: 0 };
+    current = {
+      worker,
+      connection,
+      started,
+      isOpening: () => opening,
+      failure: () => stoppedMessage,
+      retire: stop,
+      waiters: 0,
+    };
     return current;
   };
 
@@ -672,11 +685,11 @@ export const makeAuthReader = Effect.fnUntraced(function* (
   const turnOff = Effect.fn("SqliteAuthReader.turnOff")(function* (
     reader: typeof current,
     reason: string,
+    waitForExit = true,
   ) {
     if (reader !== undefined) {
-      if (current === reader) current = undefined;
-      retiring = reader.worker.terminate();
-      yield* Effect.promise(() => retiring);
+      reader.retire(reason);
+      if (waitForExit) yield* Effect.promise(() => retiring);
     }
     yield* Effect.logWarning("SQLite auth process unavailable; verification fails closed", {
       reason,
@@ -684,60 +697,96 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     return undefined;
   });
 
-  const acquire = (retried: boolean): Effect.Effect<Connection | undefined> =>
-    Effect.andThen(
-      Effect.promise(() => retiring),
-      Effect.suspend((): Effect.Effect<Connection | undefined> => {
-        let reader: NonNullable<typeof current>;
-        try {
-          reader = current ?? start();
-        } catch (cause) {
-          return turnOff(undefined, String(cause));
-        }
-        reader.waiters++;
-        return Effect.flatMap(
-          Effect.withFiber((fiber) => {
-            const restore = Context.get(fiber.context, ReadOnly) ?? identity;
-            return restore(Effect.timeoutOption(awaitStartup(reader.started), startupTimeout)).pipe(
-              // Only the last caller waiting for this start reaps it. A cancelled
-              // request (a client that gave up) used to retire a process other
-              // callers were waiting for, failing all of them (10 Nov 2026:
-              // 2,599 "startup interrupted" retirements, 6,189 lane failures).
-              Effect.onInterrupt(() =>
-                Effect.suspend(() =>
-                  reader.isOpening() && reader.waiters <= 1
-                    ? turnOff(reader, "startup interrupted")
-                    : Effect.void,
-                ),
-              ),
-              Effect.ensuring(
-                Effect.sync(() => {
-                  reader.waiters--;
-                }),
-              ),
-            );
-          }),
-          (startup): Effect.Effect<Connection | undefined> =>
-            // Another acquire may have timed out and retired this worker while this one
-            // waited; a late "ready" must not hand out a worker that is being terminated.
-            // Nothing ran for this caller, so it tries the replacement once.
-            current !== reader
-              ? retried
-                ? Effect.as(
-                    Effect.promise(() => retiring),
-                    undefined,
-                  )
-                : acquire(true)
-              : Option.isSome(startup) && startup.value.type === "ready"
-                ? Effect.succeed(reader.connection)
-                : turnOff(
-                    reader,
-                    Option.isSome(startup) && startup.value.type === "unavailable"
-                      ? startup.value.message
-                      : `worker did not open the database within ${Duration.toMillis(startupTimeout)} ms`,
-                  ),
+  const unavailable = (reason: string) => {
+    const message = `Reader lane unavailable: ${reason}`;
+    return failed(new Error(reason), message, "readerAdmission");
+  };
+  const acquire: (
+    retried: boolean,
+    deadline: number,
+    lastReason?: string,
+  ) => Effect.Effect<Connection, SqlError> = Effect.fn("SqliteAuthReader.acquire")(function* (
+    retried: boolean,
+    deadline: number,
+    lastReason?: string,
+  ) {
+    const priorReason = lastReason ?? retirementReason ?? "startup deadline exceeded";
+    const beforeRetirement = deadline - Number((yield* Clock.monotonicTimeNanos) / 1_000_000n);
+    if (beforeRetirement <= 0) return yield* unavailable(priorReason);
+    const retirement = retiring;
+    // A replacement must wait for physical exit, but the caller need not
+    // wait past its budget if the OS is slow to reap the retired process.
+    const reaped = yield* Effect.withFiber((fiber) => {
+      const restore = Context.get(fiber.context, ReadOnly) ?? identity;
+      return restore(
+        Effect.timeoutOption(
+          Effect.promise(() => retirement),
+          Duration.millis(beforeRetirement),
+        ),
+      );
+    });
+    if (Option.isNone(reaped)) {
+      const reason = `${priorReason}; reader retirement exceeded startup budget`;
+      yield* Effect.logWarning("SQLite reader startup budget exhausted", { reason });
+      return yield* unavailable(reason);
+    }
+    const remaining = deadline - Number((yield* Clock.monotonicTimeNanos) / 1_000_000n);
+    if (remaining <= 0) return yield* unavailable(priorReason);
+    const recover = (reason: string): Effect.Effect<Connection, SqlError> =>
+      retried ? Effect.fail(unavailable(reason)) : acquire(true, deadline, reason);
+    // An error can retire the current process after the awaited promise was
+    // captured. Recheck and choose/start the reader in the same synchronous turn.
+    if (retirement !== retiring)
+      return yield* recover(retirementReason ?? "reader retired during startup admission");
+    let reader: NonNullable<typeof current>;
+    try {
+      reader = current ?? start();
+    } catch (cause) {
+      yield* turnOff(undefined, String(cause));
+      return yield* recover(String(cause));
+    }
+    // Reserve half the remaining startup budget for one replacement. Both
+    // attempts share the caller's deadline; joining an older start cannot
+    // spend another full startup window.
+    const attemptMs = Math.max(0, remaining / (retried ? 1 : 2));
+    reader.waiters++;
+    return yield* Effect.flatMap(
+      Effect.withFiber((fiber) => {
+        const restore = Context.get(fiber.context, ReadOnly) ?? identity;
+        return restore(
+          Effect.timeoutOption(awaitStartup(reader.started), Duration.millis(attemptMs)),
+        ).pipe(
+          // Only the last caller waiting for this start reaps it. A cancelled
+          // request (a client that gave up) used to retire a process other
+          // callers were waiting for, failing all of them (10 Nov 2026:
+          // 2,599 "startup interrupted" retirements, 6,189 lane failures).
+          Effect.onInterrupt(() =>
+            Effect.suspend(() =>
+              reader.isOpening() && reader.waiters <= 1
+                ? turnOff(reader, "startup interrupted")
+                : Effect.void,
+            ),
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              reader.waiters--;
+            }),
+          ),
         );
       }),
+      (startup): Effect.Effect<Connection, SqlError> => {
+        if (current === reader && Option.isSome(startup) && startup.value.type === "ready")
+          return Effect.succeed(reader.connection);
+        const reason =
+          reader.failure() ??
+          (Option.isSome(startup) && startup.value.type === "unavailable"
+            ? startup.value.message
+            : `worker did not open the database within ${attemptMs} ms`);
+        return Effect.andThen(turnOff(reader, reason, false), recover(reason));
+      },
     );
-  return acquire(false);
+  });
+  return Effect.flatMap(Clock.monotonicTimeNanos, (now) =>
+    acquire(false, Number(now / 1_000_000n) + Duration.toMillis(startupTimeout)),
+  );
 });

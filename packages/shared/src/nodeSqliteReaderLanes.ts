@@ -60,7 +60,7 @@ export const readerLaneFailure = (error: unknown): "retryable" | "busy" | undefi
 
 /** Bounded admission for one reserved connection; opened after migrations. */
 export const makeReaderLanes = Effect.fnUntraced(function* <E, R>(
-  make: () => Effect.Effect<Effect.Effect<Connection | undefined>, E, R>,
+  make: () => Effect.Effect<Effect.Effect<Connection | undefined, SqlError>, E, R>,
   /** Longest wait for the lane itself. Default: the reserved lanes' 5 s statement limit. */
   admissionLimit: Duration.Input = Duration.seconds(5),
 ) {
@@ -180,9 +180,9 @@ export const makeReaderLanes = Effect.fnUntraced(function* <E, R>(
       if (connection === undefined)
         return Effect.fail(
           new SqlError({
-            reason: classifySqliteError(new Error("Reader lane unavailable"), {
+            reason: classifySqliteError(new Error("Reader factory returned no connection"), {
               operation: "readerAdmission",
-              message: "Reader lane unavailable",
+              message: "Reader lane unavailable: reader factory returned no connection",
             }),
           }),
         );
