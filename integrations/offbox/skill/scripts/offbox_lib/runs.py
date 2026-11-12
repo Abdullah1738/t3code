@@ -1259,7 +1259,9 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
                 r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if r:
                     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
-                                "AND status IN ('starting','running')", (st, code, now(), run_id))
+                                "AND (status IN ('starting','running') OR "
+                                "(status='lost' AND exit_code IS NULL AND ? IS NOT NULL))",
+                                (st, code, now(), run_id, code))
             return r
         finally:
             con.close()

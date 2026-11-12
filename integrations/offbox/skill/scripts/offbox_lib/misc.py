@@ -324,7 +324,8 @@ def _run_row(run_id: str):
         raise OffboxError(f"no run {run_id}", code=2)
     from .runs import finish, restore_run_state, terminal_result
     recovered = restore_run_state(r)
-    if terminal_result(recovered) and r['status'] in ('starting','running'):
+    if terminal_result(recovered) and (r['status'] in ('starting','running') or
+                                     (r['status'] == 'lost' and r['exit_code'] is None)):
         finish(r['run_id'], recovered['exit_code'], recovered['status'])
     return recovered
 

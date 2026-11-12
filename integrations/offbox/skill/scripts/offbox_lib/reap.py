@@ -71,10 +71,24 @@ def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> No
 
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
+    # Cleanup can declare an absent client/box lost before _check_unlocked ever sees its runs.
+    # A saved result is stronger evidence, including for a placeholder left by an earlier pass.
+    from .runs import finish, restore_run_state, terminal_result
+    recovered = set()
+    for run in con.execute("SELECT * FROM runs WHERE status IN ('starting','running') "
+                           "OR (status='lost' AND exit_code IS NULL)").fetchall():
+        saved = restore_run_state(run)
+        if terminal_result(saved):
+            recovered.add(run['run_id'])
+            if not dry:
+                finish(run['run_id'], saved['exit_code'], saved['status'])
+            actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
     # Local runs (local-first or fallback) whose offbox process died without recording an end.
     stale = con.execute("SELECT run_id FROM runs WHERE mode='local' AND status IN ('starting','running') "
                         "AND start_at<?", (now() - 6 * 3600,)).fetchall()
     for (rid,) in stale:
+        if rid in recovered:
+            continue
         actions.append(f"{'would mark' if dry else 'mark'} local run {rid} lost")
         if not dry:
             con.execute("UPDATE runs SET status='lost', end_at=? WHERE run_id=?", (now(), rid))
@@ -85,6 +99,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
                         "AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
     for (rid,) in nobox:
+        if rid in recovered:
+            continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
         if not dry:
             con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=?",
@@ -97,6 +113,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         "SELECT run_id, client_pid, start_at FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
         "AND status IN ('starting','running') AND client_pid IS NOT NULL").fetchall()]
     for rid, pid, start_at in orphan:
+        if rid in recovered:
+            continue
         if _client_alive(pid, start_at):
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
