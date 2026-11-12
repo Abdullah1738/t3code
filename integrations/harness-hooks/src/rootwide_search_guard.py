@@ -141,6 +141,8 @@ def _tokens(source):
     # become expansions or command separators opaque until the word is read.
     def literal(match):
         value = match[0]
+        if value == '~':
+            return '\0tilde'
         if value.startswith('"'):
             return value.replace('\\$', '\0dollar').replace('~', '\0tilde')
         if value.startswith("'"):
@@ -149,7 +151,7 @@ def _tokens(source):
             return f'\0escaped{ord(value[1]):x}__'
         return value.replace('$', '\0dollar').replace('~', '\0tilde')
 
-    source = re.sub(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\[^\n]", literal, source)
+    source = re.sub(r"~(?=[\"'\\])|'[^']*'|\"(?:\\.|[^\"\\])*\"|\\[^\n]", literal, source)
     # _quoted_punctuation reserves NUL markers of its own; use a temporary
     # printable marker, then restore our non-expandable sentinels after lexing.
     source = source.replace("\0", "__rootguard_literal_")

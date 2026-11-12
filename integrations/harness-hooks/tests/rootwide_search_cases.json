@@ -1290,5 +1290,35 @@
     "cwd": "/Users/ardud/checkouts/task-1",
     "root": "/Users/ardud/checkouts",
     "case_class": "literal normalization"
+  },
+  {
+    "command": "rg --files ~\"/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted tilde prefix"
+  },
+  {
+    "command": "rg --files ~\"\"/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted tilde prefix"
+  },
+  {
+    "command": "rg --files ~'/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted tilde prefix"
+  },
+  {
+    "command": "rg --files ~\\/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted tilde prefix"
+  },
+  {
+    "command": "rg --files ~\"\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted tilde prefix"
   }
 ]
