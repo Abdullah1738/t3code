@@ -64,7 +64,8 @@ def script(dirs: list[str], run_id: str) -> str:
     # Every filesystem probe (absent/symlink test, dir test, mv) runs inside one child per dir, in its own
     # process group, so a hung probe is killed as a whole at the budget. No probe starts once the budget is
     # spent: remaining dirs are reported "left" without being touched. "busy" means a group member could not
-    # be confirmed gone; the script stops. A dropped ssh (HUP/PIPE) is ignored so the background delete starts.
+    # be confirmed gone; no later dir is touched and the supervisor waits for that group before exiting.
+    # A dropped ssh (HUP/PIPE) is ignored so this confirmation survives the caller's timeout.
     # The done marker (named by run_id, known to the caller) is written last, so a caller can tell the worker
     # finished even after its ssh gave up.
     # The marker lives outside the trash tree, which BACKGROUND deletes, and is written before BACKGROUND starts.
@@ -90,11 +91,11 @@ def script(dirs: list[str], run_id: str) -> str:
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
                      f'case "$rc" in 0) echo "pruned "{q};; 5) echo "skip "{q};; 4) echo "busy "{q}; busy=1;; '
                      f'*) echo "left "{q};; esac; fi')
-    # Completion is signalled only when no group member could be confirmed gone (busy is empty): a busy script
-    # writes neither the marker nor the "done" line, so the caller keeps the box held. BACKGROUND only deletes
-    # the trash tree, never the marker, and starts after the completion signal.
-    lines += ['if [ -z "$busy" ]; then', f'  echo ok > {marker}; echo "done {run_id}"', "fi",
-              BACKGROUND, "exit 0"]
+    # Earlier groups are confirmed gone and busy prevents later children from starting. Keep the supervisor
+    # alive while the last group survives, so worker_gone cannot mistake its dead PID for completed cleanup.
+    lines += ['if [ -n "$busy" ]; then',
+              '  while kill -0 -- -"$p" 2>/dev/null; do sleep 0.2; done', 'fi',
+              f'echo ok > {marker}; echo "done {run_id}"', BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
 

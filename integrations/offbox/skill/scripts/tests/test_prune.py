@@ -1230,23 +1230,60 @@ class HoldClearTests(NoNetwork):
         self.con.commit()
 
     def test_busy_script_writes_no_marker_and_no_done_line(self):
-        # A group member that survives the kill makes the script busy: no done marker and no "done" line.
-        # A real survivor: a stub mv that ignores SIGKILL is not possible, so the busy path is forced by making the
-        # group-liveness probe report "alive" forever. Only the busy branch can then run, and it must not signal done.
-        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+        from offbox_lib import lease
+        self._hold()
+        self.con.execute("UPDATE prune_holds SET run_id='rbusy', created_at=? WHERE box_id='bx'",
+                         (common.now() - 200,))
+        self.con.commit()
+        with tempfile.TemporaryDirectory() as home:
             h = Path(home)
             (h / "w/a-aaaaaa").mkdir(parents=True)
-            # The group probe is forced to "alive" (kill -0 always succeeds). The kill then can't confirm the group is
-            # gone, so the one() path returns busy (4), and the script must not signal done.
-            body = prune.script(["w/a-aaaaaa"], "rbusy").replace(
-                'while kill -0 -- -"$p" 2>/dev/null; do',
-                'while true; do', 1).replace(
-                'if kill -0 -- -"$p" 2>/dev/null; then return 4; fi',
-                'return 4', 1)
-            p = subprocess.run(["bash", "-c", body], env={"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin"},
-                               capture_output=True, timeout=60)
-            self.assertNotIn("done rbusy", p.stdout.decode().splitlines())
-            self.assertFalse((h / ".offbox/done/rbusy").exists(), "a busy script must not write the done marker")
+            alive = h / 'group-alive'
+            alive.touch()
+            # A real group cannot ignore SIGKILL. Simulate a surviving member after its leader exits,
+            # while positive-PID probes still use the real process table for the supervisor.
+            kill = ("kill() { case \"$*\" in '-0 -- -'*) [ -f \"$HOME/group-alive\" ];; "
+                    "'-KILL -- -'*) return 0;; *) builtin kill \"$@\";; esac; };\n")
+            with patch.object(prune, 'BACKGROUND', 'true'):
+                body = prune.script(['w/a-aaaaaa', 'w/b-bbbbbb'], 'rbusy')
+            body = body.replace(f'if [ \"$SECONDS\" -ge {prune.BUDGET_S} ]; then kill', 'if true; then kill', 1)
+            body = body.replace('[ \"$k\" -lt 25 ]', '[ \"$k\" -lt 0 ]', 1)
+            env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+            p = subprocess.Popen(['bash', '-c', kill + body], env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            def ssh(box_id, cmd, timeout):
+                return subprocess.run(['bash', '-c', cmd], env=env, capture_output=True, timeout=timeout)
+            try:
+                self.assertEqual(p.stdout.readline().strip(), 'busy w/a-aaaaaa')
+                self.assertEqual(p.stdout.readline().strip(), 'left w/b-bbbbbb')
+                try:
+                    p.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                self.assertFalse((h / '.offbox/done/rbusy').exists())
+                with patch.object(api, 'get', return_value={'state': 'running'}), \
+                        patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
+                    gone = prune.worker_gone('bx', 'rbusy', 200)
+                    released = lease.release_hold_if_worker_gone(self.con, 'bx')
+                    self.assertIs(gone, False, 'a surviving child group must keep the supervisor alive')
+                    self.assertFalse(released)
+                    self.assertEqual(self._held(), 1)
+                    self.assertTrue((h / '.offbox/started/rbusy').exists())
+                    self.assertIsNone(p.poll())
+                    # Once every member is gone, the same worker can confirm completion and free the hold.
+                    alive.unlink()
+                    stdout, stderr = p.communicate(timeout=5)
+                    self.assertEqual(p.returncode, 0, stderr)
+                    self.assertEqual(stdout.splitlines(), ['done rbusy'])
+                    self.assertTrue((h / '.offbox/done/rbusy').is_file())
+                    self.assertTrue(lease.release_hold_if_worker_gone(self.con, 'bx'))
+                    self.assertEqual(self._held(), 0)
+                    self.assertFalse((h / '.offbox/started/rbusy').exists())
+                    self.assertFalse((h / '.offbox/done/rbusy').exists())
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                p.communicate(timeout=5)
 
 
 class RunnerHookTests(NoNetwork):
