@@ -44,6 +44,8 @@ export const isActiveWorkflowRun = (run: KnownWorkflowRun): boolean =>
 export const KnownWorkflowRuns = Context.Reference<{
   readonly headSha: string;
   readonly runs: ReadonlyArray<KnownWorkflowRun>;
+  /** A partial list cannot establish that no workflows need approval. */
+  readonly complete: boolean;
 } | null>("@t3tools/source-control-github/server/gitHubConditionalChecks/KnownWorkflowRuns", {
   defaultValue: () => null,
 });
@@ -168,6 +170,7 @@ export const makeChecksRevalidator = Effect.gen(function* () {
           const known = pages.every(Option.isSome)
             ? {
                 headSha: head.head.sha,
+                complete: entry.validators.get(runPages[runPages.length - 1]!)?.next === false,
                 runs: pages.flatMap((page) =>
                   Option.isSome(page) ? page.value.workflow_runs : [],
                 ),

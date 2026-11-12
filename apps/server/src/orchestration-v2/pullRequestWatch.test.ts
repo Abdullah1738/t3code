@@ -181,16 +181,19 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(confirmed.changes, [{ kind: "checks-passed", count: 1, required: false }]);
   });
 
-  it("does not report passed on 217c50a while Terraform is queued", () => {
-    const queued = detail({
-      headSha: "217c50acf103b1add10865275cc20dd692b04c42",
-      checks: [check("Kafka broker-rights", "success"), check("Terraform", "pending")],
-    });
-    const first = evaluatePullRequestWatch(watch(), queued, noRemarks);
-    assert.deepEqual(first.changes, []);
-    assert.deepEqual(evaluatePullRequestWatch(first.next, queued, noRemarks).changes, []);
-    assert.deepEqual(first.next.passedPending, []);
-  });
+  it.each(["Terraform", "Kafka broker-rights"])(
+    "does not report passed on 217c50a while %s is queued",
+    (workflow) => {
+      const queued = detail({
+        headSha: "217c50acf103b1add10865275cc20dd692b04c42",
+        checks: [check("broker-rights", "success"), check(workflow, "pending")],
+      });
+      const first = evaluatePullRequestWatch(watch(), queued, noRemarks);
+      assert.deepEqual(first.changes, []);
+      assert.deepEqual(evaluatePullRequestWatch(first.next, queued, noRemarks).changes, []);
+      assert.deepEqual(first.next.passedPending, []);
+    },
+  );
 
   it("restarts confirmation when a later workflow appears", () => {
     const early = detail({ checks: [check("A", "success")] });

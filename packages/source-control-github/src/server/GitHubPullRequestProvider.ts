@@ -222,7 +222,7 @@ export const make = Effect.gen(function* () {
             KnownWorkflowRuns,
             headWorkflowRuns === undefined || pullRequest.headSha == null
               ? null
-              : { headSha: pullRequest.headSha, runs: headWorkflowRuns },
+              : { headSha: pullRequest.headSha, ...headWorkflowRuns },
           ),
           Effect.map((workflowApprovals) => ({
             ...pullRequest,
