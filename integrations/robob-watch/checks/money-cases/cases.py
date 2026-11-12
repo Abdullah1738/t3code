@@ -641,17 +641,63 @@ RENEWAL_CARD = re.compile(r'\bending\s+(?:in\s+)?([0-9]{4})(?!\d)|[•*]{4}\s*([
 RENEWAL_TIER = r'(?:pro|plus|premium|basic|business|starter|standard|enterprise|free|team|individual|family)'
 
 
+def renewal_disabled(text):
+    entity = r'auto[ -]?renew(?:al)?|subscription|renewal|membership|plan|card'
+    negative = re.compile(r'\b(?:not|never|no longer|no|without|[a-z]+n[’\']t)\s+'
+                          r'(?:(?:be|been|being|to|set to|going to|scheduled to|ever|currently|[a-z]+ly)\s+){0,5}'
+                          r'(?:auto[ -]?)?(?:renew(?:ed|s|al)?|charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?)\b', re.I)
+    state = re.compile(r'(?:^|\b(?:is|was|has|have|had|remains|stays)\s+|[:=]\s*)'
+                       r'(?:(?:already|been|set to|[a-z]+ly|still|now)\s+){0,5}'
+                       r'(?:cancell?ed|disabled|deactivated|turned off|switched off|off)\b', re.I)
+    # Payment-method adjuncts aren't the subject of a trailing renewal status.
+    text = re.sub(r'\b(?:using|with) (?:your )?card (?:ending (?:in )?|[•*]{4}\s*)[0-9]{4}\b', '', text, flags=re.I)
+    for clause in re.split(r'(?<=[.!?;])\s+|\bbut\b|\bhowever\b|\bbecause\b', text, flags=re.I):
+        # Instructions and conditional consequences don't establish the renewal's
+        # current state. A cancelled card is precisely why this case needs action.
+        if clause.rstrip().endswith('?'):
+            continue
+        assertions = []
+        boundaries = [0] + [m.end() for m in re.finditer(r',\s+(?!\d)', clause, re.I)]
+        for lo, hi in zip(boundaries, boundaries[1:] + [len(clause)]):
+            part = clause[lo:hi]
+            for subject in re.finditer(r'\b(?:' + entity + r')\b', part, re.I):
+                if subject[0].lower() == 'card':
+                    continue
+                tail = part[subject.end():]
+                offset = subject.end() + len(tail) - len(tail.lstrip())
+                for match in state.finditer(tail.lstrip()):
+                    if not re.search(r'\bcard\b', part[subject.end():offset + match.start()], re.I):
+                        assertions.append((lo + offset + match.start(), lo + offset + match.end(), lo))
+            assertions += [(lo + m.start(), lo + m.end(), lo) for m in negative.finditer(part)]
+            for match in re.finditer(r'\b(?:cancell?ed|disabled|deactivated|turned off|switched off) '
+                                     r'(?:your |the )?(?:' + entity + r')\b', part, re.I):
+                if not re.search(r'\b(?:not|never|no longer|[a-z]+n[’\']t)\b', part[:match.start()], re.I) and not re.search(r'\bcard$', match[0], re.I):
+                    assertions.append((lo + match.start(), lo + match.end(), lo))
+        conditions = list(re.finditer(r'\b(?:if|unless|in case)\b', clause, re.I))
+        for start, end, lo in assertions:
+            prefix = clause[lo:start]
+            if re.match(r'\s*and\b', prefix, re.I):
+                # A comma doesn't end the control of "ensure X, and Y".
+                # Causal clauses are split above because they assert their own fact.
+                prefix = clause[:start]
+            if re.search(r'\b(?:can|could|may|might|would|should|ensure|make sure|how to)\b|'
+                         r'^\s*(?:please )?(?:set|keep)\b', prefix, re.I):
+                continue
+            # A condition attached to the assertion qualifies it. Advice in a later
+            # comma clause ("cancelled, contact us if...") leaves the fact intact.
+            conditional = any(c.start() < end or ',' not in clause[end:c.start()] or
+                              not re.search(r'\w', clause[end:c.start()].rsplit(',', 1)[-1]) for c in conditions)
+            if not conditional:
+                return True
+    return False
+
+
 def renewal(text, sender='', subject=''):
     """Only dated renewal notices with one explicit money value and card can become cases."""
     body = ' '.join(text.split())
     text = ' '.join((subject + ' ' + body).split()).replace('$', 'USD ')
     marker = RENEWAL.search(text)
-    if not marker or re.search(r'\b(?:cancell?ed|disabled|deactivated|turned off|switched off)\b', text, re.I):
-        return None
-    if re.search(r'\b(?:not|never|no longer|no|without|[a-z]+n[’\']t)\s+'
-                 r'(?:(?:be|been|being|to|set to|going to|scheduled to|ever|currently|[a-z]+ly)\s+){0,5}'
-                 r'(?:auto[ -]?)?(?:renew(?:ed|s|al)?|charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?)\b|'
-                 r'\bauto[ -]?renew(?:al)?\b[^.!?;\d]{0,60}\boff\b', text, re.I):
+    if not marker or renewal_disabled(text):
         return None
     if re.search(r'\bwill be charged\b', text, re.I) and not re.search(
             r'\b(?:subscription|membership|recurring|renews on|will renew|auto[ -]?renew(?:al)?)\b|\b' +

@@ -1404,6 +1404,65 @@ class PaymentNotices(unittest.TestCase):
         self.assertEqual(reason, 'bulk')
         self.assertIsNone(item['renewal_notice'])
 
+    def test_bulk_renewals_with_instructions_conditions_and_cancelled_cards_still_open_cases(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        rows = [
+            ('Auto-renew can be disabled in Settings', True),
+            ('To cancel, ensure auto-renewal is disabled in Settings', True),
+            ('Please ensure auto-renewal is disabled in Settings to cancel', True),
+            ('Please make sure your subscription is cancelled to stop billing', True),
+            ('Please ensure your subscription is cancelled and auto-renewal is disabled in Settings to stop billing', True),
+            ('Please make sure your subscription is cancelled and auto-renewal is disabled', True),
+            ('Please ensure your subscription is cancelled, and auto-renewal is disabled in Settings', True),
+            ('You can turn off auto-renewal in Settings', True),
+            ('If the renewal payment fails, your subscription will be cancelled', True),
+            ('Your subscription will be cancelled if the renewal payment fails', True),
+            ('Your subscription is disabled if the renewal payment fails', True),
+            ('If the renewal payment fails, your subscription is disabled', True),
+            ('Your subscription is disabled automatically, if the renewal payment fails', True),
+            ('Your subscription is disabled temporarily, if payment fails', True),
+            ('Your card is cancelled; update your payment method before renewal', True),
+            ('Your card has been deactivated; update it before your subscription renews', True),
+            ('Your subscription is cancelled', False),
+            ('Auto-renewal has been disabled', False),
+            ('Auto-renewal is currently off', False),
+            ('Your subscription has been cancelled, contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, and contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, please contact support if this was a mistake', False),
+            ('Your subscription has been cancelled; contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, email us if you need help', False),
+            ('Your subscription has been cancelled, reach out if this was a mistake', False),
+            ('Please note: your subscription is cancelled', False),
+            ('Please be advised: auto-renewal is disabled', False),
+            ('We have cancelled your subscription', False),
+            ('They have deactivated your membership', False),
+            ('We have not cancelled your subscription', True),
+            ('You will not be charged', False),
+            ('You will not be charged if payment fails', True),
+            ('Your card is cancelled, and your subscription has been cancelled', False),
+            ('Your card is cancelled and your subscription is disabled', False),
+            ('Your card is cancelled, and your subscription is active', True),
+            ('You can contact support because your subscription has been cancelled', False),
+            ('You may visit Settings because auto-renewal is disabled', False),
+            ('If you need help, you can contact support because your subscription has been cancelled', False),
+            ('Unless you can log in, contact support because auto-renewal has been disabled', False),
+        ]
+        for suffix, active in rows:
+            for padding in ('', 'Additional account information. ' * 20):
+                with self.subTest(suffix=suffix, long_body=bool(padding)), tempfile.TemporaryDirectory() as tmp:
+                    item, reason = self.renewal_mail(first + padding + suffix, 'Account notice',
+                                                   'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n')
+                    self.assertEqual(reason, None if active else 'bulk')
+                    wd = Path(tmp)
+                    with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                        reasons, error = t.renewal_checks([item] if reason is None else [], self.when.timestamp(), False, wd=wd)
+                        self.assertIsNone(error)
+                        self.assertEqual(reasons, {item['id']: 'renewal_case'} if active else {})
+                        self.assertEqual(len(self.mc.load(wd / 'scratch-money')['cases']), int(active))
+                        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
     def test_full_body_cancellation_or_ambiguity_cannot_be_overruled_by_preview(self):
         first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
                  'using card ending in 5542. ')

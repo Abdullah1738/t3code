@@ -1471,11 +1471,12 @@ class Renewals(Base):
         self.assertEqual(len(mc.load(self.data)['cases']), 4)
 
     def test_trailing_cancellation_and_one_off_charge_context_are_not_renewals(self):
-        for ending in ('has been cancelled', 'was canceled', 'is cancelled', 'has been disabled', 'was turned off'):
-            with self.subTest(ending=ending):
-                text = ('Your subscription renewal on 11 Nov 2026 for USD 118.80 '
-                        f'using card ending in 5542 {ending}.')
-                self.assertIsNone(mc.renewal(text, 'ElevenLabs'))
+        for date in ('11 Nov 2026', '2026-11-11', 'November 11, 2026'):
+            for ending in ('has been cancelled', 'was canceled', 'is cancelled', 'has been disabled', 'was turned off'):
+                with self.subTest(ending=ending, date=date):
+                    text = (f'Your subscription renewal on {date} for USD 1,118.80 '
+                            f'using card ending in 5542 {ending}.')
+                    self.assertIsNone(mc.renewal(text, 'ElevenLabs'))
         for purpose in ('hotel reservation', 'flight booking', 'one-off purchase', 'payment plan', 'installment'):
             with self.subTest(purpose=purpose):
                 self.assertIsNone(mc.renewal('You will be charged USD 118.80 on 11 Nov 2026 '
@@ -1568,6 +1569,86 @@ class Renewals(Base):
                 text = self.text + '. Auto-renewal ' + state
                 self.assertIsNone(mc.renewal(text, subject='Next billing date: 11 Nov 2026'))
         self.assertIsNotNone(mc.renewal(self.text + '. Auto-renewal gives 20% off'))
+
+    def test_renewal_status_requires_an_actual_state_instead_of_instructions_or_card_context(self):
+        rows = [
+            ('Auto-renew can be disabled in Settings', True),
+            ('Auto-renewal may be deactivated in Settings', True),
+            ('You can turn off auto-renewal in Settings', True),
+            ('To cancel, ensure auto-renewal is disabled in Settings', True),
+            ('Please ensure auto-renewal is disabled in Settings to cancel', True),
+            ('Please make sure your subscription is cancelled to stop billing', True),
+            ('Please keep auto-renewal off if you want to cancel', True),
+            ('Please ensure your subscription is cancelled and auto-renewal is disabled in Settings to stop billing', True),
+            ('Please make sure your subscription is cancelled and auto-renewal is disabled', True),
+            ('Please ensure your subscription is cancelled, and auto-renewal is disabled in Settings', True),
+            ('You can ensure your subscription is cancelled and auto-renewal is off', True),
+            ('If the renewal payment fails, your subscription will be cancelled', True),
+            ('Your subscription will be cancelled if the renewal payment fails', True),
+            ('Your subscription is disabled if the renewal payment fails', True),
+            ('If the renewal payment fails, your subscription is disabled', True),
+            ('Your subscription is disabled, if the renewal payment fails', True),
+            ('Your subscription is disabled automatically, if the renewal payment fails', True),
+            ('Your subscription is disabled immediately, unless payment succeeds', True),
+            ('Your subscription is disabled temporarily, if payment fails', True),
+            ('Unless payment succeeds, your membership will be canceled', True),
+            ('Your card is cancelled; update your payment method before renewal', True),
+            ('Your card has been deactivated; update it before your subscription renews', True),
+            ('Your card was switched off; auto-renewal is still enabled', True),
+            ('Your subscription is active, your card is cancelled', True),
+            ('Your subscription is active but your card is cancelled', True),
+            ('Your subscription is active and your card has been disabled', True),
+            ('Your subscription is not cancelled', True),
+            ('Your subscription has not been disabled', True),
+            ('Is auto-renewal disabled?', True),
+            ('Your subscription is cancelled', False),
+            ('Your subscription has already been cancelled', False),
+            ('Your membership was canceled', False),
+            ('Auto-renewal has been disabled', False),
+            ('Auto-renewal is currently off', False),
+            ('Auto-renewal has been switched off', False),
+            ('You cancelled your subscription', False),
+            ('You have disabled auto-renewal', False),
+            ('Your subscription is cancelled, but you can start it again', False),
+            ('Your subscription has been cancelled, contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, and contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, please contact support if this was a mistake', False),
+            ('Your subscription has been cancelled; contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, email us if you need help', False),
+            ('Your subscription has been cancelled, reach out if this was a mistake', False),
+            ('Please note: your subscription is cancelled', False),
+            ('Please note your subscription has been cancelled', False),
+            ('Please be advised: auto-renewal is disabled', False),
+            ('Please be informed: auto-renewal is currently off', False),
+            ('We have cancelled your subscription', False),
+            ('We canceled your subscription', False),
+            ('They have deactivated your membership', False),
+            ('ElevenLabs disabled your subscription', False),
+            ('We have not cancelled your subscription', True),
+            ('We may have cancelled your subscription', True),
+            ('If payment fails, we will cancel your subscription', True),
+            ('You will not be charged', False),
+            ('You will never be billed', False),
+            ('You will not be charged if payment fails', True),
+            ('Your card is cancelled, and your subscription has been cancelled', False),
+            ('Your card is cancelled and your subscription is disabled', False),
+            ('Your card is cancelled; your subscription has been cancelled', False),
+            ('Your card is cancelled, and your subscription is active', True),
+            ('You can contact support because your subscription has been cancelled', False),
+            ('You may visit Settings because auto-renewal is disabled', False),
+            ('Your subscription has been cancelled, and you can contact support', False),
+            ('If you need help, you can contact support because your subscription has been cancelled', False),
+            ('Unless you can log in, contact support because auto-renewal has been disabled', False),
+            ('Contact support if you need help because your membership has been cancelled', False),
+        ]
+        for suffix, active in rows:
+            with self.subTest(suffix=suffix):
+                notice = mc.renewal(self.text + '. ' + suffix, 'ElevenLabs')
+                if active:
+                    self.assertEqual(notice['date'], '2026-11-11')
+                    self.assertEqual(notice['last4'], '5542')
+                else:
+                    self.assertIsNone(notice)
 
     def test_ambiguous_sms_domain_alias_does_not_choose_a_closed_vendor(self):
         mc.card_dead(self.data, '5542', 'cancelled')
