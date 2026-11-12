@@ -1,6 +1,6 @@
 # Home server: the headless installer stick
 
-The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 192 GB, 2x 2 TB NVMe) has no monitor and
+The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 96 GB in two of the four sticks bought, 2x 2 TB NVMe) has no monitor and
 nobody sitting at it. This directory builds the USB stick that installs it with zero touch, the tests that
 prove it, and the Mac-side scripts for the day it arrives. It replaces the `os` and `ts` steps of
 `../bootstrap.zsh`.
@@ -168,6 +168,14 @@ tested tree (expected: `tailscale-authkey` and the BIOS file, nothing else), che
 ejects.
 
 ## On the day
+
+As built on 2026-11-12 (details: FAILURE-MODES 1.15, 1.16, 3.26-3.28): BIOS 1804 (flashed with EZ Flash from
+the stick), two DIMMs in A2 + B2 because four never trained, memory speed Auto, the four BIOS settings above
+set. The wired port has no link, so the server is on WiFi: with no cable the installed system has no network
+after the install, and the one way in is the KVM console (root + the Keychain console password), where
+`/etc/netplan/60-wifi.yaml` (`wifis: wlp8s0: dhcp4: true, access-points: "<ssid>": password:`) and
+`netplan apply` bring it onto the LAN and the tailnet within a minute. The KVM's reset button does nothing;
+use long press + short press.
 
 1. KVM screen open; BIOS settings from the table above (first power-on: enter setup with `Delete`).
 2. `OFFBOX_KVM_URL=https://<kvm> ./watch-install.zsh` on the Mac. It ends with the next two commands when the

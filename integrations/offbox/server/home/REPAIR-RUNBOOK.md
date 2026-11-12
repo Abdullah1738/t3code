@@ -159,7 +159,7 @@ Buttons, in this order, never faster:
 1. **Wait.** After any power-on or reset: 20 minutes if the screen is black (training), otherwise 10. The
    health check that settles a boot runs 4 minutes after it; the tailnet join retries every 2 minutes.
 2. **Power, short press.** Box off: it starts. Box running: a clean restart (the OS never powers off).
-3. **Reset.** Only for a hang or no POST. Once, then wait.
+3. **Reset.** Does nothing on this build (FAILURE-MODES 1.16): skip it and go to step 4.
 4. **Power, long press**, then a short press to start. Last resort, once. If that does not bring a picture,
    stop pressing: it needs a person.
 

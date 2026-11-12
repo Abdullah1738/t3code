@@ -76,6 +76,21 @@ cat > /etc/security/limits.d/90-offbox.conf <<'EOF'
 * hard nofile 1048576
 EOF
 
+# Home server only (ASUS Prime B850M-A WiFi): keep i2c_piix4 (FCH SMBus, 0000:00:14.0) from loading. On the
+# boot after a hardware-watchdog reset its probe never returns (2026-11-12, kernel 7.0.0-31, BIOS 1804): the
+# udev worker hangs in the kernel, and every later reboot or poweroff then hangs in device shutdown until
+# someone holds the power button. Nothing here uses SMBus (it only gives the DIMM temperatures); the watchdog
+# driver sp5100_tco loads by itself. home/FAILURE-MODES.md has the full story.
+if [ -s /etc/offbox/installed ]; then
+  f=/etc/modprobe.d/offbox-no-i2c-piix4.conf
+  want=$'# see install-host.sh: the probe hangs after a watchdog reset and then blocks every shutdown\nblacklist i2c_piix4\ninstall i2c_piix4 /bin/false'
+  if [ "$(cat $f 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" > $f
+    update-initramfs -u >/dev/null
+    echo "i2c_piix4 is now blacklisted (takes effect at the next boot)"
+  fi
+fi
+
 # ---- ZFS mirror over the two partitions with the GPT name offbox-zfs (one per NVMe disk).
 # Home server: the installer stick made and named them. Hetzner: installimage left the space unallocated, so
 # the partition is added here. The partitions are found by name, never by a fixed /dev/nvmeXn1 (the kernel may

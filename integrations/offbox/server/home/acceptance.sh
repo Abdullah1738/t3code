@@ -6,7 +6,8 @@
 #   --memory-full        add a long memory test: memtester over ~85% of free RAM, one pass (hours with 192 GB)
 #   --test-rtc-wake      REAL power-off with a 4-minute RTC alarm. The machine must switch itself back on.
 #                        Run `acceptance.sh --after-rtc-wake` once it is back.
-#   --test-watchdog      hang every CPU. The chipset watchdog must reset the machine within about 2 minutes.
+#   --test-watchdog      stop systemd so nothing feeds the chipset watchdog. It must reset the machine within
+#                        about 2 minutes.
 #                        Run `acceptance.sh --after-watchdog` once it is back.
 #   --after-rtc-wake / --after-watchdog   verdict of the destructive test that ran before the restart
 #   --kvm-steps          only print the steps that are driven with the network KVM (power and reset buttons on
@@ -36,7 +37,7 @@ INFO KVM-1 short press of the power button. Expected: the screen shows a normal 
 INFO KVM-2 long press (hold ~6 s) = hard power-off, wait 10 s, short press = power on. Expected: boots to the login prompt; `cat /proc/mdstat` may show a short resync, `zpool status -x` says healthy; `offbox-status` shows no failed units. (Leave it off instead and the RTC alarm switches it on by itself within 15 min: that is KVM-4's proof without the script.)
 INFO KVM-3 reset button while it is booting (during the kernel messages, before the login prompt). Expected: boots normally on the next try, no reinstall even with the stick plugged in (the stick's menu says "installed=1 ... -> disk" on screen), arrays and pool as in KVM-2.
 INFO KVM-4 RTC wake after a real power-off: run `acceptance.sh --test-rtc-wake` over SSH and watch the screen and the power LED. Expected: off (LED dark, no signal) for about 4 min, then on by itself without any button; then `acceptance.sh --after-rtc-wake` says PASS. If it is still dark after 10 min: short press, and RTC wake does not work (BIOS: check Advanced > APM Configuration > ErP Ready = Disabled; Linux sets the alarm itself).
-INFO KVM-5 watchdog: run `acceptance.sh --test-watchdog` and watch the screen. Expected: the picture freezes, within ~2 min the firmware logo appears by itself, then `--after-watchdog` says PASS. If it stays frozen for 10 min: reset button, and the chipset watchdog does not work.
+INFO KVM-5 watchdog: run `acceptance.sh --test-watchdog` and watch the screen. Expected: the login screen stays as it is, within ~2 min the firmware logo appears by itself, then `--after-watchdog` says PASS. If nothing happens for 10 min: hold the power button 5 s and press it again (the KVM reset button is not wired on this build), and the chipset watchdog does not work.
 INFO KVM-6 stick's manual menu (only if wanted, needs the stick first in the boot order or F8 at the logo): arrow down to "installer session only", Enter. Expected: the status page says "manual entry: nothing is installed"; reset to leave.
 INFO NOT-KVM real loss of mains power can only be tested by a person at the box (Abdullah): pull the power cable for 30 s, plug it back in. Expected: the machine starts by itself (BIOS: Restore AC Power Loss = Power On). The KVM's power button cannot stand in for this.
 EOF
@@ -78,15 +79,24 @@ case ${1:-} in
   --test-watchdog)
     wd=$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null)
     [ "$(cat /sys/class/watchdog/watchdog0/state 2>/dev/null)" = active ] || { fail "watchdog0 is not active (identity: ${wd:-none}); nothing to test"; exit 1; }
-    echo "Hanging every CPU now. Watchdog: $wd. The machine must reset itself within about 2 minutes."
-    echo "If it is still dead after 10 minutes: hold the power button 5 s, press it again, then report the watchdog as not working."
+    echo "Stopping systemd (PID 1) now, so nothing feeds the watchdog. Watchdog: $wd. The machine must reset itself within about 2 minutes."
+    echo "If it is still up after 10 minutes: hold the power button 5 s, press it again, then report the watchdog as not working."
     date +%s > "$STATE/acceptance-watchdog"
     sync
-    # Real-time busy loops on every CPU with both safety nets off: RT throttling, and (kernel 6.12+) the fair
-    # server that would still give normal tasks 5% of each CPU. systemd can then no longer feed the watchdog.
-    sysctl -qw kernel.sched_rt_runtime_us=-1 kernel.nmi_watchdog=0 kernel.softlockup_panic=0 2>/dev/null
-    for f in /sys/kernel/debug/sched/fair_server/cpu*/runtime; do [ -e "$f" ] && echo 0 > "$f"; done
-    nohup sh -c 'sleep 3; for c in $(seq 0 $(( $(nproc) - 1 ))); do taskset -c $c chrt -f 99 sh -c "while :; do :; done" & done' >/dev/null 2>&1 &
+    # PID 1 is the only thing that feeds the chipset watchdog (RuntimeWatchdogSec). A tracer that seizes and
+    # interrupts it holds it in a ptrace stop: the feeding ends and the hardware has to reset the machine.
+    # If the tracer dies, systemd simply runs on. (The old test, real-time busy loops on every CPU, proves
+    # nothing with Secure Boot on: lockdown forbids switching off the scheduler's fair server in debugfs, so
+    # systemd kept 5% of a CPU, fed the watchdog, and the box stayed half alive without network. 2026-11-12.)
+    have python3 || { fail "python3 is missing; cannot stop PID 1"; exit 1; }
+    nohup setsid python3 -c '
+import ctypes, time
+libc = ctypes.CDLL(None, use_errno=True)
+time.sleep(3)
+if libc.ptrace(0x4206, 1, 0, 0) != 0 or libc.ptrace(0x4207, 1, 0, 0) != 0:   # PTRACE_SEIZE, PTRACE_INTERRUPT
+    raise SystemExit("ptrace of PID 1 failed, errno %d" % ctypes.get_errno())
+time.sleep(3600)
+' >"$STATE/acceptance-watchdog.log" 2>&1 &
     exit 0 ;;
 esac
 MEMFULL=0
@@ -116,7 +126,10 @@ memgb=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
 if have dmidecode; then
   dimms=$(dmidecode -t memory 2>/dev/null | grep -cE '^\s+Size: [0-9]+ GB')
   speeds=$(dmidecode -t memory 2>/dev/null | grep -E 'Configured Memory Speed: [0-9]' | sort | uniq -c | xargs)
-  if [ "$dimms" = 4 ] && [ "$memgb" -ge 180 ]; then pass "memory: 4 DIMMs, ${memgb} GiB usable; $speeds"; else fail "memory: $dimms DIMMs populated, ${memgb} GiB usable (expected 4 DIMMs, ~187 GiB); $speeds"; fi
+  # The build runs on 2x 48 GB (slots A2+B2): four sticks never passed memory training on this board
+  # (BIOS 1087 and 1804, Auto and DDR5-3600, 2026-11-12). OFFBOX_EXPECT_DIMMS=4 if that ever changes.
+  want_dimms=${OFFBOX_EXPECT_DIMMS:-2}; want_gb=$((want_dimms * 45))
+  if [ "$dimms" = "$want_dimms" ] && [ "$memgb" -ge "$want_gb" ]; then pass "memory: $dimms DIMMs, ${memgb} GiB usable; $speeds"; else fail "memory: $dimms DIMMs populated, ${memgb} GiB usable (expected $want_dimms DIMMs, at least ${want_gb} GiB); $speeds"; fi
 else
   [ "$memgb" -ge 180 ] && pass "memory: ${memgb} GiB usable" || fail "memory: only ${memgb} GiB usable (expected ~187)"
 fi
@@ -227,8 +240,9 @@ case $h in *'"verdict":"healthy"'*) pass "boot health: $h" ;; *) warn "boot heal
 f=$(systemctl --failed --no-legend --plain | awk '{print $1}' | xargs)
 [ -z "$f" ] && pass "no failed systemd units" || fail "failed units: $f"
 info "kernel trial: $(offbox-kernel-trial status | xargs)"
-mce=$(dmesg | grep -ci -E 'mce:|machine check|hardware error|edac.*error')
-[ "$mce" = 0 ] && pass "no machine-check / hardware errors in the kernel log" || fail "$mce machine-check / hardware error lines in dmesg: $(dmesg | grep -i -E 'mce:|machine check|hardware error' | head -2 | xargs)"
+mce_lines() { dmesg | grep -i -E 'mce:|machine check|hardware error|edac.*error' | grep -v -i 'MCE decoding enabled'; } # that line is the decoder announcing itself
+mce=$(mce_lines | grep -c .)
+[ "$mce" = 0 ] && pass "no machine-check / hardware errors in the kernel log" || fail "$mce machine-check / hardware error lines in dmesg: $(mce_lines | head -2 | xargs)"
 
 # ---------------------------------------------------------------- temperatures under load
 cputemp() { # hottest k10temp reading, whole degrees
@@ -266,7 +280,7 @@ if have stress-ng; then
   else
     fail "memory: stress-ng reported errors: $(grep -i -E 'fail|error' /tmp/offbox-acc-vm.log | head -3 | xargs)"
   fi
-  mce2=$(dmesg | grep -ci -E 'mce:|machine check|hardware error')
+  mce2=$(mce_lines | grep -c .)
   [ "$mce2" = "$mce" ] || fail "new machine-check lines appeared during the tests"
 fi
 if [ "$MEMFULL" = 1 ]; then

@@ -14,7 +14,7 @@ Proof column:
 - **hardware-only (check on arrival)**: cannot be proven in a VM. `acceptance.sh` checks it where a script can.
 - *not tested*: the code path exists, nothing exercised it. Listed so nobody assumes otherwise.
 
-Tools: the network KVM on the HDMI port, with its keyboard and its power/reset buttons (K), `watch-install.zsh`
+Tools: the network KVM on the HDMI port, with its keyboard and its power button (K; the reset button does nothing on this build, 1.16), `watch-install.zsh`
 (W), `read-stick-log.zsh` with the stick in the Mac (R), `offbox-status` on the server (S), `acceptance.sh` (A).
 Where K helps it comes first. Nothing depends on it: row 1.14.
 
@@ -36,6 +36,8 @@ Where K helps it comes first. Nothing depends on it: row 1.14.
 | 1.12 | Other USB devices next to the stick (the KVM's keyboard, mouse, virtual drive; an unrelated FAT volume, even one holding files named like our marker files) | — | Ignored: the stick's volumes are found by content, other volumes are only read, markers count only on the stick, targets are NVMe only | Nothing. Do not attach the stick and a virtual-media copy of it together | `kvm-empty` `kvm-fat` `unit` |
 | 1.13 | Installing from the KVM's virtual media instead of the stick, mounted read-only | K: status page shows stage lines; R has nothing new | Install works; logs stay in RAM (`/run/offbox/log-ram`), no boot reports on the image, markers are remembered on the disks instead of deleted | Read the logs over SSH while it runs; mount read-write if the KVM can | Image boot: `macstick`. On the Comet, and read-only: *not tested* |
 | 1.14 | The KVM itself is unreachable (its network, its power, its Tailscale) | Its web page does not load | The install and the server do not depend on it in any way | Everything in this table still works without K: W, the LAN, R. A person power-cycles the KVM when convenient | by design: every VM case but `kvm-*` runs without a keyboard or screen |
+| 1.15 | **Seen 2026-11-12:** four 48 GB DIMMs never finish memory training on this board | K: power LED on, no picture, no USB, for 30 min. Tried on BIOS 1087 and 1804, Memory Frequency Auto and DDR5-3600, and with three sticks | Nothing | Run on two sticks in A2 + B2 (second and fourth slot from the CPU): POST in under a minute, 96 GB at DDR5-4800. The second kit was never tested on its own, so a faulty stick is not ruled out. `acceptance.sh` expects 2 DIMMs (`OFFBOX_EXPECT_DIMMS=4` if that changes) | seen on the real box |
+| 1.16 | **Seen 2026-11-12:** the KVM's reset button does nothing (the ATX board's reset lead is not on the header, or the board ignores it) | K: the API answers 200, the screen keeps its old content, the uptime does not change | Nothing | Use the power button instead: long press, wait 10 s, short press (REPAIR-RUNBOOK 5) | seen on the real box |
 
 ## 2. While the installer runs
 
@@ -92,6 +94,9 @@ Where K helps it comes first. Nothing depends on it: row 1.14.
 | 3.23 | Root file system full | S: failed units; health `root-not-writable` | — | Clean up over SSH | *not tested* |
 | 3.24 | Clock wrong (new board, dead battery) | Log file names use a counter, not the date | timesyncd corrects it once online; tailnet join retried | — | *not tested* |
 | 3.25 | Serial console absent (`console=ttyS0` with no UART) | S: `serial-getty@ttyS0` may show as failed | Harmless | Ignore, or drop `console=ttyS0` from `/etc/default/grub.d/90-offbox.cfg` | **hardware-only (check on arrival)** |
+| 3.26 | **Seen 2026-11-12:** after a hardware-watchdog reset the `i2c_piix4` probe (FCH SMBus, 0000:00:14.0) never returns | S: `systemd-udevd: 0000:00:14.0: Worker ... is taking a long time`; no `piix4_smbus ... SMBus Host Controller` line in that boot. The next `reboot`/`poweroff` prints `systemd-shutdown: Waiting for process: (udev-worker)` and hung-task lines on K, and stays there (20 min watched, the reboot watchdog did not end it) | Fixed: `install-host.sh` blacklists `i2c_piix4` (`/etc/modprobe.d/offbox-no-i2c-piix4.conf`, also in the initramfs). Cost: no DIMM temperature sensors. The watchdog driver `sp5100_tco` is separate and stays | If a shutdown still hangs like this: K: long press, short press. Check `lsmod \| grep piix4` is empty | real box: watchdog reset, then RTC power-off and wake, both PASS with the blacklist |
+| 3.27 | **Seen 2026-11-12:** no link on the wired port (`eno1`, RTL8125D, driver loads; cable or router port) | S: `ip -br link` shows `eno1 NO-CARRIER`; the console shows no LAN address; never joins the tailnet | Nothing until there is a network | The server is on WiFi for now: `/etc/netplan/60-wifi.yaml` (interface `wlp8s0`, written by hand on the console, password in the Mac's Keychain service `home-wifi-AmishFamily`). A cable that gets link takes over by itself (lower route metric). After a reinstall with no cable the file has to be typed again on the console (README: On the day) | real box |
+| 3.28 | The watchdog test itself: real-time busy loops on every CPU do not hang a Secure Boot machine | The box stays half alive: console answers, network dead, watchdog still fed | — | Lockdown forbids switching off the scheduler's fair server, so systemd keeps 5% of a CPU. `acceptance.sh --test-watchdog` now holds PID 1 in a ptrace stop instead | real box: reset 78-79 s after the stop, twice |
 
 ## Replacing a disk (3.13)
 
