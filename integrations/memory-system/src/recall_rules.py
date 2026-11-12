@@ -110,6 +110,11 @@ def _arguments(arguments) -> dict:
     return arguments if isinstance(arguments, dict) else {}
 
 
+def message_recipients(arguments):
+    return {arguments[k].casefold().strip() for k in ('recipient', 'to', 'contact', 'chat', 'chat_name')
+            if isinstance(arguments.get(k), str) and arguments[k].strip()}
+
+
 def _tool_name(tool: str) -> str:
     return re.split(r"[./:]|__", tool.lower())[-1]
 
@@ -1012,7 +1017,7 @@ class RuleIndex:
                     return []
                 sql += " AND r.id IN (SELECT rule_id FROM rule_keys WHERE " + " OR ".join(clauses) + ")"
             records = []
-            argument_text = (tool + " " + _json(arguments)).lower()
+            recipients = message_recipients(arguments)
             for row in con.execute(sql, params).fetchall():
                 record = self._record(con, row)
                 triggers = [r[0] for r in con.execute("SELECT value FROM rule_keys WHERE rule_id=? AND kind='path'", (row["id"],))]
@@ -1030,8 +1035,7 @@ class RuleIndex:
                 if tool and not record["actions"] and not record["recipient"]:
                     if len(set(token_values) & (_tokens(record["text"]) - _STOP)) < 2:
                         continue
-                if tool and record["recipient"] and not re.search(
-                        r"(?<![\w])" + re.escape(record["recipient"].lower()) + r"(?![\w])", argument_text):
+                if tool and record["recipient"] and record["recipient"].casefold().strip() not in recipients:
                     continue
                 record["matched_cwds"] = [location for location, local in by_location.items() if record["scope"] in local]
                 git_actions = set(record["actions"]) & {"git.commit", "git.push"}

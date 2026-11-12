@@ -4,8 +4,9 @@ No corpus, identity resolution or model imports are allowed on this path.
 """
 import json
 import os
+import time
 from pathlib import Path
-from recall_rules import RuleIndex, evaluate_conflict, filter_facts, dedupe_facts
+from recall_rules import RuleIndex, evaluate_conflict, filter_facts, dedupe_facts, message_recipients, _tool_name, _SHELL_TOOLS
 from recall_classifier import deterministic
 
 
@@ -21,9 +22,10 @@ def rule_preflight_enabled():
     return os.environ.get('RECALL_RULE_PREFLIGHT', '').strip() == '1'
 
 
-def preflight(tool, arguments, cwd, path=None, session_id=None):
+def preflight(tool, arguments, cwd, path=None, session_id=None, *, _deadline=None):
     if not rule_preflight_enabled():
         return [], None
+    deadline = _deadline if _deadline is not None else time.monotonic() + 1.3
     path = Path(path or os.environ.get('RECALL_RULES_DB', str(Path.home() / '.local/share/memory-system/data/recall_rules.db')))
     if isinstance(arguments, str):
         if tool.lower().split('__')[-1] in {'apply_patch', 'patch'}:
@@ -36,28 +38,62 @@ def preflight(tool, arguments, cwd, path=None, session_id=None):
     arguments = arguments if isinstance(arguments, dict) else {}
     if not path.exists():
         return [], None
-    from recall_messages import outgoing, check
+    from recall_messages import outgoing, check, imessage_arguments, wrapped_calls
+    wrapped = wrapped_calls(tool, arguments)
+    calls = ([(name, fields) for name, fields in wrapped if outgoing(name, fields, cwd)]
+             if wrapped else outgoing(tool, arguments, cwd, calls=True))
+    if calls and calls != [(tool, arguments)]:
+        # Normalizing the sends must not erase a prohibited push in the same
+        # shell invocation. Check the original command before its message calls.
+        if _tool_name(tool) in _SHELL_TOOLS:
+            original = filter_facts(RuleIndex(path).applicable(cwd, tool, arguments, candidates_only=True),
+                                    json.dumps(arguments), session_id)
+            conflict = evaluate_conflict(original, tool, arguments, cwd)
+            if conflict:
+                return original, {**conflict, 'sources': conflict.get('citations', []), 'note': None}
+        all_rules, results = [], []
+        # Keep each body's recipient attached when a code-mode batch texts
+        # several chats. A name in another message is not recipient evidence.
+        for name, fields in calls:
+            if time.monotonic() >= deadline:
+                if all_rules:
+                    results.append(check([], all_rules, timeout=0))
+                break
+            rules, result = preflight(name, fields, cwd, path, session_id, _deadline=deadline)
+            all_rules.extend(rules)
+            if result:
+                results.append(result)
+            if result and result['decision'] == 'deny':
+                return dedupe_facts(all_rules), result
+            if result and result.get('routed') and result.get('p') is None:
+                return dedupe_facts(all_rules), result
+        result = next((r for r in results if r.get('note')), results[0] if results else None)
+        return dedupe_facts(all_rules), result
+    arguments = imessage_arguments(tool, arguments, cwd)
     messages = outgoing(tool, arguments, cwd)
     if messages:
         # Literal recipient/branch prohibitions retain precedence.
         index = RuleIndex(path)
-        recipients = {arguments[k].casefold() for k in ('recipient', 'to', 'contact', 'chat', 'chat_name')
-                      if isinstance(arguments.get(k), str) and arguments[k]}
+        recipients = message_recipients(arguments)
         rules = [r for r in filter_facts(index.applicable(cwd, tool, arguments, candidates_only=True),
                                        " ".join(messages), session_id)
-                 if not recipients or not r.get("recipient") or r["recipient"].casefold() in recipients]
+                 if not r.get("recipient") or r["recipient"].casefold().strip() in recipients]
         rules = dedupe_facts(rules)
         conflict = evaluate_conflict(rules, tool, arguments, cwd)
         if conflict:
             return rules, {**conflict, 'sources': conflict.get('citations', []), 'note': None}
         facts = [r for r in index.search_facts(messages, cwd, session_id=session_id)
                  if not r.get('recipient') or any(rule['id'] == r['id'] for rule in rules)]
+        # Recipient-scoped message instructions apply to every body, including
+        # formatting violations with no words in common with the instruction.
+        facts = dedupe_facts(facts + [r for r in rules if r.get('recipient') and r.get('specific_matched')])
         if facts:
-            result = check(messages, facts)
+            result = check(messages, facts, timeout=max(0, deadline - time.monotonic()))
             if result['decision'] == 'allow' and not result.get('note'):
                 from recall_note import rule_note
                 # Fact checks supplement the earlier explicit message guidance.
-                guidance = [r for r in rules if r.get('specific_matched')]
+                checked = {r['id'] for r in facts}
+                guidance = [r for r in rules if r.get('specific_matched') and r['id'] not in checked]
                 result['note'], selected = rule_note(guidance)
                 result['sources'] = [r['citation'] for r in selected]
             return facts, result
