@@ -86,7 +86,8 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
   at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
-  directories remain separate per local repo path. Dependencies are warm on whichever box you receive. Old
+  directories remain separate per local repo path. Installs stay on the box that ran them; the next run, including
+  an auto-sized typecheck, may get another pool box, so install and run in the same call (examples below). Old
   checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
   last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
@@ -96,13 +97,16 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
   the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
   counts) or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
   cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). When a run's client dies,
-  the reaper brings the box back to its idle window instead of the 30-min run ttl. A resume takes ~6-10 s. The next run resumes it with everything
+  the reaper brings the box back to its idle window instead of the 30-min run ttl. A resume takes ~6-10 s. Resuming that box keeps everything
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
-- Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
-  times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
+- Put install and command together: `offbox run -- 'npm ci && npx jest ...'` or
+  `offbox run --step 'npm ci' --step 'npx jest ...'`; repeating an install on a box with deps is quick.
+  A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
+  that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
+  separate runs can reuse deps while no box switch is reported.
 - Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`

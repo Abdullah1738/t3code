@@ -601,6 +601,40 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
+
+
+def missing_deps_hint(root_files: set[str], package_manager: str | None) -> str:
+    manager = package_manager.split("@", 1)[0] if package_manager else ""
+    if manager not in {"pnpm", "bun", "yarn", "npm"}:
+        manager = next((pm for files, pm in (({"pnpm-lock.yaml"}, "pnpm"),
+                                            ({"bun.lock", "bun.lockb"}, "bun"),
+                                            ({"yarn.lock"}, "yarn"),
+                                            ({"package-lock.json"}, "npm")) if files & root_files), "npm")
+    install = {"pnpm": "pnpm install --frozen-lockfile", "bun": "bun install",
+               "yarn": "yarn install --frozen-lockfile",
+               "npm": "npm ci" if "package-lock.json" in root_files else "npm install"}[manager]
+    return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
+            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them.")
+
+
+def box_deps_hint(root: Path, log_path: Path | None) -> str:
+    # Only the remote marker proves absence: the Mac's node_modules is never synced.
+    try:
+        marked = bool(log_path) and NO_NODE_MODULES_MARKER in log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        marked = False
+    if not marked:
+        return ""
+    try:
+        root_files = {p.name for p in root.iterdir()}
+    except OSError:
+        root_files = set()
+    manifest = read_json(root / "package.json", {})
+    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
+    return missing_deps_hint(root_files, manager if isinstance(manager, str) else None)
+
+
 def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
     return (code == EXIT_REPO_SETUP and bool(log_path) and Path(log_path).exists()
             and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
@@ -783,7 +817,7 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
 
 
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
-                where: str = "remote") -> None:
+                where: str = "remote", deps_hint: str = "") -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
     if step_res is not None:
         say(steps_summary(step_res, planned))
@@ -791,6 +825,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
+    if where == "remote" and deps_hint and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or []))):
+        say(deps_hint)
     if code is None:
         say("remote exit unknown (process lost); offbox exits 90")
     else:
@@ -823,8 +859,12 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
+    root = '"$HOME"/' + shlex.quote(rdir)
+    deps_check = (f'__offbox_exit=$?; if [ "$__offbox_exit" -ne 0 ] && [ -f {root}/package.json ] '
+                  f'&& [ ! -e {root}/node_modules ]; then printf "\\n%s\\n" {NO_NODE_MODULES_MARKER} >&2; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              'trap ' + shlex.quote(deps_check) + ' EXIT',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
@@ -834,7 +874,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               GO_REPAIR,
               node,
               f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
-              cmd]
+              # Keep caller cd/exit/traps inside a subshell so the root check always runs.
+              "(\n" + cmd + "\n)"]
     return "\n".join(lines)
 
 
@@ -1476,10 +1517,11 @@ def _run_remote(a, rn) -> int:
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     steps = getattr(a, "steps", None) or []
+    deps_hint = box_deps_hint(rn.root, rn.log_path)
     if steps:
         res = step_results(rn.log_path)
         failed = next((n for n, rc in res if rc != 0), None)
-        report_exit(steps[failed - 1] if failed else "", code, res, len(steps))
+        report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint)
     else:
-        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code)
+        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint)
     return 90 if code is None else code
