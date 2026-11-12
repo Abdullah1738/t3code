@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "trace": [
+    "rollbackLate(1)",
+    "commit(1)",
+    "commit(0)",
+    "commit(1)",
+    "claim(0)",
+    "deliver(0)",
+    "crash(0)",
+    "restart(0)",
+    "claim(0)",
+    "stale(0)",
+    "deliver(0)",
+    "complete(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)"
+  ]
+}

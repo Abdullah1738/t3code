@@ -1,6 +1,8 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stdio from "effect/Stdio";
@@ -17,7 +19,12 @@ import {
   encodeOptionalPayload,
   runHandler,
 } from "./_internal/shared.ts";
-import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+import {
+  appendStderrTail,
+  boundStderrTail,
+  makeChildStdio,
+  makeTerminationError,
+} from "./_internal/stdio.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -40,6 +47,8 @@ export class CodexAppServerClient extends Context.Service<
   CodexAppServerClient,
   {
     readonly raw: CodexAppServerClientRaw;
+    /** Completes with the classified error once the App Server connection ends. */
+    readonly awaitTermination: Effect.Effect<CodexError.CodexAppServerError>;
     readonly request: <M extends CodexRpc.ClientRequestMethod>(
       method: M,
       payload: CodexRpc.ClientRequestParamsByMethod[M],
@@ -230,6 +239,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     );
 
   return CodexAppServerClient.of({
+    awaitTermination: transport.termination,
     raw: {
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,
@@ -270,6 +280,23 @@ export const layerChildProcess = (
 const makeChildProcessClient = Effect.fn(
   "effect-codex-app-server/CodexAppServerClient.makeChildProcessClient",
 )(function* (handle: ChildProcessSpawner.ChildProcessHandle, options: CodexAppServerClientOptions) {
-  yield* Stream.runDrain(handle.stderr).pipe(Effect.ignore, Effect.forkScoped);
-  return yield* make(makeChildStdio(handle), options, makeTerminationError(handle));
+  // Drain stderr fully so a chatty child never blocks on a full pipe, keeping
+  // only a bounded tail to explain an exit.
+  const stderrTail = yield* Ref.make("");
+  const stderrDrained = yield* Deferred.make<void>();
+  yield* handle.stderr.pipe(
+    Stream.decodeText(),
+    Stream.runForEach((chunk) => Ref.update(stderrTail, (tail) => appendStderrTail(tail, chunk))),
+    Effect.ignore,
+    Effect.ensuring(Deferred.succeed(stderrDrained, undefined)),
+    Effect.forkScoped,
+  );
+  // stdout can close a moment before the last stderr bytes arrive.
+  const readStderrTail = Deferred.await(stderrDrained).pipe(
+    Effect.timeout("250 millis"),
+    Effect.ignore,
+    Effect.andThen(Ref.get(stderrTail)),
+    Effect.map(boundStderrTail),
+  );
+  return yield* make(makeChildStdio(handle), options, makeTerminationError(handle, readStderrTail));
 });

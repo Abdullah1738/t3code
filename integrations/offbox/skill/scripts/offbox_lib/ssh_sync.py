@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 import re
 import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -18,6 +20,8 @@ from . import api, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
+SYNC_PROGRESS_S = 60
+CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 
 # Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
@@ -53,17 +57,23 @@ def setup(box_id: str) -> Path:
             r = api.sshkey(box_id, pubkey())
             break
         except api.ApiError as e:
+            if not (e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable")
+                    or e.status in (409, 502, 503) or api.gateway_timeout(e)):
+                raise
             last = e
-            if e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable") \
-                    or e.status in (409, 502, 503):
-                left = api.left()
-                if left is not None and left <= 0:
-                    raise
-                time.sleep(1 + attempt if left is None else min(1 + attempt, left))
-                continue
-            raise
+        except OffboxError as e:
+            if not e.outage:
+                raise
+            last = e
+        if attempt < 7:
+            left = api.left()
+            if left is not None and left <= 0:
+                raise last
+            # Authorizing the same public key is safe to repeat even when boat did not answer.
+            log(f"ssh_setup_retry {box_id} attempt={attempt + 1} {str(last)[:200]}")
+            time.sleep(1 + attempt if left is None else min(1 + attempt, left))
     else:
-        raise OffboxError(f"ssh key setup failed for {box_id}: {last}")
+        raise OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
     ep = r.get("sshEndpoint")
     if ep:
         host, port = ep.rsplit(":", 1)
@@ -145,20 +155,47 @@ def dead_mount(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-def probe_home(box_id: str, timeout: float = 45) -> str | None:
+def _write_seconds(output: bytes) -> float | None:
+    match = re.search(rb"^OFFBOX_WRITE_SECONDS ([0-9]+(?:\.[0-9]+)?)$", output, re.M)
+    return float(match[1]) if match else None
+
+
+def _timed_write(privileged: bool = False) -> str:
+    sudo = "sudo -n " if privileged else ""
+    return (f"{{ trap '{sudo}rm -f -- \"$p\"' EXIT; export LC_ALL=C; TIMEFORMAT='OFFBOX_WRITE_SECONDS %R'; "
+            f'{{ time {sudo}dd if=/dev/zero of="$p" bs=1M count=1 conv=fsync; }} 2>&1; }}')
+
+
+def probe_home(box_id: str, timeout: float = 45, *, measure_write: bool = False) -> tuple[str | None, float | None]:
     """The matched dead-mount error when $HOME on the box can't be written, else None (also None when the probe
-    can't tell: the sync still catches it). Creates nothing outside .offbox, so a --no-sync run still sees a
-    missing remote dir."""
+    can't tell: the sync still catches it), plus the optional fsync duration. Creates nothing outside .offbox,
+    so a --no-sync run still sees a missing remote dir. Timing is remote, excluding SSH connection latency."""
+    script = 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && '
+    script += _timed_write() if measure_write else ': > "$p" && rm -f -- "$p"'
+    script += ' && echo OFFBOX_PROBE_OK'
     try:
-        p = ssh(box_id, 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && : > "$p" && rm -f -- "$p" '
-                        '&& echo OFFBOX_PROBE_OK', timeout=timeout)
+        p = ssh(box_id, "bash -c " + shlex.quote(script), timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"probe {box_id} inconclusive ({type(e).__name__})")
-        return None
+        return None, None
     text = (p.stdout + p.stderr).decode(errors="replace")
     if p.returncode == 0 and "OFFBOX_PROBE_OK" in text:
+        return None, _write_seconds(p.stdout) if measure_write else None
+    return dead_mount(text), None
+
+
+def probe_docker_root(box_id: str, timeout: float = 45) -> float | None:
+    """Best effort fsync on Docker's disk; missing or wedged Docker is handled by image readiness."""
+    try:
+        info = ssh(box_id, "docker info -f '{{.DockerRootDir}}'", timeout=10)
+        root = info.stdout.decode(errors="replace").strip()
+        if info.returncode or not root.startswith("/") or "\n" in root:
+            return None
+        script = f'p={shlex.quote(root)}/.offbox-probe-$$; ' + _timed_write(privileged=True)
+        p = ssh(box_id, "bash -c " + shlex.quote(script), timeout=timeout)
+        return _write_seconds(p.stdout) if p.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
         return None
-    return dead_mount(text)
 
 
 def _gitinfo_exclude(root: Path) -> list[str]:
@@ -511,13 +548,13 @@ def _stats(out: str) -> dict:
 
 
 def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeout: float = 3600,
-         includes: list[str] | None = None) -> dict:
+         includes: list[str] | None = None, seed_candidates: list[str] | None = None) -> dict:
     """Mirror root/ to ~/<remote_dir>/ on the box. Deletes remote files removed locally (inside remote_dir only)."""
     if str(root) in ("/", str(Path.home())):
         raise OffboxError(f"refusing to sync {root} (not a repo). cd into a repo first.", code=2)
     t = time.time()
     with git_snapshot.snapshot(root) if with_git else nullcontext(None) as gitdir:
-        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes)
+        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates)
         if gitdir is not None:
             extra = _push_git(box_id, gitdir, remote_dir, timeout)
             for key, value in extra.items():
@@ -550,11 +587,67 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
             log(f"push_git cleanup failed {box_id} {staging}")
 
 
+def _seed(box_id: str, remote_dir: str, candidates: list[str]) -> tuple[bool, str | None]:
+    """Check the destination and ordered candidates in one SSH call; uncertainty never enables a seed."""
+    if not CHECKOUT_DIR.fullmatch(remote_dir):
+        return False, None
+    candidates = [d for d in candidates if CHECKOUT_DIR.fullmatch(d) and d != remote_dir]
+    lines = [f'if test -d "$HOME"/{shlex.quote(remote_dir)}; then echo existing; exit 0; fi', 'echo first']
+    lines += [f'if test -d "$HOME"/{shlex.quote(d)}; then echo {shlex.quote(d)}; exit 0; fi' for d in candidates]
+    try:
+        p = ssh(box_id, "\n".join(lines), timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if p.returncode != 0:
+        return False, None
+    result = p.stdout.decode(errors="replace").splitlines()
+    if not result or result[0] != "first":
+        return False, None
+    sibling = result[1] if len(result) > 1 and result[1] in candidates else None
+    return True, sibling
+
+
+@contextmanager
+def _sync_progress(root: Path, box_id: str, first: bool, sibling: str | None):
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def report():
+        while not stop.wait(SYNC_PROGRESS_S):
+            detail = ", first sync of this checkout" if first else ""
+            if sibling:
+                detail += f", seeded from {sibling}"
+            try:
+                print(f"offbox: still syncing {root.name} -> {box_id} ({int(time.monotonic() - started)} s{detail})",
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                return
+
+    thread = threading.Thread(target=report, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
 def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                includes: list[str] | None) -> dict:
+                includes: list[str] | None, seed_candidates: list[str] | None = None) -> dict:
+    first, sibling = _seed(box_id, remote_dir, seed_candidates) if seed_candidates is not None else (False, None)
+    if sibling:
+        log(f"push_seed {box_id} {remote_dir} from={sibling}")
+    with _sync_progress(root, box_id, first, sibling):
+        return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling)
+
+
+def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
+                      includes: list[str] | None, sibling: str | None) -> dict:
     ssh_cmd = " ".join(shlex.quote(x) for x in ssh_base(box_id))
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
+    if sibling:
+        cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
     out = _rsync(box_id, remote_dir, cmd, timeout)
@@ -622,7 +715,7 @@ def _missing_pull(code: int, error: str) -> bool:
     return missing
 
 
-def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path) -> dict:
+def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
     if path.startswith("/") or ".." in Path(path).parts:
@@ -634,7 +727,7 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path)
     dest.mkdir(parents=True, exist_ok=True)
     cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
            f"{box_id}:{rbase}/{path}", f"{dest}/"]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:

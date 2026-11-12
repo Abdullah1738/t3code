@@ -43,4 +43,5 @@ if [[ "$name" == memory-system ]]; then
     mkdir -p "${recall_dst:h}"
     install -m 755 "$recall_src" "$recall_dst"
   fi
+  /bin/bash "${src}scripts/install_launchagent.sh" "$@"
 fi

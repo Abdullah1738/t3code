@@ -120,11 +120,20 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
                            "(SELECT box_id FROM pool_callers WHERE owner=?))", (me['owner'],me['owner'])).fetchall()
     else:
         row = lease.find_lease(con, me['owner'], me['repo_root'])
+        if row is None:
+            row = con.execute("SELECT l.* FROM leases l JOIN prune_holds h USING(box_id) "
+                              "WHERE l.state IN ('running','stopped') AND ((l.owner=? AND l.repo_root=?) OR "
+                              "EXISTS (SELECT 1 FROM pool_callers c WHERE c.box_id=l.box_id AND c.owner=? "
+                              "AND c.repo_root=?)) ORDER BY l.last_used_at DESC LIMIT 1",
+                              (me['owner'], me['repo_root'], me['owner'], me['repo_root'])).fetchone()
         rows = [row] if row else []
     if not rows:
         say("nothing to release")
         return
     for r in rows:
+        lease.release_hold_if_worker_gone(con, r["box_id"])
+        if _report_prune_hold(con, r["box_id"]):
+            continue
         # A foreground run holds box-<id> while it streams, so a hung run shows up as a lock timeout. Name the active
         # runs on that path too; the recheck under the lock still decides before any mutation.
         try:
@@ -133,8 +142,20 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         except OffboxError as e:
             if "timed out waiting for lock" not in str(e):
                 raise
+            lease.release_hold_if_worker_gone(con, r["box_id"])
+            if _report_prune_hold(con, r["box_id"]):
+                continue
             if not _report_active_runs(con, r["box_id"], lock_held=True):
                 say(f"{r['box_id']}: box is busy (another offbox process holds it); not released. Try again shortly.")
+
+
+def _report_prune_hold(con, box_id: str) -> bool:
+    hold = con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+    if hold is None:
+        return False
+    since = time.strftime('%H:%M', time.localtime(hold['created_at']))
+    say(f"{box_id}: held by an unconfirmed checkout cleanup (prune {hold['run_id']}, since {since}); reap retries it")
+    return True
 
 
 def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
@@ -150,6 +171,8 @@ def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
 
 
 def _release_one(con, r, delete):
+        if _report_prune_hold(con, r["box_id"]):
+            return
         if lease.active_runs(con, r["box_id"]):
             _report_active_runs(con, r["box_id"])
             return
@@ -171,7 +194,7 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
 
     With a caller (`me`), the run must be the caller's own: an unproven caller is refused, and a proven one may only
     stop a run its owner string names. Killing another execution's run is an authority transfer, like a release."""
-    from .runs import finish
+    from .runs import confirmed_lost, finish
     r = _run_row(run_id)
     rid = r["run_id"]
     if me is not None:
@@ -199,12 +222,20 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
     except OffboxError as e:
         say(f"run {rid}: could not read process {pid} on {box} after kill ({e}); row left as {r['status']}")
         return 1
+    if st is not None and st.get('status') == 'lost':
+        try:
+            st = confirmed_lost(box, rid)
+        except OffboxError:
+            st = None
+        if st is None:
+            say(f"run {rid}: remote termination unconfirmed on {box}; row left as {r['status']}")
+            return 1
     if st is not None and st.get("running") is not False:
         why = "still reports it running" if st.get("running") else "returned no clear running state"
         say(f"run {rid}: boat {why} for process {pid} on {box}; row left as {r['status']}"
             + (f" (kill error: {kill_err})" if kill_err else ""))
         return 1
-    finish(rid, 143, "killed")
+    finish(rid, 143, "killed", catch_up=False)
     print(f"killed run {rid} (process {pid} on box {box}). `offbox release [--delete]` works now."
           + (f" (kill request failed but boat reports the process gone: {kill_err})" if kill_err else ""))
     return 0
@@ -427,11 +458,11 @@ def _catch_up_log_locked(r, path, budget) -> str:
                 os.unlink(tmp)
 
 
-def _catch_up_finished(con, run_id) -> None:
+def _catch_up_finished(con, run_id, budget: float = 10) -> None:
     """Best effort under the maintenance caller's box lock; history errors cannot undo settlement."""
     try:
         r = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
-        result = _catch_up_log(r, budget=10, locked=True)
+        result = _catch_up_log(r, budget=min(10, budget), locked=True)
         if result.startswith('incomplete:'):
             event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {result.split(':', 1)[1]}")
     except Exception as e:
@@ -452,6 +483,13 @@ def _incomplete_log(r, result) -> None:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     p = LOGS_DIR / f"{r['run_id']}.log"
+    if r['status'] == 'lost' and r['box_id']:
+        if do_follow:
+            return _wait_locked(r, echo=True)
+        from .runs import reconcile_lost
+        with file_lock('box-' + r['box_id'], timeout=0):
+            reconcile_lost(db(), r['box_id'])
+            r = _run_row(r['run_id'])
     if r['status'] in ('starting', 'running'):
         if do_follow:
             return _wait_locked(r, echo=True)
@@ -473,14 +511,17 @@ def logs(run_id: str, do_follow: bool) -> int:
 
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
-    if r["status"] not in ("starting", "running"):
+    if r["status"] not in ("starting", "running", "lost") or (r['status'] == 'lost' and not r['box_id']):
         return _settled(r)
     return _wait_locked(r, echo=False, timeout=timeout)
 
 
-def _settled(r, echo=False, pos=0, *, locked=False) -> int:
+def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
     from .runs import repo_setup_failed
-    result = _catch_up_log(r, locked=locked)
+    budget = None if until is None else max(0, until-now())
+    result = _catch_up_log(r, budget=budget, locked=locked)
+    if until is not None and now() >= until:
+        raise _wait_timeout(r)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
     _incomplete_log(r, result)
@@ -491,6 +532,8 @@ def _settled(r, echo=False, pos=0, *, locked=False) -> int:
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
     _report_deps_hint(r, r['exit_code'], LOGS_DIR / f"{r['run_id']}.log")
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
+    if r['exit_code'] is None and r['box_id']:
+        say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
 
@@ -544,12 +587,13 @@ def _wait_locked(r, echo, timeout=None):
     `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
     over, only checkpointed bytes are delivered (see runs.follow): a takeover replays everything past the checkpoint,
     and a log with no checkpoint at all (a holder from before checkpoints) is replayed whole into an emptied log."""
-    from .runs import _ended
+    from .runs import _ended, reconcile_lost
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
-    r = _wait_for_start(r, deadline)
-    if r['status'] not in ('starting', 'running'):
-        return _settled(r, echo=echo)
+    if r['status'] != 'lost':
+        r = _wait_for_start(r, deadline)
+    if r['status'] not in ('starting', 'running', 'lost') or not r['box_id']:
+        return _settled(r, echo=echo, until=deadline)
     pos, said = 0, False
     polled, ended_at = None, None
     # The row we poll: refreshed each loop, so a PID the holder records later (it starts with NULL) is picked up.
@@ -562,11 +606,15 @@ def _wait_locked(r, echo, timeout=None):
             pass
         else:
             try:
+                budget = 20 if deadline is None else min(20, max(0, deadline - now()))
+                reconcile_lost(db(), r['box_id'], timeout=budget, until=deadline)
+                if deadline is not None and now() >= deadline:
+                    raise _wait_timeout(r)
                 cur = _run_row(r['run_id'])
                 if cur['status'] not in ('starting', 'running'):
                     # The holder wrote its last output, recorded the end and released the lock between two polls.
                     # Nothing will be replayed now, so drain the whole rest of the log.
-                    return _settled(cur, echo=echo, pos=pos, locked=True)
+                    return _settled(cur, echo=echo, pos=pos, locked=True, until=deadline)
                 ck = checkpoint(log_path)
                 # Nothing below may touch the original log before the replay is confirmed. A deadline that has already
                 # passed ends the wait here, with the log and its checkpoint exactly as they were.
@@ -588,9 +636,10 @@ def _wait_locked(r, echo, timeout=None):
         if ck:
             pos = _tail(log_path, pos, echo, ck["logBytes"])
         cur = _run_row(r['run_id'])
-        if cur['status'] not in ('starting', 'running'):
+        if cur['status'] not in ('starting', 'running', 'lost') or (cur['status'] == 'lost' and db().execute(
+                'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone()):
             # Settled: nothing will be replayed, so drain the whole rest of the log.
-            return _settled(cur, echo=echo, pos=pos)
+            return _settled(cur, echo=echo, pos=pos, until=deadline)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                               f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
@@ -602,7 +651,7 @@ def _wait_locked(r, echo, timeout=None):
             probe_pid, polled, ended_at = cur['process_id'], None, None
         if cur['process_id'] and (polled is None or now() - polled >= STATUS_POLL_S):
             polled = now()
-            st = _ended(cur['box_id'], cur['process_id'], deadline)
+            st = _ended(cur['box_id'], cur['process_id'], deadline, cur['run_id'])
             # The deadline may pass during the status request: such an answer is not accepted (--timeout is 124).
             if deadline is not None and now() >= deadline:
                 raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was "
@@ -643,6 +692,8 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
     out(f"{r['run_id']}: exit={code}")
+    if code is None:
+        say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     return 90 if code is None else code
 
 
@@ -769,12 +820,17 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
         mirror = log_path if (has_checkpoint or not _has_data(log_path)) else None
         code = _resolve_exit(cur, log_path, deadline, start, tmp, echo=echo, mirror_path=mirror, mirror_keep=keep)
         if code is None:
+            confirmed = db().execute('SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone()
+            if confirmed:
+                tmp.unlink(missing_ok=True)
+                tmp_ck.unlink(missing_ok=True)
+                return _finalize(cur, code, log_path, until=deadline)
             raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
         # Publish the replacement log and checkpoint before the run is recorded as settled.
         os.replace(tmp, log_path)
         if os.path.exists(tmp_ck):
             os.replace(tmp_ck, offsets_path(log_path))
-        return _finalize(cur, code, log_path)
+        return _finalize(cur, code, log_path, until=deadline)
     except BaseException:
         for p in (tmp, tmp_ck):
             try:
@@ -808,17 +864,18 @@ def _report_deps_hint(r, code, log_path) -> None:
             say(hint)
 
 
-def _finalize(r, code, log_path) -> int:
+def _finalize(r, code, log_path, until=None) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message)
     if repo_setup_failed(code, log_path):
-        finish(r['run_id'], EXIT_INFRA, 'infra')
+        finish(r['run_id'], EXIT_INFRA, 'infra', until=until)
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
     con = db()
-    wedged = settle_box_wedged(con, r, code)
+    with contextlib.nullcontext() if until is None else api.budget(max(0, until-now())):
+        wedged = settle_box_wedged(con, r, code)
     if wedged:
         say(wedged_message(r['box_id'], *wedged))
         return EXIT_INFRA
@@ -827,11 +884,15 @@ def _finalize(r, code, log_path) -> int:
         con = db()
         row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
                                (r["run_id"],)).fetchone())
-        do_pulls(r["box_id"], row, pulls)
-    finish(r['run_id'], code)
+        do_pulls(r["box_id"], row, pulls, until=until)
+    if until is not None and now() >= until:
+        raise _wait_timeout(r)
+    finish(r['run_id'], code, until=until)
     go_std_glitch(r["box_id"], r["run_id"], log_path, code)
     _report_deps_hint(r, code, log_path)
     out(f"{r['run_id']}: exit={code}")
+    if code is None:
+        say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     return 90 if code is None else code
 
 
@@ -842,4 +903,4 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
         return r['exit_code'] if r['exit_code'] is not None else 90
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
-    return _finalize(r, code, log_path)
+    return _finalize(r, code, log_path, until=until)

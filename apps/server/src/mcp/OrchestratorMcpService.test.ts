@@ -15,15 +15,22 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
   type ServerProvider,
 } from "@t3tools/contracts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
@@ -73,6 +80,7 @@ describe("OrchestratorMcpService", () => {
       const runId = RunId.make("stall-race-run");
       const at = DateTime.makeUnsafe("2026-11-12T01:00:00Z");
       const acknowledgements: Array<string> = [];
+      const acknowledged = yield* Deferred.make<void>();
       const parent = {
         thread: { id: parentThreadId },
         runs: [],
@@ -96,6 +104,7 @@ describe("OrchestratorMcpService", () => {
         contextTransfers: [],
         runtimeRequests: [],
         providerThreads: [],
+        providerTurns: [],
         subagents: [],
         turnItems: [],
         runs: [
@@ -127,13 +136,16 @@ describe("OrchestratorMcpService", () => {
       const dependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (id) => Effect.succeed(id === parentThreadId ? parent : child),
           delegatedTaskResultPending: () => Effect.succeed(false),
           dispatch: (command) =>
             Effect.sync(() => {
               acknowledgements.push(command.type);
-              return {} as never;
-            }),
+            }).pipe(
+              Effect.andThen(Deferred.succeed(acknowledged, undefined)),
+              Effect.as({} as never),
+            ),
         }),
         ServerSettings.layerTest(),
         Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
@@ -167,11 +179,198 @@ describe("OrchestratorMcpService", () => {
         assert.match(result.summary!, /^Stalled:/);
         assert.include(result.summary!, "Partial work");
         assert.equal(result.lastProgressAt, DateTime.formatIso(at));
+        yield* Deferred.await(acknowledged);
         assert.deepEqual(acknowledgements, ["delegated_task.completion-delivery.acknowledge"]);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
     }),
   );
-  it.effect("retries terminal acknowledgement with a fresh command id", () =>
+
+  it.effect.each([
+    { finish: "stop", followup: null, incomplete: false },
+    { finish: "length", followup: null, incomplete: true },
+    { finish: "length", followup: "stop", incomplete: true },
+    { finish: "stop", followup: "length", incomplete: false },
+    { finish: "end_turn", followup: null, incomplete: false },
+    { finish: "stop_sequence", followup: null, incomplete: false },
+    { finish: "max_tokens", followup: null, incomplete: true },
+    { finish: "end_turn", followup: "length", incomplete: false },
+    { finish: "length", followup: "end_turn", incomplete: true },
+    { finish: "stop_sequence", followup: "length", incomplete: false },
+    { finish: "length", followup: "stop_sequence", incomplete: true },
+  ] as const)(
+    "reports incomplete metadata for stored finish=$finish with followup=$followup",
+    ({ finish, followup, incomplete }) =>
+      Effect.gen(function* () {
+        const parentId = ThreadId.make("parent:incomplete");
+        const childId = ThreadId.make("child:incomplete");
+        const taskId = NodeId.make("task:incomplete");
+        const runId = RunId.make("run:incomplete");
+        const attemptId = RunAttemptId.make("attempt:incomplete");
+        const now = DateTime.makeUnsafe("2026-11-05T17:52:25Z");
+        const nativeClaude =
+          finish === "end_turn" || finish === "stop_sequence" || finish === "max_tokens";
+        const childInstanceId = ProviderInstanceId.make(nativeClaude ? "claudeAgent" : "codex");
+        const childModel = nativeClaude ? "claude-haiku-5-5" : "gpt-5.4";
+        const storedResult = incomplete
+          ? "[Result looks incomplete: original output limit]\nOriginal answer."
+          : "Original answer.";
+        let parent = {
+          ...idleThreadProjection(liveThreadShell(parentId)),
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentId,
+              origin: "app_owned",
+              childThreadId: childId,
+              providerInstanceId: childInstanceId,
+              model: childModel,
+              status: "completed",
+              result: followup === null ? null : storedResult,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        let child = {
+          ...idleThreadProjection(liveThreadShell(childId)),
+          runs: [
+            {
+              id: runId,
+              ordinal: 1,
+              status: "completed",
+              startedAt: now,
+              completedAt: now,
+              modelSelection: { instanceId: childInstanceId, model: childModel },
+              activeAttemptId: attemptId,
+              rootNodeId: NodeId.make("root:incomplete"),
+            },
+          ],
+          messages: [
+            {
+              id: MessageId.make("answer:incomplete"),
+              runId,
+              role: "assistant",
+              phase: "answer",
+              text: "All checks passed.",
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+          providerTurns: [
+            {
+              id: ProviderTurnId.make("turn:incomplete"),
+              providerThreadId: ProviderThreadId.make("child:incomplete"),
+              runAttemptId: attemptId,
+              ordinal: 1,
+              finish,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        if (followup !== null) {
+          parent = {
+            ...parent,
+            contextTransfers: [
+              {
+                id: "transfer:original",
+                type: "subagent_result",
+                sourceThreadId: childId,
+                targetThreadId: parentId,
+                sourcePoint: { runId },
+              },
+            ] as unknown as OrchestrationV2ThreadProjection["contextTransfers"],
+          };
+          const laterRunId = RunId.make("run:followup");
+          const laterAttempt = RunAttemptId.make("attempt:followup");
+          child = {
+            ...child,
+            runs: [
+              ...child.runs,
+              {
+                ...child.runs[0]!,
+                id: laterRunId,
+                ordinal: 2,
+                activeAttemptId: laterAttempt,
+                startedAt: DateTime.add(now, { seconds: 1 }),
+                completedAt: DateTime.add(now, { seconds: 2 }),
+              },
+            ],
+          };
+          child = {
+            ...child,
+            messages: [
+              ...child.messages,
+              { ...child.messages[0]!, id: MessageId.make("later"), runId: laterRunId },
+            ],
+          };
+          child = {
+            ...child,
+            providerTurns: [
+              ...child.providerTurns,
+              {
+                ...child.providerTurns[0]!,
+                id: ProviderTurnId.make("turn:followup"),
+                runAttemptId: laterAttempt,
+                ordinal: 2,
+                finish: followup,
+              },
+            ],
+          };
+        }
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (id, fields) => {
+              const requestedFields: ReadonlyArray<string> = fields;
+              if (id === childId && requestedFields.includes("runs"))
+                assert.isTrue(requestedFields.includes("providerTurns"));
+              return Effect.succeed(id === parentId ? parent : child);
+            },
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            dispatch: () => Effect.succeed({} as never),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const result = yield* service.taskStatus(
+            {
+              environmentId: EnvironmentId.make("incomplete"),
+              requestNamespace: "incomplete",
+              thread: {
+                threadId: parentId,
+                providerSessionId: "incomplete",
+                providerInstanceId: ProviderInstanceId.make("codex"),
+              },
+              client: undefined,
+              capabilities: new Set(["orchestration"]),
+              issuedAt: 1,
+            },
+            taskId,
+          );
+          assert.equal(result.status, "completed");
+          assert.equal(result.resultLooksIncomplete, incomplete);
+          if (followup !== null) assert.equal(result.summary, storedResult);
+          if (incomplete) {
+            assert.include(
+              result.incompleteReason!,
+              finish === "length" ? "output limit (finish=length)" : `finish=${finish}`,
+            );
+            assert.isTrue(result.summary!.startsWith("[Result looks incomplete:"));
+          } else {
+            assert.equal(result.summary, followup === null ? "All checks passed." : storedResult);
+            assert.isUndefined(result.incompleteReason);
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
+  it.effect("returns task status while the acknowledgement command queue is blocked", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");
       const childThreadId = ThreadId.make("thread:mcp-ack-child");
@@ -179,6 +378,10 @@ describe("OrchestratorMcpService", () => {
       const taskId = NodeId.make("node:mcp-ack-task");
       const acknowledgementCommandIds = yield* Ref.make<ReadonlyArray<string>>([]);
       const acknowledgementAttempts = yield* Ref.make(0);
+      const commandQueued = yield* Deferred.make<void>();
+      const releaseQueue = yield* Deferred.make<void>();
+      const commandFailed = yield* Deferred.make<void>();
+      const commandRetried = yield* Deferred.make<void>();
       const parentProjection = {
         thread: { id: parentThreadId },
         runs: [],
@@ -216,6 +419,8 @@ describe("OrchestratorMcpService", () => {
         ],
         contextTransfers: [],
         messages: [],
+        turnItems: [],
+        providerTurns: [],
         subagents: [],
         providerThreads: [],
         runtimeRequests: [],
@@ -224,6 +429,7 @@ describe("OrchestratorMcpService", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -254,8 +460,14 @@ describe("OrchestratorMcpService", () => {
               Effect.andThen(Ref.updateAndGet(acknowledgementAttempts, (count) => count + 1)),
               Effect.flatMap((attempt) =>
                 attempt === 1
-                  ? Effect.fail(new Error("simulated acknowledgement failure") as never)
-                  : Effect.succeed({} as never),
+                  ? Deferred.succeed(commandQueued, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseQueue)),
+                      Effect.andThen(Deferred.succeed(commandFailed, undefined)),
+                      Effect.andThen(
+                        Effect.fail(new Error("simulated acknowledgement failure") as never),
+                      ),
+                    )
+                  : Deferred.succeed(commandRetried, undefined).pipe(Effect.as({} as never)),
               ),
             ),
         }),
@@ -289,10 +501,26 @@ describe("OrchestratorMcpService", () => {
         assert.isNull(pending.summary);
         assert.equal(yield* Ref.get(acknowledgementAttempts), 0);
         hasNestedWork = false;
-        const error = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
-        assert.equal(error.code, "orchestration_error");
-
+        const reading = yield* service
+          .taskStatus(scope, taskId)
+          .pipe(Effect.timeoutOption("1 second"), Effect.forkChild);
+        yield* Deferred.await(commandQueued);
+        yield* TestClock.adjust("1 second");
+        const observed = yield* Fiber.join(reading);
+        assert.isFalse(yield* Deferred.isDone(releaseQueue));
+        yield* Deferred.succeed(releaseQueue, undefined);
+        assert.isTrue(
+          Option.isSome(observed),
+          "status must return while the command queue is held",
+        );
+        if (Option.isNone(observed)) return;
+        assert.equal(observed.value.status, "completed");
+        assert.equal(observed.value.partial, false);
+        assert.isNull(observed.value.currentRunId);
+        assert.isNull(observed.value.currentRunStatus);
+        yield* Deferred.await(commandFailed);
         const result = yield* service.taskStatus(scope, taskId);
+        yield* Deferred.await(commandRetried);
         assert.equal(result.status, "completed");
         assert.equal(result.summary, "terminal result");
         assert.equal(result.latestTerminalRunId, childRunId);
@@ -302,6 +530,131 @@ describe("OrchestratorMcpService", () => {
         assert.notEqual(commandIds[0], commandIds[1]);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
+  );
+
+  it.effect.each([
+    { blockedStage: "caller", stalled: false },
+    { blockedStage: "parent", stalled: false },
+    { blockedStage: "controls", stalled: false },
+    { blockedStage: "result", stalled: false },
+    { blockedStage: "restart", stalled: false },
+    { blockedStage: "result", stalled: true },
+    { blockedStage: "restart", stalled: true },
+  ] as const)(
+    "returns only available fields at the task_status deadline during $blockedStage read (stalled=$stalled)",
+    ({ blockedStage, stalled }) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:deadline-parent");
+        const childThreadId = ThreadId.make("thread:deadline-child");
+        const taskId = NodeId.make("node:deadline-task");
+        const blocked = yield* Deferred.make<void>();
+        const never = yield* Deferred.make<never>();
+        let reads = 0;
+        const wait = Deferred.succeed(blocked, undefined).pipe(
+          Effect.andThen(Deferred.await(never)),
+        );
+        const at = yield* DateTime.now;
+        const parent = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              status: "running",
+              result: null,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const child = {
+          thread: { id: childThreadId },
+          runs: [
+            {
+              id: RunId.make("run:deadline"),
+              delegatedTaskId: taskId,
+              ordinal: 1,
+              status: stalled ? "interrupted" : "cancelled",
+              ...(stalled
+                ? {
+                    delegatedTaskStall: {
+                      idleTimeoutMs: 60_000,
+                      lastProgressAt: at,
+                      lastProgressKind: "assistant_text",
+                    },
+                  }
+                : {}),
+            },
+          ],
+          messages: [],
+          contextTransfers: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) =>
+              blockedStage === "caller" ? wait : Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (threadId, _fields, _filter, options) => {
+              assert.equal(options?.projectionOnly, true);
+              const stage = ++reads === 1 ? "parent" : reads === 2 ? "controls" : "result";
+              return stage === blockedStage
+                ? wait
+                : Effect.succeed(threadId === parentThreadId ? parent : child);
+            },
+            delegatedTaskResultPending: () =>
+              blockedStage === "restart" ? wait : Effect.succeed(false),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:deadline"),
+            requestNamespace: "deadline",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "deadline",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const read = yield* service.taskStatus(scope, taskId).pipe(Effect.forkChild);
+          yield* Deferred.await(blocked);
+          yield* TestClock.adjust("10 seconds");
+          const result = yield* Fiber.join(read);
+          assert.equal(result.partial, true);
+          assert.equal(result.taskId, taskId);
+          assert.equal(
+            result.childThreadId,
+            ["caller", "parent"].includes(blockedStage) ? undefined : childThreadId,
+          );
+          assert.equal(
+            result.latestTerminalStatus,
+            ["result", "restart"].includes(blockedStage)
+              ? stalled
+                ? "failed"
+                : "cancelled"
+              : undefined,
+          );
+          assert.isUndefined(result.status);
+          assert.isUndefined(result.summary);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
   );
 
   it.effect("reports a restart-cut child as working until its continuation settles", () =>
@@ -340,6 +693,7 @@ describe("OrchestratorMcpService", () => {
             delegatedTaskId: taskId,
           },
           { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
+          { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
         ],
         contextTransfers: [],
         messages: [],
@@ -351,6 +705,7 @@ describe("OrchestratorMcpService", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (threadId) =>
             Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
           delegatedTaskResultPending: () =>
@@ -390,12 +745,16 @@ describe("OrchestratorMcpService", () => {
         const held = yield* service.taskStatus(scope, taskId);
         assert.equal(held.status, "running");
         assert.equal(held.workState, "working");
+        assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
+        assert.equal(held.currentRunId, RunId.make("run:mcp-restart-later"));
+        assert.equal(held.currentRunStatus, "running");
+        assert.equal(held.latestTerminalStatus, "cancelled");
+        assert.equal(held.hasPendingChildRuns, true);
         assert.isNull(held.summary);
         assert.equal(yield* Ref.get(dispatched), 0);
         awaitsRestart = false;
         const settled = yield* service.taskStatus(scope, taskId);
         assert.equal(settled.status, "cancelled");
-        assert.equal(yield* Ref.get(dispatched), 1);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
   );
@@ -1319,6 +1678,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const layerDependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             hasReceipt: () => Effect.succeed(false),
             assertProviderInstanceEnabled: () => Effect.void,
             getThreadRecords: (threadId) =>
@@ -2637,6 +2997,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             getThreadRecords: (threadId) =>
               Effect.succeed(
                 threadId === parentThreadId
@@ -2798,22 +3159,27 @@ describe("OrchestratorMcpService provider resolution", () => {
       const claude = ProviderInstanceId.make("claudeAgent");
       const high = { id: "effort", value: "high" } as const;
       const xhigh = { id: "effort", value: "xhigh" } as const;
-      const stale = { id: "fastMode", value: false } as const;
+      const stale = { id: "retiredOption", value: false } as const;
       const cases = [
         { name: "object override", target: { options: { effort: "xhigh" } }, expected: [xhigh] },
         { name: "array override", target: { options: [xhigh] }, expected: [xhigh] },
         { name: "no override", expected: [high] },
+        {
+          name: "explicit standard marker",
+          target: { options: { fastMode: false } },
+          expected: [high, { id: "fastMode", value: false }],
+        },
         { name: "array clear", target: { options: [] }, expected: [] },
         { name: "object clear", target: { options: {} }, expected: [] },
         {
           name: "explicit true",
-          target: { options: [{ id: "fastMode", value: true }] },
-          error: "Unknown option fastMode",
+          target: { options: [{ id: "retiredOption", value: true }] },
+          error: "Unknown option retiredOption",
         },
         {
           name: "explicit false",
-          target: { options: { fastMode: false } },
-          error: "Unknown option fastMode",
+          target: { options: { retiredOption: false } },
+          error: "Unknown option retiredOption",
         },
         {
           name: "obsolete select",
@@ -2981,10 +3347,14 @@ describe("OrchestratorMcpService provider resolution", () => {
         instanceId: ProviderInstanceId,
         driver: string,
         model: string,
-        optionDescriptors: NonNullable<NonNullable<ServerProvider["models"][number]["capabilities"]>["optionDescriptors"]>,
+        optionDescriptors: NonNullable<
+          NonNullable<ServerProvider["models"][number]["capabilities"]>["optionDescriptors"]
+        >,
       ): ServerProvider => ({
         ...providerSnapshot({ instanceId, driver: ProviderDriverKind.make(driver), model }),
-        models: [{ slug: model, name: model, isCustom: false, capabilities: { optionDescriptors } }],
+        models: [
+          { slug: model, name: model, isCustom: false, capabilities: { optionDescriptors } },
+        ],
       });
       const legacyProvider = snapshot(opencode, "opencode", "opus/claude-opus-5-5#high", [
         select("variant"),
@@ -3002,6 +3372,21 @@ describe("OrchestratorMcpService provider resolution", () => {
       ];
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        {
+          name: "inherits a saved standard marker without a fast catalog option",
+          mode: "apply",
+          hideFastDescriptor: true,
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+        },
         {
           name: "missing flag keeps legacy",
           mode: undefined,
@@ -3024,13 +3409,25 @@ describe("OrchestratorMcpService provider resolution", () => {
           name: "apply routes suffix without source catalog lookup",
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [fast] },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "high" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "high" }, fast],
+          },
         },
         {
           name: "mapped source suffix and option agree",
           mode: "apply",
-          parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [{ id: "variant", value: "high" }, fast] },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "high" }, fast] },
+          parent: {
+            instanceId: opencode,
+            model: "opus/claude-opus-5-5#high",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "high" }, fast],
+          },
         },
         {
           name: "explicit empty options clear an inherited suffix",
@@ -3044,7 +3441,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high" },
           target: { model: "opus/cx/gpt-6.1-sol#max", options: { reasoningEffort: "max" } },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "max" }],
+          },
         },
         {
           name: "a requested suffix conflicts with a different effort",
@@ -3058,46 +3459,96 @@ describe("OrchestratorMcpService provider resolution", () => {
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high" },
           target: { model: "opus/cx/gpt-6.1-sol#max" },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "max" }],
+          },
         },
         {
           name: "native override replaces inherited variant and retains secondary setting",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
           target: { options: { effort: "max" } },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "max" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "max" }, fast],
+          },
         },
         {
           name: "codex explicit effort replaces inherited variant and retains tier",
           mode: "apply",
-          parent: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "variant", value: "high" }, { id: "serviceTier", value: "high" }] },
+          parent: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [
+              { id: "variant", value: "high" },
+              { id: "serviceTier", value: "high" },
+            ],
+          },
           target: { options: { reasoningEffort: "max" } },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }, { id: "serviceTier", value: "high" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [
+              { id: "reasoningEffort", value: "max" },
+              { id: "serviceTier", value: "high" },
+            ],
+          },
         },
         {
           name: "native clear",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
           target: { options: [] },
           expected: { instanceId: claude, model: "claude-opus-5-5", options: [] },
         },
         {
           name: "explicit effort replaces conflicting inherited efforts",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, fast],
+          },
           target: { options: { effort: "max" } },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "max" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "max" }, fast],
+          },
         },
         {
           name: "codex variant canonicalizes",
           mode: "apply",
-          parent: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "variant", value: "high" }] },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "high" }] },
+          parent: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "variant", value: "high" }],
+          },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
         {
           name: "invalid inherited option is rejected",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "fastMode", value: "yes" }] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: "yes" }],
+          },
           error: "expects a boolean",
         },
         {
@@ -3111,39 +3562,84 @@ describe("OrchestratorMcpService provider resolution", () => {
           name: "duplicate requested options are rejected",
           mode: "apply",
           parent: { instanceId: claude, model: "claude-opus-5-5" },
-          target: { options: [{ id: "effort", value: "max" }, { id: "effort", value: "max" }] },
+          target: {
+            options: [
+              { id: "effort", value: "max" },
+              { id: "effort", value: "max" },
+            ],
+          },
           error: "specified more than once",
         },
         {
           name: "conflicting stored suffix fails closed",
           mode: "apply",
-          parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [{ id: "variant", value: "max" }] },
+          parent: {
+            instanceId: opencode,
+            model: "opus/claude-opus-5-5#high",
+            options: [{ id: "variant", value: "max" }],
+          },
           error: "conflicts with its effort",
         },
       ] as const;
       for (const testCase of cases) {
         const commands: Array<{ modelSelection: ModelSelection }> = [];
         const task = {
-          id: taskId, threadId: parentThreadId, origin: "app_owned", childThreadId,
-          providerInstanceId: testCase.parent.instanceId, model: testCase.parent.model,
-          status: "running", result: null,
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: testCase.parent.instanceId,
+          model: testCase.parent.model,
+          status: "running",
+          result: null,
         };
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             hasReceipt: () => Effect.succeed(false),
-            getThreadRecords: ((threadId: ThreadId) => Effect.succeed(
-              threadId === parentThreadId
-                ? parentProjection(commands.length > 0 ? [task] : [], testCase.parent)
-                : { ...childProjection, thread: { ...childProjection.thread, modelSelection: commands[0]?.modelSelection } },
-            )) as never,
-            dispatch: (command) => Effect.sync(() => {
-              commands.push(command as unknown as { modelSelection: ModelSelection });
-              return { storedEvents: [{ event: { type: "subagent.updated", payload: task } }] } as never;
-            }),
+            getThreadRecords: ((threadId: ThreadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? parentProjection(commands.length > 0 ? [task] : [], testCase.parent)
+                  : {
+                      ...childProjection,
+                      thread: {
+                        ...childProjection.thread,
+                        modelSelection: commands[0]?.modelSelection,
+                      },
+                    },
+              )) as never,
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command as unknown as { modelSelection: ModelSelection });
+                return {
+                  storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
+                } as never;
+              }),
           }),
-          ServerSettings.layerTest(testCase.mode === undefined ? {} : { ardudHarnessMigration: { selections: testCase.mode } }),
-          providerRegistryLayer(testCase.mode === "apply" ? providers : [legacyProvider, ...providers]),
+          ServerSettings.layerTest(
+            testCase.mode === undefined
+              ? {}
+              : { ardudHarnessMigration: { selections: testCase.mode } },
+          ),
+          providerRegistryLayer(
+            testCase.mode === "apply"
+              ? "hideFastDescriptor" in testCase
+                ? providers.map((provider) => ({
+                    ...provider,
+                    models: provider.models.map((model) => ({
+                      ...model,
+                      capabilities: {
+                        ...model.capabilities,
+                        optionDescriptors: model.capabilities?.optionDescriptors?.filter(
+                          (option) => option.id !== "fastMode",
+                        ),
+                      },
+                    })),
+                  }))
+                : providers
+              : [legacyProvider, ...providers],
+          ),
           adapterRegistryLayer([opencode, claude, codexInstanceId]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
@@ -3152,7 +3648,12 @@ describe("OrchestratorMcpService provider resolution", () => {
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const target = "target" in testCase ? yield* decodeTarget(testCase.target) : undefined;
-          const call = service.delegateTask(scope, { task: "Review.", target, mode: "async", clientRequestId: testCase.name });
+          const call = service.delegateTask(scope, {
+            task: "Review.",
+            target,
+            mode: "async",
+            clientRequestId: testCase.name,
+          });
           if ("error" in testCase) {
             const error = yield* call.pipe(Effect.flip);
             assert.equal(error.code, "invalid_request", testCase.name);
@@ -3171,9 +3672,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           hasReceipt: () => Effect.succeed(false),
-          getThreadRecords: () => Effect.succeed(parentProjection([], {
-            instanceId: opencode, model: "opus/claude-opus-5-5#high",
-          })),
+          getThreadRecords: () =>
+            Effect.succeed(
+              parentProjection([], {
+                instanceId: opencode,
+                model: "opus/claude-opus-5-5#high",
+              }),
+            ),
         }),
         ServerSettings.layerTest({ ardudHarnessMigration: { selections: "apply" } }),
         providerRegistryLayer([legacyProvider]),
@@ -3184,9 +3689,13 @@ describe("OrchestratorMcpService provider resolution", () => {
       );
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const error = yield* service.delegateTask(scope, {
-            task: "Review.", mode: "async", clientRequestId: "mapped-provider-missing",
-        }).pipe(Effect.flip);
+        const error = yield* service
+          .delegateTask(scope, {
+            task: "Review.",
+            mode: "async",
+            clientRequestId: "mapped-provider-missing",
+          })
+          .pipe(Effect.flip);
         assert.equal(error.code, "provider_unavailable");
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(missingDestination))));
     }),

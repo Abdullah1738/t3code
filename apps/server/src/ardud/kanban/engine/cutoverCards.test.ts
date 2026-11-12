@@ -293,6 +293,7 @@ const threadView = (threadId: ThreadId): KanbanThreadView => ({
   quietSince: at,
   runStartedAt: null,
   backgroundWork: 0,
+  prWatches: 0,
   prs: [],
   archived: false,
 });

@@ -21,7 +21,11 @@ import { cn } from "../../lib/utils";
 import { useBoardColumnPrefs } from "./useBoardColumnPrefs";
 
 /** Show or hide each stage column, plus Show all and Reset widths. Stage grouping only. */
-export function BoardColumnsMenu(props: { boardId: string }) {
+export function BoardColumnsMenu(props: {
+  boardId: string;
+  /** Icon only, for a header or row with no room for the word. */
+  compact?: boolean;
+}) {
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
   const anyHidden = prefs.hidden.length > 0;
   const anyResized = Object.keys(prefs.widths).length > 0 || prefs.groupWidth !== null;
@@ -43,7 +47,7 @@ export function BoardColumnsMenu(props: { boardId: string }) {
         }
       >
         <Columns2Icon className="size-3.5 shrink-0" aria-hidden />
-        <span className="max-md:sr-only">Columns</span>
+        <span className={props.compact ? "sr-only" : "max-md:sr-only"}>Columns</span>
       </MenuTrigger>
       <MenuPopup align="start" side="bottom">
         {BOARD_COLUMNS.map((key: BoardColumnKey) => (

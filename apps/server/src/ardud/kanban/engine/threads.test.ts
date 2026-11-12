@@ -10,7 +10,9 @@ import {
   ProviderInstanceId,
   RunId,
   RuntimeRequestId,
+  MessageId,
   ThreadId,
+  type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -30,6 +32,7 @@ import {
   KanbanThreadError,
   KanbanThreads,
   layer,
+  prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
 
@@ -124,6 +127,82 @@ describe("backgroundWorkOf", () => {
   });
 });
 
+describe("prWatchesOf", () => {
+  const watchedPr = (overrides: Partial<ThreadPullRequestLink> = {}): ThreadPullRequestLink => ({
+    host: "github.com",
+    repository: "x/y",
+    number: 1,
+    url: "https://github.com/x/y/pull/1",
+    source: "agent",
+    linkedAt: FINISHED_AT,
+    stack: null,
+    snapshot: {
+      state: "open",
+      title: "Change",
+      headBranch: "change",
+      baseBranch: "main",
+      isDraft: false,
+      updatedAt: null,
+      syncedAt: FINISHED_AT,
+    },
+    watch: {
+      startedAt: FINISHED_AT,
+      headSha: null,
+      failedChecks: [],
+      passed: false,
+      passedChecks: [],
+      passedPending: [],
+      remarksThrough: FINISHED_AT,
+      remarkIds: [],
+      conflicting: false,
+      wakes: 0,
+    },
+    ...overrides,
+  });
+
+  it.each([
+    { name: "open", pr: watchedPr(), count: 1 },
+    {
+      name: "draft",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, isDraft: true } }),
+      count: 1,
+    },
+    { name: "no snapshot yet", pr: watchedPr({ snapshot: null }), count: 1 },
+    { name: "no watch", pr: watchedPr({ watch: undefined }), count: 0 },
+    { name: "stack-dismissed", pr: watchedPr({ source: "stack-dismissed" }), count: 0 },
+    {
+      name: "merged",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "merged" } }),
+      count: 0,
+    },
+    {
+      name: "closed",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "closed" } }),
+      count: 0,
+    },
+    {
+      name: "ended watch",
+      pr: watchedPr({ watch: undefined, endedWatch: watchedPr().watch }),
+      count: 0,
+    },
+  ])("counts $name links correctly", ({ pr, count }) => {
+    expect(prWatchesOf({ pullRequests: [pr] })).toBe(count);
+  });
+
+  it("counts each eligible link in a mixed roster", () => {
+    expect(
+      prWatchesOf({
+        pullRequests: [watchedPr(), watchedPr({ snapshot: null }), watchedPr({ watch: undefined })],
+      }),
+    ).toBe(2);
+  });
+
+  it("is zero for an empty or missing roster", () => {
+    expect(prWatchesOf({ pullRequests: [] })).toBe(0);
+    expect(prWatchesOf({})).toBe(0);
+  });
+});
+
 it.effect(
   "find distinguishes a failed shell read from a missing thread while view hides failures",
   () =>
@@ -204,6 +283,40 @@ it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
         ),
       );
     }),
+);
+
+it.effect("interrupt fails on a failed shell read and treats a missing thread as stopped", () =>
+  Effect.gen(function* () {
+    const failedId = ThreadId.make("thread-stop-read-failed");
+    const missingId = ThreadId.make("thread-stop-missing");
+    const readError = new Orchestrator.OrchestratorProjectionError({
+      threadId: failedId,
+      cause: "injected shell read failure",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: (threadId) =>
+        threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      // A saved stop retries on this instead of closing as delivered.
+      const result = yield* Effect.result(threads.interrupt(failedId, "Card moved"));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("interrupt");
+      }
+      yield* threads.interrupt(missingId, "Card moved");
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
 );
 
 it.effect("a keyed send passes stable command and message ids to thread management", () =>
@@ -495,3 +608,142 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(dependencies));
 });
+
+it.effect.each([
+  "preparing",
+  "queued",
+  "shared queued",
+  "shared active",
+  "shared completed",
+  "shared failed",
+  "shared interrupted",
+] as const)(
+  "#566 stopping an abandoned %s launch prevents its pending turn from starting",
+  (state) => {
+    const db = Sqlite.layerMemory;
+    const instanceId = ProviderInstanceId.make("codex");
+    const projectId = ProjectId.make("project:abandoned");
+    const threadId = ThreadId.make("thread:abandoned");
+    const modelSelection = { instanceId, model: "gpt-5.1-codex" };
+    const adapter = {
+      instanceId,
+      driver: ProviderDriverKind.make("codex"),
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+      openSession: () => Effect.die("Provider execution is disabled in this test"),
+    } as ProviderAdapter.ProviderAdapterV2["Service"];
+    const registry = Layer.succeed(
+      ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+      ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+        get: () => Effect.succeed(adapter),
+        list: () => Effect.succeed([instanceId]),
+      }),
+    );
+    const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+    const runtime = ProviderReplayHarness.layerWithRegistry(
+      { name: "kanban-abandoned" },
+      registry,
+      { databaseLayer: db, runEffectWorker: false },
+    );
+    const management = ThreadManagementService.layer.pipe(
+      Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    );
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("abandon:create"),
+        threadId,
+        projectId,
+        title: "Abandoned",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      const count = state === "preparing" ? 1 : 2;
+      for (let i = 0; i < count; i++)
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`abandon:message:${i}`),
+          threadId,
+          messageId: MessageId.make(`abandon:message:${i}`),
+          text: "Run",
+          attachments: [],
+          modelSelection,
+          dispatchMode:
+            state === "preparing"
+              ? { type: "defer_start", workspaceStrategy: { type: "root" } }
+              : i === 0
+                ? { type: "start_immediately" }
+                : { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+      expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)?.status).toBe(
+        state === "preparing" ? "preparing" : "queued",
+      );
+      const threads = yield* KanbanThreads;
+      if (state.startsWith("shared")) {
+        const before = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        const target = state === "shared queued" ? before.at(-1)! : before[0]!;
+        expect(yield* threads.cancelQueued(threadId, target.id)).toBe(state === "shared queued");
+        const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        expect(after[0]).toEqual(before[0]);
+        expect(after.at(-1)?.status).toBe(state === "shared queued" ? "cancelled" : "queued");
+        return;
+      }
+      yield* threads.interrupt(threadId, "Abandoned launch", true);
+      const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+      expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("abandon:resume"),
+        threadId,
+      });
+      expect(
+        (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.map((run) => run.status),
+      ).toEqual(after.map((run) => run.status));
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provideMerge(
+            Layer.effect(
+              ThreadManagementService.ThreadManagementService,
+              Effect.map(ThreadManagementService.ThreadManagementService, (service) =>
+                ThreadManagementService.ThreadManagementService.of({
+                  ...service,
+                  getThreadRecords: (id, fields, filter) =>
+                    Effect.gen(function* () {
+                      const records = yield* service.getThreadRecords(id, fields, filter);
+                      if (
+                        !["shared completed", "shared failed", "shared interrupted"].includes(state)
+                      )
+                        return records;
+                      const { runs } = yield* service.getThreadRecords(id, ["runs"]);
+                      return {
+                        ...records,
+                        runs: runs.map((run) => ({
+                          ...run,
+                          status:
+                            state === "shared completed"
+                              ? ("completed" as const)
+                              : state === "shared failed"
+                                ? ("failed" as const)
+                                : ("interrupted" as const),
+                        })),
+                      };
+                    }),
+                }),
+              ),
+            ).pipe(Layer.provideMerge(management)),
+          ),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  },
+);

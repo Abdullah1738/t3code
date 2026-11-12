@@ -495,7 +495,7 @@ export function ThreadRelationshipsPanel(props: {
                 : "";
               const project = projects.find((project) => project.id === node?.thread?.projectId);
               const relationshipHint = node?.missing
-                ? "This related thread is unavailable"
+                ? "This related thread was deleted"
                 : `Open ${relationship.toLowerCase()} in this chat`;
               const RelationshipPopup = agent ? ThreadHoverCardPopup : TooltipPopup;
               const relationshipTooltip = agent ? (

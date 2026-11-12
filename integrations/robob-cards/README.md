@@ -3,10 +3,11 @@
 Our own iMessage app, so Sendblue app cards open a Robob page right inside
 Messages instead of Photon's Spectrum app (which doesn't open Sendblue cards).
 
-- `ios/` holds the container app (one "Robob Cards is installed" screen) and
-  the Messages extension. The extension loads the tapped card's `MSMessage.url`
+- `ios/` holds the container app, the Messages extension, and a configurable
+  WidgetKit extension. The Messages extension loads the tapped card's `MSMessage.url`
   in a web view: https only, compact shows the page, a tap expands it, other
-  links go to the system. No storage, analytics or entitlements.
+  links go to the system. The widget caches its last successful response in
+  its own container. Neither extension uses analytics or app-group entitlements.
 - Bundle ids `com.abdullah.robob.cards` and
   `com.abdullah.robob.cards.MessagesExtension`, team `HVG39427R3`. The
   spectrum-bridge sends cards with this identity when `cardApp` in its
@@ -14,6 +15,17 @@ Messages instead of Photon's Spectrum app (which doesn't open Sendblue cards).
   `{"appName": "Robob Cards", "extensionBundleId": "com.abdullah.robob.cards.MessagesExtension", "teamId": "HVG39427R3"}`.
 - A card only opens in the app for people who have it installed; everyone
   else sees the static card.
+- On Abdullah's devices, long-press the Home Screen, tap +, and add Robob Cards.
+  Long-press the widget and choose Edit Widget to select a definition from
+  `https://widgets.tail`. Tailscale and the trusted .tail CA device profile are
+  required; the widget can show its last cached data when offline.
+- Medium and large widgets can run the actions in a definition. Each tap has a
+  unique request ID; an unconfirmed or pending action can be checked using the
+  Check control for that attempt, even after ten minutes. Another tap of the
+  same action stays blocked until the server confirms completion. If the server
+  cannot confirm the result, check the effect and tap “I checked” before starting
+  again. A busy response also keeps its request ID for a manual check.
+  WidgetKit chooses the actual refresh time.
 
 ## Build
 
@@ -54,7 +66,8 @@ Connect key and the distribution key and certificate come from
 ```
 
 Signing uses a throwaway keychain per run, so the login keychain and the
-search list are never touched.
+search list are never touched. The ad hoc re-sign removes the Widgets
+extension; it is intended for Abdullah's devices only.
 
 Apple can hold a newly registered device in `PROCESSING` for 24–72 hours.
 It cannot be enabled manually or added to a profile during that hold. The
@@ -64,4 +77,4 @@ enables it; the existing page is reused while its tunnel is still open.
 Only `DISABLED` devices are re-enabled. Duplicate registration responses are
 reconciled by UDID, and profile creation retries device-propagation conflicts.
 
-Tests: `node --test test/enroll.test.mjs` and `node --test test/server.test.mjs`.
+Tests: `node --test test/` from this directory.

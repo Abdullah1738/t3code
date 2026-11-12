@@ -35,7 +35,8 @@ class BoxWedgedTests(Isolated):
             self.box(box, member=True)
         rows = [dict(self.row(box), remote_dir='w/r') for box in ('bxA', 'bxB')]
         acquire = self.stack.enter_context(patch.object(pool, 'acquire', side_effect=rows))
-        self.stack.enter_context(patch.object(runs.Runner, '_prepare_box'))
+        self.stack.enter_context(patch.object(runs.Runner, '_prepare_box', return_value=None))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.node_version, 'want', return_value=None))
         start = self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7, 'commandId': 'c'}))
         outcomes = iter(outcomes)

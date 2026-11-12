@@ -529,6 +529,8 @@ it.effect.each([
         assert.equal(after.status, "failed");
         assert.equal(after.failureReason, "stalled");
         assert.match(after.summary!, /^Stalled: no tool call or text for 15 min/);
+        assert.isTrue(after.resultLooksIncomplete);
+        assert.include(after.incompleteReason!, "its last text was a progress note");
         assert.include(after.summary!, DateTime.formatIso(now));
         assert.include(after.summary!, "I checked the first file.");
         const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);

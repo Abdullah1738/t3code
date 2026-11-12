@@ -215,30 +215,23 @@ class Pings(Base):
     def sent(self):
         return json.loads((self.wd / 'pings.json').read_text())['sent']
 
-    def test_an_old_outbox_without_its_event_text_is_rebuilt(self):
-        # An outbox written before the event text was kept can't be matched to the runner's pending event.
+    def test_old_outbox_keys_are_migrated_to_built_without_repeating(self):
         self.case(deadline='2026-10-25')
-        (self.wd / 'state.json').write_text(json.dumps({'fires': 3}))
         (self.wd / 'pings.json').write_text(json.dumps({'sent': {}, 'outbox': {
-            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3, 'clock': {}}}))
-        self.assertIn('acme', self.check('2026-10-24T10:00', 'r1'))
-        self.assertEqual(self.check('2026-10-24T10:30', 'r2'), '')
-        self.assertIn('acme|r0|soon', self.sent())
-
-    def test_unrecorded_output_is_rebuilt_before_new_work(self):
-        self.case(deadline='2026-10-25')
-        first = self.check('2026-10-24T10:00', 'r1', ack=False)
-        self.assertTrue(first)
-        # The runner never took it (no state.pending), so the r2 check rebuilds the event rather than holding it.
-        rebuilt = self.check('2026-10-24T10:15', 'r2', ack=False)
-        self.assertEqual(rebuilt, first)
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3}}))
+        self.assertEqual(self.check('2026-10-24T10:00', 'r1'), '')
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('acme|r0|soon', state['built'])
         self.assertEqual(self.sent(), {})
-        # Once the runner takes it and delivers, the reminder is recorded as sent at its delivery time.
-        (self.wd / '.run-ok').write_text('r2')
-        self.deliver('2026-10-24T10:20')
-        self.assertEqual(self.check('2026-10-24T10:30', 'r3'), '')
-        self.assertIn('acme|r0|soon', self.sent())
+
+    def test_unacked_output_is_built_once_and_new_deadlines_can_fire(self):
+        self.case(deadline='2026-10-25')
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
+        self.assertEqual(self.check('2026-10-24T10:30', 'r3', ack=False), '')
+        self.assertEqual(self.sent(), {})
+        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, because='new date', at=at('2026-10-24T11:00'))
+        self.assertIn('acme', self.check('2026-10-25T10:00', 'r4', ack=False))
 
     def test_unrecorded_output_respects_quiet_hours_and_current_cases(self):
         self.case(deadline='2026-10-25T10:00:00+04:00')
@@ -440,19 +433,21 @@ class CheckEntry(Base):
 
     def test_watchdog_dumps_and_exits_during_a_c_level_hang(self):
         script = Path(__file__).with_name('cases.py')
-        code = ('import ctypes, runpy; '
-                f'ns = runpy.run_path({str(script)!r}); '
-                'ns["main"].__globals__["run_check"] = lambda *a: ctypes.CDLL(None).sleep(3); '
+        code = (f'import ctypes, runpy, time\nns = runpy.run_path({str(script)!r})\n'
+                'def hang(*args):\n'
+                '    print(time.time(), flush=True)\n'
+                '    ctypes.CDLL(None).sleep(3)\n'
+                'ns["main"].__globals__["run_check"] = hang\n'
                 'raise SystemExit(ns["main"](["check"]))')
         env = {'HOME': str(self.tmp), 'PATH': '/usr/bin:/bin', 'LANG': 'en_US.UTF-8',
                'WATCH_DIR': str(self.wd), 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_HARD_STOP': '0.15'}
-        started = time.monotonic()
         done = subprocess.run(['/usr/bin/python3', '-B', '-c', code], env=env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, start_new_session=True, timeout=2)
-        self.assertLess(time.monotonic() - started, 1)
+                              capture_output=True, text=True, start_new_session=True, timeout=5)
+        # The watchdog is armed inside main; imports on the checkout mount are outside its budget.
+        self.assertLess(time.time() - float(done.stdout.strip()), 1)
         self.assertEqual(done.returncode, 1)
         self.assertIn('Timeout', done.stderr)
-        self.assertIn('<lambda>', done.stderr)
+        self.assertIn('hang', done.stderr)
 
     def test_check_runs_in_runner_environment_with_fake_msgs_and_temp_state(self):
         home = self.tmp / 'home'
@@ -544,18 +539,14 @@ class Rules(Base):
         self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
                               if '|ask|' in k]), 1)
 
-    def test_output_lost_before_the_runner_accepted_it_is_rebuilt_not_stuck(self):
-        # The check printed and wrote its outbox, then died before the runner saved state.pending: the
-        # runner never took it, state.json has no pending and fires never rose.
+    def test_output_lost_before_runner_acceptance_is_not_emitted_again(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
-        self.assertFalse((self.wd / 'state.json').exists())
-        # A later check must not stay silent forever: it drops the lost output and shows the reminder again.
-        event = self.check('2026-10-24T10:30', 'r2', ack=False)
-        self.assertIn('acme', event)
-        # Nothing is recorded as sent until a delivery is confirmed.
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text()).get('sent', {}), {})
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+        self.assertEqual(self.check('2026-10-24T10:30', 'r2', ack=False), '')
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(state['sent'], {})
+        self.assertIn('acme|r0|soon', state['built'])
+        self.assertNotIn('outbox', state)
 
     def test_a_pending_event_the_runner_owns_is_waited_for_not_rebuilt(self):
         # The runner saved the event as its pending event, so it will deliver it: the check does not rebuild.
@@ -782,8 +773,8 @@ class Questions(Base):
         code, msg = self.ask('2026-10-25T13:00', known)
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('re-ask waits until', msg)
-        self.assertEqual(self.ask('2026-10-25T18:00', known)[0], 0)
-        code, msg = self.ask('2026-10-26T09:00', known)
+        self.assertEqual(self.ask('2026-10-26T12:00', known)[0], 0)
+        code, msg = self.ask('2026-10-26T13:00', known)
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('never a third ask', msg)
         q = self.questions()[0]
@@ -823,12 +814,12 @@ class Questions(Base):
 
     def test_the_check_turns_a_question_asked_twice_into_a_case_and_says_so_once(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
-        self.assertEqual(self.follow('2026-10-24T12:00', finder()), '')
-        event = self.follow('2026-10-24T20:30', finder())
+        self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
+        self.assertEqual(self.follow('2026-10-25T12:00', finder()), '')
+        event = self.follow('2026-10-25T20:30', finder())
         self.assertIn("he didn't answer, so it is now money case charge-", event)
         self.assertEqual(len(mc.load(self.data)['cases']), 1)
-        later = self.follow('2026-10-24T21:00', finder(), 'r2')
+        later = self.follow('2026-10-25T21:00', finder(), 'r2')
         self.assertNotIn("he didn't answer", later)
 
     def test_a_wait_with_no_receipt_is_raised_once(self):
@@ -941,8 +932,8 @@ class Questions(Base):
 
     def test_a_late_receipt_settles_a_question_that_became_a_case(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T20:00', finder())[0], mc.DONT_ASK)
+        self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
+        self.assertEqual(self.ask('2026-10-25T02:00', finder())[0], mc.DONT_ASK)
         q = self.questions()[0]
         self.assertEqual(q['status'], 'case')
         event = self.follow('2026-10-25T09:00', finder(dict(RECEIPT, ts=at('2026-10-25T08:00').timestamp())))
@@ -951,7 +942,7 @@ class Questions(Base):
         self.assertEqual(self.questions()[0]['status'], 'closed')
 
     def test_his_answer_to_a_case_question_is_noted_on_the_case(self):
-        for now in ('2026-10-24T00:37', '2026-10-24T08:00', '2026-10-24T20:00'):
+        for now in ('2026-10-24T00:37', '2026-10-25T01:00', '2026-10-25T02:00'):
             self.ask(now, finder())
         q = self.questions()[0]
         mc.answered(self.data, q['id'], 'not mine', now=at('2026-10-24T21:00'))
@@ -1619,6 +1610,181 @@ class Cli(Base):
         self.assertEqual((self.data / 'cases.json').read_text(), before)
         self.assertFalse((self.data / 'questions.json').exists())
         self.assertTrue((scratch / 'scratch-books' / 'cases.json').exists())
+
+
+
+
+class PaymentDeadlines(Base):
+    def notice(self, text='Your autopay of AED 3,532.73 failed; repay before midnight',
+               when='2026-11-07T21:05', source='mail:wio:1', sender='Wio'):
+        n = mc.payments.parse(text, sender, at(when))
+        self.assertIsNotNone(n)
+        cid = mc.record_payment(self.data, n, source, at(when))
+        return cid
+
+    def test_wio_replay_and_mail_sms_copy_are_one_case(self):
+        cid = self.notice()
+        self.assertEqual(self.notice(), cid)
+        self.assertEqual(self.notice(source='imsg:2'), cid)
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(case['deadline'], '2026-11-07T23:59:00+04:00')
+        self.assertEqual(case['sources'], ['mail:wio:1', 'imsg:2'])
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+
+    def test_hour_and_deadline_are_acknowledged_once_and_standalone(self):
+        cid = self.notice('Your payment of AED 3,532.73 failed; pay by 21:00', when='2026-11-07T18:00')
+        self.case(deadline='2026-11-07')
+        self.assertIn(cid, self.check('2026-11-07T18:01', 'initial'))
+        self.assertNotIn(cid, self.check('2026-11-07T19:44', 'early'))
+        event = self.check('2026-11-07T20:00', 'hour')
+        self.assertIn('Wio AED 3,532.73', event)
+        self.assertIn('21:00', event)
+        self.assertNotIn('acme', event)
+        self.assertNotIn(cid, self.check('2026-11-07T20:15', 'repeat'))
+        self.assertIn(cid, self.check('2026-11-07T21:00', 'due'))
+        self.assertNotIn(cid, self.check('2026-11-08T09:00', 'tomorrow'))
+
+    def test_midnight_reminder_survives_cadence_and_quiet_hours(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:45', 'hour'))
+        self.assertEqual('', self.check('2026-11-07T23:00', 'quiet'))
+        self.assertIn(cid, self.check('2026-11-08T08:00', 'due'))
+        self.assertEqual('', self.check('2026-11-08T08:15', 'again'))
+
+    def test_hour_at_exact_minus_sixty_and_closed_case_never_fires(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:59', 'hour'))
+        mc.close(self.data, cid, 'paid', at('2026-11-07T23:01'))
+        self.assertEqual('', self.check('2026-11-08T08:00', 'after'))
+        self.assertEqual(self.notice(), cid)
+        self.assertEqual('', self.check('2026-11-08T08:15', 'replay'))
+
+    def test_unacknowledged_event_is_rebuilt_without_closed_case(self):
+        cid = self.notice()
+        self.assertIn(cid, self.check('2026-11-07T22:59', 'lost', ack=False))
+        mc.close(self.data, cid, 'done', at('2026-11-07T23:00'))
+        self.assertEqual('', self.check('2026-11-08T08:00', 'closed'))
+
+    def test_success_closes_expected_and_deadline_and_replay_stays_closed(self):
+        parent = self.notice('Autopay of AED 3,532.73 is due tonight at 21:00', '2026-11-07T09:09', 'scheduled')
+        child = self.notice()
+        self.notice('Autopay successful: AED 3,532.73', '2026-11-07T22:30', 'success')
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+        self.assertEqual(self.notice(), child)
+        self.assertEqual('', self.check('2026-11-08T08:00'))
+        self.assertEqual({c['id'] for c in mc.load(self.data)['cases']}, {parent, child})
+
+    def test_owner_closes_both_rows(self):
+        parent = self.notice('Autopay of AED 3,532.73 is due tonight at 18:00', '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00')
+        child = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
+        mc.close(self.data, child['id'], 'paid', at('2026-11-07T19:30'))
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+        with patch.object(mc.charges, 'search') as search:
+            self.assertEqual('', self.check('2026-11-08T09:00'))
+            search.assert_not_called()
+        self.assertEqual(mc.find(mc.load(self.data), parent)['status'], 'closed')
+
+    def test_expected_missing_confirmation_escalates_at_due_plus_one(self):
+        self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00', '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.assertEqual('', self.check('2026-11-07T18:59'))
+            search.assert_not_called()
+            self.assertIn('Wio', self.check('2026-11-07T19:00'))
+            self.assertIsNotNone(search.call_args.kwargs['deadline'])
+            event = self.check('2026-11-07T20:00')
+        self.assertIn('Wio', event)
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(cases[1]['deadline'], '2026-11-07T21:00:00+04:00')
+
+    def test_expected_uses_stated_repayment_deadline(self):
+        self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00; repay before midnight if it fails',
+                    '2026-11-07T09:09', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00')
+        self.assertEqual(mc.load(self.data)['cases'][1]['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_search_success_requires_bank_amount_currency_and_time(self):
+        for row_changes, closes in (({}, True), ({'sender': 'Shop'}, False), ({'body': 'Payment received AED 1.00'}, False),
+                                    ({'body': 'Payment received USD 3,532.73'}, False),
+                                    ({'ts': at('2026-11-06T21:00').timestamp()}, False),
+                                    ({'source': 'whatsapp'}, False), ({'from_me': 1}, False)):
+            with self.subTest(row_changes=row_changes), tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp)
+                n = mc.payments.parse('Autopay of AED 3,532.73 due today at 18:00', 'Wio', at('2026-11-07T09:00'))
+                mc.record_payment(data, n, 'scheduled', at('2026-11-07T09:00'))
+                row = {'id': 'receipt', 'source': 'email', 'sender': 'Wio', 'body': 'Payment received AED 3,532.73',
+                       'ts': at('2026-11-07T18:05').timestamp(), **row_changes}
+                mc.follow_payments(data, at('2026-11-07T19:00'), time.time() + 3, find=lambda *a, **kw: [row])
+                self.assertEqual(mc.load(data)['cases'][0]['status'] == 'closed', closes)
+
+    def test_archive_timeout_still_tracks_an_unconfirmed_payment(self):
+        self.notice('Autopay of AED 3,532.73 due today at 18:00', '2026-11-07T09:00', 'scheduled')
+        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')):
+            self.check('2026-11-07T20:00')
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 2)
+        self.assertIn('confirmation', cases[1]['state'])
+
+    def test_brief_puts_payment_deadline_first(self):
+        self.case(deadline='2026-11-06')
+        self.notice()
+        line = mc.brief(mc.load(self.data)['cases'], at('2026-11-07T22:00'))
+        self.assertLess(line.index('Wio'), line.index('Acme'))
+        self.assertIn('23:59', line)
+
+    def test_owner_paid_closes_cycle_across_message_dates(self):
+        for schedule_day, failure_time, due_clause in (
+                ('2026-11-07T09:00', '2026-11-08T18:05', 'on 8 November 2026 at 18:00'),
+                ('2026-11-07T09:00', '2026-11-08T00:05', 'on 7 November 2026 at 23:00')):
+            with self.subTest(failure_time=failure_time), tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp)
+                parent = mc.payments.parse('Autopay of AED 100.00 scheduled ' + due_clause, 'Wio', at(schedule_day))
+                mc.record_payment(data, parent, 'scheduled', at(schedule_day))
+                failure = mc.payments.parse('Autopay of AED 100.00 failed; repay before midnight', 'Wio', at(failure_time))
+                child = mc.record_payment(data, failure, 'failed', at(failure_time))
+                mc.close(data, child, 'paid', at(failure_time) + dt.timedelta(minutes=1))
+                self.assertEqual({c['status'] for c in mc.load(data)['cases']}, {'closed'})
+                with patch.object(mc.charges, 'search') as search:
+                    mc.follow_payments(data, at(failure_time) + dt.timedelta(hours=2), time.time() + 3)
+                    search.assert_not_called()
+
+    def test_conditional_success_does_not_close_unpaid_case(self):
+        cid = self.notice('Autopay of AED 100.00 failed; repay before midnight')
+        text = 'Autopay of AED 100.00 is scheduled today at 21:00. We will notify you if payment is successful.'
+        self.notice(text, source='conditional')
+        self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open')
+        self.notice('Payment of AED 100.00 has been successfully received.', source='confirmed')
+        self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
+
+    def test_slow_lookups_do_not_abort_reminder_generation(self):
+        self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled-1')
+        self.notice('Autopay of AED 200.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled-2')
+        clock = [time.time()]
+        def slow_archive(*args, **kwargs):
+            clock[0] = kwargs['deadline'] + .01
+            raise mc.charges.Lookup('lookup budget exhausted')
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc.charges, 'search', side_effect=slow_archive):
+            event = self.check('2026-11-07T20:00')
+        self.assertIn('Wio', event)
+        self.assertEqual(sum(c['kind'] == 'payment_deadline' for c in mc.load(self.data)['cases']), 2)
+
+    def test_bank_deadline_supersedes_fallback(self):
+        self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            self.check('2026-11-07T19:00', 'missing')
+        fallback = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
+        bank = self.notice('Autopay of AED 100.00 failed; repay before midnight', '2026-11-07T20:00', 'bank')
+        self.assertEqual(mc.find(mc.load(self.data), fallback['id'])['status'], 'closed')
+        with patch.object(mc.charges, 'search', return_value=[]):
+            event = self.check('2026-11-07T21:00', 'bank-alert')
+        self.assertIn(bank, event)
+        self.assertNotIn(fallback['id'], event)
+        self.assertNotIn('21:00', event)
+        parent = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'autopay_expected')
+        self.assertEqual(parent['payment_case'], bank)
 
 
 if __name__ == '__main__':

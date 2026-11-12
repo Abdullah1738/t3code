@@ -30,6 +30,8 @@ export type ThreadSnapshotLoadResult =
       readonly snapshot: OrchestrationV2ThreadDetailSnapshot;
       readonly history?: ThreadSnapshotHistoryMeta;
     }
+  | { readonly _tag: "denied" }
+  /** Not found right now. May be a race with creation; never a confirmed delete. */
   | { readonly _tag: "missing" }
   | { readonly _tag: "unavailable" };
 

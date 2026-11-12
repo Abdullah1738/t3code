@@ -181,6 +181,10 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 actions.append(f"forget {bid}: boat deleted its data")
             continue
         state = b.get("state")
+        if not dry and state in api.LIVE_STATES and con.execute(
+                "SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
+            released = lease.release_hold_if_worker_gone(con, bid)
+            actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions)
@@ -296,6 +300,9 @@ def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) 
 
 def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
+    from .runs import confirmed_lost, reconcile_lost
+    if not dry:
+        reconcile_lost(con, bid, state=state)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
         status, code = None, None
@@ -321,6 +328,14 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
                 # Missing/unavailable status is not proof a process stopped.
                 continue
             elif not st.get("running") and st.get('status') in ('exited','lost'):
+                if st.get('status') == 'lost':
+                    try:
+                        confirmed = confirmed_lost(bid, run['run_id'], record=not dry)
+                    except OffboxError:
+                        continue
+                    if confirmed is None:
+                        continue
+                    st = {**st, **confirmed}
                 code = st.get("exitCode")
                 status = "lost" if st.get("status") == "lost" else ("done" if code == 0 else "failed")
                 # Detached runs may have no local log yet; cmd_status includes the remote stderr tail.

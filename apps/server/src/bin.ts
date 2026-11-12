@@ -14,9 +14,15 @@ if (
   })
 ) {
   const command = process.argv[2];
-  if (command === "__kanban-resolve-selection") {
+  if (command === "__install-migration-check") {
+    const { runMigrationCheck } = await import("./ardud/fast-install/migrationCheck.ts");
+    await runMigrationCheck(process.argv[3] ?? "");
+  } else if (command === "__kanban-resolve-selection") {
     const { runSelectionBridge } = await import("./ardud/kanban/engine/selectionBridge.ts");
     await runSelectionBridge();
+  } else if (command === "__sqlite-reader") {
+    const { runReaderProcess } = await import("@t3tools/shared/nodeSqliteReaderProcess");
+    runReaderProcess();
   } else {
     // Guard sockets before either dispatch path can load outbound-capable modules.
     const { ignoreMacosTypeOfServiceEinval } = await import("./outboundHttp.ts");

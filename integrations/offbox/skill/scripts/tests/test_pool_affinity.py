@@ -526,7 +526,8 @@ class HintAndPullTests(Isolated):
             self.assertIn('prefix your command with pnpm install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \
-                patch.object(runs.Runner, '_prepare_box'), patch.object(api, 'cmd_start', side_effect=start), \
+                patch.object(runs, '_ttl_keeper'), \
+                patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(api, 'cmd_start', side_effect=start), \
                 patch.object(runs.node_version, 'want', return_value=None), contextlib.redirect_stderr(err):
             try:
                 runner.start()

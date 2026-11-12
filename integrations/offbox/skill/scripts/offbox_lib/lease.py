@@ -315,7 +315,9 @@ def find_lease(con, owner: str, root: str):
 
 
 def active_runs(con, box_id: str) -> int:
-    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND status IN ('starting','running')",
+    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+                       "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
+                       "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
                        (box_id,)).fetchone()[0]
 
 
@@ -1034,6 +1036,17 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
+def _resumed_row(con, box_id, size, elapsed, prior_state):
+    previous = con.execute("SELECT kind FROM events WHERE box_id=? AND kind IN ('lease_resume','lease_resize_stop') "
+                           "ORDER BY rowid DESC LIMIT 1", (box_id,)).fetchone()
+    resized = bool(previous and previous[0] == 'lease_resize_stop')
+    event(con, box_id, "lease_resume", f"{elapsed:.1f}s size={size} from={prior_state} resized={int(resized)}")
+    row = dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
+    row['_cold_resume'] = 'archived' if prior_state == 'archived' else 'resized' if resized else None
+    row['_resumed_at'] = now()
+    return row
+
+
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
@@ -1044,6 +1057,11 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     allocation.recover_resumes(con, row['repo_key'])
     pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
     if pending:
+        t = now()
+        prior = con.execute("SELECT kind, detail FROM events WHERE box_id=? "
+                            "AND kind IN ('lease_resume_from','lease_resume') ORDER BY rowid DESC LIMIT 1",
+                            (box_id,)).fetchone()
+        prior_state = prior['detail'] if prior and prior['kind'] == 'lease_resume_from' else row['state']
         pending_size = pending[0] if pending[0] in SIZES else None
         try:
             confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True,
@@ -1057,7 +1075,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         con.commit()
         if _bigger(size, want):
             raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
-        return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
+        return _resumed_row(con, box_id, want, now() - t, prior_state)
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
         p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-O", "check", box_id], capture_output=True, timeout=10)
@@ -1145,6 +1163,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
+        # Retain the last observed boat state across an unanswered resume and the next allocator call.
+        event(con, box_id, 'lease_resume_from', st)
         def request_resume(retry=True):
             nonlocal want
             try:
@@ -1182,7 +1202,6 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
-        event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
@@ -1195,6 +1214,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
     con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
     con.commit()
+    if st in api.STOPPED_STATES:
+        return _resumed_row(con, box_id, want, now() - t, st)
     return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
 
 
@@ -1233,6 +1254,8 @@ def settle_stranded_runs(con, box_id: str) -> int:
     """Mark the box's starting/running runs lost. Call only once boat has confirmed the box is gone or stopped, so
     no process can still be running them. A run that outlived its client (no one left to end it) is then not
     counted as active forever. Caller holds 'box-<id>'. Returns how many runs were settled."""
+    con.execute("INSERT OR IGNORE INTO kv(k,v) SELECT 'lost_confirmed:' || run_id, '1' FROM runs "
+                "WHERE box_id=? AND status IN ('starting','running','lost')", (box_id,))
     cur = con.execute("UPDATE runs SET status='lost', end_at=? WHERE box_id=? AND status IN ('starting','running')",
                       (now(), box_id))
     con.commit()
@@ -1273,6 +1296,47 @@ def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
                 return False
             return _release_locked(con, box_id, run_id)
     except OffboxError:
+        return False
+
+
+def release_hold_if_worker_gone(con, box_id: str) -> bool:
+    """Recheck one prune generation under the box lock; live command runs retain their own reservations."""
+    from . import prune
+    ensure_holds(con)
+    try:
+        with file_lock('box-' + box_id, timeout=0):
+            hold = con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+            if hold is None:
+                return False
+            run_id = hold['run_id']
+            gone = None
+            if not con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                try:
+                    state = api.get(box_id)
+                    if state is None or state.get('state') in api.STOPPED_STATES:
+                        gone = True if _release_locked(con, box_id, run_id) else None
+                    elif state.get('state') in api.LIVE_STATES:
+                        gone = prune.worker_gone(box_id, run_id, max(0, now() - hold['created_at']))
+                except OffboxError:
+                    pass
+            released = False
+            if gone is True:
+                cur = con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=?", (box_id, run_id))
+                con.commit()
+                # _release_locked may already have removed this generation on a stopped/gone box.
+                remaining = con.execute("SELECT 1 FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+                released = cur.rowcount > 0 or remaining is None
+            detail = ("worker gone" if released else "worker still running" if gone is False else "unknown, kept")
+            message = f"prune hold {'released' if released else 'kept'} {box_id} run {run_id}: {detail}"
+            log(message)
+            event(con, box_id, 'prune_hold_released' if released else 'prune_hold_kept', message)
+            return released
+    except OffboxError:
+        hold = con.execute("SELECT run_id FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+        if hold:
+            message = f"prune hold kept {box_id} run {hold['run_id']}: unknown, kept (box lock busy)"
+            log(message)
+            event(con, box_id, 'prune_hold_kept', message)
         return False
 
 

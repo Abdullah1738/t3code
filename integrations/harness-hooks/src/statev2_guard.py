@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 
 
@@ -32,6 +35,10 @@ DIRECT = re.compile(
 MAX_SOURCE_BYTES = 2_000_000
 MAX_SCRIPTS = 32
 MAX_SHELL_DEPTH = 12
+# Only this inspected implementation uses --source for every source DB read.
+# A changed script falls back to source inspection until reviewed again.
+MIGRATE_SOURCE_SHA256 = "65998cc5a8ed461fc03c8ca1acbf6dad50958a6cfbef978d9009e815237e151b"
+BACKUP_FIXTURE_SHA256 = "a61b75ca544511c4d73829953ae0e1cd9b4b344f5f052d12127609b296d4a713"
 REASON = (
     "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
     "Shell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, "
@@ -202,9 +209,139 @@ def _python_touches_live(source, directory):
     return False
 
 
-def _source_hit(source, directory, python=False):
+def _trusted_fixture_tool(executable, name, directory):
+    trusted = {f'/bin/{name}', f'/usr/bin/{name}'}
+    # This Mac's default Bash is Homebrew's versioned package, not /bin/bash.
+    if name == 'bash':
+        brew = '/opt/homebrew/bin/bash'
+        if re.fullmatch(r'/opt/homebrew/Cellar/bash/[^/]+/bin/bash', os.path.realpath(brew)):
+            trusted.add(brew)
+    if executable in trusted:
+        return True
+    if executable != name:
+        return False
+    search = []
+    for entry in os.get_exec_path():
+        if not os.path.isabs(entry):
+            if directory is None:
+                return False
+            entry = str(directory / entry)
+        search.append(entry)
+    resolved = shutil.which(name, path=os.pathsep.join(search))
+    return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
+
+
+def _shell_fixture_source(source, directory):
+    """Discount only paths rooted in single, literal mktemp assignments."""
+    try:
+        shell, _ = _heredocs(source)
+        shell, quoted = _quoted_punctuation(shell)
+        lexer = shlex.shlex(shell, posix=True, punctuation_chars=";&|(){}\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except (ValueError, AmbiguousScript):
+        return source
+    audited = hashlib.sha256(source.encode()).hexdigest() == BACKUP_FIXTURE_SHA256
+    # An inherited PATH can replace mktemp or cat even in the audited body.
+    if not _trusted_fixture_tool('mktemp', 'mktemp', directory) or audited and not _trusted_fixture_tool('cat', 'cat', directory):
+        return source
+    # Merely assigning in a skipped branch or uncalled function leaves the
+    # inherited value intact. The committed backup test has audited setup
+    # calls; other bodies need a straight-line proof.
+    if not audited and any(token in {'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'case', 'select', 'do', 'done', 'function', 'ln', 'hash'} or token.startswith(('PATH=', 'PATH+=')) or re.fullmatch(r'[;&|(){}\n]*[&|(){}][;&|(){}\n]*', token) for token in tokens):
+        return source
+    candidates = {}
+    for index, token in enumerate(tokens):
+        match = re.fullmatch(r"([A-Za-z_]\w*)=(.*)", token, re.S)
+        boundary = lambda word: bool(re.fullmatch(r"[;&|(){}\n]+", word))
+        if not match or index and not boundary(tokens[index - 1]) or index + 1 < len(tokens) and not boundary(tokens[index + 1]):
+            continue
+        name, value = match.groups()
+        if name in {'HOME', 'home', 'CODEX_HOME'}:
+            continue
+        for key, literal in quoted.items():
+            value = value.replace(key, literal)
+        # Any other textual assignment or mutation invalidates the proof,
+        # including writes hidden in a branch, heredoc, or quoted command.
+        stores = re.findall(r"(?<![\w])" + re.escape(name) + r"(?:\[[^\]\n]*\])?\+?=", source)
+        if len(stores) != 1 or re.search(r"\b(?:read|readarray|mapfile|unset|let|for|select|getopts|printf\s+-v)\b[^\n;]*\b" + re.escape(name) + r"\b", shell):
+            continue
+        if not re.search(r'(?m)^[ \t]*' + re.escape(name) + r'="?\$\(mktemp ', source):
+            continue
+        if not value.startswith('$(mktemp ') or not value.endswith(')'):
+            continue
+        body = value[2:-1]
+        if re.search(r"[;|&`\n]|\$\(", body):
+            continue
+        try:
+            args = shlex.split(body)
+        except ValueError:
+            continue
+        if args[:2] != ['mktemp', '-d'] or len(args) > 3:
+            continue
+        template = args[2] if len(args) == 3 else ''
+        if template.startswith('-'):
+            continue
+        template = template.replace('${TMPDIR:-/tmp}', '/tmp')
+        deps = re.findall(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))", template)
+        if re.sub(r"\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)", '', template).find('$') >= 0:
+            continue
+        candidates[name] = {a or b for a, b in deps}
+    # Dynamic writes and imported shell state cannot establish a local proof.
+    if (any(token in {'eval', 'source', '.', 'local', 'declare', 'typeset', 'alias', 'export', 'readonly', 'read', 'readarray', 'mapfile', 'getopts', 'let', 'enable', 'unset'} for token in tokens) or
+            re.search(r'\b(?:printf\s+-v|wait\s+-p)\b', shell) or
+            any(os.path.basename(token) in {'mv', 'mount', 'umount', 'rsync', 'ditto'} for token in tokens) or
+            re.search(r'\b(?:symlink|link)\s*\(', source) or
+            re.search(r'\bmktemp\s*\(\s*\)|\bfunction\s+mktemp\b', shell)):
+        return source
+    proven = set()
+    for _ in candidates:
+        proven.update(name for name, deps in candidates.items() if deps <= proven)
+    if not audited:
+        # Keep the general proof closed: only ordered mktemp assignments and
+        # a literal fixture read. Other setup belongs in an audited test body.
+        groups, group = [], []
+        for token in tokens + ['\n']:
+            if re.fullmatch(r'[;\n]+', token):
+                if group:
+                    groups.append(group)
+                group = []
+            else:
+                group.append(token)
+        assigned = set()
+        for group in groups:
+            assignment = re.fullmatch(r'([A-Za-z_]\w*)=.*', group[0], re.S)
+            if len(group) == 1 and assignment and assignment[1] in proven and candidates[assignment[1]] <= assigned:
+                assigned.add(assignment[1])
+                continue
+            if len(group) != 2:
+                return source
+            executable, value = group
+            for key, literal in quoted.items():
+                executable = executable.replace(key, literal)
+                value = value.replace(key, literal)
+            # A same-named helper or computed command can alter the fixture
+            # root before reading it. Only the system reader preserves it.
+            if not _trusted_fixture_tool(executable, 'cat', directory):
+                return source
+            fixture = re.fullmatch(r'\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/\.robob/userdata/statev2\.sqlite(?:-(?:wal|shm|journal))?', value)
+            if not fixture or (fixture[1] or fixture[2]) not in assigned:
+                return source
+    for name in proven:
+        fixture = r"(?<![\w/.$-])\$(?:" + re.escape(name) + r"\b|\{" + re.escape(name) + r"\})/\.robob/userdata/statev2(?:\.sqlite)?"
+        assignment = re.search(r'(?m)^[ \t]*' + re.escape(name) + r'="?\$\(mktemp ', source)
+        if not audited and assignment and any(match.start() < assignment.start() for match in re.finditer(fixture, source)):
+            continue
+        source = re.sub(fixture, 'guard_isolated_fixture', source)
+    return source
+
+
+def _source_hit(source, directory, python=False, shell=False):
     if python:
         return _python_touches_live(source, directory)
+    if shell:
+        source = _shell_fixture_source(source, directory)
     if source_touches_live(source) or _relative_source_live(source, directory):
         return True
     def isolated_literal(match):
@@ -629,11 +766,58 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 # bindings rather than letting a later assignment erase them.
                 live_assignments.add(str(path) if path is not None else candidate)
 
-    def check_source(source, directory, python=False, rule="live-database-script"):
-        if _source_hit(source, directory, python):
+    def check_source(source, directory, python=False, rule="live-database-script", shell=False):
+        if _source_hit(source, directory, python, shell):
             raise LiveRead(rule)
 
-    def add(value, directory, binary="script"):
+    def migration_source(args, directory):
+        source = None
+        destination = None
+        index = 0
+        while index < len(args):
+            flag, equal, value = args[index].partition("=")
+            if flag not in {"--source", "--base-dir", "--projects", "--threads-per-project"}:
+                raise AmbiguousScript("unrecognized migrate-dev-db argument " + _token(args[index]))
+            if not equal:
+                index += 1
+                value = args[index] if index < len(args) else ""
+            if not value or value.startswith("--"):
+                raise AmbiguousScript("missing migrate-dev-db argument " + _token(flag))
+            if value.startswith(('~', '$')):
+                if _direct_read(['cat', value], directory):
+                    raise LiveRead("live-database-read")
+                raise AmbiguousScript("use literal migrate-dev-db paths without home or variable expansion " + _token(value))
+            if flag == "--source":
+                if source is not None:
+                    raise AmbiguousScript("duplicate migrate-dev-db --source")
+                source = _literal_path(value, directory)
+                if source is None:
+                    raise AmbiguousScript("non-literal migrate-dev-db --source " + _token(value))
+            elif flag == "--base-dir":
+                destination = _literal_path(value, directory)
+                if destination is None:
+                    raise AmbiguousScript("non-literal migrate-dev-db --base-dir " + _token(value))
+                if _direct_read(['cat', str(destination / 'userdata/statev2.sqlite')], directory):
+                    raise LiveRead("live-database-read")
+            index += 1
+        # Its default is HOME/.t3/userdata/statev2.sqlite, a protected database.
+        if source is None or LIVE.search(str(source)):
+            raise LiveRead("live-database-read")
+        if destination is None:
+            raise AmbiguousScript("migrate-dev-db needs an explicit isolated --base-dir")
+
+    def migration_context(words):
+        # A preceding edit or link can invalidate both the source hash and
+        # realpath before execution. Keep this exception to one plain call.
+        try:
+            plain = shlex.split(command, comments=True)
+        except ValueError:
+            plain = []
+        if (plain != words or os.environ.get('NODE_OPTIONS') or
+                '\\\n' in command or '\\\r\n' in command):
+            raise AmbiguousScript("run migrate-dev-db alone without runtime options; split preparation into a separate call")
+
+    def add(value, directory, binary="script", migration_args=None):
         path = _literal_path(value, directory)
         if path is None:
             cause = (f"relative script {_token(value)} after {unknown_cause}" if directory is None and not os.path.isabs(value)
@@ -645,9 +829,19 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             raise LiveRead("live-database-script")
         if path not in paths:
             paths.append(path)
+        try:
+            invocation = shlex.split(command, comments=True)
+        except ValueError:
+            invocation = []
+        shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
+                 os.path.basename(invocation[0]) == binary and invocation[1] == value and
+                 _trusted_fixture_tool(invocation[0], binary, directory) and
+                 not value.startswith(('~', '$')) and '\\\n' not in command and '\\\r\n' not in command and
+                 not any(os.environ.get(name) or name in shell_values for name in ('BASH_ENV', 'ENV')) and
+                 not any(name.startswith('BASH_FUNC_') for name in os.environ))
         if path in written:
             body, replaced = written[path]
-            check_source(body, directory, path.suffix == ".py")
+            check_source(body, directory, path.suffix == ".py", shell=shell)
             if replaced:
                 return
         try:
@@ -660,7 +854,10 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     return
                 source = handle.read(MAX_SOURCE_BYTES + 1)
             if len(source) <= MAX_SOURCE_BYTES:
-                check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py")
+                if migration_args is not None and hashlib.sha256(source).hexdigest() == MIGRATE_SOURCE_SHA256:
+                    migration_source(migration_args, directory)
+                    return
+                check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell)
         except OSError:
             pass
 
@@ -777,6 +974,27 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             return None
         if cwd_only:
             return scan(" ".join(args), directory, depth + 1, cwd_only=True) if binary == "eval" else after
+        if binary == "vp" and args[:2] == ["run", "migrate-dev-db"]:
+            if any(_direct_read(['cat', *values], directory)
+                   for values in variants([v for op, v in redirects if op == '<'])):
+                raise LiveRead("live-database-read")
+            migration_context(words)
+            migration_source(args[2:], directory)
+            # Resolve the package command as vp does; never trust the task name
+            # or a same-named script in an unrelated project as an exemption.
+            if directory is None:
+                raise AmbiguousScript("migrate-dev-db after " + unknown_cause)
+            for parent in (directory, *directory.parents):
+                try:
+                    package = json.loads((parent / "package.json").read_text())
+                except (OSError, ValueError):
+                    continue
+                task = package.get("scripts", {}).get("migrate-dev-db")
+                if task != "node apps/server/scripts/migrate-dev-db.ts":
+                    raise AmbiguousScript("unrecognized migrate-dev-db package command")
+                add("apps/server/scripts/migrate-dev-db.ts", parent, "node", args[2:])
+                return after
+            raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
         if python or binary in shells | {"node", "bun", "deno"}:
@@ -862,7 +1080,11 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 targets = args if binary == "node" and "--test" in words else args[:1]
                 for target in targets:
                     if not target.startswith("-"):
-                        add(target, directory, binary)
+                        migration_args = (args[1:] if binary == "node" and len(words) > 1 and words[1] == target and
+                                          Path(target).name == "migrate-dev-db.ts" else None)
+                        if migration_args is not None:
+                            migration_context(words)
+                        add(target, directory, binary, migration_args)
         elif words[0].startswith(("/", "./", "../", "~/", "$HOME/", "${HOME}/")) and re.search(r"\.(?:py|mjs|cjs|js|ts|sh)$", words[0]):
             add(words[0], directory, binary)
         return after

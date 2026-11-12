@@ -1,3 +1,5 @@
+import { continuationReport } from "../fast-install/report.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
  * crw, CLIs). Thin wrappers over the services the WebSocket RPC and the T3 MCP
@@ -81,6 +83,7 @@ import {
   type ControlThreadState,
 } from "./model.ts";
 import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
+import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
 const SSE_HEARTBEAT = Duration.seconds(15);
@@ -160,8 +163,29 @@ const archiveFailureCode = (
 
 const json = (body: unknown, status = 200) => jsonReply(body, status);
 
-const errorResponse = (error: ControlError) =>
-  json({ ok: false, error: { code: error.code, message: error.message } }, STATUS[error.code]);
+// The agent reply lane covers only building the JSON body: every database read
+// and wait happens before it (ReplyBuilders.ts).
+const encoded = (body: unknown) => ReplyBuilders.bounded(Effect.sync(() => json(body)));
+
+const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<string>> => {
+  const out: Array<ReadonlyArray<string>> = [];
+  for (let index = 0; index < ids.length; index += size) out.push(ids.slice(index, index + size));
+  return out;
+};
+
+const THREAD_DETAIL_RECENT_RUNS = 5;
+const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
+
+const errorResponse = (error: ControlError) => {
+  const response = json(
+    { ok: false, error: { code: error.code, message: error.message } },
+    STATUS[error.code],
+  );
+  // "unavailable" is transient (busy reader lane, startup): tell clients when to retry.
+  return error.code === "unavailable"
+    ? HttpServerResponse.setHeader(response, "retry-after", "1")
+    : response;
+};
 
 // ---------------------------------------------------------------------------
 // Request helpers
@@ -450,6 +474,7 @@ const makeRoutes = Effect.gen(function* () {
       ? candidateBuildCommit
       : null;
   const serverStartedAt = DateTime.formatIso(yield* DateTime.now);
+  const startupLog = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
@@ -522,15 +547,21 @@ const makeRoutes = Effect.gen(function* () {
   const authenticate = (scope: Scope) =>
     Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
-      const session = yield* auth
-        .authenticateHttpRequest(request)
-        .pipe(
-          Effect.mapError((error) =>
-            EnvironmentAuth.isServerAuthCredentialError(error)
-              ? fail("unauthorized", "A valid bearer token is required.")
+      const session = yield* auth.authenticateHttpRequest(request).pipe(
+        // A session read the auth lane never ran is retried once; a busy lane is
+        // "retry shortly" (503), not an internal error.
+        Effect.retry({
+          times: 1,
+          while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
+        }),
+        Effect.mapError((error) =>
+          EnvironmentAuth.isServerAuthCredentialError(error)
+            ? fail("unauthorized", "A valid bearer token is required.")
+            : NodeSqliteClient.readerLaneFailure(error) !== undefined
+              ? fail("unavailable", READER_BUSY_MESSAGE)
               : fail("internal", "Authentication failed."),
-          ),
-        );
+        ),
+      );
       if (!session.scopes.includes(scope)) {
         return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
       }
@@ -563,33 +594,48 @@ const makeRoutes = Effect.gen(function* () {
     );
 
   /**
-   * Shells for a few known threads, one cheap lookup each. Lists that only
-   * want live threads use this instead of building the whole shell snapshot,
-   * which grows with every thread ever made.
+   * Shells for known threads from one bounded read per 400 ids (an indexed IN
+   * list), not one shell transaction per thread: the live list polled every few
+   * seconds used ~50 reader transactions and held a reply permit for seconds.
+   * Lists that only want live threads use this instead of building the whole
+   * shell snapshot, which grows with every thread ever made.
    */
   const shellsFor = (threadIds: ReadonlyArray<string>, location: "active" | "archive") =>
     Effect.forEach(
-      threadIds,
-      (threadId) =>
-        threads
-          .getThreadShell(ThreadId.make(threadId))
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
-      { concurrency: 4 },
-    ).pipe(
-      Effect.map((shells) =>
-        shells.filter(
-          (shell): shell is OrchestrationV2ThreadShell =>
-            shell !== null &&
-            shell.deletedAt === null &&
-            (shell.archivedAt !== null) === (location === "archive"),
+      chunkIds([...new Set(threadIds)]),
+      (ids) =>
+        threads.getShellSnapshot({ threadIds: ids, location }).pipe(
+          Effect.map((snapshot) => [...snapshot.threads, ...snapshot.archivedThreads]),
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
         ),
-      ),
+      { concurrency: 1 },
+    ).pipe(
+      Effect.map((pages) => {
+        // Callers page in their own candidate order; the IN read returns rows in index order.
+        const byId = new Map(
+          pages
+            .flat()
+            .filter((shell): shell is OrchestrationV2ThreadShell => shell !== null)
+            .map((shell) => [shell.id as string, shell]),
+        );
+        return [...new Set(threadIds)].flatMap((id) => {
+          const shell = byId.get(id);
+          return shell !== undefined &&
+            shell.deletedAt === null &&
+            (shell.archivedAt !== null) === (location === "archive")
+            ? [shell]
+            : [];
+        });
+      }),
     );
 
-  const readRecords = (threadId: string) =>
+  const readRecords = (threadId: string, options?: { readonly recentRunLimit?: number }) =>
     threads
       .getThreadRecords(ThreadId.make(threadId), ["runs", "runtimeRequests", "turnItems"], {
         turnItemTypes: ["approval_request", "user_input_request"],
+        ...(options?.recentRunLimit === undefined
+          ? {}
+          : { recentRunLimit: options.recentRunLimit }),
       })
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
@@ -632,7 +678,10 @@ const makeRoutes = Effect.gen(function* () {
   const threadDetail = (threadId: string) =>
     Effect.gen(function* () {
       const shell = yield* getShell(threadId);
-      const records = yield* readRecords(threadId);
+      // ardud: the detail reports the current run and the newest five. Reading every
+      // run the thread ever had made this the slowest call on the iMessage reply path
+      // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
+      const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
       const pending = records.runtimeRequests.filter((request) => request.status === "pending");
       const { state, run } = stateFromRuns(records.runs, pending.length > 0);
       const [summary] = yield* summarize([shell]);
@@ -641,7 +690,9 @@ const makeRoutes = Effect.gen(function* () {
         state,
         status: run?.status ?? "idle",
         run: run === null ? null : runSummary(run),
-        recentRuns: runsNewestFirst(records.runs).slice(0, 5).map(runSummary),
+        recentRuns: runsNewestFirst(records.runs)
+          .slice(0, THREAD_DETAIL_RECENT_RUNS)
+          .map(runSummary),
         pendingRequests: pending.map((request) =>
           pendingRequestSummary(request, records.turnItems),
         ),
@@ -916,6 +967,102 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
+  /**
+   * `updatedSince` listings (agents' `t3ctl threads --since`, the dev-resource janitor). They
+   * used to build every thread's shell and filter afterwards, which held the single statev2
+   * reader for over two minutes on 9 Nov. Now the changed range comes from
+   * ardud_v2_threads_updated_idx, the light filters run on those rows, and shells are built
+   * only for the threads returned (or for the changed range when a state filter needs them).
+   * Same filters, order and exact `total` as the full listing.
+   */
+  const listUpdatedSince = Effect.fn("ControlApi.listUpdatedSince")(function* (input: {
+    readonly location: "active" | "archive";
+    /** `null`: no time filter (a parentThreadId listing without updatedSince). */
+    readonly since: number | null;
+    readonly active: boolean | undefined;
+    readonly states: ReadonlyArray<string> | undefined;
+    readonly projectId: string | null;
+    readonly includeSubagents: boolean;
+    readonly parentThreadId: string | null;
+    readonly creationSources: ReadonlyArray<string> | undefined;
+    readonly origin: string | null;
+    readonly limit: number;
+  }) {
+    const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
+    // updated_at is an ISO string; widen by a second so precision differences can't drop a
+    // row at the edge, then compare instants exactly.
+    const rows = yield* store
+      .threadsUpdatedSince(
+        since === null ? null : DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)),
+      )
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    let matched = rows.filter(
+      (row) =>
+        row.archived === (location === "archive") &&
+        (since === null || Date.parse(row.updatedAt) > since) &&
+        (input.includeSubagents ||
+          parentThreadId !== null ||
+          row.relationshipToParent !== "subagent") &&
+        (parentThreadId === null || row.parentThreadId === parentThreadId) &&
+        (projectId === null || row.projectId === projectId) &&
+        (input.creationSources === undefined ||
+          (row.creationSource !== null && input.creationSources.includes(row.creationSource))),
+    );
+    if (origin !== null) {
+      const origins = yield* store
+        .getOrigins(matched.flatMap((row) => [row.threadId, row.rootThreadId ?? row.threadId]))
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      matched = matched.filter((row) => {
+        const value =
+          origins.get(row.threadId) ?? origins.get(row.rootThreadId ?? row.threadId) ?? null;
+        return origin === "none" ? value === null : value === origin;
+      });
+    }
+    const needsState = active !== undefined || states !== undefined;
+    // Shells are re-read, so a thread that moved since the range read is filtered again.
+    const stillMatches = (shell: OrchestrationV2ThreadShell) =>
+      (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
+      (input.includeSubagents ||
+        parentThreadId !== null ||
+        shell.lineage.relationshipToParent !== "subagent") &&
+      (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+      (projectId === null || shell.projectId === projectId) &&
+      (input.creationSources === undefined || input.creationSources.includes(shell.creationSource));
+    let shells: Array<OrchestrationV2ThreadShell> = [];
+    // Candidates archived, deleted or moved between the two reads drop out of the page and of
+    // total; the next candidates refill the page.
+    let dropped = 0;
+    let offset = 0;
+    // With a state filter every candidate is loaded: the state decides what the page holds.
+    const wanted = needsState ? Number.POSITIVE_INFINITY : limit;
+    while (offset < matched.length && shells.length < wanted) {
+      const batch = matched.slice(offset, offset + wanted - shells.length);
+      offset += batch.length;
+      const loaded = (yield* shellsFor(
+        batch.map((row) => row.threadId),
+        location,
+      )).filter(stillMatches);
+      dropped += batch.length - loaded.length;
+      shells.push(...loaded);
+    }
+    if (active !== undefined) {
+      shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
+    }
+    if (states !== undefined) {
+      shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
+    }
+    shells = shells.toSorted(
+      (left, right) =>
+        DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+    );
+    const summaries = yield* summarize(needsState ? shells : shells.slice(0, limit));
+    return yield* encoded({
+      ok: true,
+      total: needsState ? shells.length : matched.length - dropped,
+      threads: summaries.slice(0, limit),
+    });
+  });
+
   const listThreads = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
@@ -935,6 +1082,27 @@ const makeRoutes = Effect.gen(function* () {
     // live ids instead of every thread's shell. The exact filters below
     // still decide.
     const liveOnly = active === true || (states !== undefined && !states.includes("idle"));
+    const origin = params.get("origin");
+    const limit = clampInt(params.get("limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    // ardud: a parentThreadId listing (an agent polling its children) used to build every
+    // shell ever made inside one background reader transaction: 54-89 s on 11 Nov 2026.
+    // That snapshot pinned the WAL, the checkpoint worker hit its backpressure ceiling and
+    // held every writer BEGIN until the read ended (56-87 s writer holds). The range read
+    // takes the light rows in one statement and builds shells only for the children.
+    if ((since !== undefined || parentThreadId !== null) && !liveOnly && ids === undefined) {
+      return yield* listUpdatedSince({
+        location,
+        since: since ?? null,
+        active,
+        states,
+        projectId,
+        includeSubagents,
+        parentThreadId,
+        creationSources,
+        origin,
+        limit,
+      });
+    }
     const candidates = liveOnly
       ? yield* shellsFor(
           yield* store
@@ -942,11 +1110,15 @@ const makeRoutes = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
           location,
         )
-      : yield* threads.getShellSnapshot({ location }).pipe(
-          Effect.map((snapshot) =>
-            location === "archive" ? snapshot.archivedThreads : snapshot.threads,
+      : // Every shell ever made: a heavy build, admitted like the HTTP snapshot routes.
+        yield* ReplyBuilders.bounded(
+          threads.getShellSnapshot({ location }).pipe(
+            Effect.map((snapshot) =>
+              location === "archive" ? snapshot.archivedThreads : snapshot.threads,
+            ),
+            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
           ),
-          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+          "snapshot",
         );
     let shells = candidates.filter(
       (shell) =>
@@ -971,14 +1143,12 @@ const makeRoutes = Effect.gen(function* () {
         DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
     );
     let summaries = yield* summarize(shells);
-    const origin = params.get("origin");
     if (origin !== null) {
       summaries = summaries.filter((summary) =>
         origin === "none" ? summary.origin === null : summary.origin === origin,
       );
     }
-    const limit = clampInt(params.get("limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-    return json({
+    return yield* encoded({
       ok: true,
       total: summaries.length,
       threads: summaries.slice(0, limit),
@@ -988,7 +1158,14 @@ const makeRoutes = Effect.gen(function* () {
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
-    return json({ ok: true, thread: yield* threadDetail(threadId) });
+    // ardud: bridges poll this per chat (the iMessage reply path). Admit it on the
+    // poll lane like /messages and read on the foreground reader, not behind sweeps
+    // and thread lists on the background lane (p95 wait 10-115 s on 11 Nov 2026).
+    const thread = yield* ReplyBuilders.bounded(
+      threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
+      "poll",
+    );
+    return json({ ok: true, thread });
   });
 
   const byNative = Effect.gen(function* () {
@@ -1024,16 +1201,31 @@ const makeRoutes = Effect.gen(function* () {
         ...(providerInstanceId === null ? {} : { providerInstanceId }),
         ...(agentId === null ? {} : { agentId }),
       })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      .pipe(
+        Effect.mapError((cause) =>
+          NodeSqliteClient.readerLaneFailure(cause) !== undefined
+            ? fail("unavailable", READER_BUSY_MESSAGE)
+            : fail("internal", errorDetail(cause)),
+        ),
+      );
     return json({ ok: true, identity });
   });
 
   const getMessages = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
-    yield* getShell(threadId);
     const params = yield* searchParams;
-    const records = yield* readMessages(threadId);
+    // Bridge polls read one thread: they queue on the poll lane only, never
+    // behind thread lists, HTTP snapshots or MCP reads.
+    const { records, detail } = yield* ReplyBuilders.bounded(
+      Effect.gen(function* () {
+        yield* getShell(threadId);
+        const records = yield* readMessages(threadId);
+        const detail = yield* readRecords(threadId);
+        return { records, detail };
+      }),
+      "poll",
+    );
     const role = params.get("role");
     const runId = params.get("runId");
     const since = parseSince(params.get("since"));
@@ -1056,10 +1248,9 @@ const makeRoutes = Effect.gen(function* () {
     const limit = clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000);
     const page = boolParam(params.get("all")) === true ? filtered : filtered.slice(-limit);
     const last = lastAssistantText(records.messages, runId);
-    const detail = yield* readRecords(threadId);
     const pending = detail.runtimeRequests.some((request) => request.status === "pending");
     const { state, run } = stateFromRuns(detail.runs, pending);
-    return json({
+    return yield* encoded({
       ok: true,
       threadId,
       state,
@@ -1664,6 +1855,19 @@ const makeRoutes = Effect.gen(function* () {
   const p = CONTROL_ROUTE_PREFIX;
   return [
     HttpRouter.route("GET", `${p}/health`, handle(health)),
+    HttpRouter.route(
+      "GET",
+      `${p}/install-report`,
+      handle(
+        Effect.gen(function* () {
+          yield* authenticate(AuthOrchestrationReadScope);
+          return jsonReply({
+            ...continuationReport(),
+            startup: Option.isSome(startupLog) ? startupLog.value.snapshot() : null,
+          });
+        }),
+      ),
+    ),
     HttpRouter.route("GET", `${p}/requests`, handle(listRequests)),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
@@ -1686,7 +1890,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("POST", `${p}/attachments`, handle(upload)),
     HttpRouter.route("GET", `${p}/events`, handle(events)),
   ] as const;
-});
+}).pipe((effect) => StartupPhaseLog.withStartupPhase("http.control-routes", effect));
 
 // RecoverySnapshot takes ThreadManagementService and ProviderSessionManagerV2
 // from the server runtime, like the other routes here.

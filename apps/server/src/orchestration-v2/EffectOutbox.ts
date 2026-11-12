@@ -32,6 +32,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
+    queued: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -229,6 +230,9 @@ export interface EffectOutboxV2Shape {
   readonly get: (
     effectId: string,
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly hasPendingRunContinuation: (
+    threadId: ThreadId,
+  ) => Effect.Effect<boolean, EffectOutboxError>;
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
@@ -248,6 +252,7 @@ export interface EffectOutboxV2Shape {
   >;
   readonly claimNext: (input: {
     readonly workerId: string;
+    readonly threadId?: ThreadId;
     readonly leaseDurationMs: number;
     readonly excludeRestartContinuations?: boolean;
     readonly onlyEffectTypes?: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -462,6 +467,19 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       awaitAvailable: Queue.take(available),
       awaitControlAvailable: Queue.take(controlAvailable),
       notifyAvailable,
+      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
+        function* (threadId) {
+          const rows = yield* sql`
+          SELECT 1 FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+            AND effect_type = 'provider-runtime.continue'
+            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+          LIMIT 1
+        `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
       listByCommandId: (commandId) =>
         sql<EffectRow>`
           SELECT *
@@ -564,6 +582,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       claimNext: Effect.fnUntraced(
         function* ({
           workerId,
+          threadId,
           leaseDurationMs,
           excludeRestartContinuations = false,
           onlyEffectTypes,
@@ -590,6 +609,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
               WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations)}
+                AND ${threadId === undefined ? sql`1 = 1` : sql`candidate.thread_id = ${threadId}`}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
                 AND ${onlyEffectTypes === undefined ? sql`1 = 1` : sql`candidate.effect_type IN ${sql.in(onlyEffectTypes)}`}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC

@@ -7,12 +7,16 @@ import secrets
 import shlex
 import subprocess
 import time
+from typing import NamedTuple
 
 from . import capacity, common, ssh_sync
 from .common import event, kv_get, kv_set, log, now, say
 
 # Checkout dirs offbox itself makes (identity.remote_dir_for). Anything else on the box is left alone.
 DIR_RE = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
+# Unversioned workers predate started markers and can survive deployment while still moving checkouts.
+# Version the hold before SSH starts, so only this protocol can recover a missing start marker by age.
+WORKER_ID_PREFIX = 'prune-v2-'
 EVERY_S = 6 * 3600
 # A box that ran out of budget (slow FUSE home, heavy load) is tried again this soon, not after 6 h.
 RETRY_S = 20 * 60
@@ -63,12 +67,15 @@ def script(dirs: list[str], run_id: str) -> str:
     # Every filesystem probe (absent/symlink test, dir test, mv) runs inside one child per dir, in its own
     # process group, so a hung probe is killed as a whole at the budget. No probe starts once the budget is
     # spent: remaining dirs are reported "left" without being touched. "busy" means a group member could not
-    # be confirmed gone; the script stops. A dropped ssh (HUP/PIPE) is ignored so the background delete starts.
+    # be confirmed gone; no later dir is touched and the supervisor waits for that group before exiting.
+    # A dropped ssh (HUP/PIPE) is ignored so this confirmation survives the caller's timeout.
     # The done marker (named by run_id, known to the caller) is written last, so a caller can tell the worker
     # finished even after its ssh gave up.
     # The marker lives outside the trash tree, which BACKGROUND deletes, and is written before BACKGROUND starts.
     marker = f'"$HOME/.offbox/done/{run_id}"'
     lines = ["set -m", "trap '' PIPE HUP", "busy=",
+             'mkdir -p "$HOME/.offbox/started" || exit 0',
+             f'echo $$ > "$HOME/.offbox/started/{run_id}" || exit 0',
              'mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0',
              f't="$HOME/.offbox/trash/{run_id}"', 'mkdir -p "$t" || exit 0',
              # Probe classes: 0 moved, 5 settled (absent or not a real dir), 4 busy, anything else left.
@@ -87,11 +94,11 @@ def script(dirs: list[str], run_id: str) -> str:
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
                      f'case "$rc" in 0) echo "pruned "{q};; 5) echo "skip "{q};; 4) echo "busy "{q}; busy=1;; '
                      f'*) echo "left "{q};; esac; fi')
-    # Completion is signalled only when no group member could be confirmed gone (busy is empty): a busy script
-    # writes neither the marker nor the "done" line, so the caller keeps the box held. BACKGROUND only deletes
-    # the trash tree, never the marker, and starts after the completion signal.
-    lines += ['if [ -z "$busy" ]; then', f'  echo ok > {marker}; echo "done {run_id}"', "fi",
-              BACKGROUND, "exit 0"]
+    # Earlier groups are confirmed gone and busy prevents later children from starting. Keep the supervisor
+    # alive while the last group survives, so worker_gone cannot mistake its dead PID for completed cleanup.
+    lines += ['if [ -n "$busy" ]; then',
+              '  while kill -0 -- -"$p" 2>/dev/null; do sleep 0.2; done', 'fi',
+              f'echo ok > {marker}; echo "done {run_id}"', BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
 
@@ -106,6 +113,26 @@ def _quiesced(box_id: str, run_id: str, remaining_s: float) -> bool:
         return p.returncode == 0
     except Exception:  # noqa: BLE001 - an unknown worker state is treated as not quiesced
         return False
+
+
+def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 10) -> bool | None:
+    """Probe one worker over SSH. An unreachable box or an unreadable marker is unknown, never gone."""
+    try:
+        rid = shlex.quote(run_id)
+        command = (f'done_file="$HOME/.offbox/done/"{rid}; started="$HOME/.offbox/started/"{rid}; '
+                   'if [ -f "$done_file" ]; then :; '
+                   f'elif {"false" if run_id.startswith(WORKER_ID_PREFIX) else "true"}; then exit 2; '
+                   'elif [ -f "$started" ]; then '
+                   'pid=$(cat "$started") || exit 2; '
+                   'case "$pid" in ""|*[!0-9]*|0) exit 2;; esac; '
+                   'kill -0 "$pid" 2>/dev/null && exit 1; '
+                   'elif [ -e "$started" ] || [ -e "$done_file" ]; then exit 2; '
+                   f'elif {"true" if hold_age_s > 120 else "false"}; then :; else exit 1; fi; '
+                   'rm -f -- "$started" "$done_file" || exit 2; exit 0')
+        p = ssh_sync.ssh(box_id, command, timeout=timeout_s)
+        return {0: True, 1: False}.get(p.returncode)
+    except Exception:  # noqa: BLE001 - housekeeping must keep the hold on every unknown outcome
+        return None
 
 
 def _settled_map(raw) -> dict[str, int]:
@@ -123,8 +150,14 @@ def _protected(con, box_id: str) -> bool:
                        (box_id, box_id)).fetchone() is not None
 
 
-def run(con, box_id: str, current: str) -> int:
-    """Move old checkouts on box_id out of ~/w. Returns how many moved. Never raises."""
+class Result(NamedTuple):
+    pruned: int = 0
+    timed_out: bool = False
+
+
+def run(con, box_id: str, current: str) -> Result:
+    """Move old checkouts out of ~/w; report the count and this pass's SSH timeout. Never raises."""
+    timed_out = False
     try:
         key = f"prune:{box_id}"
         # The throttle reads the record fresh; the settled list is read without the age limit, so a failed or
@@ -132,9 +165,9 @@ def run(con, box_id: str, current: str) -> int:
         raw = kv_get(con, key)
         prev = kv_get(con, key, max_age=EVERY_S)
         if prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
-            return 0
+            return Result()
         if _protected(con, box_id):
-            return 0
+            return Result()
         # settled maps dir -> the last-used time it was settled at. It only suppresses that generation: a recreated
         # checkout that is used and goes stale again has a newer last-used time, so it is offered again.
         settled = _settled_map((raw or {}).get("settled"))
@@ -143,8 +176,8 @@ def run(con, box_id: str, current: str) -> int:
         # Every path below keeps the settled map, so a failed pass never replays settled dirs on the next one.
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": settled})
         if not dirs:
-            return 0
-        run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
+            return Result()
+        run_id = f"{WORKER_ID_PREFIX}{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
         # The hold is taken before the remote script can start and released only when its worker is confirmed gone.
         # While held, the allocator never hands this box to anyone (pool.candidates, lease resume).
         con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,?,?)",
@@ -159,6 +192,7 @@ def run(con, box_id: str, current: str) -> int:
             rc = p.returncode
             finished = rc == 0 and f"done {run_id}" in out  # the script prints this only after its last child is gone
         except (subprocess.TimeoutExpired, OSError) as e:
+            timed_out = isinstance(e, subprocess.TimeoutExpired)
             # The remote script may still be running. Only a seen done marker releases the hold.
             log(f"prune {box_id} ssh failed ({type(e).__name__}); checking the remote worker")
             finished = _quiesced(box_id, run_id, deadline - time.monotonic())
@@ -182,7 +216,7 @@ def run(con, box_id: str, current: str) -> int:
             con.commit()
             event(con, box_id, "box_prune", f"{len(done)} of {len(dirs)} stale: " + " ".join(done))
             say(f"pruned {len(done)} old checkout(s) on {box_id} (OFFBOX_PRUNE_KEEP / OFFBOX_PRUNE_DAYS)")
-        return len(done)
+        return Result(len(done), timed_out)
     except Exception as e:  # noqa: BLE001 - housekeeping must never fail a run
         log(f"prune {box_id} skipped: {e}")
-        return 0
+        return Result(0, timed_out)

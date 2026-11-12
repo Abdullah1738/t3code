@@ -13,6 +13,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "vite-plus/test";
 
@@ -21,6 +22,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { SecretRedeemer } from "../ardud/auth/heldSecrets.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -383,6 +385,7 @@ it.each(["working", "retrying", "resuming", "cancelled", "interrupted"])(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             delegatedTaskResultPending: () => Effect.succeed(false),
             getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
             getThreadRecords: (threadId) => {
@@ -454,6 +457,7 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     subagents: [],
     updatedAt: now,
   } as unknown as OrchestrationV2ThreadProjection;
+  const redeemers: Array<ThreadId | null> = [];
   const foreignProjection = (threadId: ThreadId) =>
     ({
       thread: {
@@ -533,9 +537,17 @@ it("readThread and sendToThread reach threads in other projects", async () => {
         Layer.mock(ProviderRegistry.ProviderRegistry)({
           getProviders: Effect.succeed([]),
         } satisfies Partial<ProviderRegistry.ProviderRegistry["Service"]>),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: () => Effect.succeed(Option.some({ workspaceRoot: "/work" } as never)),
+        }),
         Layer.mock(SecretRequests.SecretRequests)({}),
         Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+          // ardud: records which thread a save would redeem a secretRef as.
+          upsert: () =>
+            SecretRedeemer.pipe(
+              Effect.tap((redeemer) => Effect.sync(() => redeemers.push(redeemer))),
+              Effect.andThen(Effect.die("saved far enough for this test")),
+            ),
           list: () =>
             Effect.succeed({
               tasks: [
@@ -568,6 +580,16 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       message: "hi",
     });
     expect(sent.threadId).toBe(foreignThreadId);
+
+    // ardud: a secretRef from a board ask is redeemed as the calling thread, taken
+    // from the session, so a ref given to another thread is refused.
+    yield* service
+      .scheduleTask(makeScope(), {
+        prompt: "check in later",
+        schedule: { type: "interval", everyMs: 3_600_000 },
+      })
+      .pipe(Effect.exit);
+    expect(redeemers).toEqual([parentThreadId]);
 
     parentRuns = [];
     yield* service.readThread(makeScope(), { threadId: foreignThreadId });

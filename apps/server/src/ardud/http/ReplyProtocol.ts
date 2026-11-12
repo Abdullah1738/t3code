@@ -11,12 +11,29 @@ export const withReplyBudget = (
 ): RpcServer.Protocol["Service"] => {
   let receive: Parameters<RpcServer.Protocol["Service"]["run"]>[0];
   const methods = new Map<string, string>();
+  const threadIds = new Map<string, string>();
   return {
     ...protocol,
     run: (write) => {
       receive = write;
       return protocol.run((clientId, message) => {
-        if (message._tag === "Request" && allowedMethods.has(message.tag)) methods.set(`${clientId}:${message.id}`, message.tag);
+        if (message._tag === "Request" && allowedMethods.has(message.tag))
+          methods.set(`${clientId}:${message.id}`, message.tag);
+        if (
+          message._tag === "Request" &&
+          (message.tag === "orchestration.subscribeThread" ||
+            message.tag === "orchestration.getThreadProjection") &&
+          typeof message.payload === "object" &&
+          message.payload !== null &&
+          "threadId" in message.payload &&
+          typeof message.payload.threadId === "string"
+        ) {
+          threadIds.set(`${clientId}:${message.id}`, message.payload.threadId);
+        }
+        if (message._tag === "Interrupt") {
+          methods.delete(`${clientId}:${message.requestId}`);
+          threadIds.delete(`${clientId}:${message.requestId}`);
+        }
         return write(clientId, message);
       });
     },
@@ -26,10 +43,20 @@ export const withReplyBudget = (
           return protocol.send(clientId, response, transferables);
         const key = `${clientId}:${response.requestId}`;
         const name = methods.get(key) ?? "unknown";
-        if (response._tag === "Exit") methods.delete(key);
+        const threadId = threadIds.get(key);
+        if (response._tag === "Exit") {
+          methods.delete(key);
+          threadIds.delete(key);
+        }
         if (!jsonExceedsBudget(response)) return protocol.send(clientId, response, transferables);
         try {
-          log.record({ kind: "ws", name, bytes: MAX_REPLY_BYTES + 1, rejected: true });
+          log.record({
+            kind: "ws",
+            name,
+            ...(threadId === undefined ? {} : { threadId }),
+            bytes: MAX_REPLY_BYTES + 1,
+            rejected: true,
+          });
         } catch {
           /* Diagnostics cannot bypass the cap. */
         }

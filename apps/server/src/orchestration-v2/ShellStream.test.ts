@@ -29,6 +29,7 @@ import {
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
+  withSubagentRequestAncestors,
 } from "./ShellStream.ts";
 
 function project(sequence: number, id: string): ApplicationStoredEvent {
@@ -632,6 +633,115 @@ describe("skipUnchangedThreadShells", () => {
         updated(3, shell("a")),
       ]);
       expect(sent).toEqual([1, 2, 3]);
+    }),
+  );
+});
+
+describe("withSubagentRequestAncestors", () => {
+  const sub = (id: string, parent: string, overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
+    shellFixture({
+      id: id as never,
+      lineage: {
+        parentThreadId: parent as never,
+        relationshipToParent: "subagent",
+        rootThreadId: "root" as never,
+      },
+      pendingRuntimeRequest: null,
+      ...overrides,
+    });
+  const root = shellFixture({
+    id: "root" as never,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "root" as never },
+  });
+  const middle = sub("middle", "root");
+  const asking = sub("asking", "middle", {
+    pendingRuntimeRequest: { kind: "user_input" } as never,
+  });
+  const byId = new Map([root, middle, asking].map((shell) => [shell.id as string, shell]));
+  const updated = (thread: OrchestrationV2ThreadShell) =>
+    ({ kind: "thread.updated", sequence: 9, location: "active", thread }) as const;
+
+  it.effect("sends the omitted subagent ancestors of a subagent that asks", () =>
+    Effect.gen(function* () {
+      const reads: Array<string> = [];
+      const items = yield* withSubagentRequestAncestors([updated(asking)], (id) =>
+        Effect.sync(() => {
+          reads.push(id);
+          return byId.get(id) ?? null;
+        }),
+      );
+      // The idle middle subagent follows the update at its sequence; the top-level root is read
+      // but not resent.
+      expect(
+        items.map((item) =>
+          item.kind === "thread.updated" ? [item.thread.id, item.sequence] : [null, null],
+        ),
+      ).toEqual([
+        ["asking", 9],
+        ["middle", 9],
+      ]);
+      expect(reads).toEqual(["middle", "root"]);
+    }),
+  );
+
+  it.effect("reads nothing for updates without a pending request", () =>
+    Effect.gen(function* () {
+      const items = [updated(middle), updated(sub("busy", "middle"))];
+      const result = yield* withSubagentRequestAncestors(items, () =>
+        Effect.die("no reads expected"),
+      );
+      expect(result).toBe(items);
+    }),
+  );
+
+  it.effect("walks through an ancestor the batch already carries to the omitted one above it", () =>
+    Effect.gen(function* () {
+      // root > upper (omitted, idle) > lower (updated in this batch) > deep (asks)
+      const upper = sub("upper", "root");
+      const lower = sub("lower", "upper");
+      const deep = sub("deep", "lower", {
+        pendingRuntimeRequest: { kind: "user_input" } as never,
+      });
+      const shells = new Map(
+        [root, upper, lower, deep].map((shell) => [shell.id as string, shell]),
+      );
+      for (const batch of [
+        [updated(lower), updated(deep)],
+        [updated(deep), updated(lower)],
+      ]) {
+        const reads: Array<string> = [];
+        const items = yield* withSubagentRequestAncestors(batch, (id) =>
+          Effect.sync(() => {
+            reads.push(id);
+            return shells.get(id) ?? null;
+          }),
+        );
+        const ids = items.map((item) =>
+          item.kind === "thread.updated" ? String(item.thread.id) : null,
+        );
+        expect(ids.filter((id) => id === "upper")).toHaveLength(1);
+        expect(ids.filter((id) => id === "lower")).toHaveLength(1);
+        // upper follows deep, the update that needed it.
+        expect(ids.indexOf("upper")).toBe(ids.indexOf("deep") + 1);
+        // lower came from the batch, not a read.
+        expect(reads).toEqual(["upper", "root"]);
+      }
+    }),
+  );
+
+  it.effect("skips ancestors already in the batch and stops on cycles", () =>
+    Effect.gen(function* () {
+      const loopA = sub("loop-a", "loop-b", {
+        pendingRuntimeRequest: { kind: "approval" } as never,
+      });
+      const loopB = sub("loop-b", "loop-a");
+      const items = yield* withSubagentRequestAncestors(
+        [updated(middle), updated(asking), updated(loopA)],
+        (id) => Effect.succeed(id === "loop-b" ? loopB : (byId.get(id) ?? null)),
+      );
+      expect(items.map((item) => (item.kind === "thread.updated" ? item.thread.id : null))).toEqual(
+        ["middle", "asking", "loop-a", "loop-b"],
+      );
     }),
   );
 });

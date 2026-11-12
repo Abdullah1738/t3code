@@ -1,3 +1,4 @@
+import { actionIdAttributes } from "../ardud/observability/actionCorrelation.ts";
 import {
   authScopeRequiredResponse,
   AuthAccessReadScope,
@@ -89,6 +90,7 @@ export const annotateEnvironmentRequest =
     );
     yield* Effect.annotateLogsScoped({ "environment.endpoint": endpoint, traceId });
     yield* Effect.annotateCurrentSpan({
+      ...actionIdAttributes(request.headers["x-robob-action-id"]),
       "environment.endpoint": endpoint,
       "http.request.method": request.method,
       "url.path": url._tag === "Some" ? url.value.pathname : "unknown",

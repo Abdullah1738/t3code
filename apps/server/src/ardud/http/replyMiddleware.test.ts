@@ -14,6 +14,7 @@ import * as ServerHttp from "../../http.ts";
 import * as LargeReplyLog from "../../observability/LargeReplyLog.ts";
 import { checkJsonReply, jsonReply } from "./jsonReply.ts";
 import * as ReplyBuilders from "./ReplyBuilders.ts";
+import { ShellPageReplyLane, ThreadReplyLane } from "../perf/speedups.ts";
 import { KanbanService } from "../kanban/engine/KanbanService.ts";
 import { BoardsDatabase } from "../persistence/BoardsDatabase.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
@@ -25,46 +26,127 @@ import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 it.effect.each([
-  ["HEAD", "/api/orchestration/shell"],
-  ["GET", "/api/orchestration/shell/"],
-  ["GET", "/API//ORCHESTRATION///SHELL/?paged=true"],
-  ["GET", "/api/orchestration/threads/test/transcript"],
-  ["HEAD", "/API//ARDUD/KANBAN//BOARDS/test/"],
-  ["GET", "/api/orchestration/%73hell?paged=true"],
-  ["GET", "/api/orchestration/shell;anything"],
-  ["HEAD", "/api/ardud/%6banban/boards/test;anything"],
-] as const)("bounds router-equivalent request %s before building", ([method, url]) =>
+  // The unpaged whole list builds on the snapshot lane.
+  ["HEAD", "/api/orchestration/shell", "snapshot", true],
+  ["GET", "/api/orchestration/shell/", "snapshot", true],
+  ["GET", "/api/orchestration/shell;anything", "snapshot", true],
+  ["GET", "/api/orchestration/shell?paged=false", "snapshot", true],
+  ["GET", "/api/orchestration/shell?paged=TRUE", "snapshot", true],
+  // One page of the paged list has its own lane.
+  ["GET", "/API//ORCHESTRATION///SHELL/?paged=true", "shellPage", true],
+  ["GET", "/api/orchestration/%73hell?paged=true", "shellPage", true],
+  [
+    "GET",
+    "/api/orchestration/shell?after=thread%3Aa&paged=true&recentFirst=true",
+    "shellPage",
+    true,
+  ],
+  [
+    "HEAD",
+    "/api/orchestration/shell;anything?omitIdleSubagents=true&paged=true",
+    "shellPage",
+    true,
+  ],
+  // ROBOB_SHELL_PAGE_REPLY_LANE=0: pages share the snapshot lane again.
+  ["GET", "/api/orchestration/shell?paged=true", "snapshot", false],
+  ["GET", "/api/orchestration/threads/test/transcript", "thread", true],
+  ["GET", "/api/orchestration/threads/test", "thread", true],
+  ["GET", "/API//ORCHESTRATION/threads/test/bounded/?compactTurnItems=1", "thread", true],
+  ["HEAD", "/api/orchestration/threads/test/history;anything", "thread", true],
+  // ROBOB_THREAD_REPLY_LANE=0: thread views share the snapshot lane again.
+  ["GET", "/api/orchestration/threads/test/bounded", "snapshot", false],
+  ["GET", "/api/orchestration/threads/test/transcript", "snapshot", false],
+  ["HEAD", "/API//ARDUD/KANBAN//BOARDS/test/", "snapshot", true],
+  ["HEAD", "/api/ardud/%6banban/boards/test;anything", "snapshot", true],
+] as const)(
+  "bounds router-equivalent request %s %s on the %s lane before building (own lanes %s)",
+  ([method, url, lane, ownLanes]) =>
+    Effect.gen(function* () {
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      const all = (name: ReplyBuilders.Lane) => ReplyBuilders.PERMITS[name];
+      const others = (["snapshot", "thread", "shellPage"] as const).filter((name) => name !== lane);
+      let owned = false;
+      let othersFree = false;
+      yield* middleware(
+        Effect.gen(function* () {
+          const whole = yield* builders[lane].takeIfAvailable(all(lane));
+          if (whole) yield* builders[lane].release(all(lane));
+          owned = !whole;
+          // A thread view, a list page and a board snapshot never share permits.
+          othersFree = true;
+          for (const other of others) {
+            const free = yield* builders[other].takeIfAvailable(all(other));
+            if (free) yield* builders[other].release(all(other));
+            othersFree = othersFree && free;
+          }
+          return jsonReply({ ready: true });
+        }),
+      ).pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          HttpServerRequest.fromWeb(new Request(`http://localhost${url}`, { method })),
+        ),
+        Effect.provideService(ThreadReplyLane, ownLanes),
+        Effect.provideService(ShellPageReplyLane, ownLanes),
+      );
+      expect(owned).toBe(true);
+      expect(othersFree).toBe(true);
+      expect(yield* builders[lane].takeIfAvailable(all(lane))).toBe(true);
+      yield* builders[lane].release(all(lane));
+    }).pipe(Effect.provide(ReplyBuilders.layer)),
+);
+
+it.effect.each([
+  ["GET", "/api/ardud/control/threads?active=true"],
+  ["GET", "/api/ardud/control/threads/thread-1/messages?all=true"],
+  ["GET", "/api/ardud/control/identity/resolve?nativeId=x"],
+  ["GET", "/api/ardud/control/health"],
+] as const)("holds no reply lane around the control handler %s %s", ([method, url]) =>
   Effect.gen(function* () {
     const builders = yield* ReplyBuilders.ReplyBuilders;
-    let owned = false;
-    yield* middleware(Effect.gen(function* () {
-      const both = yield* builders.takeIfAvailable(2);
-      if (both) yield* builders.release(2);
-      owned = !both;
-      return jsonReply({ ready: true });
-    })).pipe(
+    const free: Array<boolean> = [];
+    yield* middleware(
+      Effect.gen(function* () {
+        for (const lane of ["agent", "snapshot", "poll"] as const) {
+          const all = yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane]);
+          if (all) yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+          free.push(all);
+        }
+        return jsonReply({ ready: true });
+      }),
+    ).pipe(
       Effect.provideService(
         HttpServerRequest.HttpServerRequest,
         HttpServerRequest.fromWeb(new Request(`http://localhost${url}`, { method })),
       ),
+      Effect.provide(
+        Layer.merge(
+          Layer.mock(KanbanService)({ ready: Effect.void, attachmentPath: () => null }),
+          Layer.mock(BoardsDatabase)({ ready: Effect.void, path: ":memory:" }),
+        ),
+      ),
     );
-    expect(owned).toBe(true);
-    expect(yield* builders.takeIfAvailable(2)).toBe(true);
-    yield* builders.release(2);
+    expect(free).toEqual([true, true, true]);
   }).pipe(Effect.provide(ReplyBuilders.layer)),
 );
 
 it.effect("does not hold a reply builder for a websocket upgrade", () =>
   Effect.gen(function* () {
     const builders = yield* ReplyBuilders.ReplyBuilders;
-    yield* middleware(Effect.gen(function* () {
-      const available = yield* builders.takeIfAvailable(2);
-      if (available) yield* builders.release(2);
-      expect(available).toBe(true);
-      return HttpServerResponse.empty({ status: 200 });
-    })).pipe(
-      Effect.provideService(HttpServerRequest.HttpServerRequest,
-        HttpServerRequest.fromWeb(new Request("http://localhost/ws", { headers: { upgrade: "websocket" } }))),
+    yield* middleware(
+      Effect.gen(function* () {
+        const available = yield* builders.agent.takeIfAvailable(2);
+        if (available) yield* builders.agent.release(2);
+        expect(available).toBe(true);
+        return HttpServerResponse.empty({ status: 200 });
+      }),
+    ).pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        HttpServerRequest.fromWeb(
+          new Request("http://localhost/ws", { headers: { upgrade: "websocket" } }),
+        ),
+      ),
     );
   }).pipe(Effect.provide(ReplyBuilders.layer)),
 );
@@ -91,20 +173,28 @@ it.effect("orchestration authentication waits outside reply builders during boar
     );
     const origins = Context.get(services, SessionOrigins.SessionOrigins);
     const gatedAuth = yield* EnvironmentAuth.make.pipe(
-      Effect.provide(services.pipe(Context.add(SessionOrigins.SessionOrigins, {
-        ...origins,
-        originOf: (sessionId) => ready.pipe(Effect.andThen(origins.originOf(sessionId))),
-      }))),
+      Effect.provide(
+        services.pipe(
+          Context.add(SessionOrigins.SessionOrigins, {
+            ...origins,
+            originOf: (sessionId) => ready.pipe(Effect.andThen(origins.originOf(sessionId))),
+          }),
+        ),
+      ),
     );
     const sessions = yield* Effect.forEach([1, 2], (number) =>
       gatedAuth.issueSession({ subject: `uncached-${number}`, scopes: ["orchestration:read"] }),
     );
     const routes = HttpRouter.addAll([
-      HttpRouter.route("GET", "/api/orchestration/shell", Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        yield* gatedAuth.authenticateHttpRequest(request).pipe(Effect.orDie);
-        return jsonReply({ threads: [] });
-      })),
+      HttpRouter.route(
+        "GET",
+        "/api/orchestration/shell",
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          yield* gatedAuth.authenticateHttpRequest(request).pipe(Effect.orDie);
+          return jsonReply({ threads: [] });
+        }),
+      ),
     ]);
     const http = yield* Layer.build(
       HttpRouter.serve(Layer.merge(routes, ServerHttp.layerHttpCompression), {
@@ -119,12 +209,14 @@ it.effect("orchestration authentication waits outside reply builders during boar
     );
     const client = Context.get(http, HttpClient.HttpClient);
     const requests = yield* Effect.forEach(sessions, (session) =>
-      client.get("/api/orchestration/shell", { headers: { authorization: `Bearer ${session.token}` } }).pipe(Effect.forkScoped),
+      client
+        .get("/api/orchestration/shell", { headers: { authorization: `Bearer ${session.token}` } })
+        .pipe(Effect.forkScoped),
     );
     yield* Deferred.await(entered);
     const builders = Context.get(http, ReplyBuilders.ReplyBuilders);
-    const available = yield* builders.takeIfAvailable(2);
-    if (available) yield* builders.release(2);
+    const available = yield* builders.agent.takeIfAvailable(2);
+    if (available) yield* builders.agent.release(2);
     yield* Deferred.succeed(release, undefined);
     for (const request of requests) expect((yield* Fiber.join(request)).status).toBe(200);
     expect(available).toBe(true);
@@ -141,7 +233,10 @@ it.effect("cancels readiness admission even when the HTTP middleware caller is m
       Effect.onInterrupt(() => Deferred.succeed(cancelled, undefined)),
     );
     const request = yield* middleware(Effect.succeed(jsonReply({ ready: true }))).pipe(
-      Effect.provideService(HttpServerRequest.HttpServerRequest, HttpServerRequest.fromWeb(new Request("http://localhost/api/ardud/kanban/boards/test"))),
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        HttpServerRequest.fromWeb(new Request("http://localhost/api/ardud/kanban/boards/test")),
+      ),
       Effect.provide(Layer.mock(KanbanService)({ ready, attachmentPath: () => null })),
       Effect.uninterruptible,
       Effect.forkScoped,
@@ -171,7 +266,11 @@ it.effect.each(["/api/ardud/kanban/boards/test", "/api/ardud/control/threads"] a
       });
       const routes = HttpRouter.addAll([
         HttpRouter.route("GET", path, Effect.succeed(jsonReply({ ready: true }))),
-        HttpRouter.route("GET", "/api/orchestration/shell", Effect.succeed(jsonReply({ threads: [] }))),
+        HttpRouter.route(
+          "GET",
+          "/api/orchestration/shell",
+          Effect.succeed(jsonReply({ threads: [] })),
+        ),
       ]);
       const services = yield* Layer.build(
         HttpRouter.serve(Layer.merge(routes, ServerHttp.layerHttpCompression), {
@@ -190,14 +289,18 @@ it.effect.each(["/api/ardud/kanban/boards/test", "/api/ardud/control/threads"] a
         ),
       );
       const client = Context.get(services, HttpClient.HttpClient);
-      const requests = yield* Effect.forEach([1, 2], () => client.get(path).pipe(Effect.forkScoped));
+      const requests = yield* Effect.forEach([1, 2], () =>
+        client.get(path).pipe(Effect.forkScoped),
+      );
       yield* Deferred.await(entered);
       const builders = Context.get(services, ReplyBuilders.ReplyBuilders);
-      expect(yield* builders.takeIfAvailable(2)).toBe(true);
-      yield* builders.release(2);
-      expect(yield* ReplyBuilders.bounded(Effect.succeed(200)).pipe(
-        Effect.provideService(ReplyBuilders.ReplyBuilders, builders),
-      )).toBe(200);
+      expect(yield* builders.agent.takeIfAvailable(2)).toBe(true);
+      yield* builders.agent.release(2);
+      expect(
+        yield* ReplyBuilders.bounded(Effect.succeed(200)).pipe(
+          Effect.provideService(ReplyBuilders.ReplyBuilders, builders),
+        ),
+      ).toBe(200);
       yield* Deferred.succeed(release, undefined);
       for (const request of requests) expect((yield* Fiber.join(request)).status).toBe(200);
     }).pipe(Effect.scoped),
@@ -249,7 +352,13 @@ it.effect("runs the named cap before Brotli without encoding a large text body",
           }),
         ),
       ),
-      HttpRouter.route("GET", "/before-stringify", checkJsonReply(Effect.succeed({ detail: "x".repeat(MAX_REPLY_BYTES + 1) })).pipe(Effect.map(jsonReply))),
+      HttpRouter.route(
+        "GET",
+        "/before-stringify",
+        checkJsonReply(Effect.succeed({ detail: "x".repeat(MAX_REPLY_BYTES + 1) })).pipe(
+          Effect.map(jsonReply),
+        ),
+      ),
     ]);
     const services = yield* Layer.build(
       HttpRouter.serve(Layer.merge(routes, ServerHttp.layerHttpCompression), {

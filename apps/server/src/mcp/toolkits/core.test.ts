@@ -12,6 +12,7 @@ import {
   OrchestratorMcpThreadReadResult,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -76,6 +77,7 @@ const declaredFailure = (result: McpSchema.CallToolResult) => {
 };
 import { PullRequestsToolkit } from "./pullRequests/tools.ts";
 import { HtmlToolkit } from "./html/tools.ts";
+import { ImessageSendToolkit } from "../../ardud/imessage/tools.ts";
 import {
   resolveT3McpToolDefinition,
   resolveT3McpToolPresentation,
@@ -105,6 +107,7 @@ it("publishes unique tool names with reference-free object-root inputs", () => {
     DeviceToolkit,
     PullRequestsToolkit,
     HtmlToolkit,
+    ImessageSendToolkit,
   ]) {
     for (const tool of Object.values(toolkit.tools)) {
       expect(names.has(tool.name)).toBe(false);
@@ -1003,6 +1006,60 @@ it.effect("only the caller that prepared a pending upload can discard it", () =>
         Layer.provide(ServerSecretStore.layer),
         Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-attachment-" })),
         Layer.provide(NodeServices.layer),
+      ),
+    ),
+  ),
+);
+
+it.effect("preserves partial search metadata and scopes before limiting", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const result = yield* server
+      .callTool({
+        name: "t3_thread_search",
+        arguments: {
+          query: "needle",
+          projectId: "project:scoped",
+          limit: 1,
+        },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toEqual({
+      matches: [],
+      complete: false,
+      searchedBackTo: "2026-09-27T00:02:00.000Z",
+    });
+  }).pipe(
+    Effect.provide(
+      McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+        Layer.provide(
+          Layer.succeed(
+            ThreadSearch.ThreadSearch,
+            ThreadSearch.ThreadSearch.of({
+              search: (input) =>
+                Effect.sync(() => {
+                  expect(input).toEqual({
+                    query: "needle",
+                    projectId: ProjectId.make("project:scoped"),
+                    limit: 1,
+                  });
+                  return {
+                    matches: [],
+                    complete: false,
+                    searchedBackTo: "2026-09-27T00:02:00.000Z",
+                  };
+                }),
+            }),
+          ),
+        ),
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
       ),
     ),
   ),

@@ -46,7 +46,7 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.modelSelection?.instanceId).toBe("codex");
     expect(parsed.modelSelection?.model).toBe("gpt-5.3-codex");
     expect(getOptionValue(parsed.modelSelection?.options, "reasoningEffort")).toBe("high");
-    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(false);
   });
 
   it("rejects payloads without runtime mode", () => {
@@ -79,7 +79,7 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.modelSelection?.model).toBe("claude-sonnet-4-6");
     expect(getOptionValue(parsed.modelSelection?.options, "thinking")).toBe(true);
     expect(getOptionValue(parsed.modelSelection?.options, "effort")).toBe("max");
-    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(false);
     expect(parsed.runtimeMode).toBe("full-access");
   });
 
@@ -98,7 +98,7 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.provider).toBe("cursor");
     expect(parsed.modelSelection?.instanceId).toBe("cursor");
     expect(parsed.modelSelection?.model).toBe("composer-2");
-    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(false);
   });
 
   it("accepts fork-provided driver kinds as branded slugs", () => {
@@ -188,7 +188,7 @@ describe("ProviderSendTurnInput", () => {
     expect(parsed.modelSelection?.instanceId).toBe("codex");
     expect(parsed.modelSelection?.model).toBe("gpt-5.3-codex");
     expect(getOptionValue(parsed.modelSelection?.options, "reasoningEffort")).toBe("xhigh");
-    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(false);
   });
 
   it("accepts claude modelSelection including ultrathink", () => {
@@ -206,7 +206,7 @@ describe("ProviderSendTurnInput", () => {
 
     expect(parsed.modelSelection?.instanceId).toBe("claudeAgent");
     expect(getOptionValue(parsed.modelSelection?.options, "effort")).toBe("ultrathink");
-    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+    expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(false);
   });
 });
 

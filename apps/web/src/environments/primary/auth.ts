@@ -129,6 +129,8 @@ export interface ServerClientSessionRecord {
   readonly lastConnectedAt: string | null;
   readonly connected: boolean;
   readonly current: boolean;
+  // ardud: whether the session carries the owner claim; absent when the server does not say.
+  readonly owner?: boolean;
 }
 
 type ServerAuthGateState =

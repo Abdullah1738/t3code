@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
@@ -116,7 +117,7 @@ export const OrchestratorMcpTarget = Schema.Struct({
   options: Schema.optional(
     OrchestratorMcpTargetOptions.annotate({
       description:
-        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Claude: {effort: 'max', fastMode: true}; Codex: {reasoningEffort: 'max', serviceTier: 'priority'}. Only use options advertised by the selected model.",
+        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: Claude {effort: 'max'}; Codex {reasoningEffort: 'max', serviceTier: 'default'}; never fast mode. Only use options advertised by the selected model.",
     }),
   ),
 });
@@ -204,6 +205,9 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childThreadId: ThreadId,
   childRunId: Schema.NullOr(RunId),
   childNodeId: NodeId,
+  partial: Schema.optional(Schema.Literal(false)),
+  currentRunId: Schema.optional(Schema.NullOr(RunId)),
+  currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description:
@@ -244,6 +248,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   lastProgressKind: Schema.optional(Schema.NullOr(Schema.String)),
   thinkingSince: Schema.optional(Schema.NullOr(Schema.String)),
   summary: Schema.NullOr(Schema.String),
+  resultLooksIncomplete: Schema.optional(Schema.Boolean),
+  incompleteReason: Schema.optional(Schema.String),
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:
@@ -261,6 +267,16 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
+
+export const OrchestratorMcpTaskStatusResult = Schema.Union([
+  OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpDelegateTaskResult.mapFields((fields) => ({
+    ...Struct.map(fields, Schema.optionalKey),
+    taskId: NodeId,
+    partial: Schema.Literal(true),
+  })),
+]);
+export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;
 
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,

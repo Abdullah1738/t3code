@@ -83,6 +83,8 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 
 ## Your box (lease)
 
+A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `--bg` and `offbox wait` instead of a short shell timeout.
+
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
   at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
@@ -268,13 +270,23 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
   shows `boat.dev: DOWN since ...` during one.
 - A resume with no answer is checked on the box; 503 out_of_capacity and 409 resume_failed / deploy_failed at capacity are waited out like a boat.dev outage.
+- A boat "500 Request timeout" during SSH key setup is retried for up to ~4 min before exit 90; nothing ran.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
-  repo and run that. If boat loses track of a run that already ended (status `lost`), offbox reads the exit code the run left on the box (`~/.offbox/exit/<run>.rc`) or, for `--step` runs, the step lines when every step reported; only when neither exists is it 90.
+  repo and run that. Boat's `lost` is checked against retained command history, then the wrapper's exit file
+  (`~/.offbox/exit/<run>.rc`), then its PID marker on the box. A live process stays reserved and followed;
+  an SSH failure or missing legacy PID marker is unknown, so it cannot settle the run as lost or free its lease.
+  Only a confirmed missing process with no saved exit returns 90. `offbox wait` on a wrongly-lost run recovers
+  its saved exit code and corrects the row, or re-attaches while its process is alive. After a confirmed loss,
+  inspect the box with `offbox ssh <box>` before rerunning.
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
 
 ## Troubleshooting
+
+- A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
+
+- A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `--bg` + `offbox wait` instead of a short shell timeout.
 
 - Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
@@ -291,6 +303,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
   lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
+- A box wedged after resume (kept image restore stuck and Docker not answering) is stopped and set aside, and the run moves once to another box; offbox release <box> --delete drops it for good.
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
 - Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).

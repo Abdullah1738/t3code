@@ -5,6 +5,7 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -133,6 +134,56 @@ export function mergeShellSnapshotProjects(
   };
 }
 
+/**
+ * Thread ids the paged load in progress has delivered so far; `null` when no
+ * paged load is in progress.
+ */
+export type ShellPageCoverage = ReadonlySet<ThreadId> | null;
+
+/**
+ * Applies an authoritative (non-enrichment) snapshot or snapshot page.
+ *
+ * A full load can run to many pages and take minutes on a busy server. Until
+ * the last page lands, a row the load has not reached yet is unknown, not
+ * gone, so the rows the client already shows are kept (and marked by the
+ * snapshot's `page.nextAfter`). Only the final page drops rows the whole load
+ * did not deliver. Replacing the list with page one used to hide every
+ * thread past the first page from the sidebar until its page came in.
+ */
+export function mergeShellSnapshotPage(
+  previous: OrchestrationV2ShellSnapshot | null | undefined,
+  next: OrchestrationV2ShellSnapshot,
+  coverage: ShellPageCoverage,
+): { readonly snapshot: OrchestrationV2ShellSnapshot; readonly coverage: ShellPageCoverage } {
+  // Unpaged snapshots and cumulative HTTP pages start a load (after: null);
+  // socket pages after the first continue one.
+  const starts = next.page == null || next.page.after == null;
+  const complete = next.page?.nextAfter == null;
+  const merged = mergeShellSnapshotProjects(previous, next);
+  if (starts && complete) return { snapshot: merged, coverage: null };
+
+  const delivered = new Set(starts || coverage === null ? [] : coverage);
+  for (const thread of next.threads) delivered.add(thread.id);
+
+  if (complete) {
+    // The final socket page. Without the load's start nothing can be judged gone.
+    if (coverage === null) return { snapshot: merged, coverage: null };
+    const threads = merged.threads.filter((thread) => delivered.has(thread.id));
+    return {
+      snapshot: threads.length === merged.threads.length ? merged : { ...merged, threads },
+      coverage: null,
+    };
+  }
+
+  if (!starts || previous == null) return { snapshot: merged, coverage: delivered };
+  const unreached = previous.threads.filter((thread) => !delivered.has(thread.id));
+  return {
+    snapshot:
+      unreached.length === 0 ? merged : { ...merged, threads: [...merged.threads, ...unreached] },
+    coverage: delivered,
+  };
+}
+
 export function applyShellStreamEvent(
   snapshot: OrchestrationV2ShellSnapshot,
   event: Exclude<
@@ -140,7 +191,20 @@ export function applyShellStreamEvent(
     { readonly kind: "snapshot" } | { readonly kind: "synchronized" }
   >,
 ): OrchestrationV2ShellSnapshot {
-  if (event.sequence <= snapshot.snapshotSequence) return snapshot;
+  if (event.sequence < snapshot.snapshotSequence) return snapshot;
+  if (event.sequence === snapshot.snapshotSequence) {
+    // A server that leaves long-idle subagents out of the shell sends the missing ancestors of
+    // an asking subagent right after its update, at that update's sequence. Take such a row
+    // only when it is absent; anything else at an already-applied sequence is a repeat.
+    if (
+      event.kind !== "thread.updated" ||
+      event.location !== "active" ||
+      snapshot.threads.some((thread) => thread.id === event.thread.id)
+    ) {
+      return snapshot;
+    }
+    return { ...snapshot, threads: upsertById(snapshot.threads, event.thread) };
+  }
 
   switch (event.kind) {
     case "project.updated": {

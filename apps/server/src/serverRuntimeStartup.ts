@@ -1,3 +1,6 @@
+import { captureOwnedTree, cleanupOwnedTree } from "@t3tools/shared/ownedProcessTree";
+import { shutdownWithinBudget } from "./ardud/fast-install/shutdown.ts";
+import { markInstallLifecycle } from "./ardud/fast-install/report.ts";
 import {
   CommandId,
   DEFAULT_MODEL,
@@ -14,6 +17,7 @@ import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -21,6 +25,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -133,7 +138,15 @@ export const makeCommandGate = Effect.gen(function* () {
   });
 
   return {
-    awaitCommandReady: Deferred.await(commandReady),
+    awaitCommandReady: Ref.get(commandReadinessState).pipe(
+      Effect.flatMap((state) =>
+        state === "ready"
+          ? Effect.void
+          : state === "pending"
+            ? Deferred.await(commandReady)
+            : Effect.fail(state),
+      ),
+    ),
     signalCommandReady: Effect.gen(function* () {
       yield* Ref.set(commandReadinessState, "ready");
       yield* Deferred.succeed(commandReady, undefined).pipe(Effect.orDie);
@@ -442,8 +455,8 @@ export const runOrderedV2StartupPhases = Effect.fn(
   readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
   readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
 }) {
-  yield* input.importLegacyShells;
   const recovery = yield* input.recover;
+  yield* input.importLegacyShells;
   yield* input.recoverDelegatedTasks;
   yield* input.startEffectWorker;
   const bootstrap = yield* input.autoBootstrap;
@@ -463,9 +476,12 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
   const crypto = yield* Crypto.Crypto;
   const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
+  const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
 
   const commandGate = yield* makeCommandGate;
   const httpListening = yield* Deferred.make<void>();
+  const earlyWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+  const startupScope = yield* Effect.scope;
   const effectWorkerFiber = yield* Ref.make<Fiber.Fiber<void, never> | null>(null);
 
   yield* Effect.addFinalizer(() =>
@@ -480,14 +496,38 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       );
       const workerFiber = yield* Ref.getAndSet(effectWorkerFiber, null);
       if (workerFiber !== null) {
-        yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
+        yield* Fiber.interrupt(workerFiber).pipe(
+          Effect.interruptible,
+          Effect.timeoutOption("500 millis"),
+          Effect.ignore,
+        );
       }
-      yield* providerRuntimeRecovery.prepareForShutdown.pipe(
-        Effect.ensuring(providerSessions.shutdown),
+      // Capture identities before provider handles can exit and orphan MCP children.
+      const ownedProcesses = yield* Effect.tryPromise((signal) =>
+        captureOwnedTree(process.pid, new Set(), signal),
+      ).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.catchCause(() => Effect.succeed(Option.none())),
       );
-      const reconciliation = yield* providerRuntimeRecovery.reconcile("shutdown");
-      yield* Effect.logInfo("V2 orchestration shutdown reconciliation completed", reconciliation);
+      // Leave runtime facts intact: startup can recover even if preparation is cut short.
+      yield* shutdownWithinBudget({
+        prepare: providerRuntimeRecovery.prepareForShutdown,
+        closeProviders: providerSessions.shutdown.pipe(
+          Effect.interruptible,
+          Effect.timeoutOption("3 seconds"),
+          Effect.ensuring(
+            Option.isSome(ownedProcesses)
+              ? Effect.tryPromise(() => cleanupOwnedTree(ownedProcesses.value, 250)).pipe(
+                  Effect.ignoreCause({ log: true }),
+                )
+              : Effect.void,
+          ),
+        ),
+        checkpoint: Option.isSome(sql) ? sql.value`PRAGMA wal_checkpoint(PASSIVE)` : Effect.void,
+      });
     }).pipe(
+      Effect.interruptible,
+      Effect.timeoutOption("9 seconds"),
       Effect.catchCause((cause) =>
         Effect.logWarning("V2 orchestration shutdown reconciliation failed", {
           cause: Cause.pretty(cause),
@@ -540,6 +580,10 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
         },
       });
     }
+    // Recovery uses synchronous SQLite on the writer. Even a fork can monopolize
+    // the event loop before the listener is bound; park it until HTTP is serving.
+    yield* Deferred.await(httpListening);
+    yield* Effect.yieldNow;
     const { recovery, bootstrap: bootstrapTargets } = yield* runOrderedV2StartupPhases({
       importLegacyShells: runStartupPhase(
         "orchestration-v2.legacy-v1.import-shells",
@@ -551,7 +595,29 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
           ),
         ),
       ),
-      recover: runStartupPhase("orchestration-v2.recovery", providerRuntimeRecovery.recover),
+      recover: runStartupPhase(
+        "orchestration-v2.recovery",
+        providerRuntimeRecovery.recover.pipe(
+          Effect.provideService(ProviderRuntimeRecovery.ReconciledThreadContinuation, (threadId) =>
+            Effect.gen(function* () {
+              // Claims use the same durable lease and per-thread ordering as the
+              // normal daemon. Global admissions and auxiliary roots stay parked.
+              while (
+                earlyWorker.runThreadOnce !== undefined &&
+                (yield* earlyWorker.runThreadOnce(threadId))
+              ) {
+                /* drain this reconciled thread */
+              }
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Early continuation worker failed", { threadId, cause }),
+              ),
+              Effect.forkIn(startupScope),
+              Effect.asVoid,
+            ),
+          ),
+        ),
+      ),
       recoverDelegatedTasks: runStartupPhase(
         "orchestration-v2.delegated-tasks.recover",
         orchestrator.recoverDelegatedTasks,
@@ -669,6 +735,7 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
     yield* options?.activate ?? Effect.void;
     yield* Effect.logDebug("Accepting commands");
     yield* commandGate.signalCommandReady;
+    markInstallLifecycle("commandReadyAt");
     yield* Effect.logDebug("startup phase: publishing ready event");
     yield* runStartupPhase(
       "ready.publish",
@@ -718,7 +785,9 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
 
   return {
     awaitCommandReady: commandGate.awaitCommandReady,
-    markHttpListening: Deferred.succeed(httpListening, undefined),
+    markHttpListening: Effect.sync(() => markInstallLifecycle("listeningAt")).pipe(
+      Effect.andThen(Deferred.succeed(httpListening, undefined)),
+    ),
     enqueueCommand: commandGate.enqueueCommand,
   } satisfies ServerRuntimeStartup["Service"];
 });

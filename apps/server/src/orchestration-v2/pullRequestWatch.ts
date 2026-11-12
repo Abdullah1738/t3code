@@ -43,6 +43,7 @@ export function evaluatePullRequestWatch(
   let failedChecks = headMoved ? [] : watch.failedChecks;
   let passed = headMoved ? false : watch.passed;
   let passedChecks = headMoved ? [] : watch.passedChecks;
+  let passedPending = headMoved ? [] : watch.passedPending;
   if (detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
     const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
@@ -57,11 +58,19 @@ export function evaluatePullRequestWatch(
     // A required job created and finished between two passes is never seen pending. Without
     // required checks, any check counts, and advisory bots keep adding passed ones: no wake.
     const gateGrew = required.length > 0 && gateNames.some((name) => !told.includes(name));
-    if (passedNow && (!passed || gateGrew)) {
+    const previousGate = new Set(passedPending);
+    const confirmed =
+      required.length > 0 ||
+      (new Set(gateNames).size === previousGate.size &&
+        gateNames.every((name) => previousGate.has(name)));
+    if (passedNow && confirmed && (!passed || gateGrew)) {
       changes.push({ kind: "checks-passed", count: gate.length, required: required.length > 0 });
     }
-    passed = passedNow;
-    passedChecks = passedNow ? gateNames : [];
+    passedPending = required.length === 0 && passedNow ? gateNames : [];
+    passed = passedNow && (passed || confirmed);
+    passedChecks = passed ? gateNames : [];
+  } else {
+    passedPending = [];
   }
 
   const own = (detail.viewer ?? detail.author?.login)?.toLowerCase();
@@ -102,6 +111,7 @@ export function evaluatePullRequestWatch(
       failedChecks,
       passed,
       passedChecks,
+      passedPending,
       remarksThrough,
       remarkIds,
       conflicting,

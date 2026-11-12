@@ -1319,6 +1319,16 @@ export function createServerEnvironmentAtoms<R, E>(
           JSON.stringify([environmentId, input.threadId, input.turnItemId]),
       },
     }),
+    // ardud: a board ask's secret fields. The value goes over this RPC only.
+    answerAskSecrets: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:secrets:answer-ask",
+      tag: WS_METHODS.secretsAnswerAsk,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.cardId, input.askId]),
+      },
+    }),
     refreshUsageRates: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:refresh-usage-rates",
       tag: WS_METHODS.serverRefreshUsageRates,

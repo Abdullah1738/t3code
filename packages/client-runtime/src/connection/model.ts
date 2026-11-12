@@ -120,6 +120,10 @@ export type PreparedHttpAuthorization =
     };
 
 export interface PreparedConnection {
+  readonly verifiedDescriptor?: {
+    readonly httpBaseUrl: string;
+    readonly descriptor: import("@t3tools/contracts").ExecutionEnvironmentDescriptor;
+  };
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly httpBaseUrl: string;

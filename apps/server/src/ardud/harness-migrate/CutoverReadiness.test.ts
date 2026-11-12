@@ -134,7 +134,7 @@ const provider = (id: string): ServerProvider => ({
             id: "serviceTier",
             label: "Service tier",
             type: "select",
-            options: [{ id: "flex", label: "Flex" }],
+            options: [{ id: "default", label: "Standard" }],
           },
         ],
       },
@@ -759,20 +759,20 @@ describe("CutoverReadiness", () => {
           ...evidencedModels[1]!,
           options: [
             { id: "reasoningEffort", value: "high" },
-            { id: "serviceTier", value: "flex" },
+            { id: "serviceTier", value: "default" },
           ],
         };
         const reversed = { ...native, options: native.options!.toReversed() };
         const legacy: ModelSelection = {
           ...selections[1]!,
           options: [
-            { id: "serviceTier", value: "flex" },
+            { id: "serviceTier", value: "default" },
             { id: "variant", value: "high" },
           ],
         };
         yield* f.writeEvidence({
           models: [native],
-          routes: [{ ...reversed, route: "High flex route passed." }],
+          routes: [{ ...reversed, route: "High standard route passed." }],
         });
         const results = yield* f.check(
           Array.from({ length: 3_000 }, (_, index) => [native, reversed, legacy][index % 3]!),
@@ -794,7 +794,7 @@ describe("CutoverReadiness", () => {
           ...native,
           options: [
             { id: "reasoningEffort", value: "xhigh" },
-            { id: "serviceTier", value: "flex" },
+            { id: "serviceTier", value: "default" },
           ],
         };
         const distinct = yield* f.check([native, anotherEffort, native]);
@@ -802,8 +802,8 @@ describe("CutoverReadiness", () => {
           distinct.filter((result) => result.id.startsWith("model:")),
           2,
         );
-        failed(distinct, "evidence-model:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=flex");
-        failed(distinct, "evidence-route:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=flex");
+        failed(distinct, "evidence-model:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default");
+        failed(distinct, "evidence-route:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default");
       }).pipe(Effect.provide(testLayer)),
   );
 

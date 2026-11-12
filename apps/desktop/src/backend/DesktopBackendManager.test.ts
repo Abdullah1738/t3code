@@ -823,6 +823,56 @@ describe("DesktopBackendManager", () => {
       ),
   );
 
+  it.effect("keeps probing read readiness beyond sixty seconds without a false failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const firstProbe = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const childExit = yield* Deferred.make<void>();
+        let descriptorReady = false;
+        let failures = 0;
+        const spawner = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              makeProcess({
+                exitCode: Deferred.await(childExit).pipe(
+                  Effect.as(ChildProcessSpawner.ExitCode(0)),
+                ),
+              }),
+            ),
+          ),
+        );
+        const http = layerHttpClient((request) =>
+          Deferred.succeed(firstProbe, undefined).pipe(
+            Effect.andThen(
+              Effect.sync(() => responseForRequest(request, descriptorReady ? 200 : 503)),
+            ),
+          ),
+        );
+        const process = yield* DesktopBackendManager.runBackendProcess({
+          ...baseConfig,
+          desktopTelemetryStream: Stream.empty,
+          onReady: () => Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+          onReadinessFailure: () =>
+            Effect.sync(() => {
+              failures++;
+            }),
+        }).pipe(Effect.provide(Layer.merge(spawner, http)), Effect.forkChild);
+        yield* Deferred.await(firstProbe);
+        yield* TestClock.adjust("61 seconds");
+        assert.equal(failures, 0);
+        assert.isFalse(Deferred.isDoneUnsafe(ready));
+        descriptorReady = true;
+        yield* TestClock.adjust("100 millis");
+        yield* Deferred.await(ready);
+        yield* Deferred.succeed(childExit, undefined);
+        assert.equal((yield* Fiber.join(process)).code.pipe(Option.getOrUndefined), 0);
+        assert.equal(failures, 0);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
   it.effect(
     "snapshots only the first readiness timeout per child and preserves exit output",
     () => {

@@ -66,6 +66,11 @@ const Automation = codec(KanbanAutomation);
 const Wiki = codec(KanbanWikiPage);
 const ThreadLink = codec(KanbanThreadLink);
 
+const decodeTurn = Effect.callback<void>((resume) => {
+  const immediate = setImmediate(() => resume(Effect.void));
+  return Effect.sync(() => clearImmediate(immediate));
+});
+
 interface JsonRow {
   readonly json: string;
 }
@@ -177,6 +182,9 @@ export interface KanbanStoreShape {
   readonly discussionByEvaluator: (
     threadId: string,
   ) => Effect.Effect<KanbanDiscussion | null, KanbanStoreError>;
+  readonly discussionBoardIdsByEvaluator: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanBoardId>, KanbanStoreError>;
   readonly putDiscussion: (discussion: KanbanDiscussion) => Effect.Effect<void, KanbanStoreError>;
   /** The newest `limit` (default 200) after `afterSeq` and before `beforeSeq`, oldest first. */
   readonly messages: (
@@ -275,10 +283,17 @@ const make = Effect.gen(function* () {
     Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
   ).pipe(Effect.mapError(fail("create tables")));
 
+  // Decoding runs after the reader released its slot. Yield every 32 rows so
+  // simultaneous board snapshots do not starve timers (M1a 9411874c11).
   const decodeAll = <A, E>(
     rows: ReadonlyArray<JsonRow>,
     decode: (json: string) => Effect.Effect<A, E>,
-  ) => Effect.forEach(rows, (row) => decode(row.json));
+  ) =>
+    Effect.forEach(rows, (row, index) =>
+      index > 0 && index % 32 === 0
+        ? decodeTurn.pipe(Effect.andThen(decode(row.json)))
+        : decode(row.json),
+    );
 
   const first = <A>(items: ReadonlyArray<A>): A | null => items[0] ?? null;
 
@@ -388,7 +403,17 @@ const make = Effect.gen(function* () {
             'settledAt', json_extract(json, '$.settledAt'),
             'activeThreadId', active_thread_id,
             'asks', json(COALESCE((
-              SELECT json_group_array(json_object('closedAt', json_extract(ask.value, '$.closedAt')))
+              SELECT json_group_array(json_patch(
+                json_object('closedAt', json_extract(ask.value, '$.closedAt')),
+                json_object(
+                  'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
+                  'handedAt', json_extract(ask.value, '$.handedAt'),
+                  'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                  'snoozedUntil', json_extract(ask.value, '$.snoozedUntil'),
+                  'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
+                    THEN json_object('ack', json('true')) END
+                )
+              ))
               FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
             ), '[]'))
           ) AS json
@@ -652,6 +677,17 @@ const make = Effect.gen(function* () {
           SELECT json FROM ardud_kanban_discussions WHERE evaluator_thread_id = ${threadId} LIMIT 1
         `,
         (rows) => Effect.map(decodeAll(rows, Discussion.decode), first),
+      ),
+    );
+  const discussionBoardIdsByEvaluator = (threadId: string) =>
+    runRead(
+      "read discussion boards by evaluator",
+      Effect.map(
+        sql<{ readonly board_id: KanbanBoardId }>`
+          SELECT DISTINCT board_id FROM ardud_kanban_discussions
+          WHERE evaluator_thread_id = ${threadId} ORDER BY board_id
+        `,
+        (rows) => rows.map((row) => row.board_id),
       ),
     );
   const putDiscussion = (value: KanbanDiscussion) =>
@@ -961,6 +997,7 @@ const make = Effect.gen(function* () {
     discussions,
     discussion,
     discussionByEvaluator,
+    discussionBoardIdsByEvaluator,
     putDiscussion,
     messages,
     ownerWait,

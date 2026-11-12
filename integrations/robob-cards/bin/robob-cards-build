@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds the Robob Cards app (container + Messages extension) for real iPhones,
+# Builds the Robob Cards app (container + Messages and Widgets extensions) for real devices,
 # signed with the team's wildcard development profile, and optionally publishes
 # it to the tailnet OTA page. Phones outside the tailnet use robob-cards-enroll,
 # which re-signs this same build for ad hoc distribution.
@@ -49,6 +49,8 @@ ditto $built $out
 
 ext=$out/PlugIns/RobobCardsMessages.appex
 [[ -f $ext/embedded.mobileprovision ]] || { print -u2 "robob-cards-build: the Messages extension is missing its profile"; exit 1; }
+ext=$out/PlugIns/RobobCardsWidgets.appex
+[[ -f $ext/embedded.mobileprovision ]] || { print -u2 "robob-cards-build: the Widgets extension is missing its profile"; exit 1; }
 codesign --verify --deep --strict $out
 print "built $out"
 

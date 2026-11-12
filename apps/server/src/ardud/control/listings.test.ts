@@ -26,6 +26,7 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
+import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
@@ -44,6 +45,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
 
@@ -215,12 +217,43 @@ const snapshotFor = (
 const makeHarness = (
   buildCommit?: string,
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  // Shells deleted after their projection row was read: the row stays, the shell read is null.
+  vanished: ReadonlySet<string> = new Set(),
+  // Failures the session check returns, in order, before it succeeds.
+  authFailures: Array<unknown> = [],
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
     yield* seedRows;
+    // Extra shells are real projection rows too, as in production: updatedSince listings read
+    // the changed range from the table and only build shells for what they return.
+    for (const extra of extraShells) {
+      yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
+        thread_id: extra.id,
+        project_id: extra.projectId,
+        title: extra.title,
+        default_provider: "codex",
+        runtime_mode: "full-access",
+        interaction_mode: "default",
+        active_provider_thread_id: null,
+        created_at: DateTime.formatIso(extra.createdAt),
+        updated_at: DateTime.formatIso(extra.updatedAt),
+        archived_at: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
+        deleted_at: extra.deletedAt === null ? null : DateTime.formatIso(extra.deletedAt),
+        provider_instance_id: "codex",
+        payload_json: JSON.stringify({
+          lineage: extra.lineage,
+          creationSource: extra.creationSource,
+          archivedAt: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
+          updatedAt: DateTime.formatIso(extra.updatedAt),
+        }),
+      })}`;
+    }
     const snapshotReads = yield* Ref.make(0);
+    // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
+    const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
+    const shellReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
@@ -228,14 +261,35 @@ const makeHarness = (
         ),
       ),
     );
+    const startupLog = StartupPhaseLog.makeStartupPhaseLog(config.logsDir);
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-      getShellSnapshot: (options) =>
-        Ref.update(snapshotReads, (count) => count + 1).pipe(
+      getShellSnapshot: (options) => {
+        const ids = options?.threadIds;
+        if (ids !== undefined) {
+          const full = snapshotFor(options?.location ?? "active", extraShells);
+          const keep = (candidate: OrchestrationV2ThreadShell) =>
+            ids.includes(candidate.id) && !vanished.has(candidate.id);
+          return Ref.update(targetedReads, (reads) => [...reads, ids]).pipe(
+            Effect.as({
+              ...full,
+              snapshotSequence: 0,
+              threads: full.threads.filter(keep),
+              archivedThreads: full.archivedThreads.filter(keep),
+            }),
+          );
+        }
+        return Ref.update(snapshotReads, (count) => count + 1).pipe(
           Effect.as(snapshotFor(options?.location ?? "active", extraShells)),
-        ),
+        );
+      },
       getThreadShell: (threadId) =>
-        Effect.succeed(
-          [...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null,
+        Ref.update(shellReads, (count) => count + 1).pipe(
+          Effect.as(
+            vanished.has(threadId)
+              ? null
+              : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ??
+                  null),
+          ),
         ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
@@ -247,15 +301,23 @@ const makeHarness = (
               Layer.mergeAll(
                 Layer.mock(EnvironmentAuth.EnvironmentAuth)({
                   authenticateHttpRequest: () =>
-                    sql`SELECT 1`.pipe(
-                      NodeSqliteClient.readOnly,
-                      Effect.orDie,
-                      Effect.as({
-                        sessionId: AuthSessionId.make("session-cli"),
-                        subject: "cli-issued-session",
-                        method: "bearer-access-token" as const,
-                        scopes: ["orchestration:read", "orchestration:operate"],
-                      }),
+                    Effect.suspend(() =>
+                      authFailures.length > 0
+                        ? Effect.fail(
+                            new EnvironmentAuth.ServerAuthSessionCredentialValidationError({
+                              cause: authFailures.shift(),
+                            }),
+                          )
+                        : sql`SELECT 1`.pipe(
+                            NodeSqliteClient.readOnly,
+                            Effect.orDie,
+                            Effect.as({
+                              sessionId: AuthSessionId.make("session-cli"),
+                              subject: "cli-issued-session",
+                              method: "bearer-access-token" as const,
+                              scopes: ["orchestration:read", "orchestration:operate"],
+                            }),
+                          ),
                     ),
                 }),
                 threads,
@@ -292,6 +354,7 @@ const makeHarness = (
                   robobBuildCommit: buildCommit,
                 }),
                 Layer.succeed(SqlClient.SqlClient, sql),
+                Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog),
               ).pipe(Layer.provideMerge(NodeServices.layer)),
             ),
             Layer.provide(
@@ -313,7 +376,11 @@ const makeHarness = (
             headers: { authorization: "Bearer shared" },
           }),
         );
-        return { status: response.status, body: (await response.json()) as Record<string, any> };
+        return {
+          status: response.status,
+          retryAfter: response.headers.get("retry-after"),
+          body: (await response.json()) as Record<string, any>,
+        };
       });
     const threadIds = (path: string) =>
       get(path).pipe(
@@ -324,7 +391,7 @@ const makeHarness = (
             .toSorted();
         }),
       );
-    return { get, threadIds, snapshotReads };
+    return { get, threadIds, snapshotReads, targetedReads, shellReads, startupLog, sql };
   });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -334,12 +401,41 @@ const run = <A, E>(
   body: (h: Harness) => Effect.Effect<A, E>,
   buildCommit?: string,
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  vanished: ReadonlySet<string> = new Set(),
+  authFailures: Array<unknown> = [],
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells), body)).pipe(
-    Effect.provide(Sqlite.layerMemory),
-  );
+  Effect.scoped(
+    Effect.flatMap(makeHarness(buildCommit, extraShells, vanished, authFailures), body),
+  ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control listings", () => {
+  it.effect("includes current boot phase timings in the authenticated install report", () =>
+    run(({ get, startupLog }) =>
+      Effect.gen(function* () {
+        const id = startupLog.start("sqlite.migrations", 1000);
+        startupLog.end("sqlite.migrations", 6000, 5000, "success", undefined, id);
+        const response = yield* get("/install-report");
+        assert.equal(response.status, 200);
+        assert.equal(response.body.bootId, response.body.startup.bootId);
+        assert.includeDeepMembers(response.body.startup.phases, [
+          {
+            id,
+            phase: "sqlite.migrations",
+            startedAt: "1970-01-01T00:00:01.000Z",
+            endedAt: "1970-01-01T00:00:06.000Z",
+            durationMs: 5000,
+            outcome: "success",
+          },
+        ]);
+        assert.isTrue(
+          response.body.startup.phases.some(
+            (phase: { phase: string; outcome: string }) =>
+              phase.phase === "http.control-routes" && phase.outcome === "success",
+          ),
+        );
+      }),
+    ),
+  );
   it.effect("reports a validated build commit captured at startup", () =>
     Effect.gen(function* () {
       for (const [input, expected] of [
@@ -407,7 +503,7 @@ describe("control listings", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("lists active threads from live rows without the shell snapshot", () =>
-    run(({ threadIds, snapshotReads }) =>
+    run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* threadIds("/threads?active=true"), [
           "asks-waiting",
@@ -427,6 +523,11 @@ describe("control listings", () => {
           "live-queued",
         ]);
         assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        // One bounded read per list (indexed IN list), never one shell transaction per thread.
+        const targeted = yield* Ref.get(targetedReads);
+        assert.strictEqual(targeted.length, 4);
+        assert.ok(targeted.every((ids) => ids.length > 0 && ids.length <= 400));
+        assert.strictEqual(yield* Ref.get(shellReads), 0);
       }),
     ),
   );
@@ -529,6 +630,248 @@ describe("control listings", () => {
     );
   });
 
+  it.effect("lists /threads?updatedSince from the changed rows, never the shell snapshot", () => {
+    const at = (iso: string) => DateTime.makeUnsafe(iso);
+    const changed = (
+      id: string,
+      iso: string,
+      overrides: Partial<OrchestrationV2ThreadShell> = {},
+    ) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at(iso),
+        lineage: {
+          rootThreadId: ThreadId.make(id),
+          parentThreadId: null,
+          relationshipToParent: null,
+        },
+        ...overrides,
+      });
+    const extra = [
+      changed("new-1", "2026-03-01T00:00:03.000Z"),
+      changed("new-2", "2026-03-01T00:00:02.000Z", { projectId: "other" as never }),
+      changed("new-3", "2026-03-01T00:00:01.000Z"),
+      // Exactly at the cut: updatedSince is exclusive.
+      changed("edge", "2026-03-01T00:00:00.000Z"),
+      changed("stale", "2026-02-01T00:00:00.000Z"),
+      changed("new-archived", "2026-03-01T00:00:04.000Z", {
+        archivedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
+      changed("new-deleted", "2026-03-01T00:00:04.000Z", {
+        deletedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
+      changed("new-child", "2026-03-01T00:00:05.000Z", {
+        creationSource: "provider",
+        lineage: {
+          rootThreadId: ThreadId.make("new-3"),
+          parentThreadId: ThreadId.make("new-3"),
+          relationshipToParent: "subagent",
+        },
+      }),
+    ];
+    const since = Date.parse("2026-03-01T00:00:00.000Z");
+    return run(
+      ({ get, snapshotReads, sql }) =>
+        Effect.gen(function* () {
+          const list = (query: string) =>
+            get(`/threads?updatedSince=${since}${query}`).pipe(
+              Effect.map((response) => {
+                assert.strictEqual(response.status, 200);
+                return {
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                };
+              }),
+            );
+          // Newest first, cut to the limit, total still counts every match.
+          assert.deepStrictEqual(yield* list("&limit=2"), { total: 3, ids: ["new-1", "new-2"] });
+          assert.deepStrictEqual(yield* list("&limit=50"), {
+            total: 3,
+            ids: ["new-1", "new-2", "new-3"],
+          });
+          // ISO form of the same instant.
+          assert.deepStrictEqual(
+            (yield* get("/threads?updatedSince=2026-03-01T00:00:00.000Z&limit=50")).body.total,
+            3,
+          );
+          assert.deepStrictEqual(yield* list("&includeSubagents=true&limit=2"), {
+            total: 4,
+            ids: ["new-child", "new-1"],
+          });
+          assert.deepStrictEqual(yield* list("&creationSource=provider&includeSubagents=true"), {
+            total: 1,
+            ids: ["new-child"],
+          });
+          assert.deepStrictEqual(yield* list("&parentThreadId=new-3"), {
+            total: 1,
+            ids: ["new-child"],
+          });
+          assert.deepStrictEqual(yield* list("&projectId=other"), { total: 1, ids: ["new-2"] });
+          assert.deepStrictEqual(yield* list("&archived=true"), {
+            total: 1,
+            ids: ["new-archived"],
+          });
+          // A state filter that can match idle threads reads the changed range's shells.
+          assert.deepStrictEqual(yield* list("&state=idle&limit=1"), { total: 3, ids: ["new-1"] });
+          assert.deepStrictEqual(yield* list("&active=false&includeSubagents=true"), {
+            total: 4,
+            ids: ["new-child", "new-1", "new-2", "new-3"],
+          });
+          // Origins: a child inherits its root's origin.
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at) VALUES ('new-3', 'imessage', '2026-03-01T00:00:00.000Z')`;
+          assert.deepStrictEqual(yield* list("&origin=imessage&includeSubagents=true"), {
+            total: 2,
+            ids: ["new-child", "new-3"],
+          });
+          assert.deepStrictEqual(yield* list("&origin=none&limit=1"), { total: 2, ids: ["new-1"] });
+          assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        }),
+      undefined,
+      extra,
+    );
+  });
+
+  it.effect("lists /threads?parentThreadId children without the shell snapshot", () => {
+    const at = (iso: string) => DateTime.makeUnsafe(iso);
+    const child = (id: string, iso: string, parent: string, overrides = {}) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at(iso),
+        creationSource: "provider",
+        lineage: {
+          rootThreadId: ThreadId.make(parent),
+          parentThreadId: ThreadId.make(parent),
+          relationshipToParent: "subagent",
+        },
+        ...overrides,
+      });
+    const extra = [
+      child("child-new", "2026-03-01T00:00:02.000Z", "parent-a"),
+      // Old children are listed too: there is no updatedSince cut.
+      child("child-old", "2020-01-01T00:00:00.000Z", "parent-a"),
+      child("child-other", "2026-03-01T00:00:03.000Z", "parent-b"),
+      // No updatedSince means no time filter at all, including the epoch and before it.
+      child("child-epoch", "1970-01-01T00:00:00.000Z", "parent-a"),
+      child("child-pre-epoch", "1969-12-31T23:59:59.000Z", "parent-a"),
+      child("child-archived", "2026-03-01T00:00:04.000Z", "parent-a", {
+        archivedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
+      child("child-deleted", "2026-03-01T00:00:05.000Z", "parent-a", {
+        deletedAt: at("2026-03-01T00:00:05.000Z"),
+      }),
+    ];
+    return run(
+      ({ get, snapshotReads }) =>
+        Effect.gen(function* () {
+          const list = (query: string) =>
+            get(`/threads?parentThreadId=parent-a${query}`).pipe(
+              Effect.map((response) => {
+                assert.strictEqual(response.status, 200);
+                return {
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                };
+              }),
+            );
+          // The agent-tooling shape seen on 11 Nov 2026: newest first, every live child.
+          assert.deepStrictEqual(yield* list("&includeSubagents=true&limit=500"), {
+            total: 4,
+            ids: ["child-new", "child-old", "child-epoch", "child-pre-epoch"],
+          });
+          assert.deepStrictEqual(yield* list("&limit=1"), { total: 4, ids: ["child-new"] });
+          assert.deepStrictEqual(yield* list("&archived=true"), {
+            total: 1,
+            ids: ["child-archived"],
+          });
+          assert.deepStrictEqual(yield* list("&active=false"), {
+            total: 4,
+            ids: ["child-new", "child-old", "child-epoch", "child-pre-epoch"],
+          });
+          // An explicit updatedSince still cuts exactly, at the epoch too.
+          assert.deepStrictEqual(yield* list("&updatedSince=0"), {
+            total: 2,
+            ids: ["child-new", "child-old"],
+          });
+          assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        }),
+      undefined,
+      extra,
+    );
+  });
+
+  it.effect(
+    "orders /threads?updatedSince ties by thread id and refills vanished candidates",
+    () => {
+      const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+      const tied = (id: string) =>
+        shell(id, {
+          ...idle,
+          updatedAt: at,
+          lineage: {
+            rootThreadId: ThreadId.make(id),
+            parentThreadId: null,
+            relationshipToParent: null,
+          },
+        });
+      const since = Date.parse("2026-03-01T00:00:00.000Z");
+      return run(
+        ({ get }) =>
+          Effect.gen(function* () {
+            const page = (limit: number) =>
+              get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
+                Effect.map((response) => ({
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                })),
+              );
+            // Equal timestamps keep the full listing's thread id order; tie-a vanished after
+            // the range read, so tie-b fills its place and total drops it.
+            assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
+            assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
+          }),
+        undefined,
+        [tied("tie-c"), tied("tie-a"), tied("tie-b")],
+        new Set(["tie-a"]),
+      );
+    },
+  );
+
+  it.effect("orders /threads?updatedSince ties by thread id like the full listing", () => {
+    const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+    const tied = (id: string) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at,
+        lineage: {
+          rootThreadId: ThreadId.make(id),
+          parentThreadId: null,
+          relationshipToParent: null,
+        },
+      });
+    const since = Date.parse("2026-03-01T00:00:00.000Z");
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get(`/threads?updatedSince=${since}&limit=2`);
+          assert.deepStrictEqual(
+            (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+              (thread) => thread.threadId,
+            ),
+            ["tie-a", "tie-b"],
+          );
+          assert.strictEqual(response.body.total, 3);
+        }),
+      undefined,
+      [tied("tie-c"), tied("tie-a"), tied("tie-b")],
+    );
+  });
+
   it.effect("lists pending requests from pending rows without the shell snapshot", () =>
     run(({ get, snapshotReads }) =>
       Effect.gen(function* () {
@@ -612,5 +955,76 @@ describe("control listings", () => {
         assert.strictEqual(response.body.identity.robobThreadId, "migrated");
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A lane that never ran the session read (process replaced, admission queue full).
+  const laneUnavailable = () =>
+    new SqlError({
+      reason: classifySqliteError(new Error("Reader lane unavailable"), {
+        operation: "readerAdmission",
+        message: "Reader lane unavailable",
+      }),
+    });
+  // A started read whose reader process stopped under it.
+  const laneStopped = () =>
+    new Error("Session verification failed", {
+      cause: new Error("Database reader exited with code null"),
+    });
+
+  it.effect("retries a session read the auth lane never ran, once", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get(
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+          );
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+        }),
+      undefined,
+      [],
+      new Set(),
+      [laneUnavailable()],
+    ),
+  );
+
+  it.effect("answers a busy reader lane with 503 and Retry-After, not 500", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          for (const path of [
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+            "/threads/migrated",
+          ]) {
+            const response = yield* get(path);
+            assert.strictEqual(response.status, 503);
+            assert.strictEqual(response.retryAfter, "1");
+            assert.strictEqual(response.body.error.code, "unavailable");
+          }
+          // A started read is not replayed: one failure, one 503.
+          assert.strictEqual((yield* get("/threads/migrated")).status, 200);
+        }),
+      undefined,
+      [],
+      new Set(),
+      // Two retryable failures in a row exhaust the single retry.
+      [laneUnavailable(), laneUnavailable(), laneStopped(), laneStopped()],
+    ),
+  );
+
+  it.effect("keeps a non-lane authentication failure an internal error", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get("/threads/migrated");
+          assert.strictEqual(response.status, 500);
+          assert.isNull(response.retryAfter);
+        }),
+      undefined,
+      [],
+      new Set(),
+      [new Error("disk full")],
+    ),
   );
 });
