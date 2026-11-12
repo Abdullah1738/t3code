@@ -4248,7 +4248,7 @@ it.effect("interrupts both live turns before failing runs after a shared ingesti
   }),
 );
 
-it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
+it.effect.each(["rejected", "timeout", "exit-observation-retry"] as const)(
   "keeps ownership and capture through %s Stop until process exit is confirmed",
   (scenario) =>
     Effect.gen(function* () {
@@ -4258,6 +4258,10 @@ it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
       const sourceClosed = yield* Ref.make(false);
       const runFailed = yield* Ref.make(false);
       const shutdownAttempts = yield* Ref.make(0);
+      const nativeEvents = yield* Queue.unbounded<
+        ProviderAdapter.ProviderAdapterV2Event,
+        Cause.Done
+      >();
       const result = yield* captureRootRunTermination({
         key: `ingest-stop-recovery:${scenario}`,
         shouldFinalizeRun: () => Effect.succeed(true),
@@ -4267,6 +4271,7 @@ it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
             driver,
             node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
           } as unknown as ProviderAdapter.ProviderAdapterV2Event).pipe(
+            Stream.concat(Stream.fromQueue(nativeEvents)),
             Stream.ensuring(Ref.set(sourceClosed, true)),
           ),
         ingestNormalized: (input) =>
@@ -4294,10 +4299,10 @@ it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
                   ),
             ),
           ),
-        terminateSession: Effect.gen(function* () {
+        awaitSessionExit: Effect.gen(function* () {
           const attempt = yield* Ref.updateAndGet(shutdownAttempts, (n) => n + 1);
           yield* Deferred.succeed(terminationStarted, undefined);
-          if (scenario === "shutdown-retry" && attempt === 1) {
+          if (scenario === "exit-observation-retry" && attempt === 1) {
             return yield* new ProviderAdapter.ProviderAdapterCloseSessionError({
               driver,
               providerSessionId: ProviderSessionId.make("session:shutdown-retry"),
@@ -4305,6 +4310,13 @@ it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
             });
           }
           yield* Deferred.await(terminated);
+          yield* Queue.offer(
+            nativeEvents,
+            rootTerminalEvent(
+              backgroundScenarioIds(`ingest-stop-recovery:${scenario}`),
+              "completed",
+            ),
+          );
         }),
         refreshAfterTurn: Ref.set(runFailed, true),
         afterStart: (closed) =>
@@ -4316,11 +4328,11 @@ it.effect.each(["rejected", "timeout", "shutdown-retry"] as const)(
             assert.isFalse(yield* Ref.get(sourceClosed));
             assert.isFalse(yield* Deferred.isDone(closed));
             yield* Deferred.succeed(terminated, undefined);
-            if (scenario === "shutdown-retry") yield* TestClock.adjust("1 second");
+            if (scenario === "exit-observation-retry") yield* TestClock.adjust("1 second");
           }),
       });
       assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
-      assert.equal(yield* Ref.get(shutdownAttempts), scenario === "shutdown-retry" ? 2 : 1);
+      assert.equal(yield* Ref.get(shutdownAttempts), scenario === "exit-observation-retry" ? 2 : 1);
     }),
 );
 
@@ -4388,7 +4400,7 @@ it.effect.each(["delivered", "terminated"] as const)(
                   cause: "Stop unavailable",
                 }),
               ),
-        ...(scenario === "terminated" ? { terminateSession: cleanup } : {}),
+        ...(scenario === "terminated" ? { awaitSessionExit: cleanup } : {}),
       });
       const events = yield* Ref.get(ingested);
       assert.deepEqual(
@@ -4467,7 +4479,7 @@ it.effect.each(["delivered", "terminated"] as const)(
                   cause: "Stop unavailable",
                 }),
               ),
-        ...(scenario === "terminated" ? { terminateSession: endChild } : {}),
+        ...(scenario === "terminated" ? { awaitSessionExit: endChild } : {}),
         refreshAfterTurn: Ref.set(runFailed, true),
         afterStart: (ingestionClosed) =>
           Effect.gen(function* () {
@@ -4482,7 +4494,241 @@ it.effect.each(["delivered", "terminated"] as const)(
     }),
 );
 
-it.effect("does not kill a shared session after a newer run takes ownership", () =>
+it.effect("consumes natural completion while Stop rejects without a process-exit hook", () =>
+  Effect.gen(function* () {
+    const key = "stop-retry-natural-completion";
+    const ids = backgroundScenarioIds(key);
+    const queue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const current = yield* Ref.make(true);
+    const attempts = yield* Ref.make(0);
+    const secondAttempt = yield* Deferred.make<void>();
+    const consumedTerminal = yield* Deferred.make<void>();
+    const result = yield* captureRootRunTermination({
+      key,
+      shouldFinalizeRun: () => Ref.get(current),
+      subscribeEvents: () =>
+        Effect.gen(function* () {
+          yield* Queue.offer(queue, {
+            type: "node.updated",
+            driver,
+            node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+          } as ProviderAdapter.ProviderAdapterV2Event);
+          const close = Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue)), Effect.asVoid);
+          return { events: Stream.fromQueue(queue).pipe(Stream.ensuring(close)), close };
+        }),
+      ingestNormalized: (input) =>
+        input.event.type === "node.updated"
+          ? Effect.fail(
+              new ProviderEventIngestor.ProviderEventNormalizeError({
+                providerSessionId: input.providerSessionId,
+                threadId: input.threadId,
+                providerEvent: input.event,
+                cause: "reader failed",
+              }),
+            )
+          : Deferred.succeed(consumedTerminal, undefined).pipe(Effect.as([])),
+      interruptTurn: (turn) =>
+        Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(attempts, (n) => n + 1);
+          if (count === 1) yield* Queue.offer(queue, rootTerminalEvent(ids, "completed"));
+          if (count === 2) yield* Deferred.succeed(secondAttempt, undefined);
+          return yield* new ProviderAdapter.ProviderAdapterInterruptError({
+            driver,
+            providerThreadId: turn.providerThread.id,
+            providerTurnId: turn.providerTurnId,
+            cause: "Claude provider thread has no live query; turn finished naturally",
+          });
+        }),
+      afterStart: () =>
+        Effect.gen(function* () {
+          yield* TestClock.adjust("1 second");
+          yield* Effect.raceFirst(Deferred.await(consumedTerminal), Deferred.await(secondAttempt));
+          if (!(yield* Deferred.isDone(consumedTerminal))) {
+            yield* Ref.set(current, false);
+            yield* TestClock.adjust("1 second");
+          }
+        }),
+    });
+    assert.isTrue(
+      yield* Deferred.isDone(consumedTerminal),
+      "Natural completion stayed queued behind Stop retries",
+    );
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
+it.live("finishes recovery when a terminal item write fails before natural completion", () =>
+  Effect.gen(function* () {
+    const key = "failed-terminal-item-natural-end";
+    const ids = backgroundScenarioIds(key);
+    const queue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const attempts = yield* Ref.make(0);
+    const secondAttempt = yield* Deferred.make<void>();
+    const completionConsumed = yield* Deferred.make<void>();
+    const requiredReplay = yield* Ref.make(false);
+    const replayAvailable = yield* Ref.make(false);
+    const result = yield* captureRootRunTermination({
+      key,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      subscribeEvents: () =>
+        Effect.gen(function* () {
+          yield* Queue.offerAll(queue, [
+            backgroundTurnItemEvent(ids, "command_execution", "running", 101),
+            backgroundTurnItemEvent(ids, "command_execution", "completed", 101),
+          ]);
+          const close = Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue)), Effect.asVoid);
+          return { events: Stream.fromQueue(queue).pipe(Stream.ensuring(close)), close };
+        }),
+      ingestNormalized: (input) =>
+        Effect.gen(function* () {
+          if (
+            input.event.type === "turn_item.updated" &&
+            input.event.turnItem.status === "completed" &&
+            !(yield* Ref.get(replayAvailable))
+          ) {
+            return yield* new ProviderEventIngestor.ProviderEventNormalizeError({
+              providerSessionId: input.providerSessionId,
+              threadId: input.threadId,
+              providerEvent: input.event,
+              cause: "terminal item write failed",
+            });
+          }
+          if (input.event.type === "turn.terminal")
+            yield* Deferred.succeed(completionConsumed, undefined);
+          return [];
+        }),
+      interruptTurn: (turn) =>
+        Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(attempts, (n) => n + 1);
+          if (count === 1) yield* Queue.offer(queue, rootTerminalEvent(ids, "completed"));
+          if (count === 2) yield* Deferred.succeed(secondAttempt, undefined);
+          return yield* new ProviderAdapter.ProviderAdapterInterruptError({
+            driver,
+            providerThreadId: turn.providerThread.id,
+            providerTurnId: turn.providerTurnId,
+            cause: "No live query",
+          });
+        }),
+      afterStart: (closed) =>
+        Effect.gen(function* () {
+          yield* Effect.raceFirst(Deferred.await(closed), Deferred.await(secondAttempt));
+          if (!(yield* Deferred.isDone(closed))) {
+            yield* Ref.set(requiredReplay, true);
+            yield* Ref.set(replayAvailable, true);
+            yield* Queue.offer(
+              queue,
+              backgroundTurnItemEvent(ids, "command_execution", "completed", 101),
+            );
+          }
+        }),
+    });
+    assert.isTrue(yield* Deferred.isDone(completionConsumed));
+    assert.isFalse(
+      yield* Ref.get(requiredReplay),
+      "A failed completion write kept the item permanently active",
+    );
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
+it.effect("keeps healthy sibling work alive when another shared-session turn rejects Stop", () =>
+  Effect.gen(function* () {
+    const bad = backgroundScenarioIds("shared-session-stop:bad");
+    const good = backgroundScenarioIds("shared-session-stop:good");
+    const badEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const goodEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const stopAttempted = yield* Deferred.make<void>();
+    const heartbeatIngested = yield* Deferred.make<void>();
+    const sharedExit = yield* Deferred.make<void>();
+    const kills = yield* Ref.make(0);
+    const unsafeProcessStop = Ref.update(kills, (n) => n + 1).pipe(
+      Effect.andThen(Deferred.succeed(sharedExit, undefined)),
+      Effect.andThen(Queue.offer(goodEvents, rootTerminalEvent(good, "failed"))),
+      Effect.asVoid,
+    );
+    const results = yield* Effect.forEach(
+      ["bad", "good"] as const,
+      (key) => {
+        const ids = key === "bad" ? bad : good;
+        const queue = key === "bad" ? badEvents : goodEvents;
+        return captureRootRunTermination({
+          key: `shared-session-stop:${key}`,
+          sharedSessionId: ProviderSessionId.make("session:shared-siblings"),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          unsafeProcessStop,
+          awaitSessionExit: Deferred.await(sharedExit),
+          subscribeEvents: () =>
+            Effect.gen(function* () {
+              yield* Queue.offer(
+                queue,
+                key === "bad"
+                  ? ({
+                      type: "node.updated",
+                      driver,
+                      node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+                    } as ProviderAdapter.ProviderAdapterV2Event)
+                  : backgroundTurnItemEvent(ids, "command_execution", "running", 101),
+              );
+              const close = Queue.clear(queue).pipe(
+                Effect.andThen(Queue.end(queue)),
+                Effect.asVoid,
+              );
+              return { events: Stream.fromQueue(queue).pipe(Stream.ensuring(close)), close };
+            }),
+          ingestNormalized: (input) =>
+            key === "bad"
+              ? Effect.fail(
+                  new ProviderEventIngestor.ProviderEventNormalizeError({
+                    providerSessionId: input.providerSessionId,
+                    threadId: input.threadId,
+                    providerEvent: input.event,
+                    cause: "reader failed for one turn",
+                  }),
+                )
+              : input.event.type === "turn_item.updated" &&
+                  input.event.turnItem.status === "completed"
+                ? Deferred.succeed(heartbeatIngested, undefined).pipe(Effect.as([]))
+                : Effect.succeed([]),
+          interruptTurn: (turn) =>
+            Deferred.succeed(stopAttempted, undefined).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new ProviderAdapter.ProviderAdapterInterruptError({
+                    driver,
+                    providerThreadId: turn.providerThread.id,
+                    providerTurnId: turn.providerTurnId,
+                    cause: "One turn's Stop unavailable",
+                  }),
+                ),
+              ),
+            ),
+          afterStart: () =>
+            key === "good"
+              ? Effect.void
+              : Effect.gen(function* () {
+                  yield* Deferred.await(stopAttempted);
+                  yield* Queue.offer(
+                    goodEvents,
+                    backgroundTurnItemEvent(good, "command_execution", "completed", 101),
+                  );
+                  yield* Effect.raceFirst(
+                    Deferred.await(heartbeatIngested),
+                    Deferred.await(sharedExit),
+                  );
+                  yield* Queue.offer(badEvents, rootTerminalEvent(bad, "completed"));
+                  yield* Queue.offer(goodEvents, rootTerminalEvent(good, "completed"));
+                }),
+        });
+      },
+      { concurrency: "unbounded" },
+    );
+    assert.equal(yield* Ref.get(kills), 0, "A failed Stop cannot kill the sibling's app-server");
+    assert.isTrue(yield* Deferred.isDone(heartbeatIngested));
+    assert.deepEqual(results[1]?.observed, ["run:waiting", "pull-requests-refreshed"]);
+  }),
+);
+
+it.effect("does not interrupt a replaced turn after a newer run takes ownership", () =>
   Effect.gen(function* () {
     const shutdowns = yield* Ref.make(0);
     const result = yield* captureRootRunTermination({
@@ -4498,15 +4744,19 @@ it.effect("does not kill a shared session after a newer run takes ownership", ()
           }),
         ),
       interruptTurn: (turn) =>
-        Effect.fail(
-          new ProviderAdapter.ProviderAdapterInterruptError({
-            driver,
-            providerThreadId: turn.providerThread.id,
-            providerTurnId: turn.providerTurnId,
-            cause: "old turn unavailable",
-          }),
+        Ref.update(shutdowns, (n) => n + 1).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterInterruptError({
+                driver,
+                providerThreadId: turn.providerThread.id,
+                providerTurnId: turn.providerTurnId,
+                cause: "old turn unavailable",
+              }),
+            ),
+          ),
         ),
-      terminateSession: Ref.update(shutdowns, (n) => n + 1),
+      awaitSessionExit: Effect.never,
     });
     assert.equal(yield* Ref.get(shutdowns), 0);
     assert.deepEqual(result.observed, []);
@@ -4530,7 +4780,7 @@ it.effect("does not terminate a session when storing an observed native completi
           }),
         ),
       interruptTurn: () => Ref.update(stops, (n) => n + 1),
-      terminateSession: Ref.update(stops, (n) => n + 1),
+      awaitSessionExit: Ref.update(stops, (n) => n + 1),
     });
     assert.equal(yield* Ref.get(stops), 0);
     assert.include(result.observed, "run:failed");
@@ -4667,7 +4917,9 @@ function captureRootRunTermination(input: {
   ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2EventSubscription>;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
-  readonly terminateSession?: ProviderAdapter.ProviderAdapterV2SessionRuntime["terminateSession"];
+  readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
+  readonly unsafeProcessStop?: Effect.Effect<void>;
+  readonly sharedSessionId?: ProviderSessionId;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
@@ -4772,7 +5024,7 @@ function captureRootRunTermination(input: {
           archivedAt: null,
           deletedAt: null,
         } as OrchestrationV2AppThread,
-        providerSessionId: ProviderSessionId.make(`session:${input.key}`),
+        providerSessionId: input.sharedSessionId ?? ProviderSessionId.make(`session:${input.key}`),
         session: {
           events: Stream.empty,
           subscribeEvents: (
@@ -4818,9 +5070,12 @@ function captureRootRunTermination(input: {
           ),
           startTurn: input.startTurn ?? (() => Effect.void),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
-          ...(input.terminateSession === undefined
+          ...(input.awaitSessionExit === undefined
             ? {}
-            : { terminateSession: input.terminateSession }),
+            : { awaitSessionExit: input.awaitSessionExit }),
+          ...(input.unsafeProcessStop === undefined
+            ? {}
+            : { terminateSession: input.unsafeProcessStop }),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {

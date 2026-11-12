@@ -1373,7 +1373,7 @@ export interface CodexAppServerClientFactoryShape {
     readonly environment: NodeJS.ProcessEnv;
   }) => Effect.Effect<
     CodexClient.CodexAppServerClient["Service"] & {
-      readonly terminateSession?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
+      readonly awaitSessionExit?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
     },
     ProviderAdapter.ProviderAdapterOpenSessionError,
     Scope.Scope
@@ -1503,12 +1503,11 @@ export const makeCodexAppServerSpawnCommand = Effect.fn(
 
 // A failed RPC does not prove the native turn stopped. Only the captured process
 // handle can provide an independent, session-wide shutdown confirmation.
-const terminateCodexProcess = Effect.fn("CodexAdapterV2.terminateProcess")(
+const awaitCodexProcessExit = Effect.fn("CodexAdapterV2.awaitProcessExit")(
   function* (
     handle: ChildProcessSpawner.ChildProcessHandle,
     _providerSessionId: ProviderSessionId,
   ) {
-    if (yield* handle.isRunning) yield* handle.kill({ killSignal: "SIGKILL" });
     yield* handle.exitCode.pipe(
       Effect.catch((cause) =>
         handle.isRunning.pipe(
@@ -1568,7 +1567,7 @@ const layerCodexAppServerClientFactoryCommand = (
           );
           return {
             ...client,
-            terminateSession: terminateCodexProcess(handle, input.providerSessionId),
+            awaitSessionExit: awaitCodexProcessExit(handle, input.providerSessionId),
           };
         }),
       });
@@ -1705,7 +1704,7 @@ export const layerAppServerClientFactory: Layer.Layer<
         );
         return {
           ...client,
-          terminateSession: terminateCodexProcess(handle, input.providerSessionId),
+          awaitSessionExit: awaitCodexProcessExit(handle, input.providerSessionId),
         };
       }),
     });
@@ -6899,7 +6898,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeTurnId: context.nativeTurnId,
               status: "failed",
               completedAt: yield* DateTime.now,
-              failureMessage: "Codex app-server stopped after Stop could not be confirmed.",
+              failureMessage: "Codex app-server exited.",
             });
           }
           for (const context of (yield* Ref.get(settledTurns)).values()) {
@@ -6944,10 +6943,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 event.providerSession.status === "stopped",
             ),
           ),
-          ...(client.terminateSession === undefined
+          ...(client.awaitSessionExit === undefined
             ? {}
             : {
-                terminateSession: client.terminateSession.pipe(
+                awaitSessionExit: client.awaitSessionExit.pipe(
                   // Artifact settlement must survive cancellation of the caller's bounded exit wait.
                   Effect.andThen(settleExitedSession().pipe(Effect.forkIn(scope), Effect.asVoid)),
                 ),

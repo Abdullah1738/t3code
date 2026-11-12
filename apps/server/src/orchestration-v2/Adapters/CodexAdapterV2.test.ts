@@ -1136,16 +1136,17 @@ describe("CodexAdapterV2 dynamic tool projection", () => {
 });
 
 it.effect.each(["clean", "signal"] as const)(
-  "forced Codex shutdown confirms %s exit of its captured process handle",
+  "observes %s Codex process exit without killing the shared handle",
   (exitKind) =>
     Effect.gen(function* () {
-      const killed = yield* Deferred.make<void>();
+      const waitingForExit = yield* Deferred.make<void>();
       const exited = yield* Deferred.make<void>();
       let signal: string | undefined;
       const handle = {
         pid: ChildProcessSpawner.ProcessId(1234),
         isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
-        exitCode: Deferred.await(exited).pipe(
+        exitCode: Deferred.succeed(waitingForExit, undefined).pipe(
+          Effect.andThen(Deferred.await(exited)),
           Effect.andThen(
             exitKind === "signal"
               ? Effect.fail(
@@ -1162,7 +1163,7 @@ it.effect.each(["clean", "signal"] as const)(
         kill: (options?: { readonly killSignal?: string }) =>
           Effect.sync(() => {
             signal = options?.killSignal;
-          }).pipe(Effect.andThen(Deferred.succeed(killed, undefined))),
+          }),
         stdin: Sink.drain,
         stdout: Stream.never,
         stderr: Stream.never,
@@ -1192,9 +1193,9 @@ it.effect.each(["clean", "signal"] as const)(
         settings: DEFAULT_CODEX_SETTINGS,
         environment: {},
       });
-      const stopping = yield* client.terminateSession!.pipe(Effect.forkScoped);
-      yield* Deferred.await(killed);
-      assert.equal(signal, "SIGKILL");
+      const stopping = yield* client.awaitSessionExit!.pipe(Effect.forkScoped);
+      yield* Deferred.await(waitingForExit);
+      assert.isUndefined(signal);
       assert.isFalse(yield* Deferred.isDone(exited));
       assert.isUndefined(stopping.pollUnsafe());
       yield* Deferred.succeed(exited, undefined);
@@ -2466,7 +2467,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       request: ProviderContinuationRequests.ProviderContinuationRequest,
     ) => Effect.Effect<void> = () => Effect.void,
     environment: NodeJS.ProcessEnv = {},
-    terminateSession?: ProviderAdapter.ProviderAdapterV2SessionRuntime["terminateSession"],
+    awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"],
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2494,7 +2495,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   (client) =>
                     ({
                       ...client,
-                      ...(terminateSession === undefined ? {} : { terminateSession }),
+                      ...(awaitSessionExit === undefined ? {} : { awaitSessionExit }),
                       request: (method, params) =>
                         onRequest(method, params).pipe(
                           Effect.andThen(client.request(method, params)),
@@ -3458,7 +3459,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           }),
         );
       }
-      const stoppingFiber = yield* harness.runtime.terminateSession!.pipe(Effect.forkScoped);
+      const stoppingFiber = yield* harness.runtime.awaitSessionExit!.pipe(Effect.forkScoped);
       yield* Deferred.await(stopping);
       assert.lengthOf(harness.terminalEvents(), 0);
       yield* Deferred.succeed(exited, undefined);
@@ -6921,7 +6922,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       );
       yield* harness.firstTerminal;
       assert.isTrue(yield* harness.hasPendingBackgroundWork);
-      yield* harness.runtime.terminateSession!;
+      yield* harness.runtime.awaitSessionExit!;
       yield* Deferred.await(stopped);
       const commandEvents = harness.events.filter(
         (event) =>
