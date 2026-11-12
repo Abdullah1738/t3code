@@ -37,6 +37,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
 
@@ -1539,19 +1540,10 @@ describe("OrchestratorMcpService provider resolution", () => {
           yield* Deferred.await(finished);
           assert.isDefined(completed);
           const outcome = yield* Fiber.join(pending);
-          if (stage === "result") {
-            assert.isTrue(Exit.isFailure(outcome));
-            if (Exit.isFailure(outcome)) {
-              const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
-              assert.equal(error.code, "delegation_timeout");
-              assert.include(error.message, taskId);
-            }
-          } else {
-            assert.isTrue(Exit.isSuccess(outcome));
-            if (Exit.isSuccess(outcome)) {
-              assert.equal(outcome.value.taskId, taskId);
-              assert.isTrue(outcome.value.waitTimedOut);
-            }
+          assert.isTrue(Exit.isSuccess(outcome));
+          if (Exit.isSuccess(outcome)) {
+            assert.equal(outcome.value.taskId, taskId);
+            assert.equal(outcome.value.waitTimedOut, stage !== "result");
           }
           // Replay uses the same command, even after an accepted call lost its response.
           const retry = yield* service.delegateTask(scope, { ...input, mode: "async" });
@@ -1675,6 +1667,7 @@ describe("OrchestratorMcpService provider resolution", () => {
 
   it.effect.each([
     "preparation",
+    "shutdown",
     "run creation",
     "read",
     "acknowledgement",
@@ -1788,7 +1781,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           }),
           Layer.mock(ThreadLaunchService.ThreadLaunchService)({
             prepareRun: () =>
-              (held === "preparation"
+              (held === "preparation" || held === "shutdown"
                 ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
                 : Effect.void
               ).pipe(Effect.andThen(Deferred.succeed(preparationDone, undefined))),
@@ -1807,6 +1800,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           Layer.mock(SecretRequests.SecretRequests)({}),
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
         );
+        const lifetime = yield* Scope.make();
+        const context = yield* Layer.buildWithScope(
+          OrchestratorMcpService.layer.pipe(Layer.provide(dependencies)),
+          lifetime,
+        );
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const call = yield* service
@@ -1818,6 +1816,17 @@ describe("OrchestratorMcpService provider resolution", () => {
             })
             .pipe(Effect.forkScoped);
           yield* Deferred.await(entered);
+          if (held === "shutdown") {
+            yield* Scope.close(lifetime, Exit.void);
+            const outcome = yield* Fiber.await(call);
+            assert.isTrue(Exit.isFailure(outcome));
+            if (Exit.isFailure(outcome)) {
+              const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
+              assert.equal(error.code, "orchestration_error");
+              assert.include(error.message, "same clientRequestId");
+            }
+            return;
+          }
           if (held === "acknowledgement") yield* Deferred.await(followUpEntered);
           yield* TestClock.adjust(270_000);
           assert.isDefined(
@@ -1828,7 +1837,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(result.taskId, taskId);
           assert.equal(result.childThreadId, childThreadId);
           assert.isTrue(result.waitTimedOut);
-          assert.equal(result.startPending, held !== "acknowledgement");
+          assert.equal(result.startPending, held !== "acknowledgement" && held !== "wake policy");
           if (held === "acknowledgement") assert.equal(result.status, "completed");
           if (held === "run creation") assert.isNull(result.childRunId);
           if (held === "wake policy") yield* Deferred.await(followUpEntered);
@@ -1836,7 +1845,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           if (held === "preparation") yield* Deferred.await(preparationDone);
           if (held === "wake policy" || held === "acknowledgement")
             yield* Deferred.await(followUpDone);
-        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+        }).pipe(Effect.provideContext(context), Effect.ensuring(Scope.close(lifetime, Exit.void)));
       }),
     ),
   );
@@ -1954,13 +1963,17 @@ describe("OrchestratorMcpService provider resolution", () => {
 
   it.effect.each([
     { mode: "async", legacy: false },
+    { mode: "async", legacy: false, parentRestart: true },
     { mode: "wait", legacy: false },
+    { mode: "wait", legacy: false, stillRunning: true },
     { mode: "async", legacy: true },
     { mode: "wait", legacy: true },
   ] as const)(
-    "replays the same delegation after credential renewal ($mode, legacy=$legacy)",
-    ({ mode, legacy }) =>
-      Effect.scoped(
+    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning)",
+    (testCase) => {
+      const { mode, legacy } = testCase;
+      const stillRunning = "stillRunning" in testCase;
+      return Effect.scoped(
         Effect.gen(function* () {
           const driver = ProviderDriverKind.make("codex");
           const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
@@ -2092,6 +2105,26 @@ describe("OrchestratorMcpService provider resolution", () => {
             }
             const first = yield* Fiber.join(firstCall);
             assert.equal(first.waitTimedOut, mode === "wait");
+            if ("parentRestart" in testCase) {
+              const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+              yield* orchestrator.dispatch({
+                type: "run.interrupt",
+                commandId: CommandId.make("restart-parent:interrupt"),
+                threadId: parentThreadId,
+                runId: parent.runs[0]!.id,
+              });
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make("restart-parent:resume"),
+                threadId: parentThreadId,
+                messageId: MessageId.make("restart-parent:message"),
+                text: "Continue after restart.",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+            }
             const renewedScope = {
               ...scope,
               requestNamespace: "provider-session:renewed",
@@ -2104,28 +2137,73 @@ describe("OrchestratorMcpService provider resolution", () => {
               yield* Deferred.await(secondWatch);
               yield* TestClock.adjust(500);
               assert.isUndefined(retry.pollUnsafe(), "retry must wait for the existing child");
-              yield* orchestrator.dispatch({
-                type: "run.interrupt",
-                commandId: CommandId.make("interrupt-child"),
-                threadId: first.childThreadId,
-                runId: first.childRunId!,
-              });
+              if (stillRunning) {
+                yield* TestClock.adjust(500);
+                assert.isDefined(retry.pollUnsafe(), "a replay must answer inside its own budget");
+              } else
+                yield* orchestrator.dispatch({
+                  type: "run.interrupt",
+                  commandId: CommandId.make("interrupt-child"),
+                  threadId: first.childThreadId,
+                  runId: first.childRunId!,
+                });
             }
             const replayed = yield* Fiber.join(retry);
             assert.equal(replayed.taskId, first.taskId);
             assert.equal(replayed.childThreadId, first.childThreadId);
             assert.equal(replayed.childRunId, first.childRunId);
             if (mode === "wait") {
-              assert.equal(replayed.status, "interrupted");
-              assert.isFalse(replayed.waitTimedOut);
+              assert.equal(replayed.status, stillRunning ? "running" : "interrupted");
+              assert.equal(replayed.waitTimedOut, stillRunning);
             }
-            const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+            const parentBeforeSend = yield* orchestrator.getThreadProjection(parentThreadId);
+            const childBeforeSend = yield* orchestrator.getThreadProjection(first.childThreadId);
+            assert.equal(parentBeforeSend.subagents.length, 1);
+            assert.equal(childBeforeSend.runs.length, 1);
+            const send = {
+              threadId: first.childThreadId,
+              message: "Follow up.",
+              mode: "queue" as const,
+              clientRequestId: "send-across-rebind",
+            };
+            if (legacy) {
+              const threads = yield* ThreadManagementService.ThreadManagementService;
+              yield* threads.sendToThread({
+                projectId,
+                threadId: first.childThreadId,
+                senderThreadId: parentThreadId,
+                commandId: CommandId.make(
+                  "command:mcp:expired-binding:thread-send:send-across-rebind",
+                ),
+                messageId: MessageId.make(
+                  "message:mcp:expired-binding:thread-send:send-across-rebind",
+                ),
+                text: send.message,
+                attachments: [],
+                mode: "queue",
+                createdBy: "agent",
+                creationSource: "mcp",
+              });
+            }
+            const sent = yield* service.sendToThread(scope, send);
+            const afterSend = yield* orchestrator.getThreadProjection(first.childThreadId);
+            const resent = yield* service.sendToThread(renewedScope, send);
+            assert.equal(resent.messageId, sent.messageId);
+            if (legacy)
+              assert.equal(
+                sent.messageId,
+                "message:mcp:expired-binding:thread-send:send-across-rebind",
+              );
             const child = yield* orchestrator.getThreadProjection(first.childThreadId);
-            assert.equal(parent.subagents.length, 1);
-            assert.equal(child.runs.length, 1);
+            assert.equal(child.runs.length, afterSend.runs.length);
+            assert.equal(
+              child.messages.filter((message) => message.id === sent.messageId).length,
+              1,
+            );
           }).pipe(Effect.provide(layerTest));
         }).pipe(Effect.provide(NodeServices.layer)),
-      ),
+      );
+    },
   );
 
   it.effect(

@@ -1231,7 +1231,10 @@ const make = Effect.gen(function* () {
       Stream.runHead,
       Effect.timeoutOption(
         Duration.millis(
-          Math.max(0, input.timeoutMs - Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1_000_000),
+          Math.max(
+            0,
+            input.timeoutMs - Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1_000_000,
+          ),
         ),
       ),
     );

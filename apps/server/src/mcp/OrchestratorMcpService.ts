@@ -79,6 +79,8 @@ import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskPr
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
+import * as Scope from "effect/Scope";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -701,6 +703,13 @@ function stablePart(value: string): string {
   return encodeURIComponent(value);
 }
 
+function requestIdentity(scope: McpInvocationScope): string {
+  // Credentials change across catalog refreshes and restarts; the caller thread does not.
+  return scope.thread === undefined
+    ? scope.requestNamespace
+    : `thread:${stablePart(scope.environmentId)}:${stablePart(scope.thread.threadId)}`;
+}
+
 function stableCommandId(input: {
   readonly scope: McpInvocationScope;
   readonly requestKey: string;
@@ -711,7 +720,7 @@ function stableCommandId(input: {
     [
       "command",
       "mcp",
-      stablePart(input.scope.requestNamespace),
+      stablePart(requestIdentity(input.scope)),
       stablePart(input.operation),
       stablePart(input.requestKey),
       ...(input.index === undefined ? [] : [String(input.index)]),
@@ -770,7 +779,7 @@ function stableThreadId(input: {
     [
       "thread",
       "mcp",
-      stablePart(input.scope.requestNamespace),
+      stablePart(requestIdentity(input.scope)),
       stablePart(input.requestKey),
       String(input.index),
     ].join(":"),
@@ -786,7 +795,7 @@ function stableMessageId(input: {
     [
       "message",
       "mcp",
-      stablePart(input.scope.requestNamespace),
+      stablePart(requestIdentity(input.scope)),
       stablePart(input.requestKey),
       String(input.index),
     ].join(":"),
@@ -802,7 +811,7 @@ function stableOperationMessageId(input: {
     [
       "message",
       "mcp",
-      stablePart(input.scope.requestNamespace),
+      stablePart(requestIdentity(input.scope)),
       stablePart(input.operation),
       stablePart(input.requestKey),
     ].join(":"),
@@ -1063,7 +1072,23 @@ function timelineItem(input: {
 }
 
 const make = Effect.gen(function* () {
-  const serviceScope = yield* Effect.scope;
+  const lifetime = yield* Effect.scope;
+  const serviceScope = yield* Scope.fork(lifetime);
+  const stopping = yield* Deferred.make<void>();
+  // Wake HTTP callers before closing the service-owned preparation/observation fibers.
+  yield* Scope.addFinalizer(lifetime, Deferred.succeed(stopping, undefined));
+  const untilShutdown = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.raceFirst(
+      effect.pipe(McpDeadline.awaitInterruptibly),
+      Deferred.await(stopping).pipe(
+        Effect.andThen(
+          failure(
+            "orchestration_error",
+            "The server is shutting down. Retry after reconnecting; reuse the same clientRequestId for delegate_task.",
+          ),
+        ),
+      ),
+    );
   const crypto = yield* Crypto.Crypto;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const progressGuard = yield* Effect.serviceOption(
@@ -2491,7 +2516,9 @@ const make = Effect.gen(function* () {
           yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
         }
       }).pipe(
-        Effect.timeoutOption(Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs))),
+        Effect.timeoutOption(
+          Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
+        ),
         Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : closeCard)),
       );
       if (Option.isNone(answered)) yield* closeCard;
@@ -2792,10 +2819,7 @@ const make = Effect.gen(function* () {
       const response = yield* Fiber.join(continuation).pipe(
         Effect.timeoutOption(
           Duration.millis(
-            yield* remainingWaitMs(
-              waitStartedAt,
-              input.mode === "wait" ? input.timeoutMs : MAX_WAIT_TIMEOUT_MS,
-            ),
+            yield* remainingWaitMs(waitStartedAt, input.mode === "wait" ? input.timeoutMs : 10_000),
           ),
         ),
         // A disconnect must not leave an event subscription behind. Interrupt
@@ -2847,7 +2871,7 @@ const make = Effect.gen(function* () {
           );
       }
       return answer;
-    }),
+    }, untilShutdown),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
       yield* requireCapability(scope);
@@ -2884,7 +2908,7 @@ const make = Effect.gen(function* () {
         (reader) => Fiber.interrupt(reader).pipe(Effect.forkIn(serviceScope), Effect.asVoid),
       );
       return Option.isSome(result) ? result.value : partial;
-    }),
+    }, untilShutdown),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");
       const current = yield* readTask(scope, input.taskId);
@@ -3389,12 +3413,32 @@ const make = Effect.gen(function* () {
 
       const mode = input.mode ?? "auto";
       const key = yield* requestKey(input.clientRequestId);
-      const messageId = stableOperationMessageId({
-        scope,
-        requestKey: key,
-        operation: "thread-send",
-      });
-      const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-send" });
+      // Recover sends accepted by older builds before the caller's credential was rebound.
+      const prior =
+        scope.thread === undefined
+          ? undefined
+          : target.messages.find((message) => {
+              const parts = message.id.split(":");
+              return (
+                message.senderThreadId === scope.thread?.threadId &&
+                parts.length === 5 &&
+                parts[0] === "message" &&
+                parts[1] === "mcp" &&
+                parts[3] === "thread-send" &&
+                parts[4] === stablePart(key)
+              );
+            });
+      const messageId =
+        prior?.id ??
+        stableOperationMessageId({
+          scope,
+          requestKey: key,
+          operation: "thread-send",
+        });
+      const commandId =
+        prior === undefined
+          ? stableCommandId({ scope, requestKey: key, operation: "thread-send" })
+          : CommandId.make(`command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`);
       const result = yield* threadManagement
         .sendToThread({
           projectId: target.thread.projectId,
@@ -3429,22 +3473,49 @@ const make = Effect.gen(function* () {
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
       const waitStartedAt = yield* Clock.monotonicTimeNanos;
-      const { target } = yield* loadScopedThread(scope, input.threadId);
-      const result = yield* threadManagement
-        .waitForThread({
-          projectId: target.thread.projectId,
+      let snapshot: OrchestratorMcpThreadWaitResult | undefined;
+      const waiting = Effect.gen(function* () {
+        const { target } = yield* loadScopedThread(scope, input.threadId);
+        const selected =
+          input.runId === undefined
+            ? target.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
+            : target.runs.find((run) => run.id === input.runId);
+        snapshot = {
           threadId: input.threadId,
-          ...(input.runId === undefined ? {} : { runId: input.runId }),
-          timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
-        })
-        .pipe(Effect.mapError(threadManagementFailure));
-      return {
-        threadId: input.threadId,
-        runId: result.run?.id ?? null,
-        status: result.run === null ? "idle" : runOutcome(result.run),
-        timedOut: result.timedOut,
-      } satisfies OrchestratorMcpThreadWaitResult;
-    }),
+          runId: selected?.id ?? null,
+          status: selected === undefined ? "idle" : runOutcome(selected),
+          timedOut: true,
+        };
+        const result = yield* threadManagement
+          .waitForThread({
+            projectId: target.thread.projectId,
+            threadId: input.threadId,
+            ...(input.runId === undefined ? {} : { runId: input.runId }),
+            timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+        return {
+          threadId: input.threadId,
+          runId: result.run?.id ?? null,
+          status: result.run === null ? "idle" : runOutcome(result.run),
+          timedOut: result.timedOut,
+        } satisfies OrchestratorMcpThreadWaitResult;
+      });
+      const result = yield* waiting.pipe(
+        McpDeadline.awaitInterruptibly,
+        Effect.timeoutOption(
+          Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
+        ),
+      );
+      if (Option.isSome(result)) return result.value;
+      return (
+        snapshot ??
+        (yield* failure(
+          "orchestration_error",
+          "Thread wait timed out during lookup. Retry t3_thread_wait after reconnecting.",
+        ))
+      );
+    }, untilShutdown),
     interruptThread: Effect.fn("OrchestratorMcpService.interruptThread")(function* (scope, input) {
       const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
       yield* assertLiveCallerForOtherThread(scope, parent, target);

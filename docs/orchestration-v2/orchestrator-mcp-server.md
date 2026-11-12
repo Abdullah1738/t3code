@@ -262,7 +262,7 @@ the timeout expires. The total budget starts at call entry, includes setup, and 
 capped at 4 minutes 30 seconds. A wait timeout does not cancel the child; the result sets
 `waitTimedOut: true`, and the caller can continue with `task_status`. If the transport loses the
 response, retry `delegate_task` with the same `clientRequestId` from the same parent thread to
-recover the same task without starting another child, even after its MCP credential is renewed.
+recover the same task without starting another child, even after a reconnect, a 5xx, a tool-catalog refresh, or a restart.
 Once accepted, preparation continues independently of the response deadline. If preparation or a
 status read cannot finish within the budget, the response carries the accepted identity and the
 last observed state; `startPending: true` means the child has not started yet. A pending blocking
@@ -506,8 +506,9 @@ results use the latest assistant content from the final work turn.
 - A requested model must be advertised by the selected provider when the
   provider publishes a model list.
 - Delegation keys `clientRequestId` by environment and parent thread, so renewed
-  MCP credentials still recover the same task. Other tools derive stable command,
-  thread, and message IDs within the provider session.
+  MCP credentials still recover the same task. The other keyed orchestration tools
+  also use the caller thread for command, thread, and message IDs; standalone
+  client credentials retain their client-session namespace.
 - Calls without `clientRequestId` receive a generated request key and create
   new work.
 
