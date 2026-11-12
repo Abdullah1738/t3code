@@ -7154,3 +7154,223 @@ test.each(["replace", "clear", "create"])("failed-inbound defers alerts until a 
     expect(reads).toContain("ses_admitted"); expect(alerts).toEqual([]);
   }
 });
+
+
+test("a pending wake and an unfinished child scan cannot hold the next completion poll", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  h.input("owner-1037", "Run the audit");
+  await h.router.tick();
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  h.backend.states.ses_1 = { type: "busy" };
+  h.backend.messagesBehavior = async () => [...h.backend.records];
+  let release!: (children: SessionRecord[]) => void;
+  const children = new Promise<SessionRecord[]>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const scanning = new Promise<void>(resolve => { entered = resolve; });
+  h.backend.children = async () => { entered(); return children; };
+  const timeout = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 100) { expire = callback; return timeout(() => {}, 60_000); }
+    return timeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  h.input("wake:75ec", "Child update");
+  const tick = h.router.tick();
+  await scanning;
+  h.backend.final("Audit complete");
+  expire?.();
+  // A router tick must finish even while discovery has not answered. No timeout or sleep drives this proof.
+  let finished = false;
+  void tick.then(() => { finished = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    expect(finished).toBe(true);
+    await h.router.tick();
+    expect(events.filter(event => event === "run-completed-seen")).toHaveLength(1);
+    expect(h.conversations().map(op => op.text)).toContain("Audit complete");
+    expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.find(record => record.type === "idle")!.id });
+  } finally { timer.mockRestore(); release([]); await tick; }
+});
+
+test.each([false, true])("a busy wake seals once and dispatches once after idle (restart=%s)", async restart => {
+  setSystemTime(10_000);
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "first-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  // No records yet for a resumed run: the watch must not invent ownership of its old watermark.
+  h.input("wake:75ec", "Child update");
+  await h.router.tick();
+  let router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  for (let i = 1; i <= 3; i++) {
+    setSystemTime(10_000 + i * 30_000);
+    await router.tick();
+  }
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(2); // owner + wake
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  delete h.backend.states.ses_1;
+  await router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts.at(-1)!.messageId).toBe(messageId("wake:75ec"));
+  h.backend.final("Child done");
+  await router.tick();
+  await router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.conversations().map(op => op.text)).toEqual(["Child done"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+
+test("deferred wakes keep their order and each prompt is admitted once", async () => {
+  const events: string[][] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: (event, id) => { events.push([event, id ?? ""]); } });
+  await exchange(h, "owner-order-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:first-1037", "First result");
+  await h.router.tick();
+  h.input("wake:second-1037", "Second result");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  delete h.backend.states.ses_1;
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("First result");
+  h.backend.final("First delivered");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Second result");
+  h.backend.final("Second delivered");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([
+    messageId("owner-order-1037"), messageId("wake:first-1037"), messageId("wake:second-1037"),
+  ]);
+  expect(events.filter(([event]) => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(([event]) => event === "wake-deferred")).toHaveLength(1);
+  expect(h.conversations().map(op => op.text)).toEqual(["First delivered", "Second delivered"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test("a reset carries a deferred wake into the fresh route exactly once", async () => {
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER });
+  await exchange(h, "owner-reset-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:cancel-1037", "Stale result");
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:wake:cancel-1037")).toBe("deferred-wake");
+  delete h.backend.states.ses_1;
+  h.input("reset-1037", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "wake:cancel-1037")).toMatchObject({ state: "done" });
+  expect(h.backend.prompts.filter(prompt => prompt.text === "Stale result")).toMatchObject([{ id: "ses_2", messageId: messageId("wake:cancel-1037") }]);
+});
+
+
+test("an arrival during a deferred multi-wake retry preserves its sealed membership", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "owner-members-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:member-a", "First result");
+  h.input("wake:member-b", "Second result");
+  await h.router.tick();
+  delete h.backend.states.ses_1;
+  h.backend.onStatuses = () => {
+    h.backend.onStatuses = undefined;
+    h.input("arrival-1037", "One more thing");
+  };
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "wake:member-b")).toMatchObject({ state: "batched" });
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("One more thing");
+  h.backend.final("Noted");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("First result\nSecond result");
+  h.backend.final("Both handled");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+});
+
+
+test.each([1, 2, 3])("a wake leaving backoff cannot absorb a deferred batch (%s members)", async count => {
+  setSystemTime(10_000);
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "owner-backoff-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:older-1037", "Older result");
+  h.store.set("synthetic-retry:wake:older-1037", { attempts: 0, nextAt: 40_000, prompts: [] });
+  const ids = Array.from({ length: count }, (_, index) => `wake:deferred-${index}`);
+  ids.forEach((id, index) => h.input(id, `Deferred ${index}`));
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(40_000);
+  delete h.backend.states.ses_1;
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Older result");
+  h.backend.final("Older handled");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(ids.map((_, index) => `Deferred ${index}`).join("\n"));
+  h.backend.final("Deferred handled");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([
+    messageId("owner-backoff-1037"), messageId("wake:older-1037"), messageId(ids[0]!),
+  ]);
+  expect(inbounds(h.store).filter(row => ids.includes(row.id)).every(row => row.state === "done")).toBe(true);
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+
+test.each(["permission", "question"] as const)("an incomplete child scan cannot retire its request handover (%s)", async kind => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "owner-scan-1037", "Start work", "Started");
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  const child: SessionRecord = { id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } };
+  h.backend.childSessions = [child];
+  if (kind === "permission") h.backend.permissionRequests = [permission("slow-1037", child.id)];
+  else h.backend.questionRequests = [{ ...question({}, "slow-1037"), sessionID: child.id }];
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  expect(asked(h.store)).toHaveLength(0);
+  h.routerOptions.watchMs = Number.MAX_SAFE_INTEGER;
+  let release!: (children: SessionRecord[]) => void;
+  const children = new Promise<SessionRecord[]>(resolve => { release = resolve; });
+  h.backend.children = async () => children;
+  const timeout = globalThis.setTimeout;
+  let budget!: () => void;
+  let reached = new Promise<void>(resolve => { budget = resolve; });
+  let expire!: () => void;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 100) { expire = callback; budget(); return timeout(() => {}, 60_000); }
+    return timeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  try {
+    for (const at of [10_000, 30_000, 50_000]) {
+      setSystemTime(at);
+      const tick = h.router.tick();
+      await reached;
+      // Later scans on this same tick must not introduce another clock wait.
+      reached = new Promise<void>(resolve => { budget = resolve; });
+      expire();
+      await tick;
+      expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+    }
+  } finally { timer.mockRestore(); release([child]); await new Promise<void>(resolve => setImmediate(resolve)); }
+  await h.router.tick();
+  expect(asked(h.store)).toHaveLength(1);
+  expect(h.router.routerStatus().pending).toMatchObject([{ id: "slow-1037", kind, sessionId: child.id }]);
+  deliver(h.store);
+  h.input("answer-scan-1037", kind === "permission" ? "yes" : "1");
+  await h.router.tick();
+  expect(kind === "permission" ? h.backend.permissionReplies : h.backend.questionReplies).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+});
