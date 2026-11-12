@@ -1,6 +1,7 @@
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
+import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed } from './pause.mjs';
 import * as realIo from "./io.mjs";
 import { truncate } from "./detect.mjs";
 import { cutoverOwns, isOpenCodeSessionId, openCodeSession, recoveryOwned } from './harness.mjs';
@@ -24,6 +25,8 @@ async function mapLimit(items, limit, fn) {
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
 export async function stallScan({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
+  assertRecoveryActive(io);
+  io = guardRecoveryIo(io);
   const iso = new Date(now).toISOString();
   const cutover = await io.harnessCutoverStatus();
   const active = new Set([...(await io.activeSessions())].filter(isOpenCodeSessionId));
@@ -33,6 +36,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       const messages = await io.ocTail(ses, 2);
       if (messages) tails.set(ses, messages);
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       if (verbose) log(`stall: ${ses} tail failed: ${errText(err)}`);
     }
   });
@@ -53,16 +57,19 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
   const notify = (id, stall) => {
     const summary = buildStallSummary(stall);
     if (dryRun) return log(`summary (${summary.severity}):\n${summary.text}`);
+    assertRecoveryActive(io);
     stall.telegramTries = (stall.telegramTries ?? 0) + 1;
     try {
       io.telegram({ text: summary.text, severity: summary.severity, key: `stream-recovery:${id}` });
       stall.telegram = true;
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       stall.telegram = false;
       log(`telegram failed (${stall.telegramTries}/${MAX_TRIES}): ${errText(err)}`);
     }
   };
   const finish = (id, stall, outcome, detail) => {
+    assertRecoveryActive(io);
     Object.assign(stall, { outcome, detail: detail ?? null, done: true, doneAt: iso });
     stall.summary = buildStallSummary(stall).text.split("\n")[0];
     log(`stall ${id}: ${outcome}${detail ? ` (${detail})` : ""} | ${truncate(stall.title, 60)}`);
@@ -74,11 +81,13 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover owns continuation; no recovery action' });
       return;
     }
+    assertRecoveryActive(io);
     stall.ocTries = (stall.ocTries ?? 0) + 1;
     try {
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
       stall.ocTried = now;
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       stall.errors.push(`opencode interrupt: ${errText(err)}`);
       if (stall.ocTries >= MAX_TRIES) stall.ocTried = now;
     }
@@ -91,17 +100,19 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
 
   // Follow up on stalls interrupted by earlier scans.
   for (const [id, stall] of open) {
+    assertRecoveryActive(io);
     if (!isOpenCodeSessionId(stall.ses) || cutoverOwns(cutover, stall.threadId, [stall.runId])) {
       Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover or native session; no recovery action' });
       continue;
     }
-    const age = now - stall.interruptedAt;
+    const age = recoveryElapsed(io, stall.interruptedAt, now);
     const ocDone = sessionLetGo({ stall, active: active.has(stall.ses), fp: fps.get(stall.ses) ?? null });
     let thread = null;
     if (stall.threadId) {
       try {
         thread = await io.getThread(stall.threadId);
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         // Robob can't be read, but the OpenCode fallback doesn't need it.
         if (verbose) log(`stall ${id}: thread read failed: ${errText(err)}`);
         if (age >= GIVE_UP_MS) finish(id, stall, "failed", `could not read the Robob thread: ${errText(err)}`);
@@ -122,6 +133,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           await io.sendToThread(stall.threadId, buildStallNote(stall), { clientRequestId: `${id}:note`, mode: "queue" });
           stall.noted = true;
         } catch (err) {
+          if (isRecoveryPaused(err)) throw err;
           stall.errors.push(`note: ${errText(err)}`);
           if (age >= GIVE_UP_MS) finish(id, stall, "failed", "interrupted, but the carry-on note was not sent");
           continue;
@@ -163,6 +175,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       if (activity.kind === "subagent") childActive = (await io.ocChildren(ses)).some((c) => active.has(c));
       if (info?.parentID) parentTitle = (await io.ocSession(info.parentID).catch(() => null))?.title ?? null;
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       log(`stall: ${ses} gather failed: ${errText(err)}`);
       continue;
     }
@@ -189,11 +202,16 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     report.push({ id, ...stall });
     if (dryRun) continue;
     if (thread && await recoveryOwned(io, thread.threadId, [thread.activeRunId])) continue;
+    assertRecoveryActive(io);
     state.stalls[id] = stall;
     if (plan.action === "report") {
       finish(id, stall, "report");
     } else if (plan.action === "opencode") {
-      await ocStop(stall);
+      try { await ocStop(stall); }
+      catch (err) {
+        if (isRecoveryPaused(err) && !stall.ocTries) delete state.stalls[id];
+        throw err;
+      }
     } else {
       try {
         const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
@@ -207,6 +225,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           await ocStop(stall);
         }
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }
@@ -218,6 +237,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
   try {
     live = await io.activeThreads();
   } catch (err) {
+    if (isRecoveryPaused(err)) throw err;
     if (verbose) log(`stall: thread list failed: ${errText(err)}`);
   }
   if (live) {
@@ -234,6 +254,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses
           && !(await recoveryOwned(io, t.threadId, [g.runId]));
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         if (verbose) log(`stall: ghost re-check failed: ${errText(err)}`);
         return false;
       }
@@ -248,6 +269,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       try {
         lastMs = tailActivity((await io.ocTail(g.ses, 2)) ?? []).lastMs;
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         if (verbose) log(`stall: ${g.ses} tail failed: ${errText(err)}`);
         continue;
       }
@@ -271,6 +293,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       log(`stall ${id}: ${plan.action} | ${truncate(stall.title, 60)} | ghost run ${Math.round(quietMs / 60_000)}m | ${plan.reason}${dryRun ? " (dry run)" : ""}`);
       report.push({ id, ...stall });
       if (dryRun) continue;
+      assertRecoveryActive(io);
       state.stalls[id] = stall;
       if (plan.action === "report") {
         finish(id, stall, "report");
@@ -287,6 +310,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           Object.assign(stall, { runId: null, note: false });
         }
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }

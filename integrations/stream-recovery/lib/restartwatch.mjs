@@ -1,6 +1,7 @@
 // Restart watch: spot interrupted native subagents, delegated tasks and turns,
 // tell each parent thread what it lost (once), and send one summary per restart.
 // The caller loads and saves state.
+import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed } from './pause.mjs';
 import * as realIo from "./io.mjs";
 import { createHash } from 'node:crypto';
 import { cutoverOwns, openCodeSession, recoveryOwned } from './harness.mjs';
@@ -191,7 +192,7 @@ async function handleThread({ io, db, incident, threadId, subs, getActive, dryRu
   for (const sub of candidates) lost.push(await lostSubagent({ io, db, sub, active, incident }));
   // Past the hold-back window a thread that is busy, or ran again after its
   // cut, has moved on; a late "carry on" note would only confuse it.
-  const windowOver = now - windowStart >= RESTART_RESUME_WINDOW_MS;
+  const windowOver = recoveryElapsed(io, windowStart, now) >= RESTART_RESUME_WINDOW_MS;
   const cutMs = Math.min(...[...cuts, ...subs].map((r) => toMs(r.completed_at)).filter(Number.isFinite), incident.endMs);
   const ranAgain = windowOver && !alreadySent && io.runStartedSince(db, threadId, isoOf(cutMs));
   const plan = planRestartThread({ thread: info, lost, turnCut, held: queued, ranAgain, windowOver, noteSent: alreadySent,
@@ -201,7 +202,7 @@ async function handleThread({ io, db, incident, threadId, subs, getActive, dryRu
     // Keep real owner messages, regardless of age. These pulses only ask the
     // lane to re-read its durable inbox, so replaying hours of them adds noise.
     const automated = r.user_message_id?.startsWith(`ardud-control:send:${threadId}:coord%3A`) && /^\[coord[\] ]/.test(r.text ?? '');
-    if (toMs(r.requested_at) < now - STALE_PULSE_MS && automated
+    if (recoveryElapsed(io, toMs(r.requested_at), now) > STALE_PULSE_MS && automated
       && !staleHeld.some((s) => s.run_id === r.run_id)) staleHeld.push(r);
   }
   const held = queued.filter((r) => !staleHeld.some((s) => s.run_id === r.run_id));
@@ -271,7 +272,7 @@ async function handleThread({ io, db, incident, threadId, subs, getActive, dryRu
       save();
     }
   } catch (err) {
-    if (err.code === 'REPLICA_UNAVAILABLE') throw err;
+    if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
     res.ok = false;
     res.error = errText(err);
   }
@@ -309,6 +310,8 @@ function stallInterrupted(state, ses, cancelMs, threadId = null) {
 }
 
 export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
+  assertRecoveryActive(io);
+  io = guardRecoveryIo(io);
   io.assertReplicaFresh(db);
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
@@ -347,6 +350,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
   let robobUp = null;
   for (const incident of incidents) {
     if (incident.serverStart) incident.serverStart.incidentId = incident.id;
+    assertRecoveryActive(io);
     const prev = state.handled[incident.id];
     if (prev?.done) {
       if (verbose) log(`${incident.id}: already handled`);
@@ -395,6 +399,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       }
     };
     for (const threadId of byThread.keys()) {
+      assertRecoveryActive(io);
       const list = recoveryIncident.subagents.filter((s) => s.parentThreadId === threadId);
       if (!list.length && !recoveryIncident.runs.some((r) => r.thread_id === threadId)) {
         const res = ownedResult(threadId);
@@ -425,14 +430,16 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         for (const sub of pendingTasks) {
           try {
             await handleLateDelegated({ io, db, incident: recoveryIncident, threadId, sub, dryRun, progress, save });
+            assertRecoveryActive(io);
             if (!dryRun) progress.lateFailures = 0;
           } catch (err) {
-            if (err.code === 'REPLICA_UNAVAILABLE') throw err;
+            if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
             failed = errText(err);
             failedTask = sub;
             break;
           }
         }
+        assertRecoveryActive(io);
         if (failed) {
           if (!dryRun) {
             progress.done = false;
@@ -465,6 +472,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       const progress = entry.threads[threadId] ??= {};
       try {
         res = await handleThread({ io, db, incident: recoveryIncident, threadId, subs: list, getActive, dryRun, now, windowStart, progress, save });
+        assertRecoveryActive(io);
         if (res?.ok && !res.deferred && !dryRun) {
           progress.done = true;
           if (!progress.initialDelegated) {
@@ -472,7 +480,8 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
           }
         }
       } catch (err) {
-        if (err.code === 'REPLICA_UNAVAILABLE') throw err;
+        if (err.code === 'REPLICA_UNAVAILABLE' || isRecoveryPaused(err)) throw err;
+        assertRecoveryActive(io);
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };
       }
       // A sent initial note can be recovered from its receipt even when the
@@ -513,6 +522,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         if (dryRun && res.note) log(`    note:\n${truncate(res.note, 1500)}`);
       }
     }
+    assertRecoveryActive(io);
     io.assertReplicaFresh(db);
     const summary = buildRestartSummary({ incident, results: all });
     // Archiving several threads at once also cancels their subagents; that is
@@ -537,6 +547,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       try {
         io.telegram({ text: summary.text, severity: summary.severity, key: `stream-recovery:${incident.id}` });
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         sent = false;
         log(`telegram failed: ${errText(err)}`);
       }

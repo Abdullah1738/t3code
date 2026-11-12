@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { assertRecoveryActive, loadControl, recoveryElapsed } from './pause.mjs';
 import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
 import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
 export { assertReplicaFresh, assertThreadInReplica } from './readonly-db.mjs';
@@ -394,6 +395,7 @@ export async function harnessCutoverStatus() {
 
 async function api(method, path, body) {
   const { url, token } = control();
+  if (method !== "GET") assertRecoveryActive({ readControl });
   const res = await fetch(`${url}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
@@ -475,6 +477,7 @@ export function installerResumePendingMs() {
 }
 
 export async function sendToThread(threadId, text, { clientRequestId, mode = "auto" } = {}) {
+  assertRecoveryActive({ readControl });
   return ctl("POST", `/threads/${encodeURIComponent(threadId)}/send`, { text, mode, clientRequestId });
 }
 
@@ -488,6 +491,7 @@ export async function threadByNative(ses) {
 }
 
 export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+  assertRecoveryActive({ readControl });
   return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
 }
 
@@ -498,6 +502,7 @@ export async function activeThreads() {
 
 // Orchestration command over the Robob WebSocket RPC (same path the web app uses).
 export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
+  assertRecoveryActive({ readControl });
   const { url, token } = control();
   const wsUrl = `${url.replace(/^http/, "ws")}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
@@ -514,9 +519,12 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
       fn(v);
     };
     const timer = setTimeout(() => finish(reject, new Error(`ws ${command.type}: timeout`)), timeoutMs);
-    ws.addEventListener("open", () =>
-      ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: "orchestration.dispatchCommand", payload: command, headers: [] })),
-    );
+    ws.addEventListener("open", () => {
+      try {
+        assertRecoveryActive({ readControl });
+        ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: "orchestration.dispatchCommand", payload: command, headers: [] }));
+      } catch (err) { finish(reject, err); }
+    });
     ws.addEventListener("message", (ev) => {
       const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
       const parsed = parse(raw);
@@ -542,6 +550,7 @@ async function oc(path, init = {}) {
     throw new Error('refusing OpenCode request for a non-OpenCode session ID');
   }
   ocAuth ??= "Basic " + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, "utf8").trim()}`).toString("base64");
+  if (init.method && init.method !== "GET") assertRecoveryActive({ readControl });
   const res = await fetch(`${OC_URL}${path}`, {
     ...init,
     headers: { authorization: ocAuth, ...(init.headers || {}) },
@@ -599,6 +608,7 @@ export async function ocChildren(ses) {
 
 // Returns true when OpenCode stopped an active execution, false when idle.
 export async function ocInterrupt(ses) {
+  assertRecoveryActive({ readControl });
   const res = await oc(`/api/session/${ses}/interrupt`, { method: "POST" });
   return Boolean(res?.interrupted ?? res?.data?.interrupted);
 }
@@ -606,6 +616,7 @@ export async function ocInterrupt(ses) {
 // ---------- Telegram ----------
 
 export function telegram({ text, severity = "info", key }) {
+  assertRecoveryActive({ readControl });
   const env = { ...process.env };
   delete env.BUN_INSPECT;
   const r = spawnSync(
@@ -617,6 +628,8 @@ export function telegram({ text, severity = "info", key }) {
 }
 
 // ---------- State + lock ----------
+
+export const readControl = () => loadControl(PATHS.dataDir);
 
 const statePath = () => join(PATHS.dataDir, "state.json");
 
@@ -633,7 +646,7 @@ export function saveState(state, now = Date.now()) {
   mkdirSync(PATHS.dataDir, { recursive: true });
   for (const key of ["handled", "stalls"]) {
     for (const [id, v] of Object.entries(state[key] ?? {})) {
-      if (now - Date.parse(v.at) > 14 * 86_400_000) delete state[key][id];
+      if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
     }
   }
   const tmp = `${statePath()}.tmp`;

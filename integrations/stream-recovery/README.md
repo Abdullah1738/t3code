@@ -32,6 +32,26 @@ block every later queued message.
 3. Sends one Telegram summary per incident (`stream-recovery:<incident id>`).
 
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
+
+Pause automatic recovery without restarting the watcher:
+
+```sh
+node cli.mjs pause --for 30m --reason "maintenance"
+node cli.mjs pause                         # until explicitly resumed
+node cli.mjs status --json
+node cli.mjs resume
+```
+
+Durations require a positive number and a unit (`ms`, `s`, `m`, `h`, `d`).
+Pause stops scans and recovery sends, queue changes, interrupts and summaries.
+A request already sent can still complete; the watcher records its result and
+stops further sends. Resume or expiry keeps pending work eligible and retains
+successful sends so they are not repeated. `status --json` reports pause state,
+pending incident/thread counts and the last successful scan, without message bodies.
+Control lives in `data/control.json`, separately from the scan ledger. Both use
+`STREAM_RECOVERY_DATA` when set. Resume clears the active pause and retains its
+time interval so the pause cannot use up recovery deadlines.
+
 An incident that hit errors is retried on later scans, up to 3 attempts.
 
 `STREAM_RECOVERY_DB` overrides the shared `ROBOB_READONLY_DB`; otherwise the
