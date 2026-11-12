@@ -691,6 +691,13 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
         packet(4, "working", { asks: [openAsk] }),
         packet(5, "working", { asks: [closedAsk] }),
         packet(6, "needs_owner", { settledAt: at }),
+        packet(7, "needs_owner", { asks: [{ ...openAsk, blocking: true, handedAt: at }] }),
+        packet(8, "todo", { activeThreadId: null, asks: [{ ...openAsk, clarifyAskedAt: at }] }),
+        packet(9, "todo", { activeThreadId: null, asks: [{ ...openAsk, expiresAt: at }] }),
+        packet(10, "todo", {
+          activeThreadId: null,
+          asks: [{ ...openAsk, snoozedUntil: "2999-01-01T00:00:00.000Z" }],
+        }),
       ];
       for (const entry of cards) yield* store.putCard(entry);
 
@@ -703,19 +710,30 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
           stage,
           settledAt,
           activeThreadId,
-          asks: asks.map(({ closedAt }) => ({ closedAt })),
+          // Whose turn it is travels with each ask; the keys stay absent when unset.
+          asks: asks.map(({ closedAt, clarifyAskedAt, handedAt, expiresAt, snoozedUntil }) => ({
+            closedAt,
+            ...(clarifyAskedAt === undefined ? {} : { clarifyAskedAt }),
+            ...(handedAt === undefined ? {} : { handedAt }),
+            ...(expiresAt === undefined ? {} : { expiresAt }),
+            ...(snoozedUntil === undefined ? {} : { snoozedUntil }),
+          })),
         })),
       );
-      assert.isBelow(JSON.stringify(summary).length, 2_000);
+      assert.isBelow(JSON.stringify(summary).length, 3_000);
       assert.isAbove(JSON.stringify(full).length, 600_000);
 
+      const nowMs = Date.parse(at) + 1;
       const fromFull = summaries(
         tallyBoards([{ board, cards: full, discussions: [], threadIds: [] }]),
+        nowMs,
       );
       const fromSummary = summaries(
         tallyBoards([{ board, cards: summary, discussions: [], threadIds: [] }]),
+        nowMs,
       );
       assert.deepStrictEqual(fromSummary, fromFull);
+      // Cards 3 and 4; the handed, waiting-on-asker, expired and snoozed asks (7 to 10) don't count.
       assert.equal(fromSummary[0]?.needsOwner, 2);
       assert.equal(fromSummary[0]?.running, 2);
 

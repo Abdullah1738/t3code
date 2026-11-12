@@ -45,6 +45,12 @@ export interface KanbanThreadPr {
   readonly url: string;
   readonly title: string | null;
   readonly state: "open" | "draft" | "merged" | "closed";
+  /** Its head commit while the thread watches the PR (the watch keeps it current); null otherwise. */
+  readonly head?: string | null;
+  /** Checks on the head as last synced; null when none were reported. */
+  readonly checks?: "passing" | "failing" | "pending" | null;
+  /** When its state and checks were last synced from the host; null when never. */
+  readonly at?: string | null;
 }
 
 export interface KanbanThreadView {
@@ -57,8 +63,10 @@ export interface KanbanThreadView {
   readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
-  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches don't count: they never end. */
+  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
+  /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
+  readonly prWatches: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
   readonly archived: boolean;
 }
@@ -136,7 +144,11 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
-  readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
+  /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
+  readonly interrupt: (
+    threadId: ThreadId,
+    reason: string,
+  ) => Effect.Effect<void, KanbanThreadError>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -174,6 +186,14 @@ export const backgroundWorkOf = (
       !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
   ).length;
 
+export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>
+  (shell.pullRequests ?? []).filter(
+    (pr) =>
+      pr.watch !== undefined &&
+      pr.source !== "stack-dismissed" &&
+      (pr.snapshot === null || pr.snapshot.state === "open"),
+  ).length;
+
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
@@ -195,6 +215,7 @@ const make = Effect.gen(function* () {
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
               backgroundWork: backgroundWorkOf(shell),
+              prWatches: prWatchesOf(shell),
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,
@@ -205,6 +226,10 @@ const make = Effect.gen(function* () {
                     : pr.snapshot.state === "open" && pr.snapshot.isDraft
                       ? "draft"
                       : pr.snapshot.state,
+                // Only a live watch: an ended one's head may be commits behind.
+                head: pr.watch?.headSha ?? null,
+                checks: pr.snapshot?.checksState ?? null,
+                at: pr.snapshot?.syncedAt ?? null,
               })),
             },
       ),
@@ -422,7 +447,11 @@ const make = Effect.gen(function* () {
         reason,
       });
     },
-    Effect.catchCause(() => Effect.void),
+    Effect.mapError((error) =>
+      isKanbanThreadError(error)
+        ? error
+        : new KanbanThreadError({ operation: "interrupt", detail: detailOf(error) }),
+    ),
   );
 
   return KanbanThreads.of({

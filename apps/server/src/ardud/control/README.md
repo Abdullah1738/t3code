@@ -247,7 +247,7 @@ The model selection applies to this message's run. Use `PATCH` to change the
 thread's default. Response: `messageId`,
 `runId`, `status`, `delivery` (`started`, `queued`, `steered`, `restarted`).
 
-For example, `t3ctl send THREAD 'hello' --instance claudeAgent --model claude-opus-5-5 --option effort=max --option fastMode=true`.
+For example, `t3ctl send THREAD 'hello' --instance claudeAgent --model claude-opus-5-5 --option effort=max`.
 The `create` and `set` commands accept the same repeatable `--option K=V` and
 `--instance` flags. `true` and `false` become booleans; other values remain
 strings. To clear all options, send `"options": []` in the HTTP API or client.

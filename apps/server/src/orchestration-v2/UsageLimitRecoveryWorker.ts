@@ -1,5 +1,6 @@
 import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -113,7 +114,7 @@ const makeSweep = Effect.gen(function* () {
         ),
       );
     }
-  });
+  }, NodeSqliteClient.backgroundReads);
 });
 
 export const layer = Layer.effectDiscard(

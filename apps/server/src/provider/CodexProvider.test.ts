@@ -45,21 +45,8 @@ it("maps current Codex model capability fields", () => {
       id: "serviceTier",
       label: "Service Tier",
       type: "select",
-      options: [
-        { id: "default", label: "Standard" },
-        {
-          id: "priority",
-          label: "Fast",
-          description: "Lower latency responses.",
-        },
-        {
-          id: "flex",
-          label: "Flex",
-          description: "Lower-cost asynchronous routing.",
-          isDefault: true,
-        },
-      ],
-      currentValue: "flex",
+      options: [{ id: "default", label: "Standard", isDefault: true }],
+      currentValue: "default",
     },
   ]);
 });
@@ -95,19 +82,7 @@ it("uses standard routing when the catalog has no default service tier", () => {
       id: "serviceTier",
       label: "Service Tier",
       type: "select",
-      options: [
-        { id: "default", label: "Standard", isDefault: true },
-        {
-          id: "priority",
-          label: "Fast",
-          description: "1.5x speed, increased usage",
-        },
-        {
-          id: "ultrafast",
-          label: "Ultrafast",
-          description: "Even faster, more expensive",
-        },
-      ],
+      options: [{ id: "default", label: "Standard", isDefault: true }],
       currentValue: "default",
     },
   ]);

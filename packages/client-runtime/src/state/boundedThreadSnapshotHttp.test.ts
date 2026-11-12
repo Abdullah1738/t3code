@@ -120,6 +120,29 @@ const boundedBody = (compact: boolean) => ({
 });
 
 describe("boundedThreadSnapshotLoader", () => {
+  it.effect("preserves a confirmed authorization denial for route recovery", () => {
+    const fetchFn = (() =>
+      Promise.resolve(
+        Response.json(
+          {
+            _tag: "EnvironmentScopeRequiredError",
+            code: "insufficient_scope",
+            traceId: "trace-no-access",
+            requiredScope: "orchestration:read",
+          },
+          { status: 403 },
+        ),
+      )) satisfies typeof fetch;
+    return Effect.gen(function* () {
+      const loader = yield* ThreadSnapshotLoader.ThreadSnapshotLoader;
+      expect(yield* loader.load(PREPARED, THREAD_ID)).toEqual({ _tag: "denied" });
+    }).pipe(
+      Effect.provide(
+        Layer.provide(BoundedThreadSnapshotHttp.layer, RpcHttp.layerRemoteHttpClient(fetchFn)),
+      ),
+    );
+  });
+
   it.effect.each([
     ["an older server that ignores the opt-in", false],
     ["a server that sends compact turnItems", true],

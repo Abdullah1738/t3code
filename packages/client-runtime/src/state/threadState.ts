@@ -3,7 +3,19 @@ import * as Option from "effect/Option";
 
 import { EMPTY_THREAD_HISTORY_META, type ThreadHistoryMeta } from "./threadHistoryMerge.ts";
 
-export type EnvironmentThreadStatus = "empty" | "cached" | "synchronizing" | "live" | "deleted";
+export type EnvironmentThreadStatus =
+  | "empty"
+  | "cached"
+  | "synchronizing"
+  | "live"
+  /** Confirmed by a `thread.deleted` event. Retained across navigation. */
+  | "deleted"
+  /**
+   * The server answered "not found" for longer than the grace window (an HTTP
+   * miss, not a delete event). Never retained: reopening the thread refetches.
+   */
+  | "not-found"
+  | "no-access";
 
 export interface EnvironmentThreadState {
   readonly data: Option.Option<OrchestrationV2ThreadProjection>;

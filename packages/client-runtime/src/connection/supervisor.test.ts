@@ -1602,11 +1602,39 @@ describe("EnvironmentSupervisor", () => {
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active-probe");
       yield* TestClock.adjust("3 seconds");
+      // A probe slower than 3 s on a loaded server is not a dead socket.
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+      yield* TestClock.adjust("5 seconds");
       yield* awaitState(
         supervisor.state,
         (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
       );
 
+      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("backs off when the replacement session also misses its health check", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        probe: (attempt) => (attempt <= 2 ? Effect.never : Effect.void),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("8 seconds");
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 2,
+      );
+
+      yield* harness.wake("application-active-probe");
+      yield* TestClock.adjust("8 seconds");
+      const backingOff = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      expect(backingOff.retryAt).not.toBeNull();
       expect(yield* Ref.get(harness.sessionCount)).toBe(2);
     }).pipe(Effect.provide(TestClock.layer())),
   );

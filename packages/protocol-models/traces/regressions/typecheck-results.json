@@ -1,0 +1,34 @@
+[
+  {
+    "spec": "restart",
+    "step": "step",
+    "invariant": "invariant",
+    "expectedFailure": false,
+    "status": 0,
+    "ok": true
+  },
+  {
+    "spec": "commands",
+    "step": "step",
+    "invariant": "invariant",
+    "expectedFailure": false,
+    "status": 0,
+    "ok": true
+  },
+  {
+    "spec": "boards",
+    "step": "step",
+    "invariant": "invariant",
+    "expectedFailure": false,
+    "status": 0,
+    "ok": true
+  },
+  {
+    "spec": "sync",
+    "step": "step",
+    "invariant": "invariant",
+    "expectedFailure": false,
+    "status": 0,
+    "ok": true
+  }
+]

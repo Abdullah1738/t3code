@@ -268,6 +268,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
   shows `boat.dev: DOWN since ...` during one.
 - A resume with no answer is checked on the box; 503 out_of_capacity and 409 resume_failed / deploy_failed at capacity are waited out like a boat.dev outage.
+- A boat "500 Request timeout" during SSH key setup is retried for up to ~4 min before exit 90; nothing ran.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
@@ -275,6 +276,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
 
 ## Troubleshooting
+
+- A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
 
 - A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `--bg` + `offbox wait` instead of a short shell timeout.
 

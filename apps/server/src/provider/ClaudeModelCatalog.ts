@@ -48,7 +48,18 @@ function tryResolveClaudeModelCatalog(
     const adapter = decodeClaudeModelAdapter(entry.adapter ?? {});
     if (Option.isNone(profile) || Option.isNone(adapter)) return null;
     models.push({
-      model: ModelCatalog.catalogServerModel(resolved, entry),
+      model: (() => {
+        const model = ModelCatalog.catalogServerModel(resolved, entry);
+        return {
+          ...model,
+          capabilities: {
+            ...model.capabilities,
+            optionDescriptors: (model.capabilities?.optionDescriptors ?? []).filter(
+              (o) => o.id !== "fastMode",
+            ),
+          },
+        };
+      })(),
       runtime: profile.value.claudeCode ?? {},
       compatibility: adapter.value.claudeCode ?? {},
     });
@@ -106,7 +117,12 @@ export function scopeClaudeModelCatalog(
         slug: entry.slug,
         name: entry.name,
         isCustom: true,
-        capabilities: entry.capabilities,
+        capabilities: {
+          ...entry.capabilities,
+          optionDescriptors: (entry.capabilities.optionDescriptors ?? []).filter(
+            (o) => o.id !== "fastMode",
+          ),
+        },
       },
       runtime: {},
       compatibility: {},

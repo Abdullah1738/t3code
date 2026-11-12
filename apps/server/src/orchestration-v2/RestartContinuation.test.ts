@@ -122,16 +122,9 @@ it("requires matching saved native state for an unfinished root run", () => {
       ],
     },
     { ...projection, providerTurns: [] },
-    ...[
-      "queued",
-      "preparing",
-      "starting",
-      "waiting",
-      "completed",
-      "cancelled",
-      "failed",
-      "interrupted",
-    ].map((status) => ({ ...projection, runs: [{ ...projection.runs[0]!, status }] })),
+    ...["preparing", "starting", "waiting", "completed", "cancelled", "failed", "interrupted"].map(
+      (status) => ({ ...projection, runs: [{ ...projection.runs[0]!, status }] }),
+    ),
   ])
     assert.isUndefined(restartContinuationRun(invalid as OrchestrationV2ThreadProjection, now));
 });
@@ -228,7 +221,9 @@ it("does not revive a dead or unrelated turn on a failed shared session", () => 
     ),
     { skip: "session_stopped_or_error" },
   );
-  assert.deepEqual(restartContinuationDecision({ ...shared, runs: [] }, now), { skip: "other" });
+  assert.deepEqual(restartContinuationDecision({ ...shared, runs: [] }, now), {
+    skip: "no_candidate",
+  });
 });
 
 it("recovers an admitted continuation after another crash before provider start", () => {
@@ -1093,10 +1088,10 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
   }),
 );
 
-const continuationDispatches = (projection: OrchestrationV2ThreadProjection) =>
+const continuationDispatches = (projection: OrchestrationV2ThreadProjection, queued = false) =>
   Effect.gen(function* () {
     const dispatches: Array<Extract<OrchestrationV2Command, { type: "message.dispatch" }>> = [];
-    yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+    yield* continueRestartedRun({ threadId, sourceRunId: runId, queued }).pipe(
       Effect.provide(
         Layer.merge(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -1618,5 +1613,106 @@ it.effect("hedges a failed OpenCode probe and keeps the stopped headline off it"
     } finally {
       server.close();
     }
+  }),
+);
+
+it.each(["preparing", "starting", "running"] as const)(
+  "restarts original input interrupted during %s before a native thread exists",
+  (status) => {
+    const base = makeProjection();
+    for (const assigned of [false, true]) {
+      const preparing = {
+        ...base,
+        runs: [
+          {
+            ...base.runs[0]!,
+            status,
+            providerThreadId: assigned ? providerThreadId : null,
+            startedAt: null,
+          },
+        ],
+        providerThreads: [],
+        providerSessions: [],
+        providerTurns: [],
+      };
+      assert.equal(restartContinuationRun(preparing, now)?.id, runId);
+      assert.isUndefined(
+        restartContinuationRun(
+          {
+            ...preparing,
+            runs: [{ ...preparing.runs[0]!, status: "cancelled" }],
+          },
+          now,
+        ),
+      );
+    }
+  },
+);
+
+it.effect("replays preparation input and attachments with a durable idempotency key", () =>
+  Effect.gen(function* () {
+    const base = cutMidTurn({ providerThreadId: null, startedAt: null });
+    const original = {
+      id: MessageId.make("message:user"),
+      text: "Implement the migration",
+      context: { selection: "preserve original context" },
+      attachments: [],
+    } as unknown as OrchestrationV2ThreadProjection["messages"][number];
+    const projection = { ...base, providerTurns: [], providerThreads: [], messages: [original] };
+    const commands = yield* continuationDispatches(projection);
+    assert.lengthOf(commands, 1);
+    assert.equal(commands[0]!.text, original.text);
+    assert.deepEqual(commands[0]!.attachments, original.attachments);
+    assert.deepEqual(commands[0]!.context, original.context);
+    assert.equal(commands[0]!.commandId, `command:restart-continuation:${runId}`);
+    const replayed = { ...original, id: commands[0]!.messageId };
+    assert.deepEqual(
+      yield* continuationDispatches({ ...projection, messages: [original, replayed] }),
+      [],
+    );
+  }),
+);
+
+it.effect("continues an in-flight run interrupted while shutdown closed its provider", () =>
+  Effect.gen(function* () {
+    const projection = cutMidTurn({ status: "interrupted" });
+    const interrupted = {
+      ...projection,
+      providerTurns: [{ ...projection.providerTurns[0]!, status: "interrupted" as const }],
+    };
+    assert.deepEqual(yield* continuationTexts(interrupted), ["Continue where you left off."]);
+  }),
+);
+
+it("selects the first unheld queued run without requiring a native provider thread", () => {
+  const base = makeProjection();
+  const queued = (ordinal: number, queuePosition: number, held = false) => ({
+    ...base.runs[0]!,
+    id: RunId.make(`run:queued:${ordinal}`),
+    ordinal,
+    queuePosition,
+    startedAt: null,
+    status: "queued" as const,
+    queueHeld: held,
+    providerThreadId: null,
+  });
+  const first = queued(3, 1);
+  const projection = {
+    ...base,
+    runs: [queued(1, 0, true), queued(2, 2), first],
+    providerTurns: [],
+    providerThreads: [],
+  };
+  assert.equal(restartContinuationRun(projection, now)?.id, first.id);
+});
+
+it.effect("never replays a queued message cancelled before its persisted wake was delivered", () =>
+  Effect.gen(function* () {
+    const cancelled = cutMidTurn({ startedAt: null });
+    const projection = {
+      ...cancelled,
+      messages: [{ id: MessageId.make("message:user"), text: "Do this work", attachments: [] }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.deepEqual(yield* continuationDispatches(projection, true), []);
   }),
 );

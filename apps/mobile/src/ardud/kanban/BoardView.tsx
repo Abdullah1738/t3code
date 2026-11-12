@@ -167,7 +167,7 @@ export function BoardView(props: {
   readonly onEndSetup: () => void;
   readonly onLiftPause: () => void;
 }) {
-  const goals = activeGoals(props.state);
+  const goals = activeGoals(props.state, props.nowMs);
   const boardId = props.state.board.id;
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const storedFilters = AsyncResult.isSuccess(preferencesResult)
@@ -346,7 +346,7 @@ function TabsBoard(props: {
         {props.filterRow}
         {owner.length > 0 ? (
           <View className="gap-2">
-            <StageHead label={board.owner.label} count={owner.length} owner />
+            <StageHead label={board.owner.label} count={board.owner.count} owner />
             {shownOwner.map((view) => (
               <CardTile
                 key={view.id}
@@ -822,7 +822,7 @@ function ColumnsBoard(props: {
               style={{ width: layout.owner }}
             >
               <Text className="text-[11px] font-t3-medium text-foreground">
-                {board.owner.cards.length}
+                {board.owner.count}
               </Text>
             </Pressable>
           ) : (
@@ -839,7 +839,7 @@ function ColumnsBoard(props: {
                 className="rounded-tl-[16px] bg-warning px-2.5 pt-1.5"
                 style={{ width: widthOf("needs_owner") }}
               >
-                <StageHead label={board.owner.label} count={board.owner.cards.length} owner />
+                <StageHead label={board.owner.label} count={board.owner.count} owner />
                 {ownerContent}
               </View>
             </View>

@@ -21,14 +21,17 @@ export const threadEnvironment = createThreadEnvironmentAtoms(
   connectionAtomRuntime,
   environmentSnapshotAtom,
 );
-const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
-export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
-  environmentThreads.stateAtom,
-);
 export const environmentThreadShells = createEnvironmentThreadShellAtoms({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   snapshotAtom: threadEnvironment.snapshotAtom,
 });
+export const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime, {
+  // A thread opened before the server committed it loads once the shell lists it.
+  threadPresenceAtom: environmentThreadShells.threadPresenceAtom,
+});
+export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
+  environmentThreads.stateAtom,
+);
 
 const EMPTY_THREAD_STATE_ATOM = Atom.make(AsyncResult.success(EMPTY_ENVIRONMENT_THREAD_STATE)).pipe(
   Atom.withLabel("web-environment-thread:empty"),
@@ -58,7 +61,7 @@ type KeptThreads = ReadonlyMap<EnvironmentId, ReadonlySet<ThreadId>>;
 function isDetailDone<E>(result: AsyncResult.AsyncResult<EnvironmentThreadState, E>): boolean {
   if (!AsyncResult.isSuccess(result)) return true;
   const { status, data, error } = result.value;
-  if (status === "deleted" || Option.isSome(error)) return true;
+  if (status === "deleted" || status === "not-found" || Option.isSome(error)) return true;
   return (
     status === "live" &&
     !Option.exists(data, (thread) => thread.runs.some((run) => isRunning(run.status)))

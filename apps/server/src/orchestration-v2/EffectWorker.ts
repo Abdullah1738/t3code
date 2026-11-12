@@ -1,4 +1,4 @@
-import { CommandId } from "@t3tools/contracts";
+import { CommandId, type ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -106,7 +106,7 @@ export const layerExecutor: Layer.Layer<
         switch (effect.request.type) {
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
-            return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
+            return continueRestartedRun({ threadId: effect.threadId, sourceRunId, queued: effect.request.queued }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
               Effect.tapError(() =>
@@ -579,6 +579,9 @@ export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
   readonly awaitControlWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly runThreadOnce?: (
+    threadId: ThreadId,
+  ) => Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
@@ -710,13 +713,23 @@ export const layerWithOptions = (
 
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
-        function* (excludeRestartContinuations = false, controlLane = false) {
+        function* (excludeRestartContinuations = false, controlLane = false, threadId?: ThreadId) {
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
               workerId,
+              ...(threadId === undefined ? {} : { threadId }),
               leaseDurationMs,
               excludeRestartContinuations,
-              ...(controlLane ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES } : {}),
+              ...(controlLane
+                ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
+                : threadId !== undefined
+                  ? {
+                      onlyEffectTypes: [
+                        "provider-runtime.continue",
+                        "provider-turn.start",
+                      ] as const,
+                    }
+                  : {}),
             }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
@@ -823,7 +836,12 @@ export const layerWithOptions = (
           }
           return true;
         },
-        (effect, _excludeRestartContinuations?: boolean, _controlLane?: boolean) =>
+        (
+          effect,
+          _excludeRestartContinuations?: boolean,
+          _controlLane?: boolean,
+          _threadId?: ThreadId,
+        ) =>
           effect.pipe(
             Effect.mapError((cause) =>
               isOrchestrationEffectWorkerError(cause)
@@ -837,6 +855,7 @@ export const layerWithOptions = (
         awaitWork: outbox.awaitAvailable,
         awaitControlWork: outbox.awaitControlAvailable,
         runOnce: runOnce(),
+        runThreadOnce: (threadId) => runOnce(false, false, threadId),
         runRecoveryOnce: runOnce(true),
         runControlOnce: runOnce(false, true),
         nextClaimableAt: outbox.nextClaimableAt.pipe(

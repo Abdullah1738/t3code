@@ -544,6 +544,123 @@ layer("OrchestrationEventStore", (it) => {
       );
     }),
   );
+  it.effect("lists the threads and project events a shell resume must refetch", () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const baseline = yield* store.latestApplicationSequence;
+      const versions = new Map<string, number>();
+      const insert = Effect.fn(function* (input: {
+        readonly id: string;
+        readonly kind: "thread" | "project";
+        readonly streamId: string;
+        readonly type: string;
+        readonly version?: number;
+      }) {
+        const streamVersion = versions.get(input.streamId) ?? 0;
+        versions.set(input.streamId, streamVersion + 1);
+        const rows = yield* sql<{ readonly sequence: number }>`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+          ) VALUES (
+            ${input.id}, ${input.kind}, ${input.streamId}, ${streamVersion}, ${input.type},
+            '2026-11-10T00:00:00.000Z', 'server', '{not json', '{}', ${input.version ?? 2}
+          ) RETURNING sequence
+        `;
+        return rows[0]!.sequence;
+      });
+      const thread = (id: string, streamId: string, version?: number) =>
+        insert({
+          id,
+          kind: "thread",
+          streamId,
+          type: "thread.metadata-updated",
+          ...(version === undefined ? {} : { version }),
+        });
+      const a1 = yield* thread("shell-changes:a1", "shell-changes:a");
+      const b1 = yield* thread("shell-changes:b1", "shell-changes:b");
+      const projectUpdate = yield* insert({
+        id: "shell-changes:p1",
+        kind: "project",
+        streamId: "shell-changes:project",
+        type: "project.meta-updated",
+      });
+      yield* insert({
+        id: "shell-changes:p-unknown",
+        kind: "project",
+        streamId: "shell-changes:project",
+        type: "project.from-a-newer-build",
+      });
+      yield* thread("shell-changes:legacy", "shell-changes:legacy", 1);
+      const a2 = yield* thread("shell-changes:a2", "shell-changes:a");
+      const projectDelete = yield* insert({
+        id: "shell-changes:p2",
+        kind: "project",
+        streamId: "shell-changes:project",
+        type: "project.deleted",
+      });
+      const c1 = yield* thread("shell-changes:c1", "shell-changes:c");
+      const range = { afterSequence: baseline, throughSequence: c1, maxThreads: 3 };
+
+      // Bodies are never read: every payload above is invalid JSON.
+      assert.deepEqual(yield* store.getShellChanges(range), {
+        complete: true,
+        threads: [
+          { threadId: ThreadId.make("shell-changes:b"), sequence: b1 },
+          { threadId: ThreadId.make("shell-changes:a"), sequence: a2 },
+          { threadId: ThreadId.make("shell-changes:c"), sequence: c1 },
+        ],
+        projects: [
+          {
+            projectId: ProjectId.make("shell-changes:project"),
+            sequence: projectUpdate,
+            type: "project.meta-updated",
+          },
+          {
+            projectId: ProjectId.make("shell-changes:project"),
+            sequence: projectDelete,
+            type: "project.deleted",
+          },
+        ],
+      });
+      // The range is (after, through]: a thread whose only later event is past it keeps
+      // its earlier sequence; one with nothing in range is absent.
+      assert.deepEqual(
+        yield* store.getShellChanges({ ...range, afterSequence: a1, throughSequence: a2 }),
+        {
+          complete: true,
+          threads: [
+            { threadId: ThreadId.make("shell-changes:b"), sequence: b1 },
+            { threadId: ThreadId.make("shell-changes:a"), sequence: a2 },
+          ],
+          projects: [
+            {
+              projectId: ProjectId.make("shell-changes:project"),
+              sequence: projectUpdate,
+              type: "project.meta-updated",
+            },
+          ],
+        },
+      );
+      assert.deepEqual(yield* store.getShellChanges({ ...range, afterSequence: c1 }), {
+        complete: true,
+        threads: [],
+        projects: [],
+      });
+      // More changed threads (or project events) than the cap: the caller sends a snapshot.
+      assert.deepEqual(yield* store.getShellChanges({ ...range, maxThreads: 2 }), {
+        complete: false,
+        threads: [],
+        projects: [],
+      });
+      assert.deepEqual(
+        yield* store.getShellChanges({ ...range, afterSequence: b1, maxThreads: 2 }),
+        { complete: false, threads: [], projects: [] },
+      );
+    }),
+  );
+
   it.effect("measures only a bounded thread replay before decoding its payloads", () =>
     Effect.gen(function* () {
       const store = yield* OrchestrationEventStore.OrchestrationEventStore;

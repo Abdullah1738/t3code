@@ -305,7 +305,7 @@ def owner_texts(since, until, deadline=None, stats=None):
     left(deadline, 4)
     stop = time.time() + (4 if deadline is None else min(4, deadline - time.time() - 0.5))
     try:
-        db = connect_replica(STATE_DB)
+        db = connect_replica(STATE_DB, timeout=1)
         try:
             db.set_progress_handler(lambda: int(time.time() >= stop), 10000)
             if stats is not None:

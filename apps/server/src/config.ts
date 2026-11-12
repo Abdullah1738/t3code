@@ -12,6 +12,10 @@ import { sweepStalePendingAttachments } from "./attachmentStore.ts";
 import { DEFAULT_SIGNAL_EXPORT, type SignalExport } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import packageJson from "../package.json" with { type: "json" };
+import {
+  DEFAULT_TRACE_MAX_BYTES,
+  DEFAULT_TRACE_MAX_FILES,
+} from "./ardud/observability/traceRetention.ts";
 
 export const DEFAULT_PORT = 3773;
 
@@ -197,8 +201,8 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     traceMinLevel: "Info",
     traceTimingEnabled: true,
     traceBatchWindowMs: 200,
-    traceMaxBytes: 10 * 1024 * 1024,
-    traceMaxFiles: 10,
+    traceMaxBytes: DEFAULT_TRACE_MAX_BYTES,
+    traceMaxFiles: DEFAULT_TRACE_MAX_FILES,
     otlpTracesUrl: undefined,
     otlpMetricsUrl: undefined,
     otlpLogsUrl: undefined,

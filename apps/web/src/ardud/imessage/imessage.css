@@ -16,6 +16,11 @@
   --im-bubble-text: 0.9375rem;
   --im-bubble-radius: 18px;
   --im-detail-text: 0.8125rem;
+  /* Other agents' prompts and an agent's own note, each a pale tint so neither reads as a text. */
+  --im-agent: #eaf1fb;
+  --im-agent-ink: #1d3f73;
+  --im-note: #fbf3df;
+  --im-note-ink: #5c4400;
 }
 
 :root.dark {
@@ -24,4 +29,8 @@
   --im-raised: #1c1c1e;
   --im-dot: #0a84ff;
   --im-link: #8db4ff;
+  --im-agent: #16233a;
+  --im-agent-ink: #b4cdf5;
+  --im-note: #2a2410;
+  --im-note-ink: #ecd38f;
 }

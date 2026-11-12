@@ -117,7 +117,7 @@ export const OrchestratorMcpTarget = Schema.Struct({
   options: Schema.optional(
     OrchestratorMcpTargetOptions.annotate({
       description:
-        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Claude: {effort: 'max', fastMode: true}; Codex: {reasoningEffort: 'max', serviceTier: 'priority'}. Only use options advertised by the selected model.",
+        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: Claude {effort: 'max'}; Codex {reasoningEffort: 'max', serviceTier: 'default'}; never fast mode. Only use options advertised by the selected model.",
     }),
   ),
 });
@@ -240,6 +240,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     }),
   ),
   summary: Schema.NullOr(Schema.String),
+  resultLooksIncomplete: Schema.optional(Schema.Boolean),
+  incompleteReason: Schema.optional(Schema.String),
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:

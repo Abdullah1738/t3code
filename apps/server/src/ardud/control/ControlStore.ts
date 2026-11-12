@@ -69,6 +69,25 @@ export interface ControlStoreShape {
   readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
+  /**
+   * Undeleted threads whose updated_at sorts after `sinceIso`, newest first (ties by thread id, as the full listing orders them), with the fields
+   * listings filter on, from ardud_v2_threads_updated_idx: no shell is built. A string range,
+   * so callers widen it and compare `updatedAt` exactly.
+   */
+  readonly threadsUpdatedSince: (
+    sinceIso: string,
+  ) => Effect.Effect<ReadonlyArray<ControlThreadRow>, ControlStoreError>;
+}
+
+export interface ControlThreadRow {
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly updatedAt: string;
+  readonly archived: boolean;
+  readonly relationshipToParent: string | null;
+  readonly parentThreadId: string | null;
+  readonly rootThreadId: string | null;
+  readonly creationSource: string | null;
 }
 
 export class ControlStore extends Context.Service<ControlStore, ControlStoreShape>()(
@@ -254,7 +273,45 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-pending-request-threads")),
     );
 
+  const threadsUpdatedSince: ControlStoreShape["threadsUpdatedSince"] = (sinceIso) =>
+    sql<{
+      readonly thread_id: string;
+      readonly project_id: string;
+      readonly updated_at: string;
+      readonly archived: number;
+      readonly relationship_to_parent: string | null;
+      readonly parent_thread_id: string | null;
+      readonly root_thread_id: string | null;
+      readonly creation_source: string | null;
+    }>`
+      SELECT thread_id, project_id, updated_at,
+        json_extract(payload_json, '$.archivedAt') IS NOT NULL AS archived,
+        json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
+        json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
+        json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
+        json_extract(payload_json, '$.creationSource') AS creation_source
+      FROM orchestration_v2_projection_threads
+      WHERE deleted_at IS NULL AND updated_at > ${sinceIso}
+      ORDER BY updated_at DESC, thread_id ASC
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.map((rows) =>
+        rows.map((row): ControlThreadRow => ({
+          threadId: row.thread_id,
+          projectId: row.project_id,
+          updatedAt: row.updated_at,
+          archived: Boolean(row.archived),
+          relationshipToParent: row.relationship_to_parent,
+          parentThreadId: row.parent_thread_id,
+          rootThreadId: row.root_thread_id,
+          creationSource: row.creation_source,
+        })),
+      ),
+      Effect.mapError(fail("read-updated-threads")),
+    );
+
   return ControlStore.of({
+    threadsUpdatedSince,
     getOrigin,
     getOrigins,
     setOrigin,

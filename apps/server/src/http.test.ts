@@ -165,6 +165,7 @@ describe("browser API CORS", () => {
               ORCHESTRATION_PROTOCOL_HEADER,
               "authorization",
               "dpop",
+              "x-robob-action-id",
             ].join(", "),
           },
         }),
@@ -180,6 +181,7 @@ describe("browser API CORS", () => {
       expect(allowedHeaders.has(ORCHESTRATION_PROTOCOL_HEADER)).toBe(true);
       expect(allowedHeaders.has("authorization")).toBe(true);
       expect(allowedHeaders.has("dpop")).toBe(true);
+      expect(allowedHeaders.has("x-robob-action-id")).toBe(true);
     } finally {
       await dispose();
     }

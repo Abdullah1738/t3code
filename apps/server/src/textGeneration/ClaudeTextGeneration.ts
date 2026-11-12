@@ -133,6 +133,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     outputSchema: outputSchemaJson,
     modelSelection,
     investigate,
+    timeoutMs,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
     TextGenerationError,
@@ -167,18 +168,15 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     );
     const ultracode = isClaudeCatalogUltracodeEffort(resolvedEffort);
     const thinkingDescriptor = findDescriptor("thinking");
-    const fastModeDescriptor = findDescriptor("fastMode");
     // Only a chosen value; otherwise Claude Code's own default applies, as in chat turns.
     const thinking =
       thinkingDescriptor?.type === "boolean"
         ? getModelSelectionBooleanOptionValue(resolvedModelSelection, "thinking")
         : undefined;
-    const fastMode =
-      fastModeDescriptor?.type === "boolean" ? fastModeDescriptor.currentValue : undefined;
     const settings = {
       disableAllHooks: true,
       ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
-      ...(fastMode ? { fastMode: true } : {}),
+      fastMode: false,
       ...(ultracode ? { ultracode: true } : {}),
     };
     const settingsJson = yield* encodeJsonForOperation(
@@ -280,19 +278,25 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       return stdout;
     });
 
-    const rawStdout = yield* runClaudeCommand().pipe(
-      Effect.scoped,
-      Effect.timeoutOption(investigate?.timeoutMs ?? CLAUDE_TIMEOUT_MS),
-      Effect.flatMap(
-        Option.match({
-          onNone: () =>
-            Effect.fail(
-              new TextGenerationError({ operation, detail: "Claude CLI request timed out." }),
-            ),
-          onSome: (value) => Effect.succeed(value),
-        }),
-      ),
+    const limitMs = TextGenerationOperations.requestTimeoutMs(
+      { investigate, timeoutMs },
+      CLAUDE_TIMEOUT_MS,
     );
+    const claudeRun = runClaudeCommand().pipe(Effect.scoped);
+    const rawStdout = yield* limitMs === null
+      ? claudeRun
+      : claudeRun.pipe(
+          Effect.timeoutOption(limitMs),
+          Effect.flatMap(
+            Option.match({
+              onNone: () =>
+                Effect.fail(
+                  new TextGenerationError({ operation, detail: "Claude CLI request timed out." }),
+                ),
+              onSome: (value) => Effect.succeed(value),
+            }),
+          ),
+        );
 
     const output = yield* decodeClaudeOutput(rawStdout).pipe(
       Effect.catchTags({

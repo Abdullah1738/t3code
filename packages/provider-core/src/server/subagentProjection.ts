@@ -21,7 +21,7 @@ import type {
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import { isOrchestrationV2WorkActive } from "@t3tools/contracts";
+import { isOrchestrationV2WorkActive, latestProviderTurnForAttempt } from "@t3tools/contracts";
 
 function trimmed(value: string | null | undefined): string | undefined {
   const result = value?.trim();
@@ -165,10 +165,11 @@ export function makeSubagentConversationArtifacts(input: {
 }
 
 export function subagentResultForRun(
-  projection: Pick<OrchestrationV2ThreadProjection, "messages" | "turnItems">,
+  projection: Pick<OrchestrationV2ThreadProjection, "messages" | "turnItems" | "providerTurns">,
   run: OrchestrationV2Run,
 ): {
   readonly text: string;
+  readonly incomplete: string | null;
   readonly messageId: OrchestrationV2ConversationMessage["id"] | null;
   readonly turnItemId: OrchestrationV2TurnItem["id"] | null;
 } {
@@ -212,8 +213,32 @@ export function subagentResultForRun(
     (run.status === "completed"
       ? "Child task completed without an assistant result."
       : `Child task ended with status ${run.status}.`);
+  const lastTurn =
+    run.activeAttemptId !== null
+      ? latestProviderTurnForAttempt(projection.providerTurns ?? [], run.activeAttemptId)
+      : (projection.providerTurns ?? [])
+          .filter((turn) => turn.nodeId === run.rootNodeId)
+          .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+  const finish = lastTurn?.finish;
+  const reasons: string[] = [];
+  // OpenCode normalizes clean stops; native Claude preserves Anthropic's stop reasons.
+  if (finish != null && finish !== "stop" && finish !== "end_turn" && finish !== "stop_sequence") {
+    reasons.push(
+      finish === "length"
+        ? "the child's last step stopped at the output limit (finish=length)"
+        : `the child's last step ended with finish=${finish}`,
+    );
+  }
+  if (failure === undefined && (message?.phase ?? turnItem?.phase) === "narration") {
+    reasons.push("its last text was a progress note");
+  }
+  const incomplete = reasons.length === 0 ? null : reasons.join(" and ");
   return {
-    text,
+    text:
+      incomplete === null
+        ? text
+        : `[Result looks incomplete: ${incomplete}. Check the child thread before trusting this.]\n${text}`,
+    incomplete,
     messageId: failure === undefined ? (message?.id ?? turnItem?.messageId ?? null) : null,
     turnItemId: failure?.id ?? turnItem?.id ?? null,
   };

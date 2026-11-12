@@ -4171,6 +4171,62 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
+// ardud (9 Nov): a failed projection read failed the run while the Claude turn
+// kept running unread, and the next send was refused as "previous turn is
+// still running". A failed run must stop its provider turn.
+it.effect("stops the provider turn when ingestion fails the run before a terminal", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make<ReadonlyArray<string>>([]);
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:orphaned-turn",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          type: "node.updated",
+          driver,
+          node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+        } as unknown as ProviderAdapter.ProviderAdapterV2Event),
+      ingestNormalized: (ingest) =>
+        Effect.fail(
+          new ProviderEventIngestor.ProviderEventNormalizeError({
+            providerSessionId: ingest.providerSessionId,
+            threadId: ingest.threadId,
+            providerEvent: ingest.event,
+            cause: new Error("projection read failed"),
+          }),
+        ),
+      interruptTurn: (turn) =>
+        Ref.update(interrupted, (current) => [...current, String(turn.providerTurnId)]),
+    });
+    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
+    assert.deepEqual(yield* Ref.get(interrupted), ["provider-turn:ingest-failure:orphaned-turn"]);
+  }),
+);
+
+it.effect("does not stop a provider turn that already reached its terminal", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make(0);
+    yield* captureRootRunTermination({
+      key: "ingest-failure:settled-turn",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.concat(
+          Stream.make(rootTerminalEvent(ids, "completed")),
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:settled"),
+              cause: "late stream failure",
+            }),
+          ),
+        ),
+      hasPendingBackgroundWorkForThread: () => Effect.succeed(true),
+      interruptTurn: () => Ref.update(interrupted, (count) => count + 1),
+    });
+    assert.equal(yield* Ref.get(interrupted), 0);
+  }),
+);
+
 it.effect("leaves the run to restart recovery when shutdown interrupts its event stream", () =>
   Effect.gen(function* () {
     const { written, observed } = yield* captureRootRunTermination({
@@ -4273,6 +4329,8 @@ function captureRootRunTermination(input: {
     ProviderAdapter.ProviderAdapterV2Error
   >;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
@@ -4350,7 +4408,7 @@ function captureRootRunTermination(input: {
           }),
           IdAllocator.layer,
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
-            ingestNormalized: () => Effect.succeed([]),
+            ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
@@ -4411,6 +4469,7 @@ function captureRootRunTermination(input: {
             ),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
+          interruptTurn: input.interruptTurn ?? (() => Effect.void),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {
@@ -5364,4 +5423,81 @@ it.effect("retains the first failure when the resumed provider throws at startup
     assert.include(error?.type === "error" ? error.failure.message : "", "Resume error:");
     assert.lengthOf(result.committedEffects, 0);
   }),
+);
+
+it.effect.each([
+  { driverKind: "codex", stale: false, compact: false },
+  { driverKind: "codex", stale: true, compact: false },
+  { driverKind: "codex", stale: true, compact: true },
+  { driverKind: "claudeAgent", stale: false, compact: false },
+  { driverKind: "claudeAgent", stale: true, compact: false },
+  { driverKind: "claudeAgent", stale: true, compact: true },
+])("forces Standard at the unconditional provider boundary: %j", ({ driverKind, stale, compact }) =>
+  Effect.gen(function* () {
+    const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    const started = yield* Deferred.make<ProviderAdapter.ProviderAdapterV2TurnInput>();
+    const threadId = ThreadId.make("thread:run-execution-app-context");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const attemptId = RunAttemptId.make("attempt:run-execution-app-context");
+    const session = {
+      driver: ProviderDriverKind.make(driverKind),
+      events: Stream.never,
+      compactThread: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Deferred.succeed(started, input),
+      startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Deferred.succeed(started, input),
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+
+    yield* runExecution.startRootRun({
+      commandId: CommandId.make("command:run-execution-app-context"),
+      appThread: { id: threadId } as OrchestrationV2AppThread,
+      providerSessionId: ProviderSessionId.make("session:run-execution-app-context"),
+      session,
+      run: {
+        id: RunId.make("run:run-execution-app-context"),
+        threadId,
+        ordinal: 1,
+        providerInstanceId,
+      } as OrchestrationV2Run,
+      rootNode: {
+        id: NodeId.make("node:run-execution-app-context"),
+      } as OrchestrationV2ExecutionNode,
+      checkpointScope: {
+        id: CheckpointScopeId.make("checkpoint-scope:run-execution-app-context"),
+      } as OrchestrationV2CheckpointScope,
+      providerThread: {
+        id: ProviderThreadId.make("provider-thread:run-execution-app-context"),
+        driver,
+      } as OrchestrationV2ProviderThread,
+      attempt: { id: attemptId, providerTurnId: null } as OrchestrationV2RunAttempt,
+      attemptId,
+      providerTurnOrdinal: 1,
+      message: {
+        messageId: MessageId.make("message:run-execution-app-context"),
+        text: compact ? "/compact" : "What is on my list?",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      },
+      modelSelection: {
+        instanceId: providerInstanceId,
+        model: "gpt-6-sol",
+        options: stale
+          ? [
+              driverKind === "codex"
+                ? { id: "serviceTier", value: "priority" }
+                : { id: "fastMode", value: true },
+            ]
+          : [],
+      },
+      runtimePolicy: { runtimeMode: "full-access", interactionMode: "default", cwd: process.cwd() },
+    });
+
+    const input = yield* Deferred.await(started);
+    assert.deepEqual(input.modelSelection.options, [
+      driverKind === "codex"
+        ? { id: "serviceTier", value: "default" }
+        : { id: "fastMode", value: false },
+    ]);
+  }).pipe(Effect.provide(layerRunExecutionTest)),
 );

@@ -11,6 +11,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -30,6 +31,7 @@ import {
   KanbanThreadError,
   KanbanThreads,
   layer,
+  prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
 
@@ -124,6 +126,81 @@ describe("backgroundWorkOf", () => {
   });
 });
 
+describe("prWatchesOf", () => {
+  const watchedPr = (overrides: Partial<ThreadPullRequestLink> = {}): ThreadPullRequestLink => ({
+    host: "github.com",
+    repository: "x/y",
+    number: 1,
+    url: "https://github.com/x/y/pull/1",
+    source: "agent",
+    linkedAt: FINISHED_AT,
+    stack: null,
+    snapshot: {
+      state: "open",
+      title: "Change",
+      headBranch: "change",
+      baseBranch: "main",
+      isDraft: false,
+      updatedAt: null,
+      syncedAt: FINISHED_AT,
+    },
+    watch: {
+      startedAt: FINISHED_AT,
+      headSha: null,
+      failedChecks: [],
+      passed: false,
+      passedChecks: [],
+      remarksThrough: FINISHED_AT,
+      remarkIds: [],
+      conflicting: false,
+      wakes: 0,
+    },
+    ...overrides,
+  });
+
+  it.each([
+    { name: "open", pr: watchedPr(), count: 1 },
+    {
+      name: "draft",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, isDraft: true } }),
+      count: 1,
+    },
+    { name: "no snapshot yet", pr: watchedPr({ snapshot: null }), count: 1 },
+    { name: "no watch", pr: watchedPr({ watch: undefined }), count: 0 },
+    { name: "stack-dismissed", pr: watchedPr({ source: "stack-dismissed" }), count: 0 },
+    {
+      name: "merged",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "merged" } }),
+      count: 0,
+    },
+    {
+      name: "closed",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "closed" } }),
+      count: 0,
+    },
+    {
+      name: "ended watch",
+      pr: watchedPr({ watch: undefined, endedWatch: watchedPr().watch }),
+      count: 0,
+    },
+  ])("counts $name links correctly", ({ pr, count }) => {
+    expect(prWatchesOf({ pullRequests: [pr] })).toBe(count);
+  });
+
+  it("counts each eligible link in a mixed roster", () => {
+    expect(
+      prWatchesOf({
+        pullRequests: [watchedPr(), watchedPr({ snapshot: null }), watchedPr({ watch: undefined })],
+      }),
+    ).toBe(2);
+  });
+
+  it("is zero for an empty or missing roster", () => {
+    expect(prWatchesOf({ pullRequests: [] })).toBe(0);
+    expect(prWatchesOf({})).toBe(0);
+  });
+});
+
 it.effect(
   "find distinguishes a failed shell read from a missing thread while view hides failures",
   () =>
@@ -204,6 +281,40 @@ it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
         ),
       );
     }),
+);
+
+it.effect("interrupt fails on a failed shell read and treats a missing thread as stopped", () =>
+  Effect.gen(function* () {
+    const failedId = ThreadId.make("thread-stop-read-failed");
+    const missingId = ThreadId.make("thread-stop-missing");
+    const readError = new Orchestrator.OrchestratorProjectionError({
+      threadId: failedId,
+      cause: "injected shell read failure",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: (threadId) =>
+        threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      // A saved stop retries on this instead of closing as delivered.
+      const result = yield* Effect.result(threads.interrupt(failedId, "Card moved"));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("interrupt");
+      }
+      yield* threads.interrupt(missingId, "Card moved");
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
 );
 
 it.effect("a keyed send passes stable command and message ids to thread management", () =>

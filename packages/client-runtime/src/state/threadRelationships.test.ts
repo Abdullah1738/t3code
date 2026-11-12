@@ -13,6 +13,23 @@ import {
 } from "./threadRelationships.ts";
 
 describe("thread relationships", () => {
+  it("disables only a confirmed deleted shell, while unresolved parents stay navigable", () => {
+    const parent = ThreadId.make("unloaded-parent");
+    const child = ThreadId.make("deleted-child");
+    const graph = deriveThreadRelationshipGraph({
+      threads: [
+        {
+          id: child,
+          deletedAt: DateTime.makeUnsafe("2026-11-08T00:00:00Z"),
+          lineage: { parentThreadId: parent, relationshipToParent: "subagent" },
+        },
+      ] as never,
+      projection: null,
+    });
+    expect(graph.nodes.get(child)?.missing).toBe(true);
+    expect(graph.nodes.get(parent)?.missing).toBe(false);
+    expect(walkThreadRelationships(graph, child).map((row) => row.threadId)).toEqual([parent]);
+  });
   it.each([
     ["running", "completed"],
     ["completed", "running"],
@@ -115,7 +132,7 @@ describe("thread relationships", () => {
       projection: null,
     });
 
-    expect(graph.nodes.get(missing)?.missing).toBe(true);
+    expect(graph.nodes.get(missing)?.missing).toBe(false);
     expect(relatedThreadIds(graph, root)).toEqual([child]);
     expect(relatedThreadIds(graph, child)).toEqual([root, missing]);
     expect(
@@ -170,7 +187,7 @@ describe("thread relationships", () => {
     });
 
     expect(graph.nodes.get(child)?.thread?.archivedAt).not.toBeNull();
-    expect(graph.nodes.get(transferTarget)?.missing).toBe(true);
+    expect(graph.nodes.get(transferTarget)?.missing).toBe(false);
     expect(graph.edges).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

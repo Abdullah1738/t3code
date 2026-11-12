@@ -6,6 +6,8 @@ import { defaultAnimateLayoutChanges, type AnimateLayoutChanges } from "@dnd-kit
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
+  boundedSidebarTail,
+  withWholeActiveOrder,
   animateSidebarLayoutChanges,
   archiveSelectedThreadEntries,
   buildBulkTitleRegenerationContextMenuItem,
@@ -497,6 +499,25 @@ describe("sidebar thread lineage helpers", () => {
     const loopA = subagentOf("thread-loop-a", ThreadId.make("thread-loop-b"));
     const loopB = subagentOf("thread-loop-b", loopA.id);
     expect(resolveSidebarRowThreadId(loopA.id, environmentId, [loopA, loopB])).toBe(loopA.id);
+    // Idle subagents are omitted from the client shell: the open thread's detail lineage
+    // still resolves it to its parent row (and through shell-present subagent ancestors).
+    const idle = subagentOf("thread-idle", child.id);
+    expect(resolveSidebarRowThreadId(idle.id, environmentId, threads)).toBe(idle.id);
+    expect(resolveSidebarRowThreadId(idle.id, environmentId, threads, idle.lineage)).toBe(root.id);
+    expect(resolveSidebarRowThreadId(child.id, environmentId, threads, root.lineage)).toBe(root.id);
+    // root -> omitted idle A -> open idle B: B's lineage root stands in for the missing chain.
+    const nestedIdle = makeThreadFixture({
+      id: ThreadId.make("thread-nested-idle"),
+      environmentId,
+      lineage: {
+        rootThreadId: root.id,
+        parentThreadId: ThreadId.make("thread-omitted-middle"),
+        relationshipToParent: "subagent",
+      },
+    });
+    expect(
+      resolveSidebarRowThreadId(nestedIdle.id, environmentId, threads, nestedIdle.lineage),
+    ).toBe(root.id);
   });
 
   it("resolves the parent thread for fork sidebar affordances", () => {
@@ -2417,5 +2438,100 @@ describe("Working shelf (beta)", () => {
         unsnooze: false,
       });
     });
+  });
+});
+
+describe("boundedSidebarTail", () => {
+  const rows = Array.from({ length: 5 }, (_, index) => ({ key: `row-${index}` }));
+  const keyOf = (row: { readonly key: string }) => row.key;
+
+  it("returns the shelf itself when it fits", () => {
+    expect(boundedSidebarTail(rows, 5, null, keyOf)).toBe(rows);
+  });
+
+  it("cuts the shelf and keeps the open thread visible", () => {
+    expect(boundedSidebarTail(rows, 2, null, keyOf).map(keyOf)).toEqual(["row-0", "row-1"]);
+    expect(boundedSidebarTail(rows, 2, "row-4", keyOf).map(keyOf)).toEqual([
+      "row-0",
+      "row-1",
+      "row-4",
+    ]);
+    expect(boundedSidebarTail(rows, 2, "row-1", keyOf).map(keyOf)).toEqual(["row-0", "row-1"]);
+  });
+});
+
+describe("withWholeActiveOrder", () => {
+  // The shelf is a, b, c, d, e; only a, b and c are drawn.
+  const whole = ["a", "b", "c", "d", "e"];
+  const drop = (activeOrder: readonly string[]) =>
+    ({ section: "active", pinnedOrder: [], activeOrder }) as const;
+
+  it("keeps a drop at the end of the drawn rows above the hidden ones", () => {
+    const target = withWholeActiveOrder(drop(["b", "c", "a"]), whole, "a");
+    expect(target.activeOrder).toEqual(["b", "c", "a", "d", "e"]);
+    // With the planned keys the row sits between c and d, so it stays in the drawn slice.
+    const keys = new Map(whole.map((key) => [key, null] as const));
+    const plan = planSidebarThreadDrop({
+      activeKey: "a",
+      activeSection: "active",
+      target,
+      pinnedOrder: [],
+      pinnedKeysById: new Map(),
+      activeOrder: whole,
+      activeKeysById: keys,
+    });
+    expect(plan.kind).toBe("move-active");
+    if (plan.kind !== "move-active") return;
+    const byKey = [...plan.assignments].sort((x, y) => (x.orderKey < y.orderKey ? -1 : 1));
+    expect(byKey.map(({ id }) => id)).toEqual(["b", "c", "a", "d", "e"]);
+  });
+
+  it("never crosses the hidden rows to reach the open thread's row", () => {
+    // a, b drawn from the start; e is the open thread, drawn below them.
+    expect(withWholeActiveOrder(drop(["b", "a", "e"]), whole, "a").activeOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+      "e",
+    ]);
+    // Moved to the top, it stays at the top.
+    expect(withWholeActiveOrder(drop(["b", "a", "e"]), whole, "b").activeOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+      "e",
+    ]);
+    // The open thread's row dropped among the start rows lands there.
+    expect(withWholeActiveOrder(drop(["a", "e", "b"]), whole, "e").activeOrder).toEqual([
+      "a",
+      "e",
+      "b",
+      "c",
+      "d",
+    ]);
+    expect(withWholeActiveOrder(drop(["b", "e", "a"]), whole, "a").activeOrder).toEqual([
+      "b",
+      "c",
+      "d",
+      "e",
+      "a",
+    ]);
+  });
+
+  it("places rows from other sections and leaves whole shelves alone", () => {
+    expect(withWholeActiveOrder(drop(["a", "p", "b", "c"]), whole, "p").activeOrder).toEqual([
+      "a",
+      "p",
+      "b",
+      "c",
+      "d",
+      "e",
+    ]);
+    const full = drop(["b", "a", "c", "d", "e"]);
+    expect(withWholeActiveOrder(full, whole, "a")).toBe(full);
+    const pinned = { section: "pinned", pinnedOrder: ["a"], activeOrder: ["b"] } as const;
+    expect(withWholeActiveOrder(pinned, whole, "a")).toBe(pinned);
   });
 });

@@ -941,7 +941,7 @@ function normalizeProviderModelOptions(
       legacy.codexFastMode === true ||
       (typeof legacy.serviceTier === "string" && legacy.serviceTier === "fast");
     if (fastMode) {
-      codexExtras.push({ id: "fastMode", value: true });
+      codexExtras.push({ id: "serviceTier", value: "default" });
     }
     if (codexExtras.length > 0) {
       const existing = result.codex ?? [];

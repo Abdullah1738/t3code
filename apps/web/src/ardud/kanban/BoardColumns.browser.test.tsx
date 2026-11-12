@@ -6,6 +6,7 @@ import { cdp, page } from "vite-plus/test/browser";
 
 import {
   boardStateFromSnapshot,
+  createBoardView,
   EMPTY_FILTER_PREFS,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -17,6 +18,19 @@ import { BoardFilterMenu } from "./BoardFilterMenu";
 import "./tokens.css";
 import "./kanban.css";
 import { boardColumnsStorageKey } from "./useBoardColumnPrefs";
+
+// The board links to the Needs you page; a plain anchor stands in for the router's link.
+vi.mock("@tanstack/react-router", async () => {
+  const { createElement } = await import("react");
+  return {
+    Link: (props: { children?: unknown; className?: string; "aria-label"?: string }) =>
+      createElement(
+        "a",
+        { href: "/needs-you", className: props.className, "aria-label": props["aria-label"] },
+        props.children as never,
+      ),
+  };
+});
 
 const BOARD_ID = "board-test";
 const NOW = Date.parse("2026-10-28T12:00:00.000Z");
@@ -183,9 +197,11 @@ async function render(state = boardState()) {
     root.render(
       <BoardColumns
         boardId={BOARD_ID}
-        state={state}
-        nowMs={NOW}
+        model={createBoardView().model(state, NOW, { filter: {}, group: "stage" })}
         group="stage"
+        lens="all"
+        onGroup={() => {}}
+        onLens={() => {}}
         filter={{}}
         selectedCardId={undefined}
         onOpenCard={() => {}}
@@ -196,16 +212,19 @@ async function render(state = boardState()) {
   );
 }
 
-const isStageGrid = () => container.querySelector('[role="tablist"]') === null;
+/** The phone layout's column switcher: one column at a time. */
+const columnSwitcher = () =>
+  container.querySelector<HTMLElement>('[role="group"][aria-label="Column"]');
+
+const isStageGrid = () => columnSwitcher() === null;
 
 beforeEach(async () => {
-  // The stage grid needs a wide viewport; a narrow one picks the phone tabs.
+  // The stage grid needs a wide viewport; a narrow one picks the phone's column switcher.
   await page.viewport(1400, 900);
   localStorage.clear();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  // A wide board, so the stage grid is picked over the phone tabs.
+  // A wide board, so the stage grid is picked over the phone layout.
   container = document.createElement("div");
-  // Wide enough that BoardColumns picks StageGrid over the phone tabs.
   container.style.width = "1400px";
   container.style.height = "800px";
   document.body.append(container);
@@ -270,7 +289,7 @@ describe("stage columns", () => {
     root = createRoot(container);
     await render();
 
-    // The stage grid, not the phone tabs, must be the layout under test.
+    // The stage grid, not the phone layout, must be the layout under test.
     expect(isStageGrid()).toBe(true);
     expect(column("Working")).toBeNull();
     const rail = container.querySelector<HTMLButtonElement>('button[aria-label^="Show Working"]');
@@ -365,9 +384,11 @@ describe("group columns", () => {
       root.render(
         <BoardColumns
           boardId={BOARD_ID}
-          state={withProjects}
-          nowMs={NOW}
+          model={createBoardView().model(withProjects, NOW, { filter: {}, group: "project" })}
           group="project"
+          lens="all"
+          onGroup={() => {}}
+          onLens={() => {}}
           filter={{}}
           selectedCardId={undefined}
           onOpenCard={() => {}}
@@ -432,30 +453,38 @@ async function mountAt(width: number, height: number, pointerKind: "coarse" | "f
 
 const rect = (element: Element) => element.getBoundingClientRect();
 
+// The lens switch keeps a 36 px pill on touch and fills its 44 px track with the hit
+// area, so its buttons are measured by the track.
 const shortButtons = () =>
   [...container.querySelectorAll("button")]
+    .filter((button) => button.closest('[role="group"][aria-label="Lens"]') === null)
     .filter((button) => rect(button).height < 44)
     .map((button) => button.getAttribute("aria-label") ?? button.textContent);
 
+const STATE_LABELS = ["To-Do", "Working", "Reviewing", "In review, waiting"] as const;
+
 describe("iPad layout", () => {
-  it("lays a landscape touch board out as columns with Shipped folded", async () => {
+  it("lays a landscape touch board out as columns that scroll sideways, Shipped folded", async () => {
     await mountAt(1084, 900, "coarse");
 
     expect(isStageGrid()).toBe(true);
-    for (const label of ["To-Do", "Working", "Needs Review", "In Review", "Needs Owner"]) {
+    for (const label of [...STATE_LABELS, "Needs you"]) {
       expect(column(label), label).not.toBeNull();
     }
     expect(column("Shipped")).toBeNull();
 
-    // The review stages stack in one column, In Review under Needs Review.
-    const needsReview = rect(column("Needs Review")!);
-    const inReview = rect(column("In Review")!);
-    expect(inReview.left).toBeCloseTo(needsReview.left, 0);
-    expect(inReview.top).toBeGreaterThanOrEqual(needsReview.bottom);
+    // Every state has its own column at a readable width, side by side.
+    const top = rect(column("To-Do")!).top;
+    for (const label of STATE_LABELS) {
+      expect(rect(column(label)!).width, label).toBeGreaterThanOrEqual(248);
+      expect(rect(column(label)!).top, label).toBeCloseTo(top, 0);
+    }
 
-    // Nothing scrolls sideways: not the column strip, not any column's list.
+    // Too narrow for all of them: the strip scrolls sideways and takes Needs you with it.
     const strip = column("To-Do")!.parentElement!;
-    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    expect(strip.scrollWidth).toBeGreaterThan(strip.clientWidth);
+    expect(column("Needs you")!.parentElement).toBe(strip);
+    // No column's own list scrolls sideways.
     for (const list of container.querySelectorAll<HTMLElement>(
       "section[data-column] > div:last-child",
     )) {
@@ -467,6 +496,16 @@ describe("iPad layout", () => {
     const folded = container.querySelector('button[aria-label="Show shipped cards"]');
     expect(folded?.getAttribute("aria-expanded")).toBe("false");
     expect(shortButtons()).toEqual([]);
+    const lens = container.querySelector('[role="group"][aria-label="Lens"]')!;
+    expect(rect(lens).height).toBeGreaterThanOrEqual(44);
+  });
+
+  it("keeps Needs you beside the strip on a board wide enough for every column", async () => {
+    await mountAt(1400, 900, "fine");
+
+    const strip = column("To-Do")!.parentElement!;
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    expect(column("Needs you")!.parentElement).not.toBe(strip);
   });
 
   it("opens folded Shipped on click and keeps it open after a reload", async () => {
@@ -492,7 +531,8 @@ describe("iPad layout", () => {
   });
 
   it("opens Shipped by default on a wide mouse board and keeps desktop sizes", async () => {
-    await mountAt(1500, 900, "fine");
+    // Shipped opens by itself from a 1500 px board; the container pads 20.
+    await mountAt(1600, 900, "fine");
 
     expect(column("Shipped")).not.toBeNull();
     expect(
@@ -504,15 +544,23 @@ describe("iPad layout", () => {
     expect(getComputedStyle(header).fontSize).toBe("12px");
   });
 
-  it("falls back to stage tabs on a portrait touch board", async () => {
-    await mountAt(1000, 900, "coarse");
+  it("shows one column at a time under a column switcher on a phone-width board", async () => {
+    await mountAt(390, 844, "coarse");
 
-    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+    const switcher = columnSwitcher();
+    expect(switcher).not.toBeNull();
     expect(column("Working")).toBeNull();
-    // The selected stage's cards sit side by side, not one per row.
-    const tiles = [...container.querySelectorAll('[role="tablist"] ~ div > button')];
-    expect(tiles.length).toBeGreaterThan(2);
-    expect(rect(tiles[1]!).top).toBeCloseTo(rect(tiles[0]!).top, 0);
+    // The first column with cards is picked, and only one is pressed.
+    const pressed = [...switcher!.querySelectorAll('button[aria-pressed="true"]')];
+    expect(pressed).toHaveLength(1);
+    expect(pressed[0]!.textContent).toContain("To-Do");
+
+    const working = [...switcher!.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Working"),
+    )!;
+    await act(() => working.click());
+    expect(working.getAttribute("aria-pressed")).toBe("true");
+    expect(switcher!.querySelectorAll('button[aria-pressed="true"]')).toHaveLength(1);
     expect(shortButtons()).toEqual([]);
   });
 });
@@ -552,12 +600,12 @@ describe("header triggers", () => {
   });
 });
 
-describe("review stack", () => {
+describe("review columns", () => {
   it.each([
-    ["needs_review", "Needs Review", "In Review"],
-    ["in_review", "In Review", "Needs Review"],
+    ["needs_review", "Reviewing", "In review, waiting"],
+    ["in_review", "In review, waiting", "Reviewing"],
   ] as const)(
-    "hides %s and keeps the other review stage whole",
+    "hides %s as a rail and keeps the other review column whole",
     async (hiddenStage, hiddenLabel, shownLabel) => {
       localStorage.setItem(
         boardColumnsStorageKey(BOARD_ID),
@@ -571,80 +619,32 @@ describe("review stack", () => {
         `button[aria-label^="Show ${hiddenLabel}"]`,
       );
       expect(restore).not.toBeNull();
-      // The restore control sits inside the shared review stack, not in the column strip.
-      expect(restore!.parentElement).toBe(column(shownLabel)!.parentElement);
-
+      // The rail stands where the column stood, in the strip beside its neighbour.
       const shown = column(shownLabel)!;
-      const list = shown.querySelector<HTMLElement>(":scope > div:last-child")!;
-      // The stack's restore row sits above the shown column when its sibling is hidden,
-      // so the shown column starts a row lower than the strip's top.
-      const stackTop = rect(shown.parentElement!).top;
-      expect(rect(shown).top).toBeGreaterThanOrEqual(stackTop);
-      expect(rect(shown).top).toBeLessThan(stackTop + 120);
+      expect(restore!.parentElement).toBe(shown.parentElement);
+      expect(rect(restore!).top).toBeCloseTo(rect(shown).top, 0);
+      expect(rect(shown).width).toBeGreaterThanOrEqual(184);
       expect(rect(shown).bottom).toBeLessThanOrEqual(900);
-      expect(rect(shown).width).toBeGreaterThanOrEqual(176);
-      // Every card of the visible stage shows; nothing is squeezed into a sliver.
-      expect(list.clientHeight).toBeGreaterThanOrEqual(list.scrollHeight - 1);
-      expect(list.querySelectorAll("button").length).toBeGreaterThan(0);
-    },
-  );
-});
+      expect(shown.querySelectorAll("button").length).toBeGreaterThan(0);
 
-describe("review stack at the iPad width", () => {
-  it.each(["needs_review", "in_review"] as const)(
-    "keeps the stage grid inside the board with %s hidden at 1084px touch",
-    async (hiddenStage) => {
-      localStorage.setItem(
-        boardColumnsStorageKey(BOARD_ID),
-        JSON.stringify({ widths: {}, hidden: [hiddenStage], groupWidth: null }),
-      );
-      await mountAt(1084, 900, "coarse");
-
-      expect(isStageGrid()).toBe(true);
-      const strip = container.querySelector<HTMLElement>(".overflow-x-auto")!;
-      expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
-      const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
-      const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
-      const visibleShipped = shipped ?? folded;
-      expect(visibleShipped).not.toBeNull();
-      expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
-        strip.getBoundingClientRect().right + 1,
-      );
+      await act(() => restore!.click());
+      expect(column(hiddenLabel)).not.toBeNull();
     },
   );
 
-  it.each([
-    // The thresholds: 964 fine, 1044 coarse. The container pads 20px, so the board is
-    // 20px narrower than the viewport.
-    ["fine", 984],
-    ["coarse", 1064],
-  ] as const)(
-    "drops the review stack with both stages hidden on a %s pointer (board over threshold)",
-    async (pointerKind, viewportWidth) => {
-      localStorage.setItem(
-        boardColumnsStorageKey(BOARD_ID),
-        JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
-      );
-      await mountAt(viewportWidth, 900, pointerKind);
+  it("fits the board without sideways scroll at the iPad width with both hidden", async () => {
+    localStorage.setItem(
+      boardColumnsStorageKey(BOARD_ID),
+      JSON.stringify({ widths: {}, hidden: ["needs_review", "in_review"], groupWidth: null }),
+    );
+    await mountAt(1084, 900, "coarse");
 
-      expect(isStageGrid()).toBe(true);
-      expect(container.querySelector("[data-review-stack]")).toBeNull();
-      expect(container.querySelector('[aria-label="Resize Review"]')).toBeNull();
-      expect(container.querySelector('button[aria-label^="Show Needs Review"]')).not.toBeNull();
-      expect(container.querySelector('button[aria-label^="Show In Review"]')).not.toBeNull();
-
-      // The stage strip is the To-Do column's parent, not the goal strip above the board.
-      const strip = column("To-Do")!.parentElement as HTMLElement;
-      expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
-      const folded = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
-      const shipped = container.querySelector<HTMLElement>('section[aria-label="Shipped"]');
-      const visibleShipped = shipped ?? folded;
-      expect(visibleShipped).not.toBeNull();
-      expect(rect(visibleShipped!).right).toBeLessThanOrEqual(
-        strip.getBoundingClientRect().right + 1,
-      );
-    },
-  );
+    expect(isStageGrid()).toBe(true);
+    expect(container.querySelector('button[aria-label^="Show Reviewing"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label^="Show In review, waiting"]')).not.toBeNull();
+    const strip = column("To-Do")!.parentElement as HTMLElement;
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+  });
 });
 
 describe("saved widths", () => {
@@ -663,36 +663,35 @@ describe("saved widths", () => {
   });
 
   it("keeps saved review widths after a reload", async () => {
-    saveWidths({ needs_review: 480, in_review: 480 });
+    saveWidths({ needs_review: 480, in_review: 360 });
     await mountAt(1500, 900, "fine");
 
-    expect(rect(column("Needs Review")!).width).toBeCloseTo(480, 0);
-    expect(rect(column("In Review")!).width).toBeCloseTo(480, 0);
+    expect(rect(column("Reviewing")!).width).toBeCloseTo(480, 0);
+    expect(rect(column("In review, waiting")!).width).toBeCloseTo(360, 0);
   });
 
-  it("saves a review stack resize to both review stages and keeps it after a reload", async () => {
+  it("saves a Reviewing resize to that column alone and keeps it after a reload", async () => {
     await mountAt(1500, 900, "fine");
-    const before = rect(column("Needs Review")!).width;
+    const before = rect(column("Reviewing")!).width;
 
     await act(() => {
-      handle("Review")!.dispatchEvent(
+      handle("Reviewing")!.dispatchEvent(
         new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
       );
     });
 
     const { widths } = readStored(boardColumnsStorageKey(BOARD_ID));
     expect(widths.needs_review).toBeCloseTo(before + 16, 0);
-    expect(widths.in_review).toBe(widths.needs_review);
+    expect(widths.in_review).toBeUndefined();
 
     await mountAt(1500, 900, "fine");
-    expect(rect(column("Needs Review")!).width).toBeCloseTo(before + 16, 0);
-    expect(rect(column("In Review")!).width).toBeCloseTo(before + 16, 0);
+    expect(rect(column("Reviewing")!).width).toBeCloseTo(before + 16, 0);
   });
 });
 
 describe("left-edge keyboard step", () => {
-  it("widens Needs Owner from its rendered width on ArrowLeft", async () => {
-    const separator = handle("Needs Owner")!;
+  it("widens Needs you from its rendered width on ArrowLeft", async () => {
+    const separator = handle("Needs you")!;
     const column = separator.parentElement as HTMLElement;
     const before = column.getBoundingClientRect().width;
 

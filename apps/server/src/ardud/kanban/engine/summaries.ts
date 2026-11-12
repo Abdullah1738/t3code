@@ -6,6 +6,8 @@
  * the threads started since the last list.
  */
 import {
+  kanbanAskIsNotice,
+  kanbanAskWaitsOn,
   type KanbanBoard,
   type KanbanBoardListEntry,
   type KanbanBoardSummary,
@@ -17,11 +19,22 @@ import * as Stream from "effect/Stream";
 
 import type { SummaryCard } from "../store/summaryCard.ts";
 
-type CardCount = "owner" | "running" | null;
+/**
+ * What a card adds to the counts. `owner` holds, for each ask the owner can
+ * answer, the time span (ms, from inclusive, until exclusive) in which it
+ * counts: from the end of a snooze, until its expiry. A hand-set hold counts
+ * for all time. The card counts for him while any span holds the clock.
+ */
+interface CardCount {
+  readonly owner: ReadonlyArray<readonly [from: number, until: number]>;
+  readonly running: boolean;
+}
 
 interface BoardTally {
   board: KanbanBoard;
   readonly cards: Map<string, CardCount>;
+  /** The counts the last list carried, to notice an ask expiring or a snooze running out between changes. */
+  sent: Counts | null;
   readonly unread: Map<string, number>;
   readonly threads: Set<ThreadId>;
   /** The board changed since the last list. */
@@ -33,15 +46,35 @@ interface BoardTally {
 /** Mutable on purpose: one per watcher, folded over its own changes. */
 export type BoardTallies = Map<string, BoardTally>;
 
-// A card waiting on the owner, or with an open ask, counts there even while a thread holds it.
-const cardCount = (card: SummaryCard): CardCount =>
-  card.settledAt !== null
-    ? null
-    : card.stage === "needs_owner" || card.asks.some((ask) => ask.closedAt === null)
-      ? "owner"
-      : card.activeThreadId !== null
-        ? "running"
-        : null;
+// The time-free half of `kanbanCardNeedsOwner`: the clock is applied when a list is built.
+const cardCount = (card: SummaryCard): CardCount | null => {
+  if (card.settledAt !== null) return null;
+  const owner: Array<readonly [number, number]> = [];
+  let open = 0;
+  for (const ask of card.asks) {
+    if (ask.closedAt !== null || kanbanAskIsNotice(ask)) continue;
+    open += 1;
+    if (kanbanAskWaitsOn(ask) !== "owner") continue;
+    owner.push([
+      ask.snoozedUntil === undefined ? 0 : Date.parse(ask.snoozedUntil),
+      ask.expiresAt === undefined ? Number.POSITIVE_INFINITY : Date.parse(ask.expiresAt),
+    ]);
+  }
+  if (open === 0 && card.stage === "needs_owner") owner.push([0, Number.POSITIVE_INFINITY]);
+  const running = card.activeThreadId !== null;
+  return owner.length === 0 && !running ? null : { owner, running };
+};
+
+const sameCount = (a: CardCount | null, b: CardCount | null) =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.running === b.running &&
+    a.owner.length === b.owner.length &&
+    a.owner.every(([from, until], index) => {
+      const other = b.owner[index]!;
+      return from === other[0] && until === other[1];
+    }));
 
 // Same rule as the board snapshot's unread entries.
 const unreadOf = (discussion: KanbanDiscussion) => {
@@ -77,6 +110,7 @@ export function tallyBoards(
         threads: new Set(threadIds),
         boardChanged: false,
         started: [],
+        sent: null,
       },
     ]),
   );
@@ -97,6 +131,7 @@ export function applyChange(tallies: BoardTallies, boardId: string, change: Kanb
         threads: new Set(),
         boardChanged: true,
         started: [],
+        sent: null,
       });
     return true;
   }
@@ -104,9 +139,9 @@ export function applyChange(tallies: BoardTallies, boardId: string, change: Kanb
   if (!tally) return false;
   switch (change._tag) {
     case "card":
-      return setEntry(tally.cards, change.card.id, cardCount(change.card), null);
+      return setCard(tally.cards, change.card.id, cardCount(change.card));
     case "cardRemoved":
-      return setEntry(tally.cards, change.cardId, null, null);
+      return setCard(tally.cards, change.cardId, null);
     case "discussion":
       return setEntry(tally.unread, change.discussion.id, unreadOf(change.discussion), 0);
     case "thread": {
@@ -128,22 +163,46 @@ const setEntry = <T>(map: Map<string, T>, key: string, value: T, none: T) => {
   return changed;
 };
 
-const countsOf = (tally: BoardTally) => {
+const setCard = (map: Map<string, CardCount>, key: string, value: CardCount | null) => {
+  const changed = !sameCount(map.get(key) ?? null, value);
+  if (value === null) map.delete(key);
+  else map.set(key, value);
+  return changed;
+};
+
+interface Counts {
+  readonly needsOwner: number;
+  readonly running: number;
+  readonly unread: number;
+}
+
+// A card the owner can act on counts there even while a thread holds it.
+const countsOf = (tally: BoardTally, nowMs: number): Counts => {
   let needsOwner = 0;
   let running = 0;
   let unread = 0;
   for (const count of tally.cards.values()) {
-    if (count === "owner") needsOwner += 1;
-    else if (count === "running") running += 1;
+    if (count.owner.some(([from, until]) => from <= nowMs && nowMs < until)) needsOwner += 1;
+    else if (count.running) running += 1;
   }
   for (const count of tally.unread.values()) unread += count;
   return { needsOwner, running, unread };
 };
 
-export function summaries(tallies: BoardTallies): ReadonlyArray<KanbanBoardSummary> {
+/** True when a count moved with no change behind it: an ask expired, or a snooze ran out. */
+const countsMoved = (tallies: BoardTallies, nowMs: number) => {
+  for (const tally of tallies.values()) {
+    if (tally.sent === null) continue;
+    const now = countsOf(tally, nowMs);
+    if (now.needsOwner !== tally.sent.needsOwner || now.running !== tally.sent.running) return true;
+  }
+  return false;
+};
+
+export function summaries(tallies: BoardTallies, nowMs: number): ReadonlyArray<KanbanBoardSummary> {
   return [...tallies.values()].map((tally) => ({
     board: tally.board,
-    ...countsOf(tally),
+    ...countsOf(tally, nowMs),
     threadIds: [...tally.threads],
   }));
 }
@@ -152,12 +211,15 @@ export function summaries(tallies: BoardTallies): ReadonlyArray<KanbanBoardSumma
 export function listUpdate(
   tallies: BoardTallies,
   first: boolean,
+  nowMs: number,
 ): ReadonlyArray<KanbanBoardListEntry> {
   return [...tallies.values()].map((tally) => {
+    const counts = countsOf(tally, nowMs);
+    tally.sent = counts;
     const entry = {
       boardId: tally.board.id,
       board: first || tally.boardChanged ? tally.board : null,
-      ...countsOf(tally),
+      ...counts,
       threadIds: first ? [...tally.threads] : tally.started.slice(),
     };
     tally.boardChanged = false;
@@ -170,14 +232,17 @@ export function listUpdate(
  * The whole list now, then an update once per batch of changes that moves a
  * count, so a burst sends one list. Changes set whole records: one queued before the
  * starting read can briefly undo a newer copy it holds, and the change that
- * made that copy follows it and sets it back.
+ * made that copy follows it and sets it back. An ask passing its `expiresAt`
+ * or the end of its snooze is no change, so each batch also recounts: the
+ * badge follows at the next change on any board.
  */
 export const follow = <E, R>(
   tallies: BoardTallies,
   changes: Stream.Stream<{ readonly boardId: string; readonly change: KanbanChange }, E, R>,
+  now: () => number = Date.now,
 ): Stream.Stream<ReadonlyArray<KanbanBoardListEntry>, E, R> =>
   Stream.concat(
-    Stream.sync(() => listUpdate(tallies, true)),
+    Stream.sync(() => listUpdate(tallies, true, now())),
     changes.pipe(
       Stream.mapAccumArray(
         () => tallies,
@@ -186,7 +251,11 @@ export const follow = <E, R>(
           for (const entry of batch) {
             if (applyChange(state, entry.boardId, entry.change)) moved = true;
           }
-          return [state, moved ? [listUpdate(state, false)] : []] as const;
+          const nowMs = now();
+          return [
+            state,
+            moved || countsMoved(state, nowMs) ? [listUpdate(state, false, nowMs)] : [],
+          ] as const;
         },
       ),
     ),

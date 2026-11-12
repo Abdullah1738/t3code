@@ -473,6 +473,13 @@ const make = Effect.gen(function* () {
     },
     // Both writes and large shell snapshots can outlast offbox's lookup timeout.
     NodeSqliteClient.identityReadOnly,
+    // Pure reads: a lookup the identity lane never ran (process replaced, queue
+    // full) runs once more on the fresh reader. A started read is not replayed.
+    (effect) =>
+      Effect.retry(effect, {
+        times: 1,
+        while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
+      }),
   );
 
   const currentNative: ExecutionIdentityShape["currentNative"] = (threadIds) =>
