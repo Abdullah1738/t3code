@@ -783,7 +783,7 @@ it.live("redaction stops a real export worker and resumed publication stays clea
   ),
 );
 
-it.effect.each(["detach", "durability", "mode"])(
+it.effect.each(["detach", "durability", "mode", "fullfsync"])(
   "retains recovery through a %s cleanup failure and retries cleanup before verification",
   (phase) =>
     run(
@@ -800,7 +800,8 @@ it.effect.each(["detach", "durability", "mode"])(
             if (
               broken &&
               ((phase === "detach" && statement === "DETACH DATABASE ardud_redaction_base") ||
-                (phase === "durability" && /^PRAGMA main.synchronous=\d/.test(statement)))
+                (phase === "durability" && /^PRAGMA main.synchronous=\d/.test(statement)) ||
+                (phase === "fullfsync" && /^PRAGMA fullfsync=\d/.test(statement)))
             )
               throw new Error("Fixture cleanup failure");
             return originalPrepare.call(this, statement);
@@ -1735,7 +1736,7 @@ it.effect.each(["ardud_redaction_base", "ardud_redaction_replica"])(
     ),
 );
 
-it.effect.each(["detach", "durability", "mode"])(
+it.effect.each(["detach", "durability", "mode", "fullfsync"])(
   "pre-mutation recovery survives a $s cleanup failure",
   (phase) =>
     run(
@@ -1751,7 +1752,8 @@ it.effect.each(["detach", "durability", "mode"])(
             if (
               broken &&
               ((phase === "detach" && source === "DETACH DATABASE ardud_redaction_base") ||
-                (phase === "durability" && /^PRAGMA main.synchronous=\d/.test(source)))
+                (phase === "durability" && /^PRAGMA main.synchronous=\d/.test(source)) ||
+                (phase === "fullfsync" && /^PRAGMA fullfsync=\d/.test(source)))
             )
               throw new Error("Fixture cleanup failure");
             return original.call(this, source);
@@ -2078,6 +2080,262 @@ it.effect.each([
   ),
 );
 
+it.effect.each(["separate lines", "prefix", "suffix", "both"])(
+  "mixed %s logs verify and resume export on the first pass",
+  (layout) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const config = yield* Config.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const file = NodePath.join(config.logsDir, "mixed-format.log");
+        const json = JSON.stringify({ copy: fake });
+        const framed = "[2026-11-12T00:00:00.000Z] NTIVE: " + json;
+        const source =
+          layout === "separate lines"
+            ? framed + "\nplain copy: " + fake
+            : layout === "prefix"
+              ? fake + " " + json
+              : layout === "suffix"
+                ? framed + " " + fake
+                : fake + " " + json + " " + fake;
+        const copies = layout === "both" ? 3 : 2;
+        yield* Effect.promise(() => NodeFSP.writeFile(file, source + "\nunrelated line\n"));
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service.redactItem({
+          threadId,
+          itemId: "item-fixture",
+          reason: "fixture",
+          compact: true,
+        });
+        expect(result.verify).toBe(true);
+        const rewritten = yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"));
+        expect(rewritten.includes(fake)).toBe(false);
+        expect(rewritten.endsWith("unrelated line\n")).toBe(true);
+        expect(result.stores.find((store) => store.store === file)).toMatchObject({
+          matchedBefore: copies,
+          replaced: copies,
+          remainingAfter: 0,
+        });
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+      }),
+    ),
+);
+
+it.effect.each([
+  {
+    form: "inline JSON output",
+    value: 'before {"part":"eyJFAKE.inline"} after',
+    copy: 'prefix before {"part":"eyJFAKE.inline"} after suffix\n',
+  },
+  {
+    form: "framed scalar",
+    value: "1000000000000000000000",
+    copy: "[2026-11-12T00:00:00.000Z] NTIVE: 1e+21\n",
+  },
+])("verifies complete erasure of $form copies", ({ value, copy }) =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify({ ...fixture, output: value })}`;
+      const file = NodePath.join(config.logsDir, "complete-copy.log");
+      yield* Effect.promise(() => NodeFSP.writeFile(file, copy));
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      expect(result.stores.find((entry) => entry.store === file)).toMatchObject({
+        matchedBefore: 1,
+        replaced: 1,
+        remainingAfter: 0,
+      });
+      const rewritten = yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"));
+      expect(rewritten.includes(value)).toBe(false);
+      expect(rewritten).toContain("[redacted ");
+    }),
+  ),
+);
+
+it.effect.each(["file", "database"])(
+  "key collisions in %s refuse before any content mutation",
+  (surface) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const config = yield* Config.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const output = { fixtureAlpha: "eyJFAKE.alpha", fixtureBeta: "eyJFAKE.beta" };
+        const original = JSON.stringify({ ...fixture, output });
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${original}`;
+        const collision = JSON.stringify({ ...output, keep: true });
+        const file = NodePath.join(config.logsDir, "key-collision.log");
+        const before = surface === "file" ? "prefix " + collision + " suffix\n" : fake;
+        yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+        if (surface === "database")
+          yield* sql`UPDATE projection_thread_messages SET text=${collision} WHERE message_id='quote'`;
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const failure = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(Effect.flip);
+        expect(JSON.stringify(failure).includes("fixtureAlpha")).toBe(false);
+        const rows = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        expect(rows[0]?.payload_json).toBe(original);
+        expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+      }),
+    ),
+);
+
+it.effect("incomplete framed JSON refuses before any content mutation", () =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const config = yield* Config.ServerConfig;
+      const sql = yield* SqlClient.SqlClient;
+      const file = NodePath.join(config.logsDir, "incomplete-frame.log");
+      const before = '[2026-11-12T00:00:00.000Z] NTIVE: "' + fake.replace("e", "\\u0065") + " []";
+      yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      yield* service
+        .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+        .pipe(Effect.flip);
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+      expect(rows[0]?.payload_json).toBe(JSON.stringify(fixture));
+      expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+      const pending = yield* sql<{
+        pending: number;
+      }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+      expect(pending[0]?.pending).toBe(0);
+    }),
+  ),
+);
+
+it.effect.each([
+  { form: "solidus", value: "fixture/output", encoded: String.raw`fixture\/output` },
+  { form: "reverse solidus", value: "fixture\\output", encoded: String.raw`fixture\\output` },
+  { form: "quotation mark", value: 'fixture"output', encoded: String.raw`fixture\"output` },
+  { form: "backspace", value: "fixture\boutput", encoded: String.raw`fixture\boutput` },
+  { form: "form feed", value: "fixture\foutput", encoded: String.raw`fixture\foutput` },
+  { form: "line feed", value: "fixture\noutput", encoded: String.raw`fixture\noutput` },
+  { form: "carriage return", value: "fixture\routput", encoded: String.raw`fixture\routput` },
+  { form: "tab", value: "fixture\toutput", encoded: String.raw`fixture\toutput` },
+])("incomplete $form log refuses without mutation and permits retry", ({ value, encoded }) =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const config = yield* Config.ServerConfig;
+      const sql = yield* SqlClient.SqlClient;
+      const original = JSON.stringify({ ...fixture, output: value });
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${original} WHERE turn_item_id='item-fixture'`;
+      const file = NodePath.join(config.logsDir, "incomplete-escape.log");
+      const before = 'NTIVE: "' + encoded;
+      yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+      const logs: unknown[] = [];
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const error = yield* service
+        .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+        .pipe(
+          Effect.provide(Logger.layer([Logger.make((entry) => logs.push(entry))])),
+          Effect.flip,
+        );
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+      expect(rows[0]?.payload_json).toBe(original);
+      expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+      const pending = yield* sql<{
+        pending: number;
+      }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+      expect(pending[0]?.pending).toBe(0);
+      expect(JSON.stringify([error, logs]).includes(encoded)).toBe(false);
+      expect(JSON.stringify([error, logs]).includes(value)).toBe(false);
+      yield* Effect.promise(() => NodeFSP.writeFile(file, "NTIVE: " + JSON.stringify(value)));
+      const retried = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(retried.verify).toBe(true);
+      expect((yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).includes(encoded)).toBe(
+        false,
+      );
+    }),
+  ),
+);
+
+it.effect.each([
+  { form: "solidus", value: "fixture/output", encoded: String.raw`fixture\/output` },
+  { form: "Unicode", value: "fixture/output", encoded: String.raw`fixture\u002foutput` },
+  { form: "numeric", value: "1000000000000000000000", encoded: String.raw`\u0031e+21` },
+  {
+    form: "document",
+    value: '{"a":1,"b":2}',
+    encoded: String.raw`\u007b\u0022b\u0022:2,\u0022a\u0022:1\u007d`,
+  },
+])(
+  "unquoted alternate $form log refuses without mutation and permits retry",
+  ({ value, encoded }) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const config = yield* Config.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const original = JSON.stringify({ ...fixture, output: value });
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${original} WHERE turn_item_id='item-fixture'`;
+        const file = NodePath.join(config.logsDir, "bare-escape.log");
+        const before = "NTIVE: " + encoded;
+        yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+        const logs: unknown[] = [];
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const error = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(
+            Effect.provide(Logger.layer([Logger.make((entry) => logs.push(entry))])),
+            Effect.flip,
+          );
+        const rows = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        expect(rows[0]?.payload_json).toBe(original);
+        expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+        expect(JSON.stringify([error, logs]).includes(encoded)).toBe(false);
+        expect(JSON.stringify([error, logs]).includes(value)).toBe(false);
+        yield* Effect.promise(() => NodeFSP.writeFile(file, "NTIVE: " + JSON.stringify(value)));
+        const retried = yield* service.redactItem({
+          threadId,
+          itemId: "item-fixture",
+          reason: "fixture",
+          compact: true,
+        });
+        expect(retried.verify).toBe(true);
+        expect(
+          (yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).includes(encoded),
+        ).toBe(false);
+      }),
+    ),
+);
+
 it.effect("invalid log encoding refuses before any content mutation", () =>
   run(
     Effect.gen(function* () {
@@ -2267,7 +2525,7 @@ it.effect.each(["selected payload", "outbox copy"])(
         const failure = yield* service
           .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
           .pipe(Effect.flip);
-        expect(failure.code).toBe("failed");
+        expect(failure.code).toBe(surface === "outbox copy" ? "invalid" : "failed");
         expect(JSON.stringify(failure).includes(fake)).toBe(false);
         const after = yield* sql<{
           payload_json: string;
@@ -2662,6 +2920,435 @@ it.effect.each([
       expect(copied.output).toContain("[redacted ");
       expect(copied.neighbor).toBe(neighbor);
       expect(copied.neighborText).toBe(input.neighborText);
+    }),
+  ),
+);
+
+it.effect.each(
+  ["node", "subagent", "run", "item", "archive-item"].flatMap((reference) =>
+    ["main", "base"].flatMap((store) =>
+      [false, true].flatMap((foreign) =>
+        [false, true].map((pending) => ({ reference, store, foreign, pending })),
+      ),
+    ),
+  ),
+)(
+  "linked provider reader $reference store=$store foreign=$foreign pending=$pending",
+  ({ reference, store, foreign, pending }) =>
+    run(
+      Effect.gen(function* () {
+        const paths = yield* extendedStores(false);
+        const sql = yield* SqlClient.SqlClient;
+        const config = yield* Config.ServerConfig;
+        if (reference === "node")
+          yield* sql`INSERT INTO orchestration_v2_projection_nodes(node_id,thread_id,root_node_id,kind,status,payload_json) VALUES ('linked-node',${threadId},'linked-node','tool','completed','{}')`;
+        if (reference === "subagent")
+          yield* sql`INSERT INTO orchestration_v2_projection_subagents(subagent_id,thread_id,parent_node_id,provider,provider_thread_id,origin,status,updated_at,payload_json) VALUES ('linked-agent',${threadId},'linked-node','claudeAgent','linked-provider','native','completed','2026-01-01','{}')`;
+        if (reference === "run")
+          yield* sql`INSERT INTO orchestration_v2_projection_runs(run_id,thread_id,ordinal,provider,provider_thread_id,status,requested_at,payload_json) VALUES ('linked-run',${threadId},2,'claudeAgent','linked-provider','completed','2026-01-01','{}')`;
+        if (reference === "item")
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,thread_id,provider_thread_id,ordinal,type,status,updated_at,payload_json) VALUES ('linked-item',${threadId},'linked-provider',2,'command_execution','completed','2026-01-01','{}')`;
+        if (reference === "archive-item")
+          yield* sql`INSERT INTO ardud_archive.ardud_turn_items(turn_item_id,thread_id,provider_thread_id,ordinal,type,status,updated_at,payload_json) VALUES ('linked-archive-item',${threadId},'linked-provider',2,'command_execution','completed','2026-01-01','{}')`;
+        const linked = JSON.stringify({
+          id: "linked-provider",
+          driver: "claudeAgent",
+          nativeThreadRef: { nativeId: "linked-session" },
+          status: "idle",
+          pendingBackgroundTasks: pending ? [{ taskId: "task-fixture" }] : [],
+          copy: fake,
+        }).replace(fake, fake.replace("e", "\\u0065"));
+        const values = [
+          foreign ? "other-reader-fixture" : null,
+          reference === "node" ? "linked-node" : null,
+          linked,
+        ];
+        const statement =
+          "INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,thread_id,owner_node_id,provider,provider_session_id,status,updated_at,payload_json) VALUES ('linked-provider',?,?,'claudeAgent','linked-session','idle','2026-01-01',?)";
+        if (store === "main") yield* sql.unsafe(statement, values);
+        else
+          yield* Effect.sync(() => {
+            const mode = NodeFS.statSync(paths.basePath).mode & 0o777;
+            NodeFS.chmodSync(paths.basePath, mode | 0o200);
+            try {
+              const database = new NodeSqlite.DatabaseSync(paths.basePath);
+              try {
+                database.prepare(statement).run(...values);
+              } finally {
+                database.close();
+              }
+            } finally {
+              NodeFS.chmodSync(paths.basePath, mode);
+            }
+          });
+        const unrelated = "eyJFAKE.UNRELATED-LINKED";
+        const file = NodePath.join(
+          config.baseDir,
+          "harness-homes",
+          "claude",
+          "projects",
+          "fixture",
+          "linked-session.jsonl",
+        );
+        const before =
+          JSON.stringify({ copy: fake }).replace(fake, fake.replace("e", "\\u0065")) +
+          "\n" +
+          JSON.stringify({ type: "tool_result", tool_use_id: "call-fixture", content: unrelated }) +
+          "\n";
+        yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(Effect.result);
+        if (pending) {
+          expect(result._tag).toBe("Failure");
+          if (result._tag === "Failure") expect(result.failure.code).toBe("running");
+          expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+        } else {
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success") expect(result.success.verify).toBe(true);
+          const rows = yield* sql.unsafe<{ payload_json: string }>(
+            `SELECT payload_json FROM ${store === "main" ? "main" : "ardud_base"}.orchestration_v2_projection_provider_threads WHERE provider_thread_id='linked-provider'`,
+          );
+          expect(JSON.parse(rows[0]!.payload_json).copy).toContain("[redacted ");
+          const text = yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"));
+          expect(JSON.parse(text.split("\n")[0]!).copy).toContain("[redacted ");
+          expect(JSON.parse(text.split("\n")[1]!).content).toBe(unrelated);
+          if (foreign) {
+            const audits =
+              yield* sql`SELECT event_id FROM orchestration_events WHERE stream_id='other-reader-fixture' AND event_type='thread.item-redacted'`;
+            expect(audits.length).toBe(1);
+          }
+        }
+      }),
+    ),
+);
+
+it.effect.each([0, 1].flatMap((original) => [false, true].map((failed) => ({ original, failed }))))(
+  "fullfsync protects pending marker and restores original=$original failed=$failed",
+  ({ original, failed }) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql.unsafe(`PRAGMA fullfsync=${original}`);
+        if (failed)
+          yield* sql`CREATE TRIGGER fixture_sync_failure BEFORE INSERT ON orchestration_events WHEN NEW.event_type='thread.item-redacted' BEGIN SELECT RAISE(ABORT,'fixture'); END`;
+        const observed: number[] = [];
+        const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
+        const spy = vi
+          .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
+          .mockImplementation(function (this: NodeSqlite.DatabaseSync, source: string) {
+            if (source.startsWith("INSERT INTO ardud_thread_redaction_recovery"))
+              observed.push(Number(prepare.call(this, "PRAGMA fullfsync").get()!.fullfsync));
+            return prepare.call(this, source);
+          });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(Effect.result);
+        expect(result._tag).toBe(failed ? "Failure" : "Success");
+        expect(observed).toEqual([1]);
+        const restored = yield* sql.unsafe<{ fullfsync: number }>("PRAGMA fullfsync");
+        expect(restored[0]?.fullfsync).toBe(original);
+      }),
+    ),
+);
+
+it.effect.each(
+  ["native-ref", "session-column", "thread-column"].flatMap((form) =>
+    [false, true].map((foreign) => ({ form, foreign })),
+  ),
+)("selected provider owns $form native output with foreign=$foreign", ({ form, foreign }) =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      const providerId = form === "thread-column" ? "owned-session" : "provider-thread:owned";
+      const sessionId = form === "session-column" ? "owned-session" : null;
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET provider_thread_id=${providerId} WHERE turn_item_id='item-fixture'`;
+      const provider = {
+        id: providerId,
+        driver: "claudeAgent",
+        nativeThreadRef: form === "native-ref" ? { nativeId: "owned-session" } : null,
+        pendingBackgroundTasks: [],
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,thread_id,provider,provider_session_id,status,updated_at,payload_json) VALUES (${providerId},${foreign ? "foreign-reader" : null},'claudeAgent',${sessionId},'idle','2026-01-01',${JSON.stringify(provider)})`;
+      const root = NodePath.join(config.baseDir, "harness-homes", "claude", "projects", "fixture");
+      const file = NodePath.join(root, "owned-session.jsonl");
+      const only = "eyJFAKE.EXACT-PROVIDER-ONLY";
+      const log = NodePath.join(config.logsDir, "owned-provider-copy.log");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(root, { recursive: true });
+        await NodeFSP.mkdir(config.logsDir, { recursive: true });
+        await NodeFSP.writeFile(
+          file,
+          JSON.stringify({ type: "tool_result", tool_use_id: "call-fixture", content: only }) +
+            "\n",
+        );
+        await NodeFSP.writeFile(log, JSON.stringify({ copy: only }));
+      });
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      expect(result.providers).toContainEqual({ provider: "claudeAgent", status: "rewritten" });
+      expect((yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).includes(only)).toBe(
+        false,
+      );
+      expect((yield* Effect.promise(() => NodeFSP.readFile(log, "utf8"))).includes(only)).toBe(
+        false,
+      );
+      expect(JSON.stringify(result).includes(only)).toBe(false);
+    }),
+  ),
+);
+
+it.effect.each(
+  ["example", "dynamic_tool"].flatMap((exampleType) =>
+    [
+      "direct",
+      "payload",
+      "item",
+      "activity",
+      "data",
+      "tool",
+      "state",
+      "turnItems",
+      "visibleTurnItems",
+    ].map((envelope) => ({ exampleType, envelope })),
+  ),
+)(
+  "revision preserves $exampleType argument examples inside $envelope copies",
+  ({ exampleType, envelope }) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const sql = yield* SqlClient.SqlClient;
+        const old = "2026-01-01T00:00:00.000Z";
+        const example = { id: "item-fixture", type: exampleType, updatedAt: old };
+        const input = {
+          example,
+          payload: example,
+          item: [example],
+          arguments: [{ data: example }],
+        };
+        const item = {
+          ...fixture,
+          type: "dynamic_tool",
+          input,
+          arguments: { example },
+          providerMetadata: { example },
+          updatedAt: old,
+        };
+        const wrapped = envelope === "direct" ? item : { [envelope]: [item] };
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify(item)},updated_at=${old} WHERE turn_item_id='item-fixture'`;
+        yield* sql`UPDATE orchestration_events SET payload_json=${JSON.stringify(wrapped)} WHERE event_id='fixture-event'`;
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service.redactItem({
+          threadId,
+          itemId: "item-fixture",
+          reason: "fixture",
+          compact: true,
+        });
+        expect(result.verify).toBe(true);
+        const rows = yield* sql<{
+          payload_json: string;
+          updated_at: string;
+        }>`SELECT payload_json,updated_at FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        const revised = JSON.parse(rows[0]!.payload_json);
+        expect(revised.updatedAt).toBe(rows[0]!.updated_at);
+        expect(revised.updatedAt > old).toBe(true);
+        expect(revised.input).toEqual(input);
+        expect(revised.arguments).toEqual(item.arguments);
+        expect(revised.providerMetadata).toEqual(item.providerMetadata);
+        const events = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_events WHERE event_id='fixture-event'`;
+        const payload = JSON.parse(events[0]!.payload_json);
+        const copied = envelope === "direct" ? payload : payload[envelope][0];
+        expect(copied.updatedAt).toBe(revised.updatedAt);
+        expect(copied.input).toEqual(input);
+        expect(copied.arguments).toEqual(item.arguments);
+        expect(copied.providerMetadata).toEqual(item.providerMetadata);
+      }),
+    ),
+);
+
+it.effect.each([false, true])(
+  "streamed prefix cannot hide quoted=$quoted escaped output",
+  (quoted) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const sql = yield* SqlClient.SqlClient;
+        const config = yield* Config.ServerConfig;
+        const output = "heading fixture/output";
+        const item = { ...fixture, output };
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify(item)} WHERE turn_item_id='item-fixture'`;
+        yield* sql`UPDATE orchestration_events SET payload_json=${JSON.stringify({ ...fixture, output: "heading " })} WHERE event_id='fixture-event'`;
+        const file = NodePath.join(config.logsDir, "overlap.log");
+        const encoded = String.raw`heading fixture\/output`;
+        const before = quoted ? 'prefix "' + encoded + '" suffix' : "NTIVE: " + encoded;
+        yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(Effect.result);
+        if (quoted) {
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success") expect(result.success.verify).toBe(true);
+          const after = yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"));
+          expect(after.includes("fixture/output")).toBe(false);
+          expect(after.includes(encoded)).toBe(false);
+        } else {
+          expect(result._tag).toBe("Failure");
+          expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+          const rows = yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+          expect(rows[0]!.payload_json).toBe(JSON.stringify(item));
+        }
+      }),
+    ),
+);
+
+it.effect.each([
+  { form: "object", body: '{"copy":3.141592653589793e15' },
+  { form: "array", body: "[3.141592653589793e15" },
+  { form: "trailing comma", body: '{"copy":3.141592653589793e15,}' },
+  { form: "nested", body: '{"copy":[3.141592653589793e15' },
+])("malformed $form log refuses before any mutation", ({ body }) =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      const item = { ...fixture, output: "3141592653589793" };
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify(item)} WHERE turn_item_id='item-fixture'`;
+      const file = NodePath.join(config.logsDir, "malformed-container.log");
+      const before = "NTIVE: " + body;
+      yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const error = yield* service
+        .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+        .pipe(Effect.flip);
+      expect(JSON.stringify(error).includes(item.output)).toBe(false);
+      expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+      expect(rows[0]!.payload_json).toBe(JSON.stringify(item));
+      const pending = yield* sql<{
+        pending: number;
+      }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+      expect(pending[0]?.pending).toBe(0);
+    }),
+  ),
+);
+
+it.effect("redacts an equivalent numeric token beside JSON and ordinary log text", () =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify({ ...fixture, output: "3141592653589793" })} WHERE turn_item_id='item-fixture'`;
+      const file = NodePath.join(config.logsDir, "raw-number.log");
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(file, '{"unrelated":"kept"} 3.141592653589793e15 total'),
+      );
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      const after = yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"));
+      expect(after.startsWith('{"unrelated":"kept"} ')).toBe(true);
+      expect(after.endsWith(" total")).toBe(true);
+      expect(after.includes("3.141592653589793e15")).toBe(false);
+    }),
+  ),
+);
+
+it.effect.each(["1e10000000", "1e-1000000"])(
+  "unverifiable numeric %s refuses before mutation",
+  (output) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const sql = yield* SqlClient.SqlClient;
+        const config = yield* Config.ServerConfig;
+        const item = { ...fixture, output };
+        yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify(item)} WHERE turn_item_id='item-fixture'`;
+        const file = NodePath.join(config.logsDir, "numeric-bound.log");
+        const before =
+          "amount " + (output.startsWith("1e-") ? "10e-1000001" : "10e9999999") + " total";
+        yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const error = yield* service
+          .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+          .pipe(Effect.flip);
+        expect(JSON.stringify(error).includes(output)).toBe(false);
+        expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+        const rows = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        expect(rows[0]!.payload_json).toBe(JSON.stringify(item));
+        const audit =
+          yield* sql`SELECT event_id FROM orchestration_events WHERE event_type='thread.item-redacted'`;
+        expect(audit.length).toBe(0);
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+      }),
+    ),
+);
+
+it.effect.each([
+  { output: "1e999999", copy: "0.1e1000000" },
+  { output: "1e-999999", copy: "10e-1000000" },
+  { output: "-1e999999", copy: "-0.1e1000000" },
+  { output: "-1e-999999", copy: "-10e-1000000" },
+])("unverifiable source numeric for $output refuses before mutation", ({ output, copy }) =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      const item = { ...fixture, output };
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json=${JSON.stringify(item)} WHERE turn_item_id='item-fixture'`;
+      const file = NodePath.join(config.logsDir, "numeric-source-bound.log");
+      const before = "NTIVE: amount " + copy + " total";
+      yield* Effect.promise(() => NodeFSP.writeFile(file, before));
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const error = yield* service
+        .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })
+        .pipe(Effect.flip);
+      expect(JSON.stringify(error).includes(output)).toBe(false);
+      expect(JSON.stringify(error).includes(copy)).toBe(false);
+      expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(before);
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+      expect(rows[0]!.payload_json).toBe(JSON.stringify(item));
+      const audit =
+        yield* sql`SELECT event_id FROM orchestration_events WHERE event_type='thread.item-redacted'`;
+      expect(audit.length).toBe(0);
+      const pending = yield* sql<{
+        pending: number;
+      }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+      expect(pending[0]?.pending).toBe(0);
     }),
   ),
 );

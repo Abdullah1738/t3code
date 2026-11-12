@@ -75,7 +75,11 @@ const matchesJsonValue = (value: unknown, needles: readonly string[]) =>
       }
       return equalJson(parseJson(n), value);
     } catch (error) {
-      if (error instanceof DuplicateJsonKeyError || error instanceof LossyJsonNumberError)
+      if (
+        error instanceof DuplicateJsonKeyError ||
+        error instanceof LossyJsonNumberError ||
+        error instanceof InvalidJsonRecordError
+      )
         throw error;
       return false;
     }
@@ -93,6 +97,11 @@ export class DuplicateJsonKeyError extends Error {
 export class LossyJsonNumberError extends Error {
   constructor() {
     super("Redaction refuses lossy JSON numeric values.");
+  }
+}
+export class InvalidJsonRecordError extends Error {
+  constructor() {
+    super("Redaction refuses incomplete encoded JSON strings.");
   }
 }
 const jsonNumber = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
@@ -144,11 +153,79 @@ export function parseJson(source: string): unknown {
   return parsed;
 }
 
+const requireComparableNumbers = (needles: readonly string[]) => {
+  for (const needle of needles)
+    if (jsonNumber.test(needle.trim()) && decimalValue(needle.trim()) === undefined)
+      throw new LossyJsonNumberError();
+};
+
 /** Decode string tokens before matching so valid alternate JSON escapes share one meaning. */
 export function replaceText(
   text: string,
   needles: readonly string[],
   marker: string,
+): { text: string; count: number } {
+  requireComparableNumbers(needles);
+  // Keep repeated escape-layer proofs bounded; the cache lives only for this invocation.
+  const cache = new Map<string, Map<string, { text: string; count: number }>>();
+  const visit: typeof replaceText = (source, selected, replacement) => {
+    const key = JSON.stringify([selected, replacement]);
+    let bucket = cache.get(key);
+    if (!bucket) cache.set(key, (bucket = new Map()));
+    const cached = bucket.get(source);
+    if (cached) return cached;
+    // Each output stays verifiable before overlapping streamed copies change its context.
+    if (selected.length > 1) for (const needle of selected) visit(source, [needle], replacement);
+    let structured = false;
+    const semantic = selected.filter((needle) => {
+      if (jsonNumber.test(needle.trim())) {
+        structured = true;
+        return true;
+      }
+      try {
+        const value = parseJson(needle);
+        structured = true;
+        return typeof value !== "string";
+      } catch (error) {
+        if (
+          error instanceof DuplicateJsonKeyError ||
+          error instanceof LossyJsonNumberError ||
+          error instanceof InvalidJsonRecordError
+        )
+          throw error;
+        return false;
+      }
+    });
+    const replaced = replaceTextContent(source, selected, replacement, visit, structured);
+    let decoded = replaced.text;
+    while (true) {
+      const next = decoded.replace(
+        /\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})/g,
+        (escape) => JSON.parse(`"${escape}"`) as string,
+      );
+      if (next === decoded) break;
+      decoded = next;
+      if (
+        escapedNeedles(selected, longestBackslashRun(decoded)).some((needle) =>
+          decoded.includes(needle),
+        ) ||
+        // Decoding JSON syntax can itself produce an incomplete container around unrelated data.
+        (semantic.length && replaceTextContent(decoded, semantic, replacement, visit, false).count)
+      )
+        throw new InvalidJsonRecordError();
+    }
+    bucket.set(source, replaced);
+    return replaced;
+  };
+  return visit(text, needles, marker);
+}
+
+function replaceTextContent(
+  text: string,
+  needles: readonly string[],
+  marker: string,
+  visit: typeof replaceText,
+  structuredProof: boolean,
 ): { text: string; count: number } {
   const plain = (source: string) => {
     let count = 0;
@@ -165,6 +242,8 @@ export function replaceText(
     // Numeric string fields stay strings; compare nested numbers without a lossy Number conversion.
     if (jsonNumber.test(source.trim())) {
       const value = decimalValue(source.trim());
+      if (value === undefined && needles.some((needle) => jsonNumber.test(needle.trim())))
+        throw new LossyJsonNumberError();
       if (
         value !== undefined &&
         needles.some(
@@ -174,7 +253,7 @@ export function replaceText(
         return { text: marker, count: 1 };
       return plain(source);
     }
-    const replaced = replaceText(source, needles, marker);
+    const replaced = visit(source, needles, marker);
     if (replaced.count) return replaced;
     // Some log fields contain JSON string bodies without their outer quotes.
     if (source.includes("\\")) {
@@ -186,14 +265,152 @@ export function replaceText(
             return { text: JSON.stringify(inner.text).slice(1, -1), count: inner.count };
         }
       } catch (error) {
-        if (error instanceof DuplicateJsonKeyError || error instanceof LossyJsonNumberError)
+        if (
+          error instanceof DuplicateJsonKeyError ||
+          error instanceof LossyJsonNumberError ||
+          error instanceof InvalidJsonRecordError
+        )
           throw error;
         /* This is ordinary text, not another JSON string body. */
       }
     }
     return replaced;
   };
-  const syntax = (source: string) => {
+  const parseRegion = (source: string) => {
+    try {
+      return { value: parseJson(source) };
+    } catch (error) {
+      if (
+        error instanceof DuplicateJsonKeyError ||
+        error instanceof LossyJsonNumberError ||
+        error instanceof InvalidJsonRecordError
+      )
+        throw error;
+      return undefined;
+    }
+  };
+  // Framing and surrounding plaintext are not part of the encoded JSON value.
+  const jsonRegions = (source: string) => {
+    const regions: { start: number; end: number; value: unknown; rawToken?: boolean }[] = [];
+    const lines: typeof regions = [];
+    const headers: { start: number; end: number }[] = [];
+    let offset = 0;
+    for (const line of source.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+      const start = offset;
+      offset += line.length;
+      const frame = line.match(/^\uFEFF?(?:\[[^\]\r\n]+\] )?(?:NTIVE|CANON|ORCH): /u)?.[0];
+      const header = frame ?? (line.startsWith("\uFEFF") ? "\uFEFF" : "");
+      if (frame) headers.push({ start, end: start + frame.length });
+      const parsed = parseRegion(line.slice(header.length));
+      if (parsed)
+        lines.push({
+          start: start + header.length,
+          end: offset - (line.endsWith("\n") ? 1 : 0),
+          value: parsed.value,
+        });
+    }
+    const quotedToken = new RegExp(jsonStringTokens.source, "y");
+    let lineIndex = 0;
+    let headerIndex = 0;
+    for (let start = 0; start < source.length; start++) {
+      while (headerIndex < headers.length && headers[headerIndex]!.end <= start) headerIndex++;
+      const header = headers[headerIndex];
+      if (header && header.start <= start && start < header.end) {
+        start = header.end - 1;
+        continue;
+      }
+      while (lineIndex < lines.length && lines[lineIndex]!.end <= start) lineIndex++;
+      const line = lines[lineIndex];
+      if (line && line.start <= start && start < line.end) {
+        start = line.end - 1;
+        continue;
+      }
+      if (source[start] === '"') {
+        quotedToken.lastIndex = start;
+        const token = quotedToken.exec(source);
+        if (token) {
+          regions.push({
+            start,
+            end: start + token[0].length,
+            value: parseJson(token[0]),
+            rawToken: true,
+          });
+          start += token[0].length - 1;
+          continue;
+        }
+        // A truncated encoded value cannot be verified by scanning its raw bytes.
+        if (source.slice(start).includes("\\")) {
+          const literal = escapedNeedles(needles, longestBackslashRun(source)).some((needle) => {
+            const at = source.lastIndexOf(needle, start);
+            return (
+              at >= 0 &&
+              start < at + needle.length &&
+              !source.slice(at + needle.length).includes("\\")
+            );
+          });
+          if (!literal) throw new InvalidJsonRecordError();
+        }
+      }
+
+      if (source[start] !== "{" && source[start] !== "[") continue;
+      if (
+        source[start] === "[" &&
+        /^\[(?:\d{4}-\d{2}-\d{2}[T ][^\]\r\n]+|\d{2}:\d{2}:\d{2}(?:\.\d+)?)\](?=\s)/u.test(
+          source.slice(start),
+        )
+      ) {
+        start = source.indexOf("]", start);
+        continue;
+      }
+      const structured =
+        source[start] === "{" ||
+        /^\[\s*(?:["{[\]\-0-9]|true\b|false\b|null\b|$)/u.test(source.slice(start));
+      const stack: string[] = [];
+      let quoted = false;
+      let escaped = false;
+      let complete = false;
+      let stopped = source.length;
+      for (let end = start; end < source.length; end++) {
+        const character = source[end]!;
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (character === "\\") escaped = true;
+          else if (character === '"') quoted = false;
+        } else if (character === '"') quoted = true;
+        else if (character === "{" || character === "[") stack.push(character);
+        else if (character === "}" || character === "]") {
+          if (stack.pop() !== (character === "}" ? "{" : "[")) {
+            stopped = end + 1;
+            break;
+          }
+          if (!stack.length) {
+            const parsed = parseRegion(source.slice(start, end + 1));
+            stopped = end + 1;
+            if (parsed) {
+              complete = true;
+              regions.push({ start, end: end + 1, value: parsed.value });
+              start = end;
+            }
+            break;
+          }
+        }
+      }
+      if (!complete && structured && structuredProof) {
+        const covered = escapedNeedles(needles, longestBackslashRun(source)).some((needle) => {
+          const at = source.lastIndexOf(needle, start);
+          return at >= 0 && at + needle.length >= stopped;
+        });
+        if (!covered) throw new InvalidJsonRecordError();
+      }
+    }
+    regions.push(
+      ...lines.filter(
+        (line) => !regions.some((region) => region.start < line.end && line.start < region.end),
+      ),
+    );
+    return regions.sort((a, b) => a.start - b.start);
+  };
+  const syntax = (source: string, parsed?: { value: unknown }) => {
     let valueCount = 0;
     const values = (value: unknown): unknown => {
       if (matchesJsonValue(value, needles)) {
@@ -205,29 +422,9 @@ export function replaceText(
         return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, values(v)]));
       return value;
     };
-    // The provider logger's timestamp brackets are framing, not a JSON array.
-    const header = source.match(/^\uFEFF?\[[^\]\r\n]+\] (?:NTIVE|CANON|ORCH): /u)?.[0] ?? "";
-    let prefix = header;
-    let json = source.slice(header.length);
-    try {
-      parseJson(json);
-    } catch (error) {
-      if (error instanceof DuplicateJsonKeyError || error instanceof LossyJsonNumberError)
-        throw error;
-      const first = source.search(/[[{]/);
-      if (first >= 0) {
-        prefix = source.slice(0, first);
-        json = source.slice(first);
-      }
-    }
-    try {
-      const changed = values(parseJson(json));
-      if (valueCount)
-        source = prefix + JSON.stringify(changed) + (source.endsWith("\n") ? "\n" : "");
-    } catch (error) {
-      if (error instanceof DuplicateJsonKeyError || error instanceof LossyJsonNumberError)
-        throw error;
-      /* Non-JSON logs still contain independently decodable string tokens. */
+    if (parsed) {
+      const changed = values(parsed.value);
+      if (valueCount) source = JSON.stringify(changed) + (source.endsWith("\n") ? "\n" : "");
     }
     let end = 0;
     let count = 0;
@@ -240,46 +437,120 @@ export function replaceText(
       end = match.index + match[0].length;
     }
     parts.push(source.slice(end));
-    return { text: parts.join(""), count: count + valueCount };
+    const rewritten = parts.join("");
+    // Key replacement must remain injective, including in JSON embedded in logs.
+    if (parsed) parseJson(rewritten);
+    return { text: rewritten, count: count + valueCount };
   };
-  const isJson = (source: string) => {
-    try {
-      parseJson(source);
-      return true;
-    } catch (error) {
-      if (error instanceof DuplicateJsonKeyError || error instanceof LossyJsonNumberError)
-        throw error;
-      return false;
-    }
-  };
-  if (isJson(text)) return syntax(text);
+  const whole = parseRegion(text);
+  if (whole) return syntax(text, whole);
   let count = 0;
+  let regions = jsonRegions(text);
+  // Raw output can contain complete JSON values. Match across their boundaries
+  // only with surrounding text or multiple values, preserving JSON delimiters.
+  const ranges: { start: number; end: number }[] = [];
+  for (const needle of escapedNeedles(needles, longestBackslashRun(text))) {
+    for (
+      let start = text.indexOf(needle);
+      start >= 0;
+      start = text.indexOf(needle, start + needle.length)
+    ) {
+      const end = start + needle.length;
+      const overlaps = regions.filter((region) => region.start < end && start < region.end);
+      if (
+        overlaps.some(
+          (region) =>
+            region.rawToken &&
+            ((start < region.start && region.start < end && end < region.end) ||
+              (region.start < start && start < region.end && region.end < end)),
+        )
+      )
+        throw new InvalidJsonRecordError();
+      const surrounding = overlaps.length
+        ? text.slice(start, overlaps[0]!.start) + text.slice(overlaps.at(-1)!.end, end)
+        : "";
+      if (
+        overlaps.length &&
+        overlaps.every((region) => start <= region.start && region.end <= end) &&
+        (overlaps.length > 1 ||
+          /\S/u.test(surrounding) ||
+          overlaps.every((region) => region.rawToken)) &&
+        ranges.every((range) => end <= range.start || range.end <= start)
+      )
+        ranges.push({ start, end });
+    }
+  }
+  if (ranges.length) {
+    let end = 0;
+    const chunks: string[] = [];
+    for (const range of ranges.sort((a, b) => a.start - b.start)) {
+      chunks.push(text.slice(end, range.start), marker);
+      end = range.end;
+    }
+    text = chunks.join("") + text.slice(end);
+    count = ranges.length;
+    regions = jsonRegions(text);
+  }
   const parts: string[] = [];
-  let ordinary = "";
-  const flush = () => {
-    const lines = (ordinary.match(/[^\n]*\n|[^\n]+$/g) ?? []).map(syntax);
-    const tokens = {
-      text: lines.map((v) => v.text).join(""),
-      count: lines.reduce((n, v) => n + v.count, 0),
-    };
-    const replaced = tokens.count ? tokens : plain(ordinary);
+  const raw = (source: string) => {
+    const candidates: { start: number; end: number }[] = [];
+    for (const needle of escapedNeedles(needles, longestBackslashRun(source))) {
+      for (
+        let start = source.indexOf(needle);
+        start >= 0;
+        start = source.indexOf(needle, start + needle.length)
+      )
+        candidates.push({ start, end: start + needle.length });
+    }
+    const numbers = new Set(
+      needles
+        .filter((needle) => jsonNumber.test(needle.trim()))
+        .map((needle) => decimalValue(needle.trim())),
+    );
+    if (numbers.size)
+      for (const match of source.matchAll(
+        /(^|[^\p{L}\p{N}_.])(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)(?![\p{L}\p{N}_.])/gu,
+      )) {
+        const value = decimalValue(match[2]!);
+        if (value === undefined) throw new LossyJsonNumberError();
+        if (value !== undefined && numbers.has(value)) {
+          const start = match.index + match[1]!.length;
+          candidates.push({ start, end: start + match[2]!.length });
+        }
+      }
+    const chosen: typeof candidates = [];
+    for (const candidate of candidates.sort(
+      (a, b) => b.end - b.start - (a.end - a.start) || a.start - b.start,
+    ))
+      if (chosen.every((range) => candidate.end <= range.start || range.end <= candidate.start))
+        chosen.push(candidate);
+    const chunks: string[] = [];
+    let end = 0;
+    for (const range of chosen.sort((a, b) => a.start - b.start)) {
+      chunks.push(source.slice(end, range.start), marker);
+      end = range.end;
+    }
+    const tokens = syntax(chunks.join("") + source.slice(end));
+    parts.push(tokens.text);
+    count += chosen.length + tokens.count;
+  };
+  let end = 0;
+  for (const region of regions) {
+    raw(text.slice(end, region.start));
+    const replaced = syntax(text.slice(region.start, region.end), region);
     parts.push(replaced.text);
     count += replaced.count;
-    ordinary = "";
-  };
-  for (const line of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
-    if (isJson(line)) {
-      flush();
-      const replaced = syntax(line);
-      parts.push(replaced.text);
-      count += replaced.count;
-    } else ordinary += line;
+    end = region.end;
   }
-  flush();
-  return { text: parts.join(""), count };
+  raw(text.slice(end));
+  const rewritten = parts.join("");
+  // Removing a known literal can expose an unmatched quote that previously paired across outputs.
+  if (count) jsonRegions(rewritten);
+  return { text: rewritten, count };
 }
 
 export function replaceScalarText(text: string, needles: readonly string[], marker: string) {
+  requireComparableNumbers(needles);
   if (needles.includes(text)) return { text: marker, count: 1 };
   if (jsonNumber.test(text.trim())) {
     const replaced = replaceText(JSON.stringify(text), needles, marker);
@@ -293,12 +564,13 @@ export function replaceValue(value: unknown, needles: readonly string[], marker:
   if (typeof value === "string") return replaceScalarText(value, needles, marker).text;
   if (Array.isArray(value)) return value.map((v) => replaceValue(v, needles, marker));
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([k, v]) => [
-        replaceScalarText(k, needles, marker).text,
-        replaceValue(v, needles, marker),
-      ]),
+    const entries = Object.entries(value).map(
+      ([k, v]) =>
+        [replaceScalarText(k, needles, marker).text, replaceValue(v, needles, marker)] as const,
     );
+    if (new Set(entries.map(([key]) => key)).size !== entries.length)
+      throw new DuplicateJsonKeyError();
+    return Object.fromEntries(entries);
   }
   return value;
 }

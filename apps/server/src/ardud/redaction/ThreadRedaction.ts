@@ -120,6 +120,7 @@ interface Table {
   db: string;
   name: string;
   columns: string[];
+  fields: string[];
   jsonColumns: string[];
   scope: string[];
   keys: string[];
@@ -153,7 +154,23 @@ const advanceRevision = (previous: unknown, now: string) => {
     ),
   );
 };
-const reviseItems = (value: unknown, revisions: ReadonlyMap<string, string>): unknown => {
+interface ItemRevision {
+  readonly at: string;
+  readonly types: ReadonlySet<string>;
+}
+const itemEnvelopes = new Set([
+  "payload",
+  "item",
+  "activity",
+  "data",
+  "tool",
+  "state",
+  "items",
+  "activities",
+  "turnItems",
+  "visibleTurnItems",
+]);
+const reviseItems = (value: unknown, revisions: ReadonlyMap<string, ItemRevision>): unknown => {
   if (Array.isArray(value)) {
     const revised = value.map((v) => reviseItems(v, revisions));
     return revised.some((v, i) => v !== value[i]) ? revised : value;
@@ -164,15 +181,13 @@ const reviseItems = (value: unknown, revisions: ReadonlyMap<string, string>): un
     typeof fields.id === "string" && typeof fields.type === "string"
       ? revisions.get(fields.id)
       : undefined;
+  if (revision && typeof fields.type === "string" && revision.types.has(fields.type))
+    return fields.updatedAt === revision.at ? value : { ...fields, updatedAt: revision.at };
   const entries = Object.entries(fields).map(
-    ([key, v]) => [key, reviseItems(v, revisions)] as const,
+    ([key, v]) => [key, itemEnvelopes.has(key) ? reviseItems(v, revisions) : v] as const,
   );
-  const changed =
-    entries.some(([key, v]) => v !== fields[key]) ||
-    (revision !== undefined && fields.updatedAt !== revision);
-  return changed
-    ? { ...Object.fromEntries(entries), ...(revision ? { updatedAt: revision } : {}) }
-    : value;
+  const changed = entries.some(([key, v]) => v !== fields[key]);
+  return changed ? Object.fromEntries(entries) : value;
 };
 const active = new Set([
   "preparing",
@@ -314,7 +329,16 @@ const make = Effect.gen(function* () {
                                                 ].includes(c.name),
                                               )
                                               .map((c) => c.name);
-                                            if (!scope.length) continue;
+                                            if (
+                                              !scope.length &&
+                                              !cols.some((c) =>
+                                                [
+                                                  "provider_thread_id",
+                                                  "provider_session_id",
+                                                ].includes(c.name),
+                                              )
+                                            )
+                                              continue;
                                             const columns = cols
                                               .filter(
                                                 (c) =>
@@ -334,6 +358,7 @@ const make = Effect.gen(function* () {
                                                 name,
                                                 scope,
                                                 columns,
+                                                fields: cols.map((c) => c.name),
                                                 jsonColumns: cols
                                                   .filter(
                                                     (c) =>
@@ -405,10 +430,75 @@ const make = Effect.gen(function* () {
                                             sharedSessions.set(row.provider_session_id, members);
                                           }
                                         }
+                                        const providerThreadReaders = new Map<
+                                          string,
+                                          Set<ThreadId>
+                                        >();
+                                        for (const provider of tables.filter((table) =>
+                                          table.name.endsWith("projection_provider_threads"),
+                                        )) {
+                                          const prefix = provider.name.slice(
+                                            0,
+                                            -"provider_threads".length,
+                                          );
+                                          const session = provider.fields.includes(
+                                            "provider_session_id",
+                                          )
+                                            ? "provider.provider_session_id"
+                                            : "NULL";
+                                          const relations = [
+                                            `SELECT provider.provider_thread_id, ${session} AS provider_session_id, provider.thread_id AS reader_thread_id FROM ${fullName(provider)} AS provider WHERE provider.thread_id IS NOT NULL`,
+                                          ];
+                                          for (const reference of tables) {
+                                            if (!reference.fields.includes("thread_id")) continue;
+                                            const node =
+                                              reference.name === prefix + "nodes" &&
+                                              provider.fields.includes("owner_node_id") &&
+                                              reference.fields.includes("node_id");
+                                            const native =
+                                              (["subagents", "runs", "turn_items"].some(
+                                                (name) => reference.name === prefix + name,
+                                              ) ||
+                                                reference.name === "ardud_turn_items") &&
+                                              reference.fields.includes("provider_thread_id");
+                                            if (!node && !native) continue;
+                                            relations.push(
+                                              `SELECT provider.provider_thread_id, ${session} AS provider_session_id, reference.thread_id AS reader_thread_id FROM ${fullName(provider)} AS provider JOIN ${fullName(reference)} AS reference ON ${node ? "reference.node_id = provider.owner_node_id" : "reference.provider_thread_id = provider.provider_thread_id"} WHERE reference.thread_id IS NOT NULL`,
+                                            );
+                                          }
+                                          for (const row of yield* sql.unsafe<Row>(
+                                            relations.join(" UNION "),
+                                          )) {
+                                            if (
+                                              typeof row.provider_thread_id !== "string" ||
+                                              typeof row.reader_thread_id !== "string"
+                                            )
+                                              continue;
+                                            const reader = ThreadId.make(row.reader_thread_id);
+                                            const members =
+                                              providerThreadReaders.get(row.provider_thread_id) ??
+                                              new Set<ThreadId>();
+                                            members.add(reader);
+                                            providerThreadReaders.set(
+                                              row.provider_thread_id,
+                                              members,
+                                            );
+                                            if (typeof row.provider_session_id === "string") {
+                                              const sessions =
+                                                sharedSessions.get(row.provider_session_id) ??
+                                                new Set<ThreadId>();
+                                              sessions.add(reader);
+                                              sharedSessions.set(row.provider_session_id, sessions);
+                                            }
+                                          }
+                                        }
                                         let grew = true;
                                         while (grew) {
                                           grew = false;
-                                          for (const members of sharedSessions.values())
+                                          for (const members of [
+                                            ...sharedSessions.values(),
+                                            ...providerThreadReaders.values(),
+                                          ])
                                             if ([...members].some((id) => affectedThreads.has(id)))
                                               for (const id of members)
                                                 if (!affectedThreads.has(id)) {
@@ -424,15 +514,35 @@ const make = Effect.gen(function* () {
                                               grew = true;
                                             }
                                         }
+                                        const providerThreadIds = [...providerThreadReaders]
+                                          .filter(([, readers]) =>
+                                            [...readers].some((id) => affectedThreads.has(id)),
+                                          )
+                                          .map(([id]) => id);
+                                        const providerSessionIds = [...sharedSessions]
+                                          .filter(([, readers]) =>
+                                            [...readers].some((id) => affectedThreads.has(id)),
+                                          )
+                                          .map(([id]) => id);
                                         const scopedRows = (table: Table) => {
                                           stage = `scoped-rows:${table.db}.${table.name}`;
                                           const predicates = table.scope.map(
                                             (s) =>
                                               `${quote(s)} IN (${[...affectedThreads].map(() => "?").join(",")})`,
                                           );
-                                          const parameters = table.scope.flatMap(() => [
-                                            ...affectedThreads,
-                                          ]);
+                                          const parameters = table.scope.flatMap(() =>
+                                            [...affectedThreads].map(String),
+                                          );
+                                          for (const [field, ids] of [
+                                            ["provider_thread_id", providerThreadIds],
+                                            ["provider_session_id", providerSessionIds],
+                                          ] as const)
+                                            if (table.fields.includes(field) && ids.length) {
+                                              predicates.push(
+                                                `${quote(field)} IN (${ids.map(() => "?").join(",")})`,
+                                              );
+                                              parameters.push(...ids);
+                                            }
                                           const binding = tables.find(
                                             (other) =>
                                               other.db === table.db &&
@@ -448,7 +558,7 @@ const make = Effect.gen(function* () {
                                             parameters.push(...affectedThreads);
                                           }
                                           return sql.unsafe<Row>(
-                                            `SELECT ${table.keys.length ? "" : "rowid AS __redaction_rowid, "}* FROM ${fullName(table)} WHERE ${predicates.join(" OR ")}`,
+                                            `SELECT ${table.keys.length ? "" : "rowid AS __redaction_rowid, "}* FROM ${fullName(table)} WHERE ${predicates.join(" OR ") || "0"}`,
                                             parameters,
                                           );
                                         };
@@ -482,7 +592,6 @@ const make = Effect.gen(function* () {
                                         if (
                                           inventories.some(
                                             ({ table, rows }) =>
-                                              table.db === "main" &&
                                               table.name.endsWith("provider_threads") &&
                                               rows.some((r) => {
                                                 const tasks = record(
@@ -566,12 +675,20 @@ const make = Effect.gen(function* () {
                                             table.name,
                                           ),
                                         );
+                                        const selectedProviderThreadId =
+                                          selected.row.provider_thread_id ??
+                                          selected.value.providerThreadId;
                                         const sessionIds = new Set<string>();
                                         const ownerSessionIds = new Set<string>();
                                         const drivers = new Set<string>();
                                         for (const { rows } of bindings)
                                           for (const row of rows) {
                                             const v = record(payload(row));
+                                            const ownsBinding =
+                                              row.thread_id === input.threadId ||
+                                              (typeof selectedProviderThreadId === "string" &&
+                                                row.provider_thread_id ===
+                                                  selectedProviderThreadId);
                                             const driver = String(
                                               v.driver ??
                                                 row.driver ??
@@ -590,8 +707,7 @@ const make = Effect.gen(function* () {
                                                 /^[a-zA-Z0-9_-]+$/.test(value)
                                               ) {
                                                 sessionIds.add(value);
-                                                if (row.thread_id === input.threadId)
-                                                  ownerSessionIds.add(value);
+                                                if (ownsBinding) ownerSessionIds.add(value);
                                               }
                                             }
                                             for (const p of [
@@ -605,8 +721,7 @@ const make = Effect.gen(function* () {
                                                   /^[a-zA-Z0-9_-]+$/.test(value)
                                                 ) {
                                                   sessionIds.add(value);
-                                                  if (row.thread_id === input.threadId)
-                                                    ownerSessionIds.add(value);
+                                                  if (ownsBinding) ownerSessionIds.add(value);
                                                 }
                                             }
                                           }
@@ -796,19 +911,35 @@ const make = Effect.gen(function* () {
                                           return yield* new ThreadRedactionError({
                                             code: "invalid",
                                           });
-                                        for (const { table, rows } of inventories)
-                                          for (const row of rows)
-                                            for (const column of table.jsonColumns)
-                                              if (
-                                                structuralCollision(parse(row[column]), needles) ||
-                                                !validRewrite(
-                                                  parse(row[column]),
-                                                  replaceValue(parse(row[column]), needles, marker),
-                                                )
-                                              )
-                                                return yield* new ThreadRedactionError({
-                                                  code: "invalid",
-                                                });
+                                        const valid = yield* Effect.try({
+                                          try: () => {
+                                            for (const { table, rows } of inventories)
+                                              for (const row of rows)
+                                                for (const column of table.columns) {
+                                                  const value = row[column];
+                                                  if (typeof value !== "string") continue;
+                                                  if (table.jsonColumns.includes(column)) {
+                                                    const before = parse(value);
+                                                    if (
+                                                      structuralCollision(before, needles) ||
+                                                      !validRewrite(
+                                                        before,
+                                                        replaceValue(before, needles, marker),
+                                                      )
+                                                    )
+                                                      return false;
+                                                    replaceText(value, needles, marker);
+                                                  } else replaceScalarText(value, needles, marker);
+                                                }
+                                            return true;
+                                          },
+                                          catch: () =>
+                                            new ThreadRedactionError({ code: "invalid" }),
+                                        });
+                                        if (!valid)
+                                          return yield* new ThreadRedactionError({
+                                            code: "invalid",
+                                          });
                                         // File preparation is read-only. No original content is saved to temporary files.
                                         stage = "file-preparation";
                                         const logPaths = yield* io(() =>
@@ -834,7 +965,7 @@ const make = Effect.gen(function* () {
                                         stage = "file-rewrite";
                                         for (const plan of plans)
                                           stores.push(yield* rewriteFile(plan, needles, marker));
-                                        const revisions = new Map<string, string>();
+                                        const revisions = new Map<string, ItemRevision>();
                                         for (const { table, rows } of inventories) {
                                           if (!isTurnItemTable(table.name)) continue;
                                           for (const row of rows) {
@@ -846,13 +977,16 @@ const make = Effect.gen(function* () {
                                             const itemId = String(row.turn_item_id);
                                             const previous =
                                               record(payload(row)).updatedAt ?? row.updated_at;
-                                            revisions.set(
-                                              itemId,
-                                              advanceRevision(
+                                            revisions.set(itemId, {
+                                              at: advanceRevision(
                                                 previous,
-                                                revisions.get(itemId) ?? at,
+                                                revisions.get(itemId)?.at ?? at,
                                               ),
-                                            );
+                                              types: new Set([
+                                                ...(revisions.get(itemId)?.types ?? []),
+                                                String(record(payload(row)).type ?? row.type),
+                                              ]),
+                                            });
                                           }
                                         }
                                         stage = "database-rewrite";
@@ -899,7 +1033,7 @@ const make = Effect.gen(function* () {
                                             )
                                               updates.push([
                                                 "updated_at",
-                                                revisions.get(String(row.turn_item_id))!,
+                                                revisions.get(String(row.turn_item_id))!.at,
                                               ]);
                                             if (updates.length) {
                                               const keys = table.keys.length

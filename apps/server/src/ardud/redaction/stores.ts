@@ -53,6 +53,7 @@ export const makeStoreCleanup = () => ({
   attached: new Set<string>(),
   modes: new Map<string, number>(),
   syncModes: new Map<string, number>(),
+  fullFsync: undefined as number | undefined,
 });
 
 export const withStores = Effect.fn("ThreadRedaction.withStores")(
@@ -82,7 +83,18 @@ export const withStores = Effect.fn("ThreadRedaction.withStores")(
             const restored = yield* io(() => NodeFSP.chmod(file, mode)).pipe(Effect.result);
             if (restored._tag === "Success") state.modes.delete(file);
           }
-          if (state.attached.size || state.modes.size || state.syncModes.size)
+          if (state.fullFsync !== undefined) {
+            const restored = yield* sql
+              .unsafe(`PRAGMA fullfsync=${state.fullFsync}`)
+              .pipe(Effect.result);
+            if (restored._tag === "Success") state.fullFsync = undefined;
+          }
+          if (
+            state.attached.size ||
+            state.modes.size ||
+            state.syncModes.size ||
+            state.fullFsync !== undefined
+          )
             return yield* new RedactionStoresError({});
         });
         // Retry unfinished cleanup before inspecting a mode that maintenance itself changed.
@@ -156,6 +168,12 @@ export const withStores = Effect.fn("ThreadRedaction.withStores")(
             }
             yield* add(NodePath.resolve(replicaPath), "ardud_redaction_replica", "readonly");
           }
+          // macOS needs F_FULLFSYNC to persist the pending marker across power loss.
+          yield* Effect.gen(function* () {
+            const previous = yield* sql.unsafe<{ fullfsync: number }>("PRAGMA fullfsync");
+            state.fullFsync = previous[0]!.fullfsync;
+            yield* sql.unsafe("PRAGMA fullfsync=ON");
+          }).pipe(Effect.uninterruptible);
           for (const store of stores) {
             const previous = yield* sql.unsafe<{ synchronous: number }>(
               `PRAGMA ${store.db}.synchronous`,
