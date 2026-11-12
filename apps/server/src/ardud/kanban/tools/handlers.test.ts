@@ -2681,7 +2681,34 @@ it.effect(
         note: "later",
       });
       assert.isTrue(own.isError);
-      assert.include(own.text, "has a running thread");
+      assert.include(
+        own.text,
+        "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+      );
+      yield* store.putCard({ ...running, links: card.links });
+      const ci = yield* call(running.activeThreadId!, "card_wait", {
+        on: "ci",
+        pr: card.links[0]!.url,
+        note: "checks finish",
+      });
+      assert.isTrue(ci.isError);
+      assert.include(
+        ci.text,
+        "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
+      );
+      const evaluator = yield* call(evaluatorThread, "card_wait", {
+        card: `#${running.number}`,
+        on: "ci",
+        note: "checks finish",
+      });
+      assert.isTrue(evaluator.isError);
+      assert.include(
+        evaluator.text,
+        `card #${running.number} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+      );
+      const after = (yield* kanban.card(running.id)).card;
+      assert.isUndefined(after.wait);
+      assert.strictEqual(after.activeThreadId, running.activeThreadId);
       // And it can't touch another thread's card.
       const foreign = yield* call(running.activeThreadId!, "card_wait", {
         card: `#${card.number}`,
