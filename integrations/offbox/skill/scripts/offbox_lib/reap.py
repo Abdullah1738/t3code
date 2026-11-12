@@ -181,6 +181,10 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 actions.append(f"forget {bid}: boat deleted its data")
             continue
         state = b.get("state")
+        if not dry and state in api.LIVE_STATES and con.execute(
+                "SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
+            released = lease.release_hold_if_worker_gone(con, bid)
+            actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions)

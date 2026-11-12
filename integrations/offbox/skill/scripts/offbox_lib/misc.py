@@ -120,11 +120,20 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
                            "(SELECT box_id FROM pool_callers WHERE owner=?))", (me['owner'],me['owner'])).fetchall()
     else:
         row = lease.find_lease(con, me['owner'], me['repo_root'])
+        if row is None:
+            row = con.execute("SELECT l.* FROM leases l JOIN prune_holds h USING(box_id) "
+                              "WHERE l.state IN ('running','stopped') AND ((l.owner=? AND l.repo_root=?) OR "
+                              "EXISTS (SELECT 1 FROM pool_callers c WHERE c.box_id=l.box_id AND c.owner=? "
+                              "AND c.repo_root=?)) ORDER BY l.last_used_at DESC LIMIT 1",
+                              (me['owner'], me['repo_root'], me['owner'], me['repo_root'])).fetchone()
         rows = [row] if row else []
     if not rows:
         say("nothing to release")
         return
     for r in rows:
+        lease.release_hold_if_worker_gone(con, r["box_id"])
+        if _report_prune_hold(con, r["box_id"]):
+            continue
         # A foreground run holds box-<id> while it streams, so a hung run shows up as a lock timeout. Name the active
         # runs on that path too; the recheck under the lock still decides before any mutation.
         try:
@@ -133,8 +142,20 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         except OffboxError as e:
             if "timed out waiting for lock" not in str(e):
                 raise
+            lease.release_hold_if_worker_gone(con, r["box_id"])
+            if _report_prune_hold(con, r["box_id"]):
+                continue
             if not _report_active_runs(con, r["box_id"], lock_held=True):
                 say(f"{r['box_id']}: box is busy (another offbox process holds it); not released. Try again shortly.")
+
+
+def _report_prune_hold(con, box_id: str) -> bool:
+    hold = con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id=?", (box_id,)).fetchone()
+    if hold is None:
+        return False
+    since = time.strftime('%H:%M', time.localtime(hold['created_at']))
+    say(f"{box_id}: held by an unconfirmed checkout cleanup (prune {hold['run_id']}, since {since}); reap retries it")
+    return True
 
 
 def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
@@ -150,6 +171,8 @@ def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
 
 
 def _release_one(con, r, delete):
+        if _report_prune_hold(con, r["box_id"]):
+            return
         if lease.active_runs(con, r["box_id"]):
             _report_active_runs(con, r["box_id"])
             return

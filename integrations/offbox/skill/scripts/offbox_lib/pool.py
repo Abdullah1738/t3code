@@ -9,7 +9,7 @@ import time
 
 from . import capacity
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
-                     now, say)
+                     kv_get, kv_set, now, say)
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
@@ -33,7 +33,7 @@ def wait_seconds() -> int:
 
 
 def queue_state(con, key, run_id=None):
-    """(busy boxes, pool cap, other callers still waiting for this pool). Waiters are approximate: a
+    """(busy boxes, pool cap, other waiting callers, held idle boxes). Waiters are approximate: a
     'starting' run with no box yet whose checkout already maps to this pool."""
     cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
     busy = con.execute("""SELECT COUNT(DISTINCT r.box_id) FROM runs r JOIN pool_members p USING(box_id)
@@ -43,7 +43,11 @@ def queue_state(con, key, run_id=None):
           OR r.repo_root IN (SELECT c.repo_root FROM pool_callers c JOIN pool_members p USING(box_id)
                              WHERE p.pool_key=?))""",
                           (run_id or "", now() - WAIT_MAX_S, key, key)).fetchone()[0]
-    return busy, cap, waiting
+    held = con.execute("""SELECT COUNT(*) FROM prune_holds h JOIN pool_members p USING(box_id)
+        JOIN leases l USING(box_id) WHERE p.pool_key=? AND l.state IN ('running','stopped')
+        AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=h.box_id AND r.status IN ('starting','running'))""",
+                       (key,)).fetchone()[0]
+    return busy, cap, waiting, held
 
 
 def lock_name(key: str) -> str:
@@ -327,7 +331,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     # Replaying the retained key resolves the old allocation; it is not a new pool slot.
                     rows, can_create = [], True
                 if source and not rows and not can_create and not _source_member(con, key, source):
-                    busy, cap, _ = queue_state(con, key, run_id)
+                    busy, cap, _, _ = queue_state(con, key, run_id)
                     raise OffboxError(
                         f"this run needs a new {key} pool box ({source}), but the pool is full "
                         f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
@@ -540,28 +544,30 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
+        if _recheck_prune_holds(con, key):
+            continue
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
         if t >= deadline:
             if last_error:
                 raise last_error
-            busy, cap, waiting = queue_state(con, key, run_id)
-            raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} boxes stayed busy for "
+            busy, cap, waiting, held = queue_state(con, key, run_id)
+            raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} busy, {held} held by checkout cleanup for "
                                 f"{int(t-started)}s; remote queue timed out. Nothing ran (exit {EXIT_BUSY}, not an "
                                 f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})")
         if isinstance(last_error, api.BoatAtCapacity):
             raise last_error
         if t >= next_progress:
-            busy, cap, waiting = queue_state(con, key, run_id)
+            busy, cap, waiting, held = queue_state(con, key, run_id)
             if not said:
-                say(f"queued for a {key} pool box: {busy}/{cap} busy, {waiting} other caller(s) waiting; "
+                say(f"queued for a {key} pool box: {busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting; "
                     f"will wait up to {wait}s" + (f" ({last_error})" if last_error else "") +
                     f". Use a tool timeout above {wait}s or run this in a background shell.")
                 said = True
             else:
                 say(f"still queued for a {key} pool box: waited {int(t-started)}s of {wait}s, "
-                    f"{busy}/{cap} busy, {waiting} other caller(s) waiting")
+                    f"{busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting")
             next_progress = t + PROGRESS_EVERY_S
         time.sleep(min(2, max(0, deadline-time.monotonic())))
 
@@ -642,6 +648,27 @@ def try_warm(me, size, source, exclude, run_id):
     finally:
         con.close()
     return None
+
+
+def _recheck_prune_holds(con, key) -> bool:
+    """SSH stays outside the pool lock; callers share a per-box 60 second probe throttle."""
+    from . import lease
+    rows = con.execute("SELECT h.box_id FROM prune_holds h JOIN leases l USING(box_id) WHERE l.repo_key=?",
+                       (key,)).fetchall()
+    released = False
+    for row in rows:
+        bid = row['box_id']
+        try:
+            with file_lock('prunecheck-' + bid, timeout=0):
+                check_key = f'prunecheck:{bid}'
+                last = kv_get(con, check_key)
+                if last is not None and now() - last < 60:
+                    continue
+                kv_set(con, check_key, now())
+                released = lease.release_hold_if_worker_gone(con, bid) or released
+        except OffboxError:
+            pass
+    return released
 
 
 def _claim(con, me, row, run_id):

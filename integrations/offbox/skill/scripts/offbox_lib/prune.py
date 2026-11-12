@@ -70,6 +70,8 @@ def script(dirs: list[str], run_id: str) -> str:
     # The marker lives outside the trash tree, which BACKGROUND deletes, and is written before BACKGROUND starts.
     marker = f'"$HOME/.offbox/done/{run_id}"'
     lines = ["set -m", "trap '' PIPE HUP", "busy=",
+             'mkdir -p "$HOME/.offbox/started" || exit 0',
+             f'echo $$ > "$HOME/.offbox/started/{run_id}" || exit 0',
              'mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0',
              f't="$HOME/.offbox/trash/{run_id}"', 'mkdir -p "$t" || exit 0',
              # Probe classes: 0 moved, 5 settled (absent or not a real dir), 4 busy, anything else left.
@@ -107,6 +109,25 @@ def _quiesced(box_id: str, run_id: str, remaining_s: float) -> bool:
         return p.returncode == 0
     except Exception:  # noqa: BLE001 - an unknown worker state is treated as not quiesced
         return False
+
+
+def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 10) -> bool | None:
+    """Probe one worker over SSH. An unreachable box or an unreadable marker is unknown, never gone."""
+    try:
+        rid = shlex.quote(run_id)
+        command = (f'done_file="$HOME/.offbox/done/"{rid}; started="$HOME/.offbox/started/"{rid}; '
+                   'if [ -f "$done_file" ]; then :; '
+                   'elif [ -f "$started" ]; then '
+                   'pid=$(cat "$started") || exit 2; '
+                   'case "$pid" in ""|*[!0-9]*|0) exit 2;; esac; '
+                   'kill -0 "$pid" 2>/dev/null && exit 1; '
+                   'elif [ -e "$started" ] || [ -e "$done_file" ]; then exit 2; '
+                   f'elif {"true" if hold_age_s > 120 else "false"}; then :; else exit 1; fi; '
+                   'rm -f -- "$started" "$done_file" || exit 2; exit 0')
+        p = ssh_sync.ssh(box_id, command, timeout=timeout_s)
+        return {0: True, 1: False}.get(p.returncode)
+    except Exception:  # noqa: BLE001 - housekeeping must keep the hold on every unknown outcome
+        return None
 
 
 def _settled_map(raw) -> dict[str, int]:
