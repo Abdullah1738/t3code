@@ -78,7 +78,7 @@ Inbox triage records bank repayment/failure notices as `payment_deadline` cases 
 
 One institution/amount/currency/deadline is one case, including mail/SMS copies and replays. The check looks for a bank success confirmation at due+1h, with at most 6 seconds total and 4 seconds per lookup from its existing 40-second budget. Without confirmation it opens an unconfirmed payment deadline, using the bank's stated repayment deadline or due+3h. A later bank deadline supersedes that fallback. Lookup time is separate from the reserved case-save budget, so a slow archive cannot skip reminder generation. Archive errors leave the payment unconfirmed and are recorded in pings; they do not establish that the debit failed.
 
-The initial payment alert and reminders go alone through the existing outbox: once on detection, once 60–75 minutes before the deadline (the watcher's 15-minute cadence), then at most once at/after it. The usual one-per-day/third-question flow does not apply to these two reminders. Existing 23:00–08:00 quiet hours still apply, so a midnight deadline gets its first reminder before quiet hours and its final reminder in the morning. Payment deadlines come first in `brief`. Bank payment-received/autopay-success notices close matching rows; `money-cases close ID --outcome paid` (or `done`) is the existing chat-confirmation path and closes the related autopay row too. Closed cases are never reopened by replays.
+The initial payment alert and reminders go alone through the existing outbox: once on detection, once 60–75 minutes before the deadline (the watcher's 15-minute cadence), then at most once at/after it. The usual one-per-day/third-question flow does not apply to these two reminders. Existing 23:00–08:00 quiet hours still apply, so a midnight deadline gets its first reminder before quiet hours and its final reminder in the morning. Payment deadlines come first in `brief`. Bank payment-received/autopay-success notices close matching rows; `money-cases close ID --outcome paid --source sms:<id>` (or `done`, with its source) is the existing chat-confirmation path and closes the related autopay row too. Closed cases are never reopened by replays.
 
 ## Charge questions
 
@@ -100,7 +100,7 @@ shared `ROBOB_READONLY_DB`. A missing, incomplete or >120-second-old export is a
 failed lookup, never evidence that he said nothing, and never falls back to the
 live writer. Symlink and hardlink aliases of the writer are refused too.
 
-Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), raises a wait that ran out once, turns a question asked twice and unanswered for 12 hours, or open for a week, into a money case, and keeps looking for 30 days after that, closing a case nobody has touched when the receipt comes. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
+Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), raises a wait that ran out once, retains asked questions as awaiting_answer, and queues unasked charges older than 24 hours regardless of age. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
 
@@ -125,3 +125,19 @@ Card numbers and labelled codes or passwords (`OTP code 482913`, `OTP is 482 913
 unset BUN_INSPECT
 robob-watch test money-cases
 ```
+
+
+## Unanswered charges and purchase notes
+
+`questions`, `list`, `show` and `brief` retain asked charges as `awaiting_answer` until an answer or a sourced closure. `answered QID --note ...` records the answer; `close ID --outcome ... --source mail:<id>|sms:<id>|imessage:<id>|statement:<path>#<line>` closes a waiting case with evidence. A charge with no asks older than 24 hours queues once, behind any unanswered question, and still goes through the receipt gate. Quiet hours and the check budget apply.
+
+Overdue bills bypass that queue. Their alert includes the latest recorded statement balance less later posted credits for that card, including closed refund cases. Promised refunds are excluded. Repeated or corroborating events retain an OVERDUE state and a separate history line.
+
+At payment time, record a delegated purchase:
+
+```sh
+money-cases note-purchase --merchant MERCHANT --amount AMOUNT --currency CUR \
+  --card LAST4 --asked-by owner --thread THREAD_ID [--invoice INVOICE_ID]
+```
+
+Use `--asked-by moni` for her purchases. This records the request, not a payment or a ledger entry. The charge matcher (including inbox triage) checks merchant, exact amount/currency, last four digits and a 15-minute payment window before external lookups. Once matched, the note cannot explain a separate later charge. Purchase notes stay in the private case book, outside git.

@@ -141,7 +141,7 @@ class Pings(Base):
         for now, run in (('2026-11-05T21:13:51.632', 'r2'), ('2026-11-05T21:28:51.632', 'r3')):
             with self.subTest(now=now):
                 self.assertEqual(self.check(now, run), '')
-                self.assertEqual(self.sent()['acme|r0|soon'], '2026-11-05T20:58:51+04:00')
+                self.assertEqual(self.sent()['acme|r0|soon'], '2026-11-05T20:58:51.632000+04:00')
                 self.assertNotIn('outbox', json.loads((self.wd / 'pings.json').read_text()))
         self.assertEqual(json.loads((self.wd / 'state.json').read_text())['fires'], 1)
 
@@ -310,7 +310,7 @@ class Pings(Base):
         # Moving the deadline re-arms the ping, but the day's one reminder already went out at 10:00.
         self.assertEqual(self.check('2026-10-25T11:00', 'r3'), '')
         self.assertIn('OVERDUE', self.check('2026-10-26T09:00', 'r4'))
-        mc.close(self.data, 'acme', 'refunded')
+        mc.close(self.data, 'acme', 'refunded', source='sms:refund')
         mc.reopen(self.data, 'acme', '2026-10-25', 'refund bounced')
         self.assertEqual(self.check('2026-10-26T12:00', 'r5'), '')
         self.assertIn('OVERDUE', self.check('2026-10-27T09:00', 'r6'))
@@ -405,7 +405,7 @@ class Pings(Base):
         self.assertEqual(self.check('2027-05-01T10:00', 'r4'), '')
         sent = self.sent()
         self.assertTrue(any(k.startswith('acme|c0|watcher|host-reply|') for k in sent))
-        mc.close(self.data, 'acme', 'refunded', at=at('2027-05-01T11:00'))
+        mc.close(self.data, 'acme', 'refunded', at=at('2027-05-01T11:00'), source='sms:refund')
         self.check('2027-07-15T10:00', 'r5')
         self.assertFalse(any(k.startswith('acme|') for k in self.sent()))
 
@@ -610,8 +610,8 @@ class Rules(Base):
         pings = json.loads((self.wd / 'pings.json').read_text())
         self.assertEqual(pings['clock']['acme']['at'], '2026-10-26T10:00:00+04:00')
 
-    def test_a_future_case_is_not_asked_before_its_first_reminder(self):
-        self.case(deadline='2026-11-30', when=at('2026-10-24T09:00'))
+    def test_a_future_bill_is_not_asked_before_its_first_reminder(self):
+        self.case(merchant='Acme bill', deadline='2026-11-30', when=at('2026-10-24T09:00'))
         for day in range(24, 28):
             self.assertNotIn('Yes or no', self.check(f'2026-10-{day}T10:00', f'q{day}'))
 
@@ -817,7 +817,7 @@ class Questions(Base):
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('never a third ask', msg)
         q = self.questions()[0]
-        self.assertEqual((q['status'], len(q['asks'])), ('case', 2))
+        self.assertEqual((q['status'], len(q['asks'])), ('awaiting_answer', 2))
         case = mc.load(self.data)['cases'][0]
         self.assertEqual((case['id'], case['amount'], case['currency'], case['reference']),
                          (q['case'], '12.34', 'EUR', 'card ending 1111'))
@@ -851,15 +851,13 @@ class Questions(Base):
                           find=finder(), said=nobody, item='imsg:1')
         self.assertEqual(again['verdict'], 'explained')
 
-    def test_the_check_turns_a_question_asked_twice_into_a_case_and_says_so_once(self):
+    def test_the_check_keeps_twice_asked_questions_awaiting_an_answer(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
         self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
-        self.assertEqual(self.follow('2026-10-25T12:00', finder()), '')
-        event = self.follow('2026-10-25T20:30', finder())
-        self.assertIn("he didn't answer, so it is now money case charge-", event)
-        self.assertEqual(len(mc.load(self.data)['cases']), 1)
-        later = self.follow('2026-10-25T21:00', finder(), 'r2')
-        self.assertNotIn("he didn't answer", later)
+        for now in ('2026-10-25T12:00', '2026-10-25T20:30', '2026-11-25T21:00'):
+            self.assertEqual(self.follow(now, finder()), '')
+            self.assertEqual(self.questions()[0]['status'], 'awaiting_answer')
+            self.assertEqual(mc.load(self.data)['cases'], [])
 
     def test_a_wait_with_no_receipt_is_raised_once(self):
         r = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T00:37'), data=self.data,
@@ -897,16 +895,16 @@ class Questions(Base):
         # The same alert seen again (a re-run, or an ask quoting it) is still one question.
         self.assertEqual(self.screen(ALERT, BANK, '2026-10-23T23:52', '2026-10-24T00:45', 'imsg:2')['id'], b['id'])
 
-    def test_an_alert_triage_left_out_is_closed_as_answered_and_one_nobody_raised_becomes_a_case(self):
+    def test_an_alert_triage_left_out_is_closed_and_unasked_ones_stay_in_queue(self):
         a = self.screen(ALERT, BANK, '2026-10-23T23:47', '2026-10-24T00:37', 'imsg:1')
         mc.triaged(self.data, [(a['id'], 'imsg:1', False)], at('2026-10-24T00:37'))
         self.assertEqual((self.questions()[0]['status'], self.questions()[0]['outcome']),
                          ('closed', 'already answered in a chat'))
-        # Held for a receipt and never raised: after a week it is a money case he hears about.
+        # Held for a receipt and never raised: age cannot bypass the first-question queue.
         held = self.screen(ALERT.replace('12.34', '5.55'), BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:2')
         event = self.follow('2026-10-31T09:00', finder())
-        self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'case')
-        self.assertIn("he didn't answer, so it is now money case", event)
+        self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'open')
+        self.assertIn('money-cases ask --id ' + held['id'], event)
 
     def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
         pending = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
@@ -974,7 +972,7 @@ class Questions(Base):
         self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
         self.assertEqual(self.ask('2026-10-25T02:00', finder())[0], mc.DONT_ASK)
         q = self.questions()[0]
-        self.assertEqual(q['status'], 'case')
+        self.assertEqual(q['status'], 'awaiting_answer')
         event = self.follow('2026-10-25T09:00', finder(dict(RECEIPT, ts=at('2026-10-25T08:00').timestamp())))
         self.assertIn(f"money case {q['case']} closed", event)
         self.assertEqual(mc.find(mc.load(self.data), q['case'])['status'], 'closed')
@@ -1087,7 +1085,8 @@ class CheckBudget(Base):
                 def owner(*args, **kw):
                     return [(mc.charges.iso(when), 'I paid Acme', 'app')]
                 if action == 'close':
-                    mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                    with mc.Locked(self.data, 'questions') as book:
+                        mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 replace = mc.os.replace
                 def interrupted_replace(src, dst):
                     replace(src, dst)
@@ -1096,8 +1095,11 @@ class CheckBudget(Base):
                             mc.signal.raise_signal(mc.signal.SIGALRM)
                 with patch.object(mc.os, 'replace', interrupted_replace):
                     with self.assertRaises(mc.CheckTimeout):
-                        mc.follow(self.data, now, self.root, time.time() + 5, finder(),
-                                  owner if action == 'close' else nobody)
+                        if action == 'close':
+                            mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                        else:
+                            with mc.Locked(self.data, 'questions') as book:
+                                mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 self.assertEqual(self.questions()[0]['status'], 'case' if action == 'close' else 'open')
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
                 mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
@@ -1127,7 +1129,8 @@ class CheckBudget(Base):
                             mc.signal.raise_signal(mc.signal.SIGALRM)
                 with patch.object(mc.os, 'replace', interrupted_replace):
                     with self.assertRaises(mc.CheckTimeout):
-                        mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                        with mc.Locked(self.data, 'questions') as book:
+                            mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
                 if entry == 'answered':
@@ -1277,11 +1280,16 @@ class CheckBudget(Base):
 
     def test_successful_pings_timing_includes_data_fsync(self):
         self.case()
-        fsync = mc.os.fsync
+        fsync, write = mc.os.fsync, mc.write_json
         def slow(fd):
             time.sleep(0.1)
             return fsync(fd)
-        with patch.object(mc.os, 'fsync', slow):
+        def write_pings(path, obj, timing=None):
+            if path.name == 'pings.json':
+                with patch.object(mc.os, 'fsync', slow):
+                    return write(path, obj, timing=timing)
+            return write(path, obj, timing=timing)
+        with patch.object(mc, 'write_json', write_pings):
             mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
         timing = json.loads((self.wd / 'pings.json').read_text())['timing']
         self.assertGreaterEqual(timing['total_s'], 0.1)
@@ -1303,9 +1311,11 @@ class CheckBudget(Base):
         self.assertEqual(state['timing']['slowest'], 'attention')
 
     def test_held_case_lock_exits_cleanly_and_keeps_pings(self):
-        self.case()
+        self.case('charge-budget0')
         now = at('2026-10-25T12:00')
-        self.seed([now - dt.timedelta(days=8)])
+        book = self.seed([now - dt.timedelta(days=8)])
+        book['questions'][0].update(status='case', case='charge-budget0', asks=[{'at': mc.stamp(now)}])
+        mc.write_json(self.data / 'questions.json', book)
         mc.write_json(self.wd / 'pings.json', {'sent': {'kept': mc.stamp(now)}})
         script = ('import fcntl, sys; f = open(sys.argv[1], "a"); '
                   'fcntl.flock(f, fcntl.LOCK_EX); print("locked", flush=True); sys.stdin.read()')
@@ -1322,7 +1332,7 @@ class CheckBudget(Base):
             self.assertIn('kept', state['sent'])
             self.assertIn('cases.lock', str(state['question_errors']))
             self.assertNotIn('outbox', state)
-            self.assertEqual(mc.load_questions(self.data)['questions'][0]['status'], 'open')
+            self.assertEqual(mc.load_questions(self.data)['questions'][0]['status'], 'case')
         finally:
             holder.communicate(timeout=2)
 
@@ -2220,7 +2230,7 @@ class PaymentDeadlines(Base):
 
     def test_hour_and_deadline_are_acknowledged_once_and_standalone(self):
         cid = self.notice('Your payment of AED 3,532.73 failed; pay by 21:00', when='2026-11-07T18:00')
-        self.case(deadline='2026-11-07')
+        self.case(deadline='2026-11-07', when=at('2026-11-07T18:00'))
         self.assertIn(cid, self.check('2026-11-07T18:01', 'initial'))
         self.assertNotIn(cid, self.check('2026-11-07T19:44', 'early'))
         event = self.check('2026-11-07T20:00', 'hour')
