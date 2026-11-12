@@ -553,6 +553,12 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+const OrchestrationV2DelegatedTaskStall = Schema.Struct({
+  idleTimeoutMs: Schema.Finite,
+  lastProgressAt: Schema.DateTimeUtc,
+  lastProgressKind: Schema.String,
+});
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -573,6 +579,7 @@ export const OrchestrationV2Run = Schema.Struct({
   contextHandoffId: Schema.NullOr(ContextHandoffId),
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
+  delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
@@ -751,6 +758,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
     "cancelled",
     "interrupted",
   ]),
+  idleTimeoutMs: Schema.optional(Schema.Finite),
+  failureReason: Schema.optional(Schema.Literal("stalled")),
   progress: Schema.optional(Schema.String),
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
   result: Schema.NullOr(Schema.String),
@@ -2084,6 +2093,12 @@ export type OrchestrationV2AppThreadJson = typeof OrchestrationV2AppThreadJson.T
 
 export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => ({
   ...fields,
+  delegatedTaskStall: Schema.optional(
+    OrchestrationV2DelegatedTaskStall.mapFields((fields) => ({
+      ...fields,
+      lastProgressAt: Schema.DateTimeUtcFromString,
+    })),
+  ),
   requestedAt: Schema.DateTimeUtcFromString,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -3020,6 +3035,7 @@ export const OrchestrationV2Command = Schema.Union([
     runId: RunId,
     reason: Schema.optional(Schema.String),
     holdQueue: Schema.optional(Schema.Boolean),
+    delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
     expectedAttemptId: Schema.optional(RunAttemptId),
     fenced: Schema.optional(Schema.Boolean),
   }),
@@ -3114,6 +3130,7 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,
     runtimeMode: RuntimeMode,

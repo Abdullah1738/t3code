@@ -4303,8 +4303,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
         });
 
-        // Claude emits retry progress but no recovered frame; the next
-        // assistant message is the first reliable evidence of recovery.
+        // Claude has no recovered frame; root stream activity confirms recovery.
         const completeProviderRetry = Effect.fn("ClaudeAdapterV2.completeProviderRetry")(function* (
           context: ActiveClaudeTurnContext,
           updatedAt: DateTime.Utc,
@@ -7604,6 +7603,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
           if (message.type === "stream_event" && !message.parent_tool_use_id) {
             const event = message.event;
+            if (event.type === "message_start" || event.type === "content_block_start") {
+              yield* completeProviderRetry(context, now);
+            }
             const reasoning = context.reasoning;
             if (event.type === "message_start") {
               reasoning.messageId = event.message.id;
