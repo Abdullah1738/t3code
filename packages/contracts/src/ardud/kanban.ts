@@ -1243,16 +1243,18 @@ export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean =>
  * step as subtask_done; a note never grants work on a later step. Findings
  * leave the review subtask open, so that review-only step is the one exception.
  * Its durable verdict bit survives note consumption, retries and fresh threads;
- * the header fallback supports cards saved before that bit existed.
+ * notes alone never grant eligibility; older verdicts are upgraded by the server.
  */
-export const kanbanWorkStep = (card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">): boolean => {
+export const kanbanWorkStep = (
+  card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">,
+): boolean => {
   if (card.subtasks.length === 0) return true;
   const open = kanbanStepSubtasks(card);
   return (
     open.some((subtask) => subtask.owner === "work") ||
     (open.length > 0 &&
       open.every((subtask) => subtask.owner === "review") &&
-      (card.reviewFindingsPending === true || /(?:^|\n)Review findings \(round \d+\):/.test(card.wakeNote ?? "")))
+      card.reviewFindingsPending === true)
   );
 };
 

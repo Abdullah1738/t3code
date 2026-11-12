@@ -1098,7 +1098,7 @@ describe("worker dispatch uses the current step", () => {
       );
     },
   );
-  it("allows findings only at the review step, including fresh-thread notes", () => {
+  it("a fresh-thread findings header alone cannot grant worker eligibility", () => {
     const note = "Fresh thread: earlier context ended.\n\nReview findings (round 1):\n- Fix rate";
     expect(
       kanbanWaitsOnEvaluator({
@@ -1106,7 +1106,7 @@ describe("worker dispatch uses the current step", () => {
         wakeNote: note,
         subtasks: [scriptSubtask("s2", 2, "Review", "review")],
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       kanbanWaitsOnEvaluator({
         stage: "todo",
@@ -1118,7 +1118,48 @@ describe("worker dispatch uses the current step", () => {
 });
 
 it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
-  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s2", 2, "Review", "review")] })).toBe(false);
-  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s3", 3, "Hold", "evaluator"), scriptSubtask("s4", 4, "Review", "review")] })).toBe(true);
-  expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: null, reviewFindingsPending: true, subtasks: [scriptSubtask("s3", 3, "Hold", "script"), scriptSubtask("s4", 4, "Review", "review")] })).toBe(true);
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+    }),
+  ).toBe(false);
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [
+        scriptSubtask("s3", 3, "Hold", "evaluator"),
+        scriptSubtask("s4", 4, "Review", "review"),
+      ],
+    }),
+  ).toBe(true);
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [
+        scriptSubtask("s3", 3, "Hold", "script"),
+        scriptSubtask("s4", 4, "Review", "review"),
+      ],
+    }),
+  ).toBe(true);
 });
+
+it.each([false, true])(
+  "an explicit pending-findings verdict %s overrides a legacy header",
+  (reviewFindingsPending) => {
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: "Review findings (round 1): old words",
+        reviewFindingsPending,
+        subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+      }),
+    ).toBe(!reviewFindingsPending);
+  },
+);
