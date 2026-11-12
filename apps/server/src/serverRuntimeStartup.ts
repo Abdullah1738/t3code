@@ -393,8 +393,12 @@ export const maybeOpenBrowser = Effect.fn("serverRuntimeStartup.maybeOpenBrowser
   );
 });
 
-export const runStartupPhase = <A, E, R>(phase: StartupPhase, effect: Effect.Effect<A, E, R>) =>
-  withStartupPhase(phase, effect).pipe(
+export const runStartupPhase = <A, E, R>(
+  phase: StartupPhase,
+  effect: Effect.Effect<A, E, R>,
+  counts?: Parameters<typeof withStartupPhase<A, E, R>>[2],
+) =>
+  withStartupPhase(phase, effect, counts).pipe(
     // Attributes on the span itself, not annotateSpans: an annotation follows
     // every fiber forked inside the phase, such as the effect worker, for the
     // life of the server.
@@ -440,24 +444,20 @@ export const runOrderedV2StartupPhases = Effect.fn(
   Bootstrap,
   ImportError,
   RecoveryError,
-  DelegationError,
   WorkerError,
   BootstrapError,
   ImportContext,
   RecoveryContext,
-  DelegationContext,
   WorkerContext,
   BootstrapContext,
 >(input: {
   readonly importLegacyShells: Effect.Effect<Import, ImportError, ImportContext>;
   readonly recover: Effect.Effect<Recovery, RecoveryError, RecoveryContext>;
-  readonly recoverDelegatedTasks: Effect.Effect<void, DelegationError, DelegationContext>;
   readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
   readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
 }) {
   const recovery = yield* input.recover;
   yield* input.importLegacyShells;
-  yield* input.recoverDelegatedTasks;
   yield* input.startEffectWorker;
   const bootstrap = yield* input.autoBootstrap;
   return { recovery, bootstrap } as const;
@@ -618,10 +618,6 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
           ),
         ),
       ),
-      recoverDelegatedTasks: runStartupPhase(
-        "orchestration-v2.delegated-tasks.recover",
-        orchestrator.recoverDelegatedTasks,
-      ),
       startEffectWorker: runStartupPhase(
         "orchestration-v2.effect-worker.start",
         startEffectWorkerWithRelay({
@@ -748,6 +744,16 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
           ...(updateOutcome === undefined ? {} : { updateOutcome }),
         },
       }),
+    );
+    // Delivery mutations share the live parent dispatch lock and recheck durable
+    // cohort generations/transfers inside it. Recovery can safely trail readiness.
+    yield* runStartupPhase(
+      "orchestration-v2.delegated-tasks.recover",
+      orchestrator.recoverDelegatedTasks,
+      (counts) => counts,
+    ).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("Delegated task recovery failed", { cause })),
+      Effect.forkIn(startupScope),
     );
     yield* Effect.logDebug("startup phase: complete");
     yield* flushCompileCache;

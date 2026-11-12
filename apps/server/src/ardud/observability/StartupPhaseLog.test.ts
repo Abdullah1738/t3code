@@ -171,7 +171,9 @@ it.effect(
   "preserves shared layer acquisition and scoped cleanup while a dependency is blocked",
   () => {
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "startup-log-"));
-    class Shared extends Context.Service<Shared, number>()("t3/ardud/observability/StartupPhaseLog.test/Shared") {}
+    class Shared extends Context.Service<Shared, number>()(
+      "t3/ardud/observability/StartupPhaseLog.test/Shared",
+    ) {}
     return Effect.gen(function* () {
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
@@ -217,3 +219,36 @@ it.effect(
     );
   },
 );
+
+it.effect("records delegated recovery counts and the slowest item without extra fields", () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "startup-delegated-log-"));
+  const counts = {
+    subagentResultThreads: 2,
+    delegatedCompletionThreads: 1,
+    timedOut: 1,
+    slowestItemId: "thread:stuck-child",
+    slowestItemMs: 30_000,
+    secret: "must not persist",
+  };
+  const logger = StartupPhaseLog.makeStartupPhaseLog(dir);
+  return StartupPhaseLog.withStartupPhase(
+    "orchestration-v2.delegated-tasks.recover",
+    Effect.succeed(counts),
+    (value) => value,
+  ).pipe(
+    Effect.provideService(StartupPhaseLog.StartupPhaseLog, logger),
+    Effect.tap(() =>
+      Effect.sync(() => {
+        const record = readRecords(dir)[1]!;
+        assert.equal(record.subagentResultThreads, 2);
+        assert.equal(record.delegatedCompletionThreads, 1);
+        assert.equal(record.timedOut, 1);
+        assert.equal(record.slowestItemId, "thread:stuck-child");
+        assert.equal(record.slowestItemMs, 30_000);
+        assert.isUndefined(record.secret);
+        assert.equal(logger.snapshot().phases[0]?.timedOut, 1);
+      }),
+    ),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true }))),
+  );
+});

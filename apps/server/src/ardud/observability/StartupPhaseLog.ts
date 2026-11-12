@@ -87,7 +87,24 @@ export interface RecoveryCounts {
   readonly terminalizedRuns: number;
 }
 
-interface StartupPhaseTiming {
+export interface DelegatedRecoveryCounts {
+  readonly subagentResultThreads: number;
+  readonly delegatedCompletionThreads: number;
+  readonly timedOut: number;
+  readonly slowestItemId: string | null;
+  readonly slowestItemMs: number;
+}
+
+export const emptyDelegatedRecoveryCounts: DelegatedRecoveryCounts = {
+  subagentResultThreads: 0,
+  delegatedCompletionThreads: 0,
+  timedOut: 0,
+  slowestItemId: null,
+  slowestItemMs: 0,
+};
+type StartupPhaseCounts = RecoveryCounts | DelegatedRecoveryCounts;
+
+interface StartupPhaseTiming extends Partial<RecoveryCounts & DelegatedRecoveryCounts> {
   readonly id: number;
   readonly phase: StartupPhase;
   readonly startedAt: string;
@@ -115,7 +132,7 @@ export class StartupPhaseLog extends Context.Service<
       at: number,
       durationMs: number,
       outcome: "success" | "failure" | "interrupted",
-      counts?: RecoveryCounts,
+      counts?: StartupPhaseCounts,
       id?: number | void,
     ) => void;
     readonly snapshot: () => StartupReport;
@@ -235,10 +252,15 @@ export function makeStartupPhaseLog(
       const safeCounts =
         counts === undefined
           ? {}
-          : {
-              recoveryIds: counts.recoveryIds,
-              terminalizedRuns: counts.terminalizedRuns,
-            };
+          : "recoveryIds" in counts
+            ? { recoveryIds: counts.recoveryIds, terminalizedRuns: counts.terminalizedRuns }
+            : {
+                subagentResultThreads: counts.subagentResultThreads,
+                delegatedCompletionThreads: counts.delegatedCompletionThreads,
+                timedOut: counts.timedOut,
+                slowestItemId: counts.slowestItemId,
+                slowestItemMs: counts.slowestItemMs,
+              };
       phases[index] = { ...entry, endedAt: iso(at), durationMs, outcome, ...safeCounts };
       write({
         bootId,
@@ -276,7 +298,7 @@ export const withStartupLayer =
 export const withStartupPhase = <A, E, R>(
   phase: StartupPhase,
   effect: Effect.Effect<A, E, R>,
-  recoveryCounts?: (value: A) => RecoveryCounts,
+  recoveryCounts?: (value: A) => StartupPhaseCounts,
 ): Effect.Effect<A, E, R> =>
   Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
