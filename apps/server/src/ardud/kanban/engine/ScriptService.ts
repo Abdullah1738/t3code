@@ -347,122 +347,223 @@ const make = Effect.gen(function* () {
       : `Couldn't resize the ${command.model} pool: ${resized.failure.detail}`;
   });
 
-  // Applies what the script printed, as the script. One bad command doesn't stop the rest.
+  // A malformed command cannot become valid by replaying it after board configuration changes.
+  class InvalidScriptCommand extends Schema.TaggedError<InvalidScriptCommand>()(
+    "InvalidScriptCommand",
+    {
+      detail: Schema.String,
+    },
+  ) {}
+  const invalidCommand = (detail: string) => Effect.fail(new InvalidScriptCommand({ detail }));
+
+  const retryWrite = Effect.fn("KanbanScripts.retryWrite")(function* <A, R>(
+    effect: Effect.Effect<A, KanbanError | InvalidScriptCommand, R>,
+    budget = 4,
+  ) {
+    const delays = [3_000, 10_000, 30_000];
+    let attempts = 0;
+    while (true) {
+      const result = yield* Effect.result(effect);
+      attempts += 1;
+      if (
+        Result.isSuccess(result) ||
+        result.failure._tag !== "KanbanError" ||
+        result.failure.writeOutcome !== "not-written" ||
+        attempts >= Math.min(budget, 4)
+      )
+        return { result, attempts };
+      yield* Effect.sleep(delays[attempts - 1]!);
+    }
+  });
+
+  // Even rejected input must be safe to include in the delivery notice.
+  // eslint-disable-next-line no-control-regex -- Rejected command text must be printable in a board message.
+  const labelText = (text: string) => text.slice(0, 80).replace(/[\u0000-\u001f\u007f]/g, " ");
+  const commandLabel = (command: Scripts.ScriptCommand) => {
+    switch (command.kanban) {
+      case "card":
+        return `card: ${labelText(command.title || command.prompt)}`;
+      case "post":
+        return `post: ${labelText(command.text)}`;
+      case "pool":
+        return `pool: ${command.model}`;
+      default:
+        return `${command.kanban}: card #${command.card}`;
+    }
+  };
+
+  const writeCommand = Effect.fn("KanbanScripts.writeCommand")(function* (
+    script: KanbanScript,
+    command: Exclude<Scripts.ScriptCommand, Scripts.PoolCommand>,
+  ) {
+    const actor: KanbanActor = { _tag: "script", scriptId: script.id };
+    // Re-read on every attempt: another writer may have delivered the card during backoff.
+    const cards =
+      command.kanban === "post" && command.card === undefined
+        ? []
+        : yield* io(store.cards(script.boardId));
+    if (command.kanban === "card") {
+      const problem = Text.textProblem([
+        ["title", command.title],
+        ["description", command.description],
+        ["prompt", command.prompt],
+      ]);
+      if (problem) return yield* invalidCommand(problem);
+      if (!command.prompt.trim() && !command.title?.trim()) {
+        return yield* invalidCommand("a card needs a prompt or a title");
+      }
+      const existing = Scripts.duplicateOf(cards, command);
+      if (existing) return `Card #${existing.number} is already on the board.`;
+      const created = yield* service.createCard(
+        script.boardId,
+        {
+          prompt: command.prompt,
+          title: command.title,
+          description: command.description,
+          priority: command.priority,
+          projects: command.projects,
+          links: command.links,
+        },
+        actor,
+      );
+      return `Added card #${created.number}.`;
+    }
+    if (command.kanban === "post") {
+      const problem = Text.textProblem([["message", command.text]]);
+      if (problem) return yield* invalidCommand(problem);
+      const discussion = yield* targetOf(script, command, cards).pipe(
+        Effect.catchIf(
+          (error) => error.code === "invalid",
+          (error) => invalidCommand(error.detail),
+        ),
+      );
+      yield* service.post(discussion.id, actor, [{ _tag: "md", text: command.text }]);
+      return `Posted in "${discussion.title}".`;
+    }
+    const card = cards.find((entry) => entry.number === command.card);
+    if (!card) return yield* fail("not-found", `No card #${command.card} on this board.`);
+    if (command.kanban === "subtask") {
+      yield* service.markSubtask(
+        card.id,
+        command.subtask,
+        command.state,
+        command.note ?? null,
+        actor,
+        "script",
+      );
+      return `Marked ${command.subtask} ${command.state} on card #${command.card}.`;
+    }
+    if (command.kanban === "handback") {
+      yield* service.handBack(card.id, command.subtask, command.note, actor);
+      return `Handed ${command.subtask} on card #${command.card} back to the evaluator.`;
+    }
+    yield* service.moveCard(card.id, command.to, "script", actor, { note: command.note ?? null });
+    return `Moved card #${command.card} to ${command.to}.`;
+  });
+
+  // Applies held work first, then what the child printed. A bad command never stops its siblings.
   const apply = Effect.fn("KanbanScripts.apply")(function* (
     script: KanbanScript,
     commands: ReadonlyArray<Scripts.ScriptCommand>,
   ) {
-    const actor: KanbanActor = { _tag: "script", scriptId: script.id };
+    type Held = NonNullable<KanbanScript["held"]>[number];
     const notes: Array<string> = [];
-    const cards = [...(yield* io(store.cards(script.boardId)))];
-    for (const command of commands) {
-      if (command.kanban === "card") {
-        const problem = Text.textProblem([
-          ["title", command.title],
-          ["description", command.description],
-          ["prompt", command.prompt],
-        ]);
-        if (problem) {
-          notes.push(`Couldn't add a card: ${problem}`);
+    const notices: Array<string> = [];
+    let held = [...((yield* scriptOf(script.id)).held ?? [])];
+    const saveHeld = () => update(script.id, (latest) => ({ ...latest, held: [...held] }));
+    const pending = [
+      ...held.map((entry) => ({ command: entry.command, previous: entry as Held | null })),
+      ...commands.map((command) => ({ command, previous: null as Held | null })),
+    ];
+    for (const { command, previous } of pending) {
+      const label = commandLabel(command);
+      if (previous !== null) {
+        // Consume before sending: a crash or MAY_HAVE_APPLIED must never leave it queued for replay.
+        if (!held.includes(previous)) continue;
+        held = held.filter((entry) => entry !== previous);
+        yield* saveHeld();
+        const age =
+          DateTime.toEpochMillis(yield* DateTime.now) - Date.parse(previous.firstFailedAt);
+        if (age >= 24 * 60 * 60_000 || previous.attempts >= 10) {
+          const note = `Dropped ${label}: ${previous.lastError} (${age >= 24 * 60 * 60_000 ? "24 hours old" : "10 attempts"}; will not retry).`;
+          notes.push(note);
+          notices.push(note);
           continue;
         }
-        const existing = Scripts.duplicateOf(cards, command);
-        if (existing) {
-          notes.push(`Card #${existing.number} is already on the board.`);
-          continue;
-        }
-        const created = yield* Effect.result(
-          service.createCard(
-            script.boardId,
-            {
-              prompt: command.prompt,
-              title: command.title,
-              description: command.description,
-              priority: command.priority,
-              projects: command.projects,
-              links: command.links,
-            },
-            actor,
-          ),
-        );
-        if (Result.isSuccess(created)) {
-          cards.push(created.success);
-          notes.push(`Added card #${created.success.number}.`);
-        } else {
-          notes.push(`Couldn't add a card: ${created.failure.detail}`);
-        }
-        continue;
       }
       if (command.kanban === "pool") {
         notes.push(yield* resizePool(script, command));
         continue;
       }
-      if (
-        command.kanban === "subtask" ||
-        command.kanban === "handback" ||
-        command.kanban === "move"
-      ) {
-        const card = cards.find((entry) => entry.number === command.card);
-        if (!card) {
-          notes.push(
-            `Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`,
-          );
-          continue;
-        }
-        if (command.kanban === "subtask") {
-          const marked = yield* Effect.result(
-            service.markSubtask(
-              card.id,
-              command.subtask,
-              command.state,
-              command.note ?? null,
-              actor,
-              "script",
-            ),
-          );
-          notes.push(
-            Result.isSuccess(marked)
-              ? `Marked ${command.subtask} ${command.state} on card #${command.card}.`
-              : `Couldn't mark ${command.subtask} on card #${command.card}: ${marked.failure.detail}`,
-          );
-        } else if (command.kanban === "handback") {
-          const handed = yield* Effect.result(
-            service.handBack(card.id, command.subtask, command.note, actor),
-          );
-          notes.push(
-            Result.isSuccess(handed)
-              ? `Handed ${command.subtask} on card #${command.card} back to the evaluator.`
-              : `Couldn't hand ${command.subtask} on card #${command.card} back: ${handed.failure.detail}`,
-          );
-        } else {
-          const moved = yield* Effect.result(
-            service.moveCard(card.id, command.to, "script", actor, { note: command.note ?? null }),
-          );
-          notes.push(
-            Result.isSuccess(moved)
-              ? `Moved card #${command.card} to ${command.to}.`
-              : `Couldn't move card #${command.card}: ${moved.failure.detail}`,
-          );
-        }
+      const firstFailedAt = previous?.firstFailedAt ?? (yield* nowIso);
+      const { result, attempts } = yield* retryWrite(
+        writeCommand(script, command),
+        10 - (previous?.attempts ?? 0),
+      );
+      if (Result.isSuccess(result)) {
+        notes.push(
+          attempts > 1
+            ? `${result.success.replace(/\.$/, "")} after ${attempts - 1} ${attempts === 2 ? "retry" : "retries"}.`
+            : result.success,
+        );
+        if (previous !== null) notices.push(`Delivered held ${label}.`);
         continue;
       }
-      const problem = Text.textProblem([["message", command.text]]);
-      const posted = yield* Effect.result(
-        (problem ? fail("invalid", problem) : targetOf(script, command, cards)).pipe(
+      const error = result.failure;
+      const prefix =
+        command.kanban === "card"
+          ? "add a card"
+          : command.kanban === "post"
+            ? "post"
+            : command.kanban === "move"
+              ? `move card #${command.card}`
+              : command.kanban === "handback"
+                ? `hand ${command.subtask} on card #${command.card} back`
+                : `mark ${command.subtask} on card #${command.card}`;
+      notes.push(`Couldn't ${prefix}: ${error.detail}`);
+      if (command.kanban !== "card" && command.kanban !== "post") continue;
+      if (error._tag === "KanbanError" && error.writeOutcome === "may-have-applied") {
+        notices.push(`${label}: ${error.detail} Will not retry; check the board.`);
+        continue;
+      }
+      const total = (previous?.attempts ?? 0) + attempts;
+      if (error._tag === "InvalidScriptCommand" || total >= 10) {
+        const note = `Dropped ${label}: ${error.detail} (${total >= 10 ? "10 attempts" : "invalid command"}; will not retry).`;
+        notes.push(note);
+        notices.push(note);
+        continue;
+      }
+      held.push({
+        command,
+        firstFailedAt,
+        lastError: error.detail,
+        attempts: total,
+      });
+      held.sort((a, b) => a.firstFailedAt.localeCompare(b.firstFailedAt));
+      while (held.length > 100) {
+        const dropped = held.shift()!;
+        const note = `Dropped ${commandLabel(dropped.command)}: ${dropped.lastError} (100 command limit; will not retry).`;
+        notes.push(note);
+        notices.push(note);
+      }
+      yield* saveHeld();
+      notices.push(`Held ${label}: ${error.detail} Will retry next run.`);
+    }
+    if (notices.length > 0) {
+      const notice = yield* retryWrite(
+        ownDiscussion(script).pipe(
           Effect.flatMap((discussion) =>
-            service
-              .post(discussion.id, actor, [{ _tag: "md", text: command.text }])
-              .pipe(Effect.as(discussion)),
+            service.post(discussion.id, { _tag: "script", scriptId: script.id }, [
+              { _tag: "md", text: notices.join("\n") },
+            ]),
           ),
         ),
       );
-      notes.push(
-        Result.isSuccess(posted)
-          ? `Posted in "${posted.success.title}".`
-          : `Couldn't post: ${posted.failure.detail}`,
-      );
+      if (Result.isFailure(notice.result)) {
+        notes.push(`Couldn't post delivery notice: ${notice.result.failure.detail}`);
+      }
     }
-    return notes;
+    return { notes, heldCount: held.length };
   });
 
   // Applies what the script printed about waits. A check run also answers for
@@ -661,9 +762,17 @@ const make = Effect.gen(function* () {
     run: KanbanScriptRun,
     exitCode: number | null,
     output: string,
+    heldCount = 0,
   ) {
     const endedAt = yield* nowIso;
-    yield* saveRun(script.boardId, { ...run, endedAt, exitCode, output: Scripts.tail(output) });
+    const summary = heldCount > 0 ? `Held ${heldCount} command(s) for retry\n` : "";
+    yield* saveRun(script.boardId, {
+      ...run,
+      endedAt,
+      exitCode,
+      output:
+        summary + Scripts.tail(output, Scripts.OUTPUT_TAIL_BYTES - Buffer.byteLength(summary)),
+    });
     yield* update(script.id, (latest) => ({
       ...latest,
       lastRun: { startedAt: run.startedAt, endedAt, exitCode },
@@ -700,10 +809,8 @@ const make = Effect.gen(function* () {
     });
     const parsed = Scripts.parseOutput(result.stdout);
     const broke = Scripts.checkRunProblem(script.name, result, RUN_TIMEOUT_MS);
-    const notes = [
-      ...(yield* apply(script, parsed.commands)),
-      ...(yield* applyWaits(script, parsed.waits, check, broke)),
-    ];
+    const { notes, heldCount } = yield* apply(script, parsed.commands);
+    notes.push(...(yield* applyWaits(script, parsed.waits, check, broke)));
     const problems = [
       result.spawnError === null ? null : `It didn't start: ${result.spawnError}`,
       result.timedOut ? `Stopped after ${RUN_TIMEOUT_MS / 60_000} minutes.` : null,
@@ -713,7 +820,7 @@ const make = Effect.gen(function* () {
     const output = [notes.join("\n"), parsed.text, result.stderr.trim(), problems.join("\n")]
       .filter((part) => part.length > 0)
       .join("\n\n");
-    yield* close(script, run, result.exitCode, output);
+    yield* close(script, run, result.exitCode, output, heldCount);
   });
 
   const claim = (scriptId: KanbanScript["id"], done: Deferred.Deferred<void>) =>

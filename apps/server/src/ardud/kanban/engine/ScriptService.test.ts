@@ -8,10 +8,13 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
   KanbanBoardId,
+  KanbanError,
+  KanbanScript as KanbanScriptSchema,
   KanbanScriptId,
   ProjectId,
   ProviderInstanceId,
@@ -75,9 +78,19 @@ const boardFilesLayer = (apply = false) =>
     ),
   );
 
-const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>, apply = false) =>
+const makeTestLayer = (
+  threadsLayer: Layer.Layer<KanbanThreads>,
+  apply = false,
+  wrap: (
+    service: KanbanService.KanbanService["Service"],
+  ) => KanbanService.KanbanService["Service"] = (service) => service,
+) =>
   ScriptService.layer.pipe(
-    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(
+      Layer.effect(KanbanService.KanbanService, Effect.map(KanbanService.KanbanService, wrap)).pipe(
+        Layer.provide(KanbanService.layer),
+      ),
+    ),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threadsLayer),
     Layer.provideMerge(KanbanStore.layer),
@@ -92,6 +105,8 @@ const testLayer = makeTestLayer(threads);
 
 const owner: KanbanActor = { _tag: "owner" };
 const manual: KanbanScriptTrigger = { _tag: "manual" };
+const decodeScript = Schema.decodeUnknownEffect(KanbanScriptSchema);
+const encodeScript = Schema.encodeEffect(KanbanScriptSchema);
 
 const scriptFile = (body: string, name = "script.sh") => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-board-script-"));
@@ -1589,4 +1604,397 @@ it.effect(
       assert.strictEqual(woken.stage, "needs_review");
     }).pipe(Effect.provide(withReader));
   },
+);
+
+const busyError = () =>
+  new KanbanError({
+    code: "conflict",
+    detail: "Board busy: not written. Safe to retry once.",
+    writeOutcome: "not-written",
+  });
+
+const retryFixture = Effect.gen(function* () {
+  const firstAttempt = yield* Deferred.make<void>();
+  let calls = 0;
+  let failure: () => KanbanError | null = () => busyError();
+  const layer = makeTestLayer(threads, false, (service) => ({
+    ...service,
+    createCard: (boardId, input, actor) =>
+      actor._tag !== "script"
+        ? service.createCard(boardId, input, actor)
+        : Effect.gen(function* () {
+            calls += 1;
+            yield* Deferred.succeed(firstAttempt, undefined);
+            const error = failure();
+            if (error) return yield* Effect.fail(error);
+            return yield* service.createCard(boardId, input, actor);
+          }),
+  }));
+  return {
+    layer,
+    firstAttempt,
+    calls: () => calls,
+    failWith: (next: () => KanbanError | null) => {
+      failure = next;
+    },
+  };
+});
+
+const cardLine = `echo '{"kanban":"card","prompt":"Investigate","title":"Lost ticket"}'`;
+const scriptMessages = (board: KanbanBoard) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const discussions = yield* kanban.discussions(board.id);
+    assert.strictEqual(discussions.length, 1);
+    return yield* kanban.messages(discussions[0]!.id, {});
+  });
+
+it.effect(
+  "#577 retries busy card creation twice, with 3s then 10s backoff, and creates exactly once",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(() => (fixture.calls() <= 2 ? busyError() : null));
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const script = yield* register(board, scriptFile(cardLine));
+        yield* scripts.run(script.id, "manual");
+        yield* Deferred.await(fixture.firstAttempt);
+        assert.strictEqual(fixture.calls(), 1);
+        yield* TestClock.adjust(2_999);
+        assert.strictEqual(fixture.calls(), 1);
+        yield* TestClock.adjust(1);
+        assert.strictEqual(fixture.calls(), 2);
+        yield* TestClock.adjust(9_999);
+        assert.strictEqual(fixture.calls(), 2);
+        yield* TestClock.adjust(1);
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 3);
+        assert.strictEqual((yield* kanban.snapshot(board.id)).cards.length, 1);
+        assert.include(
+          (yield* scripts.runs(script.id, 1))[0]!.output,
+          "Added card #1 after 2 retries.",
+        );
+        assert.lengthOf(yield* kanban.discussions(board.id), 0);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect(
+  "#577 holds exhausted busy work, posts one notice, and delivers it on the next trigger once",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const path = scriptFile(cardLine + "\nexit 7");
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* Deferred.await(fixture.firstAttempt);
+        yield* TestClock.adjust(43_000);
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 4);
+        const held = (yield* store.script(script.id))!.held!;
+        assert.strictEqual(held.length, 1);
+        assert.strictEqual(held[0]!.attempts, 4);
+        const run = (yield* scripts.runs(script.id, 1))[0]!;
+        assert.strictEqual(run.exitCode, 7);
+        assert.isTrue(run.output.startsWith("Held 1 command(s) for retry\n"));
+        const notices = yield* scriptMessages(board);
+        assert.lengthOf(notices, 1);
+        assert.include(JSON.stringify(notices), "Will retry next run");
+        NodeFS.writeFileSync(path, cardLine);
+        fixture.failWith(() => null);
+        yield* scripts.run(script.id, "schedule");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 5);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        const delivered = yield* scriptMessages(board);
+        assert.lengthOf(delivered, 2);
+        assert.include(JSON.stringify(delivered), "Delivered held card: Lost ticket");
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 replay sees a card added by another writer and clears the held command", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      yield* store.putScript({
+        ...script,
+        held: [
+          {
+            command: { kanban: "card", prompt: "Investigate", title: "Lost ticket" },
+            firstFailedAt: "1970-01-01T00:00:00.000Z",
+            lastError: "Busy",
+            attempts: 4,
+          },
+        ],
+      });
+      yield* kanban.createCard(board.id, { prompt: "Investigate", title: "Lost ticket" }, owner);
+      yield* scripts.run(script.id, "manual");
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 0);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      assert.include(JSON.stringify(yield* scriptMessages(board)), "Delivered held card");
+      assert.include((yield* scripts.runs(script.id, 1))[0]!.output, "already on the board");
+    }).pipe(Effect.provide(fixture.layer));
+  }),
+);
+
+it.effect(
+  "#577 MAY_HAVE_APPLIED is never retried or held, including while replaying held work",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () =>
+          new KanbanError({
+            code: "conflict",
+            detail: "May have been applied",
+            writeOutcome: "may-have-applied",
+          }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const path = scriptFile(cardLine);
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 1);
+        assert.lengthOf((yield* store.script(script.id))!.held ?? [], 0);
+        yield* store.putScript({
+          ...(yield* store.script(script.id))!,
+          held: [
+            {
+              command: { kanban: "card", prompt: "Investigate", title: "Held uncertain" },
+              firstFailedAt: "1970-01-01T00:00:00.000Z",
+              lastError: "Busy",
+              attempts: 4,
+            },
+          ],
+        });
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 2);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 2);
+        assert.include(JSON.stringify(yield* scriptMessages(board)), "Will not retry");
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 drops held commands at 24 hours or 10 attempts and posts the reason", () =>
+  Effect.gen(function* () {
+    const scripts = yield* ScriptService.KanbanScripts;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* toyBoard;
+    const script = yield* register(board, scriptFile(""));
+    yield* store.putScript({
+      ...script,
+      held: [
+        {
+          command: { kanban: "card", prompt: "Old", title: "Expired" },
+          firstFailedAt: "1970-01-01T00:00:00.000Z",
+          lastError: "Old busy",
+          attempts: 4,
+        },
+        {
+          command: { kanban: "post", text: "Too many attempts" },
+          firstFailedAt: "1970-01-02T00:00:00.000Z",
+          lastError: "Still busy",
+          attempts: 10,
+        },
+      ],
+    });
+    yield* TestClock.adjust("24 hours");
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+    assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+    const output = (yield* scripts.runs(script.id, 1))[0]!.output;
+    assert.include(output, "24 hours old");
+    assert.include(output, "10 attempts");
+    assert.include(output, "Old busy");
+    const messages = yield* scriptMessages(board);
+    assert.lengthOf(messages, 1);
+    assert.include(JSON.stringify(messages), "Expired");
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("#577 old script rows decode and held commands survive schema encoding", () =>
+  Effect.gen(function* () {
+    const { first } = scriptWriteFixture();
+    const legacy = yield* decodeScript(first);
+    assert.isUndefined(legacy.held);
+    const withHeld = yield* decodeScript({
+      ...first,
+      held: [
+        {
+          command: { kanban: "post", text: "Keep this" },
+          firstFailedAt: first.createdAt,
+          lastError: "Busy",
+          attempts: 4,
+        },
+      ],
+    });
+    const encoded = yield* encodeScript(withHeld);
+    const decoded = yield* decodeScript(encoded);
+    assert.deepStrictEqual(decoded.held, withHeld.held);
+    assert.lengthOf(decoded.held!, 1);
+  }),
+);
+
+it.effect(
+  "#577 configuration errors are held, capped at 100 oldest-first, while malformed commands are dropped",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () => new KanbanError({ code: "invalid", detail: "no pool runs missing/model" }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const body = [
+          ...Array.from(
+            { length: 101 },
+            (_, n) => `echo '{"kanban":"card","prompt":"Ticket ${n}","title":"Ticket ${n}"}'`,
+          ),
+          `echo '{"kanban":"card","prompt":""}'`,
+          `echo '{"kanban":"post","text":"bad\\u0001"}'`,
+        ].join("\n");
+        const script = yield* register(board, scriptFile(body));
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        const held = (yield* store.script(script.id))!.held!;
+        assert.lengthOf(held, 100);
+        assert.strictEqual(fixture.calls(), 101);
+        assert.strictEqual(held[0]!.command.kanban, "card");
+        assert.include(JSON.stringify(held[0]), 'Ticket 1"');
+        assert.include(JSON.stringify(held.at(-1)), "Ticket 100");
+        assert.isTrue(held.every((entry) => entry.attempts === 1));
+        const run = (yield* scripts.runs(script.id, 1))[0]!;
+        assert.isTrue(run.output.startsWith("Held 100 command(s) for retry"));
+        assert.include(run.output, "100 command limit");
+        assert.include(run.output, "invalid command");
+        assert.lengthOf(yield* scriptMessages(board), 1);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 a held card gets at most ten total delivery attempts", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      yield* store.putScript({
+        ...script,
+        held: [
+          {
+            command: { kanban: "card", prompt: "Investigate", title: "Lost ticket" },
+            firstFailedAt: "1970-01-01T00:00:00.000Z",
+            lastError: "Busy",
+            attempts: 9,
+          },
+        ],
+      });
+      yield* scripts.run(script.id, "manual");
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 1);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      assert.include((yield* scripts.runs(script.id, 1))[0]!.output, "10 attempts");
+    }).pipe(Effect.provide(fixture.layer));
+  }),
+);
+
+it.effect("#577 a post retries, is held, then is delivered before the next run's new post", () =>
+  Effect.gen(function* () {
+    const attempted = yield* Deferred.make<void>();
+    let fail = true;
+    let calls = 0;
+    const layer = makeTestLayer(threads, false, (service) => ({
+      ...service,
+      post: (id, actor, blocks) =>
+        Effect.gen(function* () {
+          if (blocks.some((block) => block._tag === "md" && block.text === "Original post")) {
+            calls += 1;
+            yield* Deferred.succeed(attempted, undefined);
+            if (fail) return yield* Effect.fail(busyError());
+          }
+          return yield* service.post(id, actor, blocks);
+        }),
+    }));
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const path = scriptFile(`echo '{"kanban":"post","text":"Original post"}'`);
+      const script = yield* register(board, path);
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(attempted);
+      yield* TestClock.adjust(42_999);
+      assert.strictEqual(calls, 3);
+      yield* TestClock.adjust(1);
+      yield* scripts.idle;
+      assert.strictEqual(calls, 4);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 1);
+      fail = false;
+      NodeFS.writeFileSync(path, `echo '{"kanban":"post","text":"New post"}'`);
+      yield* scripts.run(script.id, "event");
+      yield* scripts.idle;
+      assert.strictEqual(calls, 5);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      const messages = yield* scriptMessages(board);
+      const texts = messages.flatMap((message) =>
+        message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
+      );
+      assert.strictEqual(texts.filter((text) => text === "Original post").length, 1);
+      assert.isBelow(texts.indexOf("Original post"), texts.indexOf("New post"));
+      assert.include(texts.join("\n"), "Delivered held post: Original post");
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("#577 checks for an intervening duplicate before retrying card creation", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(cardLine));
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(fixture.firstAttempt);
+      yield* kanban.createCard(board.id, { title: "Lost ticket", prompt: "Investigate" }, owner);
+      yield* TestClock.adjust(3_000);
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 1);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+      assert.include(
+        (yield* scripts.runs(script.id, 1))[0]!.output,
+        "already on the board after 1 retry",
+      );
+    }).pipe(Effect.provide(fixture.layer));
+  }),
 );
