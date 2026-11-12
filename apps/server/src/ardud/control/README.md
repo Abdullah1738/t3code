@@ -396,7 +396,7 @@ Agents inside t3 threads already get the T3 MCP server. Equivalents:
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `projects.list`                                | `t3_project_list`                                                                                                               |                                                                                       |
 | `models.list`                                  | `orchestrator_capabilities`                                                                                                     | Lists providers, models and options. No favourites or recents.                        |
-| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches titles and content.                 |
+| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches finished messages (5 s budget; `complete: false` means partial, `searchedBackTo` is the oldest timestamp examined). Narrow the query or pass `projectId`.                 |
 | `session.create`                               | `t3_thread_launch` (`message` optional, `scratch`, `workspaceStrategy`) or `create_threads`                                     |                                                                                       |
 | `session.dispatch`                             | `t3_thread_launch` with `message`, or `create_threads` with `prompt`                                                            | Both return without waiting.                                                          |
 | `session.send`                                 | `t3_thread_send`                                                                                                                | `mode` auto, queue, steer, restart                                                    |
@@ -427,3 +427,7 @@ favourites and recents, `session.send` to a thread in another project, and
   branch). Before that, `by-native` resolves only sessions t3 itself created.
 - Tokens come from `t3 auth session issue` with administrative scopes. There is
   no read-only option in the CLI.
+
+Thread message search is exposed through MCP `t3_thread_search` and WebSocket
+`orchestration.searchThreads`; there is no control HTTP search route or t3ctl
+search command. Both return optional `complete` and `searchedBackTo` fields.

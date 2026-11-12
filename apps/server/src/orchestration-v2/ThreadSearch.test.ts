@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import {
   EventId,
   MessageId,
@@ -15,6 +15,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -123,7 +124,7 @@ it.layer(layerTest)("ThreadSearch", (it) => {
   it.effect("returns one finished user or assistant match per active thread", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
-      const search = yield* ThreadSearch.ThreadSearch;
+      const search = yield* ThreadSearch.make({ sliceSize: 2 });
       const project = ProjectId.make("project:search");
       const deletedProject = ProjectId.make("project:search-deleted");
       yield* createProject(project);
@@ -174,6 +175,8 @@ it.layer(layerTest)("ThreadSearch", (it) => {
           [assistantOnly, "assistant", "needle in an answer"],
         ],
       );
+      assert.equal(result.complete, true);
+      assert.equal(result.searchedBackTo, undefined);
       assert.lengthOf((yield* search.search({ query: "needle", limit: 1 })).matches, 1);
       assert.deepEqual((yield* search.search({ query: "ne%le" })).matches, []);
     }),
@@ -249,6 +252,192 @@ it.effect("searches on the reader worker while the writer is busy", () =>
         result.matches.map((match) => match.threadId),
         [threadId],
       );
+    }).pipe(Effect.provide(layerFile));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.layer(layerTest)("bounded ThreadSearch", (it) => {
+  it.effect("returns matches and the oldest examined timestamp after a zero budget slice", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const project = ProjectId.make("project:budget");
+      const threadId = ThreadId.make("thread:budget");
+      yield* createProject(project);
+      yield* Effect.forEach(
+        [
+          thread(threadId, project),
+          message(threadId, "budget-old", "user", "needle old", { minute: 1 }),
+          message(threadId, "budget-new", "assistant", "needle new", { minute: 2 }),
+        ],
+        projections.apply,
+        { discard: true },
+      );
+      const search = yield* ThreadSearch.make({ sliceSize: 1, budgetMs: 0 });
+      const result = yield* search.search({ query: "needle" });
+      assert.equal(result.complete, false);
+      assert.equal(result.searchedBackTo, DateTime.formatIso(at(2)));
+      assert.deepEqual(
+        result.matches.map((m) => m.snippet),
+        ["needle new"],
+      );
+      const noMatch = yield* search.search({ query: "absent" });
+      assert.equal(noMatch.complete, false);
+      assert.equal(noMatch.searchedBackTo, DateTime.formatIso(at(2)));
+      assert.deepEqual(noMatch.matches, []);
+    }),
+  );
+
+  it.effect(
+    "keeps SQLite ranking with out-of-order inserts, ties, filters and literal LIKE characters",
+    () =>
+      Effect.gen(function* () {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const project = ProjectId.make("project:parity");
+        const other = ProjectId.make("project:parity-other");
+        yield* createProject(project);
+        yield* createProject(other);
+        const a = ThreadId.make("parity:a");
+        const b = ThreadId.make("parity:b");
+        const c = ThreadId.make("parity:c");
+        const events = [
+          thread(a, project),
+          thread(b, project),
+          thread(c, other),
+          message(a, "parity-a-new", "assistant", "needle answer", { minute: 9 }),
+          message(b, "parity-b", "user", "needle user % _ !", { minute: 8 }),
+          message(a, "parity-a-z", "user", "needle tied z % _ !", { minute: 2 }),
+          message(a, "parity-a-\uE000", "user", "needle unicode BMP % _ !", { minute: 3 }),
+          message(a, "parity-a-\u{10000}", "user", "needle unicode astral % _ !", { minute: 3 }),
+          message(a, "parity-a-a", "user", "needle tied a % _ !", { minute: 2 }),
+          message(c, "parity-c", "user", "needle other % _ !", { minute: 3 }),
+          message(a, "parity-a-old", "user", "needle oldest", { minute: 1 }),
+          thread(ThreadId.make("parity:archived"), project, { archivedAt: at(1) }),
+          message(ThreadId.make("parity:archived"), "parity-archived", "user", "needle % _ !"),
+        ];
+        yield* Effect.forEach(events, projections.apply, { discard: true });
+        yield* sql`UPDATE orchestration_v2_projection_threads SET updated_at = ${DateTime.formatIso(at(10))} WHERE thread_id = ${a}`;
+        const search = yield* ThreadSearch.make({ sliceSize: 1 });
+        for (const query of ["needle", "%", "_", "!", "% _ !", "NEEDLE", "ne%le", "ne_dle", "!!"]) {
+          const pattern = `%${query.replaceAll("!", "!!").replaceAll("%", "!%").replaceAll("_", "!_")}%`;
+          for (const limit of [1, 50]) {
+            const expected = yield* sql<{
+              threadId: string;
+              source: string;
+              snippet: string;
+              messageCreatedAt: string;
+            }>`
+            WITH ranked AS (
+              SELECT t.thread_id AS threadId, m.role AS source,
+                json_extract(m.payload_json, '$.text') AS snippet,
+                m.created_at AS messageCreatedAt, t.updated_at,
+                CASE m.role WHEN 'user' THEN 0 ELSE 1 END AS match_rank,
+                ROW_NUMBER() OVER (PARTITION BY t.thread_id ORDER BY
+                  CASE m.role WHEN 'user' THEN 0 ELSE 1 END, m.created_at DESC, m.message_id ASC) AS rn
+              FROM orchestration_v2_projection_messages m
+              JOIN orchestration_v2_projection_threads t ON t.thread_id = m.thread_id
+              JOIN projection_projects p ON p.project_id = t.project_id
+              WHERE t.deleted_at IS NULL AND t.archived_at IS NULL AND p.deleted_at IS NULL
+                AND m.streaming = 0 AND m.role IN ('user','assistant')
+                AND json_extract(m.payload_json, '$.text') LIKE ${pattern} ESCAPE '!'
+            ) SELECT threadId, source, snippet, messageCreatedAt FROM ranked WHERE rn = 1
+              ORDER BY match_rank, updated_at DESC, threadId ASC LIMIT ${limit}
+          `;
+            const result = yield* search.search({ query, limit });
+            assert.equal(result.complete, true);
+            expect(
+              result.matches.map(({ threadId, source, snippet, messageCreatedAt }) => ({
+                threadId,
+                source,
+                snippet,
+                messageCreatedAt,
+              })),
+            ).toEqual(expected);
+          }
+        }
+        const scoped = yield* search.search({ query: "needle", projectId: other, limit: 1 });
+        assert.deepEqual(
+          scoped.matches.map((m) => m.threadId),
+          [c],
+        );
+      }),
+  );
+});
+
+it.effect("hands background slot 0 to a queued control read between search slices", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-search-fairness-" });
+    const layerFile = Layer.mergeAll(ProjectionStore.layer, ProjectStore.layer).pipe(
+      Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"))),
+      Layer.provide(NodeServices.layer),
+    );
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const project = ProjectId.make("project:fairness");
+      const threadId = ThreadId.make("thread:fairness");
+      yield* createProject(project);
+      yield* projections.apply(thread(threadId, project));
+      for (let i = 0; i < 12; i++) {
+        yield* projections.apply(message(threadId, `fairness-${i}`, "user", `needle ${i}`));
+      }
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      // Pause inside the first real read transaction so the control read is
+      // queued behind search on the live pool's single background slot.
+      const instrumented = new Proxy(sql, {
+        get(target, key) {
+          if (key !== "withTransaction") return Reflect.get(target, key);
+          return <A, E, R>(body: Effect.Effect<A, E, R>) =>
+            target.withTransaction(
+              Effect.gen(function* () {
+                if (first) {
+                  first = false;
+                  yield* Deferred.succeed(held, undefined);
+                  yield* Deferred.await(release);
+                }
+                return yield* body;
+              }),
+            );
+        },
+      });
+      const search = yield* ThreadSearch.make({ sliceSize: 1 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, instrumented),
+      );
+      const order: string[] = [];
+      const searching = yield* Effect.forkChild(
+        search.search({ query: "needle" }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              order.push("search");
+            }),
+          ),
+        ),
+      );
+      yield* Deferred.await(held);
+      const controlDone = yield* Deferred.make<void>();
+      const control = yield* Effect.forkChild(
+        sql`SELECT 1`.pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.backgroundReads,
+          Effect.tap(() =>
+            Effect.sync(() => {
+              order.push("control");
+            }),
+          ),
+          Effect.andThen(Deferred.succeed(controlDone, undefined)),
+        ),
+        { startImmediately: true },
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(controlDone);
+      yield* Fiber.join(control);
+      const result = yield* Fiber.join(searching);
+      assert.equal(result.complete, true);
+      assert.deepEqual(order, ["control", "search"]);
     }).pipe(Effect.provide(layerFile));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
