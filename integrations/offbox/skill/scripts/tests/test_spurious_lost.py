@@ -167,7 +167,7 @@ class SpuriousLostTests(Isolated):
     def test_wrapper_writes_pid_before_script_and_prunes_it(self):
         import shlex
         script = shlex.split(runs.exit_recording_command('exit 3','run-t'))[2]
-        self.assertLess(script.index('echo $$'),script.index('bash -lc'))
+        self.assertLess(script.index('python3 - "$$"'),script.index('bash -lc'))
         self.assertIn('run-t.pid',script)
         self.assertIn('*.pid',script)
 
@@ -236,7 +236,7 @@ class SpuriousLostTests(Isolated):
                 if expected:
                     self.assertEqual(lease.active_runs(self.con,'bx'),1)
 
-    def test_history_errors_still_allow_saved_exit_and_never_prove_loss(self):
+    def test_history_errors_allow_saved_exit_but_transport_errors_do_not_prove_loss(self):
         self.con.execute("UPDATE runs SET command_id='cmd-t'")
         self.con.commit()
         for error in [api.ApiError(404,'not_found','history expired'),common.OffboxError('history timed out')]:
@@ -245,7 +245,11 @@ class SpuriousLostTests(Isolated):
                 self.assertEqual(runs.confirmed_lost('bx','run-t')['exitCode'],0)
             with patch.object(api,'history_get',side_effect=error), \
                     patch.object(runs,'recorded_exit',return_value=None),patch.object(runs,'remote_alive',return_value='gone'):
-                self.assertIsNone(runs.confirmed_lost('bx','run-t'))
+                result = runs.confirmed_lost('bx','run-t')
+                if isinstance(error, api.ApiError) and error.status == 404:
+                    self.assertEqual(result['status'],'lost')
+                else:
+                    self.assertIsNone(result)
 
     def test_recovered_pulls_finish_before_terminal_status_and_retry_on_interrupt(self):
         self.con.execute("UPDATE runs SET status='lost',end_at=1000,pulls='[\"out.txt\"]'")

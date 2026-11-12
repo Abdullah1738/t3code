@@ -725,12 +725,23 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
                      + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
                      + 'OFFBOX_EXIT_RECORD')
+    marker = ('mkdir -p "$HOME/.offbox/exit" && '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/exit/{run_id}.pid"')
+    # Pass the wrapper's PID: the supervised writer has a different PID and may outlive its deadline.
+    marker_block = ('python3 - "$$" <<\'OFFBOX_PID_RECORD\'\n' + BOUNDED_PROCESS
+                    + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
+                    + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
     outer = "\n".join([
-        'mkdir -p "$HOME/.offbox/exit" || exit 1',
-        f'echo $$ > "$HOME/.offbox/exit/{run_id}.pid" || exit 1',
+        marker_block,
+        '__offbox_rc=$?',
+        'if [ "$__offbox_rc" -ne 0 ]; then',
+        '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
+        '  __offbox_rc=97',
+        'else',
         '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
+        'fi',
         persist_block,
         # Whether a container started during the run (events, since testcontainers removes its own): only then
         # does the box get the longer Docker idle window. <run>.dk holds "1" (a container started) or "0" (the query
@@ -785,7 +796,8 @@ def remote_alive(box_id: str, run_id: str, timeout: float = 20) -> str | None:
     return result if p.returncode == 0 and result in ("ended", "alive", "gone") else None
 
 
-def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True) -> dict | None:
+def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True,
+                   check_box: bool = False) -> dict | None:
     """Check retained history, then .rc, then liveness. None keeps the run reserved (alive or unknown)."""
     deadline = now() + timeout
 
@@ -807,17 +819,39 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
                 # Leave time for the independent SSH evidence even if the tracker hangs.
                 with api.budget(min(5, left() / 2)):
                     code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
-            except OffboxError:
-                history_unknown, code = True, None
+            except OffboxError as e:
+                history_unknown = not (isinstance(e, api.ApiError) and e.status == 404)
+                code = None
             left()
             if code is not None:
                 return dict(status='exited', running=False, exitCode=code)
+        if check_box:
+            # A follower owns the box lock, so it must detect a stopped/deleted box without the reaper.
+            try:
+                with api.budget(min(5, left() / 2)):
+                    box = api.get(box_id, deadline=now() + min(5, left() / 2))
+                left()
+            except OffboxError:
+                box = {'state': 'unknown'}
+            if box is None or box.get('state') in (*api.STOPPED_STATES, 'error', 'cancelled'):
+                if history_unknown:
+                    return None
+                if record:
+                    con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'box'))
+                    con.commit()
+                return dict(status='lost', running=False, exitCode=None)
         code = recorded_exit(box_id, run_id, timeout=left())
         left()
         if code is not None:
             return dict(status='exited', running=False, exitCode=code)
         alive = remote_alive(box_id, run_id, timeout=left())
         left()
+        if alive in ('gone', 'ended'):
+            # The wrapper can publish .rc and exit between remote_alive's first file test and kill -0.
+            code = recorded_exit(box_id, run_id, timeout=left())
+            left()
+            if code is not None:
+                return dict(status='exited', running=False, exitCode=code)
         if alive == 'gone':
             if history_unknown:
                 return None
@@ -933,20 +967,28 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
     """A lost process can still have its exit on disk, in step results or in retained command history.
     Failure to read history propagates, keeping the active row available for later reconciliation."""
     deadline = time.monotonic() + timeout
-    code = recorded_exit(box_id, run_id, timeout=timeout)
+    con = db()
+    try:
+        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
+    finally:
+        con.close()
+    # Only box-state confirmation rules out SSH: a dead PID's saved exit can still be read on a live box.
+    stopped = confirmed and confirmed['v'] == 'box'
+    code = None if stopped else recorded_exit(box_id, run_id, timeout=timeout)
     if code is not None:
         return code, "the box's exit file"
     code = steps_exit(log_path, planned)
     if code is not None:
         return code, "the step results"
-    con = db()
-    try:
-        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
-    finally:
-        con.close()
     if row and row['command_id']:
-        with api.budget(max(0, deadline - time.monotonic())):
-            code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+        try:
+            with api.budget(max(0, deadline - time.monotonic())):
+                code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+        except api.ApiError as e:
+            if not (stopped and e.status == 404):
+                raise
+            code = None
         if code is not None:
             return code, 'retained command history'
     return None, ""
@@ -1298,7 +1340,8 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
     if st and not st.get("running") and st.get("status") in ("exited", "lost"):
         if st.get('status') == 'lost' and run_id:
             try:
-                return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())))
+                return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())),
+                                      check_box=True)
             except OffboxError:
                 return None
         return st
@@ -1375,7 +1418,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 raise timed_out()
             budget = 20 if until is None else min(20, max(0, left()))
             try:
-                st = confirmed_lost(box_id, run_id, budget)
+                st = confirmed_lost(box_id, run_id, budget, check_box=True)
             except OffboxError:
                 st = None
             if until is not None and now() >= until:
