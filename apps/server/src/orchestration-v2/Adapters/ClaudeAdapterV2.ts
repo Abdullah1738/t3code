@@ -561,6 +561,13 @@ export interface ClaudeAgentSdkSubagentLookupInput {
 // after this bound so orchestration can safely end the run and accept another.
 const CLAUDE_INTERRUPT_SETTLE_TIMEOUT = "10 seconds";
 
+// Stop waits for admission to release its lock. Native preparation requests
+// must not hold it forever before a turn exists for Stop to interrupt.
+const CLAUDE_TURN_PREPARATION_TIMEOUT = "15 seconds";
+
+// Transcript enrichment must not hold native shutdown or replacement admission.
+const CLAUDE_TURN_FINALIZATION_TIMEOUT = "10 seconds";
+
 const isClaudeAgentSdkQueryRunnerError = Schema.is(ClaudeAgentSdkQueryRunnerError);
 const isProviderAdapterRuntimeRequestResponseError = Schema.is(
   ProviderAdapter.ProviderAdapterRuntimeRequestResponseError,
@@ -3546,6 +3553,7 @@ interface ActiveClaudeSubagent {
 }
 
 interface ClaudeLiveQueryContext {
+  readonly generation: number;
   readonly nativeThreadId: string;
   readonly query: ClaudeAgentSdkQuerySession;
   readonly queryPolicyKey: string;
@@ -3992,6 +4000,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const mcpStatuses = new Map<string, McpRegistrationStatus>();
         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
+        const queryGenerations = yield* Ref.make(new Map<string, number>());
+        const turnQueries = new WeakMap<ActiveClaudeTurnContext, ClaudeLiveQueryContext>();
+        // A wake can be native work already, before replay acquires the SDK lock.
+        const pendingContinuation = yield* Ref.make<{
+          readonly context: ActiveClaudeTurnContext;
+          readonly querySession: ClaudeLiveQueryContext;
+        } | null>(null);
         // Foreground Bash calls whose output file is being tailed, by tool_use_id.
         const taskOutputTails = new Map<
           string,
@@ -6549,23 +6564,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
         });
         const endSubagentCallsOfClosedQuery = Effect.fnUntraced(function* (
-          nativeThreadId: string,
+          closedQuery: ClaudeLiveQueryContext,
           status: "interrupted" | "failed",
         ) {
-          const settled = settledTurnByNativeThread.get(nativeThreadId);
+          if (
+            (yield* Ref.get(queryGenerations)).get(closedQuery.nativeThreadId) !==
+            closedQuery.generation
+          )
+            return;
+          const settled = settledTurnByNativeThread.get(closedQuery.nativeThreadId);
           if (settled === undefined || subagentToolCalls.size === 0) {
             return;
           }
+          const calls = [...subagentToolCalls.values()];
           yield* endToolCalls({
             context: settled,
-            toolCalls: [...subagentToolCalls.values()],
+            toolCalls: calls,
             status,
             completedAt: yield* DateTime.now,
           });
-          subagentToolCalls.clear();
+          for (const call of calls) {
+            if (subagentToolCalls.get(call.nativeItemId) === call)
+              subagentToolCalls.delete(call.nativeItemId);
+          }
         });
 
-        const finalizeActiveTurn = Effect.fnUntraced(function* (input: {
+        const performActiveTurnFinalization = Effect.fnUntraced(function* (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly status: Extract<
             OrchestrationV2ProviderTurn["status"],
@@ -6576,113 +6600,123 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
         }) {
-          input.context.acceptingSteers = false;
-          yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
-          if (input.context.compaction?.status === "running") {
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: CLAUDE_PROVIDER,
-              turnItem: {
-                ...input.context.compaction,
-                status: input.status === "completed" ? "failed" : input.status,
-                title:
-                  input.status === "completed" || input.status === "failed"
-                    ? "Context compaction failed"
-                    : "Context compaction stopped",
-                completedAt: input.completedAt,
-                updatedAt: input.completedAt,
-              },
-            });
-          }
-          input.context.compaction = null;
-          if (input.status !== "completed") {
-            const liveQuery = yield* Ref.get(queryContext);
-            for (const [taskId, subagent] of yield* Ref.get(sessionSubagentsByTaskId)) {
-              if (
-                subagent.task.workflow === undefined ||
-                subagent.task.status !== "running" ||
-                subagent.task.runId !== input.context.input.runId
-              )
-                continue;
-              if (liveQuery !== null && !liveQuery.stopping) {
-                // Best effort and off the terminal path: an unanswered stop must
-                // not keep the turn from ending.
-                yield* liveQuery.query
-                  .stopTask(taskId)
-                  .pipe(Effect.timeout("15 seconds"), Effect.ignore, Effect.forkIn(sessionScope));
-              }
-              yield* updateClaudeSubagentNode({
-                context: input.context,
-                taskId,
-                status: input.status === "failed" ? "failed" : "cancelled",
-                onlyIfRunningInRun: input.context.input.runId,
+          yield* Effect.gen(function* () {
+            input.context.acceptingSteers = false;
+            yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
+            if (input.context.compaction?.status === "running") {
+              yield* emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: {
+                  ...input.context.compaction,
+                  status: input.status === "completed" ? "failed" : input.status,
+                  title:
+                    input.status === "completed" || input.status === "failed"
+                      ? "Context compaction failed"
+                      : "Context compaction stopped",
+                  completedAt: input.completedAt,
+                  updatedAt: input.completedAt,
+                },
               });
             }
-          }
-          const liveQuery = yield* Ref.get(queryContext);
-          const runningChildThreadIds = new Set(
-            [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].flatMap((subagent) =>
-              subagent.task.status === "running" &&
-              (input.status === "completed" ||
-                (liveQuery !== null && subagent.task.runId !== input.context.input.runId)) &&
-              liveQuery?.subagentsFromEarlierProcesses.has(subagent) !== true
-                ? [subagent.childThreadId]
-                : [],
-            ),
-          );
-          const endingSubagentCalls = [...subagentToolCalls.values()].filter(
-            (toolCall) => !runningChildThreadIds.has(toolCall.threadId),
-          );
-          yield* endToolCalls({
-            context: input.context,
-            toolCalls: [...input.context.toolCalls.values(), ...endingSubagentCalls],
-            status: input.status === "completed" ? "failed" : input.status,
-            completedAt: input.completedAt,
-          });
-          input.context.toolCalls.clear();
-          for (const toolCall of endingSubagentCalls) {
-            subagentToolCalls.delete(toolCall.nativeItemId);
-          }
-
-          if (
-            input.context.assistant.emittedNativeItemIds.size === 0 &&
-            input.context.assistant.fallbackText.length > 0
-          ) {
-            const ordinal = yield* resolveItemOrdinal(
-              input.context,
-              input.context.assistant.fallbackNativeItemId,
+            input.context.compaction = null;
+            if (input.status !== "completed") {
+              const liveQuery = yield* Ref.get(queryContext);
+              for (const [taskId, subagent] of yield* Ref.get(sessionSubagentsByTaskId)) {
+                if (
+                  subagent.task.workflow === undefined ||
+                  subagent.task.status !== "running" ||
+                  subagent.task.runId !== input.context.input.runId
+                )
+                  continue;
+                if (liveQuery !== null && !liveQuery.stopping) {
+                  // Best effort and off the terminal path: an unanswered stop must
+                  // not keep the turn from ending.
+                  yield* liveQuery.query
+                    .stopTask(taskId)
+                    .pipe(Effect.timeout("15 seconds"), Effect.ignore, Effect.forkIn(sessionScope));
+                }
+                yield* updateClaudeSubagentNode({
+                  context: input.context,
+                  taskId,
+                  status: input.status === "failed" ? "failed" : "cancelled",
+                  onlyIfRunningInRun: input.context.input.runId,
+                });
+              }
+            }
+            const liveQuery = yield* Ref.get(queryContext);
+            const runningChildThreadIds = new Set(
+              [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].flatMap((subagent) =>
+                subagent.task.status === "running" &&
+                (input.status === "completed" ||
+                  (liveQuery !== null && subagent.task.runId !== input.context.input.runId)) &&
+                liveQuery?.subagentsFromEarlierProcesses.has(subagent) !== true
+                  ? [subagent.childThreadId]
+                  : [],
+              ),
             );
-            const artifacts = buildAssistantArtifacts({
-              idAllocator,
-              turnInput: input.context.input,
-              providerTurnId: input.context.providerTurnId,
-              nativeItemId: input.context.assistant.fallbackNativeItemId,
-              text: input.context.assistant.fallbackText,
-              ordinal,
-              startedAt: input.context.startedAt,
+            const endingSubagentCalls = [...subagentToolCalls.values()].filter(
+              (toolCall) => !runningChildThreadIds.has(toolCall.threadId),
+            );
+            yield* endToolCalls({
+              context: input.context,
+              toolCalls: [...input.context.toolCalls.values(), ...endingSubagentCalls],
+              status: input.status === "completed" ? "failed" : input.status,
               completedAt: input.completedAt,
             });
-            yield* Effect.all(
-              [
-                emitProviderEvent({
-                  type: "node.updated",
-                  driver: CLAUDE_PROVIDER,
-                  node: artifacts.node,
-                }),
-                emitProviderEvent({
-                  type: "message.updated",
-                  driver: CLAUDE_PROVIDER,
-                  message: artifacts.message,
-                }),
-                emitProviderEvent({
-                  type: "turn_item.updated",
-                  driver: CLAUDE_PROVIDER,
-                  turnItem: artifacts.turnItem,
-                }),
-              ],
-              { concurrency: 1 },
-            );
-          }
+            input.context.toolCalls.clear();
+            for (const toolCall of endingSubagentCalls) {
+              subagentToolCalls.delete(toolCall.nativeItemId);
+            }
+
+            if (
+              input.context.assistant.emittedNativeItemIds.size === 0 &&
+              input.context.assistant.fallbackText.length > 0
+            ) {
+              const ordinal = yield* resolveItemOrdinal(
+                input.context,
+                input.context.assistant.fallbackNativeItemId,
+              );
+              const artifacts = buildAssistantArtifacts({
+                idAllocator,
+                turnInput: input.context.input,
+                providerTurnId: input.context.providerTurnId,
+                nativeItemId: input.context.assistant.fallbackNativeItemId,
+                text: input.context.assistant.fallbackText,
+                ordinal,
+                startedAt: input.context.startedAt,
+                completedAt: input.completedAt,
+              });
+              yield* Effect.all(
+                [
+                  emitProviderEvent({
+                    type: "node.updated",
+                    driver: CLAUDE_PROVIDER,
+                    node: artifacts.node,
+                  }),
+                  emitProviderEvent({
+                    type: "message.updated",
+                    driver: CLAUDE_PROVIDER,
+                    message: artifacts.message,
+                  }),
+                  emitProviderEvent({
+                    type: "turn_item.updated",
+                    driver: CLAUDE_PROVIDER,
+                    turnItem: artifacts.turnItem,
+                  }),
+                ],
+                { concurrency: 1 },
+              );
+            }
+          }).pipe(
+            Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.claude-terminal-enrichment-failed", {
+                providerTurnId: input.context.providerTurnId,
+                cause,
+              }),
+            ),
+          );
 
           const providerRetry = yield* Ref.modify(providerRetries, (current) => {
             const retry = current.get(input.context.providerTurnId);
@@ -6871,6 +6905,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
         });
 
+        const turnFinalizations = new WeakMap<ActiveClaudeTurnContext, Deferred.Deferred<void>>();
+        const finalizeActiveTurn = Effect.fnUntraced(function* (
+          input: Parameters<typeof performActiveTurnFinalization>[0],
+        ) {
+          const existing = turnFinalizations.get(input.context);
+          if (existing !== undefined) return yield* Deferred.await(existing);
+          // Claim before any transcript I/O. Shutdown joins this same bounded
+          // finalization instead of publishing a second terminal from its fallback.
+          const done = Deferred.makeUnsafe<void>();
+          turnFinalizations.set(input.context, done);
+          yield* performActiveTurnFinalization(input).pipe(
+            Effect.ensuring(Deferred.succeed(done, undefined)),
+            Effect.uninterruptible,
+          );
+        });
+
         const emitAssistantTextArtifacts = Effect.fnUntraced(function* (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly nativeItemId: string;
@@ -6996,11 +7046,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     }),
                   }),
             });
-          } else {
+          } else if (
+            (yield* Ref.get(queryGenerations)).get(closedQuery.nativeThreadId) ===
+            closedQuery.generation
+          ) {
             yield* resetBackgroundTaskStateForNativeThreadProcess(closedQuery.nativeThreadId);
           }
           // Preserve buffered outcomes before Stop clears the wake buffer.
           for (const [taskId, subagent] of subagents) {
+            if (
+              (yield* Ref.get(queryGenerations)).get(closedQuery.nativeThreadId) !==
+              closedQuery.generation
+            )
+              break;
             if (
               subagent.task.status !== "running" ||
               closedQuery.subagentsFromEarlierProcesses.has(subagent)
@@ -9448,6 +9506,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           if (
             existing !== null &&
             existing.nativeThreadId === nativeThreadId &&
+            !existing.stopping &&
             isClaudeProviderContinuationTurn(turnInput)
           ) {
             return existing;
@@ -9467,7 +9526,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               Effect.andThen(
                 live.query.applyFlagSettings(claudeLiveSelectionFlagSettings(compiledSelection)),
               ),
-              Effect.tapError(() =>
+              Effect.onError(() =>
                 Effect.sync(() => {
                   live.selection = { ...live.selection, queryIdentity: "" };
                 }),
@@ -9479,6 +9538,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             existing !== null &&
             existing.nativeThreadId === nativeThreadId &&
             existing.queryPolicyKey === queryPolicyKey &&
+            !existing.stopping &&
             existing.selection.queryIdentity === compiledSelection.queryIdentity
           ) {
             // Claude can switch its own mode mid-session (EnterPlanMode), and
@@ -9605,6 +9665,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
           const closed = yield* Deferred.make<void, never>();
           const context: ClaudeLiveQueryContext = {
+            generation: yield* Ref.modify(queryGenerations, (current) => {
+              const generation = (current.get(nativeThreadId) ?? 0) + 1;
+              return [generation, new Map(current).set(nativeThreadId, generation)];
+            }),
             nativeThreadId,
             query: querySession,
             queryPolicyKey,
@@ -9667,7 +9731,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     exit._tag === "Failure" ? exit.cause : undefined,
                   );
                   yield* endSubagentCallsOfClosedQuery(
-                    context.nativeThreadId,
+                    context,
                     context.stopping ? "interrupted" : "failed",
                   );
                 }
@@ -9678,6 +9742,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           );
           return context;
         });
+
+        const previousTurnActiveError = (currentTurn: ActiveClaudeTurnContext) =>
+          new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CLAUDE_PROVIDER,
+            detail: `Claude provider turn ${currentTurn.providerTurnId} is still active.`,
+            reason: "previous_turn_active",
+            activeTurn: {
+              runId: currentTurn.input.runId,
+              attemptId: currentTurn.input.attemptId,
+              providerThreadId: currentTurn.input.providerThread.id,
+              providerTurnId: currentTurn.providerTurnId,
+            },
+          });
 
         const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
@@ -9706,20 +9783,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               nativeTurnId,
             });
             const providerTurnOrdinal = turnInput.providerTurnOrdinal;
-            const currentTurn = yield* Ref.get(activeTurn);
-            if (currentTurn !== null) {
-              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                driver: CLAUDE_PROVIDER,
-                detail: `Claude provider turn ${currentTurn.providerTurnId} is still active.`,
-                reason: "previous_turn_active",
-                activeTurn: {
-                  runId: currentTurn.input.runId,
-                  attemptId: currentTurn.input.attemptId,
-                  providerThreadId: currentTurn.input.providerThread.id,
-                  providerTurnId: currentTurn.providerTurnId,
-                },
-              });
-            }
+            const currentTurn =
+              (yield* Ref.get(activeTurn)) ??
+              (yield* Ref.get(pendingContinuation))?.context ??
+              null;
+            if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
             yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
               const updated = new Map(current);
               updated.set(nativeThreadId, {
@@ -9809,6 +9877,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
             yield* querySession.query.retryMcp ?? Effect.void;
+            turnQueries.set(context, querySession);
             const attachTurn = Effect.gen(function* () {
               querySession.lastTurn = context;
               yield* Ref.set(activeTurn, context);
@@ -9827,20 +9896,29 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* startUserTurnForWakeReports(nativeThreadId);
               return querySession.query.offer(userMessage);
             }
+            yield* Ref.set(pendingContinuation, { context, querySession });
             // Transcript reads suspend replay. Hold live SDK frames until the whole
             // buffer has been applied so starts, completions and the root result stay ordered.
-            yield* sdkMessageLock.withPermits(1)(
+            return sdkMessageLock.withPermits(1)(
               Effect.gen(function* () {
-                if (
-                  (yield* Ref.get(queryContext))?.query !== querySession.query ||
-                  querySession.stopping
-                ) {
-                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                    driver: CLAUDE_PROVIDER,
-                    detail: "Claude provider query ended before the continuation could start.",
-                  });
-                }
-                yield* attachTurn;
+                yield* turnControlLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    if (
+                      (yield* Ref.get(queryContext))?.query !== querySession.query ||
+                      querySession.stopping ||
+                      (yield* Ref.get(pendingContinuation))?.context !== context
+                    ) {
+                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                        driver: CLAUDE_PROVIDER,
+                        detail: "Claude provider query ended before the continuation could start.",
+                      });
+                    }
+                    const currentTurn = yield* Ref.get(activeTurn);
+                    if (currentTurn !== null) return yield* previousTurnActiveError(currentTurn);
+                    yield* Ref.set(pendingContinuation, null);
+                    yield* attachTurn;
+                  }),
+                );
                 const drained = (yield* Ref.get(wakeBuffers)).get(nativeThreadId)?.messages ?? [];
                 yield* Ref.update(requestedContinuations, (current) => {
                   const updated = new Set(current);
@@ -9956,9 +10034,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           },
           (effect, turnInput) =>
             effect.pipe(
+              Effect.timeout(CLAUDE_TURN_PREPARATION_TIMEOUT),
               turnControlLock.withPermits(1),
-              // Release the control lock before waiting for prompt delivery so Stop
-              // can close a query whose offer never acknowledges.
+              // Delivery and transcript replay can stall. Only admission owns the
+              // control lock so Stop can still close the query while they wait.
               Effect.flatMap((offer) => offer ?? Effect.void),
               Effect.mapError(
                 (cause) =>
@@ -9975,8 +10054,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const interruptTurn = Effect.fn("ClaudeAdapterV2.interruptTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
-            const existing = yield* Ref.get(queryContext);
-            const currentTurn = yield* Ref.get(activeTurn);
+            const attached = yield* Ref.get(activeTurn);
+            const pending = yield* Ref.get(pendingContinuation);
+            const currentTurn = attached ?? pending?.context ?? null;
+            // Stream exit clears queryContext before turn enrichment finishes.
+            // Stop must retain the captured query throughout that window.
+            const existing =
+              (yield* Ref.get(queryContext)) ??
+              (currentTurn === null ? null : (turnQueries.get(currentTurn) ?? null));
             const nativeThreadId = turnInput.providerThread.nativeThreadRef?.nativeId ?? null;
             if (currentTurn === null && turnInput.requestRuntimeRestart === true) {
               if (nativeThreadId === null) return;
@@ -10009,6 +10094,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 detail: `Claude provider turn ${turnInput.providerTurnId} is not the active turn.`,
               });
             }
+            if (attached === null) {
+              if (pending?.querySession !== existing) {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CLAUDE_PROVIDER,
+                  detail: "Claude continuation query ended before Stop could attach its turn.",
+                });
+              }
+              existing.lastTurn = currentTurn;
+              yield* Ref.set(activeTurn, currentTurn);
+              yield* Ref.set(pendingContinuation, null);
+            }
             yield* Ref.update(interruptedTurns, (current) => {
               const next = new Set(current);
               next.add(turnInput.providerTurnId);
@@ -10029,6 +10125,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               Effect.timeoutOption("10 seconds"),
             );
             if (Option.isSome(closed)) {
+              if ((yield* Ref.get(activeTurn)) === currentTurn) {
+                yield* finalizeActiveTurn({
+                  context: currentTurn,
+                  status: "interrupted",
+                  completedAt: yield* DateTime.now,
+                });
+              }
               return;
             }
 
@@ -10044,7 +10147,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (ownedLiveQuery) {
               existing.stopping = true;
               yield* finalizeActiveTurnAfterQueryExit(existing);
-              yield* endSubagentCallsOfClosedQuery(existing.nativeThreadId, "interrupted");
+              yield* endSubagentCallsOfClosedQuery(existing, "interrupted");
             } else if ((yield* Ref.get(activeTurn)) === currentTurn) {
               yield* finalizeActiveTurn({
                 context: currentTurn,
@@ -10235,7 +10338,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           );
           if (ownedLiveQuery) {
             yield* finalizeActiveTurnAfterQueryExit(existing);
-            yield* endSubagentCallsOfClosedQuery(nativeThreadId, "interrupted");
+            yield* endSubagentCallsOfClosedQuery(existing, "interrupted");
           }
           yield* Deferred.succeed(existing.closed, undefined);
         });
@@ -10470,7 +10573,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             );
           }),
           interruptTurn: Effect.fn("ClaudeAdapterV2.interruptTurnControl")(function* (turnInput) {
-            if ((yield* Ref.get(activeTurn)) === null && turnInput.requestRuntimeRestart === true) {
+            if (
+              (yield* Ref.get(activeTurn)) === null &&
+              (yield* Ref.get(pendingContinuation)) === null &&
+              turnInput.requestRuntimeRestart === true
+            ) {
               return yield* interruptTurn(turnInput);
             }
             yield* turnControlLock.withPermits(1)(interruptTurn(turnInput));
@@ -10478,7 +10585,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           interruptStartingRun: Effect.fn("ClaudeAdapterV2.interruptStartingRun")(function* (
             runInput,
           ) {
-            const current = yield* Ref.get(activeTurn);
+            const current =
+              (yield* Ref.get(activeTurn)) ??
+              (yield* Ref.get(pendingContinuation))?.context ??
+              null;
             if (
               current === null ||
               current.input.runId !== runInput.runId ||

@@ -1028,6 +1028,7 @@ export const layer: Layer.Layer<
         );
         const rootTerminalSeen = yield* Ref.make(false);
         const ingestionFailure = yield* Ref.make<Cause.Cause<unknown> | null>(null);
+        const startupFailurePending = yield* Ref.make(false);
         const shutdownCleanupDeadline = yield* Deferred.make<Cause.Cause<unknown>>();
         const rootRunFinalized = yield* Ref.make(false);
         const providerThreadOwnerLost = yield* Ref.make(false);
@@ -1040,7 +1041,7 @@ export const layer: Layer.Layer<
         const finalizeRootRun = Effect.fn("RunExecutionService.finalizeRootRun")(function* (
           terminal: ProviderTerminalEvent,
         ) {
-          if (yield* Ref.get(rootRunFinalized)) {
+          if ((yield* Ref.get(rootRunFinalized)) || (yield* Ref.get(startupFailurePending))) {
             return;
           }
           if (
@@ -1319,6 +1320,7 @@ export const layer: Layer.Layer<
             terminal !== null &&
             terminal.status !== "completed" &&
             (yield* Ref.get(ingestionFailure)) === null &&
+            !(yield* Ref.get(startupFailurePending)) &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1339,6 +1341,7 @@ export const layer: Layer.Layer<
             terminal !== null &&
             terminal.status !== "completed" &&
             (yield* Ref.get(ingestionFailure)) === null &&
+            !(yield* Ref.get(startupFailurePending)) &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1631,7 +1634,11 @@ export const layer: Layer.Layer<
           // Also after events this run does not accept, such as a child handed to another run.
           Stream.tap(() =>
             Effect.gen(function* () {
-              if ((yield* Ref.get(ingestionFailure)) !== null && (yield* nativeEndConfirmed))
+              if (
+                ((yield* Ref.get(ingestionFailure)) !== null ||
+                  (yield* Ref.get(startupFailurePending))) &&
+                (yield* nativeEndConfirmed)
+              )
                 yield* Deferred.succeed(nativeEndObserved, undefined);
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
@@ -1678,6 +1685,7 @@ export const layer: Layer.Layer<
                   cause,
                 });
                 if (finalized) return;
+                if (yield* Ref.get(startupFailurePending)) return;
                 const providerThread = yield* Ref.get(latestProviderThread);
                 const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
                 const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -1819,14 +1827,21 @@ export const layer: Layer.Layer<
               attemptId: input.attemptId,
             })
             ?.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new RunExecutionStartError({
-                    commandId: input.commandId,
-                    runId: input.run.id,
-                    cause,
-                  }),
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.fail(
+                      new RunExecutionStartError({
+                        commandId: input.commandId,
+                        runId: input.run.id,
+                        cause,
+                      }),
+                    ),
               ),
+              // A failed Stop is not evidence that native work ended. Keep
+              // ownership and lifecycle ingestion while retrying this exact attempt.
+              Effect.retry({ schedule: Schedule.spaced("1 second") }),
+              Effect.raceFirst(Deferred.await(nativeEndObserved)),
             ) ?? Effect.void;
         yield* Effect.andThen(shouldStart, startTurn).pipe(
           // The event fiber is detached; an interrupted start must not leak it.
@@ -1848,6 +1863,13 @@ export const layer: Layer.Layer<
                   runId: input.run.id,
                   cause,
                 }).pipe(
+                  // Cleanup can emit a native interrupted terminal before Stop
+                  // returns. Keep ingestion for liveness, but let this error own settlement.
+                  Effect.andThen(
+                    input.session.interruptStartingRun === undefined
+                      ? Effect.void
+                      : Ref.set(startupFailurePending, true),
+                  ),
                   Effect.andThen(stopStartingRun),
                   Effect.andThen(Fiber.interrupt(providerEventFiber)),
                   Effect.andThen(Ref.get(latestProviderThread)),

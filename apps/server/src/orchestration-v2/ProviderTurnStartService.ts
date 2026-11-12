@@ -81,11 +81,12 @@ const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
+const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+
 const activeTurnRefusal = (
   error: unknown,
 ): ProviderAdapter.ProviderAdapterProtocolError | undefined =>
-  Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(error) &&
-  error.reason === "previous_turn_active"
+  isProtocolError(error) && error.reason === "previous_turn_active"
     ? error
     : Predicate.hasProperty(error, "cause")
       ? activeTurnRefusal(error.cause)

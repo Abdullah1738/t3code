@@ -4945,6 +4945,109 @@ it.effect.each(["failure", "interruption"] as const)(
     }),
 );
 
+it.effect.each(["terminal", "ingest_error", "stop_error"] as const)(
+  "preserves the startup failure when Claude cleanup emits a terminal before returning: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const key = `claude-startup-terminal-${mode}`;
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingestionStarted = yield* Deferred.make<void>();
+      const ingestionClosed = yield* Deferred.make<void>();
+      const outcome = yield* captureRootRunTermination({
+        key,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.unwrap(
+            Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.fromQueue(events))),
+          ),
+        startTurn: (input) =>
+          Deferred.await(ingestionStarted).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  threadId: input.threadId,
+                  providerThreadId: input.providerThread.id,
+                  runId: input.runId,
+                  cause: "offer failed after attachment",
+                }),
+              ),
+            ),
+          ),
+        interruptStartingRun: () =>
+          Queue.offer(events, rootTerminalEvent(backgroundScenarioIds(key), "interrupted")).pipe(
+            Effect.andThen(Deferred.await(ingestionClosed)),
+            Effect.andThen(mode === "stop_error" ? Effect.die("late Stop error") : Effect.void),
+          ),
+        ingestNormalized: () =>
+          mode !== "ingest_error"
+            ? Effect.succeed([])
+            : Effect.die("cleanup terminal persistence failed"),
+        onSubscriptionClose: Deferred.succeed(ingestionClosed, undefined),
+      }).pipe(Effect.exit);
+      assert.isTrue(Exit.isSuccess(outcome));
+      if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+      const result = outcome.value;
+      const terminals = result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      );
+      assert.deepEqual(terminals, ["failed"]);
+      const error = result.written.find((item) => item.type === "error");
+      assert.include(error?.failure.message ?? "", "provider could not start this turn");
+      assert.notInclude(error?.failure.message ?? "", "cleanup terminal persistence failed");
+    }),
+);
+
+it.effect("retries a failed Claude startup cleanup before settling the original failure", () =>
+  Effect.gen(function* () {
+    const firstStopFailed = yield* Deferred.make<void>();
+    const ingestionStarted = yield* Deferred.make<void>();
+    let stops = 0;
+    const run = yield* captureRootRunTermination({
+      key: "claude-startup-cleanup-retry",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.unwrap(Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never))),
+      startTurn: (input) =>
+        Deferred.await(ingestionStarted).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: ProviderDriverKind.make("claudeAgent"),
+                threadId: input.threadId,
+                providerThreadId: input.providerThread.id,
+                runId: input.runId,
+                cause: "offer failed after attachment",
+              }),
+            ),
+          ),
+        ),
+      interruptStartingRun: () =>
+        Effect.suspend(() =>
+          ++stops === 1
+            ? Deferred.succeed(firstStopFailed, undefined).pipe(
+                Effect.andThen(Effect.die("transient Stop failure")),
+              )
+            : Effect.void,
+        ),
+    }).pipe(Effect.exit, Effect.forkScoped);
+    yield* Deferred.await(firstStopFailed);
+    yield* TestClock.adjust("1 second");
+    const outcome = yield* Fiber.join(run);
+    assert.isTrue(Exit.isSuccess(outcome));
+    if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+    const result = outcome.value;
+    assert.equal(stops, 2);
+    assert.deepEqual(
+      result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      ),
+      ["failed"],
+    );
+  }).pipe(Effect.scoped),
+);
+
 it.effect("refreshes pull requests only once when startup failure closes its event stream", () =>
   Effect.gen(function* () {
     const ingestionStarted = yield* Deferred.make<void>();
