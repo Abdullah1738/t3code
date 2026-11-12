@@ -1,3 +1,0 @@
-#!/bin/sh
-# Records backup calls made by offbox-person down/save.
-printf '%s\n' "$*" >> "${FAKE_BACKUP_LOG:-/dev/null}"

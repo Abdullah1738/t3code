@@ -17,8 +17,9 @@ from pathlib import Path
 
 from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune, prepare
-from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
-                     atomic_write_json, db, event, log, new_id, now, offsets_path, read_json, say, silence)
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
+                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
+                     offsets_path, person, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -1255,7 +1256,9 @@ class Runner:
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id),
+                              meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
+                              retry_interrupted=retry_interrupted(a))
         except (api.ApiError, api.NetworkError) as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
@@ -1581,7 +1584,7 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
-    if st and not st.get("running") and st.get("status") in ("exited", "lost"):
+    if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
             try:
                 return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())),
@@ -1592,6 +1595,31 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
     return None
 
 
+class Interrupted(OffboxError):
+    """Our server lost power (or was restarted hard) under the run, and the run is not being run again: it was
+    started with retry off, or it had already been retried once. Its own exit code does not exist."""
+
+    def __init__(self, what: str):
+        super().__init__(f"the offbox server restarted while {what} was running, and the run was not run again. "
+                         f"It did not finish; its output up to the restart is kept (offbox logs). "
+                         f"Run it again if that is safe (exit {EXIT_INTERRUPTED})", code=EXIT_INTERRUPTED,
+                         started=True)
+
+
+def retry_interrupted(a) -> bool:
+    """May the server run this command again by itself after a power cut? Yes for an ordinary `offbox run` (a
+    synced repo plus a test or build command: running it twice is harmless). No for person-box work (her
+    accounts, messages, logins: never twice without someone deciding), and no with --no-retry."""
+    if api.BACKEND != "server" or getattr(a, "no_retry", False):
+        return False
+    return person() is None
+
+
+# A cold boot of the home server can take this long (it trains memory): after a dropped stream the client keeps
+# reconnecting for 15 minutes, from the byte it had reached, before it gives up on a run the server accepted.
+HOME_RECONNECT_S = 900
+
+
 # follow() asks boat's status at most this often while a stream sends only heartbeats.
 QUIET_PROBE_S = 300
 _RUNNING = object()
@@ -1599,6 +1627,21 @@ _RUNNING = object()
 
 # Matches outage.WAIT_MAX_S: the auto-stop now holds ~25 min, so a run can ride out an outage that long.
 OUTAGE_FOLLOW_S = 1800
+
+
+def run_kind(cmd_text: str) -> str:
+    """A short label grouping runs for right-sizing on the server: the tool and its subcommand, e.g. `go test`,
+    `make test-int`, `pnpm vitest`. Flags, paths and arguments after the second word are dropped."""
+    try:
+        toks = shlex.split(cmd_text or "", posix=True)
+    except ValueError:
+        toks = (cmd_text or "").split()
+    if len(toks) >= 3 and toks[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and toks[1].startswith("-") \
+            and "c" in toks[1]:
+        return run_kind(toks[2])
+    words = [w for w in toks[:6] if not w.startswith("-") and "=" not in w]
+    words = [w.rsplit("/", 1)[-1] for w in words]
+    return " ".join(words[:2])[:60] or "?"
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
@@ -1638,6 +1681,31 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             # original right away sees a valid committed length rather than none.
             _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
+    # Our own server restarts (no UPS): the window for reconnecting to a run it accepted, and what the stream said
+    # about the server and the attempt last time, to tell a restart and a retry from a network blip.
+    home_run = api.BACKEND == "server"
+    window = HOME_RECONNECT_S if home_run else OUTAGE_FOLLOW_S
+    what = run_id or f"{box_id}:{pid}"
+    seen = {"boot": None, "started": None, "attempt": None, "lost": False}
+
+    def hello(fr) -> None:
+        """First frame of every attach on our server: boot id, boatd start time, the run's attempt."""
+        boot, started, attempt = fr.get("bootId"), fr.get("serverStartedAt"), fr.get("attempt")
+        if seen["boot"] is not None and (boot != seen["boot"] or started != seen["started"]):
+            how = "the machine restarted" if boot != seen["boot"] else "its service restarted"
+            say(f"the offbox server restarted while this run was going ({how}); reconnected")
+        elif seen["lost"]:
+            say("reconnected to the offbox server")
+        seen.update(boot=boot, started=started, lost=False)
+        new_attempt(attempt)
+
+    def new_attempt(attempt) -> None:
+        if attempt and seen["attempt"] is not None and attempt != seen["attempt"]:
+            say(f"the restart cut the run off; the server is running it again from the start (attempt {attempt}). "
+                "Output continues below")
+        if attempt:
+            seen["attempt"] = attempt
+
     # How often boat's status has said the process ended with no output delivered in between. Unlike `failures`, a
     # frame does not reset it, only progress does: a failure that recurs after the first frame of every attach (31 Oct,
     # run-1031-140118-88ca: each reattach replayed one chunk, its echo raised EIO, `attached` cleared `failures`) still
@@ -1681,6 +1749,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
+        if st is not None and st.get("status") == "interrupted":
+            raise Interrupted(what)
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
@@ -1708,7 +1778,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 read_s = 90 if until is None else max(1.0, min(90.0, left()))
                 if down_from is not None:
                     # Inside an outage the attach may not outrun the outage window either.
-                    read_s = max(1.0, min(read_s, OUTAGE_FOLLOW_S - (now() - down_from)))
+                    read_s = max(1.0, min(read_s, window - (now() - down_from)))
                 frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s, deadline=until)
                 for fr in frames:
                     if stop_evt.is_set():
@@ -1752,7 +1822,13 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         code = probe_end()
                         if code is not _RUNNING:
                             return code
+                    elif t == "hello":
+                        hello(fr)
+                    elif t == "attempt":
+                        new_attempt(fr.get("attempt"))
                     elif t == "exit":
+                        if fr.get("status") == "interrupted":
+                            raise Interrupted(what)
                         if fr.get('exitCode') is None and not fr.get('signal'):
                             return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
@@ -1770,6 +1846,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             except api.StreamDeadline:
                 # api.stream shut the socket at `until`: the deadline, not a broken stream to retry.
                 raise timed_out()
+            except Interrupted:
+                raise
             except (OffboxError, OSError, TimeoutError) as e:
                 if stop_evt.is_set():
                     return None
@@ -1781,22 +1859,22 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 boat_down = False
                 # The outage window runs on the wall clock: attach and status requests that hang count against it
                 # too, so the limit cannot slip by failure count alone.
-                if down_from is not None and now() - down_from >= OUTAGE_FOLLOW_S:
-                    raise OffboxError(f"lost the output stream of {box_id}:{pid}: boat's API was down for "
-                                      f"{int(OUTAGE_FOLLOW_S)}s: {e}", started=True)
+                if down_from is not None and now() - down_from >= window:
+                    raise OffboxError(f"lost the output stream of {box_id}:{pid}: {api.NAME}'s API was down for "
+                                      f"{int(window)}s: {e}", started=True)
                 try:
                     # Status and the retry pause share the deadline: a blocked status request must not outrun it.
                     # During an outage it is also capped to the outage window left, so one call cannot outrun it.
                     status_s = max(1.0, min(60.0, left() if until is not None else 60.0))
                     if down_from is not None:
-                        status_s = max(1.0, min(status_s, OUTAGE_FOLLOW_S - (now() - down_from)))
+                        status_s = max(1.0, min(status_s, window - (now() - down_from)))
                     # An absolute end (the caller's until, the outage window) is what makes api.cmd_status skip the
                     # connect retries: without it a not-delivered 52x would be sent six times, outside the window.
                     ends = [now() + status_s]
                     if until is not None:
                         ends.append(until)
                     if down_from is not None:
-                        ends.append(down_from + OUTAGE_FOLLOW_S)
+                        ends.append(down_from + window)
                     try:
                         st = api.cmd_status(box_id, pid, timeout=status_s, retries=0, deadline=min(ends))
                     except OffboxError as se:
@@ -1806,17 +1884,25 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 if until is not None and now() >= until:
                     raise timed_out()
                 down_from = (down_from or failed_at) if boat_down else None
+                if home_run and boat_down and not seen["lost"]:
+                    # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
+                    # server and pick the output up where it stopped.
+                    seen["lost"] = True
+                    say(f"lost the connection to the offbox server; the run stays there. Reconnecting for up to "
+                        f"{int(window // 60)} min")
+                if st and st.get("status") == "interrupted":
+                    raise Interrupted(what)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
                         return follow_lost()
                     if ended_again() > 3:
                         return _status_code(st)
-                if failures > 20 and (down_from is None or now() - down_from >= OUTAGE_FOLLOW_S):
+                if failures > 20 and (down_from is None or now() - down_from >= window):
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
                 pause = min(10, 1 + failures)
                 if down_from is not None:
                     # boat's API is down, not the run: keep reattaching, but never pause past the outage window.
-                    pause = min(pause, max(0.0, OUTAGE_FOLLOW_S - (now() - down_from)))
+                    pause = min(pause, max(0.0, window - (now() - down_from)))
                 if until is not None:
                     pause = max(0.0, min(pause, left()))
                 if stop_evt.wait(pause):
@@ -2003,6 +2089,9 @@ def _run_remote(a, rn) -> int:
         code = None
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
+        except Interrupted:
+            finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
+            raise
         except KeyboardInterrupt:
             # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
             rn.record(error='interrupted; awaiting confirmed remote termination')

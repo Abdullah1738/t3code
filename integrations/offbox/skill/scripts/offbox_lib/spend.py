@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import datetime as dt
 
-from . import api
+from . import api, capacity
 from .common import (CAP_PATH, OffboxError, atomic_write_json, db, event, file_lock, kv_get, kv_set, month_key, month_start_utc,
                      now, read_json, say)
 from .identity import telegram
@@ -36,6 +36,11 @@ def compute() -> dict:
 
 
 def _compute(con) -> dict:
+    if api.BACKEND != "boat":
+        # The home server has no meter. Reading its /limits here would look like a new, empty billing period
+        # and clear a real cap.
+        raise OffboxError("spend is boat.dev's meter; `offbox spend` reads it (this process is on the home server)",
+                          code=2)
     L = api.limits()
     if L.get('creditUsedSeconds') is None or not L.get('subscriptionCurrentPeriodEnd'):
         raise OffboxError('boat /limits missing spend meter or billing period; keeping previous cap state')
@@ -70,6 +75,12 @@ def _compute(con) -> dict:
            'spend': round(seconds/sps, 4), 'per_box_sum': None, 'limits': lim,
            'cap': CAP_DOLLARS, 'cap_state': read_json(CAP_PATH, {}), 'boxes': []}
     kv_set(con, 'spend_last', {k: out[k] for k in ('month','billing_month','period_end','spend','per_box_sum')})
+    # What the plan allows, for the start windows and sizes (capacity.windows, capacity.plan_allows): a smaller
+    # plan (Boat as the standby of the home server) is then respected without a code change.
+    kv_set(con, capacity.PLAN_KEY, {
+        'key': L.get('sandboxPlanKey'), 'dollars': L.get('sandboxPlanDollars'), 'starts': L.get('startLimits') or {},
+        'max_active': L.get('maxActiveSandboxes'),
+        'types': {m.get('type'): bool(m.get('available')) for m in (L.get('machineTypes') or []) if m.get('type')}})
     return out
 
 

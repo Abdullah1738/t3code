@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Fake offbox for offbox-person tests. Logs every call and runs `ssh` commands against a local fake box home,
 except the desktop script, which only a real box can run. `ports` serves a fake CDP endpoint, or with --reverse
-just stays up like a tunnel. `run`/`release`/`save`/`keep` do nothing."""
+just stays up like a tunnel. `run`/`release`/`save`/`keep` do nothing.
+
+FAKE_EXIT (JSON {subcommand: code, "*": code}) makes those subcommands exit with that code without doing
+anything, the way the real client reports the home server being down (93) or a run a server restart
+interrupted (94). FAKE_EXIT_MATCH limits it to calls whose arguments contain that text."""
 
 import json
 import os
@@ -21,10 +25,11 @@ def remote_cmd(a):
 
 
 sub = args[0] if args else ""
-# `list --all --json` / `bases --json` print the file named by FAKE_LIST_JSON / FAKE_BASES_JSON.
-if sub in ("list", "bases") and os.environ.get(f"FAKE_{sub.upper()}_JSON"):
-    print(open(os.environ[f"FAKE_{sub.upper()}_JSON"]).read())
-    sys.exit(0)
+forced = json.loads(os.environ.get("FAKE_EXIT") or "{}")
+code = forced.get(sub, forced.get("*"))
+if code is not None and os.environ.get("FAKE_EXIT_MATCH", "") in " ".join(args):
+    print(f"offbox: fake exit {code}", file=sys.stderr)
+    sys.exit(code)
 if sub == "ssh":
     responses = os.environ.get("FAKE_SSH_RESPONSES")
     if responses:

@@ -522,7 +522,7 @@ class HintAndPullTests(Isolated):
         args.cmd = ['pnpm', 'test']
         runner = runs.Runner(args, me)
         err = io.StringIO()
-        def start(*a):
+        def start(*a, **_kw):
             self.assertIn('prefix your command with pnpm install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \

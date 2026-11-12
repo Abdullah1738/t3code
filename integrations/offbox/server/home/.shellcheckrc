@@ -1,0 +1,11 @@
+# shellcheck settings for the offbox home installer (static-check.sh runs shellcheck -x on every script).
+# Followed sources resolve next to the script (# shellcheck source=... lines are relative to it).
+source-path=SCRIPTDIR
+# Style notes that do not fit these scripts:
+#   SC2015  `A && B || C` is used on purpose where B cannot fail (echo, assignments)
+#   SC2016  single-quoted `sh -c '... $1'` bodies are meant to expand in the inner shell
+#   SC2317  functions called through with_esp / traps look unreachable to the checker
+#   SC2013  /proc/cmdline is read word by word on purpose
+#   SC2018/SC2019  tr 'A-Z' 'a-z' on GUIDs and ASCII file names
+#   SC2002  `cat file 2>/dev/null | tr` keeps a missing file quiet
+disable=SC2015,SC2016,SC2317,SC2013,SC2018,SC2019,SC2002

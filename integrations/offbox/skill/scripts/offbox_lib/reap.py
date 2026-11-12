@@ -5,7 +5,8 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S, RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
+                     RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, now, say)
 from .identity import thread_get
 
@@ -415,6 +416,9 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if st is None:
                 # Missing/unavailable status is not proof a process stopped.
                 continue
+            elif not st.get("running") and st.get('status') == 'interrupted':
+                # Our server restarted under the run and did not run it again (runs.Interrupted).
+                status, code = 'interrupted', EXIT_INTERRUPTED
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 if st.get('status') == 'lost':
                     try:

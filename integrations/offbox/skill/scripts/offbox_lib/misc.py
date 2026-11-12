@@ -319,8 +319,20 @@ STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (
 
 
 def status(me: dict) -> None:
+    from . import common, home
     con = db()
     cap = read_json(CAP_PATH, {})
+    if common.home_config() is not None:
+        st = common.home_state()
+        since = f" since {iso(st['since'])}" if st.get("since") else ""
+        if api.BACKEND == "server":
+            print(f"backend: home offbox server ({st.get('state')}{since}); Boat is the standby")
+        else:
+            why = st.get("reason") or ("pinned to Boat" if common.backend_pinned() else "home unreachable")
+            print(f"backend: Boat, standing in for the home offbox server ({st.get('state')}{since}: {why}). "
+                  "Runs go back home after three good health checks")
+        if st.get("degraded"):
+            print(f"home server degraded: {'; '.join(str(x) for x in st['degraded'][:3])}")
     d = outage.current()
     if d:
         print(f"boat.dev: DOWN since {iso(d['since'])} ({d.get('reason')}), last failure {ago(d.get('seen'))} ago")
@@ -927,10 +939,15 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
     `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
     only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
-    from .runs import follow
-    code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
-                  start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
-                  mirror_keep=mirror_keep)
+    from .runs import Interrupted, finish, follow
+    try:
+        code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
+                      start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
+                      mirror_keep=mirror_keep)
+    except Interrupted as e:
+        # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
+        finish(r["run_id"], e.code, "interrupted")
+        raise
     if code is None:
         code, how = _recover_by(r, log_path, until)
         if code is not None:
@@ -986,3 +1003,28 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
     return _finalize(r, code, log_path, until=until)
+
+
+def stats(days: float, as_json: bool) -> None:
+    """`offbox stats`: what runs actually use, from the server's per-run cgroup numbers (wall, cores, memory peak,
+    memory waits). Use it to pick sizes and to see when the server needs more RAM or a second box."""
+    if api.BACKEND != "server":
+        raise OffboxError("offbox stats needs the offbox server backend", code=2)
+    d = api.call("GET", f"/stats?days={days:g}")
+    if as_json:
+        print(json.dumps(d, indent=1))
+        return
+    h = d.get("host") or {}
+    gb = 2 ** 30
+    print(f"last {d['days']:g} days: {d['runs']} runs, {d['memory_waits']} waited for memory "
+          f"({d['memory_wait_pct']}%; add RAM above 1%)")
+    if h.get("n"):
+        print(f"host: cpu busy avg {100 * (h.get('cpu') or 0):.0f}%, cpu pressure avg {h.get('psi_cpu_avg') or 0:.1f}% "
+              f"max {h.get('psi_cpu_max') or 0:.0f}% (2nd box above 20% sustained), min free mem "
+              f"{(h.get('mem_min') or 0) / gb:.0f} GB, most runs at once {h.get('run_max')}, most queued "
+              f"{h.get('q_max')}, min disk free {(h.get('disk_min') or 0) / gb:.0f} GB")
+    print(f"{'repo kind':<44} {'runs':>5} {'wall p50/p95':>14} {'cores p50/p95':>14} {'mem GB p50/p95':>15} {'oom':>4}")
+    for k in d.get("kinds") or []:
+        w50, w95 = k.get("wall_p50_s") or 0, k.get("wall_p95_s") or 0
+        print(f"{k['kind'][:44]:<44} {k['runs']:>5} {w50:>6.0f}s/{w95:>5.0f}s {k['cores_p50']:>6.1f}/{k['cores_p95']:<6.1f} "
+              f"{k['mem_p50_gb']:>7.1f}/{k['mem_p95_gb']:<6.1f} {k['oom_kills']:>4}")
