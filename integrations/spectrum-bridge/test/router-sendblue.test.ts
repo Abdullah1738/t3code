@@ -1618,3 +1618,20 @@ test("failed money/security wake escalates its actual first two lines without re
   expect(alerts[0]).not.toContain("Third line");
   expect(h.backend.prompts).toHaveLength(0);
 });
+
+test.each(["owner", "moni", "critical"])("failed-inbound stale %s rows never alert or replay", async kind => {
+  const alerts: string[] = [];
+  const events: string[] = [];
+  const ctx = context(kind === "moni" ? "dm" : "owner");
+  if (kind === "moni") ctx.chat.slug = "moni";
+  const h = setup(ctx, { notifyFailure: async text => { alerts.push(text); return true; }, log: event => { events.push(event); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  const id = kind === "critical" ? "wake:expired-money" : "expired-person";
+  h.input(id, kind === "critical" ? "[Watcher event from robob-watch money-cases]\nBill overdue" : "Old instruction", "+15555550123",
+    { source: kind === "critical" ? undefined : "typed", receivedAt: now - 72 * 3600_000 });
+  h.store.updateInbound(id, "failed");
+  await h.router.checkFailedInbound(); await h.router.tick();
+  setSystemTime(now + 60_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toEqual([]); expect(h.backend.prompts).toEqual([]);
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
+});
