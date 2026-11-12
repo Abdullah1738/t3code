@@ -109,6 +109,8 @@ def _ansi_quote(s, i):
             m = re.match(patterns[c], s[i + 2:]) if c in patterns else re.match(r"[0-7]{1,3}", s[i + 1:]) if c in "01234567" else None
             if m:
                 value = int(m.group(0), 16 if c in patterns else 8)
+                if c not in patterns:
+                    value &= 0xff
                 buf.append(chr(value) if value <= 0x10ffff else "\\" + c + m.group(0))
                 i += len(m.group(0)) + (2 if c in patterns else 1)
                 continue
@@ -125,6 +127,10 @@ def _brace_expands(s, i):
     i += 1
     while i < len(s):
         c = s[i]
+        if s.startswith("$'", i):
+            _, i = _ansi_quote(s, i)
+            plain.append("\x00")
+            continue
         if c == "\\":
             plain.append("\x00")
             i += 2
@@ -147,6 +153,12 @@ def _brace_expands(s, i):
             plain.append(c)
         i += 1
     return False
+
+
+def _dollar_expands(s, i):
+    while s.startswith("\\\n", i + 1):
+        i += 2
+    return re.match(r"[A-Za-z_0-9({\[@*#?$!-]", s[i + 1:i + 2]) is not None
 
 
 def _word(s: str, i: int, subs: list, expansions=None) -> tuple[str, int]:
@@ -181,7 +193,7 @@ def _word(s: str, i: int, subs: list, expansions=None) -> tuple[str, int]:
                     buf.append(s[i + 1] if s[i + 1] in '"\\$`' else s[i:i + 2])
                     i += 2
                 elif s[i] == "$":
-                    dynamic = True
+                    dynamic = dynamic or _dollar_expands(s, i)
                     i = _dollar(s, i, buf, subs)
                 elif s[i] == "`":
                     dynamic = True
@@ -198,7 +210,7 @@ def _word(s: str, i: int, subs: list, expansions=None) -> tuple[str, int]:
             literal, i = _ansi_quote(s, i)
             buf.append(literal)
         elif c == "$":
-            dynamic = True
+            dynamic = dynamic or _dollar_expands(s, i)
             i = _dollar(s, i, buf, subs)
         elif c == "`":
             dynamic = True
@@ -475,6 +487,8 @@ def _match(rule, base, argv, dynamic):
 
 def _heavy(rule, flags, pos, cwd, expanded, argv) -> str | None:
     args = argv[1 + len(rule["_sub"]):]
+    if rule.get("_skip"):
+        args = [a for a in args if not rule["_skip"].fullmatch(a)]
     diagnostic = rule.get("diagnostic_flags", [])
     base = os.path.basename(argv[0])
     diagnostic_cmd = re.fullmatch(rule.get("diagnostic_cmd", ".*"), base)

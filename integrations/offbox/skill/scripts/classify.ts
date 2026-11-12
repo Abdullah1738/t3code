@@ -98,7 +98,8 @@ function ansiQuote(s: string, i: number): [string, number] {
       const patterns: Record<string, RegExp> = { x: /^[0-9a-fA-F]{1,2}/, u: /^[0-9a-fA-F]{1,4}/, U: /^[0-9a-fA-F]{1,8}/ }
       const m = patterns[c] ? patterns[c].exec(s.slice(i + 2)) : /[0-7]/.test(c) ? /^[0-7]{1,3}/.exec(s.slice(i + 1)) : null
       if (m) {
-        const value = Number.parseInt(m[0], patterns[c] ? 16 : 8)
+        const decoded = Number.parseInt(m[0], patterns[c] ? 16 : 8)
+        const value = patterns[c] ? decoded : decoded & 0xff
         buf.push(value <= 0x10ffff ? String.fromCodePoint(value) : "\\" + c + m[0])
         i += m[0].length + (patterns[c] ? 2 : 1)
         continue
@@ -117,6 +118,7 @@ function braceExpands(s: string, i: number): boolean {
   i++
   while (i < s.length) {
     const c = s[i]
+    if (s.startsWith("$'", i)) { i = ansiQuote(s, i)[1]; plain.push("\x00"); continue }
     if (c === "\\") { plain.push("\x00"); i += 2; continue }
     if (c === "'" || c === '"') {
       const quote = c
@@ -131,6 +133,11 @@ function braceExpands(s: string, i: number): boolean {
     i++
   }
   return false
+}
+
+function dollarExpands(s: string, i: number): boolean {
+  while (s.startsWith("\\\n", i + 1)) i += 2
+  return /[A-Za-z_0-9({\[@*#?$!-]/.test(s[i + 1] ?? "")
 }
 
 function word(s: string, i: number, subs: string[], expansions?: Set<number>): [string, number] {
@@ -158,7 +165,7 @@ function word(s: string, i: number, subs: string[], expansions?: Set<number>): [
         if (s[i] === "\\" && i + 1 < n) {
           buf.push('"\\$`'.includes(s[i + 1]) ? s[i + 1] : s.slice(i, i + 2))
           i += 2
-        } else if (s[i] === "$") { dynamic = true; i = dollar(s, i, buf, subs) }
+        } else if (s[i] === "$") { dynamic ||= dollarExpands(s, i); i = dollar(s, i, buf, subs) }
         else if (s[i] === "`") {
           dynamic = true
           let j = s.indexOf("`", i + 1)
@@ -172,7 +179,7 @@ function word(s: string, i: number, subs: string[], expansions?: Set<number>): [
     } else if (c === "$" && s.startsWith("$'", i)) {
       const [literal, end] = ansiQuote(s, i)
       buf.push(literal); i = end
-    } else if (c === "$") { dynamic = true; i = dollar(s, i, buf, subs) }
+    } else if (c === "$") { dynamic ||= dollarExpands(s, i); i = dollar(s, i, buf, subs) }
     else if (c === "`") {
       dynamic = true
       let j = s.indexOf("`", i + 1)
@@ -407,7 +414,7 @@ function match(rule: any, base: string, argv: string[], dynamic: boolean[]): [st
 }
 
 function heavy(rule: any, flags: string[], pos: string[], cwd: string | null, expanded: string[], argv: string[]): string | null {
-  const args = argv.slice(1 + rule._sub.length)
+  const args = argv.slice(1 + rule._sub.length).filter((a) => !(rule._skip && rule._skip.test(a)))
   const base = basename(argv[0])
   const diagnosticCmd = full(rule.diagnostic_cmd ?? ".*").test(base)
   if (diagnosticCmd && args.length && args.every((a) => (rule.diagnostic_flags ?? []).includes(a) || (a === "-V" && full(rule.version_short_cmd ?? "$^").test(base)))) return null
