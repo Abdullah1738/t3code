@@ -18,6 +18,7 @@ import { sessionMarker } from "./session.ts";
 import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, mentionsRobob, observedPreamble } from "./group-gate.ts";
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
+import { criticalWake, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -134,6 +135,7 @@ type Options = {
   swipes?: { find: Swipes; line: string; waitMs?: number };
   /** "final" (default) forwards each turn's final text; "tool" forwards nothing and the agent sends with imessage_send. */
   replyMode?: ReplyMode;
+  notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
 type Swipe =
@@ -602,6 +604,13 @@ export class Router {
     return this.ticking ??= this.run().finally(() => { this.ticking = undefined; });
   }
 
+  private checkingFailed?: Promise<void>;
+
+  /** The health timer also runs this while a normal tick waits on the backend. */
+  checkFailedInbound(): Promise<void> {
+    return this.checkingFailed ??= this.recoverFailedInbound().finally(() => { this.checkingFailed = undefined; });
+  }
+
   /** Tool mode: the agent texts the chat itself, and no assistant text is ever forwarded. */
   private get toolMode(): boolean {
     return this.options.replyMode === "tool";
@@ -637,6 +646,130 @@ export class Router {
     };
   }
 
+  private recordFailure(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    const failure = { stage, message: failureMessage(error), threadId: route?.id ?? null, at: Date.now() };
+    this.store.recordInboundFailure(id, failure);
+    this.options.log?.("inbound-failed", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", ...failure }));
+  }
+
+  private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    // Keep the transport exception rather than replacing it with a generic timeout notice.
+    const prior = this.store.inboundFailure(id);
+    if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
+    const failure = this.store.inboundFailure(id)!;
+    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
+  }
+
+  private failedScanAt = -Infinity;
+
+  private async sendFailedAlert(id: string, text: string): Promise<void> {
+    if (this.store.get<boolean>(`failed-alert:${id}`)) return;
+    try {
+      if (await this.options.notifyFailure!(text, `bridge-failed:${id}`)) this.store.db.transaction(() => {
+        this.store.set(`failed-alert:${id}`, true);
+        this.store.set(`failed-alert-pending:${id}`, null);
+      }).immediate();
+    } catch { this.options.log?.("failed-alert-unavailable", id); }
+  }
+
+  private async recoverFailedInbound(): Promise<void> {
+    const chat = this.options.context?.chat;
+    if (!this.options.notifyFailure || (chat && chat.kind !== "owner" && chat.slug !== "moni")) return;
+    const now = Date.now();
+    if (now - this.failedScanAt < 30_000) return;
+    this.failedScanAt = now;
+    // A failed notification stays due even if recovery has since delivered the message.
+    const pending = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null'",
+    ).all();
+    const attempted = new Set<string>();
+    for (const row of pending) {
+      const id = row.key.slice("failed-alert-pending:".length);
+      attempted.add(id);
+      await this.sendFailedAlert(id, JSON.parse(row.value) as string);
+    }
+    for (const row of this.store.failedInbound()) {
+      const input = row.payload as NormalizedInbound;
+      const critical = criticalWake(row.id, input.text);
+      if (!critical && (synthetic(row.id) || input.source !== "typed")) continue;
+      const failure = this.store.inboundFailure(row.id);
+      const at = failure?.at ?? input.receivedAt ?? input.sentAt;
+      if (at === undefined || now - at < 120_000) continue;
+      const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
+      const parent = this.store.db.query<{ id: string }, [string]>(
+        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? LIMIT 1",
+      ).get(row.id)?.id ?? row.id;
+      const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
+      // landed() writes this receipt. A later failed run must never erase its proof of admission.
+      const receipted = () => this.store.get(`batch-phase:${parent}`) === "accepted";
+      if (!critical && receipted()) continue;
+      const destination = this.store.get<Route | null>("route");
+      let original = this.store.get<Turn | null>(`failed-delivery:${parent}`);
+      const live = this.store.get<Turn | null>("activeTurn");
+      if (!original && live?.inboundId === parent) original = live;
+      if (!original) {
+        const notice = this.store.db.query<{ payload: string }, [string]>(
+          "SELECT payload FROM outbox WHERE json_extract(payload, '$.replyTo') = ? AND id LIKE 'turn:%:failed' ORDER BY rowid DESC LIMIT 1",
+        ).get(parent);
+        const op = notice ? JSON.parse(notice.payload) as OutboxRecord : undefined;
+        const route = this.store.get<Route | null>("route");
+        // Robob ignores the directory argument; other backends need their original directory as proof.
+        if (op?.sessionId?.startsWith("ardud-control:thread:") && route) original = { ...route, id: op.sessionId, generation: op.generation ?? route.generation,
+          inboundId: parent, messageId: `msg_${hash(parent)}`, phase: "failed", startedAt: input.receivedAt ?? at };
+      }
+      const admitted = async (): Promise<boolean | undefined> => {
+        if (receipted()) return true;
+        const route = this.store.get<Route | null>("route");
+        const destinations = original ? [original] : [];
+        if (route && !destinations.some(item => item.id === route.id && item.directory === route.directory)) destinations.push({ ...route,
+          inboundId: parent, messageId: original?.messageId ?? `msg_${hash(parent)}`, phase: "failed", startedAt: at });
+        let conclusive = original !== undefined;
+        for (const target of destinations) for (const id of [target.messageId, ...(target.earlier ?? [])]) {
+          try { if (await bounded(this.backend.promptAccepted(target.id, target.directory, id))) return true; }
+          catch { conclusive = false; }
+          if (receipted()) return true;
+        }
+        if (route && !this.current(route)) return undefined;
+        return conclusive ? false : undefined;
+      };
+      const accepted = critical ? undefined : await admitted();
+      // The new destination was outside this readback's snapshot; let the next scan check it.
+      if (!critical && (destination ? !this.current(destination) : this.store.get("route") != null)) continue;
+      if (!stillFailed() || (!critical && (accepted || receipted()))) continue;
+      if (!this.store.get<boolean>(`failed-alert:${row.id}`)) {
+        const who = chat?.slug === "moni" ? "Moni" : "Abdullah";
+        const time = new Date(input.sentAt ?? input.receivedAt ?? at).toLocaleString("en-GB", { timeZone: this.options.timezone });
+        const text = critical ? `Missed money/security update at ${time}:\n${wakeEventPreview(input.text)}`
+          : `Missed message from ${who} at ${time}: '${input.text.slice(0, 80)}'`;
+        // No await separates the final receipt check from the durable alert decision.
+        if (!critical && receipted()) continue;
+        const saved = this.store.get<string | null>(`failed-alert-pending:${row.id}`);
+        if (!saved) this.store.set(`failed-alert-pending:${row.id}`, text);
+        if (!attempted.has(row.id)) await this.sendFailedAlert(row.id, saved ?? text);
+      }
+      if (!stillFailed() || (!critical && receipted())) continue;
+      if (!failure) this.recordFailure(row.id, "legacy", "Failure predates reason logging", original);
+      if (critical || accepted !== false || parent !== row.id || !original) continue;
+      // Alert delivery was an await too: reconcile again before scheduling a replay.
+      if (await admitted() !== false) continue;
+      const route = this.store.get<Route | null>("route");
+      if (!route) continue;
+      const recovered = this.store.db.transaction(() => {
+        const active = this.store.get<Turn | null>("activeTurn");
+        if (!stillFailed() || receipted() || !this.current(route) || this.store.get<PreparingDelivery | null>("preparingDelivery")
+          || (active && active.phase !== "failed") || this.controlArrived(new Set())) return false;
+        this.store.updateInbound(row.id, "processing");
+        this.store.set(`batch:${row.id}`, batch ?? { ...input, batchIds: [row.id] });
+        this.store.set(`batch-phase:${row.id}`, "preparing");
+        this.store.set("activeTurn", null);
+        this.store.set("preparingDelivery", { id: row.id, startedAt: input.receivedAt ?? at, attemptAt: now - ACCEPT_WAIT_MS,
+          attempt: 2, held: true, posted: true } satisfies PreparingDelivery);
+        return true;
+      }).immediate();
+      if (recovered) this.watchdogLog("replay", original);
+    }
+  }
+
   private current(route: Route): boolean {
     const current = this.store.get<Route | null>("route");
     return current?.id === route.id && current.directory === route.directory && current.generation === route.generation;
@@ -666,7 +799,8 @@ export class Router {
       }
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
-      this.store.updateInbound(id, state);
+      if (state === "failed") this.failInbound(id, "prepare", text);
+      else this.store.updateInbound(id, state);
     }).immediate();
   }
 
@@ -751,13 +885,13 @@ export class Router {
         // A late reset would wipe whatever the owner said in the meantime, so it
         // isn't retried and the owner never hears about it. The next due check
         // (or /new) asks again.
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         this.options.log?.("context-reset-dropped", reason);
         continue;
       }
       if (replyNudgeRow(id)) {
         // A late "you texted nothing" reminder is stale, and the owner never typed it.
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         this.options.log?.("reply-nudge-dropped", reason);
         continue;
       }
@@ -767,7 +901,7 @@ export class Router {
         // effects, and the event is already in the session's history.
         this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
         this.queueDropped(id, text, reason);
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         continue;
       }
       // "errored": the model call failed before any tool ran, so a retry is safe.
@@ -782,7 +916,7 @@ export class Router {
       this.queueDropped(id, text, reason);
       const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
       this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
-      this.store.updateInbound(id, "failed");
+      this.failInbound(id, "synthetic", reason);
     }
   }
 
@@ -1174,6 +1308,7 @@ export class Router {
     const guidance = attempt?.guidance ?? `[Bridge note, not typed by anyone.] This message came in while you were working. Take it into account in what you are doing now; ${this.toolMode ? `${TOOL_MODE_MARKER} Answer it with imessage_send if it needs an answer.` : "your final reply still goes to the chat."} Current incoming message ID: ${JSON.stringify(input.id)}. Source incoming message IDs (in order, available as reaction targets): ${JSON.stringify(input.batchIds ?? [row.id])}.${eyes ? " The 👀 reaction to it is already sent." : ""}`;
     const sent: SteerAttempt = { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance, startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
     this.store.set(`steer-attempt:${row.id}`, sent);
+    this.store.set(`failed-delivery:${row.id}`, { ...turn, inboundId: row.id, messageId });
     let delivery: SteerDelivery;
     try {
       delivery = await this.sending(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance), handled);
@@ -2548,7 +2683,8 @@ export class Router {
           this.store.set(`batch-phase:${row.id}`, "preparing");
         }).immediate();
         this.retireOthers();
-      } catch {
+      } catch (error) {
+        this.recordFailure(row.id, "create-chat", error);
         if (replyNudgeRow(row.id)) this.store.db.transaction(() => {
           this.retrySynthetic(row.id, "undelivered");
           this.store.set("preparingDelivery", null);
@@ -2718,6 +2854,7 @@ export class Router {
       // Anything the agent sends for this turn lands after this mark.
       turn.outbox = steerAttempt?.outbox ?? this.outboxMark();
       this.store.set("activeTurn", turn);
+      this.store.set(`failed-delivery:${row.id}`, turn);
       // Keep the exact sealed body until acceptance; retries share its prompt id.
       this.store.set("resendBody", {
         inboundId: row.id, text: body, system, parts, model: preferences.model, ...(owner ? { owner } : {}),
@@ -2745,7 +2882,8 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch {
+    } catch (error) {
+      if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
   }
@@ -3064,7 +3202,8 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch {
+    } catch (error) {
+      if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
   }
@@ -3396,6 +3535,11 @@ export class Router {
           }).immediate();
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
+        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
+        if (turn.inboundId && providerError) {
+          const detail = typeof providerError === "object" && "message" in providerError ? providerError.message : providerError;
+          this.recordFailure(turn.inboundId, "execution", detail, turn);
+        }
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
           failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
           return;
@@ -3612,7 +3756,7 @@ export class Router {
     this.store.db.transaction(() => {
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.store.updateInbound(id, "failed");
+        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.failInbound(id, "execution", text, turn);
         this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
@@ -3629,7 +3773,7 @@ export class Router {
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
-        if (turn.inboundId) this.store.updateInbound(turn.inboundId, "failed");
+        if (turn.inboundId) this.failInbound(turn.inboundId, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.store.set("activeTurn", turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

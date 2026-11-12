@@ -6742,3 +6742,216 @@ test("tool mode: a text steered into a watcher wake whose model call errors is t
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
   expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
 });
+
+async function failedTick(router: Router): Promise<void> {
+  await router.checkFailedInbound();
+  await router.tick();
+}
+
+// #932: a failed row outlives activeTurn, so recovery cannot depend on that one pointer.
+test("failed-inbound watcher reply retains reason, alerts once and uses the held replay path after rotation", async () => {
+  const alerts: { text: string; key: string }[] = [];
+  const logs: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (text, key) => { alerts.push({ text, key }); return true; },
+    log: (event, code) => { if (event === "inbound-failed") logs.push(code!); } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.store.enqueue({ id: "send:watcher", kind: "conversation", text: "Meds nag", sessionId: "ses_1", generation: 1 });
+  h.store.outboxState("send:watcher", "sent", "watcher-provider-id");
+  h.backend.promptBehavior = async () => { throw new Error("Control timeout token=private-secret"); };
+  h.input("failed-owner", "Pause the job for now please", { replyTo: "watcher-provider-id", source: "typed", sender: options.owner });
+  await failedTick(h.router);
+  expect(h.store.inboundFailure("failed-owner")).toMatchObject({ stage: "dispatch", threadId: "ses_1", message: "Control timeout token=[redacted]" });
+  expect(logs.join()).not.toContain("private-secret");
+  expect(h.backend.prompts[0]!.id).toBe("ses_1");
+  // Reproduce the pre-#633 terminal state, followed by another thread taking over.
+  h.store.updateInbound("failed-owner", "failed", undefined, h.store.inboundFailure("failed-owner"));
+  h.store.set("activeTurn", null);
+  h.store.set("resendBody", null);
+  h.store.set("route", { id: "ses_live", directory: "/Chats/live", generation: 2 });
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toEqual({ text: expect.stringContaining("Pause the job for now please"), key: "bridge-failed:failed-owner" });
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: "ses_live", messageId: messageId("failed-owner") });
+  expect(h.backend.prompts.at(-1)!.system).toContain("delayed by a technical outage");
+  expect(h.backend.prompts.at(-1)!.text).toContain("Pause the job for now please");
+  expect(inbounds(h.store).find(row => row.id === "failed-owner")?.state).toBe("done");
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  setSystemTime(start + 181_000);
+  await failedTick(restarted);
+  expect(alerts).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(2);
+});
+
+test.each(["late-accepted", "done", "unknown"])("failed-inbound reconciliation handles %s without duplicate POST", async kind => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("lost", "Important instruction", { source: "typed" });
+  await failedTick(h.router);
+  h.store.updateInbound("lost", "failed", undefined, h.store.inboundFailure("lost"));
+  h.store.set("activeTurn", null);
+  if (kind === "done") h.store.updateInbound("lost", "done");
+  if (kind === "late-accepted") h.backend.accept(h.backend.prompts[0]!);
+  if (kind === "unknown") h.backend.promptAccepted = async () => { throw new Error("readback down"); };
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  expect(alerts).toHaveLength(kind === "unknown" ? 1 : 0);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "lost")?.state).toBe(kind === "done" ? "done" : "failed");
+});
+
+test("failed-inbound Telegram failure retries the stable key across restart and keeps replay independent", async () => {
+  const keys: string[] = [];
+  let ok = false;
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return ok; } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.input("old", "Hello?", { source: "typed" });
+  h.store.updateInbound("old", "failed");
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  ok = true;
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual(["bridge-failed:old", "bridge-failed:old"]);
+  expect(h.store.get<boolean>("failed-alert:old")).toBe(true);
+});
+
+test.each(["leader", "member"])("failed-inbound accepted receipt suppresses false alarms even without a surviving turn (%s)", async kind => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  const id = "25C628F6-A3BF-4F49-A6DD-680F11CB189E";
+  h.input(id, "Is robob down?", { source: "typed" }); h.store.updateInbound(id, "failed");
+  const leader = kind === "leader" ? id : "batch-leader";
+  h.store.set(`batch:${leader}`, { id: leader, text: "Is robob down?", batchIds: [leader, id] });
+  h.store.set(`batch-phase:${leader}`, "accepted");
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(alerts).toEqual([]);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+test("failed-inbound health scan runs while the router is waiting on a poll", async () => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("working", "Still working", { source: "typed" }); await failedTick(h.router);
+  let entered!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  h.backend.messagesBehavior = async () => { entered(); await blocked; return h.backend.records; };
+  const tick = h.router.tick(); await reading;
+  h.input("lost-during-poll", "Hello?", { source: "typed" }); h.store.updateInbound("lost-during-poll", "failed");
+  setSystemTime(start + 121_000);
+  try { await h.router.checkFailedInbound(); expect(alerts).toEqual(["bridge-failed:lost-during-poll"]); }
+  finally { release(); await tick; }
+});
+
+test.each(["original-read", "live-read", "live-admitted", "alert-return"])("failed-inbound rechecks admission at %s", async boundary => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => {
+    alerts.push(key);
+    if (boundary === "alert-return") {
+      h.store.set("batch-phase:race", "accepted"); h.store.updateInbound("race", "failed");
+    }
+    return true;
+  } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("race", "Is robob down?", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("race", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  h.store.set("route", { id: "ses_live", directory: "/Chats/live", generation: 2 });
+  h.backend.promptAccepted = async id => {
+    if ((boundary === "original-read" && id === "ses_1") || (boundary === "live-read" && id === "ses_live")) {
+      h.store.set("batch-phase:race", "accepted"); h.store.updateInbound("race", "failed");
+    }
+    return boundary === "live-admitted" && id === "ses_live";
+  };
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(alerts).toHaveLength(boundary === "alert-return" ? 1 : 0);
+  expect(inbounds(h.store).find(row => row.id === "race")?.state).toBe("failed");
+  expect(h.store.get("preparingDelivery")).toBeNull();
+  expect(h.store.get<string>("batch-phase:race")).toBe(boundary === "live-admitted" ? "submitting" : "accepted");
+});
+
+test("failed-inbound pending alert survives successful recovery and restart", async () => {
+  let ok = false;
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return ok; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("recover-alert", "Please pause", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("recover-alert", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(inbounds(h.store).find(row => row.id === "recover-alert")?.state).toBe("done");
+  expect(h.store.get<string>("failed-alert-pending:recover-alert")).toContain("Please pause");
+  ok = true;
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await restarted.checkFailedInbound();
+  setSystemTime(start + 181_000); await restarted.checkFailedInbound();
+  expect(keys).toEqual(["bridge-failed:recover-alert", "bridge-failed:recover-alert"]);
+  expect(h.store.get<boolean>("failed-alert:recover-alert")).toBe(true);
+});
+
+test("failed-inbound scan I/O never blocks a fresh control", async () => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("blocked-old", "Old message", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); }; await h.router.tick();
+  h.store.updateInbound("blocked-old", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  let entered!: () => void; const enteredRead = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  h.backend.promptAccepted = async () => { entered(); await gate; return false; };
+  setSystemTime(start + 121_000); const scan = h.router.checkFailedInbound(); await enteredRead;
+  h.input("stop", "/stop");
+  try {
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "stop")?.state).toBe("done");
+  } finally { release(); await scan; }
+});
+
+test("failed-inbound batch members each alert once and replay only their leader", async () => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("leader", "First", { source: "typed" }); h.input("member", "Second", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); }; await h.router.tick();
+  for (const id of ["leader", "member"]) h.store.updateInbound(id, "failed");
+  h.store.set("activeTurn", null); h.store.set("resendBody", null); h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(keys.sort()).toEqual(["bridge-failed:leader", "bridge-failed:member"]);
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts[1]!.text).toBe("First\nSecond");
+  expect(inbounds(h.store).filter(row => row.state === "done")).toHaveLength(2);
+});
+
+test.each(["replace", "clear", "create"])("failed-inbound defers alerts until a changed destination is reconciled (%s)", async mode => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("moved", "Is robob down?", { source: "typed" }); h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("moved", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  if (mode === "create") h.store.set("route", null);
+  const reads: string[] = [];
+  h.backend.promptAccepted = async id => {
+    reads.push(id);
+    if (id === "ses_1") h.store.set("route", mode === "clear" ? null : { id: "ses_admitted", directory: "/Chats/admitted", generation: 2 });
+    return id === "ses_admitted";
+  };
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(alerts).toEqual([]);
+  if (mode !== "clear") {
+    setSystemTime(start + 181_000); await h.router.checkFailedInbound();
+    expect(reads).toContain("ses_admitted"); expect(alerts).toEqual([]);
+  }
+});
