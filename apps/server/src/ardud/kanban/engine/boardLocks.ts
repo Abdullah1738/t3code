@@ -488,6 +488,12 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       return yield* effect;
     }),
     board: <A, E, R>(id: string, effect: Effect.Effect<A, E, R>) => run(access(id, effect)),
+    // Detached work owns compensation even after the request that forked it ends.
+    independent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provideService(current, undefined),
+        Effect.provideService(ancestor, undefined),
+      ),
     fresh: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.flatMap(current, (parent) =>
         effect.pipe(

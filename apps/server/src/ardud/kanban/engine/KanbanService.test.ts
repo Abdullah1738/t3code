@@ -848,6 +848,24 @@ it.effect.each(["self flag", "non-final verdict", "final verdict", "third findin
       const fake = yield* makeFake;
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const sent = yield* Deferred.make<void>();
+      let watched: string | undefined;
+      const observed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            send: (input) =>
+              real
+                .send(input)
+                .pipe(
+                  Effect.tap(() =>
+                    input.threadId === watched ? Deferred.succeed(sent, undefined) : Effect.void,
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
         yield* kanban.setPool(board.id, board.defaultCardModel, 3);
@@ -909,6 +927,7 @@ it.effect.each(["self flag", "non-final verdict", "final verdict", "third findin
         );
         const before = yield* kanban.card(card.id);
         const sends = fake.sends.length;
+        watched = evalId;
         fake.findControl.beforeRead = (id) =>
           id === evalId
             ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
@@ -927,6 +946,7 @@ it.effect.each(["self flag", "non-final verdict", "final verdict", "third findin
         yield* kanban.editCard(other.id, { description: "Concurrent" }, owner);
         yield* Deferred.succeed(release, undefined);
         const result = yield* Fiber.join(writing);
+        yield* Deferred.await(sent);
         const after = yield* kanban.card(card.id);
         assert.deepStrictEqual(result.card, after.card);
         assert.strictEqual(
@@ -973,7 +993,7 @@ it.effect.each(["self flag", "non-final verdict", "final verdict", "third findin
           assert.deepStrictEqual(yield* kanban.card(card.id), after);
           assert.strictEqual(fake.sends.length, sends + 1);
         }
-      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+      }).pipe(Effect.provide(inlineTestLayer(observed)));
     }),
 );
 
@@ -7697,7 +7717,20 @@ it.effect.each([false, true])(
           fake.prs.set(worker.threadId, [
             { url: "https://github.com/o/r/pull/662", title: "Fix", state: "open" },
           ]);
-          const moved = yield* kanban.moveCard(created.id, "needs_review", "cardThread", worker);
+          const synced = yield* Deferred.make<void>();
+          const moved = yield* kanban
+            .moveCard(created.id, "needs_review", "cardThread", worker)
+            .pipe(
+              Effect.provideService(SavedWrite.observer, (saved) => {
+                if (
+                  saved.kind === "card" &&
+                  saved.card.id === created.id &&
+                  saved.card.links.some((link) => link.url === "https://github.com/o/r/pull/662")
+                )
+                  Deferred.doneUnsafe(synced, Effect.void);
+              }),
+            );
+          yield* Deferred.await(synced);
           assert.strictEqual(moved.stage, "needs_review");
           assert.isNull(moved.activeThreadId);
           const stored = yield* kanban.card(created.id);
@@ -17189,8 +17222,11 @@ it.effect(
     Effect.gen(function* () {
       const fake = yield* makeFake;
       const warnings: unknown[] = [];
+      const warned = yield* Deferred.make<void>();
       const logger = Logger.make(({ message }) => {
         warnings.push(message);
+        if (JSON.stringify(message).includes("post-commit work failed"))
+          Deferred.doneUnsafe(warned, Effect.void);
       });
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
@@ -17210,6 +17246,7 @@ it.effect(
         const moved = yield* kanban.moveCard(created.id, "needs_review", "cardThread", worker, {
           note: "Exact note",
         });
+        yield* Deferred.await(warned);
         delete fake.viewControl.beforeRead;
         assert.strictEqual(moved.stage, "needs_review");
         const saved = yield* kanban.card(created.id);
@@ -17395,7 +17432,7 @@ it.effect(
         assert.strictEqual(saved.events.at(-1)?.kind, "review");
         assert.isTrue(
           warnings.some((message) =>
-            JSON.stringify(message).includes("evaluator step note failed"),
+            JSON.stringify(message).includes("kanban saved owner message delivery pending"),
           ),
         );
         assert.deepStrictEqual(
@@ -17422,11 +17459,24 @@ it.effect("inline post-save PR refresh and owner-ask publication can write succe
       const worker = (yield* kanban.card(card.id)).card.workThreadId!;
       const url = "https://github.com/o/r/pull/722";
       fake.prs.set(worker, [{ url, title: "Fix", state: "open" }]);
-      const moved = yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
-        _tag: "thread",
-        threadId: worker,
-      });
-      assert.isTrue(moved.links.some((link) => link.url === url));
+      const synced = yield* Deferred.make<void>();
+      const moved = yield* kanban
+        .moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        })
+        .pipe(
+          Effect.provideService(SavedWrite.observer, (saved) => {
+            if (
+              saved.kind === "card" &&
+              saved.card.id === card.id &&
+              saved.card.links.some((link) => link.url === url)
+            )
+              Deferred.doneUnsafe(synced, Effect.void);
+          }),
+        );
+      assert.strictEqual(moved.stage, "needs_review");
+      yield* Deferred.await(synced);
       assert.isTrue((yield* kanban.card(card.id)).card.links.some((link) => link.url === url));
       const askCard = yield* kanban.createCard(board.id, { prompt: "Ask", title: "Ask" }, owner);
       yield* kanban.dispatchNow;
@@ -19760,4 +19810,249 @@ it.effect.each(["work", "review"] as const)(
         );
       }).pipe(Effect.provide(testLayer(observed)));
     }),
+);
+
+it.effect("#882 self-flag replies and frees its slot while its discussion note is blocked", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const delivered = yield* Deferred.make<void>();
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            input.title.startsWith("Evaluator")
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(real.launch(input)),
+                  Effect.tap(() => Deferred.succeed(delivered, undefined)),
+                )
+              : real.launch(input),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId } = yield* workingCard;
+      const next = yield* kanban.createCard(board.id, { prompt: "Next", title: "Next" }, owner);
+      let committedAt = 0;
+      const flagged = yield* kanban
+        .flagCard(card.id, "Waiting on CI", {
+          _tag: "thread",
+          threadId,
+        })
+        .pipe(
+          Effect.provideService(SavedWrite.observer, (saved) => {
+            if (saved.kind === "card" && saved.card.id === card.id && committedAt === 0)
+              committedAt = performance.now();
+          }),
+        );
+      const repliedAt = performance.now();
+      assert.strictEqual(flagged.stage, "todo");
+      assert.isNull(flagged.activeThreadId);
+      assert.isNull(flagged.activePool);
+      yield* Deferred.await(entered);
+      assert.isFalse(yield* Deferred.isDone(release));
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(next.id)).card.stage, "working");
+      yield* Effect.logInfo("#882 slot release latency", {
+        replyMs: repliedAt - committedAt,
+        dispatchMs: performance.now() - committedAt,
+      });
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(delivered);
+      const evaluators = [...(yield* Ref.get(fake.threads)).values()].filter((t) =>
+        t.title.startsWith("Evaluator"),
+      );
+      assert.lengthOf(evaluators, 1);
+      assert.strictEqual(
+        evaluators[0]!.messages.filter((t) => t.includes("Waiting on CI")).length,
+        1,
+      );
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(gated), "deferred")));
+  }),
+);
+
+it.effect.each([true, false])(
+  "#882 review handoff replies before PR sync (deferred=%s)",
+  (deferred) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const synced = yield* Deferred.make<void>();
+      let worker: string | undefined;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            view: (id) =>
+              id === worker
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(real.view(id)),
+                  )
+                : real.view(id),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putCard: (card) =>
+              real
+                .putCard(card)
+                .pipe(
+                  Effect.tap(() =>
+                    card.links.some((link) => link.url === "https://github.com/o/r/pull/882")
+                      ? Deferred.succeed(synced, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, threadId } = yield* workingCard;
+        worker = threadId;
+        fake.prs.set(threadId, [
+          { url: "https://github.com/o/r/pull/882", title: "PR", state: "open" },
+        ]);
+        const moved = yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId,
+        });
+        assert.strictEqual(moved.stage, "needs_review");
+        assert.isNull(moved.activeThreadId);
+        yield* Deferred.await(entered);
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(synced);
+        assert.strictEqual((yield* kanban.card(card.id)).card.links[0]?.state, "open");
+      }).pipe(
+        Effect.provide(
+          withOwnerRouteMode(testLayer(gated, undefined, undefined, observed), "deferred").pipe(
+            Layer.provide(Layer.succeed(KanbanService.DeferWriteEffects, deferred)),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect("#882 a saved review result replies while its evaluator notice is blocked", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const delivered = yield* Deferred.make<void>();
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            input.title.startsWith("Evaluator")
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(real.launch(input)),
+                  Effect.tap(() => Deferred.succeed(delivered, undefined)),
+                )
+              : real.launch(input),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, reviewThread } = yield* startReplayReview;
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putCard({
+        ...(yield* kanban.card(card.id)).card,
+        subtasks: [
+          {
+            id: "s1",
+            step: 2,
+            text: "Merge",
+            owner: "evaluator",
+            state: "open",
+            note: null,
+            doneAt: null,
+            doneBy: null,
+          },
+        ],
+        subtaskSeq: 1,
+      });
+      const result = yield* kanban.reviewResult(reviewThread, "clear", []);
+      assert.isTrue(result.recorded);
+      assert.isNull(result.card.activeThreadId);
+      yield* Deferred.await(entered);
+      assert.isFalse(yield* Deferred.isDone(release));
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(delivered);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(gated), "deferred")));
+  }),
+);
+
+it.effect("#882 overlapping needs-owner moves publish one ask sequence", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const committed = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let hold = true;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          putCard: (card) =>
+            real.putCard(card).pipe(
+              Effect.andThen(
+                Effect.suspend(() => {
+                  if (!hold || card.stage !== "needs_owner") return Effect.void;
+                  hold = false;
+                  return Deferred.succeed(committed, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  );
+                }),
+              ),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      const move = kanban.moveCard(
+        card.id,
+        "needs_owner",
+        "cardThread",
+        { _tag: "thread", threadId },
+        { question: "Ship this version?" },
+      );
+      const first = yield* Effect.forkChild(move);
+      yield* Deferred.await(committed);
+      const second = yield* Effect.forkChild(move);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(release, undefined);
+      const a = yield* Fiber.join(first);
+      const b = yield* Fiber.join(second);
+      assert.isNotNull(a.asks[0]?.seq);
+      assert.strictEqual(a.asks[0]?.seq, b.asks[0]?.seq);
+      const saved = (yield* kanban.card(card.id)).card;
+      const messages = yield* kanban.messages(saved.discussionId!);
+      assert.strictEqual(
+        messages.filter(
+          (message) => message.askId === saved.asks[0]?.id && message.askRevision !== undefined,
+        ).length,
+        1,
+      );
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+      Effect.provide(
+        withOwnerRouteMode(testLayer(fake.layer, undefined, undefined, observed), "deferred"),
+      ),
+    );
+  }),
 );

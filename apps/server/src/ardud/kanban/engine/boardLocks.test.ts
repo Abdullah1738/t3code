@@ -726,3 +726,37 @@ it.effect(
       }
     }),
 );
+
+it.effect("#882 detached follow-ons own cleanup after their original operation returns", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const start = yield* Deferred.make<void>();
+    const cleaned: string[] = [];
+    const background = yield* locks.board(
+      "a",
+      Effect.forkChild(
+        locks
+          .independent(
+            locks.board(
+              "a",
+              Effect.gen(function* () {
+                yield* Deferred.await(start);
+                yield* locks.launched(
+                  "orphan",
+                  Effect.sync(() => {
+                    cleaned.push("orphan");
+                  }),
+                );
+                return yield* Effect.fail("association failed");
+              }),
+            ),
+          )
+          .pipe(Effect.exit),
+      ),
+    );
+    yield* Deferred.succeed(start, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(background)));
+    assert.deepStrictEqual(cleaned, ["orphan"]);
+    yield* locks.board("a", Effect.void);
+  }),
+);

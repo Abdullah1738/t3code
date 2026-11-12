@@ -1182,7 +1182,8 @@ type BoardEffect =
       readonly actor: KanbanActor;
     }
   | ({ readonly kind: "tellAnswered" } & AnsweredNotice)
-  | { readonly kind: "syncPrs"; readonly cardId: string };
+  | { readonly kind: "syncPrs"; readonly cardId: string }
+  | { readonly kind: "noteDiscussion"; readonly cardId: string; readonly text: string };
 interface OwnerRouteEffect {
   readonly kind: "effect";
   readonly effect: BoardEffect;
@@ -1670,9 +1671,15 @@ const make = Effect.gen(function* () {
     });
   /** A card's follow-ons run in order in its discussion's lane, or its own when it has none. */
   const cardLane = (card: KanbanCard) => card.discussionId ?? `card:${card.id}`;
-  // Timeout forks a fiber; release the caller's permit before that fiber takes its own.
-  const postCommit = <A, E, R>(effect: Effect.Effect<A, E, R>, fallback: A) =>
-    locks.outside(SavedWrite.bestEffort(locks.fresh(locks.run(effect)), fallback));
+  // Notifications must neither reacquire the caller's permit nor die with its MCP request.
+  const forkPostCommit = <E, R>(effect: Effect.Effect<unknown, E, R>) =>
+    locks.independent(locks.run(effect)).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban saved write post-commit work failed", { cause }),
+      ),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
 
   const modelIo = yield* KanbanModels;
   const models = { ...modelIo, listed: locks.outside(modelIo.listed, undefined, true) };
@@ -4179,6 +4186,10 @@ const make = Effect.gen(function* () {
           const discussion = yield* discussionOf(KanbanDiscussionId.make(effect.discussionId));
           const card = yield* cardOf(KanbanCardId.make(effect.cardId));
           yield* tellAnswered(effect, discussion, card);
+        });
+      case "noteDiscussion":
+        return Effect.gen(function* () {
+          yield* noteDiscussion(yield* cardOf(KanbanCardId.make(effect.cardId)), effect.text);
         });
       case "syncPrs":
         return Effect.gen(function* () {
@@ -9140,13 +9151,20 @@ const make = Effect.gen(function* () {
             ? { ...card, reviewStep: 0 }
             : card;
         const moved = yield* moveUnlocked(source, to, role, actor, options ?? {});
-        yield* laterEvaluatorTurn(card, moved, actor);
+        const deferred = yield* effectSink;
+        if (deferred === undefined || deferred.closed) {
+          yield* forkPostCommit(
+            Effect.gen(function* () {
+              yield* evaluatorTurn(card, moved, actor);
+              if (to === "needs_review") yield* syncPrs(moved);
+            }),
+          );
+        } else {
+          yield* laterEvaluatorTurn(card, moved, actor);
+        }
         if (to === "needs_review") {
           // The PR read is thread state: a deferred write returns the card without it.
-          const deferred = yield* effectSink;
-          if (deferred === undefined || deferred.closed)
-            return yield* postCommit(syncPrs(moved), moved);
-          if (moved.workThreadId !== null)
+          if (deferred !== undefined && !deferred.closed && moved.workThreadId !== null)
             deferred.effects.push({
               boardId: moved.boardId,
               lane: cardLane(moved),
@@ -9154,11 +9172,32 @@ const make = Effect.gen(function* () {
             });
           return moved;
         }
-        const ask = Asks.openBlockingAsk(moved);
-        if (to === "needs_owner" && ask !== undefined && ask.seq === null) {
-          return yield* postCommit(postAsk(moved, ask, []), moved);
-        }
         return moved;
+      }),
+    ).pipe(
+      Effect.flatMap((moved) => {
+        const ask = Asks.openBlockingAsk(moved);
+        // The ask sequence belongs in the reply, but the move's permit must
+        // already be released before its bounded follow-up takes another one.
+        return to === "needs_owner" && ask !== undefined && ask.seq === null
+          ? SavedWrite.bestEffort(
+              guardDeferred(
+                Effect.gen(function* () {
+                  const current = yield* cardOf(moved.id);
+                  const pending = current.asks.find((entry) => entry.id === ask.id);
+                  if (
+                    pending === undefined ||
+                    pending.closedAt !== null ||
+                    pending.seq !== null ||
+                    kanbanAskRevision(pending) !== kanbanAskRevision(ask)
+                  )
+                    return current;
+                  return yield* postAsk(current, pending, []);
+                }),
+              ),
+              moved,
+            )
+          : Effect.succeed(moved);
       }),
     );
 
@@ -9824,20 +9863,17 @@ const make = Effect.gen(function* () {
           body: reason ?? "Cleared",
         });
         yield* saveCard(next);
-        return yield* postCommit(
-          Effect.gen(function* () {
-            if (selfFlag && reason !== null) {
-              yield* noteDiscussion(next, Briefs.workerFlaggedText(next, reason)).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("kanban self-flag note failed", { cardId: next.id, cause }),
-                ),
-              );
-            }
-            yield* kick;
-            return next;
-          }),
-          next,
-        );
+        yield* kick;
+        if (selfFlag && reason !== null) {
+          const text = Briefs.workerFlaggedText(next, reason);
+          yield* later(
+            next.boardId,
+            cardLane(next),
+            { kind: "noteDiscussion", cardId: next.id, text },
+            forkPostCommit(noteDiscussion(next, text)),
+          );
+        }
+        return next;
       }),
     );
 
@@ -10434,33 +10470,25 @@ const make = Effect.gen(function* () {
             head: sha,
           });
           yield* saveCard(next);
-          return yield* postCommit(
-            Effect.gen(function* () {
-              yield* evaluatorTurn(card, next, { _tag: "thread", threadId });
-              if (verdict === "findings" && next.reviewRound === 3) {
-                // Third findings round: the evaluator decides scope rather than the loop running on.
-                // A failed note must not fail the review result, so it only logs.
-                yield* cardDiscussionUnlocked(next.id).pipe(
-                  Effect.flatMap((discussion) =>
-                    toEvaluator(
-                      discussion,
-                      `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`,
-                      true,
-                    ),
-                  ),
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("kanban third review round note failed", {
-                      cardId: next.id,
-                      cause,
-                    }),
-                  ),
-                );
-              }
-              yield* kick;
-              return { card: next, recorded: true };
-            }),
-            { card: next, recorded: true },
-          );
+          yield* kick;
+          const actor: KanbanActor = { _tag: "thread", threadId };
+          if (evaluatorTurnDue(card, next))
+            yield* later(
+              next.boardId,
+              cardLane(next),
+              { kind: "evaluatorTurn", before: card, after: next, actor },
+              forkPostCommit(evaluatorTurn(card, next, actor)),
+            );
+          if (verdict === "findings" && next.reviewRound === 3) {
+            const text = `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`;
+            yield* later(
+              next.boardId,
+              cardLane(next),
+              { kind: "noteDiscussion", cardId: next.id, text },
+              forkPostCommit(noteDiscussion(next, text)),
+            );
+          }
+          return { card: next, recorded: true };
         }),
       ),
       (saved) => (saved.kind === "card" ? { card: saved.card, recorded: true } : undefined),
