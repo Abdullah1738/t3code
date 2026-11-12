@@ -350,6 +350,256 @@ class ChargeTests(unittest.TestCase):
         # Test runs aren't the live watcher, so they keep a copy of the money books in their folder.
         return {q['amount']: q for q in self.mc.load_questions(self.tmp / 'wd' / 'scratch-money')['questions']}
 
+    def renewal(self, last4='5542', source='email'):
+        return {'id': 'mail:renewal:1' if source == 'email' else 'imsg:123', 'source': source,
+                'sender': 'ElevenLabs <billing@elevenlabs.io>', 'subject': 'Subscription renewal',
+                'preview': 'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                           f'using card ending in {last4}', 'ts': self.now - 60, 'list_unsubscribe': True}
+
+    def check_dead_renewal(self, source):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        item = self.renewal(source=source)
+        model, state, runs = self.run_triage([item])
+        cases = self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases']
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]['id'], 'renewal-elevenlabs-2026-11-11')
+        self.assertEqual(cases[0]['history'][0]['source'], item['id'])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_dead_card_renewal_mail_is_a_case_and_dropped_before_classifier(self):
+        self.check_dead_renewal('email')
+
+    def test_dead_card_renewal_sms_is_a_case_and_dropped_before_classifier(self):
+        self.check_dead_renewal('imessage')
+
+    def test_duplicate_renewals_are_handled_in_batch_on_replay_and_after_closure(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        items = [self.renewal(source='email'), self.renewal(source='imessage')]
+        model, state, runs = self.run_triage(items)
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                if closed:
+                    self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'moved card')
+                model, _, runs = self.run_triage(items)
+                model.assert_not_called()
+                self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+                self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        self.assertEqual(self.mc.load(data)['cases'][0]['status'], 'closed')
+
+    def test_live_card_renewal_passes_through_without_a_case(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        item = self.renewal('2342')
+        model, _, runs = self.run_triage([item])
+        self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+        self.assertNotIn('renewal_case', runs[-1]['dropped'])
+        self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_generic_renewals_from_different_sender_domains_create_separate_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        items = []
+        for vendor in ('elevenlabs', 'acme'):
+            item = self.renewal()
+            item.update(id='mail:' + vendor, sender=f'"Notifications@Work" <billing@notifications.{vendor}.example>',
+                        preview='Your monthly subscription will renew on 11 Nov 2026 for USD 118.80 '
+                                'using card ending in 5542')
+            items.append(item)
+        model, _, runs = self.run_triage(items)
+        model.assert_not_called()
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+        cases = self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases']
+        self.assertEqual({c['merchant'] for c in cases},
+                         {'notifications.elevenlabs.example', 'notifications.acme.example'})
+
+    def test_sender_wording_changes_and_domain_punctuation_do_not_reopen_or_merge_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        model, _, _ = self.run_triage([self.renewal()])
+        model.assert_not_called()
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'cancelled')
+        item = self.renewal()
+        item.update(id='mail:generic', preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+        model, _, runs = self.run_triage([item])
+        model.assert_not_called()
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        for n, domain in enumerate(('notifications.elevenlabs.io', 'notifications-elevenlabs.io')):
+            item = self.renewal()
+            item.update(id=f'mail:domain-{n}', sender=f'billing@{domain}',
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+            newest = self.mc.load(data)['cases'][-1]
+            self.assertEqual(newest['renewal_identity'], domain)
+            self.assertEqual(newest['status'], 'open')
+            self.mc.close(data, newest['id'], 'cancelled')
+        self.assertEqual(len(self.mc.load(data)['cases']), 3)
+
+    def test_generic_email_and_named_sms_reuse_closed_case_in_either_arrival_order(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for email_first in (False, True):
+            with self.subTest(email_first=email_first):
+                root = self.tmp / ('email-first' if email_first else 'sms-first')
+                root.mkdir()
+                email, sms = self.renewal(), self.renewal(source='imessage')
+                email['preview'] = email['preview'].replace('ElevenLabs Pro plan', 'subscription')
+                sms['sender'] = 'ElevenLabs'
+                items = (email, sms) if email_first else (sms, email)
+                with patch.object(self, 'tmp', root):
+                    model, _, _ = self.run_triage([items[0]])
+                    model.assert_not_called()
+                    data = root / 'wd' / 'scratch-money'
+                    case = self.mc.load(data)['cases'][0]
+                    self.mc.close(data, case['id'], 'cancelled')
+                    model, _, runs = self.run_triage([items[1]])
+                    model.assert_not_called()
+                    self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+                    self.assertEqual(len(self.mc.load(data)['cases']), 1)
+                    self.assertEqual(self.mc.load(data)['cases'][0]['status'], 'closed')
+
+    def test_sms_first_cannot_absorb_multiple_email_domains(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        sms = self.renewal(source='imessage')
+        sms['sender'] = 'ElevenLabs'
+        self.run_triage([sms])
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'cancelled')
+        for n, domain in enumerate(('elevenlabs.io', 'alerts.elevenlabs.example')):
+            item = self.renewal()
+            item.update(id=f'mail:identity-{n}', sender='billing@' + domain,
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        cases = self.mc.load(data)['cases']
+        self.assertEqual({c['renewal_identity']: c['status'] for c in cases},
+                         {'elevenlabs.io': 'closed', 'alerts.elevenlabs.example': 'open'})
+
+    def test_dotted_sms_merchant_binds_its_email_and_stays_closed_after_other_domain(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        sms = self.renewal(source='imessage')
+        sms.update(sender='Boat.dev', preview=sms['preview'].replace('ElevenLabs Pro', 'Boat.dev Pro'))
+        self.run_triage([sms])
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-boat-dev-2026-11-11', 'cancelled')
+        for n, domain in enumerate(('boat.dev', 'boatdev.com', 'boat.dev')):
+            item = self.renewal()
+            item.update(id=f'mail:dotted-{n}', sender='billing@' + domain,
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        cases = self.mc.load(data)['cases']
+        self.assertEqual({c['renewal_identity']: c['status'] for c in cases},
+                         {'boat.dev': 'closed', 'boatdev.com': 'open'})
+
+    def test_one_off_notices_stay_unhandled_with_billing_subject_markers(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for subject in ('Next billing date', 'Next billing date: 11 Nov 2026'):
+            for purpose in ('hotel reservation', 'flight booking', 'payment plan', 'installment'):
+                with self.subTest(subject=subject, purpose=purpose):
+                    item = self.renewal()
+                    item.update(subject=subject, list_unsubscribe=False, preview='You will be charged USD 118.80 on 11 Nov 2026 '
+                                f'for your {purpose} using card ending in 5542.')
+                    model, _, runs = self.run_triage([item])
+                    self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                    self.assertNotIn('renewal_case', runs[-1]['dropped'])
+        self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_cancelled_renewals_and_one_off_charges_pass_through_without_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        texts = [
+            'Your subscription renewal on 11 Nov 2026 for USD 118.80 using card ending in 5542 has been cancelled.',
+            'You will be charged USD 118.80 on 11 Nov 2026 for your hotel reservation using card ending in 5542.',
+            "Your ElevenLabs Pro plan doesn't auto-renew on 11 Nov 2026 for USD 118.80 using card ending in 5542.",
+            'Your ElevenLabs Pro plan doesn’t auto-renew on 11 Nov 2026 for USD 118.80 using card ending in 5542.',
+            'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 using card ending in 5542. Auto-renewal is currently off.',
+            'Your ElevenLabs Pro subscription will not be charged USD 118.80 on 11 Nov 2026 using card ending in 5542.',
+        ]
+        for text in texts:
+            with self.subTest(text=text):
+                item = self.renewal()
+                item.update(subject='Next billing date: 11 Nov 2026', list_unsubscribe=False, preview=text)
+                model, _, runs = self.run_triage([item])
+                self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                self.assertNotIn('renewal_case', runs[-1]['dropped'])
+                self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_full_message_rejection_survives_queueing_for_email_and_sms(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for source in ('email', 'imessage'):
+            with self.subTest(source=source):
+                item = self.renewal(source=source)
+                item.update(subject='Confirmation', list_unsubscribe=False, renewal_notice=None)
+                model, _, runs = self.run_triage([item])
+                self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                self.assertNotIn('renewal_case', runs[-1]['dropped'])
+                self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_dry_renewal_tracking_uses_its_own_scratch_books_even_at_live_path(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        before = (self.mc.DATA / 'cards.json').read_bytes()
+        wd = self.tmp / 'dry'
+        with patch.object(t, 'LIVE', wd):
+            reasons, error = t.renewal_checks([self.renewal()], self.now, True, wd=wd)
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {'mail:renewal:1': 'renewal_case'})
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+        self.assertEqual((self.mc.DATA / 'cards.json').read_bytes(), before)
+        self.assertEqual(len(self.mc.load(wd / 'scratch-renewals')['cases']), 1)
+
+    def test_dry_runs_track_renewals_after_fast_or_slow_collection(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for delay in (0, 25, 100):
+            with self.subTest(delay=delay):
+                wd = self.tmp / f'dry-{delay}'
+                clock = [self.now]
+                def collect(*args):
+                    clock[0] += delay
+                    return {'mail': {'cursor': {}, 'items': [self.renewal()], 'drops': {}, 'scanned': 1}}, {}
+                args = types.SimpleNamespace(dry_run_hours=2, report=str(wd / 'report.json'))
+                with patch.dict(t.os.environ, {'WATCH_DIR': str(wd)}), \
+                     patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
+                     patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                     patch.object(t, 'collect', side_effect=collect), patch.object(t, 'build_context', return_value={}), \
+                     patch.object(t, 'handled', return_value=({}, {})), \
+                     patch.object(t, 'classify') as model, patch('builtins.print'):
+                    self.assertEqual(t.run(args), 0)
+                model.assert_not_called()
+                report = t.read_json(wd / 'report.json')
+                self.assertEqual(report['dropped']['renewal_case'], 1)
+                self.assertNotIn('charge_check_errors', report)
+                self.assertEqual(len(self.mc.load(wd / 'scratch-renewals')['cases']), 1)
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_renewal_tracking_stops_when_budget_is_spent(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        reasons, error = t.renewal_checks([self.renewal()], self.now, False,
+                                        deadline=time.time() - 1, wd=self.tmp / 'expired')
+        self.assertEqual(reasons, {})
+        self.assertIn('out of time', error)
+        self.assertEqual(self.mc.load(self.tmp / 'expired' / 'scratch-money')['cases'], [])
+
+    def test_failed_renewal_write_keeps_the_item_queued_for_the_next_tick(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        with patch.object(self.mc, 'renewal_case', side_effect=self.mc.CheckTimeout('renewal tracking out of time')):
+            model, state, runs = self.run_triage([self.renewal()])
+        model.assert_not_called()
+        self.assertEqual([i['id'] for i in state['queue']], ['mail:renewal:1'])
+        self.assertIn('renewal tracking out of time', runs[-1]['charge_check_errors'])
+        model, state, runs = self.run_triage([])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+
     def test_explained_waiting_held_and_unexplained_alerts(self):
         self.rows = [{'id': 1, 'source': 'email', 'from_me': 0, 'ts': self.now - 30, 'sender': 'Globex <r@globex.example>',
                       'subject': 'Your Globex receipt', 'text': 'Your globex receipt. Total EUR 20.00'},
@@ -1112,6 +1362,67 @@ class PaymentNotices(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertNotIn('midnight', item['preview'])
         self.assertEqual(item['payment_notice']['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_full_mail_renewal_survives_long_preview_and_bulk_header(self):
+        raw = ('From: ElevenLabs <billing@elevenlabs.io>\r\nSubject: Your subscription\r\n'
+               'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\nContent-Type: text/plain\r\n\r\n' +
+               'Important account information. ' * 20 +
+               'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 using card ending in 5542').encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+            item, reason = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        self.assertIsNone(reason)
+        self.assertNotIn('5542', item['preview'])
+        self.assertEqual(item['renewal_notice']['last4'], '5542')
+        self.assertEqual(item['renewal_notice']['merchant'], 'ElevenLabs')
+
+    def renewal_mail(self, body, subject='Confirmation', header=''):
+        raw = (f'From: ElevenLabs <billing@elevenlabs.io>\r\nSubject: {subject}\r\n' + header +
+               'Content-Type: text/plain\r\n\r\n' + body).encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]) as fetch:
+            result = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        fetch.assert_called_once()
+        return result
+
+    def test_bulk_and_promo_headers_cannot_hide_a_renewal_in_the_body(self):
+        body = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                'using card ending in 5542')
+        rows = [
+            ('Update your payment method', 'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n'),
+            ('Account notice', 'Precedence: bulk\r\n'),
+            ('Account notice', 'Precedence: list\r\n'),
+            ('Account notice', 'Precedence: junk\r\n'),
+            ('Special offer', ''),
+        ]
+        for subject, header in rows:
+            with self.subTest(subject=subject, header=header):
+                item, reason = self.renewal_mail(body, subject, header)
+                self.assertIsNone(reason)
+                self.assertEqual(item['renewal_notice']['date'], '2026-11-11')
+        item, reason = self.renewal_mail('Here is our weekly newsletter.', 'Account notice', 'Precedence: bulk\r\n')
+        self.assertEqual(reason, 'bulk')
+        self.assertIsNone(item['renewal_notice'])
+
+    def test_full_body_cancellation_or_ambiguity_cannot_be_overruled_by_preview(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        tails = ['Your subscription is cancelled.', 'The other amount is USD 100.00.',
+                 'The other card is ending in 2342.']
+        for tail in tails:
+            with self.subTest(tail=tail), tempfile.TemporaryDirectory() as tmp:
+                item, reason = self.renewal_mail(first + 'Additional account details. ' * 20 + tail)
+                self.assertIsNone(reason)
+                self.assertIsNone(item['renewal_notice'])
+                self.assertNotIn(tail, item['preview'])
+                self.assertIsNotNone(self.mc.renewal(item['preview'], item['sender']))
+                wd = Path(tmp)
+                with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                    self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                    reasons, error = t.renewal_checks([item], self.when.timestamp(), False, wd=wd)
+                    self.assertIsNone(error)
+                    self.assertEqual(reasons, {})
+                    self.assertEqual(self.mc.load(wd / 'scratch-money')['cases'], [])
 
     def test_failure_cause_never_replaces_repayment_clause(self):
         for cause in ('due to insufficient funds', 'due to account restrictions', 'because the account is blocked'):
