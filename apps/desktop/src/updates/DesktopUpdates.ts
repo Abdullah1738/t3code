@@ -29,6 +29,7 @@ import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
+import * as DesktopQuit from "../app/DesktopQuit.ts";
 import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as IpcChannels from "../ipc/channels.ts";
@@ -642,10 +643,14 @@ export const make = Effect.gen(function* () {
       })),
     );
 
+  const resetQuit = DesktopQuit.reset.pipe(
+    Effect.provideService(DesktopState.DesktopState, desktopState),
+  );
   const resetInstallAction = Effect.all(
     [
       finishUpdateAction("install"),
       Ref.set(desktopState.quitting, false),
+      resetQuit,
       Ref.set(installRunningBackendsRef, []),
       removeUpdateRestartMarker,
       removeInstallRecord,
@@ -664,6 +669,7 @@ export const make = Effect.gen(function* () {
     if (!ownsRecovery) return;
 
     yield* Ref.set(desktopState.quitting, false);
+    yield* resetQuit;
     yield* removeUpdateRestartMarker;
     yield* removeInstallRecord;
     yield* Effect.gen(function* () {
@@ -757,6 +763,9 @@ export const make = Effect.gen(function* () {
             instances,
             (instance) => instance.stop({ timeout: Duration.seconds(5) }),
             { concurrency: "unbounded" },
+          );
+          yield* DesktopQuit.prepare({ trigger: "quitAndInstall" }).pipe(
+            Effect.provideService(DesktopState.DesktopState, desktopState),
           );
           yield* electronUpdater.quitAndInstall({
             isSilent: true,
