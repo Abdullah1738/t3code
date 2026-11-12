@@ -236,6 +236,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     }),
   ),
   summary: Schema.NullOr(Schema.String),
+  resultLooksIncomplete: Schema.optional(Schema.Boolean),
+  incompleteReason: Schema.optional(Schema.String),
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:

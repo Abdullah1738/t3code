@@ -15,6 +15,9 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -65,6 +68,176 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 );
 
 describe("OrchestratorMcpService", () => {
+  it.effect.each([
+    { finish: "stop", followup: null },
+    { finish: "length", followup: null },
+    { finish: "length", followup: "stop" },
+    { finish: "stop", followup: "length" },
+  ] as const)(
+    "reports incomplete metadata for stored finish=$finish with followup=$followup",
+    ({ finish, followup }) =>
+      Effect.gen(function* () {
+        const parentId = ThreadId.make("parent:incomplete");
+        const childId = ThreadId.make("child:incomplete");
+        const taskId = NodeId.make("task:incomplete");
+        const runId = RunId.make("run:incomplete");
+        const attemptId = RunAttemptId.make("attempt:incomplete");
+        const now = DateTime.makeUnsafe("2026-11-05T17:52:25Z");
+        const storedResult =
+          finish === "length"
+            ? "[Result looks incomplete: original output limit]\nOriginal answer."
+            : "Original answer.";
+        let parent = {
+          ...idleThreadProjection(liveThreadShell(parentId)),
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentId,
+              origin: "app_owned",
+              childThreadId: childId,
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+              status: "completed",
+              result: followup === null ? null : storedResult,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        let child = {
+          ...idleThreadProjection(liveThreadShell(childId)),
+          runs: [
+            {
+              id: runId,
+              ordinal: 1,
+              status: "completed",
+              startedAt: now,
+              completedAt: now,
+              activeAttemptId: attemptId,
+              rootNodeId: NodeId.make("root:incomplete"),
+            },
+          ],
+          messages: [
+            {
+              id: MessageId.make("answer:incomplete"),
+              runId,
+              role: "assistant",
+              phase: "answer",
+              text: "All checks passed.",
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+          providerTurns: [
+            {
+              id: ProviderTurnId.make("turn:incomplete"),
+              providerThreadId: ProviderThreadId.make("child:incomplete"),
+              runAttemptId: attemptId,
+              ordinal: 1,
+              finish,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        if (followup !== null) {
+          parent = {
+            ...parent,
+            contextTransfers: [
+              {
+                id: "transfer:original",
+                type: "subagent_result",
+                sourceThreadId: childId,
+                targetThreadId: parentId,
+                sourcePoint: { runId },
+              },
+            ] as unknown as OrchestrationV2ThreadProjection["contextTransfers"],
+          };
+          const laterRunId = RunId.make("run:followup");
+          const laterAttempt = RunAttemptId.make("attempt:followup");
+          child = {
+            ...child,
+            runs: [
+              ...child.runs,
+              {
+                ...child.runs[0]!,
+                id: laterRunId,
+                ordinal: 2,
+                activeAttemptId: laterAttempt,
+                startedAt: DateTime.add(now, { seconds: 1 }),
+                completedAt: DateTime.add(now, { seconds: 2 }),
+              },
+            ],
+          };
+          child = {
+            ...child,
+            messages: [
+              ...child.messages,
+              { ...child.messages[0]!, id: MessageId.make("later"), runId: laterRunId },
+            ],
+          };
+          child = {
+            ...child,
+            providerTurns: [
+              ...child.providerTurns,
+              {
+                ...child.providerTurns[0]!,
+                id: ProviderTurnId.make("turn:followup"),
+                runAttemptId: laterAttempt,
+                ordinal: 2,
+                finish: followup,
+              },
+            ],
+          };
+        }
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (id, fields) => {
+              const requestedFields: ReadonlyArray<string> = fields;
+              if (id === childId && requestedFields.includes("runs"))
+                assert.isTrue(requestedFields.includes("providerTurns"));
+              return Effect.succeed(id === parentId ? parent : child);
+            },
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            dispatch: () => Effect.succeed({} as never),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const result = yield* service.taskStatus(
+            {
+              environmentId: EnvironmentId.make("incomplete"),
+              requestNamespace: "incomplete",
+              thread: {
+                threadId: parentId,
+                providerSessionId: "incomplete",
+                providerInstanceId: ProviderInstanceId.make("codex"),
+              },
+              client: undefined,
+              capabilities: new Set(["orchestration"]),
+              issuedAt: 1,
+            },
+            taskId,
+          );
+          assert.equal(result.status, "completed");
+          assert.equal(result.resultLooksIncomplete, finish === "length");
+          if (followup !== null) assert.equal(result.summary, storedResult);
+          if (finish === "length") {
+            assert.include(result.incompleteReason!, "output limit (finish=length)");
+            assert.isTrue(result.summary!.startsWith("[Result looks incomplete:"));
+          } else {
+            assert.equal(result.summary, followup === null ? "All checks passed." : storedResult);
+            assert.isUndefined(result.incompleteReason);
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
   it.effect("retries terminal acknowledgement with a fresh command id", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");
@@ -110,6 +283,8 @@ describe("OrchestratorMcpService", () => {
         ],
         contextTransfers: [],
         messages: [],
+        turnItems: [],
+        providerTurns: [],
         subagents: [],
         providerThreads: [],
         runtimeRequests: [],

@@ -241,6 +241,102 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
 });
 
 describe("OpenCodeAdapterV2", () => {
+  it.effect.each(
+    (["length", "stop"] as const).flatMap((finish) =>
+      (
+        ["owned-first", "step-first", "late-foreign", "unknown-foreign", "replayed-older"] as const
+      ).map((order) => ({ finish, order })),
+    ),
+  )("records the last owned step finish=$finish with $order events", ({ finish, order }) =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      let promptId = "";
+      const harness = yield* makeOpenCodeRuntimeHarness(`finish-${finish}-${order}`, "root", {
+        event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          promptAsync: async (input: { messageID: string }) => {
+            promptId = input.messageID;
+            return { data: true };
+          },
+          abort: async () => ({ data: true }),
+          children: async () => ({ data: [] }),
+        },
+      });
+      yield* harness.startTurn();
+      const received = yield* harness.runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      const assistant = (id: string, parentID = promptId) => ({
+        type: "message.updated",
+        properties: {
+          sessionID: "root",
+          info: {
+            id,
+            role: "assistant",
+            parentID,
+            time: { created: 1 },
+          },
+        },
+      });
+      const step = (reason: string, messageID = `assistant-${reason}`) => ({
+        type: "message.part.updated",
+        properties: {
+          part: {
+            type: "step-finish",
+            id: `step-${messageID}`,
+            sessionID: "root",
+            messageID,
+            reason,
+            cost: 0,
+            tokens: { input: 0, output: 64000, reasoning: 64000, cache: { read: 0, write: 0 } },
+          },
+        },
+      });
+      yield* Effect.promise(() =>
+        nativeEvents.push({
+          type: "message.updated",
+          properties: {
+            sessionID: "root",
+            info: { id: promptId, role: "user", time: { created: 1 } },
+          },
+        }),
+      );
+      for (const reason of ["tool-calls", finish]) {
+        if (order !== "step-first" || reason === finish)
+          yield* Effect.promise(() => nativeEvents.push(assistant(`assistant-${reason}`)));
+        yield* Effect.promise(() => nativeEvents.push(step(reason)));
+      }
+      if (order === "step-first") {
+        yield* Effect.promise(() => nativeEvents.push(assistant("assistant-tool-calls")));
+      }
+      if (order === "late-foreign" || order === "unknown-foreign") {
+        yield* Effect.promise(() =>
+          nativeEvents.push(step(finish === "length" ? "stop" : "length", "foreign")),
+        );
+        if (order === "late-foreign")
+          yield* Effect.promise(() => nativeEvents.push(assistant("foreign", "old-prompt")));
+      }
+      if (order === "replayed-older")
+        yield* Effect.promise(() => nativeEvents.push(step("tool-calls")));
+      for (const type of ["busy", "idle"]) {
+        yield* Effect.promise(() =>
+          nativeEvents.push({
+            type: "session.status",
+            properties: { sessionID: "root", status: { type } },
+          }),
+        );
+      }
+      const events = yield* Fiber.join(received);
+      const completed = events.findLast((event) => event.type === "provider_turn.updated");
+      assert.equal(completed?.providerTurn.finish, finish);
+    }).pipe(
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+      Effect.scoped,
+    ),
+  );
   it.effect.each(["completed", "failed", "unresolved", "unavailable", "reconnect"] as const)(
     "normalizes OpenCode step usage for %s turns",
     (ending) =>
