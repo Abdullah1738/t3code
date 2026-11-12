@@ -7858,6 +7858,8 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             remarksThrough: DateTime.formatIso(at),
             remarkIds: [],
             conflicting: false,
+            conflictHead: null,
+            conflictWokeFor: null,
             wakes: 0,
           },
         },

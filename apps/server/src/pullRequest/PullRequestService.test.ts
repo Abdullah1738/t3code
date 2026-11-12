@@ -223,6 +223,31 @@ it.effect("keeps cached previews available and pauses uncached previews until qu
   }),
 );
 
+it.effect("keeps the base SHA reported by the host in detail", () =>
+  Effect.gen(function* () {
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "web", workspaceRoot: "/w", repository: "acme/web" })],
+      providers: [
+        fakeProvider(SourceControlProviderKind.make("github"), {
+          getChangeRequest: () =>
+            Effect.succeed({
+              ...hostedChangeRequest("Description"),
+              headSha: "head111",
+              baseSha: "base111",
+            }),
+        }),
+      ],
+    });
+    const detail = yield* service.detail({
+      projectId: "p1" as ProjectId,
+      repository: "acme/web",
+      number: 1,
+    });
+    assert.strictEqual(detail.headSha, "head111");
+    assert.strictEqual(detail.baseSha, "base111");
+  }),
+);
+
 it.effect("reuses only unexpired detail for previews", () =>
   Effect.gen(function* () {
     let previewReads = 0;

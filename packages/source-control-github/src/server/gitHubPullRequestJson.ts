@@ -379,6 +379,7 @@ export interface GitHubPullRequestDetail extends GitHubPullRequestListItem {
   readonly headRepositoryOwner: string | null;
   readonly headRepositoryNameWithOwner?: string | null;
   readonly headSha?: string | null;
+  readonly baseSha?: string | null;
   readonly body: string;
   readonly changedFiles: number;
   readonly mergedAt: string | null;
@@ -797,6 +798,7 @@ function toListItem(raw: ListItemFields): GitHubPullRequestListItem {
 }
 
 interface DetailFields extends ListItemFields {
+  readonly baseRefOid?: string | null | undefined;
   readonly isCrossRepository?: boolean | undefined;
   readonly headRepositoryOwner?: { readonly login: string } | null | undefined;
   readonly headRefOid?: string | null | undefined;
@@ -819,6 +821,7 @@ function toDetail(raw: DetailFields): GitHubPullRequestDetail {
       : {}),
     headRepositoryOwner: trimmed(raw.headRepositoryOwner?.login),
     headSha: trimmed(raw.headRefOid),
+    baseSha: trimmed(raw.baseRefOid),
     body: raw.body ?? "",
     changedFiles: raw.changedFiles ?? 0,
     mergedAt: trimmed(raw.mergedAt),

@@ -155,6 +155,8 @@ describe("prWatchesOf", () => {
       remarksThrough: FINISHED_AT,
       remarkIds: [],
       conflicting: false,
+      conflictHead: null,
+      conflictWokeFor: null,
       wakes: 0,
     },
     ...overrides,

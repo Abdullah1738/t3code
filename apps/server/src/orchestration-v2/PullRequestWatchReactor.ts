@@ -175,6 +175,8 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
     left.remarksThrough === right.remarksThrough &&
     left.remarkIds.join("\n") === right.remarkIds.join("\n") &&
     left.conflicting === right.conflicting &&
+    left.conflictHead === right.conflictHead &&
+    left.conflictWokeFor === right.conflictWokeFor &&
     left.wakes === right.wakes
   );
 }
@@ -533,34 +535,56 @@ export const make = Effect.gen(function* () {
       fingerprint: group.fingerprint,
       inFlight:
         detail.mergeability === "unknown" ||
+        group.targets.some(({ watch }) => {
+          const next = evaluatePullRequestWatch(watch, detail, null).next;
+          return next.conflictHead !== null && !next.conflicting;
+        }) ||
         detail.checks.some((check) => check.status === "pending"),
       remarksComplete: plan.activity ? remarks !== null : (last?.remarksComplete ?? false),
       watches: new Set(group.targets.map(watchKey)),
       status: fingerprint?.status ?? null,
       remarks: fingerprint?.remarks ?? null,
     });
-    yield* eachTarget(group, (target) => {
-      const report = evaluatePullRequestWatch(target.watch, detail, remarks);
-      if (report.changes.length > 0) {
-        const wake = pullRequestWatchMessage({
-          number: target.link.number,
-          url: target.link.url,
-          baseBranch: detail.baseBranch,
-          headSha: report.next.headSha,
-          report,
-        });
-        // An ending watch keeps what this pass saw, so watching again starts from it.
-        return (
-          report.exhausted
-            ? record(target, null, wake, report.next)
-            : record(target, report.next, wake)
-        ).pipe(
-          Effect.tap(() => woke(target)),
-          Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
-        );
-      }
-      return watchesEqual(report.next, target.watch) ? Effect.void : record(target, report.next);
-    });
+    yield* eachTarget(
+      group,
+      Effect.fn("PullRequestWatchReactor.sendReport")(function* (target: WatchTarget) {
+        let report = evaluatePullRequestWatch(target.watch, detail, remarks);
+        if (report.changes.some((change) => change.kind === "conflicting")) {
+          const current = yield* projections.getThread(target.thread.id);
+          const watch = current?.pullRequests?.find(
+            (link) => threadPullRequestKeyOf(link) === threadPullRequestKeyOf(target.link),
+          )?.watch;
+          if (watch === undefined || watch.startedAt !== target.watch.startedAt) return;
+          const changes = report.changes.filter(
+            (change) => change.kind !== "conflicting" || change.headSha === watch.headSha,
+          );
+          // A head that moved while reading must not be overwritten by this older report.
+          if (changes.length !== report.changes.length) {
+            if (changes.length === 0) return;
+            report = { ...report, changes, next: watch };
+          }
+        }
+        if (report.changes.length > 0) {
+          const wake = pullRequestWatchMessage({
+            number: target.link.number,
+            url: target.link.url,
+            baseBranch: detail.baseBranch,
+            headSha: detail.headSha ?? null,
+            report,
+          });
+          // An ending watch keeps what this pass saw, so watching again starts from it.
+          return yield* (
+            report.exhausted
+              ? record(target, null, wake, report.next)
+              : record(target, report.next, wake)
+          ).pipe(
+            Effect.tap(() => woke(target)),
+            Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
+          );
+        }
+        if (!watchesEqual(report.next, target.watch)) yield* record(target, report.next);
+      }),
+    );
   });
 
   const sweep = Effect.gen(function* () {

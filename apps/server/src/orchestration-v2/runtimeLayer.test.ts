@@ -3053,6 +3053,227 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("confirms conflict reads and remembers wakes across flaps, restarts and rewatch", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-pr-watch-confirmed-conflict");
+      const projectId = ProjectId.make("pr-watch-confirmed-conflict-project");
+      yield* seedProject({
+        projectId,
+        title: "Conflict watch",
+        workspaceRoot: "/workspace/confirmed-conflict",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("confirmed-conflict-create"),
+        threadId,
+        projectId,
+        title: "Conflict watch",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const watch = (watching: boolean, id: string) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`confirmed-conflict-${id}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 12,
+          watching,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/12", source: "agent" },
+        });
+      yield* watch(true, "start");
+      let mergeability: PullRequestDetail["mergeability"] = "conflicting";
+      let reads = 0;
+      const host = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(PullRequestService.PullRequestService)({
+          detail: () =>
+            Effect.sync(() => {
+              reads += 1;
+              return {
+                ...watchedPullRequestDetail({
+                  projectId,
+                  number: 12,
+                  at: "2026-10-02T12:00:00.000Z",
+                }),
+                headSha: "aaaaaaaaaa",
+                baseSha: "f77c1992e5e9",
+                checks: [],
+                mergeability,
+              };
+            }),
+          activity: () =>
+            Effect.succeed({
+              comments: [],
+              commentCount: 0,
+              commentsTruncated: false,
+              reviewThreads: [],
+              commits: [],
+            }),
+        }),
+      );
+      const summaries = Effect.map(
+        orchestrator.getThreadRecords(threadId, ["messages"]),
+        ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
+      );
+      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      yield* reactor.sweep;
+      assert.deepEqual(yield* summaries, []);
+      assert.equal(
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch?.conflictHead,
+        "aaaaaaaaaa",
+      );
+      yield* TestClock.adjust("2 minutes");
+      yield* reactor.sweep;
+      assert.equal(reads, 2);
+      assert.deepEqual(yield* summaries, ["#12: merge conflict"]);
+      const messages = (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages;
+      assert.isTrue(
+        messages.some((message) => message.text.includes("head aaaaaaa, GitHub base f77c199")),
+      );
+      mergeability = "mergeable";
+      yield* TestClock.adjust("10 minutes");
+      yield* reactor.sweep;
+      const clean = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
+      assert.isFalse(clean?.conflicting);
+      assert.equal(clean?.conflictWokeFor, "aaaaaaaaaa:f77c1992e5e9");
+      yield* watch(false, "stop");
+      yield* watch(true, "again");
+      const restarted = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      mergeability = "conflicting";
+      yield* restarted.sweep;
+      yield* TestClock.adjust("2 minutes");
+      yield* restarted.sweep;
+      assert.deepEqual(yield* summaries, ["#12: merge conflict"]);
+      assert.isTrue(
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch?.conflicting,
+      );
+      yield* watch(false, "end");
+    }),
+  );
+
+  it.effect("drops a conflict wake when its stored head moves during the read", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-pr-watch-stale-conflict");
+      const projectId = ProjectId.make("pr-watch-stale-conflict-project");
+      yield* seedProject({
+        projectId,
+        title: "Conflict watch",
+        workspaceRoot: "/workspace/stale-conflict",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("stale-conflict-create"),
+        threadId,
+        projectId,
+        title: "Conflict watch",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const watch = (watching: boolean, id: string) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`stale-conflict-${id}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 12,
+          watching,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/12", source: "agent" },
+        });
+      yield* watch(true, "start");
+      let mergeability: PullRequestDetail["mergeability"] = "conflicting";
+      let moveDuringRead = false;
+      let reads = 0;
+      const host = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(PullRequestService.PullRequestService)({
+          detail: () =>
+            Effect.gen(function* () {
+              reads += 1;
+              if (moveDuringRead) {
+                const current = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]
+                  ?.watch;
+                assert.isDefined(current);
+                yield* orchestrator.dispatch({
+                  type: "thread.pull-request-watch.sync",
+                  commandId: CommandId.make("stale-conflict-move"),
+                  threadId,
+                  host: "github.com",
+                  repository: "pingdotgg/t3code",
+                  number: 12,
+                  startedAt: current!.startedAt,
+                  watch: {
+                    ...current!,
+                    headSha: "bbbbbbbbbb",
+                    conflicting: false,
+                    conflictHead: null,
+                  },
+                });
+              }
+              return {
+                ...watchedPullRequestDetail({
+                  projectId,
+                  number: 12,
+                  at: "2026-10-02T12:00:00.000Z",
+                }),
+                headSha: "aaaaaaaaaa",
+                baseSha: "f77c1992e5e9",
+                checks: [],
+                mergeability,
+              };
+            }),
+          activity: () =>
+            Effect.succeed({
+              comments: [],
+              commentCount: 0,
+              commentsTruncated: false,
+              reviewThreads: [],
+              commits: [],
+            }),
+        }),
+      );
+      const summaries = Effect.map(
+        orchestrator.getThreadRecords(threadId, ["messages"]),
+        ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
+      );
+      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      yield* reactor.sweep;
+      assert.deepEqual(yield* summaries, []);
+      assert.equal(
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch?.conflictHead,
+        "aaaaaaaaaa",
+      );
+      yield* TestClock.adjust("2 minutes");
+      moveDuringRead = true;
+      yield* reactor.sweep;
+      assert.equal(reads, 2);
+      assert.deepEqual(yield* summaries, []);
+      assert.equal(
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch?.headSha,
+        "bbbbbbbbbb",
+      );
+      yield* watch(false, "end");
+    }),
+  );
+
   it.effect("a watch that ends on the comment limit keeps what its last pass saw", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
