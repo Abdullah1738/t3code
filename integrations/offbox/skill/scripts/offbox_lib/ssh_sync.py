@@ -53,17 +53,23 @@ def setup(box_id: str) -> Path:
             r = api.sshkey(box_id, pubkey())
             break
         except api.ApiError as e:
+            if not (e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable")
+                    or e.status in (409, 502, 503) or api.gateway_timeout(e)):
+                raise
             last = e
-            if e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable") \
-                    or e.status in (409, 502, 503):
-                left = api.left()
-                if left is not None and left <= 0:
-                    raise
-                time.sleep(1 + attempt if left is None else min(1 + attempt, left))
-                continue
-            raise
+        except OffboxError as e:
+            if not e.outage:
+                raise
+            last = e
+        if attempt < 7:
+            left = api.left()
+            if left is not None and left <= 0:
+                raise last
+            # Authorizing the same public key is safe to repeat even when boat did not answer.
+            log(f"ssh_setup_retry {box_id} attempt={attempt + 1} {str(last)[:200]}")
+            time.sleep(1 + attempt if left is None else min(1 + attempt, left))
     else:
-        raise OffboxError(f"ssh key setup failed for {box_id}: {last}")
+        raise OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
     ep = r.get("sshEndpoint")
     if ep:
         host, port = ep.rsplit(":", 1)

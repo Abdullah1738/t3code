@@ -59,6 +59,12 @@ class ApiError(OffboxError):
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
         self.status, self.api_code, self.retryable = status, code, retryable
+        self.message = message
+
+
+def gateway_timeout(e: OffboxError) -> bool:
+    return isinstance(e, ApiError) and e.status in (500, 504) and (
+        e.api_code.startswith("Request timeout after") or e.message.startswith("Request timeout after"))
 
 
 class NetworkError(OffboxError):
