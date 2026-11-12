@@ -33,6 +33,12 @@ import {
 } from "./composerImages";
 import { imageMimeType } from "@t3tools/shared/image";
 import { uuidv4 } from "./uuid";
+// ardud: a caller's own rule, asked immediately before every attachment write
+import {
+  AttachmentWriteRefused,
+  requireAttachmentWrite,
+  type AttachmentWriteGate,
+} from "../ardud/common/attachmentWriteGate";
 
 export type UploadedMobileAttachment =
   | UploadChatImageAttachment
@@ -93,11 +99,14 @@ export function withUploadedMobileAttachmentReferences(input: {
 export async function releasePendingAttachmentUploads(
   environmentId: EnvironmentId,
   attachmentIds: ReadonlyArray<string>,
+  // ardud: asked before each delete; a refusal throws, so it is not tried again
+  writeGate?: AttachmentWriteGate,
 ): Promise<void> {
   const deleteOnce = async (attachmentId: string): Promise<boolean> => {
     if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) {
       throw new Error("This connection cannot delete pending attachments.");
     }
+    requireAttachmentWrite(writeGate);
     const result = await runAtomCommand(
       appAtomRegistry,
       attachmentEnvironment.remove,
@@ -126,10 +135,13 @@ export async function releasePendingAttachmentUploads(
 async function releaseCreatedUploadsQuietly(
   environmentId: EnvironmentId,
   attachmentIds: ReadonlyArray<string>,
+  writeGate?: AttachmentWriteGate,
 ): Promise<void> {
   try {
-    await releasePendingAttachmentUploads(environmentId, attachmentIds);
+    await releasePendingAttachmentUploads(environmentId, attachmentIds, writeGate);
   } catch (error) {
+    // ardud: a delete the gate refused is left for the server to drop
+    if (error instanceof AttachmentWriteRefused) return;
     console.warn("[attachments] could not delete abandoned pending uploads", error);
   }
 }
@@ -236,6 +248,7 @@ async function uploadFileBytes(
   url: string,
   signal: AbortSignal,
   onProgress?: (progress: number) => void,
+  writeGate?: AttachmentWriteGate,
 ): Promise<void> {
   const { File, Paths, UploadType } = await import("expo-file-system");
   if (signal.aborted) throw new Error("Upload cancelled.");
@@ -258,6 +271,8 @@ async function uploadFileBytes(
         encoding: "base64",
       });
     }
+    // ardud: asked last, after everything that takes time: no byte goes once the gate has closed
+    requireAttachmentWrite(writeGate);
     const result = await file.upload(url, {
       httpMethod: "POST",
       uploadType: UploadType.BINARY_CONTENT,
@@ -293,6 +308,8 @@ export async function prepareTurnAttachments(input: {
   readonly persistUploadedReferences?: (
     draftAttachments: ReadonlyArray<DraftComposerAttachment>,
   ) => Promise<"persisted" | "abandon">;
+  // ardud: asked before the upload is created, before its bytes go, and before a delete
+  readonly writeGate?: AttachmentWriteGate;
 }): Promise<PrepareTurnAttachmentsResult> {
   const { environmentId } = input;
   if (input.signal?.aborted) return { status: "abandoned" };
@@ -325,6 +342,7 @@ export async function prepareTurnAttachments(input: {
     if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) {
       throw new Error("This connection cannot upload attachments.");
     }
+    requireAttachmentWrite(input.writeGate);
   };
   requireUploadAccess();
 
@@ -397,11 +415,14 @@ export async function prepareTurnAttachments(input: {
             input.onUploadProgress
               ? (progress) => input.onUploadProgress?.(attachment.id, progress)
               : undefined,
+            input.writeGate,
           ),
           abort,
         }),
         onMinted: (attachmentId) => {
-          if (controller.signal.aborted) return "cancel";
+          // ardud: "cancel" deletes the fresh upload. With the gate closed that delete may
+          // not go either: the upload is left, and the next step stops at the gate.
+          if (controller.signal.aborted && (input.writeGate?.() ?? null) === null) return "cancel";
           pendingAttachmentIds.push(attachmentId);
           createdAttachmentIds.push(attachmentId);
           return "continue";
@@ -427,13 +448,13 @@ export async function prepareTurnAttachments(input: {
     );
     if (referencesChanged && input.persistUploadedReferences) {
       if ((await input.persistUploadedReferences(draftAttachments)) === "abandon") {
-        await releaseCreatedUploadsQuietly(environmentId, createdAttachmentIds);
+        await releaseCreatedUploadsQuietly(environmentId, createdAttachmentIds, input.writeGate);
         return { status: "abandoned" };
       }
     }
     return ready(uploadedAttachments, pendingAttachmentIds, draftAttachments);
   } catch (error) {
-    await releaseCreatedUploadsQuietly(environmentId, createdAttachmentIds);
+    await releaseCreatedUploadsQuietly(environmentId, createdAttachmentIds, input.writeGate);
     if (controller.signal.aborted) return { status: "abandoned" };
     throw error;
   } finally {

@@ -212,6 +212,84 @@ export const KanbanAskBlock = Schema.Union([
 ]);
 export type KanbanAskBlock = typeof KanbanAskBlock.Type;
 
+/** What stands in for a block of a kind this build doesn't know. */
+export const KANBAN_UNKNOWN_BLOCK_TEXT = "A part here can't be shown in this version of Robob.";
+
+const blockTag = (raw: unknown): string | null =>
+  typeof raw === "object" &&
+  raw !== null &&
+  "_tag" in raw &&
+  typeof (raw as { _tag: unknown })._tag === "string"
+    ? (raw as { _tag: string })._tag
+    : null;
+
+let readsUnknownBlocks = false;
+
+/**
+ * Lets this process read a card or a message that carries a block of a kind
+ * its build doesn't know. For the apps only (the board client turns it on):
+ * an app can be older than its server, and must not lose a whole card to one
+ * new kind of block. The server never turns it on. It stores what it reads,
+ * so it reads strictly, as it always has: a stored block it doesn't know is
+ * refused, and nothing that stands in for one can reach a feed, a tool reply,
+ * a wake note or a write.
+ */
+export const tolerateUnknownKanbanBlocks = (on = true): void => {
+  readsUnknownBlocks = on;
+};
+
+/**
+ * Runs one read with unknown blocks stood in for, then puts the setting back
+ * as it was. `read` must finish before it returns (a synchronous decode): the
+ * setting is this process's, so nothing else may run while it is on. For an
+ * app's own reads of what a server sent over HTTP.
+ */
+export const readingUnknownKanbanBlocks = <A>(read: () => A): A => {
+  const before = readsUnknownBlocks;
+  readsUnknownBlocks = true;
+  try {
+    return read();
+  } finally {
+    readsUnknownBlocks = before;
+  }
+};
+
+/**
+ * A block as it is read back from a card or a message. In an app that has
+ * turned `tolerateUnknownKanbanBlocks` on, a block of a kind this build
+ * doesn't know (a newer server's) decodes as a line of text saying so, in the
+ * same place, instead of failing: the indexes a field or an option points at
+ * stay right, and the rest of the card or message still loads. The line holds
+ * nothing of the block it stands for. An app only reads cards and messages;
+ * what it sends is checked by `KanbanBlockInput`, which stays closed. A block
+ * of a known kind is checked as before, everywhere.
+ */
+const readBlock = <S extends Schema.Top>(block: S, known: ReadonlyArray<string>) =>
+  Schema.Unknown.pipe(
+    Schema.decodeTo(
+      block,
+      SchemaTransformation.transform<S["Encoded"], unknown>({
+        decode: (raw) => {
+          const tag = blockTag(raw);
+          return readsUnknownBlocks && tag !== null && !known.includes(tag)
+            ? ({ _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT } as S["Encoded"])
+            : (raw as S["Encoded"]);
+        },
+        encode: (encoded) => encoded,
+      }),
+    ),
+  );
+
+/**
+ * Every block kind this build knows. A kind it knows is checked against the
+ * place it sits in, so an ask still can't hold a pick block; only a kind it
+ * has never heard of is stood in for.
+ */
+const KNOWN_BLOCK_TAGS = ["md", "collapse", "html", "choice", "card", "image", "attachment"];
+
+const KanbanBlockRead = readBlock(KanbanBlock, KNOWN_BLOCK_TAGS);
+const KanbanAskBlockRead = readBlock(KanbanAskBlock, KNOWN_BLOCK_TAGS);
+
 /**
  * Kinds with a ready layout and ready response parts. A kind is a label, not a
  * closed list: any other string is valid, and clients render every ask from
@@ -497,7 +575,7 @@ export const KanbanOwnerAsk = Schema.Struct({
    * files. On the card a big md, collapse or html body is a stub (`truncated`,
    * `fullBytes`); the single-ask read returns them whole. Absent means none.
    */
-  blocks: Schema.optional(Schema.Array(KanbanAskBlock)),
+  blocks: Schema.optional(Schema.Array(KanbanAskBlockRead)),
 });
 export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
 
@@ -1860,7 +1938,7 @@ export const KanbanMessage = Schema.Struct({
   author: KanbanActor,
   /** Display name at post time ("Evaluator", "U1-U4 union reader", "Cert check"). */
   authorName: Schema.String,
-  blocks: Schema.Array(KanbanBlock),
+  blocks: Schema.Array(KanbanBlockRead),
   answers: Schema.Array(KanbanAnswer),
   createdAt: IsoDateTime,
   /** Set on a message that belongs to one ask's discussion (`q1`, ... on the discussion's card). */
@@ -1916,6 +1994,16 @@ export const KanbanAskFeed = Schema.Struct({
   closed: Schema.Array(KanbanAskFeedItem),
 });
 export type KanbanAskFeed = typeof KanbanAskFeed.Type;
+
+/** One ask as the single-ask read sends it: its blocks whole, and where it sits. */
+export const KanbanAskDetail = Schema.Struct({
+  boardId: KanbanBoardId,
+  cardId: KanbanCardId,
+  cardNumber: PositiveInt,
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  ask: KanbanOwnerAsk,
+});
+export type KanbanAskDetail = typeof KanbanAskDetail.Type;
 
 export const KanbanParticipant = Schema.Struct({
   actor: KanbanActor,
