@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, lease, node_version, pool, ssh_sync
+from . import api, capacity, lease, node_version, pool, ssh_sync
 from . import prune
 from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
@@ -894,6 +894,9 @@ class Runner:
         self.started = False
         self.killed = False
         self.lease_row = None
+        self.cold_boxes: set[str] = set()
+        self.cold_moved = False
+        self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
 
     def record(self, **kw):
@@ -911,6 +914,7 @@ class Runner:
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
         wait_images = needs_image_wait(cmd_text, me["repo_root"])
+        self.wait_images = wait_images
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
                        log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
@@ -925,23 +929,33 @@ class Runner:
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        for attempt in (1, 2):
-            row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+        dead_attempts = 0
+        replacement = None
+        while True:
+            options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
+            row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
+                                              run_id=self.run_id, **options)
             self.lease_row = row
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             try:
-                self._prepare_box(con, a, rdir, env_file, body)
+                replacement = self._prepare_box(con, a, rdir, env_file, body)
+                if replacement is not None:
+                    pool.release_guard(row)
+                    self.lease_row, self.box = replacement, replacement['box_id']
+                    continue
                 break
             except lease.DeadMount as e:
+                replacement = None
+                dead_attempts += 1
                 dead = self.box
                 self.record(box_id=None)  # our run row must not point at the box we stop
                 lease.set_aside_dead_mount(con, dead, e.reason)
                 pool.release_guard(row)
                 self.lease_row = self.box = None
-                if attempt == 2:
+                if dead_attempts == 2:
                     raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
                                       "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
                 say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
@@ -987,13 +1001,46 @@ class Runner:
                                           f"cmd={cmd_text[:200]}")
         return row
 
-    def _prepare_box(self, con, a, rdir, env_file, body) -> None:
+    def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
         # The probe goes before prune: prune's ssh hangs on a dead filesystem.
-        reason = ssh_sync.probe_home(self.box)
+        forced_cold = self.lease_row.get('_cold_resume')
+        reason, home_s = ssh_sync.probe_home(self.box, measure_write=not forced_cold)
         if reason:
             raise lease.DeadMount(self.box, reason)
-        prune.run(con, self.box, rdir)
+        docker_s = ssh_sync.probe_docker_root(self.box) if self.wait_images and not forced_cold else None
+        pruned = prune.run(con, self.box, rdir)
+        threshold = capacity.setting('OFFBOX_COLD_HOME_SECONDS', 5)
+        if forced_cold or pruned.timed_out or any(s is not None and s > threshold for s in (home_s, docker_s)):
+            self.cold_boxes.add(self.box)
+            resumed = self.lease_row.get('_resumed_at')
+            if resumed is None:
+                last = con.execute("SELECT MAX(ts) FROM events WHERE box_id=? AND kind='lease_resume'",
+                                   (self.box,)).fetchone()
+                resumed = last[0]
+            since = f'{max(0, now() - resumed):.1f}s after resume' if resumed is not None else 'resume time unknown'
+            home = f'{home_s:.3f}s' if home_s is not None else 'unknown'
+            docker = f'{docker_s:.3f}s' if docker_s is not None else 'unknown'
+            event(con, self.box, 'cold_home', f'home {home}, docker {docker}, {since}; '
+                  f'prune_timeout={int(pruned.timed_out)} resume={forced_cold or "ordinary"}')
+            # A failed existence check proves nothing; only exit 1 means a first push is safe to move.
+            missing = False
+            if not self.cold_moved and not a.no_sync:
+                try:
+                    exists = ssh_sync.ssh(self.box, 'test -d "$HOME"/' + shlex.quote(rdir), timeout=10)
+                    missing = exists.returncode == 1
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            if missing:
+                replacement = pool.try_warm(self.me, self.lease_row['size'], self.lease_row.get('source'),
+                                            self.cold_boxes, self.run_id)
+                if replacement is not None:
+                    self.cold_moved = True
+                    say(f'{self.box} was just resumed and its disk is still loading; '
+                        f'using running box {replacement["box_id"]} instead')
+                    return replacement
+            say(f'{self.box} was just resumed and its disk is still loading; the first sync, installs and Docker '
+                'databases on it can be slow for 5-25 min. For long runs use --bg + offbox wait.')
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
         tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))

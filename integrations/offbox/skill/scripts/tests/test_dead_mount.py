@@ -46,8 +46,8 @@ class DeadMountTests(Isolated):
         rn = self.runner()
         stack = self.stack
         acquire = stack.enter_context(patch.object(runs.pool, "acquire", side_effect=rows))
-        stack.enter_context(patch.object(runs.ssh_sync, "probe_home", side_effect=probes))
-        prune = stack.enter_context(patch.object(runs.prune, "run", return_value=0))
+        stack.enter_context(patch.object(runs.ssh_sync, "probe_home", side_effect=[(reason, None) for reason in probes]))
+        prune = stack.enter_context(patch.object(runs.prune, "run", return_value=runs.prune.Result()))
         push = stack.enter_context(patch.object(runs.ssh_sync, "push", side_effect=pushes))
         stack.enter_context(patch.object(runs.ssh_sync, "put_file"))
         stack.enter_context(patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]))
@@ -68,13 +68,13 @@ class DeadMountTests(Isolated):
         dead = subprocess.CompletedProcess([], 1, b"", ENOTCONN_CHDIR.encode())
         denied = subprocess.CompletedProcess([], 1, b"", b"Permission denied")
         with patch.object(ssh_sync, "ssh", return_value=ok):
-            self.assertIsNone(ssh_sync.probe_home("bxA"))
+            self.assertIsNone(ssh_sync.probe_home("bxA")[0])
         with patch.object(ssh_sync, "ssh", return_value=dead):
-            self.assertIn("Transport endpoint is not connected", ssh_sync.probe_home("bxA"))
+            self.assertIn("Transport endpoint is not connected", ssh_sync.probe_home("bxA")[0])
         with patch.object(ssh_sync, "ssh", return_value=denied):
-            self.assertIsNone(ssh_sync.probe_home("bxA"))
+            self.assertIsNone(ssh_sync.probe_home("bxA")[0])
         with patch.object(ssh_sync, "ssh", side_effect=subprocess.TimeoutExpired("ssh", 45)):
-            self.assertIsNone(ssh_sync.probe_home("bxA"))
+            self.assertIsNone(ssh_sync.probe_home("bxA")[0])
 
     def test_probe_failure_sets_box_aside_and_uses_next_box(self):
         rn, acquire, prune, push, stop, cmd = self.run_start(
@@ -122,8 +122,8 @@ class DeadMountTests(Isolated):
         push_plain = OffboxError("rsync to bxA failed (12): connection unexpectedly closed")
         rn = self.runner()
         with patch.object(runs.pool, "acquire", side_effect=rows), \
-                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
-                patch.object(runs.prune, "run", return_value=0), \
+                patch.object(runs.ssh_sync, "probe_home", return_value=(None, None)), \
+                patch.object(runs.prune, "run", return_value=runs.prune.Result()), \
                 patch.object(runs.ssh_sync, "put_file", side_effect=[env_dead, None]), \
                 patch.object(runs.ssh_sync, "push", side_effect=[push_plain, {}]), \
                 patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \
@@ -153,8 +153,8 @@ class DeadMountTests(Isolated):
         rn = self.runner()
         row = dict(self.lease_row('bxA'), remote_dir='w/r')
         with patch.object(runs.pool, "acquire", return_value=row) as acquire, \
-                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
-                patch.object(runs.prune, "run", return_value=0), \
+                patch.object(runs.ssh_sync, "probe_home", return_value=(None, None)), \
+                patch.object(runs.prune, "run", return_value=runs.prune.Result()), \
                 patch.object(runs.ssh_sync, "put_file"), \
                 patch.object(runs.ssh_sync, "push", side_effect=err), \
                 patch.object(lease.api, "stop") as stop:
