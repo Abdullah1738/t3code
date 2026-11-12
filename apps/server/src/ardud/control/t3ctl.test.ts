@@ -2,13 +2,95 @@
 import * as NodeAssert from "node:assert/strict";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { test } from "@effect/vitest";
 
 // @ts-expect-error plain ESM module without declarations
-import { checkLive } from "./t3ctl.mjs";
+import { checkLive, ignoreMacosTypeOfServiceEinval } from "./t3ctl.mjs";
+
+test("the macOS QoS guard swallows only Error EINVAL and preserves socket calls", () => {
+  let error: unknown = Object.assign(new Error("setTypeOfService EINVAL"), { code: "EINVAL" });
+  const socket = new NodeNet.Socket();
+  const prototype = {
+    setTypeOfService(this: NodeNet.Socket, typeOfService: number) {
+      NodeAssert.equal(this, socket);
+      NodeAssert.equal(typeOfService, 0);
+      if (error !== undefined) throw error;
+      return "success";
+    },
+  };
+  ignoreMacosTypeOfServiceEinval("darwin", prototype);
+  NodeAssert.equal(prototype.setTypeOfService.call(socket, 0), socket);
+
+  error = Object.assign(new Error("setTypeOfService EPERM"), { code: "EPERM" });
+  NodeAssert.throws(
+    () => prototype.setTypeOfService.call(socket, 0),
+    (thrown) => thrown === error,
+  );
+  error = { code: "EINVAL" };
+  NodeAssert.throws(
+    () => prototype.setTypeOfService.call(socket, 0),
+    (thrown) => thrown === error,
+  );
+  error = undefined;
+  NodeAssert.equal(prototype.setTypeOfService.call(socket, 0), "success");
+});
+
+test("the QoS guard changes nothing off macOS or without the socket method", () => {
+  const error = Object.assign(new Error("setTypeOfService EINVAL"), { code: "EINVAL" });
+  const prototype = {
+    setTypeOfService() {
+      throw error;
+    },
+  };
+  const original = prototype.setTypeOfService;
+  for (const platform of ["linux", "win32"]) {
+    ignoreMacosTypeOfServiceEinval(platform, prototype);
+    NodeAssert.equal(prototype.setTypeOfService, original);
+    NodeAssert.throws(
+      () => prototype.setTypeOfService(),
+      (thrown) => thrown === error,
+    );
+  }
+  const withoutMethod = {};
+  ignoreMacosTypeOfServiceEinval("darwin", withoutMethod);
+  NodeAssert.equal(Object.hasOwn(withoutMethod, "setTypeOfService"), false);
+});
+
+test("health reports a closed port without a stack trace", async () => {
+  const server = NodeNet.createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no test server address");
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  const result = NodeChildProcess.spawnSync(
+    process.execPath,
+    [
+      NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
+      "health",
+      "--request-timeout",
+      "5",
+    ],
+    {
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        T3_CONTROL_URL: `http://127.0.0.1:${address.port}`,
+        T3_CONTROL_TOKEN: "test-secret-not-for-output",
+      },
+    },
+  );
+  NodeAssert.equal(result.error, undefined);
+  NodeAssert.equal(result.status, 1);
+  NodeAssert.equal(result.stdout, "");
+  NodeAssert.equal(result.stderr, "fetch failed\n");
+});
 
 test("live checks the running build's ancestry and exits for each outcome", async ({
   onTestFinished,
