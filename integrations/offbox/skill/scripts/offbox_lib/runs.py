@@ -17,10 +17,10 @@ from pathlib import Path
 
 from . import api, capacity, identity, lease, node_version, pool, ssh_sync
 from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
+from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
 
-BG_TTL_S = 6 * 3600
+BG_TTL_S = ORPHAN_RUN_MAX_S
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",

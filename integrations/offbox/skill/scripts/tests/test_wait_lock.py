@@ -54,6 +54,7 @@ class WaitLockTests(Isolated):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', common.LOGS_DIR))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         # The wait polls boat's status for a lock-held run. Offline: the default answer is "still running"; a test that
         # needs boat to say the process ended sets its own `_ended`. Any real request is a failure.
         self.ended = self.stack.enter_context(patch.object(runs, '_ended', return_value=None))
