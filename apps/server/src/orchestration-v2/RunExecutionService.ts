@@ -30,6 +30,7 @@ import {
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -37,6 +38,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
@@ -1025,6 +1027,8 @@ export const layer: Layer.Layer<
           }),
         );
         const rootTerminalSeen = yield* Ref.make(false);
+        const ingestionFailure = yield* Ref.make<Cause.Cause<unknown> | null>(null);
+        const shutdownCleanupDeadline = yield* Deferred.make<Cause.Cause<unknown>>();
         const rootRunFinalized = yield* Ref.make(false);
         const providerThreadOwnerLost = yield* Ref.make(false);
         const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
@@ -1158,10 +1162,9 @@ export const layer: Layer.Layer<
           }
           yield* Ref.set(rootRunFinalized, true);
         });
-        // Runs for every provider event, including streamed text updates; avoid a per-event span.
-        const trackChildLifecycle = Effect.fnUntraced(function* (
+        // Observe every event before persistence: a failed write must not pin native liveness.
+        const observeNativeLifecycle = Effect.fnUntraced(function* (
           event: ProviderAdapter.ProviderAdapterV2Event,
-          deliverable: boolean,
         ) {
           const routing = yield* Ref.get(eventRouting);
           if (event.type === "provider_turn.updated") {
@@ -1171,11 +1174,9 @@ export const layer: Layer.Layer<
             if (!isRoot) {
               yield* Ref.update(activeChildProviderTurns, (current) => {
                 const next = new Set(current);
-                if (isTerminalProviderTurnStatus(event.providerTurn.status)) {
+                if (isTerminalProviderTurnStatus(event.providerTurn.status))
                   next.delete(event.providerTurn.id);
-                } else {
-                  next.add(event.providerTurn.id);
-                }
+                else next.add(event.providerTurn.id);
                 return next;
               });
             }
@@ -1188,14 +1189,45 @@ export const layer: Layer.Layer<
             if (belongsToRootRun || belongsToOwnedChildThread) {
               yield* Ref.update(activeChildSubagents, (current) => {
                 const next = new Map(current);
-                if (isSettledSubagentStatus(event.subagent.status)) {
-                  next.delete(event.subagent.id);
-                } else {
-                  next.set(event.subagent.id, event.subagent.threadId);
-                }
+                if (isSettledSubagentStatus(event.subagent.status)) next.delete(event.subagent.id);
+                else next.set(event.subagent.id, event.subagent.threadId);
                 return next;
               });
             }
+          }
+          if (event.type === "turn_item.updated") {
+            const belongsToRootRun = event.turnItem.runId === input.run.id;
+            const belongsToOwnedChildThread =
+              event.turnItem.threadId !== input.run.threadId &&
+              routing.ownedThreadIds.has(event.turnItem.threadId);
+            const belongsToInheritedBackgroundItem =
+              event.turnItem.threadId === input.run.threadId &&
+              event.turnItem.runId !== null &&
+              inheritedBackgroundTurnItemsById.get(event.turnItem.id) === event.turnItem.runId;
+            if (
+              backgroundCapableTurnItemTypes.has(event.turnItem.type) &&
+              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem)
+            ) {
+              yield* Ref.update(activeBackgroundTurnItems, (current) => {
+                const next = new Set(current);
+                if (isSettledTurnItemStatus(event.turnItem.status)) next.delete(event.turnItem.id);
+                else next.add(event.turnItem.id);
+                return next;
+              });
+            }
+          }
+        });
+        // Runs for every provider event, including streamed text updates; avoid a per-event span.
+        const trackChildLifecycle = Effect.fnUntraced(function* (
+          event: ProviderAdapter.ProviderAdapterV2Event,
+          deliverable: boolean,
+        ) {
+          const routing = yield* Ref.get(eventRouting);
+          if (event.type === "subagent.updated") {
+            const belongsToRootRun = event.subagent.runId === input.run.id;
+            const belongsToOwnedChildThread =
+              event.subagent.threadId !== input.run.threadId &&
+              routing.ownedThreadIds.has(event.subagent.threadId);
             // Preserve childThreadId linkage for the root-run lifetime even after the subagent
             // row terminalizes, so open child-thread nodes can still be proven linked on a
             // later root interrupt. A provider records nested native subagents on the child
@@ -1248,24 +1280,6 @@ export const layer: Layer.Layer<
             const belongsToOwnedChildThread =
               event.turnItem.threadId !== input.run.threadId &&
               routing.ownedThreadIds.has(event.turnItem.threadId);
-            const belongsToInheritedBackgroundItem =
-              event.turnItem.threadId === input.run.threadId &&
-              event.turnItem.runId !== null &&
-              inheritedBackgroundTurnItemsById.get(event.turnItem.id) === event.turnItem.runId;
-            if (
-              backgroundCapableTurnItemTypes.has(event.turnItem.type) &&
-              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem)
-            ) {
-              yield* Ref.update(activeBackgroundTurnItems, (current) => {
-                const next = new Set(current);
-                if (isSettledTurnItemStatus(event.turnItem.status)) {
-                  next.delete(event.turnItem.id);
-                } else {
-                  next.add(event.turnItem.id);
-                }
-                return next;
-              });
-            }
             if (
               belongsToOwnedChildThread &&
               (event.turnItem.runId === null || belongsToRootRun) &&
@@ -1304,6 +1318,7 @@ export const layer: Layer.Layer<
           if (
             terminal !== null &&
             terminal.status !== "completed" &&
+            (yield* Ref.get(ingestionFailure)) === null &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1323,6 +1338,7 @@ export const layer: Layer.Layer<
           if (
             terminal !== null &&
             terminal.status !== "completed" &&
+            (yield* Ref.get(ingestionFailure)) === null &&
             !childTurnsContinue(terminal)
           ) {
             return true;
@@ -1359,25 +1375,61 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
-        // ardud: stop a provider turn whose events nobody reads any more.
-        // Only while no root terminal arrived: a settled turn has nothing left.
+        const orphanStopConfirmed = yield* Ref.make(false);
+        const nativeEndConfirmed = shouldStopProviderEventIngestion;
+        const nativeEndObserved = yield* Deferred.make<void>();
+        let orphanRecovery: Fiber.Fiber<void, ProviderAdapter.ProviderAdapterV2Error> | undefined;
         const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
           function* (providerThread: OrchestrationV2ProviderThread) {
-            if (yield* Ref.get(rootTerminalSeen)) return;
-            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-            if (providerTurnId === null) return;
-            yield* input.session.interruptTurn({ providerThread, providerTurnId }).pipe(
-              Effect.timeout("30 seconds"),
-              Effect.catchCause((interruptCause) =>
-                Effect.logWarning("orchestration V2 could not stop an orphaned provider turn", {
+            while (!(yield* nativeEndConfirmed) && !(yield* Ref.get(orphanStopConfirmed))) {
+              if (input.shouldFinalizeRun !== undefined) {
+                const current = yield* input
+                  .shouldFinalizeRun()
+                  .pipe(Effect.timeout("10 seconds"), Effect.exit);
+                if (Exit.isSuccess(current) && !current.value) return;
+                if (Exit.isFailure(current)) {
+                  yield* Effect.sleep("1 second");
+                  continue;
+                }
+              }
+              const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (providerTurnId === null) {
+                yield* Effect.sleep("1 second");
+                continue;
+              }
+              const stopped = yield* input.session
+                .interruptTurn({ providerThread, providerTurnId })
+                .pipe(Effect.timeout("30 seconds"), Effect.exit);
+              if (Exit.isSuccess(stopped)) {
+                yield* Ref.set(orphanStopConfirmed, true);
+                return;
+              }
+              yield* Effect.logWarning(
+                "orchestration V2 could not stop an orphaned provider turn",
+                {
                   runId: input.run.id,
                   threadId: input.run.threadId,
                   providerTurnId,
-                  cause: interruptCause,
-                }),
-              ),
-            );
+                  cause: stopped.cause,
+                },
+              );
+              // Recovery is lineage-scoped: killing the shared app-server would also
+              // terminate unrelated threads that still own healthy turns.
+              yield* Effect.sleep("1 second");
+            }
           },
+          (effect) =>
+            effect.pipe(
+              Effect.raceFirst(Deferred.await(nativeEndObserved)),
+              Effect.raceFirst(
+                input.session.awaitSessionExit === undefined
+                  ? Effect.never
+                  : input.session.awaitSessionExit.pipe(
+                      Effect.retry({ schedule: Schedule.spaced("1 second") }),
+                      Effect.andThen(Ref.set(orphanStopConfirmed, true)),
+                    ),
+              ),
+            ),
         );
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.mapEffect((event) =>
@@ -1458,6 +1510,12 @@ export const layer: Layer.Layer<
           Stream.tap(({ event, accepted }) =>
             Effect.gen(function* () {
               if (!accepted) return;
+              yield* observeNativeLifecycle(event);
+              // Native completion remains termination evidence even if persisting it fails.
+              if (event.type === "turn.terminal") {
+                yield* Ref.set(rootTerminalSeen, true);
+                yield* Ref.set(terminalEvent, event);
+              }
               let storedEventCount = 0;
               const deliveredEvent = filterAssistantEvent(
                 event,
@@ -1546,22 +1604,50 @@ export const layer: Layer.Layer<
               if (event.type === "turn.terminal") {
                 yield* Ref.set(terminalEvent, event);
                 yield* Ref.set(rootTerminalSeen, true);
-                yield* finalizeRootRun(event);
+                if ((yield* Ref.get(ingestionFailure)) === null) yield* finalizeRootRun(event);
               }
               yield* trackChildLifecycle(event, deliveredEvent !== null);
-            }),
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  if (Cause.hasInterruptsOnly(cause)) return yield* Effect.failCause(cause);
+                  yield* Ref.update(ingestionFailure, (previous) => previous ?? cause);
+                  if (yield* nativeEndConfirmed) return;
+                  if (orphanRecovery === undefined) {
+                    // Stop can fail after a native turn ends. Its terminal must still
+                    // reach this consumer while the recovery fiber retries the RPC.
+                    orphanRecovery = yield* stopOrphanedProviderTurn(
+                      yield* Ref.get(latestProviderThread),
+                    ).pipe(
+                      Effect.andThen(Deferred.succeed(shutdownCleanupDeadline, cause)),
+                      Effect.asVoid,
+                      Effect.forkScoped,
+                    );
+                  }
+                }),
+              ),
+            ),
           ),
           // Also after events this run does not accept, such as a child handed to another run.
           Stream.tap(() =>
             Effect.gen(function* () {
+              if ((yield* Ref.get(ingestionFailure)) !== null && (yield* nativeEndConfirmed))
+                yield* Deferred.succeed(nativeEndObserved, undefined);
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+          Stream.interruptWhen(
+            Deferred.await(shutdownCleanupDeadline).pipe(
+              Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
+            ),
+          ),
           Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
+              const failure = yield* Ref.get(ingestionFailure);
+              if (failure !== null) return yield* Effect.failCause(failure);
               const terminal = yield* Ref.get(terminalEvent);
               if (terminal === null) {
                 // A session release interrupts or fails the stream; a clean
@@ -1595,6 +1681,11 @@ export const layer: Layer.Layer<
                 const providerThread = yield* Ref.get(latestProviderThread);
                 const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
                 const openSubagents = yield* Ref.get(openRunOwnedSubagents);
+                // Failing the run revokes its MCP authority. Deliver Stop first so
+                // a live provider cannot keep working after that authority is gone.
+                if (orphanRecovery !== undefined) yield* Fiber.join(orphanRecovery);
+                else if (!(yield* nativeEndConfirmed))
+                  yield* stopOrphanedProviderTurn(providerThread);
                 yield* writeFinalRunEvents({
                   run: input.run,
                   rootNode: input.rootNode,
@@ -1615,14 +1706,7 @@ export const layer: Layer.Layer<
                   ),
                   failureItemPersisted: false,
                   refreshAfterTurn,
-                }).pipe(
-                  // ardud: the run is failed now, but the provider turn may
-                  // still be running with nobody reading its events. Stop it
-                  // so its process does not run on orphaned and the next send
-                  // is not refused as "previous turn is still running"
-                  // (9 Nov incident). Runs even if the write failed.
-                  Effect.ensuring(stopOrphanedProviderTurn(providerThread)),
-                );
+                });
               }).pipe(
                 Effect.mapError(
                   (writeCause) =>
@@ -1638,6 +1722,7 @@ export const layer: Layer.Layer<
           // ardud: provider ingest can wait; it must not inherit a foreground lane from
           // the request that started the turn.
           NodeSqliteClient.backgroundReads,
+          Effect.scoped,
           Effect.forkDetach,
         );
 

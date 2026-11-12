@@ -591,6 +591,8 @@ export interface ProviderAdapterV2SessionRuntime {
    * thread keeps showing Waiting.
    */
   readonly backgroundTasksEndWithProcess?: true;
+  /** Observes process exit without stopping it; shared sessions may have unrelated live owners. */
+  readonly awaitSessionExit?: Effect.Effect<void, ProviderAdapterV2Error>;
   readonly getModelContextWindow?: (
     modelSelection: ModelSelection,
     cwd?: string | null,

@@ -47,6 +47,7 @@ export class CodexAppServerClient extends Context.Service<
   CodexAppServerClient,
   {
     readonly raw: CodexAppServerClientRaw;
+    readonly awaitInputEnd: Effect.Effect<void>;
     /** Completes with the classified error once the App Server connection ends. */
     readonly awaitTermination: Effect.Effect<CodexError.CodexAppServerError>;
     readonly request: <M extends CodexRpc.ClientRequestMethod>(
@@ -239,6 +240,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     );
 
   return CodexAppServerClient.of({
+    awaitInputEnd: transport.awaitInputEnd,
     awaitTermination: transport.termination,
     raw: {
       notifications: transport.incomingNotifications,
