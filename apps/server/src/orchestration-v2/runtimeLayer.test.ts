@@ -3239,7 +3239,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                 checks: [],
                 mergeability,
               };
-            }),
+            }).pipe(Effect.orDie),
           activity: () =>
             Effect.succeed({
               comments: [],
