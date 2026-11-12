@@ -249,6 +249,7 @@ EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue 
 EXIT_HOME_DOWN = 93            # person-box work while the home server is down: it waits, it never goes to Boat
 EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
+EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)

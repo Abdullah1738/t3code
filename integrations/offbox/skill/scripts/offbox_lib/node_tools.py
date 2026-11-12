@@ -16,10 +16,12 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
     local dir=$(pwd -P) bins= rest= entry tail=$PATH sep=
     while :; do
       entry=${tail%%:*}
-      case ":$__offbox_repo_bins" in
-        *":$entry:"*) ;;
-        *) rest="$rest$sep$entry"; sep=: ;;
-      esac
+      if [ -z "${__offbox_toolchain_bin:-}" ] || [ "$entry" != "$__offbox_toolchain_bin" ]; then
+        case ":$__offbox_repo_bins" in
+          *":$entry:"*) ;;
+          *) rest="$rest$sep$entry"; sep=: ;;
+        esac
+      fi
       [[ $tail == *:* ]] || break
       tail=${tail#*:}
     done
@@ -32,7 +34,7 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
         done ;;
     esac
     __offbox_repo_bins=$bins
-    export PATH="$bins$rest"
+    export PATH="${__offbox_toolchain_bin:+$__offbox_toolchain_bin:}$bins$rest"
     hash -r 2>/dev/null || :
     set +h
   }

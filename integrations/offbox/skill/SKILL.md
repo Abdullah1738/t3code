@@ -149,12 +149,13 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
-- Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
+- Node version: offbox selects the newest installed Node satisfying the nearest `.nvmrc`/`.node-version` and `package.json` `engines.node` together. If none matches, it bootstraps nvm and installs the newest published match from official Node binaries, checking SHASUMS256 before temporary extraction and activation. It prints `offbox: node vX (...)`; provisioning or activation failure stops before the command with exit 99. Repos without a usable Node pin keep their existing behaviour.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
+- pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
-  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 22 + 24, system Node 20, warm npm cache,
+  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 20, 22 (>=22.13) + 24, warm npm cache,
   large), `crpko-harness` (large, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
 - On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, AWS CLI v2, GNU time (`/usr/bin/time`) and the Terraform version pinned in the checkout's `terraform-dev.yml`. Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby is installed by apt at `/usr/bin/ruby`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
@@ -347,6 +348,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
+- **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.

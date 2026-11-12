@@ -1,5 +1,6 @@
 """Node version pick: parser cases, repo lookup, and the real bash block (no boat calls)."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -47,7 +48,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(p("16 - 18"), [(K(16), K(19))])
         self.assertEqual(p("16.2.1 - 18.3"), [(K(16, 2, 1), K(18, 4))])
         self.assertIsNone(p("foo"))
-        self.assertIsNone(p(">=25 <24"))
+        self.assertEqual(p(">=25 <24"), [])
         self.assertEqual(p("^20.19.4 || ^22.13 || ^24.3"),
                          [(K(20, 19, 4), K(21)), (K(22, 13), K(23)), (K(24, 3), K(25))])
         self.assertIsNone(p(""))
@@ -90,12 +91,12 @@ class WantTests(unittest.TestCase):
         self.assertIn('.nvmrc 22.13.0', label)
         self.assertIn('package.json engines >=22.13 <23', label)
 
-    def test_disjoint_uses_engines_alone(self):
+    def test_disjoint_constraints_cannot_select_node(self):
         self.write('.nvmrc', '20.11.1\n')
         self.pkg('>=22.13 <23')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
-        self.assertEqual(label, 'package.json engines >=22.13 <23')
+        self.assertEqual(ranges, [])
+        self.assertIn('.nvmrc 20.11.1', label)
 
     def test_node_version_file_used_without_nvmrc(self):
         self.write('.node-version', '22.13.0\n')
@@ -146,7 +147,12 @@ class BlockRunTests(unittest.TestCase):
                     patch.object(runs, 'LDCACHE_REPAIR', ':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
                                             steps=steps, node=blk)
-            env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+            bindir = Path(home) / 'bin'
+            bindir.mkdir()
+            curl = bindir / 'curl'
+            curl.write_text('#!/bin/sh\nexit 18\n')
+            curl.chmod(0o755)
+            env = {'HOME': home, 'PATH': str(bindir) + ':/usr/bin:/bin'}
             return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=60)
 
     def test_range_picks_newest_fitting(self):
@@ -158,11 +164,11 @@ class BlockRunTests(unittest.TestCase):
         r = self.run_block('^24.13.1')
         self.assertEqual(r.stdout.strip(), 'v24.21.0')
 
-    def test_no_match_warns_and_keeps_path(self):
+    def test_no_match_stops_before_command(self):
         r = self.run_block('18', cmd_argv=['echo ran'])
-        self.assertIn('warning', r.stderr)
-        self.assertEqual(r.stdout.strip(), 'ran')
-        self.assertEqual(r.returncode, 0)
+        self.assertIn('nothing ran', r.stderr)
+        self.assertEqual(r.stdout.strip(), '')
+        self.assertEqual(r.returncode, 99)
 
     def test_exit_code_of_command_untouched(self):
         r = self.run_block('>=22.13 <23', cmd_argv=['exit 3'])
@@ -171,11 +177,119 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 4)
         self.assertIn('v22.23.2', r.stdout)
 
-    def test_no_nvm_dir_warns_and_command_runs(self):
+    def test_no_nvm_dir_stops_before_command(self):
         r = self.run_block('>=22.13 <23', cmd_argv=['echo ran'], nvm=False)
-        self.assertIn('warning', r.stderr)
-        self.assertEqual(r.stdout.strip(), 'ran')
-        self.assertEqual(r.returncode, 0)
+        self.assertIn('nothing ran', r.stderr)
+        self.assertEqual(r.stdout.strip(), '')
+        self.assertEqual(r.returncode, 99)
+
+class ProvisionTests(unittest.TestCase):
+    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); repo = root / 'repo'; repo.mkdir()
+            (repo / '.nvmrc').write_text(pin)
+            (repo / 'package.json').write_text(json.dumps({'engines': {'node': engine}}))
+            fake_nvm(tmp, installed)
+            bindir = root / 'bin'; bindir.mkdir()
+            node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
+            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.2 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
+            body = b'node archive fixture'
+            (root / 'archive').write_bytes(body)
+            digest = '0' * 64 if checksum_bad else hashlib.sha256(body).hexdigest()
+            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.23.2', 'v24.22.1')))
+            (root / 'nvm-fixture.sh').write_text(r'''
+nvm_get_download_slug() { echo node-$3-linux-x64; }
+nvm_get_artifact_compression() { echo tar.xz; }
+nvm() {
+  [ "$1" = install ] || return 88
+  [ "$2" = -b ] || return 89
+  mkdir -p "$NVM_DIR/versions/node/$3/bin"
+  [ "$NVM_FAIL" = 1 ] && return 1
+  printf '#!/bin/sh\necho %s\n' "$3" > "$NVM_DIR/versions/node/$3/bin/node"
+  chmod +x "$NVM_DIR/versions/node/$3/bin/node"
+}
+''')
+            curl = bindir / 'curl'; curl.write_text(r'''#!/bin/bash
+count=$(cat "$HOME/count" 2>/dev/null || echo 0); count=$((count+1)); echo "$count" > "$HOME/count"
+case " $* " in *" --connect-timeout 20 --speed-limit 30720 --speed-time 60 --max-time 600 "*) ;; *) exit 88 ;; esac
+if [ "$CURL_FAIL" = always ] || { [ "$CURL_FAIL" = once ] && [ "$count" = 1 ]; }; then exit 18; fi
+while [ $# -gt 0 ]; do
+  case "$1" in https://*) url=$1 ;; -o) shift; out=$1 ;; esac
+  shift
+done
+case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$HOME/index.tab" "$out" ;; */SHASUMS256.txt) cp "$HOME/sums" "$out" ;; *.tar.xz) cp "$HOME/archive" "$out" ;; *) exit 88 ;; esac
+'''); curl.chmod(0o755)
+            script = node_version.block(node_version.want(repo, repo), require_nvm=require_nvm) + '\necho COMMAND_MARKER\nnode --version'
+            result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin',
+                'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry}, capture_output=True, text=True, timeout=15)
+            count = int((root / 'count').read_text()) if (root / 'count').exists() else 0
+            if fail:
+                self.assertFalse((root / '.nvm/versions/node/v20.20.2').exists())
+                self.assertFalse(list((root / '.nvm').glob('.offbox-stage.*')))
+            return result, count
+
+    def test_pin_provision_corpus(self):
+        for pin, engine, installed, expected in [
+            ('v20', '^20.19.0 || >=22.12.0 <23', ('v22.23.2', 'v24.22.1'), 'v20.20.2'),
+            ('v20', '^20.19.0 || >=22.12.0 <23', (), 'v20.20.2'),
+            ('22.13', '>=22.13 <23', (), 'v22.23.2'),
+        ]:
+            with self.subTest(pin=pin, installed=installed):
+                result, count = self.run_provision(pin, engine, installed)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'node {expected} (installed:', result.stderr)
+                self.assertIn('COMMAND_MARKER', result.stdout)
+                self.assertEqual(result.stdout.splitlines()[-1], expected)
+                self.assertEqual(count, 5)
+
+    def test_checksum_mismatch_cannot_reach_nvm_or_command(self):
+        result, _ = self.run_provision(checksum_bad=True)
+        self.assertEqual(result.returncode, 99)
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
+
+    def test_recipe_installs_nvm_node_even_if_system_matches(self):
+        result, count = self.run_provision(system='v20.20.2', require_nvm=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('(installed:', result.stderr)
+        self.assertEqual(count, 5)
+
+    def test_only_system_20_needs_no_network(self):
+        result, count = self.run_provision(system='v20.20.2', retry='always')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count, 0)
+
+    def test_nvm_failure_stops_before_command(self):
+        result, _ = self.run_provision(fail=True)
+        self.assertEqual(result.returncode, 99)
+        self.assertIn('nvm install v20.20.2 failed', result.stderr)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
+
+    def test_download_exhaustion_stops_before_command(self):
+        result, count = self.run_provision(retry='always')
+        self.assertEqual(result.returncode, 99)
+        self.assertEqual(count, 3)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
+
+    def test_impossible_or_disjoint_pin_stops_before_command(self):
+        for pin, engine in [('v19.999', '>=18'), ('v20', '>=22.13 <23'), ('v20', '>=22 <20'), ('v20', '^22 <20'), ('v20', '>=22.13 <22.12')]:
+            result, _ = self.run_provision(pin, engine)
+            self.assertEqual(result.returncode, 99)
+            self.assertNotIn('COMMAND_MARKER', result.stdout)
+            self.assertIn('no published Node satisfies', result.stderr)
+
+
+class RecipeTests(unittest.TestCase):
+    def test_crpko_node_uses_the_run_provisioner_for_all_required_versions(self):
+        from offbox_lib import bases
+        templates = Path(__file__).resolve().parents[2] / 'templates'
+        with patch.object(bases, 'TEMPLATES_DIR', templates):
+            script, _ = bases.recipe('crpko-node')
+        for label in ('crpko-node recipe 20', 'crpko-node recipe >=22.13 <23', 'crpko-node recipe 24'):
+            self.assertIn(label, script)
+        self.assertLess(script.index('nvm install -b'), script.index('# ---- recipe ----'))
+        self.assertIn('__offbox_archive_ok()', script)
+        self.assertIn('mv "$NVM_DIR/versions/node/', script)
 
 
 if __name__ == '__main__':
