@@ -835,5 +835,460 @@
     "command": "rg --files -- \"/Users/ardud/checkouts\"",
     "cwd": "/Users/ardud/checkouts",
     "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/{task-1,task-2}/src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace word"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/task-{1,2}/src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace word"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/{task-{1,2},other}/src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace word"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/{task-1}/src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace word"
+  },
+  {
+    "command": "rg --files \"/Users/ardud/checkouts/{task-1,task-2}/src\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted brace word"
+  },
+  {
+    "command": "{ rg --files /Users/ardud/checkouts; }",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "standalone group control"
+  },
+  {
+    "command": "echo \\; rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo ';' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\& rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '&' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\| rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '|' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\( rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '(' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\) rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo ')' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\{ rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '{' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\} rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '}' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\< rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '<' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo \\> rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "escaped operator"
+  },
+  {
+    "command": "echo '>' rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "quoted operator"
+  },
+  {
+    "command": "echo ; rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "real separator control"
+  },
+  {
+    "command": "echo & rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "real background control"
+  },
+  {
+    "command": "echo \\\\; rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "escaped backslash before real separator"
+  },
+  {
+    "command": "rg --files \"~/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "literal tilde"
+  },
+  {
+    "command": "rg --files '~/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "literal tilde"
+  },
+  {
+    "command": "rg --files \\~/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "literal tilde"
+  },
+  {
+    "command": "rg --files \"~\"/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "literal tilde"
+  },
+  {
+    "command": "rg --files \"~/\"checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "literal tilde"
+  },
+  {
+    "command": "rg --files ~/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "expanded home control"
+  },
+  {
+    "command": "rg --files ~/\"checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "expanded home control"
+  },
+  {
+    "command": "rg --files \"$HOME/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "expanded home control"
+  },
+  {
+    "command": "rg --files ${HOME}/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "expanded home control"
+  },
+  {
+    "command": "bash -c 'rg --files \"~/checkouts\"'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "nested literal tilde"
+  },
+  {
+    "command": "bash -c 'rg --files ~/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "nested expanded home control"
+  },
+  {
+    "command": "cd /tmp & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "cd /tmp && echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "cd /tmp || echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "cd /tmp && echo ok | cat & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "{ cd /tmp; } & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "(cd /tmp) & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "cd /tmp && { echo ok; } & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background cwd out of root"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts || echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && echo ok | cat & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "(cd /Users/ardud/checkouts) & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && { echo ok; } & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "background cwd into root"
+  },
+  {
+    "command": "export AGENT_GUARD_APPROVED=owner-approved & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background grant"
+  },
+  {
+    "command": "AGENT_GUARD_APPROVED=owner-approved & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background grant"
+  },
+  {
+    "command": "export AGENT_GUARD_APPROVED=owner-approved && echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background grant"
+  },
+  {
+    "command": "{ export AGENT_GUARD_APPROVED=owner-approved; } & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background grant"
+  },
+  {
+    "command": "unset AGENT_GUARD_APPROVED & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "background removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "export AGENT_GUARD_APPROVED= & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "background removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "unset AGENT_GUARD_APPROVED && echo ok & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "background removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "{ unset AGENT_GUARD_APPROVED; } & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "background removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "cd /tmp; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "foreground cwd control"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "foreground cwd control"
+  },
+  {
+    "command": "export AGENT_GUARD_APPROVED=owner-approved; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "foreground grant control"
+  },
+  {
+    "command": "unset AGENT_GUARD_APPROVED; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "foreground removal control",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && rg --files & echo ok",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "background search still checked"
+  },
+  {
+    "command": "echo { rg --files /Users/ardud/checkouts }",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace argument"
+  },
+  {
+    "command": "echo } rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace argument"
+  },
+  {
+    "command": "rg { src/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace argument"
+  },
+  {
+    "command": "rg --files {task-1,task-2}/src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "brace argument"
+  },
+  {
+    "command": "{} rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "adjacent brace word"
+  },
+  {
+    "command": "{{ rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "adjacent brace word"
+  },
+  {
+    "command": "echo {} rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "adjacent brace word"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/\"~\"/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "literal normalization"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/\\;/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "literal normalization"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/'$HOME'/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "literal normalization"
   }
 ]

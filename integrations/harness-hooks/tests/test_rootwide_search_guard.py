@@ -24,16 +24,13 @@ class RootwideSearchTests(unittest.TestCase):
 
     def test_native_adapters_and_code_mode_shell_calls(self):
         cases = json.loads(CORPUS.read_text())
-        with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {'HARNESS_HOOKS_STATE_DIR': state, 'AGENT_GUARD_APPROVED': ''}), patch.object(engine, 'resolve_identity', return_value={}), patch.object(engine, '_classify_offbox', return_value=None):
+        with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {'HOME': '/Users/ardud', 'HARNESS_HOOKS_STATE_DIR': state, 'AGENT_GUARD_APPROVED': ''}), patch.object(engine, 'resolve_identity', return_value={}), patch.object(engine, '_classify_offbox', return_value=None):
             for harness, adapter, tool, field in [('codex', codex, 'exec_command', 'cmd'), ('claude', claude, 'Bash', 'command'), ('codex', codex, 'mcp__shell__exec_command', 'cmd')]:
                 for case in cases:
-                    # The shared parser corpus covers synthetic HOME and env too;
-                    # these adapter probes exercise commands with the real cwd.
-                    if '~' in case['command'] or '$HOME' in case['command'] or '${HOME}' in case['command'] or case.get('approved'):
-                        continue
                     event = {'hook_event_name': 'PreToolUse', 'cwd': '/tmp', 'tool_name': tool,
                              'tool_input': {field: case['command'], 'workdir': case['cwd']}}
-                    result = engine.decide(event, harness)
+                    with patch.dict(os.environ, {guard.OVERRIDE: case.get('approved', '')}):
+                        result = engine.decide(event, harness)
                     with self.subTest(harness=harness, case=case):
                         self.assertEqual(result['context'].get('rule') == 'rootwide-search', bool(case['root']))
                         if case['root']:

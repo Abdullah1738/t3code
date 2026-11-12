@@ -125,7 +125,11 @@ def _path(value, cwd, home):
         value = home + value[1:]
     value = re.sub(r"\$\{HOME\}|\$HOME(?!\w)", lambda _: home, value)
     # Dynamic paths/globs are deliberately not guessed or expanded on disk.
-    if any(char in value for char in "$`*?\0"):
+    if any(char in value for char in "$`*?"):
+        return None
+    value = value.replace('\0tilde', '~').replace('\0dollar', '$').replace('\0literal:', '')
+    value = re.sub(r'\x00escaped([0-9a-f]+)__', lambda match: chr(int(match[1], 16)), value)
+    if '\0' in value:
         return None
     if not value.startswith("/") and cwd is None:
         return None
@@ -133,19 +137,31 @@ def _path(value, cwd, home):
 
 
 def _tokens(source):
-    # Preserve literal dollars/tildes in single quotes and escaped words. shlex
-    # otherwise loses the distinction between '$HOME' and "$HOME".
-    source = re.sub(r"'[^']*'|\\[^\n]", lambda m: m[0].replace("$", "\0dollar").replace("~", "\0tilde"), source)
+    # shlex removes quoting and escapes. Keep characters that would otherwise
+    # become expansions or command separators opaque until the word is read.
+    def literal(match):
+        value = match[0]
+        if value.startswith('"'):
+            return value.replace('\\$', '\0dollar').replace('~', '\0tilde')
+        if value.startswith("'"):
+            return value.replace('$', '\0dollar').replace('~', '\0tilde')
+        if value[1] in ';&|(){}<>':
+            return f'\0escaped{ord(value[1]):x}__'
+        return value.replace('$', '\0dollar').replace('~', '\0tilde')
+
+    source = re.sub(r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\[^\n]", literal, source)
     # _quoted_punctuation reserves NUL markers of its own; use a temporary
     # printable marker, then restore our non-expandable sentinels after lexing.
     source = source.replace("\0", "__rootguard_literal_")
     source, quoted = _quoted_punctuation(source)
-    lexer = shlex.shlex(source, posix=True, punctuation_chars=";&|(){}<>\n")
+    # Braces are reserved words only when standing alone. Splitting them out
+    # of a pathname would turn root/{task-1,task-2}/src into a root operand.
+    lexer = shlex.shlex(source, posix=True, punctuation_chars=";&|()<>\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     tokens = []
     for word in lexer:
-        if re.fullmatch(r"[;&|(){}<>\n]+", word):
+        if re.fullmatch(r"[;&|()<>\n]+", word):
             tokens.extend(re.findall(r"&&|\|\||<<<|<<|>>|<&|>&|<>|[;&|(){}<>\n]", word))
             continue
         for key, value in quoted.items():
@@ -264,7 +280,14 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0):
         return None, directory, approved
 
     piped, pipeline = False, None
+    # An async AND/OR list runs in a child shell. Its checkpoint precedes the
+    # whole list, not just the last command immediately before '&'.
+    list_state = (directory, approved)
     for token in [*tokens, ";"]:
+        # A brace after a command name is an argument, as in `echo { ... }`.
+        if token in {"{", "}"} and words and not all(word in {"then", "do", "else"} for word in words):
+            words.append(token)
+            continue
         if token in {";", "&&", "||", "|", "&", "\n", "(", ")", "{", "}"}:
             previous = (directory, approved)
             hit, directory, approved = inspect(words, directory, approved, piped)
@@ -278,10 +301,17 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0):
                 directory, approved = pipeline
                 pipeline = None
             piped = token == "|"
-            if token == "(":
-                scopes.append((directory, approved))
-            elif token == ")" and scopes:
-                directory, approved = scopes.pop()
+            if token == "&":
+                directory, approved = list_state
+            elif token in {";", "\n"}:
+                list_state = (directory, approved)
+            elif token in {"(", "{"}:
+                scopes.append((token, directory, approved, list_state))
+                list_state = (directory, approved)
+            elif token in {")", "}"} and scopes:
+                opening, parent_directory, parent_approved, list_state = scopes.pop()
+                if opening == "(":
+                    directory, approved = parent_directory, parent_approved
         else:
             words.append(token)
     return None
