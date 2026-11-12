@@ -3242,6 +3242,7 @@ it.effect(
         yield* kanban.updateBoard(board.id, { name: "Changed target board" });
         yield* Deferred.succeed(release, undefined);
         const error = yield* Fiber.join(launch);
+        assert.strictEqual(error.writeOutcome, "may-have-applied");
         assert.include(error.detail, "may have been applied");
         assert.lengthOf(fake.interrupted, 1);
         const id = [...(yield* Ref.get(fake.threads)).keys()][0]!;
@@ -4034,6 +4035,7 @@ it.effect(
         yield* Deferred.succeed(release, undefined);
         const error = yield* Fiber.join(setup);
         assert.strictEqual(error.code, "conflict");
+        assert.strictEqual(error.writeOutcome, "may-have-applied");
         assert.include(error.detail, "may have been applied");
         assert.notInclude(error.detail, "Re-read its state before retrying");
         assert.strictEqual((yield* kanban.card(card.id)).card.stage, "todo");
@@ -4511,7 +4513,9 @@ it.effect("a started write finishes after the start deadline", () =>
         kanban.editCard(card.id, { description: "Expired" }, owner).pipe(Effect.flip),
       );
       yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
-      assert.include((yield* Fiber.join(queued)).message, "Board busy: not written");
+      const busyError = yield* Fiber.join(queued);
+      assert.include(busyError.message, "Board busy: not written");
+      assert.strictEqual(busyError.writeOutcome, "not-written");
       assert.isUndefined(write.pollUnsafe());
       yield* Deferred.succeed(finish, undefined);
       assert.strictEqual((yield* Fiber.join(write)).description, "Started");

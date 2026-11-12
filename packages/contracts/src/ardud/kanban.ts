@@ -2077,6 +2077,33 @@ export const KanbanScriptTrigger = Schema.Union([
 ]);
 export type KanbanScriptTrigger = typeof KanbanScriptTrigger.Type;
 
+export const KanbanScriptCardCommand = Schema.Struct({
+  kanban: Schema.Literal("card"),
+  prompt: Schema.String,
+  title: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.String),
+  priority: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 4 }))),
+  projects: Schema.optional(Schema.Array(Schema.String)),
+  links: Schema.optional(
+    Schema.Array(Schema.Struct({ url: Schema.String, label: Schema.optional(Schema.String) })),
+  ),
+});
+
+export const KanbanScriptPostCommand = Schema.Struct({
+  kanban: Schema.Literal("post"),
+  text: Schema.String,
+  discussion: Schema.optional(Schema.String),
+  card: Schema.optional(Schema.Int),
+});
+
+const KanbanScriptHeldCommand = Schema.Struct({
+  command: Schema.Union([KanbanScriptCardCommand, KanbanScriptPostCommand]),
+  firstFailedAt: IsoDateTime,
+  lastError: Schema.String,
+  /** Total delivery attempts, including retries within a run. */
+  attempts: NonNegativeInt,
+});
+
 export const KanbanScript = Schema.Struct({
   id: KanbanScriptId,
   boardId: KanbanBoardId,
@@ -2087,6 +2114,7 @@ export const KanbanScript = Schema.Struct({
   enabled: Schema.Boolean,
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
+  held: Schema.optional(Schema.Array(KanbanScriptHeldCommand)),
   lastRun: Schema.NullOr(
     Schema.Struct({
       startedAt: IsoDateTime,
@@ -2156,6 +2184,8 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
    * (`invalid`) or an older one (`conflict`). The detail says it in words too.
    */
   revision: Schema.optionalKey(NonNegativeInt),
+  /** Only not-written failures may be retried automatically. */
+  writeOutcome: Schema.optional(Schema.Literals(["not-written", "may-have-applied"])),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;
