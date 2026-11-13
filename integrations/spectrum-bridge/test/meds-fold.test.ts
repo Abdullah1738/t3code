@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { appendFold, foldMedsLine } from "../src/meds-fold.ts";
-import { fakeFold, LINE } from "./meds-fold-fixture.ts";
+import { fakeFold, FOLD_VISIBILITY_CASES, LINE } from "./meds-fold-fixture.ts";
 
 const fixtures: ReturnType<typeof fakeFold>[] = [];
 const fixture = (body?: string) => { const f = fakeFold(body); fixtures.push(f); return f; };
@@ -13,6 +13,17 @@ test("appendFold adds the trimmed line to only the last text without mutating in
   expect(texts).toEqual(["first", "last"]);
   expect(appendFold(texts, "")).toBe(texts);
   expect(appendFold([], LINE)).toEqual([]);
+});
+
+test.each(FOLD_VISIBILITY_CASES)("appendFold uses visible text: $name", ({ text, visible }) => {
+  const texts = [text];
+  expect(appendFold(texts, LINE)).toEqual([visible ? `${visible}\n\n${LINE}` : text]);
+  expect(texts).toEqual([text]);
+});
+
+test.each(FOLD_VISIBILITY_CASES.filter(row => !row.visible))("appendFold selects the last visible text before $name", ({ text }) => {
+  expect(appendFold(["First", "Answer.\n<think>private thought", text], LINE))
+    .toEqual(["First", `Answer.\n\n${LINE}`, text]);
 });
 
 test("line and logs carry counts and timing without health text", async () => {

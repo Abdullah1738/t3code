@@ -2,11 +2,12 @@ import { afterEach, expect, test } from "bun:test";
 import { createApi } from "../src/api.ts";
 import type { ChatContext, ChatInfo } from "../src/chats.ts";
 import { Delivery } from "../src/delivery.ts";
+import { formatText } from "../src/formatting.ts";
 import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionRequest, type SessionRecord } from "../src/openchamber.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
-import { fakeFold, HOLD_FOLD, LINE } from "./meds-fold-fixture.ts";
+import { fakeFold, FOLD_VISIBILITY_CASES, HOLD_FOLD, LINE } from "./meds-fold-fixture.ts";
 
 class Backend extends OpenChamber {
   records: MessageRecord[] = [];
@@ -63,6 +64,15 @@ function setup(opts: { kind?: ChatInfo["kind"]; slug?: string; tool?: boolean; b
     send(text: string, dedupeKey = "send-1") {
       return api(new Request("http://local/send", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ text, dedupeKey, sessionId: "ses_1" }) }));
+    },
+    async deliver() {
+      const sent: Parameters<Photon["sendText"]>[0][] = [];
+      const transport = { async sendText(input: Parameters<Photon["sendText"]>[0]) {
+        sent.push(input); return { providerId: `delivered-${sent.length}` };
+      } };
+      await new Delivery(store, transport, { projectScope: "fold-visible-test", enabled: () => true,
+        chatGuid: () => chat.key, sleep: async () => {} }).tick();
+      return sent;
     },
   };
   harnesses.push(h);
@@ -254,4 +264,40 @@ test("early acknowledgement stays unchanged and the eventual final text carries 
   expect(h.sends().map(row => row.text)).toEqual(["Acknowledged"]); expect(h.fake.calls()).toBe(0);
   await h.finish(["Final reply"]);
   expect(h.sends().map(row => row.text)).toEqual(["Acknowledged", `Final reply\n\n${LINE}`]); expect(h.fake.calls()).toBe(1);
+});
+
+test.each(FOLD_VISIBILITY_CASES)("visible reply survives delivery in final/tool mode: $name", async ({ text, visible }) => {
+  for (const tool of [false, true]) {
+    const h = setup({ tool }); await h.start();
+    if (tool) {
+      expect((await h.send(text)).status).toBe(202);
+      expect((await h.send(text)).status).toBe(200);
+    } else await h.finish([text]);
+    expect(h.fake.calls()).toBe(visible ? 1 : 0);
+    const delivered = await h.deliver();
+    expect(delivered.map(row => row.text)).toEqual(visible ? [formatText(`${visible}\n\n${LINE}`).text] : []);
+    if (visible) expect(delivered[0]!.formatting ?? []).toEqual(formatText(`${visible}\n\n${LINE}`).formatting);
+    if (!visible && tool) {
+      expect((await h.send("Answer.", "first-visible-send")).status).toBe(202);
+      expect(h.fake.calls()).toBe(1);
+      expect((await h.deliver()).map(row => row.text)).toEqual([`Answer.\n\n${LINE}`]);
+    }
+  }
+});
+
+test.each(FOLD_VISIBILITY_CASES.filter(row => !row.visible))("final mode folds the last visible text before $name", async ({ text }) => {
+  const h = setup(); await h.start(); await h.finish(["First", "Answer.\n<think>private thought", text]);
+  expect(h.fake.calls()).toBe(1);
+  expect(h.sends().map(row => row.text)).toEqual(["First", `Answer.\n\n${LINE}`, text]);
+  expect((await h.deliver()).map(row => row.text)).toEqual(["First", `Answer.\n\n${LINE}`]);
+});
+
+test("empty fold leaves raw internal content unchanged for final/tool mode", async () => {
+  const text = "Answer.\n<think>private thought";
+  for (const tool of [false, true]) {
+    const h = setup({ tool, body: "" }); await h.start();
+    if (tool) await h.send(text); else await h.finish([text]);
+    expect(h.sends().map(row => row.text)).toEqual([text]);
+    expect((await h.deliver()).map(row => row.text)).toEqual(["Answer."]);
+  }
 });

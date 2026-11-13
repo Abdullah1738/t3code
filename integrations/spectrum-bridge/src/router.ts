@@ -618,7 +618,7 @@ export class Router {
           && live.startedAt === turn.startedAt && !live.background && !live.origin && live.phase !== "failed" && live.phase !== "held";
       };
       if (!stillLive()) { foldSkipped("background", replyMode); return texts; }
-      if (!texts.some(text => replyText(text).trim())) { foldSkipped("no_text", replyMode); return texts; }
+      if (!texts.some(text => stripInternalText(replyText(text)))) { foldSkipped("no_text", replyMode); return texts; }
       // Persist before spawning: recovery may lose a fold, but cannot consume another slot for this turn.
       const key = `meds-fold:${turn.id}:${turn.generation}:${turn.inboundId}:${turn.startedAt}`;
       const inflight = this.medsFolding.get(key);

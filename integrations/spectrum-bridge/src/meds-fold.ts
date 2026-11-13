@@ -1,5 +1,6 @@
 import { toolLog } from "./toollog.ts";
 import type { ReplyMode } from "./config.ts";
+import { stripInternalText } from "./formatting.ts";
 
 const COMMAND = ["/usr/bin/python3", "/Users/ardud/.local/share/robob-watch/watchers/meds-nag/check.py", "--fold"];
 export type FoldOptions = { cmd?: string[]; timeoutMs?: number; env?: Record<string, string | undefined>; replyMode?: ReplyMode };
@@ -79,7 +80,12 @@ export async function foldMedsLine(opts: FoldOptions = {}): Promise<FoldResult> 
 
 export function appendFold(texts: string[], line?: string): string[] {
   if (!line?.trim() || !texts.length) return texts;
-  const copy = [...texts];
-  copy[copy.length - 1] += `\n\n${line.trim()}`;
-  return copy;
+  for (let index = texts.length - 1; index >= 0; index--) {
+    const visible = stripInternalText(texts[index]!);
+    if (!visible) continue;
+    const copy = [...texts];
+    copy[index] = `${visible}\n\n${line.trim()}`;
+    return copy;
+  }
+  return texts;
 }
