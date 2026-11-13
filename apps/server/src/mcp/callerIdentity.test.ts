@@ -207,7 +207,10 @@ it.effect.each(
           getThreadShell: () => Effect.die("active caller must not load its full shell"),
           getThreadRecords: () =>
             Effect.gen(function* () {
-              assert.equal(yield* SqliteClient.ReaderLane, "background");
+              assert.equal(
+                yield* SqliteClient.ReaderLane,
+                operation === "status" ? "foreground" : "background",
+              );
               yield* Deferred.succeed(recordEntered, undefined);
               yield* sql
                 .withTransaction(sql`SELECT * FROM entries`)
