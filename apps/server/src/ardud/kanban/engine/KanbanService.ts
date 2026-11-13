@@ -4688,7 +4688,7 @@ const make = Effect.gen(function* () {
         );
       const gated = next.subtasks.some(
         (subtask) =>
-          (subtask.gate ?? Subtasks.inferGate(subtask.text)) !== undefined &&
+          Subtasks.gateOf(subtask) !== undefined &&
           (subtask.state === "open" || Subtasks.approvalProblem(next, subtask) !== null),
       );
       const stage =

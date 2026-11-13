@@ -263,7 +263,7 @@ it.effect.each([
   { task: "Install the release", neutral: "Staging", approve: "Install the release" },
   { task: "Restart LaunchAgent", neutral: "Check status first", approve: "Restart now" },
   { task: "Share the token", neutral: "Explain the token permissions", approve: "Share the token" },
-  { task: "Use the API key", neutral: "Check the key", approve: "Use the API key" },
+  { task: "Provide the API key", neutral: "Check the key", approve: "Provide the API key" },
   { task: "Purchase the license", neutral: "Purchase after review", approve: "Approve" },
   { task: "Deploy the release", neutral: "Deploy if tests pass", approve: "Yes" },
   { task: "Deploy the release", neutral: "Deploy later", approve: "Go" },
@@ -449,9 +449,9 @@ it.each([
   ["purchase", "money"],
   ["charge", "money"],
   ["refund", "money"],
-  ["secret", "secret"],
-  ["token", "secret"],
-  ["key", "secret"],
+  ["secret", undefined],
+  ["token", undefined],
+  ["key", undefined],
   ["Read back", undefined],
 ] as const)("infers %s", (text, gate) => assert.strictEqual(inferGate(text), gate));
 

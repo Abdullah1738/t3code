@@ -11,14 +11,30 @@ import {
 } from "@t3tools/contracts";
 
 export const inferGate = (text: string): KanbanSubtask["gate"] => {
-  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?|releases?)\b/i.test(text)) return "deploy";
+  if (
+    /\b(deploy\w*|install\w*|restart\w*|launchagents?|release(?:s|d)?(?!\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?|devices?)\b))\b/i.test(
+      text,
+    )
+  )
+    return "deploy";
   if (
     /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
   )
     return "money";
-  if (/\b(secrets?|tokens?|keys?)\b/i.test(text)) return "secret";
+  if (
+    /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b[^.;\r\n]{0,40}\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i.test(
+      text,
+    )
+  )
+    return "secret";
   return undefined;
 };
+
+export const gateOf = (
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
+): KanbanSubtask["gate"] =>
+  // Older plans also stored inferred gates on read-only review checklists.
+  subtask.owner === "review" ? undefined : (subtask.gate ?? inferGate(subtask.text));
 
 export const isNegativeOption = (label: string): boolean =>
   /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
@@ -107,7 +123,7 @@ export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt">,
   subtask: KanbanSubtask,
 ): string | null => {
-  const gate = subtask.gate ?? inferGate(subtask.text);
+  const gate = gateOf(subtask);
   if (gate === undefined) return null;
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
@@ -234,26 +250,24 @@ export function planSubtasks(
         };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
-      const { script: _old, ...rest } = known;
-      const gate = known.gate ?? inferGate(known.text) ?? input.gate ?? inferGate(text);
+      const { script: _old, gate: _oldGate, ...rest } = known;
+      const previousGate = gateOf(known);
+      const gate =
+        input.owner === "review" ? undefined : (previousGate ?? gateOf({ ...input, text }));
       planned.push({
         ...rest,
         step,
         text,
         owner: input.owner,
         ...(gate === undefined ? {} : { gate }),
-        ...((text !== known.text ||
-          script !== known.script ||
-          !(known.gate ?? inferGate(known.text))) &&
-        (input.gate ?? inferGate(text) ?? known.gate ?? inferGate(known.text)) &&
-        at
+        ...((text !== known.text || script !== known.script || !previousGate) && gate && at
           ? { createdAt: at }
           : {}),
         ...(script ? { script } : {}),
       });
     } else {
       nextId += 1;
-      const gate = input.gate ?? inferGate(text);
+      const gate = gateOf({ ...input, text });
       planned.push({
         id: `s${nextId}`,
         step,

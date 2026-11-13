@@ -32,7 +32,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
-import { inferGate } from "./subtasks.ts";
+import { gateOf } from "./subtasks.ts";
 import { stubBlockAt } from "./messagePages.ts";
 
 /** An upload as a board message or an ask's file field holds it. */
@@ -2066,8 +2066,7 @@ export const passOnText = (card: KanbanCard, ask: KanbanOwnerAsk, answer: string
 
 export const droppedText = (card: KanbanCard, ask: KanbanOwnerAsk, byOwner: boolean) => {
   const gated = card.subtasks.filter(
-    (subtask) =>
-      subtask.state === "open" && (subtask.gate ?? inferGate(subtask.text)) !== undefined,
+    (subtask) => subtask.state === "open" && gateOf(subtask) !== undefined,
   );
   return `${byOwner ? "Abdullah" : "The evaluator"} dropped ${ask.id}. That is not approval for ${gated.length > 0 ? gated.map((subtask) => `${subtask.id} (${subtask.text})`).join(", ") : "any deploy, money or secret step"}; ask again or skip them only with his answer.\n\nCard #${card.number}: ${ask.text}`;
 };

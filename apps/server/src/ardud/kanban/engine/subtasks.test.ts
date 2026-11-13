@@ -1,10 +1,18 @@
-import { kanbanEvaluatorStep, kanbanOpenStep, kanbanStepSubtasks } from "@t3tools/contracts";
+import {
+  kanbanEvaluatorStep,
+  kanbanOpenStep,
+  kanbanStepSubtasks,
+  type KanbanSubtask,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  approvalProblem,
   checkHandBack,
   checkMark,
+  gateOf,
   handBack,
+  inferGate,
   markSubtask,
   PACKET_SUBTASK,
   passReview,
@@ -16,6 +24,135 @@ import {
 
 const owner = { _tag: "owner" } as const;
 const at = "2026-10-26T12:00:00.000Z";
+const torsshReview =
+  "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
+
+describe("inferGate", () => {
+  it.each([
+    ["Rotate the Linear API key", "secret"],
+    ["Store the new token in Keychain", "secret"],
+    ["Provide the signing key to CI", "secret"],
+    ["share the secret with Moni", "secret"],
+    ["Enter the password", "secret"],
+    ["Paste credentials", "secret"],
+    ["Set the API keys", "secret"],
+    ["Create a private key", "secret"],
+    ["Generate SSH keys", "secret"],
+    ["Issue tokens", "secret"],
+    ["Regenerate secrets", "secret"],
+    ["Revoke the key", "secret"],
+    ["Reveal passwords", "secret"],
+    ["Send the credential", "secret"],
+    ["Give the token to CI", "secret"],
+    ["Hand over the secret", "secret"],
+    ["Add a signing key", "secret"],
+    [torsshReview, undefined],
+    ["token fresh per launch and never logged", undefined],
+    ["check the key decisions in the doc", undefined],
+    ["primary key migration test", undefined],
+    ["verify tokens are redacted in logs", undefined],
+    ["Store the report. Check the token", undefined],
+    ["Create the report; verify credentials", undefined],
+    ["Generate a report\nCheck the key", undefined],
+    ["Regenerate the report", undefined],
+    [`Store${" ".repeat(40)}token`, "secret"],
+    [`Store${" ".repeat(41)}token`, undefined],
+    ["Release the Run Cloud session", undefined],
+    ["release the emulator", undefined],
+    ["release the phone hold/lock", undefined],
+    ["release the box", undefined],
+    ["released the session", undefined],
+    ["release session", undefined],
+    ["release the sim", undefined],
+    ["release the simulator", undefined],
+    ["release the hold", undefined],
+    ["release the lock", undefined],
+    ["release the slot", undefined],
+    ["release the device", undefined],
+    ["release the boxes", undefined],
+    ...["", "the ", "a ", "an "].flatMap((article) =>
+      [
+        "Run Cloud session",
+        "session",
+        "emulator",
+        "sim",
+        "simulator",
+        "box",
+        "hold",
+        "lock",
+        "slot",
+        "phone hold/lock",
+        "device",
+      ].map((resource) => [`Release ${article}${resource}`, undefined] as const),
+    ),
+    ["Install the Robob release", "deploy"],
+    ["cut release 0.4.2", "deploy"],
+    ["deploy spectrum-bridge", "deploy"],
+    ["restart agent-bridges", "deploy"],
+  ] as const)("%s → %s", (text, gate) => expect(inferGate(text)).toBe(gate));
+});
+
+describe("approvalProblem", () => {
+  const card = { number: 8, asks: [], createdAt: at };
+  const subtask: KanbanSubtask = {
+    id: "s4",
+    step: 4,
+    text: torsshReview,
+    owner: "review",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+
+  it.each([undefined, "secret", "deploy", "money"] as const)(
+    "allows a read-only review with stored gate %s and no asks",
+    (gate) => {
+      const review = { ...subtask, ...(gate === undefined ? {} : { gate }) };
+      expect(gateOf(review)).toBeUndefined();
+      expect(approvalProblem(card, review)).toBeNull();
+    },
+  );
+
+  it.each(["work", "evaluator", "script"] as const)(
+    "still requires approval for real actions owned by %s",
+    (owner) => {
+      for (const [text, gate] of [
+        ["Rotate the Linear API key", "secret"],
+        ["Deploy spectrum-bridge", "deploy"],
+        ["Purchase the license", "money"],
+      ] as const) {
+        const action = { ...subtask, owner, text };
+        expect(gateOf(action)).toBe(gate);
+        expect(approvalProblem(card, action)).toContain("needs Abdullah's approval");
+        expect(gateOf({ ...action, text: "Do it", gate })).toBe(gate);
+      }
+    },
+  );
+
+  it("still denies a deploy action after a dropped ask", () => {
+    expect(
+      approvalProblem(
+        {
+          ...card,
+          asks: [
+            {
+              id: "q1",
+              text: "Restart agent-bridges?",
+              blocking: false,
+              by: owner,
+              at,
+              seq: null,
+              closedAt: at,
+              answer: { verdict: "dropped", by: owner, at },
+            },
+          ],
+        },
+        { ...subtask, owner: "evaluator", text: "Restart agent-bridges", gate: "deploy" },
+      ),
+    ).toContain("a dropped ask is not approval");
+  });
+});
 
 const flow = [
   { text: "Write the PR", owner: "work" },
@@ -33,6 +170,37 @@ const planned = () => {
 };
 
 describe("planSubtasks", () => {
+  it.each([undefined, "secret", "deploy", "money"] as const)(
+    "does not store a gate on a new review even with explicit gate %s",
+    (gate) => {
+      const plan = planSubtasks(
+        [],
+        [{ text: "Review token rotation", owner: "review", gate }],
+        0,
+        at,
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    },
+  );
+
+  it("removes a stored review gate without refreshing its approval timestamp", () => {
+    const known: KanbanSubtask = {
+      ...planned()[1]!,
+      gate: "secret",
+      createdAt: at,
+    };
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, text: "Review: rotate the token safely", owner: "review", gate: "secret" }],
+      0,
+      "2026-10-27T12:00:00.000Z",
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    expect(plan.subtasks[0]?.createdAt).toBe(at);
+  });
+
   it("numbers steps in order, and keeps a shared step for work in any order", () => {
     const subtasks = planned();
     expect(subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([
