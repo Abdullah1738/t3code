@@ -14,7 +14,7 @@ LIVE = Path.home() / '.local/share/robob-watch/watchers/money-cases'
 DATA = Path.home() / 'Documents/assistant/money-cases'
 BIN = Path.home() / '.local/bin/money-cases'
 SOURCE_FILES = ('payments.py', 'cases.py', 'charges.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
-                'test_install.py', 'test_subscriptions.py', 'test_unanswered.py', 'README.md', 'settings.json',
+                'test_install.py', 'test_subscriptions.py', 'test_unanswered.py', 'test_daily_list.py', 'README.md', 'settings.json',
                 'order_lookup.py', 'test_accuracy.py')
 EXECUTABLE = ('cases.py', 'check.sh', 'install.py')
 

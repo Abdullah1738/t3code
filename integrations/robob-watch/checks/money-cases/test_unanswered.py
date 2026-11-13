@@ -89,7 +89,8 @@ class Unanswered(Base):
                                                              '--now', (newer + mc.dt.timedelta(minutes=2)).isoformat()))
                             self.assertNotEqual(result['verdict'], 'receipt')
                     self.assertEqual(mc.find_question(mc.load_questions(self.data), old)['status'], 'awaiting_answer')
-                    self.assertEqual(mc.find_question(mc.load_questions(self.data), fresh)['status'], 'open')
+                    self.assertEqual(mc.find_question(mc.load_questions(self.data), fresh)['status'],
+                                     'awaiting_answer' if entry == 'ask' else 'open')
 
     def test_rejected_ambiguous_receipt_does_not_hide_a_separate_original_receipt(self):
         old = self.seed(when='2026-11-01T09:00')
@@ -149,37 +150,31 @@ class Unanswered(Base):
             self.assertEqual(mc.main(list(args)), 0)
         return out.getvalue()
 
-    def test_never_asked_25_hours_queues_exactly_once_and_only_one_question(self):
-        first = self.seed()
-        second = self.seed('23.45')
-        self.assertEqual(self.fire('2026-11-11T09:00'), '')  # strictly older than 24h
-        event = self.fire()
-        self.assertIn('money-cases ask --id ' + first, event)
-        self.assertNotIn(second, event)
-        self.assertEqual(self.fire(n=1), '')  # no runner acknowledgement needed
-        self.assertEqual(self.fire(n=2), '')
-        self.assertEqual(mc.load_questions(self.data)['questions'][0]['asks'], [])
-        # Answering frees the queue for the next oldest question.
-        mc.answered(self.data, first, 'mine', now=at('2026-11-11T10:01'))
-        self.assertIn(second, self.fire(n=3))
-
-    def test_direct_ask_obeys_the_same_pending_question_queue(self):
+    def test_never_asked_25_hours_emit_one_daily_list(self):
         first, second = self.seed(), self.seed('23.45')
-        self.assertEqual(mc.ask(self.data, 'Yours?', qid=first, now=at('2026-11-11T10:00'),
-                                find=finder(), said=nobody)[0], 0)
-        code, reason = mc.ask(self.data, 'Yours?', qid=second, now=at('2026-11-11T10:01'),
-                              find=finder(), said=nobody)
-        self.assertEqual(code, mc.DONT_ASK)
-        self.assertIn('kept in the queue', reason)
-        self.assertEqual(mc.find_question(mc.load_questions(self.data), second)['asks'], [])
+        self.assertEqual(self.fire('2026-11-11T09:00'), '')
+        self.assertIn('2 unasked charges', self.fire())
+        self.assertEqual(self.fire(n=1), '')
+        self.assertEqual(self.fire(n=2), '')
+        text = mc.unasked(self.data, at('2026-11-11T10:00'), find=finder(), said=nobody)
+        self.assertIn(first, text)
+        self.assertIn(second, text)
+        self.assertNotIn(first, mc.unasked(self.data, at('2026-11-11T10:01'), find=finder(), said=nobody))
 
-    def test_explicit_never_asked_charge_case_queues_once(self):
+    def test_direct_ask_is_not_blocked_by_another_pending_question(self):
+        first, second = self.seed(), self.seed('23.45')
+        for qid in (first, second):
+            self.assertEqual(mc.ask(self.data, 'Yours?', qid=qid, now=at('2026-11-11T10:00'),
+                                    find=finder(), said=nobody)[0], 0)
+        self.assertEqual(len(mc.find_question(mc.load_questions(self.data), second)['asks']), 1)
+
+    def test_explicit_never_asked_charge_case_joins_daily_list(self):
         self.case('charge', when=at('2026-11-10T09:00'), deadline='2026-12-01')
-        self.assertIn('unasked charge', self.fire())
+        self.assertIn('unasked charges', self.fire())
         self.assertEqual(self.fire(n=1), '')
 
-    def test_unasked_age_class_always_uses_first_question_queue(self):
-        # age in days | expected: one first ask, never a conversion/third-question message
+    def test_unasked_age_class_always_uses_daily_list(self):
+        # age in days | expected: daily first ask, never a conversion/third-question message
         for age in (2, 8, 70):
             with self.subTest(age=age):
                 self.data = self.tmp / f'age-{age}'
@@ -188,7 +183,7 @@ class Unanswered(Base):
                 when = at('2026-11-11T10:00') - mc.dt.timedelta(days=age)
                 qid = self.seed(when=when.isoformat())
                 event = self.fire()
-                self.assertIn('money-cases ask --id ' + qid, event)
+                self.assertIn('money-cases unasked --ask', event)
                 self.assertNotIn("he didn't answer", event)
                 self.assertEqual(mc.load(self.data)['cases'], [])
                 self.assertEqual(self.fire(n=1), '')
@@ -222,8 +217,8 @@ class Unanswered(Base):
         self.assertEqual(questions[first]['status'], 'closed')
         self.assertEqual(questions[second]['status'], 'open')
         self.assertTrue((self.wd / 'pings.json').exists())
-        # A retry reads other sources and queues the unexplained second charge.
-        self.assertIn(second, self.fire(n=1))
+        # A retry reads other sources and includes the unexplained second charge in the daily list.
+        self.assertIn('1 unasked charges', self.fire(n=1))
 
     def test_legacy_linked_case_migrates_with_asked_question(self):
         qid = self.seed()
@@ -239,15 +234,14 @@ class Unanswered(Base):
         self.assertIn('awaiting_answer', self.cli('list', '--json'))
         self.assertIn('awaiting answer', self.cli('brief'))
 
-    def test_direct_ask_cannot_jump_a_watchers_queue_reservation(self):
+    def test_direct_ask_and_daily_list_cannot_first_ask_the_same_item(self):
         first, second = self.seed(), self.seed('23.45')
-        self.assertIn(first, self.fire())
+        self.assertIn('2 unasked charges', self.fire())
         self.assertEqual(mc.ask(self.data, 'Yours?', qid=second, now=at('2026-11-11T10:01'),
-                                find=finder(), said=nobody)[0], mc.DONT_ASK)
-        self.assertEqual(mc.ask(self.data, 'Yours?', qid=first, now=at('2026-11-11T10:02'),
                                 find=finder(), said=nobody)[0], 0)
-        mc.answered(self.data, first, 'mine', now=at('2026-11-11T10:03'))
-        self.assertIn(second, self.fire(n=1))
+        text = mc.unasked(self.data, at('2026-11-11T10:02'), find=finder(), said=nobody)
+        self.assertIn(first, text)
+        self.assertNotIn(second, text)
 
     def test_sourced_question_close_cascades_to_parent_and_releases_queue(self):
         first, second = self.seed(), self.seed('23.45')
@@ -258,7 +252,7 @@ class Unanswered(Base):
             cid = q['case']
         mc.close(self.data, first, 'explained by invoice', source='mail:invoice', at=at('2026-11-11T09:00'))
         self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'closed')
-        self.assertIn(second, self.fire())
+        self.assertIn('1 unasked charges', self.fire())
 
     def test_bill_and_yes_no_keys_survive_full_retention_class(self):
         self.bill()
@@ -278,13 +272,14 @@ class Unanswered(Base):
                 self.assertIn('awaiting answer', self.cli('brief'))
 
     def test_case_answer_releases_reservation_without_reacquiring_consumed_ask(self):
-        self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01')
+        self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01', reference='card ending 1111')
         qid = self.seed()
-        self.assertIn('old-charge', self.fire())
+        self.assertIn('unasked charges', self.fire())
+        mc.unasked(self.data, at('2026-11-11T10:00'), find=finder(), said=nobody)
         self.deliver('2026-11-11T10:00')
         self.fire('2026-11-11T10:15', 1)
         mc.update(self.data, 'old-charge', {}, reply='owner:answer', at=at('2026-11-11T11:00'))
-        self.assertIn(qid, self.fire('2026-11-11T11:15', 2))
+        self.assertEqual(self.fire('2026-11-11T11:15', 2), '')
         row = mc.find(mc.load(self.data), 'old-charge')
         self.assertEqual(row['status'], 'open')
         self.assertNotIn('queued', row)
@@ -316,7 +311,7 @@ class Unanswered(Base):
                 self.assertEqual(rc, mc.DONT_ASK)
                 self.assertIn('explained', reason)
                 self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'closed')
-                self.assertIn(second, self.fire())
+                self.assertIn('1 unasked charges', self.fire())
 
     def test_screen_explains_passed_question_then_ask_cannot_ask_it_again(self):
         qid = self.seed()
@@ -338,16 +333,19 @@ class Unanswered(Base):
                 self.data = self.tmp / ('reply-' + suffix)
                 self.wd = self.tmp / ('wd-reply-' + suffix)
                 self.wd.mkdir()
-                self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01')
+                self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01', reference='card ending 1111')
                 qid = self.seed()
-                self.assertIn('old-charge', self.fire())
+                self.assertIn('unasked charges', self.fire())
+                with patch.object(mc, 'unasked_candidates', return_value=[dict(mc.find(mc.load(self.data), 'old-charge'), type='case', card='1111', at='2026-11-09T09:00+04:00')]):
+                    mc.unasked(self.data, at('2026-11-11T10:00'), find=finder(), said=nobody)
                 self.deliver('2026-11-11T' + delivery_at)
                 mc.update(self.data, 'old-charge', {}, reply='owner:answer', at=at('2026-11-11T' + reply_at))
-                self.assertIn(qid, self.fire('2026-11-11T10:15', 1))
+                self.assertEqual(self.fire('2026-11-11T10:15', 1), '')
+                self.assertIn(qid, [r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-11T10:15'))])
                 self.assertEqual(mc.find(mc.load(self.data), 'old-charge')['status'], 'open')
 
     def test_answered_case_key_does_not_block_a_future_bill_reminder(self):
-        self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01')
+        self.case('old-charge', when=at('2026-11-09T09:00'), deadline='2026-12-01', reference='card ending 1111')
         self.fire()
         self.deliver('2026-11-11T10:00')
         self.fire('2026-11-11T10:15', 1)
@@ -395,7 +393,7 @@ class Unanswered(Base):
                           cascade_questions=cascade)
                 if cascade:
                     self.assertEqual(mc.find_question(mc.load_questions(self.data), first)['status'], 'closed')
-                self.assertIn(second, self.fire())
+                self.assertIn('1 unasked charges', self.fire())
                 self.assertEqual(mc.find_question(mc.load_questions(self.data), first)['status'], 'closed')
                 self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open')
 
