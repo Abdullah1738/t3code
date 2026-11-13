@@ -3016,7 +3016,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                     state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
                                        'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
     except CheckTimeout as e:
-        diagnostic['budgetHit'] = True
+        diagnostic['budgetHit'] = time.time() >= work_end
         errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
         errors.append(str(e))
         # A partly built event was never handed to the runner. Keep only a previously owned outbox.
@@ -3043,7 +3043,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
             write_json(pings, state, timing=timing)
             saved = True
     except CheckTimeout:
-        diagnostic['budgetHit'] = True
+        diagnostic['budgetHit'] = diagnostic['budgetHit'] or time.time() >= end
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()

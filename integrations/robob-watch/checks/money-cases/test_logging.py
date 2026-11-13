@@ -1,6 +1,7 @@
 """Case diagnostics stay outside book locks and never carry financial source text."""
 import ast
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -173,7 +174,7 @@ class Logging(Base):
         self.assertAlmostEqual(row['durationMs'], timing['total_s'] * 1000, delta=10)
         with patch.object(mc, 'follow', side_effect=mc.CheckTimeout('fixture timeout')):
             mc.run_check(self.wd, 'timeout', self.data, self.root, now, finder(), nobody)
-        self.assertTrue(self.rows('check.run')[-1]['props']['budgetHit'])
+        self.assertFalse(self.rows('check.run')[-1]['props']['budgetHit'])
         self.assertFalse(self.rows('check.run')[-1]['ok'])
         with patch.object(mc, 'write_json', side_effect=OSError('private save failure')):
             with self.assertRaises(OSError):
@@ -213,6 +214,53 @@ class Logging(Base):
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
         self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow'})
+
+    def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
+        self.case()
+        now = at('2026-10-24T10:00')
+        forms = [(40, 0.05, False), (1.05, 10, True)]
+        with (self.data / 'cases.lock').open('a') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for budget, wait, budget_hit in forms:
+                with self.subTest(budget=budget, lock_wait=wait):
+                    def lock_cases(*args, **kwargs):
+                        with mc.Locked(self.data, wait=wait):
+                            self.fail('the held case lock must not be acquired')
+                    with patch.object(mc, 'CHECK_BUDGET', budget), patch.object(mc, 'follow', lock_cases):
+                        self.assertEqual(mc.run_check(self.wd, 'held-lock', self.data, self.root,
+                                                       now, finder(), nobody), '')
+                    row = self.rows('check.run')[-1]
+                    self.assertEqual(row['props']['budgetHit'], budget_hit)
+                    self.assertFalse(row['ok'])
+                    self.assertEqual(row['props']['fired'], 0)
+                    if not budget_hit:
+                        self.assertIn('cases.lock still held', str(json.loads((self.wd / 'pings.json').read_text())))
+        self.assertEqual(mc.CHECK_BUDGET, 40)
+
+    def test_save_timeout_marks_budget_only_after_its_deadline(self):
+        self.case()
+        guard = mc.within
+        for elapsed, budget_hit in ((0, False), (40, True)):
+            with self.subTest(elapsed=elapsed):
+                clock = [1000.0]
+                @contextlib.contextmanager
+                def at_save(deadline, error):
+                    if deadline == 1040:
+                        clock[0] += elapsed
+                    with guard(deadline, error):
+                        yield
+                with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'within', at_save), \
+                        patch.object(mc, 'write_json', side_effect=mc.CheckTimeout('local save timeout')) as write, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    event = mc.run_check(self.wd, 'save-timeout', self.data, self.root,
+                                         at('2026-10-24T10:00'), finder(), nobody)
+                self.assertEqual(event, '')
+                self.assertEqual(write.call_count, 0 if budget_hit else 1)
+                row = self.rows('check.run')[-1]
+                self.assertEqual(row['props']['budgetHit'], budget_hit)
+                self.assertFalse(row['ok'])
+                self.assertEqual(row['props']['fired'], 0)
+                self.assertFalse((self.wd / 'pings.json').exists())
 
     def test_watcher_logger_and_orders_logger_work_in_both_import_orders(self):
         helper_path = HERE.parents[1] / 'helpers/toollog.py'
