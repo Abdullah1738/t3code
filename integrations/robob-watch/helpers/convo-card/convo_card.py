@@ -773,7 +773,7 @@ def cmd_send(a):
             return
         card_url = url.rstrip("/") + "/?v=" + data["v"]
         to = [] if own_chat(a.to, a.session) else ["--to", a.to]
-        res = bridge("app", "--url", card_url, "--caption", caption, "--subcaption", sub,
+        res = bridge("app", "--url", card_url, f"--caption={caption}", f"--subcaption={sub}",
                      "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, *to)
         sent[a.to] = {"key": key, "url": url, "card_url": card_url, "last_id": data["last_id"],
                       "at": datetime.now(DXB).isoformat(timespec="seconds"), "op": res.get("id"),

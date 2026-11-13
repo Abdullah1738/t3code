@@ -66,7 +66,7 @@ afterEach(async () => {
     rmSync(f.sandbox, { recursive: true, force: true });
   }
 });
-const opt = (args: string[], key: string) => args[args.indexOf(key) + 1]!;
+const opt = (args: string[], key: string) => args.find(arg => arg.startsWith(`${key}=`))?.slice(key.length + 1) ?? args[args.indexOf(key) + 1]!;
 
 test("a: five failures pause checks and send exactly one pause notice", async () => {
   const f = fixture(); f.add("broken");

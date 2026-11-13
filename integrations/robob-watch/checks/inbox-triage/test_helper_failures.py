@@ -62,7 +62,7 @@ try {
                 self.assertEqual(parsed.returncode, 0, parsed.stderr)
                 body = json.loads(parsed.stdout)['body']
                 self.assertEqual(body['text'], expected)
-                self.assertEqual(body['dedupeKey'], run.call_args.args[0][-1])
+                self.assertEqual(body['dedupeKey'], run.call_args.args[0][-1].split('=', 1)[1])
 
     def test_original_split_value_reproduces_the_exact_live_hash(self):
         out = t.run_helper('telegram-bridge', [str(t.BUN), str(self.stub), 'notify', '--source', 'Inbox triage',

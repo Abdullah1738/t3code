@@ -9,7 +9,7 @@ const calls = join(sandbox, "calls.log");
 const stub = (name: string, failOn: string) => {
   const path = join(sandbox, `${name}.ts`);
   writeFileSync(path, `import { appendFileSync, existsSync } from "node:fs";
-const args = process.argv.slice(2);
+const args = process.argv.slice(2).flatMap(a => { const i = a.indexOf("="); return a.startsWith("--") && i > 0 ? [a.slice(0, i), a.slice(i + 1)] : [a]; });
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ cli: ${JSON.stringify(name)}, args }) + "\\n");
 if (existsSync(${JSON.stringify(join(sandbox, "fail-"))} + args[0])) { console.error("stub failure"); process.exit(1); }
 console.log(JSON.stringify({ id: "x", created: true }));
