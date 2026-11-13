@@ -29,6 +29,10 @@ const moneyKeyword =
 const negatableMoneyKeyword = new RegExp(`${moneyKeyword.source}|\\b(?:paying|purchasing)\\b`, "i");
 const secretAction =
   /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b/i;
+const negatableSecretAction = new RegExp(
+  `${secretAction.source}|\\b(?:sharing|providing|entering|pasting|setting|storing|creating|generating|issuing|rotating|regenerating|revoking|revealing|sending|giving|handing\\s+over|adding)\\b`,
+  "i",
+);
 const secretKeyword =
   /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
 const negatableSecretKeyword = /\b(?:secrets?|passwords?|credentials?|tokens?|keys?)\b/i;
@@ -36,6 +40,46 @@ const secretMention = new RegExp(
   `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
   "i",
 );
+
+const inlinePairs = new Map([
+  ["(", ")"],
+  ["[", "]"],
+  ["{", "}"],
+  ['"', '"'],
+  ["'", "'"],
+  ["“", "”"],
+  ["‘", "’"],
+  ["—", "—"],
+  ["–", "–"],
+  ["--", "--"],
+]);
+
+const closesInlineAside = (prefix: string, suffix: string): boolean | undefined => {
+  const expected: string[] = [];
+  for (let i = 0; i < prefix.length; i++) {
+    let char = prefix[i]!;
+    if (
+      (char === "'" || char === "’") &&
+      /\w/.test(prefix[i - 1] ?? "") &&
+      /\w/.test(prefix[i + 1] ?? "")
+    )
+      continue;
+    if (char === "-" && prefix[i + 1] === "-") {
+      char = "--";
+      i++;
+    }
+    if (expected.at(-1) === char) expected.pop();
+    else {
+      const closing = inlinePairs.get(char);
+      const dash = char === "—" || char === "–" || char === "--";
+      if (closing && (!dash || prefix.includes(char, i + 1) || suffix.includes(char)))
+        expected.push(closing);
+    }
+  }
+  const closing = expected.at(-1);
+  return closing === undefined ? undefined : suffix.trimStart().startsWith(closing);
+};
+
 const withoutNegated = (
   text: string,
   keyword: RegExp,
@@ -49,7 +93,7 @@ const withoutNegated = (
   const object = options.object ? String.raw`(?:${gap}${qualifiers}${options.object.source})?` : "";
   const precedingNegation = new RegExp(String.raw`\b${negation}${gap}$`, "i");
   const sharedObject = new RegExp(
-    String.raw`${secretAction.source}[ \t]*(?:${filler}){0,2}?(?:(?:[,:([{"'“‘–—-]+|(?:and|but|or|then|also)\b)[ \t]*)*$`,
+    String.raw`${secretAction.source}[ \t]*(?:${filler}){0,2}?(?:(?:[,:([{"'“‘–—-]|(?:and|but|or|then|also)\b)[ \t]*)*$`,
     "i",
   );
   return text.replace(
@@ -59,12 +103,30 @@ const withoutNegated = (
     ),
     (match, action: string, directObject: string, offset: number) => {
       const prefix = text.slice(0, offset);
-      if (precedingNegation.test(prefix)) return match;
+      let before = prefix;
+      let negations = 0;
+      for (
+        let previous = precedingNegation.exec(before);
+        previous;
+        previous = precedingNegation.exec(before)
+      ) {
+        negations++;
+        before = before.slice(0, previous.index);
+      }
+      if (negations % 2 === 1) return match;
+      if (/^keys?$/i.test(action) && /^(?:no|not)-(?:api|private|signing|ssh)[ \t-]/i.test(match))
+        return action;
       const modifier = /^(?:(?:no|not)-|non\b)/i.test(match);
-      const replacement = options.boundary && !modifier && !sharedObject.test(prefix) ? ";" : " ";
+      const aside = options.boundary
+        ? closesInlineAside(prefix, text.slice(offset + match.length))
+        : undefined;
+      const shared = options.boundary ? (aside ?? sharedObject.test(prefix)) : false;
+      const replacement = options.boundary && !modifier && !shared ? ";" : " ";
       // "No-restart deployment" negates the modifier, unlike "don't restart the deployment".
       const nounModifier = /^no[ \t]/i.test(match) && !/ing$/i.test(action);
-      return modifier || nounModifier ? replacement + directObject : replacement;
+      return modifier || nounModifier || (options.boundary && shared && aside === undefined)
+        ? replacement + directObject
+        : replacement;
     },
   );
 };
@@ -80,7 +142,7 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
     return "money";
   // Removing a negated action must not attach its object to an earlier unrelated action.
   const secretText = withoutNegated(
-    withoutNegated(text, secretAction, { boundary: true }),
+    withoutNegated(text, negatableSecretAction, { boundary: true, object: secretKeyword }),
     negatableSecretKeyword,
   );
   if (secretMention.test(secretText)) return "secret";

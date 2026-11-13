@@ -29,8 +29,44 @@ const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
 const mergeOnly =
   "Merge into main-dev after clear review at exact head with green CI (test-only, no deploy)";
+const repeatedNegationCases = [1, 2, 3, 4].flatMap((count) =>
+  [
+    ["deploy agent-bridges", "deploy"],
+    ["pay the invoice", "money"],
+    ["rotate the API key", "secret"],
+  ].map(([action, gate]) => ({
+    text: `${"not ".repeat(count)}${action}`,
+    gate: count % 2 === 0 ? gate : undefined,
+  })),
+);
 
 const affirmativeClauseCases = [
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["tokens", "passwords", "the API key"].flatMap((inside) =>
+      ["never", "don't", "do not yet"].map(
+        (negation) => [`${verb} (${negation} share ${inside}) a token`, "secret"] as const,
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["an ephemeral", "a single", "a temporary"].flatMap((qualifier) =>
+      [
+        ["(", ")"],
+        ["[", "]"],
+        ["'", "'"],
+        ["—", "—"],
+        ["--", "--"],
+      ].flatMap(([open, close]) =>
+        ["never", "don't", "do not yet"].map(
+          (negation) =>
+            [
+              `${verb} ${qualifier} ${open}${negation} share${close} the API key`,
+              "secret",
+            ] as const,
+        ),
+      ),
+    ),
+  ),
   ["Prepare a no deploy signing release", "deploy"] as const,
   ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
     ["and", "but", "or", "then", "and then", "but also"].flatMap((joiner) =>
@@ -56,7 +92,7 @@ const affirmativeClauseCases = [
     ),
   ),
   ...["API", "SSH", "private", "signing"].flatMap((type) =>
-    ["non-", "non "].flatMap((prefix) =>
+    ["non-", "non ", "no-", "not-"].flatMap((prefix) =>
       ["key", "keys"].map((noun) => [`Rotate the ${prefix}${type} ${noun}`, "secret"] as const),
     ),
   ),
@@ -168,8 +204,29 @@ const negatedSecretCases = ["Create", "Generate", "Store", "Issue"].flatMap((ver
     ),
   ),
 );
+const negatedAsideCases = ["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+  [
+    ["(", ")"],
+    ["[", "]"],
+    ["'", "'"],
+    ["—", "—"],
+    ["--", "--"],
+  ].flatMap(([open, close]) =>
+    ["never", "don't", "do not yet", "without", "not"].flatMap((negation) =>
+      [
+        "share tokens",
+        "reveal passwords",
+        "rotate the API key",
+        "sharing tokens",
+        "revealing passwords",
+        "rotating the API key",
+      ].map((action) => `${verb} ${open}${negation} ${action}${close} a report`),
+    ),
+  ),
+);
 
 const negatedGateCases = [
+  ...negatedAsideCases,
   ...["No", "Not", "Without"].flatMap((negation) =>
     [
       "restarting the LaunchAgent",
@@ -277,6 +334,14 @@ const resourceReleaseCases = [
 ] as const;
 
 describe("inferGate", () => {
+  it.each(repeatedNegationCases)("counts repeated negation: $text", ({ text, gate }) => {
+    expect(inferGate(text)).toBe(gate);
+  });
+  it.each([40, 80, 160])("handles %i punctuation characters without backtracking", (length) => {
+    const start = performance.now();
+    expect(inferGate(`Create ${"-".repeat(length)} a report, never share tokens`)).toBeUndefined();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
   it.each(affirmativeClauseCases)("keeps the next affirmative clause: %s → %s", (text, gate) => {
     expect(inferGate(text)).toBe(gate);
   });
@@ -535,6 +600,18 @@ describe("approvalProblem", () => {
     doneBy: null,
     doneAt: null,
   };
+  it.each(repeatedNegationCases)(
+    "plans and enforces repeated negation: $text",
+    ({ text, gate }) => {
+      const plan = planSubtasks([], [{ text, owner: "evaluator" }], 0, at);
+      if (!plan.ok) throw new Error(plan.reason);
+      const action = plan.subtasks[0]!;
+      expect(action.gate).toBe(gate);
+      const problem = approvalProblem({ ...card, subtasks: plan.subtasks }, action);
+      if (gate === undefined) expect(problem).toBeNull();
+      else expect(problem).toContain("needs Abdullah's approval");
+    },
+  );
 
   it.each(affirmativeClauseCases)(
     "persists and enforces the next clause's gate: %s → %s",
@@ -648,17 +725,20 @@ describe("approvalProblem", () => {
     answer: { verdict: "approved", by: owner, at },
   });
 
-  it.each(negatedSecretCases)("does not reattach negated secret objects in an ask: %s", (text) => {
-    const action = {
-      ...subtask,
-      owner: "evaluator" as const,
-      text: "Share tokens",
-      gate: "secret" as const,
-    };
-    expect(
-      approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
-    ).toContain("no owner answer");
-  });
+  it.each([...negatedSecretCases, ...negatedAsideCases])(
+    "does not reattach negated secret objects in an ask: %s",
+    (text) => {
+      const action = {
+        ...subtask,
+        owner: "evaluator" as const,
+        text: "Share tokens",
+        gate: "secret" as const,
+      };
+      expect(
+        approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
+      ).toContain("no owner answer");
+    },
+  );
 
   it.each([
     ["deploy", "Don't deploy yet?", "Deploy now?"],
