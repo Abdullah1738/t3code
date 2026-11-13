@@ -141,7 +141,7 @@ const approvesGate = (
       : /\b(?:pay|purchase|buy|charge|refund|transfer)\b/i;
   return (
     choiceVerb.test(command) &&
-    !/\b(?:not|no|without|except|only|instead|partial|dry[- ]?run|draft|plan|preview|prepare)\b/i.test(
+    !/\b(?:not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead|partial|dry[- ]?run|draft|plan|preview|prepare)\b/i.test(
       command,
     ) &&
     others.some((other) => isNegativeOption(other) || !choiceVerb.test(other))

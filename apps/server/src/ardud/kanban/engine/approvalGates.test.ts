@@ -130,6 +130,45 @@ it.each([
   );
 });
 
+it.each(
+  [
+    {
+      subtask: goChoiceSubtask,
+      lead: "Build the bundle",
+      verbs: ["deploy", "release", "install", "restart", "ship"],
+      hold: "Wait for #4280",
+    },
+    {
+      subtask: { ...goChoiceSubtask, text: "Purchase the license", gate: "money" as const },
+      lead: "Check prices",
+      verbs: ["pay", "purchase", "buy", "charge", "refund", "transfer"],
+      hold: "Leave it",
+    },
+  ].flatMap(({ verbs, ...fixture }) =>
+    verbs.flatMap((verb) =>
+      [
+        "don't",
+        "don’t",
+        "dont",
+        "DON'T",
+        "do not",
+        "never",
+        "cannot",
+        "can't",
+        "can’t",
+        "won't",
+        "won’t",
+        "shouldn't",
+        "shouldn’t",
+        "must not",
+      ].map((negation) => ({ ...fixture, label: `${fixture.lead}, ${negation} ${verb} it` })),
+    ),
+  ),
+)("a negated go/hold label cannot approve: $label", ({ subtask, label, hold }) => {
+  const card = goChoiceCard([label, hold], ["o1"], subtask);
+  assert.include(approvalProblem(card, subtask)!, "approval");
+});
+
 it("secret picks keep the strict approval path even with a hold", () => {
   const subtask = { ...goChoiceSubtask, text: "Share the token", gate: "secret" as const };
   const card = goChoiceCard(["Share the key with the worker", "Don't"], ["o1"], subtask);
