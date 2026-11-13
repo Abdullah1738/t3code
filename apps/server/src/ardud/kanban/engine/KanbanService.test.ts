@@ -25848,6 +25848,123 @@ it.effect("card_thread stop reaches an unattached pending question", () =>
   }),
 );
 
+it.effect.each(
+  (["reset", "stop"] as const).flatMap((action) =>
+    (["active", "detached"] as const).flatMap((attachment) =>
+      (["inline", "await"] as const).flatMap((mode) =>
+        (["claim", "dispatch", "claim during read failure"] as const).map((probe) => ({
+          action,
+          attachment,
+          mode,
+          probe,
+        })),
+      ),
+    ),
+  ),
+)(
+  "#1295 settlement reservation: $action $attachment $probe ($mode)",
+  ({ action, attachment, mode, probe }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const fake = yield* makeFake;
+      const ended = yield* Ref.make(false);
+      let target: string | undefined;
+      const layer = Layer.succeed(
+        KanbanThreads,
+        KanbanThreads.of({
+          ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+          interrupt: (id, reason, cancelQueued, runId) =>
+            lifecycle.interrupt(id, reason, cancelQueued, runId),
+          // A live provider can acknowledge Stop before its asynchronous interrupt settles.
+          runSettled: (_id, run) =>
+            Effect.gen(function* () {
+              assert.equal(run, target);
+              if (yield* Ref.get(ended)) return true;
+              if (probe === "claim during read failure")
+                return yield* new KanbanThreadError({
+                  operation: "runSettled",
+                  detail: "read failed",
+                });
+              return false;
+            }),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const threadId = card.activeThreadId!;
+        const modelSelection = {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-6.1-sol",
+        };
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("reservation:create"),
+          threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "Old work",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+        for (let i = 0; i < 3; i++)
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`reservation:message:${i}`),
+            threadId,
+            messageId: MessageId.make(`reservation:message:${i}`),
+            text: "Stale wake",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: i === 0 ? "start_immediately" : "queue_after_active" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+        target = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!.id;
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(threadId)!, { running: true, runId: target });
+          return all;
+        });
+        if (attachment === "detached")
+          yield* store.putCard({
+            ...card,
+            stage: "todo",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+          });
+        const sibling = yield* kanban.createCard(board.id, { title: "B", prompt: "B" }, owner);
+        yield* store.putCard({ ...sibling, workThreadId: threadId });
+        yield* kanban.cardThread(card.id, action, "Stop old work", owner);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs
+            .slice(1)
+            .map((run) => run.status),
+          ["cancelled", "cancelled"],
+        );
+        if (probe === "dispatch") {
+          yield* kanban.dispatchNow;
+          assert.isNull((yield* kanban.card(sibling.id)).card.activeThreadId);
+        } else {
+          const error = yield* kanban.claimCard(threadId, sibling.id).pipe(Effect.flip);
+          assert.include(error.detail, "being stopped");
+        }
+        yield* Ref.set(ended, true);
+        yield* setRunning(fake, threadId, false);
+        assert.equal((yield* kanban.claimCard(threadId, sibling.id)).card.activeThreadId, threadId);
+      }).pipe(Effect.provide(mode === "inline" ? inlineTestLayer(layer) : testLayer(layer)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
 it.effect.each(["claim", "dispatch", "claim during read failure"])(
   "an acknowledged stop reserves its target until it settles: %s",
   (action) =>

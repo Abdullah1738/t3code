@@ -659,7 +659,7 @@ const make = Effect.gen(function* () {
       }
       // Stop holds the queue atomically with the interrupt. interruptThread alone
       // ignores queued runs, allowing an abandoned launch to start afterwards.
-      yield* threads.dispatch({
+      const result = yield* threads.dispatch({
         type: "thread.stop",
         commandId: commandId("stop"),
         threadId,
@@ -675,6 +675,18 @@ const make = Effect.gen(function* () {
           runId: run.id,
         });
       }
+      // The committed request identifies the stopped run even if it changed after the shell read.
+      for (const { event } of result.storedEvents) {
+        if (
+          event.threadId === threadId &&
+          event.type === "turn-item.updated" &&
+          event.payload.type === "run_interrupt_request" &&
+          event.payload.runId !== null
+        ) {
+          return { outcome: "requested", runId: event.payload.runId } as const;
+        }
+      }
+      return { outcome: "noop" } as const;
     },
     Effect.mapError((error) =>
       isKanbanThreadError(error)
