@@ -156,3 +156,27 @@ test.each([
   const { cardKind } = await import("../src/toollog.ts");
   expect(cardKind(name)).toBe(expected);
 });
+
+test.each([
+  ["http_400:private_message_sentinel", "http_400:provider_error"],
+  ["http_429:private_token_sentinel", "http_429:provider_error"],
+  ["http_503:otp_654321", "http_503:provider_error"],
+  ["http_400:stop_opt_out_private_sentinel", "http_400:provider_error"],
+  ["http_400:STOP", "http_400:stop_opt_out"],
+  ["http_400:invalid_number", "http_400:invalid_number"],
+  ["http_503:worker_unavailable", "http_503:worker_unavailable"],
+  ["http_400:5504", "http_400:5504"],
+  ["sendblue.654321", "sendblue.async_failure"],
+  ["sendblue.private_token_sentinel", "sendblue.async_failure"],
+  ["sendblue.STOP", "sendblue.stop_opt_out"],
+])("writer and rollup allowlist provider tag %s", async (tag, expected) => {
+  const { root, log, lines } = setup();
+  const row = { ...entry, kind: "error", name: "reply.failed", ok: false, error: { tag, message: "PRIVATE_MESSAGE" } } as const;
+  log.write(row);
+  expect(lines()[0].error?.tag).toBe(expected);
+  // Older or externally supplied input must pass the same filter when aggregated.
+  appendFileSync(join(root, `${day}.ndjson`), JSON.stringify({ ...row, ts: `${day}T12:00:00.000Z`, tool: "imessage" }) + "\n");
+  const rollup = await log.rollup(day);
+  expect(rollup?.topErrorTags).toEqual([{ tag: expected, count: 2, sampleId: "msg-fixture" }]);
+  expect(JSON.stringify(rollup)).not.toContain("PRIVATE_MESSAGE");
+});

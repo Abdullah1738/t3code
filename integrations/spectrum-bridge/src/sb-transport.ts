@@ -5,7 +5,7 @@ import { toolError } from "./toollog.ts";
  * history before it is sent again.
  */
 import type { ChatKey, Line, LineFile, LineAppCard, LineOutbound } from "./line.ts";
-import { LINE_FAILURE_CODE, LineError, chatKey } from "./line.ts";
+import { LineError, chatKey, safeLineFailureCode } from "./line.ts";
 import { TransportError, type NormalizedInbound } from "./photon.ts";
 import type { Store } from "./store.ts";
 import { CARD_TEXT_FIELDS, cardLayout, type CardText } from "./card-text.ts";
@@ -23,7 +23,7 @@ export const TYPING_MAX_MS = 60_000;
 
 export function classifyLineFailure(error: unknown): TransportError {
   if (!(error instanceof LineError)) return new TransportError("operationFailed", false, false);
-  const code = LINE_FAILURE_CODE.test(error.code) ? error.code : /^http_[1-5]\d{2}/.exec(error.code)?.[0] ?? "lineFailure";
+  const code = safeLineFailureCode(error.code);
   return new TransportError(code, error.retryable, error.uncertain);
 }
 

@@ -1,3 +1,4 @@
+import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -45,7 +46,12 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
   }
   if (Object.keys(props).length) line.props = props;
-  if (entry.kind === "error") line.error = { tag: TAG.test(entry.error?.tag ?? "") ? entry.error!.tag : "operation.failed", message: "Operation failed" };
+  if (entry.kind === "error") {
+    let tag = entry.error?.tag ?? "";
+    if (/^http_[1-5]\d{2}/.test(tag)) tag = safeLineFailureCode(tag);
+    else if (tag.startsWith("sendblue.")) tag = `sendblue.${sendblueErrorKey(tag.slice(9)) ?? "async_failure"}`;
+    line.error = { tag: TAG.test(tag) ? tag : "operation.failed", message: "Operation failed" };
+  }
   return line;
 }
 

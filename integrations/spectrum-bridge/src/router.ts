@@ -884,6 +884,7 @@ export class Router {
       for (const member of ids) this.store.db.query("UPDATE inbound SET state = 'failed' WHERE id = ? AND state IN ('processing', 'batched')").run(member);
       this.store.set(`batch-phase:${id}`, "expired");
       if (preparing?.id === id) this.store.set("preparingDelivery", null);
+      if (attempted) this.logTurnEnd(attempted, "failed");
       if (active?.inboundId === id) this.setTurn({ ...active, phase: "failed" });
       if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
       if (preparing?.id === id || active?.inboundId === id) this.store.set("deliveryOutage", null);
@@ -2053,9 +2054,14 @@ export class Router {
       this.store.updateInbound(inboundId, "processing");
       this.store.set("routeGeneration", generation);
       this.store.set("route", null);
+      if (turn) this.logTurnEnd(turn, turn.earlySent ? "replied" : "no_reply");
       this.setTurn(null);
       const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
       if (preparing) {
+        toolLog.capture(() => {
+          const original = this.store.get<Turn | null>(`failed-delivery:${preparing.id}`);
+          if (original) this.logTurnEnd(original, original.earlySent ? "replied" : "no_reply");
+        });
         for (const id of this.store.get<NormalizedInbound | null>(`batch:${preparing.id}`)?.batchIds ?? [preparing.id]) this.store.updateInbound(id, "cancelled");
         this.store.set(`batch:${preparing.id}`, null);
         this.store.set(`batch-phase:${preparing.id}`, null);
@@ -3438,6 +3444,7 @@ export class Router {
         } satisfies PreparingDelivery);
         this.setTurn(null);
       } else {
+        this.logTurnEnd(turn, "failed");
         this.setTurn({ ...turn, phase: "failed" });
         this.store.set("deliveryOutage", null);
         if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
@@ -3939,6 +3946,7 @@ export class Router {
         if (now - (turn.activeAt ?? turn.startedAt) < REQUEST_TURN_GRACE) return;
         this.store.db.transaction(() => {
           if (!this.current(turn!)) return;
+          this.logTurnEnd(turn!, turn!.earlySent ? "replied" : "no_reply");
           this.setTurn(null);
           this.store.set("pendingApprovals", null);
         }).immediate();
@@ -3948,6 +3956,7 @@ export class Router {
       // Once it stops, there is no later idle marker for this empty background turn.
       if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size && !discoveryPending) {
         this.store.db.transaction(() => {
+          this.logTurnEnd(turn!, turn!.earlySent ? "replied" : "no_reply");
           this.setTurn(null);
           this.store.set("pendingApprovals", null);
         }).immediate();
@@ -4117,11 +4126,9 @@ export class Router {
     }
   }
 
+  // Clearing this pointer can be temporary during rebuilds; terminal paths log their own outcome.
   private setTurn(turn: Turn | null): void {
-    let previous: Turn | null | undefined;
-    toolLog.capture(() => { previous = this.store.get<Turn | null>("activeTurn"); });
     this.store.set("activeTurn", turn);
-    if (previous && previous.messageId !== turn?.messageId) this.logTurnEnd(previous, previous.earlySent ? "replied" : "no_reply");
     if (turn && turn.phase !== "failed") this.logTurnStart(turn);
   }
 

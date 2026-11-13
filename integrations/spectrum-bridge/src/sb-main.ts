@@ -15,7 +15,7 @@ import type { Access } from "./chats.ts";
 import { alertSkillPath, skillPath, stateRoot, telegramBridgeSocket, type Config } from "./config.ts";
 import { Delivery } from "./delivery.ts";
 import { checkReply, readReplyRules } from "./replyCheck.ts";
-import type { Line, LineEvent } from "./line.ts";
+import { sendblueErrorKey, type Line, type LineEvent } from "./line.ts";
 import { acquireLock } from "./lock.ts";
 import type { ChatBackend } from "./openchamber.ts";
 import type { Photon } from "./photon.ts";
@@ -70,7 +70,7 @@ export function observedLine(line: Line, seen: { synchronized: boolean; lastEven
         seen.lastEventAt = Date.now();
         if (event.type === "status" && /^(error|declined|failed)$/i.test(event.status)) toolLog.capture(() => toolLog.write({
           component: "sendblue", kind: "error", name: "reply.failed", ok: false, ids: { messageId: event.handle },
-          error: { tag: /^(?:[0-9]{3,6}|STOP|stop_opt_out)$/.test(event.errorCode ?? "") ? `sendblue.${event.errorCode}` : "sendblue.async_failure", message: "" },
+          error: { tag: `sendblue.${sendblueErrorKey(event.errorCode) ?? "async_failure"}`, message: "" },
         }));
         yield event;
       }

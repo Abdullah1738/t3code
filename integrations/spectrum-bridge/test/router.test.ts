@@ -7395,6 +7395,86 @@ test("background follow-up turns have paired start/end records", async () => {
   expect(JSON.stringify(captured)).not.toContain("PRIVATE_");
 });
 
+test("replay expiry ends the tracked turn as failed before it is cleared", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("expiring-log", "PRIVATE_PROMPT", { source: "typed" });
+    await h.router.tick();
+    h.store.set("failed-replay-until:expiring-log", start + 1000);
+    setSystemTime(start + 2000);
+    await h.router.tick();
+    expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "expiring-log", phase: "failed" });
+  });
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  const later = await captureLogs(async () => {
+    h.backend.promptBehavior = undefined;
+    h.input("fresh-log", "New instruction", { source: "typed" });
+    await h.router.tick();
+  });
+  expect(later.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log"))).toEqual([]);
+});
+
+test("a held-turn rebuild logs no terminal outcome until the rebuilt turn replies", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const rebuilding = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("rebuild-log", "PRIVATE_HELD_PROMPT");
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    h.backend.promptBehavior = undefined;
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    expect(h.backend.prompts.at(-1)).toMatchObject({ messageId: messageId("rebuild-log"), text: "PRIVATE_HELD_PROMPT" });
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "running" });
+  });
+  expect(rebuilding.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("rebuild-log"))).toEqual([]);
+  const completed = await captureLogs(async () => {
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+  });
+  expect(completed.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("rebuild-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["replied", true]]);
+});
+
+test("reset during held-turn preparation closes the original logged turn", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  let resetDuringPreparation = false;
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("cancel-rebuild-log", "PRIVATE_HELD_PROMPT");
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    h.backend.onStatuses = () => {
+      if (!resetDuringPreparation && h.store.get("preparingDelivery") && !h.store.get("activeTurn")) {
+        resetDuringPreparation = true;
+        h.input("cancel-preparation", "/new");
+      }
+    };
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    await h.router.tick();
+    expect(resetDuringPreparation).toBe(true);
+    expect(inbounds(h.store).find(row => row.id === "cancel-rebuild-log")?.state).toBe("cancelled");
+  });
+  expect(logs.filter(l => l.name === "turn.start" && l.ids?.messageId === messageId("cancel-rebuild-log"))).toHaveLength(1);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("cancel-rebuild-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["no_reply", true]]);
+});
+
 test("watcher reply guard logs accepted silence and visible replies without text", async () => {
   const previous = process.env.TOOLLOG_DIR;
   const logs = mkdtempSync(join(tmpdir(), "wake-guard-log-")); directories.push(logs);

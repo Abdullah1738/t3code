@@ -12,7 +12,7 @@ import {
 } from "@photon-ai/advanced-imessage/grpc";
 import type { SharedTokenData, TokenData } from "@spectrum-ts/core";
 import type { Format } from "./formatting.ts";
-import { LINE_FAILURE_CODE } from "./line.ts";
+import { safeLineFailureCode, LINE_FAILURE_CODE } from "./line.ts";
 
 export type { CatchUpEvent } from "@photon-ai/advanced-imessage/grpc";
 
@@ -44,15 +44,16 @@ export class TransportError extends Error {
 /** Unknown outcomes may only be retried with the original durable idempotency key. */
 export function classifySendFailure(error: unknown): { retryable: boolean; uncertain: boolean; code: string } {
   if (error instanceof TransportError) {
+    const code = /^http_[1-5]\d{2}/.test(error.code) ? safeLineFailureCode(error.code) : error.code;
     const knownCode = [
       "invalidCredentials", "endpointOverride", "closed", "tokenNetwork", "invalidTokenResponse",
       "sharedPlanRequired", "invalidTokenLifetime", "invalidOperationId", "invalidOwner", "invalidOwnerChat",
       "unauthorized", "invalidAttachmentLimit", "invalidAttachment", "attachmentTooLarge",
       "catchupTimeout", "catchupIncomplete", "attachmentTimeout", "invalidEffect", "invalidPoll", "invalidApp",
-    ].includes(error.code) || (error.code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(error.code))
+    ].includes(code) || (code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(code))
       // Sendblue line failures carry their own retry and uncertainty flags (sb-transport.ts).
-      || LINE_FAILURE_CODE.test(error.code);
-    if (knownCode) return { retryable: error.retryable, uncertain: error.ambiguous, code: error.code };
+      || LINE_FAILURE_CODE.test(code);
+    if (knownCode) return { retryable: error.retryable, uncertain: error.ambiguous, code };
   }
   if (error instanceof IMessageError) {
     const code = Object.values(ErrorCode).includes(error.code) ? error.code : "unknownSendFailure";

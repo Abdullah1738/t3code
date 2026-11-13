@@ -7,7 +7,7 @@ import { toolError, toolLog } from "./toollog.ts";
 import { CARD_TEXT_FIELDS, cardLayout, cardSafeText, type CardText } from "./card-text.ts";
 import type { SendblueOptions } from "./chats.ts";
 import { SPECTRUM_CARD_APP, type CardApp } from "./config.ts";
-import { chatKey, LineError, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
+import { chatKey, LineError, sendblueFailureCode, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
 
 const BASE = "https://api.sendblue.com";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -236,7 +236,7 @@ export class Sendblue implements Line {
     const status = response.status;
     const detail = isObject(parsed) ? (str(parsed.message) ?? str(parsed.error_reason) ?? str(parsed.error)) : undefined;
     const errorKey = isObject(parsed) ? (str(parsed.error_key) ?? str(parsed.error) ?? (num(parsed.error_code) === undefined ? undefined : String(parsed.error_code))) : undefined;
-    const code = errorKey ? `http_${status}:${errorKey}` : `http_${status}`;
+    const code = sendblueFailureCode(status, errorKey);
     const message = `Sendblue ${method} ${path} returned ${status}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
     if (status === 429) throw new LineError(message, code, true, false);
     if (status >= 500) throw new LineError(message, code, true, send);

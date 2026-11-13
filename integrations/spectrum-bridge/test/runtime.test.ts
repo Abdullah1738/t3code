@@ -540,7 +540,7 @@ test("late Sendblue failures retain the status code but never the provider's err
     };
     for await (const _event of observedLine(line, { synchronized: true, lastEventAt: 0 }).events(new AbortController().signal)) { /* drain fixture */ }
   });
-  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe("sendblue.STOP");
+  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe("sendblue.stop_opt_out");
   expect(logs.filter(l => l.name === "reply.failed")).toHaveLength(1);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_MESSAGE");
 });
