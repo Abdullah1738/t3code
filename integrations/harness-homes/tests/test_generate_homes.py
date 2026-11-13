@@ -105,6 +105,18 @@ class HarnessTestCase(unittest.TestCase):
                     self.assertGreater(i, 2)
                     self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
 
+    def test_generated_shared_mcp_connect_headroom(self) -> None:
+        self.run_gen()
+        env = json.loads((self.claude / "settings.json").read_text())["env"]
+        self.assertEqual(env["MCP_TIMEOUT"], "15000")
+        self.assertEqual(env["MCP_CONNECT_TIMEOUT_MS"], "15000")
+        for harness in ("codex", "codex-cu"):
+            config = tomllib.loads((self.root / harness / "config.toml").read_text())
+            for name in ("flighty", "inbody"):
+                self.assertEqual(config["mcp_servers"][name]["startup_timeout_sec"], 30)
+        rc, output = self.run_check()
+        self.assertEqual(rc, 0, output)
+
     def run_check(self, manifest: dict | None = None) -> tuple[int, str]:
         with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
             out = io.StringIO()

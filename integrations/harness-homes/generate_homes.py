@@ -356,6 +356,8 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "ENABLE_PROMPT_CACHING_1H": "1",
             "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "450000",
             "API_TIMEOUT_MS": "1800000",
+            "MCP_TIMEOUT": str(c["mcpTimeoutMs"]),
+            "MCP_CONNECT_TIMEOUT_MS": str(c["mcpTimeoutMs"]),
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "900000",
