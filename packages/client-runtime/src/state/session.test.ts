@@ -11,13 +11,23 @@ import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } fr
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { TestClock } from "effect/testing";
 
-import { RemoteEnvironmentAuthFetchError, RemoteEnvironmentAuthTimeoutError } from "../rpc/http.ts";
-import { createEnvironmentSessionAtoms, isTransientSessionStateError } from "./session.ts";
+import {
+  RemoteEnvironmentAuthFetchError,
+  RemoteEnvironmentAuthTimeoutError,
+  RemoteEnvironmentAuthUndeclaredStatusError,
+} from "../rpc/http.ts";
+import {
+  createEnvironmentSessionAtoms,
+  isTransientSessionStateError,
+  isRejectedSessionStateError,
+} from "./session.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import {
   ConnectionBlockedError,
+  AVAILABLE_CONNECTION_STATE,
+  type SupervisorConnectionState,
   PrimaryConnectionTarget,
   type PreparedConnection,
 } from "../connection/model.ts";
@@ -55,6 +65,7 @@ const makeHarness = Effect.fnUntraced(function* (options?: {
   dpop?: boolean;
   initiallySlow?: boolean;
   initiallyBlocked?: boolean;
+  initialResponse?: Response;
 }) {
   const binding = options?.dpop
     ? {
@@ -67,12 +78,20 @@ const makeHarness = Effect.fnUntraced(function* (options?: {
       }
     : prepared;
   const preparedRef = yield* SubscriptionRef.make(Option.some(binding));
-  const supervisor = { prepared: preparedRef } as EnvironmentSupervisor["Service"];
+  const stateRef = yield* SubscriptionRef.make<SupervisorConnectionState>({
+    ...AVAILABLE_CONNECTION_STATE,
+    phase: "connected",
+  });
+  const supervisor = { prepared: preparedRef, state: stateRef } as EnvironmentSupervisor["Service"];
   const environments = {
     followStream: (_id, stream) => Stream.provideService(stream, EnvironmentSupervisor, supervisor),
   } as EnvironmentRegistry["Service"];
   let reply: () => Effect.Effect<Response, HttpClientError.HttpClientError> = () =>
-    options?.initiallySlow ? Effect.never : Effect.succeed(Response.json(grant));
+    options?.initialResponse !== undefined
+      ? Effect.succeed(options.initialResponse)
+      : options?.initiallySlow
+        ? Effect.never
+        : Effect.succeed(Response.json(grant));
   const calls: number[] = [];
   const clock = yield* Clock.Clock;
   const client = HttpClient.make((request) =>
@@ -135,16 +154,22 @@ const makeHarness = Effect.fnUntraced(function* (options?: {
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const atoms = createEnvironmentSessionAtoms(runtime);
   const atom = atoms.sessionStateAtom(environmentId);
-  const permission = createCommandPermissions(
-    runtime,
-    WS_METHODS.scheduledTasksDelete,
-  ).permissionAtom(environmentId);
-  const unmount = registry.mount(permission);
+  const permissions = createCommandPermissions(runtime, WS_METHODS.scheduledTasksDelete);
+  const permission = permissions.permissionAtom(environmentId);
+  const status = permissions.permissionStatusAtom(environmentId);
+  const stopPermission = registry.mount(permission);
+  const stopStatus = registry.mount(status);
+  const unmount = () => {
+    stopPermission();
+    stopStatus();
+  };
   const read = AtomRegistry.getResult(registry, atom, { suspendOnWaiting: true });
   return {
     registry,
     atom,
     permission,
+    status,
+    stateRef,
     atoms,
     read,
     unmount,
@@ -176,6 +201,27 @@ const makeHarness = Effect.fnUntraced(function* (options?: {
 const settle = TestClock.adjust(0);
 
 describe("session state retry", () => {
+  it.each([400, 401, 403, 500, 502, 503, 504])(
+    "classifies HTTP %s through both error forms",
+    (status) => {
+      const request = HttpClientRequest.get(prepared.httpBaseUrl);
+      const response = HttpClientResponse.fromWeb(request, new Response("unavailable", { status }));
+      const wrapped = new RemoteEnvironmentAuthFetchError({
+        message: "HTTP failure",
+        cause: new HttpClientError.HttpClientError({
+          reason: new HttpClientError.StatusCodeError({ request, response }),
+        }),
+      });
+      const transient = [502, 503, 504].includes(status);
+      expect(isTransientSessionStateError(wrapped)).toBe(transient);
+      expect(isRejectedSessionStateError(wrapped)).toBe(status === 401 || status === 403);
+      expect(
+        isTransientSessionStateError(
+          new RemoteEnvironmentAuthUndeclaredStatusError(prepared.httpBaseUrl, status),
+        ),
+      ).toBe(transient);
+    },
+  );
   it("retries a session read that timed out on a busy server", () => {
     expect(
       isTransientSessionStateError(
@@ -254,12 +300,15 @@ describe("session permissions", () => {
       const h = yield* makeHarness({ initiallySlow: true });
       yield* settle;
       expect(h.registry.get(h.permission)).toBe(false);
+      expect(h.registry.get(h.status)).toBe("unknown");
       yield* TestClock.adjust(6_000);
       expect(h.calls).toHaveLength(1);
+      expect(h.registry.get(h.status)).toBe("unknown");
       h.reply(() => Effect.succeed(Response.json(grant)));
       yield* TestClock.adjust(1_000);
       yield* h.read;
       expect(h.registry.get(h.permission)).toBe(true);
+      expect(h.registry.get(h.status)).toBe("granted");
       expect(h.calls).toHaveLength(2);
     }).pipe(Effect.scoped),
   );
@@ -277,6 +326,7 @@ describe("session permissions", () => {
       yield* TestClock.adjust(1_000);
       yield* h.read;
       expect(h.registry.get(h.permission)).toBe(false);
+      expect(h.registry.get(h.status)).toBe("denied");
       expect(h.calls).toHaveLength(3);
     }).pipe(Effect.scoped),
   );
@@ -346,6 +396,17 @@ describe("session permissions", () => {
       yield* h.read.pipe(Effect.flip);
       expect(h.registry.get(h.permission)).toBe(false);
       expect(Option.isNone(AsyncResult.value(h.registry.get(h.atom)))).toBe(true);
+      expect(h.registry.get(h.status)).toBe("denied");
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "backoff" as const,
+      }));
+      yield* settle;
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "connected" as const,
+      }));
+      yield* settle;
       yield* TestClock.adjust(60_000);
       expect(h.calls).toHaveLength(2);
     }).pipe(Effect.scoped),
@@ -528,6 +589,105 @@ describe("session permissions", () => {
       h.registry.mount(h.permission);
       yield* settle;
       expect(h.registry.get(h.permission)).toBe(true);
+    }).pipe(Effect.scoped),
+  );
+});
+
+describe("session recovery on reconnect", () => {
+  it.effect.each([502, 503, 504])("retries HTTP %s and grants without remounting", (status) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ initialResponse: new Response("restarting", { status }) });
+      yield* settle;
+      expect(h.calls).toHaveLength(1);
+      expect(h.registry.get(h.status)).toBe("unknown");
+      h.reply(() => Effect.succeed(Response.json(grant)));
+      yield* TestClock.adjust(999);
+      expect(h.calls).toHaveLength(1);
+      yield* TestClock.adjust(1);
+      yield* h.read;
+      expect(h.registry.get(h.status)).toBe("granted");
+      expect(h.calls).toHaveLength(2);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("rereads a nonterminal failure once per reconnect and stops on unmount", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ initialResponse: Response.json({ invalid: true }) });
+      yield* h.read.pipe(Effect.flip);
+      yield* settle;
+      expect(h.registry.get(h.status)).toBe("unknown");
+      expect(h.calls).toHaveLength(1);
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "backoff" as const,
+      }));
+      yield* settle;
+      expect(h.calls).toHaveLength(1);
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "connected" as const,
+      }));
+      yield* settle;
+      yield* h.read.pipe(Effect.flip);
+      expect(h.calls).toHaveLength(2);
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        attempt: state.attempt + 1,
+      }));
+      yield* TestClock.adjust(60_000);
+      expect(h.calls).toHaveLength(2);
+      h.reply(() => Effect.succeed(Response.json(grant)));
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "backoff" as const,
+      }));
+      yield* settle;
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "connected" as const,
+      }));
+      yield* settle;
+      yield* h.read;
+      expect(h.calls).toHaveLength(3);
+      expect(h.registry.get(h.status)).toBe("granted");
+      h.unmount();
+      yield* settle;
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "backoff" as const,
+      }));
+      yield* settle;
+      yield* SubscriptionRef.update(h.stateRef, (state) => ({
+        ...state,
+        phase: "connected" as const,
+      }));
+      yield* TestClock.adjust(60_000);
+      expect(h.calls).toHaveLength(3);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not restart a healthy read or its backoff on reconnect", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.read;
+      for (const phase of ["backoff", "connected"] as const) {
+        yield* SubscriptionRef.update(h.stateRef, (state) => ({ ...state, phase }));
+        yield* settle;
+      }
+      expect(h.calls).toHaveLength(1);
+      h.offline();
+      h.registry.refresh(h.atom);
+      yield* settle;
+      yield* TestClock.adjust(1_000);
+      expect(h.calls).toHaveLength(3);
+      for (const phase of ["backoff", "connected"] as const) {
+        yield* SubscriptionRef.update(h.stateRef, (state) => ({ ...state, phase }));
+        yield* settle;
+      }
+      yield* TestClock.adjust(1_999);
+      expect(h.calls).toHaveLength(3);
+      yield* TestClock.adjust(1);
+      expect(h.calls).toHaveLength(4);
     }).pipe(Effect.scoped),
   );
 });

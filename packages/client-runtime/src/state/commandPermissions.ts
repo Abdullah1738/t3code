@@ -7,6 +7,7 @@ import {
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -15,6 +16,8 @@ import { createEnvironmentSessionAtoms, isRejectedSessionStateError } from "./se
 
 // Two six-second reads plus the first one-second backoff, with room to settle.
 const SESSION_AUTHORIZATION_TIMEOUT_MS = 15_000;
+
+export type PermissionStatus = "granted" | "denied" | "unknown";
 
 function makeCommandPermissions<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -40,6 +43,23 @@ function makeCommandPermissions<R, E>(
   );
   const permissionAtom = (environmentId: EnvironmentId | null, input?: unknown) =>
     atomsByEnvironment(environmentId)(requiredScopes(input).join(","));
+  const statusesByEnvironment = Atom.family((environmentId: EnvironmentId | null) =>
+    Atom.family((scopeKey: string) =>
+      Atom.make((get): PermissionStatus => {
+        if (environmentId === null) return "denied";
+        const scopes = scopeKey.split(",").filter(Boolean) as AuthEnvironmentScope[];
+        if (scopes.length === 0) return "granted";
+        const result = get(sessions.sessionStateAtom(environmentId));
+        if (result._tag === "Failure" && isRejectedSessionStateError(Cause.squash(result.cause)))
+          return "denied";
+        const session = Option.getOrNull(AsyncResult.value(result));
+        if (session === null) return "unknown";
+        return scopes.every((scope) => sessionGrantsScope(session, scope)) ? "granted" : "denied";
+      }),
+    ),
+  );
+  const permissionStatusAtom = (environmentId: EnvironmentId | null, input?: unknown) =>
+    statusesByEnvironment(environmentId)(requiredScopes(input).join(","));
   const authorize = (
     registry: AtomRegistry.AtomRegistry,
     environmentId: EnvironmentId,
@@ -75,7 +95,7 @@ function makeCommandPermissions<R, E>(
         }),
       );
     });
-  return { requiredScopes, permissionAtom, authorize };
+  return { requiredScopes, permissionAtom, permissionStatusAtom, authorize };
 }
 
 const permissionsByRuntime = new WeakMap<

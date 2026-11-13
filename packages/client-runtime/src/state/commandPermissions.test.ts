@@ -42,7 +42,7 @@ vi.mock("./session.ts", async (importOriginal) => {
 });
 const liveRuntimes = new WeakSet<object>();
 const sessions = Atom.family((_id: EnvironmentId) =>
-  Atom.make<AsyncResult.AsyncResult<AuthSessionState, string>>(AsyncResult.initial()),
+  Atom.make<AsyncResult.AsyncResult<AuthSessionState, unknown>>(AsyncResult.initial()),
 );
 const env = EnvironmentId.make("target");
 const other = EnvironmentId.make("other");
@@ -71,6 +71,60 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("distinguishes unanswered checks, cached grants and scope revocation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const status = permissions.permissionStatusAtom(env);
+        yield* AtomRegistry.mount(registry, status);
+        expect(registry.get(permissions.permissionStatusAtom(null))).toBe("denied");
+        const unguarded = createCommandPermissions(runtime, "unguarded.read");
+        expect(registry.get(unguarded.permissionStatusAtom(env))).toBe("granted");
+        const unanswered: AsyncResult.AsyncResult<AuthSessionState, unknown>[] = [
+          AsyncResult.initial<AuthSessionState>(),
+          AsyncResult.waiting(AsyncResult.initial<AuthSessionState>()),
+          AsyncResult.failure(Cause.fail({ _tag: "RemoteEnvironmentAuthTimeoutError" })),
+          AsyncResult.failure(
+            Cause.fail({
+              _tag: "RemoteEnvironmentAuthFetchError",
+              cause: new TypeError("offline"),
+            }),
+          ),
+          AsyncResult.failure(
+            Cause.fail({ _tag: "RemoteEnvironmentAuthUndeclaredStatusError", status: 503 }),
+          ),
+        ];
+        for (const result of unanswered) {
+          registry.set(sessions(env), result);
+          expect(registry.get(status)).toBe("unknown");
+          expect(registry.get(permissions.permissionAtom(env))).toBe(false);
+        }
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(status)).toBe("granted");
+        registry.set(sessions(env), AsyncResult.waiting(AsyncResult.success(grant(true))));
+        expect(registry.get(status)).toBe("granted");
+        registry.set(sessions(env), AsyncResult.success(grant(false)));
+        expect(registry.get(status)).toBe("denied");
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { _tag: "RemoteEnvironmentAuthUndeclaredStatusError", status: 401 },
+    { _tag: "RemoteEnvironmentAuthUndeclaredStatusError", status: 403 },
+    { _tag: "EnvironmentAuthInvalidError" },
+    { _tag: "EnvironmentScopeRequiredError" },
+    { _tag: "RemoteEnvironmentAuthFetchError", cause: { _tag: "ConnectionBlockedError" } },
+  ])("reports terminal session rejection as denied ($ _tag)", (error) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        registry.set(sessions(env), AsyncResult.failure(Cause.fail(error)));
+        expect(registry.get(permissions.permissionStatusAtom(env))).toBe("denied");
+      }),
+    ),
+  );
+
   it.effect("requires the destination preview grant to close a browser tab", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -263,6 +317,8 @@ describe("slow session authorization", () => {
     });
     liveRuntimes.add(harness.runtime);
     const permission = createCommandPermissions(harness.runtime, WS_METHODS.scheduledTasksDelete);
+    const status = permission.permissionStatusAtom(harness.environmentId);
+    const unmount = harness.registry.mount(status);
     try {
       const first = Effect.runPromiseExit(
         permission.authorize(harness.registry, harness.environmentId),
@@ -275,15 +331,18 @@ describe("slow session authorization", () => {
       expect(reads).toBe(1);
       expect(aborted).toBe(1);
       expect(settled).toBe(false);
+      expect(harness.registry.get(status)).toBe("unknown");
       await vi.advanceTimersByTimeAsync(1_100);
       expect((await first)._tag).toBe("Success");
       expect(reads).toBe(2);
+      expect(harness.registry.get(status)).toBe("granted");
       const second = Effect.runPromiseExit(
         permission.authorize(harness.registry, harness.environmentId),
       );
       await vi.advanceTimersByTimeAsync(100);
       expect((await second)._tag).toBe("Success");
     } finally {
+      unmount();
       harness.registry.dispose();
     }
   });

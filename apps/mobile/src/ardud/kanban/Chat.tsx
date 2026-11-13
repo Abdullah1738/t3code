@@ -48,7 +48,7 @@ import {
   useKanbanBoardCard,
   useKanbanMessages,
   useKanbanMessagesFeed,
-  useKanbanPermission,
+  useKanbanPermissionStatus,
 } from "./kanbanStore";
 import {
   cardGlyph,
@@ -1225,7 +1225,7 @@ export function Composer(props: {
   const [field, setField] = useState(0);
   const action = useBoardAction();
   const environmentId = usePairedEnvironmentId();
-  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
+  const canPost = useKanbanPermissionStatus(KANBAN_WS_METHODS.messagePost) !== "denied";
   const configs = useServerConfigs();
   const capabilities =
     environmentId === null ? undefined : configs.get(environmentId)?.environment.capabilities;

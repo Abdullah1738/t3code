@@ -9,7 +9,12 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/reactivity";
-import { PrimaryConnectionTarget, type PreparedConnection } from "../connection/model.ts";
+import {
+  AVAILABLE_CONNECTION_STATE,
+  PrimaryConnectionTarget,
+  type PreparedConnection,
+  type SupervisorConnectionState,
+} from "../connection/model.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { layerRemoteHttpClient } from "../rpc/http.ts";
@@ -49,7 +54,13 @@ export async function sessionHarness(
     target,
   };
   const preparedRef = await Effect.runPromise(SubscriptionRef.make(Option.some(prepared)));
-  const supervisor = { prepared: preparedRef } as EnvironmentSupervisor["Service"];
+  const stateRef = await Effect.runPromise(
+    SubscriptionRef.make<SupervisorConnectionState>({
+      ...AVAILABLE_CONNECTION_STATE,
+      phase: "connected",
+    }),
+  );
+  const supervisor = { prepared: preparedRef, state: stateRef } as EnvironmentSupervisor["Service"];
   const environmentRegistry = {
     followStream: (
       _id: EnvironmentId,
@@ -65,7 +76,7 @@ export async function sessionHarness(
   const registry = AtomRegistry.make();
   const sessions = createEnvironmentSessionAtoms(runtime);
   const atom = sessions.sessionStateAtom(environmentId);
-  return { runtime, registry, sessions, atom, environmentId, preparedRef, prepared };
+  return { runtime, registry, sessions, atom, environmentId, preparedRef, prepared, stateRef };
 }
 
 export function delayedSession(ms: number, signal?: AbortSignal | null): Promise<Response> {
