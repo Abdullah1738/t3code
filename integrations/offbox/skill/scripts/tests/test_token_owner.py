@@ -200,7 +200,7 @@ class OtherPaths(Home):
                 patch.object(api, "fork", side_effect=AssertionError("our template is not hers to fork")):
             _box, source, _dir, _size = self.quiet(lease._new_box, self.con, dict(self.me, owner="person:moni"), None,
                                                     None, None, False)
-        self.assertEqual((source, made), ("fresh", [{}]), "a plain box, not our saved snapshot")
+        self.assertEqual((source, made), ("recipe:generic", [{}]), "her own recipe box, without our saved snapshot")
         row = self.con.execute("SELECT saved, expired_at FROM templates WHERE name='generic'").fetchone()
         self.assertEqual((row["saved"], row["expired_at"]), ("offbox-template-generic", None))
         with self.who("moni"), self.assertRaises(common.OffboxError) as cm:
