@@ -3,7 +3,10 @@ set -euo pipefail
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
-  sudo apt-get install -y -qq openjdk-17-jdk-headless
+  sudo apt-get install -y -qq openjdk-17-jdk-headless || {
+    sudo apt-get update -qq || exit 98
+    sudo apt-get install -y -qq openjdk-17-jdk-headless || exit 98
+  }
 fi
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
@@ -14,7 +17,7 @@ sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 if [ ! -x "$sdkmanager" ]; then
   stage=$(mktemp -d)
   trap 'rm -rf "$stage"' EXIT
-  curl -fsSL --retry 3 https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip -o "$stage/tools.zip"
+  offbox_fetch "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip" "$stage/tools.zip"
   unzip -q "$stage/tools.zip" -d "$stage"
   mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
   cp -R "$stage/cmdline-tools/." "$ANDROID_HOME/cmdline-tools/latest/"

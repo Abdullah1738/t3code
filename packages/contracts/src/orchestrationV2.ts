@@ -1,3 +1,4 @@
+import { ThreadItemRedacted } from "./ardud/threadRedaction.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -581,6 +582,7 @@ export const OrchestrationV2Run = Schema.Struct({
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
+  lastActivityAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
   ),
@@ -1823,6 +1825,11 @@ export const OrchestrationV2DomainEvent = Schema.Union([
   }),
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("turn-item.updated"),
     payload: OrchestrationV2TurnItem,
   }),
@@ -2044,12 +2051,14 @@ export const OrchestrationV2ShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("thread.updated"),
     sequence: NonNegativeInt,
+    redactionSequence: Schema.optionalKey(NonNegativeInt),
     location: Schema.Literals(["active", "archive"]),
     thread: OrchestrationV2ThreadShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread.removed"),
     sequence: NonNegativeInt,
+    redactionSequence: Schema.optionalKey(NonNegativeInt),
     location: Schema.Literals(["active", "archive"]),
     threadId: ThreadId,
   }),
@@ -2104,6 +2113,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
+  lastActivityAt: Schema.optional(Schema.DateTimeUtcFromString),
   // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),
@@ -2661,6 +2671,11 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
   }),
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("turn-item.updated"),
     payload: OrchestrationV2TurnItemJson,
   }),
@@ -3038,6 +3053,7 @@ export const OrchestrationV2Command = Schema.Union([
     holdQueue: Schema.optional(Schema.Boolean),
     delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
     expectedAttemptId: Schema.optional(RunAttemptId),
+    expectedLastInputMessageId: Schema.optional(MessageId),
     fenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({

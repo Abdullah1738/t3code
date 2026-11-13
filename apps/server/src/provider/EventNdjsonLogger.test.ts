@@ -972,3 +972,105 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
     }),
   );
 });
+
+it.effect(
+  "maintenance drains batches, fences queued thread writes and preserves other threads",
+  () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-log-maintenance-"));
+      const basePath = NodePath.join(tempDir, "events.log");
+      const target = ThreadId.make("thread-maintenance");
+      const fake = "eyJFAKE.BUFFERED-ONLY.NO-SIGNATURE";
+      try {
+        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 1_000 });
+        yield* store.logger("native").write({ output: fake }, target);
+        const related = new Set<ThreadId>();
+        const forkId = ThreadId.make("thread-fork");
+        const pending = yield* store.withMaintenance(
+          target,
+          Effect.gen(function* () {
+            const file = ownedLogPath(basePath, "thread-maintenance");
+            assert.equal(NodeFS.existsSync(file), true);
+            assert.equal(NodeFS.readFileSync(file, "utf8").includes(fake), true);
+            NodeFS.writeFileSync(file, "[redacted fixture]\n");
+            const stale = yield* Effect.forkScoped(
+              store.logger("canonical").write({ output: fake }, target),
+              { startImmediately: true },
+            );
+            const other = yield* Effect.forkScoped(
+              store
+                .logger("native")
+                .write({ message: "other thread" }, ThreadId.make("thread-other")),
+              { startImmediately: true },
+            );
+            related.add(forkId);
+            const fork = yield* Effect.forkScoped(
+              store.logger("native").write({ output: fake }, forkId),
+              { startImmediately: true },
+            );
+            return { stale, other, fork };
+          }),
+          { relatedThreadIds: related },
+        );
+        yield* Fiber.join(pending.fork);
+        assert.equal(NodeFS.existsSync(ownedLogPath(basePath, "thread-fork")), false);
+        yield* Fiber.join(pending.stale);
+        yield* Fiber.join(pending.other);
+        yield* store.logger("canonical").write({ message: "new output" }, target);
+        yield* TestClock.adjust(1_000);
+        yield* store.close();
+        const contents = NodeFS.readFileSync(ownedLogPath(basePath, "thread-maintenance"), "utf8");
+        assert.equal(contents.includes(fake), false);
+        assert.equal(contents.includes("new output"), true);
+        assert.equal(
+          NodeFS.readFileSync(ownedLogPath(basePath, "thread-other"), "utf8").includes(
+            "other thread",
+          ),
+          true,
+        );
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("a refused maintenance operation preserves queued target and shared-thread writes", () =>
+  Effect.gen(function* () {
+    const tempDir = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-log-refused-maintenance-"),
+    );
+    const target = ThreadId.make("refused-target");
+    const related = ThreadId.make("refused-shared");
+    const basePath = NodePath.join(tempDir, "events.log");
+    try {
+      const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 1000 });
+      const queued = yield* store.withMaintenance(
+        target,
+        Effect.gen(function* () {
+          const first = yield* Effect.forkScoped(
+            store.logger("native").write({ message: "target output stays" }, target),
+            { startImmediately: true },
+          );
+          const second = yield* Effect.forkScoped(
+            store.logger("canonical").write({ message: "shared output stays" }, related),
+            { startImmediately: true },
+          );
+          return [first, second];
+        }),
+        { relatedThreadIds: [related], shouldInvalidate: () => false },
+      );
+      for (const fiber of queued) yield* Fiber.join(fiber);
+      yield* store.close();
+      assert.include(
+        NodeFS.readFileSync(ownedLogPath(basePath, target), "utf8"),
+        "target output stays",
+      );
+      assert.include(
+        NodeFS.readFileSync(ownedLogPath(basePath, related), "utf8"),
+        "shared output stays",
+      );
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

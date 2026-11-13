@@ -66,6 +66,7 @@ const makeFake = () => {
             updatedAt: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
             quietSince: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
             runStartedAt: null,
+            lastActivityAt: null,
             backgroundWork: 0,
             prWatches: 0,
             prs: [],
@@ -87,6 +88,7 @@ const makeFake = () => {
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {
@@ -99,6 +101,7 @@ const makeFake = () => {
         Effect.sync(() => {
           threads.get(input.threadId)?.messages.push(input.text);
         }),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,

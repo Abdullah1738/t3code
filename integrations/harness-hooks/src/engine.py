@@ -1140,12 +1140,9 @@ def decide(event, harness):
                           "context": {"rule": "live-database-unavailable"}}
                 return result
             if hit:
-                reason = statev2_guard.UNRESOLVED_REASON if hit == "live-database-script-unresolved" else statev2_guard.REASON
+                reason = statev2_guard.refusal_reason(hit, cause, command_cwd)
                 context = {"rule": hit}
-                if hit == "live-database-script-unresolved" and cause:
-                    reason = ("statev2 guard: this command was NOT run. Could not check an explicit script invocation: "
-                              f"{cause}. Resolved workdir: {command_cwd}. Run the script by a literal path, write scripts "
-                              "with apply_patch rather than a heredoc in the same command, or split the steps; do not bypass the guard.")
+                if cause:
                     context["cause"] = cause
                 result = {"decision": "deny", "reason": reason, "context": context}
                 return result

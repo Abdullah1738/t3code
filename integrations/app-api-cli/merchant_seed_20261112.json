@@ -1,0 +1,9 @@
+[
+  {"merchant": "Bupa", "last4": "5542", "role": "primary", "next_charge": "2027-01-03"},
+  {"merchant": "boat.dev", "last4": "5542", "role": "primary"},
+  {"merchant": "boat.dev", "last4": "7572", "role": "backup"},
+  {"merchant": "OpenAI", "last4": "5542", "role": "primary"},
+  {"merchant": "Stripe Link", "last4": "none", "role": "primary"},
+  {"merchant": "Amazon app", "last4": "2342", "role": "primary"},
+  {"merchant": "Amazon app", "last4": "2792", "role": "backup"}
+]

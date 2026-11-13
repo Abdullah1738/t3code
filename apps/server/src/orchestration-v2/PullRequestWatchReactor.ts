@@ -35,7 +35,11 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import { evaluatePullRequestWatch, pullRequestWatchMessage } from "./pullRequestWatch.ts";
+import {
+  evaluatePullRequestWatch,
+  pullRequestChecksSettling,
+  pullRequestWatchMessage,
+} from "./pullRequestWatch.ts";
 
 /**
  * Checks take minutes, so a faster pass mostly spends the host's rate limit,
@@ -289,9 +293,20 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (target: WatchTarget) =>
+  const giveUp = (
+    target: WatchTarget,
+    failures: number,
+    error: Option.Option<PullRequestService.PullRequestError>,
+  ) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
+      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive read ${failures === 1 ? "failure" : "failures"}.${Option.match(
+        error,
+        {
+          onNone: () => "",
+          onSome: (failure) =>
+            ` Last error: ${failure.message}${failure._tag === "PullRequestUnavailableError" ? ` (${failure.reason})` : ""}`,
+        },
+      )} Check it yourself, and call watch_pull_request to watch it again.`,
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
@@ -488,7 +503,14 @@ export const make = Effect.gen(function* () {
       if (isRateLimited(read.cause)) return;
       const failures = (readFailures.get(group.key) ?? 0) + 1;
       readFailures.set(group.key, failures);
-      if (failures >= READ_FAILURE_LIMIT && (yield* eachTarget(group, giveUp))) {
+      const error = Cause.findErrorOption(read.cause);
+      // Unavailable reasons require a tool, credential or host configuration change.
+      const unavailable =
+        Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
+      if (
+        (unavailable || failures >= READ_FAILURE_LIMIT) &&
+        (yield* eachTarget(group, (target) => giveUp(target, failures, error)))
+      ) {
         readFailures.delete(group.key);
       }
       return yield* Effect.failCause(read.cause);
@@ -534,6 +556,7 @@ export const make = Effect.gen(function* () {
           : last.at,
       fingerprint: group.fingerprint,
       inFlight:
+        pullRequestChecksSettling(detail) ||
         detail.mergeability === "unknown" ||
         group.targets.some(({ watch }) => {
           const next = evaluatePullRequestWatch(watch, detail, null).next;

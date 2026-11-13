@@ -15,7 +15,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                   [--depends ssd,phone]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, max_consecutive_failures, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, timeout_s, max_consecutive_failures, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID                 full saved context (wakes carry only its start)
@@ -135,6 +135,7 @@ async function main(argv: string[]): Promise<void> {
       // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
       // outside watcher.json, so no replace can lift one.
       if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
+      if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
       if (values.json === undefined && previous?.depends) input.depends = previous.depends;
       if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;
@@ -210,7 +211,7 @@ async function main(argv: string[]): Promise<void> {
         const w = loadWatcher(id)!;
         const s = loadState(id);
         const status = statusLabel(w, s);
-        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}\n    ${w.title}`);
+        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
       }
       return;
     }
@@ -218,6 +219,7 @@ async function main(argv: string[]): Promise<void> {
       const w = need(positionals[0]);
       const s = loadState(w.id);
       console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id) }, null, 2));
+      if (s.load_timeouts) console.log(`load-timeouts ${s.load_timeouts}`);
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
       return;
     }
@@ -262,6 +264,8 @@ async function main(argv: string[]): Promise<void> {
       }
       if (command === "resume") {
         delete s.failure_paused_at;
+        delete s.load_timeouts;
+        delete s.load_timeout_since;
         s.consecutive_failures = 0;
         s.failure_alerted = false;
         delete s.failure_escalated;

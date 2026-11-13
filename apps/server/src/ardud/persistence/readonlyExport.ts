@@ -57,7 +57,45 @@ export function createReadonlyReplica(
     "ardud_kanban_threads",
   ];
   const selectedItems = new Set(["user_message", "error", "run_interrupt_request"]);
-  const source = new sqlite.DatabaseSync(options.sourcePath, { readOnly: true });
+  const origin = (
+    error: unknown,
+    file: string,
+    role: "primary" | "replica",
+    operation: string,
+  ): never => {
+    if (typeof error === "object" && error !== null)
+      Object.assign(error, { sqliteFile: file, sqliteRole: role, sqliteOperation: operation });
+    throw error;
+  };
+  const protect = <T extends object>(target: T, file: string, role: "primary" | "replica"): T =>
+    new Proxy(target, {
+      get(object, key) {
+        const value: unknown = Reflect.get(object, key, object);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          try {
+            const result: unknown = Reflect.apply(value, object, args);
+            return key === "prepare" && typeof result === "object" && result !== null
+              ? protect(result, file, role)
+              : result;
+          } catch (error) {
+            return origin(error, file, role, String(key));
+          }
+        };
+      },
+    });
+  const open = (
+    file: string,
+    settings: NodeSqlite.DatabaseSyncOptions,
+    role: "primary" | "replica",
+  ) => {
+    try {
+      return protect(new sqlite.DatabaseSync(file, settings), file, role);
+    } catch (error) {
+      return origin(error, file, role, "open");
+    }
+  };
+  const source = open(options.sourcePath, { readOnly: true }, "primary");
   let boards: NodeSqlite.DatabaseSync | undefined;
   let archive: NodeSqlite.DatabaseSync | undefined;
   let baseArchive: NodeSqlite.DatabaseSync | undefined;
@@ -72,6 +110,21 @@ export function createReadonlyReplica(
         throw new Error("Readonly export requires a WAL source");
     };
     setupReader(source);
+    const assertRedactionComplete = () => {
+      if (
+        source
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_thread_redaction_recovery'")
+          .get() &&
+        source
+          .prepare("SELECT 1 FROM ardud_thread_redaction_recovery WHERE pending=1 LIMIT 1")
+          .get()
+      ) {
+        const error = new Error("Readonly export is paused for incomplete redaction maintenance.");
+        Object.assign(error, { code: "REDACTION_PENDING" });
+        throw error;
+      }
+    };
+    assertRedactionComplete();
     const baseFilename = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
@@ -93,7 +146,7 @@ export function createReadonlyReplica(
     const basePath = baseName ? path.join(path.dirname(options.sourcePath), baseName) : undefined;
     if (basePath) {
       if (!fs.existsSync(basePath)) throw new Error("Readonly history base unavailable");
-      baseArchive = new sqlite.DatabaseSync(basePath, { readOnly: true });
+      baseArchive = open(basePath, { readOnly: true }, "primary");
       // The offline installer checkpoints the original before preserving it;
       // this immutable base need not retain WAL journal mode or sidecars.
       setupReader(baseArchive, false);
@@ -105,7 +158,7 @@ export function createReadonlyReplica(
         throw new Error("Readonly history base events unavailable");
     }
     if (options.archivePath && fs.existsSync(options.archivePath)) {
-      archive = new sqlite.DatabaseSync(options.archivePath, { readOnly: true });
+      archive = open(options.archivePath, { readOnly: true }, "primary");
       setupReader(archive);
       const mainIdentity = source
         .prepare("SELECT identity FROM ardud_history_archive_identity")
@@ -117,7 +170,7 @@ export function createReadonlyReplica(
         throw new Error("Readonly archive identity does not match source");
     }
     if (options.boardPath && fs.existsSync(options.boardPath)) {
-      boards = new sqlite.DatabaseSync(options.boardPath, { readOnly: true });
+      boards = open(options.boardPath, { readOnly: true }, "primary");
       setupReader(boards);
       if (boards.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_boards_migration'").get()) {
         boardsReady =
@@ -138,7 +191,7 @@ export function createReadonlyReplica(
       if (a.dev === b.dev && a.ino === b.ino)
         throw new Error("Replica cannot be a source database");
     }
-    target = new sqlite.DatabaseSync(options.replicaPath);
+    target = open(options.replicaPath, {}, "replica");
     fs.chmodSync(options.replicaPath, 0o600);
     // Export bookkeeping; a rebuild drops and recreates all of it except meta.
     const bookkeeping = `CREATE TABLE IF NOT EXISTS ardud_readonly_progress (name TEXT PRIMARY KEY, json TEXT NOT NULL);
@@ -997,6 +1050,7 @@ export function createReadonlyReplica(
       /** One bounded page; false means caught up, ready for the next interval. */
       step(): boolean {
         try {
+          assertRedactionComplete();
           return stepOnce();
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of

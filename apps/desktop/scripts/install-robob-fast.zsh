@@ -1,6 +1,7 @@
 #!/bin/zsh -f
 # Usage: zsh install-robob-fast.zsh --dmg /absolute/build.dmg
 # --dry-run prints the plan; --rollback restores the previous bundle only.
+# Exit 75: installed, but reads did not stay healthy for 5 min. See the log; do not reinstall.
 set -euo pipefail
 unset BUN_INSPECT
 SCRIPT=${0:A}
@@ -10,7 +11,7 @@ fi
 if [[ -z ${TMUX:-} ]]; then
   stamp=$(date +%Y%m%d-%H%M%S)
   log=$HOME/.robob/install-$stamp.ndjson
-  launch="zsh ${(q)SCRIPT} ${(j: :)${(q)@}} >> ${(q)log} 2>&1"
+  launch="ROBOB_INSTALL_LOG=${(q)log} zsh ${(q)SCRIPT} ${(j: :)${(q)@}} >> ${(q)log} 2>&1"
   tmux -L robob-install new-session -d -s "install-$stamp" "$launch"
   /Users/ardud/.bun/bin/bun /Users/ardud/.local/share/telegram-bridge/src/cli.ts notify \
     --source 'Robob install' --severity attention --key "robob-install:$stamp:start" \

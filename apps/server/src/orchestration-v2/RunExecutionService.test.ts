@@ -4205,6 +4205,50 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
   }),
 );
 
+it.effect("stops a Claude query before publishing ingestion failure as a terminal run", () =>
+  Effect.gen(function* () {
+    const order: Array<string> = [];
+    const interruptEntered = yield* Deferred.make<void>();
+    const allowClose = yield* Deferred.make<void>();
+    const result = yield* captureRootRunTermination({
+      key: "claude-stop-before-terminal",
+      providerDriver: ProviderDriverKind.make("claudeAgent"),
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          type: "node.updated",
+          driver: ProviderDriverKind.make("claudeAgent"),
+          node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+        } as unknown as ProviderAdapter.ProviderAdapterV2Event),
+      ingestNormalized: (ingest) =>
+        Effect.fail(
+          new ProviderEventIngestor.ProviderEventNormalizeError({
+            providerSessionId: ingest.providerSessionId,
+            threadId: ingest.threadId,
+            providerEvent: ingest.event,
+            cause: "projection failure",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.gen(function* () {
+          order.push("query.interrupt");
+          yield* Deferred.succeed(interruptEntered, undefined);
+          yield* Deferred.await(allowClose);
+          order.push("query.close");
+        }),
+      onTerminalRun: Effect.sync(() => {
+        order.push("run:failed");
+      }),
+      afterStart: () =>
+        Deferred.await(interruptEntered).pipe(
+          Effect.andThen(Deferred.succeed(allowClose, undefined)),
+        ),
+    });
+    assert.deepEqual(order, ["query.interrupt", "query.close", "run:failed"]);
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
 it.effect("interrupts both live turns before failing runs after a shared ingestion error", () =>
   Effect.gen(function* () {
     const requested = yield* Ref.make(0);
@@ -4848,6 +4892,162 @@ it.effect("does not start a turn whose run settled during the app context read",
   }),
 );
 
+it.effect.each(["failure", "interruption"] as const)(
+  "stops the exact attached Claude attempt before startup %s closes ingestion",
+  (mode) =>
+    Effect.gen(function* () {
+      const order: Array<string> = [];
+      const ingestionStarted = yield* Deferred.make<void>();
+      const result = yield* captureRootRunTermination({
+        key: `claude-startup-${mode}`,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.unwrap(
+            Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never)),
+          ),
+        startTurn: (input) =>
+          Deferred.await(ingestionStarted).pipe(
+            Effect.andThen(
+              mode === "interruption"
+                ? Effect.interrupt
+                : Effect.fail(
+                    new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver: ProviderDriverKind.make("claudeAgent"),
+                      threadId: input.threadId,
+                      providerThreadId: input.providerThread.id,
+                      runId: input.runId,
+                      cause: "offer failed after attachment",
+                    }),
+                  ),
+            ),
+          ),
+        interruptStartingRun: ({ runId, attemptId }) =>
+          Effect.sync(() => {
+            assert.equal(runId, RunId.make(`run:claude-startup-${mode}`));
+            assert.equal(attemptId, RunAttemptId.make(`attempt:claude-startup-${mode}`));
+            order.push("query.stopped");
+          }),
+        onSubscriptionClose: Effect.sync(() => {
+          order.push("ingestion.closed");
+        }),
+        onTerminalRun: Effect.sync(() => {
+          order.push("run:failed");
+        }),
+      }).pipe(Effect.exit);
+      assert.deepEqual(
+        order,
+        mode === "failure"
+          ? ["query.stopped", "ingestion.closed", "run:failed"]
+          : ["query.stopped", "ingestion.closed"],
+      );
+      assert.equal(result._tag, mode === "failure" ? "Success" : "Failure");
+    }),
+);
+
+it.effect.each(["terminal", "ingest_error", "stop_error"] as const)(
+  "preserves the startup failure when Claude cleanup emits a terminal before returning: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const key = `claude-startup-terminal-${mode}`;
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingestionStarted = yield* Deferred.make<void>();
+      const ingestionClosed = yield* Deferred.make<void>();
+      const outcome = yield* captureRootRunTermination({
+        key,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.unwrap(
+            Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.fromQueue(events))),
+          ),
+        startTurn: (input) =>
+          Deferred.await(ingestionStarted).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  threadId: input.threadId,
+                  providerThreadId: input.providerThread.id,
+                  runId: input.runId,
+                  cause: "offer failed after attachment",
+                }),
+              ),
+            ),
+          ),
+        interruptStartingRun: () =>
+          Queue.offer(events, rootTerminalEvent(backgroundScenarioIds(key), "interrupted")).pipe(
+            Effect.andThen(Deferred.await(ingestionClosed)),
+            Effect.andThen(mode === "stop_error" ? Effect.die("late Stop error") : Effect.void),
+          ),
+        ingestNormalized: () =>
+          mode !== "ingest_error"
+            ? Effect.succeed([])
+            : Effect.die("cleanup terminal persistence failed"),
+        onSubscriptionClose: Deferred.succeed(ingestionClosed, undefined),
+      }).pipe(Effect.exit);
+      assert.isTrue(Exit.isSuccess(outcome));
+      if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+      const result = outcome.value;
+      const terminals = result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      );
+      assert.deepEqual(terminals, ["failed"]);
+      const error = result.written.find((item) => item.type === "error");
+      assert.include(error?.failure.message ?? "", "provider could not start this turn");
+      assert.notInclude(error?.failure.message ?? "", "cleanup terminal persistence failed");
+    }),
+);
+
+it.effect("retries a failed Claude startup cleanup before settling the original failure", () =>
+  Effect.gen(function* () {
+    const firstStopFailed = yield* Deferred.make<void>();
+    const ingestionStarted = yield* Deferred.make<void>();
+    let stops = 0;
+    const run = yield* captureRootRunTermination({
+      key: "claude-startup-cleanup-retry",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.unwrap(Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never))),
+      startTurn: (input) =>
+        Deferred.await(ingestionStarted).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: ProviderDriverKind.make("claudeAgent"),
+                threadId: input.threadId,
+                providerThreadId: input.providerThread.id,
+                runId: input.runId,
+                cause: "offer failed after attachment",
+              }),
+            ),
+          ),
+        ),
+      interruptStartingRun: () =>
+        Effect.suspend(() =>
+          ++stops === 1
+            ? Deferred.succeed(firstStopFailed, undefined).pipe(
+                Effect.andThen(Effect.die("transient Stop failure")),
+              )
+            : Effect.void,
+        ),
+    }).pipe(Effect.exit, Effect.forkScoped);
+    yield* Deferred.await(firstStopFailed);
+    yield* TestClock.adjust("1 second");
+    const outcome = yield* Fiber.join(run);
+    assert.isTrue(Exit.isSuccess(outcome));
+    if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+    const result = outcome.value;
+    assert.equal(stops, 2);
+    assert.deepEqual(
+      result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      ),
+      ["failed"],
+    );
+  }).pipe(Effect.scoped),
+);
+
 it.effect("refreshes pull requests only once when startup failure closes its event stream", () =>
   Effect.gen(function* () {
     const ingestionStarted = yield* Deferred.make<void>();
@@ -4892,6 +5092,8 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  readonly providerDriver?: ProviderDriverKind;
+  readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
   readonly legacyOwnership?:
     | "app_owned"
@@ -4916,6 +5118,7 @@ function captureRootRunTermination(input: {
     ids: BackgroundScenarioIds,
   ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2EventSubscription>;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly interruptStartingRun?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"];
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
@@ -4931,7 +5134,8 @@ function captureRootRunTermination(input: {
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
-    const providerInstanceId = ProviderInstanceId.make("codex");
+    const driver = input.providerDriver ?? ProviderDriverKind.make("codex");
+    const providerInstanceId = ProviderInstanceId.make(driver);
     const runningSubagent = makeRunOwnedSubagentFixture({
       ids,
       providerInstanceId,
@@ -4955,6 +5159,7 @@ function captureRootRunTermination(input: {
             yield* captureTurnItem(event.payload);
           }
           if (event.type === "run.updated") {
+            yield* input.onTerminalRun ?? Effect.void;
             yield* Ref.update(observed, (current) => [...current, `run:${event.payload.status}`]);
           }
         }
@@ -5069,6 +5274,9 @@ function captureRootRunTermination(input: {
             })),
           ),
           startTurn: input.startTurn ?? (() => Effect.void),
+          ...(input.interruptStartingRun === undefined
+            ? {}
+            : { interruptStartingRun: input.interruptStartingRun }),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
           ...(input.awaitSessionExit === undefined
             ? {}

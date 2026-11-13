@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs after zz-update-grub whenever a kernel package is installed: try the new kernel once at the next boot.
+# Never fails the package installation.
+[ -x /usr/local/sbin/offbox-kernel-trial ] || exit 0
+/usr/local/sbin/offbox-kernel-trial arm "$1" || true
+exit 0

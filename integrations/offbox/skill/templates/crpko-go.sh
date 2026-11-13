@@ -7,7 +7,7 @@ export DEBIAN_FRONTEND=noninteractive
 GO_VERSION="${OFFBOX_GO_VERSION:-1.26.9}"
 # A matching binary version does not prove an old overlay left a clean source tree.
 if [ -f /usr/local/go/src/runtime/traceexp.go ] || [ -f /usr/local/go/src/strconv/ctoa.go ] || [ -f /usr/local/go/src/syscall/syscall_linux_accept4.go ] || ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  offbox_fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "/tmp/go.tgz"
   sudo rm -rf /usr/local/go
   sudo tar -C /usr/local -xzf /tmp/go.tgz
   rm -f /tmp/go.tgz
@@ -16,18 +16,13 @@ export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
 go version
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync ca-certificates >/dev/null
+sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync ca-certificates \
+  zsh openjdk-21-jre-headless >/dev/null
+sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
 
 offbox_crpko_tools
 
-# FoundationDB client library (crpko services link github.com/apple/foundationdb/bindings/go via cgo).
-FDB_VERSION="${OFFBOX_FDB_VERSION:-7.3.63}"
-if ! dpkg -s foundationdb-clients >/dev/null 2>&1; then
-  curl -fsSL --retry 5 "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" \
-    -o /tmp/fdb-clients.deb
-  sudo apt-get install -y -qq /tmp/fdb-clients.deb >/dev/null
-  rm -f /tmp/fdb-clients.deb
-fi
+offbox_foundationdb
 sudo apt-get clean
 
 # Common tools used by Makefiles/CI in the Crpko Go repos.

@@ -44,7 +44,9 @@ if [[ "$mode" == check ]]; then
   if ! agent_loaded; then
     print -u2 "agent not loaded: $label is not in launchctl ($domain)"; bad=1
   fi
-  (( bad )) && exit 1
+  if (( bad )); then
+    exit 1
+  fi
   print "OK installed copy and $label match the fork"
   exit 0
 fi

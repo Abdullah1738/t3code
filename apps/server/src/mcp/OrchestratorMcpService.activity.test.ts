@@ -507,9 +507,17 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
-                ? (foreignProjection(threadId).thread as unknown as OrchestrationV2ThreadShell)
+                ? ({
+                    ...liveThreadShell(threadId),
+                    ...foreignProjection(threadId).thread,
+                  } as OrchestrationV2ThreadShell)
                 : threadId === parentThreadId
-                  ? parentShell
+                  ? (parentShell ?? {
+                      ...liveThreadShell(parentThreadId, {
+                        activeRunId: parentRuns.length > 0 ? RunId.make("run-parent-live") : null,
+                      }),
+                      ...parentProjection.thread,
+                    })
                   : null,
             ),
           getTimelinePage: (threadId) =>

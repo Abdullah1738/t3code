@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import time
@@ -11,6 +12,7 @@ from noon_checkout import fingerprint
 
 class NowNowFlowTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         for module in (c.journal,c.receipts):
             p=patch.object(module,'ROOT',Path(temp.name).resolve()/'commerce');p.start();self.addCleanup(p.stop)
@@ -49,7 +51,7 @@ class NowNowFlowTests(unittest.TestCase):
 
     def test_current_controller_finalize_with_exact_review_journals_once(self):
         import json
-        from test import test_noon_nownow_review as fixtures
+        import test_noon_nownow_review as fixtures
         from noon_nownow_checkout import Snapshot,SavedCard
         fixture=fixtures.ReviewTests();fixture.setUp()
         flow=c.NowNowFlow(store_code='shop',products=(('p',2),),auth=self.auth,request=Mock())

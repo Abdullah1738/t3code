@@ -8,6 +8,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as BoardLocks from "./boardLocks.ts";
+import * as SavedReply from "../tools/savedReply.ts";
+import { McpSchema } from "effect/ai";
 
 it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
   Effect.gen(function* () {
@@ -545,6 +547,103 @@ it.effect("a stale read-only operation reruns before any write or external side 
   }),
 );
 
+it.effect.each(["unrelated", "card", "slot", "migration"] as const)(
+  "dispatch dependencies retain only their card and slot across %s changes",
+  (change) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let free = true;
+      let abandoned = false;
+      const dispatch = yield* Effect.forkChild(
+        locks
+          .board(
+            "a",
+            Effect.gen(function* () {
+              yield* locks.scopeDispatch(
+                "a",
+                ["card:target"],
+                Effect.sync(() => free),
+              );
+              // Dispatch's collection reads cannot reintroduce the board generation or epoch.
+              yield* locks.access("a", Effect.void);
+              yield* locks.outside(
+                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+                () =>
+                  Effect.sync(() => {
+                    abandoned = true;
+                  }),
+              );
+            }),
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      if (change === "migration") yield* locks.exclusive(Effect.void);
+      else if (change === "slot") free = false;
+      else
+        yield* locks.run(
+          locks.access("a", Effect.void, true, change === "card" ? "card:target" : undefined),
+        );
+      yield* Deferred.succeed(resume, undefined);
+      assert.strictEqual(Exit.isSuccess(yield* Fiber.join(dispatch)), change === "unrelated");
+      assert.strictEqual(abandoned, change !== "unrelated");
+    }),
+);
+
+it.effect.each([
+  "refresh",
+  "content",
+  "links",
+  "refresh-after-content",
+  "refresh-after-migration",
+] as const)("only dispatch ignores link metadata during %s", (change) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const scoped = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          Effect.gen(function* () {
+            yield* locks.scopeDispatch("a", ["card:target"], Effect.succeed(true));
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+            );
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const defaultEntered = yield* Deferred.make<void>();
+    const ordinary = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.access("a", Effect.void, false, "card:target");
+            yield* locks.outside(
+              Deferred.succeed(defaultEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(resume)),
+              ),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(defaultEntered);
+    const write = locks.run(locks.access("a", Effect.void, true, "card:target"));
+    if (change === "refresh-after-content") yield* write;
+    if (change === "refresh-after-migration") yield* locks.exclusive(Effect.void);
+    yield* change.startsWith("refresh") ? locks.dispatchMetadata(write) : write;
+    yield* Deferred.succeed(resume, undefined);
+    assert.strictEqual(Exit.isSuccess(yield* Fiber.join(scoped)), change === "refresh");
+    assert.isFalse(Exit.isSuccess(yield* Fiber.join(ordinary)));
+  }),
+);
+
 it.effect.each([false, true])(
   "compensation releases permits even with a stale snapshot: %s",
   (stale) =>
@@ -725,4 +824,138 @@ it.effect(
         assert.strictEqual(calls, 1);
       }
     }),
+);
+
+it.effect("#882 detached follow-ons own cleanup after their original operation returns", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const start = yield* Deferred.make<void>();
+    const cleaned: string[] = [];
+    const background = yield* locks.board(
+      "a",
+      Effect.forkChild(
+        locks
+          .independent(
+            locks.board(
+              "a",
+              Effect.gen(function* () {
+                yield* Deferred.await(start);
+                yield* locks.launched(
+                  "orphan",
+                  Effect.sync(() => {
+                    cleaned.push("orphan");
+                  }),
+                );
+                return yield* Effect.fail("association failed");
+              }),
+            ),
+          )
+          .pipe(Effect.exit),
+      ),
+    );
+    yield* Deferred.succeed(start, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(background)));
+    assert.deepStrictEqual(cleaned, ["orphan"]);
+    yield* locks.board("a", Effect.void);
+  }),
+);
+
+it.effect("saved-reply admission expires before the reply budget and never writes later", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    let written = false;
+    const waiter = yield* Effect.forkChild(
+      SavedReply.protect(
+        locks
+          .board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                written = true;
+              }),
+              true,
+            ),
+          )
+          .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+        "card_update",
+      ).pipe(Effect.exit),
+    );
+    yield* TestClock.adjust(SavedReply.ADMISSION_BUDGET_MS - 1);
+    assert.isUndefined(waiter.pollUnsafe());
+    yield* TestClock.adjust(1);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      assert.include(
+        String(Cause.squash(result.cause)),
+        "Board busy: not written. Safe to retry once.",
+      );
+    }
+    assert.isFalse(written);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
+    yield* locks.exclusive(Effect.void);
+    assert.isFalse(written);
+  }),
+);
+
+it.effect.each([
+  "unrelated",
+  "card",
+  "stop",
+  "migration",
+  "refresh",
+  "refresh-after-content",
+] as const)("a startup reconciliation cannot forgive a dispatch dependency after %s", (change) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let abandoned = false;
+    const dispatch = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.scopeDispatch("a", ["card:target", "stops:worker"], Effect.succeed(true));
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+              () =>
+                Effect.sync(() => {
+                  abandoned = true;
+                }),
+              false,
+              Effect.succeed(true),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const write = (resource?: string) => locks.run(locks.access("a", Effect.void, true, resource));
+    if (change === "migration") yield* locks.exclusive(Effect.void);
+    else if (change === "unrelated") yield* write();
+    else if (change === "stop") yield* write("stops:worker");
+    else {
+      if (change === "refresh-after-content") yield* write("card:target");
+      yield* change.startsWith("refresh")
+        ? locks.dispatchMetadata(write("card:target"))
+        : write("card:target");
+    }
+    yield* Deferred.succeed(resume, undefined);
+    const valid = change === "unrelated" || change === "refresh";
+    assert.strictEqual(Exit.isSuccess(yield* Fiber.join(dispatch)), valid);
+    assert.strictEqual(abandoned, !valid);
+  }),
 );

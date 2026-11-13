@@ -269,7 +269,7 @@ def review(cart_data, session_data, expected_manifest, home, card, *, context,
             and bool(re.search(r'[xX*•]',mask)) and len(re.sub(r'\D','',mask))<=12, 'SAVED_CARD_LAST4_MISMATCH')
     token = text(card.get('token'), 'INVALID_SAVED_CARD')
     card_type = text(card.get('card_type'), 'INVALID_SAVED_CARD')
-    require(card_type.lower()=='mastercard','SAVED_CARD_TYPE_MISMATCH')
+    require(card_type.lower()==order_card.NETWORK,'SAVED_CARD_TYPE_MISMATCH')
     if native_shape:
         from noon_marketplace_card import extract_selected_card,CardError
         try:selected=extract_selected_card(session_data)

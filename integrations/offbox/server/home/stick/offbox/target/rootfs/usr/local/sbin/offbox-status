@@ -1,0 +1,20 @@
+#!/bin/bash
+# offbox-status: one screen that says whether this server is fine. Read by watch-install.zsh and by humans.
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+echo "stage=installed"
+echo "host=$(hostname) kernel=$(uname -r) booted_image=$(booted_kernel) up=$(cut -d' ' -f1 /proc/uptime)s"
+echo "installed=$(cat /etc/offbox/installed 2>/dev/null | tr '\n' ' ')"
+echo "system=$(systemctl is-system-running 2>/dev/null) failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ',')"
+echo "ip=$(hostname -I 2>/dev/null | tr ' ' ,) tailscale=$(tailscale ip -4 2>/dev/null | head -1) ts_state=$(tailscale status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*\)".*/\1/p' | head -1)"
+echo "md=$(awk '/^md/{n=$1} /blocks/{getline s; } /\[[U_]+\]/{print n":"$NF}' /proc/mdstat | tr '\n' ' ')$(grep -Eo '(resync|recovery) *= *[0-9.]+%' /proc/mdstat | tr '\n' ' ')"
+if command -v zpool >/dev/null && zpool list -H offbox >/dev/null 2>&1; then
+  echo "zpool=$(zpool list -H -o name,health,size,alloc offbox | tr '\t' ' ')"
+else
+  echo "zpool=none"
+fi
+echo "health=$(cat "$STATE/health.json" 2>/dev/null)"
+/usr/local/sbin/offbox-kernel-trial status 2>/dev/null | tr '\n' ' '; echo
+echo "watchdog=$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null || echo none) state=$(cat /sys/class/watchdog/watchdog0/state 2>/dev/null) timeout=$(cat /sys/class/watchdog/watchdog0/timeout 2>/dev/null)"
+echo "rtc_alarm=$(cat /sys/class/rtc/rtc0/wakealarm 2>/dev/null) now=$(date +%s)"
+echo "emergency_count=$(cat "$STATE/emergency-count" 2>/dev/null || echo 0)"

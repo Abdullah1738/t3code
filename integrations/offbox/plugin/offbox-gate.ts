@@ -113,7 +113,7 @@ async function parentOf(ctx: any, sessionID: string): Promise<string | null> {
 
 const shq = (s: string) => `'${s.replace(/'/g, `'"'"'`)}'`
 
-function denial(cmd: string, v: any): string {
+export function denial(cmd: string, v: any): string {
   const lines = [
     "offbox gate: this command was NOT run on the Mac (owner rule 2026-10-13, remote-compute skill).",
     `Why: ${v.why} [rule ${v.rule}].`,
@@ -121,6 +121,7 @@ function denial(cmd: string, v: any): string {
     `  ${v.rewrite}`,
     "Narrow single tests stay local (go test -run X ./pkg, jest path/file.test.ts, pytest path::test).",
     'Only if it truly must run here (e.g. needs local creds/devices): offbox local --reason "<why>" [--ttl 2h], then rerun.',
+    "Nothing in the refused command ran.",
   ]
   return `printf '%s\\n' ${lines.map(shq).join(" ")} >&2; exit 3`
 }

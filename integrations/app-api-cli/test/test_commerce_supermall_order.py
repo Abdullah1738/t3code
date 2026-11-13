@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 import json
@@ -163,6 +164,9 @@ def make_flow(responses, *, quantity=1, search=None):
 
 
 class CapturedContractTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_rocket_add_is_quick_atc_route_with_deselect_flags(self):
         self.assertEqual(FIXTURE['add_path'],
                          '/_svc/cart-v1/cart/item/aaa9dcee08bdd46c/1?showCart')
@@ -239,6 +243,9 @@ class CapturedContractTests(unittest.TestCase):
 
 
 class ResolveOfferTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_variant_uses_rocket_catalog_experience(self):
         hit = FIXTURE['search']['hits'][0]
         class Opener:
@@ -290,6 +297,9 @@ class ResolveOfferTests(unittest.TestCase):
 
 
 class LaneTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def run_lane(self, responses, *, quantity=1):
         with patch.object(c.urllib.request, 'build_opener',
                           return_value=patched_resolve(FIXTURE['search'])()):
@@ -508,6 +518,9 @@ class LaneTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def prepare_partial_flow(self):
         temp = tempfile.mkdtemp()
         roots = (patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'),
@@ -561,6 +574,9 @@ class ResumeTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_paid_order_completes_journal_with_tracker_and_eta(self):
         temp = tempfile.mkdtemp()
         with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \

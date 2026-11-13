@@ -155,7 +155,7 @@ CPU niceness is fine to keep in the scripts (`nice -n 10`).
   Snapshots hold replicas of memory.db and opencode_raw.db, plus
   `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
   projects, board, import map, thread index). The full Robob DB is not backed up.
-  Replicas and restic run at nice 10 with normal I/O priority (darwin-background I/O stalls on the USB SSD; see `src/run_limited.py`); limits for replicas and restic backup are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s).
+  Replicas and restic run at utility QoS and nice 10, demoting I/O above 1.5 load/core and restoring it below 0.8. Runs defer above 1.0 load/core or within one hour of boot, unless waiting for the next four-hour launch would put the last success over 24 h old. The cadence is unchanged. Replica/restic caps are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s), extended by time demoted up to `MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD` (10800 s). Replicas with a WAL over 2 GiB, a catch-up marker, or an age over 48 h are reseeded through a checked replacement; a live holder blocks recovery.
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
@@ -246,12 +246,16 @@ Producer source configuration: `OPENCODE_EXPORT_SOURCE_DB` (default
 producer-only; `OPENCODE_DB` remains a guarded legacy reader override. Python 3.11+
 is required for incremental blob I/O; the plist uses Homebrew Python.
 
-For first deployment, sync this integration, create its log directory, install
-`scripts/com.abdullah.opencode-readonly.plist` in `~/Library/LaunchAgents/`, and
-bootstrap that agent. Wait for `ready=1` and fresh `updated_at` in the **export**
+`zsh -f integrations/deploy.zsh memory-system` installs the exporter plist in
+`~/Library/LaunchAgents/` and creates its log directory. Bootstrap the exporter
+separately with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.abdullah.opencode-readonly.plist`.
+Wait for `ready=1` and fresh `updated_at` in the **export**
 before restarting the recall/capture readers. After an OpenCode schema change or
 source-file replacement, rebuild this disposable export (never alter live state).
-The producer refuses overlapping instances and source/target aliases.
+The producer refuses overlapping instances and source/target aliases. It exits
+after five minutes without progress so launchd can recover from a lost volume.
+Memory health flags publications older than 30 minutes; a first bootstrap may
+take longer while its progress heartbeat stays within five minutes.
 
 Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and
 `bash tests/test_stages.sh`.

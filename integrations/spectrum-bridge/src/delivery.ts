@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { IMessageError } from "@photon-ai/advanced-imessage/grpc";
 import { BUBBLE_CHARS, formatText, isSingleUrl, splitFormatted, stripInternalText } from "./formatting.ts";
-import { classifySendFailure, isEffect, type Photon, type PollResult } from "./photon.ts";
+import { classifySendFailure, isEffect, type Photon, type PollResult, type SendResult } from "./photon.ts";
 import { rememberUnmatchedPoll } from "./poll-match.ts";
 import type { OutboxRecord, PollRecord, Store } from "./store.ts";
 
@@ -61,7 +61,8 @@ export class Delivery {
   constructor(
     private readonly store: Store,
     private readonly photon: Pick<Photon, "sendText">
-      & Partial<Pick<Photon, "uploadAttachment" | "sendAttachment" | "sendPoll" | "sendApp">>,
+      & Partial<Pick<Photon, "uploadAttachment" | "sendAttachment" | "sendPoll" | "sendApp">>
+      & { prepareApp?: (input: Parameters<Photon["sendApp"]>[0]) => Promise<() => Promise<SendResult>> },
     private readonly options: Options,
   ) {
     this.sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
@@ -436,6 +437,27 @@ export class Delivery {
         const input = Object.freeze({
           id, chatGuid, ...(item.replyTo === undefined ? {} : { replyTo: item.replyTo }),
         });
+        const final = index === chunks.length;
+        let sendPreparedApp: (() => Promise<SendResult>) | undefined;
+        if (final && app && this.photon.prepareApp) {
+          try {
+            this.store.db.transaction(() => {
+              if (firstAttempt === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
+              this.store.set(destinationKey, chatGuid);
+              this.store.set(ambiguityKey, wasAmbiguous);
+              if (state === "pending") this.store.outboxState(item.id, "sending");
+            }).immediate();
+            if (state === "pending") dispatched++;
+            state = "sending";
+            sendPreparedApp = await this.photon.prepareApp({ id, chatGuid, ...app });
+          } catch (error) {
+            if (!this.current(item, state)) continue operations;
+            if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
+            // Preparing an image cannot send a message; preserve uncertainty from any earlier send.
+            this.failed(item, state, wasAmbiguous, { ...classifySendFailure(error), uncertain: false });
+            continue operations;
+          }
+        }
         const decision = this.options.beforeSend ? await this.options.beforeSend(item) : "send";
         if (!this.current(item, state)) continue operations;
         if (decision !== "send") {
@@ -447,8 +469,13 @@ export class Delivery {
           if (state === "sending") this.store.outboxState(item.id, "pending");
           continue operations;
         }
+        if (this.store.get(`firstAttempt:${item.id}`) !== undefined && !this.withinRetryWindow(item.id)) {
+          this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
+          this.error("retryWindowExpired");
+          continue operations;
+        }
         this.store.db.transaction(() => {
-          if (firstAttempt === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
+          if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
           this.store.set(destinationKey, chatGuid);
           // A crash after dispatch but before checkpointing must remain ambiguous.
           this.store.set(ambiguityKey, true);
@@ -456,7 +483,6 @@ export class Delivery {
         }).immediate();
         if (state === "pending") dispatched++;
         state = "sending";
-        const final = index === chunks.length;
         let result: PollResult;
         try {
           if (attachment) {
@@ -466,7 +492,7 @@ export class Delivery {
               id, chatGuid, title: item.poll.title, options: Object.freeze([...item.poll.options]),
             }));
           } else if (final && item.app) {
-            result = await this.photon.sendApp!(Object.freeze({ id, chatGuid, ...app! }));
+            result = sendPreparedApp ? await sendPreparedApp() : await this.photon.sendApp!(Object.freeze({ id, chatGuid, ...app! }));
           } else {
             const chunk = chunks[index]!;
             const rich = {

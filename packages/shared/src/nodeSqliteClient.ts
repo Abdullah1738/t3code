@@ -48,10 +48,18 @@ export { ReaderLane, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
 export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 
+import {
+  annotateSqliteError,
+  ErrorObserver,
+  type SqliteErrorObserver,
+} from "./nodeSqliteErrors.ts";
+
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
 export interface SqliteClientConfig {
   readonly filename: string;
+  readonly databaseRole?: "primary" | "replica" | "unknown" | undefined;
+  readonly errorObserver?: SqliteErrorObserver | undefined;
   /** Reserve a bounded process for fresh session lookups. */
   readonly authReaderProcess?: boolean | undefined;
   /**
@@ -263,7 +271,25 @@ const checkNodeSqliteCompat = () => {
  * `node:sqlite` reports the SQLite result code as `errcode`, while
  * `classifySqliteError` reads `errno`.
  */
-const classifyError = (cause: unknown, message: string, operation: string) => {
+const classifyError = (
+  cause: unknown,
+  message: string,
+  operation: string,
+  options?: SqliteClientConfig,
+  connection = "writer",
+) => {
+  if (options)
+    annotateSqliteError(
+      cause,
+      {
+        file: options.filename,
+        role: options.databaseRole ?? "primary",
+        connection,
+        operation,
+        span: `sqlite.${connection}.${operation}`,
+      },
+      options.errorObserver,
+    );
   if (
     Predicate.hasProperty(cause, "errcode") &&
     typeof cause.errcode === "number" &&
@@ -339,7 +365,7 @@ try {
   db = next;
   parentPort.postMessage({ type: "ready" });
 } catch (error) {
-  parentPort.postMessage({ type: "unavailable", message: String(error && error.message ? error.message : error) });
+  parentPort.postMessage({ type: "unavailable", message: String(error && error.message ? error.message : error), errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code });
 }
 const statements = new Map();
 const prepare = (sql, cached) => {
@@ -468,8 +494,12 @@ const readerFailureMessages = {
   execute: "Failed to execute statement",
 } as const;
 
-const failed = (cause: unknown, message: string, operation: string) =>
-  new SqlError({ reason: classifyError(cause, message, operation) });
+const readerFailed = (
+  options: SqliteClientConfig,
+  cause: unknown,
+  message: string,
+  operation: string,
+) => new SqlError({ reason: classifyError(cause, message, operation, options, "reader") });
 
 // Reads a stopped worker never started. Nothing ran, so another worker may run them.
 const notStarted = new WeakSet<SqlError>();
@@ -508,6 +538,8 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  * replacement once; after any statement reached the worker it stays pinned.
  */
 const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
+  const failed = (cause: unknown, message: string, operation: string) =>
+    readerFailed(options, cause, message, operation);
   const snapshotLock = options.readerSnapshotLock ?? (yield* Semaphore.make(1));
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const slowStatementMs = Duration.toMillis(
@@ -646,6 +678,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
     };
     worker.on("message", (reply: ReaderReply | ReaderStartup | { readonly started: number }) => {
       if ("type" in reply) {
+        if (reply.type === "unavailable") failed(reply, "Failed to open reader", "open");
         announce(reply);
         if (pending.size === 0) worker.unref();
         return;
@@ -990,6 +1023,9 @@ const readSafeSqliteInteger = (value: unknown) => {
 // Evaluated source also works in bundles and single-executable builds.
 const checkpointWorkerSource = `
 const { parentPort, workerData } = require("node:worker_threads");
+process.on("uncaughtException", error => {
+  parentPort.postMessage({ type: "db-error", errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code });
+});
 const { DatabaseSync } = require("node:sqlite");
 const { statSync } = require("node:fs");
 let db;
@@ -1110,6 +1146,7 @@ parentPort.on("message", (request) => {
 const startCheckpointWorker = Effect.fnUntraced(function* (
   filename: string,
   writer: NodeSqlite.DatabaseSync,
+  options: SqliteClientConfig,
 ) {
   const warn = (reason: string) =>
     Effect.logWarning(
@@ -1209,7 +1246,8 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
       log = nextLog;
       checkpointed = nextCheckpointed;
       unknown = false;
-    } catch {
+    } catch (cause) {
+      classifyError(cause, "WAL inspection failed", "checkpoint", options, "writer");
       unknown = true;
     }
   };
@@ -1244,7 +1282,10 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
     request();
     wake();
   };
-  worker.on("error", (cause) => handBack(cause.message));
+  worker.on("error", (cause) => {
+    classifyError(cause, "Checkpoint worker failed", "checkpoint", options, "checkpoint");
+    handBack(cause.message);
+  });
   worker.on("exit", (code) => handBack(`exited with code ${code}`));
   worker.on("message", (message: unknown) => {
     if (stopped || typeof message !== "object" || message === null || !("type" in message)) return;
@@ -1256,6 +1297,12 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
       truncate = { id: message.truncateId, acknowledged: false };
       blocked = true;
       acknowledge();
+      return;
+    }
+    if (message.type === "db-error") {
+      classifyError(message, "Checkpoint worker failed", "checkpoint", options, "checkpoint");
+      handBack("SQLite checkpoint failed");
+      void worker.terminate();
       return;
     }
     if (message.type !== "checkpoint") return;
@@ -1342,6 +1389,7 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
 const make = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
 ): Effect.fn.Return<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> {
+  options = { ...options, errorObserver: options.errorObserver ?? (yield* ErrorObserver) };
   yield* checkNodeSqliteCompat();
   const statementMetrics =
     options.statementMetrics ??
@@ -1366,7 +1414,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         }),
       catch: (cause) =>
         new SqlError({
-          reason: classifyError(cause, "Failed to open database", "open"),
+          reason: classifyError(cause, "Failed to open database", "open", options),
         }),
     });
     yield* Scope.addFinalizer(
@@ -1375,14 +1423,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
         try: () => db.close(),
         catch: (cause) =>
           new SqlError({
-            reason: classifyError(cause, "Failed to close database", "close"),
+            reason: classifyError(cause, "Failed to close database", "close", options),
           }),
       }).pipe(Effect.orDie),
     );
     // Started after the close finalizer, so the worker stops before the writer closes.
     const checkpoint =
       options.checkpointWorker && isFileDatabase
-        ? yield* startCheckpointWorker(options.filename, db)
+        ? yield* startCheckpointWorker(options.filename, db, options)
         : undefined;
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
@@ -1471,7 +1519,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         },
         catch: (cause) =>
           new SqlError({
-            reason: classifyError(cause, "Failed to prepare statement", "prepare"),
+            reason: classifyError(cause, "Failed to prepare statement", "prepare", options),
           }),
       });
 
@@ -1533,7 +1581,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           } catch (cause) {
             result = Exit.fail(
               new SqlError({
-                reason: classifyError(cause, "Failed to execute statement", "execute"),
+                reason: classifyError(cause, "Failed to execute statement", "execute", options),
               }),
             );
           } finally {
@@ -1550,6 +1598,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
                     cause,
                     "Failed to reset statement result mode",
                     "resetResultMode",
+                    options,
                   ),
                 }),
               );
