@@ -39,6 +39,8 @@ import {
   KanbanBlock,
   KanbanBlockInput,
   KanbanScriptId,
+  CommandId,
+  MessageId,
   KANBAN_WS_METHODS as M,
   ProjectId,
   ProviderDriverKind,
@@ -64,6 +66,15 @@ import { layer as providerRegistryLayer } from "../../../provider/testUtils/prov
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { makeKanbanWsHandlers } from "../ws.ts";
 import * as KanbanModels from "./models.ts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
+import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
+import * as KanbanThreadLifecycle from "./threads.ts";
 import {
   DEFAULT_CARD_MODEL,
   DEFAULT_EVALUATOR_MODEL,
@@ -22890,6 +22901,53 @@ it.live("a saved follow-on cut by a stop is run once after the restart", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.live.each(["reset", "stop"] as const)(
+  "#1295 a saved %s cancels queued work after a service restart",
+  (action) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-effect-" });
+      const dbPath = path.join(directory, "state.sqlite");
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      let cut = true;
+      const delivered = yield* Deferred.make<void>();
+      const layer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            interrupt: (id, reason, cancelQueued, runId) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(entered, undefined);
+                if (cut) return yield* Effect.never;
+                assert.isTrue(cancelQueued);
+                yield* real.interrupt(id, reason, cancelQueued, runId);
+                yield* Deferred.succeed(delivered, undefined);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      const { cardId, threadId } = yield* Effect.gen(function* () {
+        const { kanban, card, threadId } = yield* workingCard;
+        yield* kanban.cardThread(card.id, action, "End old work", owner);
+        // The process stops while the interrupt is out.
+        yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+        return { cardId: card.id, threadId };
+      }).pipe(Effect.provide(withOwnerRouteMode(fileTestLayer(layer, dbPath), "deferred")));
+      assert.notInclude(fake.interrupted, threadId);
+      cut = false;
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.ready;
+        yield* Deferred.await(delivered);
+        assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
+        assert.strictEqual((yield* kanban.card(cardId)).card.stage, "todo");
+      }).pipe(Effect.provide(withOwnerRouteMode(fileTestLayer(layer, dbPath), "deferred")));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live.each(
   [false, true].flatMap((running) => [false, true].map((settled) => ({ running, settled }))),
 )(
@@ -25415,6 +25473,223 @@ it.effect.each([
   }),
 );
 
+// Leave provider effects unstarted so the real orchestrator holds admission-waiting runs.
+const unstartedLifecycleLayer = () => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const runtime = ProviderReplayHarness.layerWithRegistry(
+    { name: "kanban-old-thread" },
+    ProviderAdapterRegistry.layerFromAdapters([adapter]),
+    { databaseLayer: db, runEffectWorker: false },
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  return ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    Layer.merge(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+  );
+};
+
+it.effect.each(
+  (["reset", "stop"] as const).flatMap((action) =>
+    (["inline", "deferred"] as const).flatMap((mode) =>
+      (["detached starting", "detached queue only", "active", "distinct old threads"] as const).map(
+        (state) => ({ action, mode, state }),
+      ),
+    ),
+  ),
+)("#1295 $action clears old runs: $state ($mode)", ({ action, mode, state }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+    const fake = yield* makeFake;
+    const delivered = yield* Deferred.make<void>();
+    const interrupted: Array<ThreadId> = [];
+    let targetCount = 1;
+    const layer = Layer.succeed(
+      KanbanThreads,
+      KanbanThreads.of({
+        ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+        interrupt: (id, reason, cancelQueued, runId) =>
+          lifecycle.interrupt(id, reason, cancelQueued, runId).pipe(
+            Effect.tap(() =>
+              Effect.gen(function* () {
+                interrupted.push(id);
+                if (interrupted.length === targetCount)
+                  yield* Deferred.succeed(delivered, undefined);
+              }),
+            ),
+          ),
+      }),
+    );
+    const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+    const seed = Effect.fn("test.seedOldThread")(function* (id: ThreadId) {
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`create:${id}`),
+        threadId: id,
+        projectId: ProjectId.make("project-1"),
+        title: "Old work",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      for (let i = 0; i < 3; i++)
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`message:${id}:${i}`),
+          threadId: id,
+          messageId: MessageId.make(`message:${id}:${i}`),
+          text: "Stale board wake",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: i === 0 ? "start_immediately" : "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+    });
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const created = yield* kanban.createCard(
+        board.id,
+        { title: "Old runs", prompt: "Work" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const card = (yield* kanban.card(created.id)).card;
+      const work = card.workThreadId!;
+      const ids =
+        state === "distinct old threads"
+          ? [work, ThreadId.make("old-review"), ThreadId.make("old-active")]
+          : [work];
+      targetCount = ids.length;
+      const unrelated = ThreadId.make("unrelated");
+      for (const id of [...ids, unrelated]) yield* seed(id);
+      const unrelatedBefore = yield* orchestrator.getThreadRecords(unrelated, ["runs"]);
+      for (const id of ids) {
+        if (state === "detached queue only")
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`hold:${id}`),
+            threadId: id,
+            reason: "Hold queue",
+          });
+        assert.deepEqual(
+          (yield* orchestrator.getThreadRecords(id, ["runs"])).runs.map((run) => run.status),
+          [state === "detached queue only" ? "interrupted" : "starting", "queued", "queued"],
+        );
+      }
+      yield* setRunning(fake, work, state !== "detached queue only");
+      if (state !== "active")
+        yield* store.putCard({
+          ...card,
+          stage: state === "distinct old threads" ? "working" : "todo",
+          activeThreadId: state === "distinct old threads" ? ids[2]! : null,
+          reviewThreadId: state === "distinct old threads" ? ids[1]! : null,
+          activeRole: state === "distinct old threads" ? "work" : null,
+          activePool: state === "distinct old threads" ? card.activePool : null,
+        });
+      yield* kanban.cardThread(card.id, action, "End old work", owner);
+      yield* Deferred.await(delivered);
+      assert.sameMembers(interrupted, ids);
+      assert.lengthOf(interrupted, ids.length);
+      for (const id of ids) {
+        const after = yield* orchestrator.getThreadRecords(id, ["runs"]);
+        assert.deepEqual(
+          after.runs.map((run) => run.status),
+          ["interrupted", "cancelled", "cancelled"],
+        );
+        assert.isNull((yield* orchestrator.getThreadShell(id))!.activeRunId);
+      }
+      assert.deepEqual(yield* orchestrator.getThreadRecords(unrelated, ["runs"]), unrelatedBefore);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.isNull(after.activeThreadId);
+      if (action === "reset") {
+        assert.isNull(after.workThreadId);
+        assert.isNull(after.reviewThreadId);
+      } else assert.isNotNull(after.stalled);
+    }).pipe(
+      Effect.provide(
+        mode === "inline"
+          ? inlineTestLayer(layer)
+          : withOwnerRouteMode(testLayer(layer), "deferred"),
+      ),
+    );
+  }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(["reset", "stop"] as const)(
+  "#1295 active shared %s sends only the drop text",
+  (action) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const thread = card.workThreadId!;
+        const sibling = (yield* kanban.createForThread(thread, { title: "B", prompt: "B" })).card;
+        yield* setRunning(fake, thread, true);
+        yield* kanban.cardThread(card.id, action, "Fresh work", owner);
+        assert.deepEqual(fake.interrupted, []);
+        assert.isTrue((yield* Ref.get(fake.threads)).get(thread)!.running);
+        assert.equal((yield* kanban.card(sibling.id)).card.activeThreadId, thread);
+        const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages;
+        assert.include(
+          messages.at(-1)!,
+          Briefs.dropCardText(
+            card,
+            action === "reset" ? "moved to a fresh thread" : "was stopped: Fresh work",
+            [sibling],
+          ),
+        );
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1295 detached reset leaves a shared thread running and sends the drop text", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const card = (yield* kanban.card(created.id)).card;
+      const thread = card.workThreadId!;
+      const sibling = (yield* kanban.createForThread(thread, { title: "B", prompt: "B" })).card;
+      yield* store.putCard({
+        ...card,
+        stage: "todo",
+        activeThreadId: null,
+        activeRole: null,
+        activePool: null,
+      });
+      yield* setRunning(fake, thread, true);
+      yield* kanban.cardThread(card.id, "reset", "Fresh work", owner);
+      assert.deepEqual(fake.interrupted, []);
+      assert.isTrue((yield* Ref.get(fake.threads)).get(thread)!.running);
+      assert.equal((yield* kanban.card(sibling.id)).card.activeThreadId, thread);
+      assert.include(
+        (yield* Ref.get(fake.threads)).get(thread)!.messages.at(-1)!,
+        Briefs.dropCardText(card, "moved to a fresh thread", [sibling]),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect.each([false, true])("card_thread stop protects another attached card: %s", (shared) =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -25571,6 +25846,123 @@ it.effect("card_thread stop reaches an unattached pending question", () =>
       assert.deepEqual(fake.interrupted, [thread]);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(
+  (["reset", "stop"] as const).flatMap((action) =>
+    (["active", "detached"] as const).flatMap((attachment) =>
+      (["inline", "await"] as const).flatMap((mode) =>
+        (["claim", "dispatch", "claim during read failure"] as const).map((probe) => ({
+          action,
+          attachment,
+          mode,
+          probe,
+        })),
+      ),
+    ),
+  ),
+)(
+  "#1295 settlement reservation: $action $attachment $probe ($mode)",
+  ({ action, attachment, mode, probe }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const fake = yield* makeFake;
+      const ended = yield* Ref.make(false);
+      let target: string | undefined;
+      const layer = Layer.succeed(
+        KanbanThreads,
+        KanbanThreads.of({
+          ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+          interrupt: (id, reason, cancelQueued, runId) =>
+            lifecycle.interrupt(id, reason, cancelQueued, runId),
+          // A live provider can acknowledge Stop before its asynchronous interrupt settles.
+          runSettled: (_id, run) =>
+            Effect.gen(function* () {
+              assert.equal(run, target);
+              if (yield* Ref.get(ended)) return true;
+              if (probe === "claim during read failure")
+                return yield* new KanbanThreadError({
+                  operation: "runSettled",
+                  detail: "read failed",
+                });
+              return false;
+            }),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const threadId = card.activeThreadId!;
+        const modelSelection = {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-6.1-sol",
+        };
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("reservation:create"),
+          threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "Old work",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+        for (let i = 0; i < 3; i++)
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`reservation:message:${i}`),
+            threadId,
+            messageId: MessageId.make(`reservation:message:${i}`),
+            text: "Stale wake",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: i === 0 ? "start_immediately" : "queue_after_active" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+        target = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!.id;
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(threadId)!, { running: true, runId: target });
+          return all;
+        });
+        if (attachment === "detached")
+          yield* store.putCard({
+            ...card,
+            stage: "todo",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+          });
+        const sibling = yield* kanban.createCard(board.id, { title: "B", prompt: "B" }, owner);
+        yield* store.putCard({ ...sibling, workThreadId: threadId });
+        yield* kanban.cardThread(card.id, action, "Stop old work", owner);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs
+            .slice(1)
+            .map((run) => run.status),
+          ["cancelled", "cancelled"],
+        );
+        if (probe === "dispatch") {
+          yield* kanban.dispatchNow;
+          assert.isNull((yield* kanban.card(sibling.id)).card.activeThreadId);
+        } else {
+          const error = yield* kanban.claimCard(threadId, sibling.id).pipe(Effect.flip);
+          assert.include(error.detail, "being stopped");
+        }
+        yield* Ref.set(ended, true);
+        yield* setRunning(fake, threadId, false);
+        assert.equal((yield* kanban.claimCard(threadId, sibling.id)).card.activeThreadId, threadId);
+      }).pipe(Effect.provide(mode === "inline" ? inlineTestLayer(layer) : testLayer(layer)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
 );
 
 it.effect.each(["claim", "dispatch", "claim during read failure"])(
