@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 import imaplib
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -62,6 +63,138 @@ class NotifierParserTests(unittest.TestCase):
                         self.assertEqual(delivered[0]['body']['text'], text)
                         if kind == 'health':
                             self.assertEqual(delivered[0]['body']['dedupeKey'], '--health-key')
+
+
+class ExclusionTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.logs = self.root / 'logs'
+        self.stack.enter_context(patch.dict(os.environ, {'TOOLLOG_DIR': str(self.logs),
+                                                        'WATCH_ID': 'inbox-triage', 'ROBOB_TEST': '1'}))
+        self.watcher = {'id': 'fixture-watcher', '_dir': str(self.root), '_healthy': True,
+                        'check': 'bash check.sh'}
+
+    def seen(self, account, query, folder='Inbox'):
+        key = hashlib.sha256(f'{account}|{folder}|{query}'.encode()).hexdigest()[:16]
+        (self.root / f'mail-{key}.seen').write_text('exact-message-id\n')
+
+    def errors(self):
+        rows = [json.loads(line) for p in self.logs.glob('*.ndjson') for line in p.read_text().splitlines()]
+        return [row for row in rows if row.get('error', {}).get('tag') == 'watcher.command_invalid']
+
+    def test_multiline_quoted_script_and_query_preserve_exact_exclusions(self):
+        query = 'from example.test\nor subject booking'
+        (self.root / 'check.sh').write_text(
+            "# The owner's watcher\npython3 -c '\nprint(\"fixture\")\n'\n"
+            f"email-new-message gmail '{query}'\n"
+            "printf 'finished'\nwhatsapp-new-message '123@s.whatsapp.net'\n")
+        self.seen('gmail', query)
+        jids, seen = t.exclusions([self.watcher], {})
+        self.assertEqual(jids, {'123@s.whatsapp.net'})
+        self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_command_boundaries_comments_and_mailbox_defaults(self):
+        commands = (
+            "email-new-message gmail 'from example.test'",
+            "email-new-message gmail 'from example.test' Inbox",
+            "email-new-message gmail 'from example.test'\nprintf done",
+            "email-new-message gmail 'from example.test' # owner's comment\nprintf done",
+            "# owner's comment\nemail-new-message gmail 'from example.test'\n# another's comment",
+            "email-new-message gmail 'from example.test' && printf done",
+            "email-new-message gmail 'from example.test' ; printf done",
+            "email-new-message gmail 'from example.test' || printf failed",
+        )
+        self.seen('gmail', 'from example.test')
+        for command in commands:
+            with self.subTest(command=command):
+                self.watcher['check'] = command
+                _, seen = t.exclusions([self.watcher], {})
+                self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_broken_command_logs_once_per_watcher_and_change_across_runs(self):
+        script = self.root / 'check.sh'
+        script.write_text("printf 'private-unclosed\n")
+        self.watcher['check'] = "email-new-message gmail 'from example.test'"
+        self.seen('gmail', 'from example.test')
+        state = {}
+        _, seen = t.exclusions([self.watcher], state)
+        self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(len(self.errors()), 1)
+        # Re-load the same state a new process receives on the next tick.
+        t.atomic(self.root / 'cursor.json', state)
+        state = t.read_json(self.root / 'cursor.json')
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 1)
+        script.write_text("printf 'private-changed\n")
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 2)
+        self.watcher['check'] += '\nprintf changed'
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 3)
+        other = dict(self.watcher, id='other-watcher')
+        t.exclusions([self.watcher, other], state)
+        self.assertEqual([row['ids']['watcher'] for row in self.errors()],
+                         ['fixture-watcher'] * 3 + ['other-watcher'])
+        for private in ('private-unclosed', 'private-changed', 'from example.test'):
+            self.assertNotIn(private, json.dumps(self.errors()))
+            self.assertNotIn(private, json.dumps(state))
+
+    def test_shell_hash_and_escape_forms_keep_the_exact_query(self):
+        queries = (
+            (r'subject\ booking#123', 'subject booking#123'),
+            (r'subject\ booking\#123', 'subject booking#123'),
+            ("'subject booking#123'", 'subject booking#123'),
+            ('"subject booking#123"', 'subject booking#123'),
+            ("subject\\ booking'#123'", 'subject booking#123'),
+            ("'subject #123'", 'subject #123'),
+            ('"subject #123"', 'subject #123'),
+            (r'subject\ \#123', 'subject #123'),
+            ("'subject booking' # owner's comment", 'subject booking'),
+            ("'subject booking'\t# owner's comment", 'subject booking'),
+            ("'subject booking' ;# owner's comment", 'subject booking'),
+            ("'subject booking'\n# owner's comment", 'subject booking'),
+            ("'subject booking'\\\n#123", 'subject booking#123'),
+            ("\\\n'subject booking'", 'subject booking'),
+            ("'subject booking\\\n#123'", 'subject booking\\\n#123'),
+            ('"subject booking\\\n#123"', 'subject booking#123'),
+        )
+        for shell_query, query in queries:
+            with self.subTest(shell_query=shell_query):
+                for path in self.root.glob('mail-*.seen'):
+                    path.unlink()
+                self.seen('gmail', query)
+                self.watcher['check'] = 'email-new-message gmail ' + shell_query
+                _, seen = t.exclusions([self.watcher], {})
+                self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_recovery_clears_failure_and_unhealthy_watcher_is_ignored(self):
+        self.watcher['check'] = "printf 'broken"
+        state = {}
+        t.exclusions([dict(self.watcher, _healthy=False)], state)
+        self.assertEqual(self.errors(), [])
+        t.exclusions([self.watcher], state)
+        self.watcher['check'] = 'printf fixed'
+        t.exclusions([self.watcher], state)
+        self.assertNotIn(self.watcher['id'], state['watcher_command_invalid'])
+        self.assertEqual(len(self.errors()), 1)
+
+    def test_exact_seen_ids_only_and_all_existing_whatsapp_jid_forms(self):
+        self.watcher['check'] = (
+            "email-new-message gmail 'from example.test' Sent\n"
+            "# email-new-message gmail 'from example.test'\n"
+            "whatsapp-new-message '123@s.whatsapp.net'\n"
+            "whatsapp-new-message '456@lid'\nwhatsapp-new-message '789@g.us'")
+        self.seen('gmail', 'from example.test')
+        self.seen('gmail', 'from example.test', 'Sent')
+        jids, seen = t.exclusions([self.watcher], {})
+        self.assertEqual(jids, {'123@s.whatsapp.net', '456@lid', '789@g.us'})
+        self.assertEqual(seen, {a: set() for a in t.ACCOUNTS})
+        self.assertEqual(self.errors(), [])
 
 
 class TriageTests(unittest.TestCase):
