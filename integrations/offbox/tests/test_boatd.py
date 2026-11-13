@@ -561,6 +561,27 @@ class Http(Base):
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/commands/{pid}")[0], 404)
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/command-history/{cid}/logs")[0], 404)
 
+    def test_history_logs_report_stream_byte_size_and_done_at_that_size(self):
+        bid = self.box()
+        streams = {"stdout": ("x" * (1 << 20) + "€tail\n").encode(), "stderr": "error é\n".encode()}
+        for pid, status in enumerate(("queued", "running", "exited"), start=1001):
+            self.cmd(bid, pid=pid, status=status)
+            for stream, content in streams.items():
+                ext = "out" if stream == "stdout" else "err"
+                (boatd.cmd_dir(bid) / f"{pid}.{ext}").write_bytes(content)
+            for stream, content in streams.items():
+                for offset in (0, len(content)):
+                    with self.subTest(status=status, stream=stream, offset=offset):
+                        st, page = self.call("ardud", "GET",
+                                             f"/sandboxes/{bid}/command-history/cmd_{pid}/logs"
+                                             f"?stream={stream}&offset={offset}")
+                        self.assertEqual(st, 200, page)
+                        self.assertEqual(page["size"], len(content))
+                        data = page["data"].encode()
+                        self.assertEqual(data, content[offset:offset + (1 << 20)])
+                        self.assertEqual(page["nextOffset"], offset + len(data))
+                        self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
+
     def test_saved_states_are_per_owner_even_with_the_same_name(self):
         hers, his = self.make_box("moni"), self.make_box("ardud")
         self.assertEqual(self.call("moni", "POST", "/saved-snapshots", {"name": "base", "sandboxId": hers})[0], 200)
