@@ -7488,7 +7488,7 @@ test("watcher reply guard logs accepted silence and visible replies without text
       await h.router.tick();
       const raw = readFileSync(join(logs, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8");
       const rows = raw.trim().split("\n").map(line => JSON.parse(line));
-      const entry = rows.findLast(row => row.tool === "watchers" && row.name === "wake.reply_guard");
+      const entry = rows.filter(row => row.tool === "watchers" && row.name === "wake.reply_guard").at(-1);
       expect(entry).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
       expect(entry.ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
       if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(entry));
