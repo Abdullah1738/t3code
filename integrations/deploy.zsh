@@ -33,6 +33,19 @@ rsync "${flags[@]}" \
   "$src" "$dst"
 
 if [[ "$name" == memory-system ]]; then
+  export_plist="com.abdullah.opencode-readonly.plist"
+  export_src="${src}scripts/$export_plist"
+  export_dst="$HOME/Library/LaunchAgents/$export_plist"
+  if ! cmp -s "$export_src" "$export_dst"; then
+    print "memory-system: $export_dst missing or differs from scripts/$export_plist"
+  fi
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "memory-system: would install -m 644 $export_src $export_dst (bootstrap separately)"
+  else
+    mkdir -p "${export_dst:h}" "${dst}logs"
+    install -m 644 "$export_src" "$export_dst"
+    print "memory-system: installed $export_dst; bootstrap/reload requires a separate launchctl command"
+  fi
   recall_src="${src}scripts/recall"
   recall_dst="$HOME/.local/bin/recall"
   if [[ -e "$recall_dst" ]] && ! cmp -s "$recall_src" "$recall_dst"; then
