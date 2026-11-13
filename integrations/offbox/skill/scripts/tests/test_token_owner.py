@@ -18,10 +18,9 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-sys.path.insert(0, str(SCRIPTS.parents[1] / "tests"))
 from offbox_lib import api, bases, common, lease, misc, pool, reap  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
-import test_boatd  # noqa: E402
+from test_home_wire import test_boatd  # noqa: E402
 
 GONE = "bx_gone0000"   # a box id the server has never heard of
 

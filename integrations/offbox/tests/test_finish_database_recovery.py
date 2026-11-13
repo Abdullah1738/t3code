@@ -7,9 +7,12 @@ import sys
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
-sys.path[:0] = [str(SCRIPTS), str(SCRIPTS / 'tests')]
+sys.path.insert(0, str(SCRIPTS))
 from offbox_lib import api, cli, common, identity, lease, misc, pool, reap, runs
-from test_capacity import Isolated
+if __package__:
+    from .client_fixtures import Isolated
+else:
+    from client_fixtures import Isolated
 
 
 class FinishDatabaseRecovery(Isolated):

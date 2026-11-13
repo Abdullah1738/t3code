@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skill" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(SCRIPTS / "tests"))
 from offbox_lib import common, identity, lease, pool, ssh_sync  # noqa: E402
-from test_capacity import Isolated  # noqa: E402
+if __package__:
+    from .client_fixtures import Isolated
+else:
+    from client_fixtures import Isolated
 
 
 class BaseCheckoutTests(Isolated):
