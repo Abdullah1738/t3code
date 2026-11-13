@@ -2493,7 +2493,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         delivery: "steer",
       },
     });
-  const nestedLaunch: ReadonlyArray<ProviderReplayEntry> = [
+  const middleLaunch: ReadonlyArray<ProviderReplayEntry> = [
     out("session.prompt", { sessionID: SESSION, text: "<any>" }),
     promptAccepted,
     event("session.execution.started", { sessionID: SESSION }),
@@ -2510,6 +2510,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       metadata: { sessionID: MIDDLE, status: "running" },
     }),
     event("session.execution.started", { sessionID: MIDDLE }),
+  ];
+  const nestedLaunch: ReadonlyArray<ProviderReplayEntry> = [
+    ...middleLaunch,
     event("session.tool.input.started", { ...toolOf(MIDDLE, "call-deep"), name: "subagent" }),
     event("session.tool.called", {
       ...toolOf(MIDDLE, "call-deep"),
@@ -2575,6 +2578,112 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         });
       return { deep, middleTurns, terminals, until };
     });
+
+  it.effect.each([
+    { source: "subagent", status: "completed" },
+    { source: "subagent", status: "interrupted" },
+    { source: "subagent", status: "failed" },
+    { source: "shell", status: "completed" },
+    { source: "shell", status: "interrupted" },
+    { source: "shell", status: "failed" },
+  ] as const)(
+    "publishes idle after a nested $source's $status follow-up output",
+    ({ source, status }) =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed([
+          ...(source === "subagent"
+            ? [
+                ...nestedLaunch,
+                event("session.execution.succeeded", { sessionID: DEEP }),
+                deepReport(status === "interrupted" ? "cancelled" : "completed"),
+              ]
+            : [
+                ...middleLaunch,
+                shellCreated("sh_nested", MIDDLE),
+                event("session.execution.succeeded", { sessionID: MIDDLE }),
+                event("session.tool.success", {
+                  ...toolOf(SESSION, "call-middle"),
+                  content: [{ type: "text", text: "MIDDLE_OK" }],
+                  metadata: { sessionID: MIDDLE, status: "completed", truncated: false },
+                  executed: false,
+                }),
+                event("session.execution.succeeded", { sessionID: SESSION }),
+                shellExited("sh_nested"),
+              ]),
+          event("session.execution.started", { sessionID: MIDDLE }),
+          event("session.text.ended", {
+            sessionID: MIDDLE,
+            assistantMessageID: "msg_middle_follow_up",
+            ordinal: 0,
+            text: "GRANDCHILD_OK",
+          }),
+          status === "failed"
+            ? event("session.execution.failed", {
+                sessionID: MIDDLE,
+                error: { type: "unknown", message: "Follow-up failed after output" },
+              })
+            : event(
+                status === "completed"
+                  ? "session.execution.succeeded"
+                  : "session.execution.interrupted",
+                { sessionID: MIDDLE },
+              ),
+        ]);
+        const delivered = yield* runtime.events.pipe(
+          Stream.tap(() => Effect.yieldNow),
+          Stream.takeUntil(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.id === thread.id &&
+              event.providerThread.pendingBackgroundWork === false,
+          ),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(withLineage(thread));
+        const events = [...(yield* Fiber.join(delivered))];
+        const states = events.flatMap((event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.id === thread.id &&
+          event.providerThread.pendingBackgroundWork !== undefined
+            ? [event.providerThread.pendingBackgroundWork]
+            : [],
+        );
+        assert.equal(states[0], true);
+        assert.equal(states.at(-1), false);
+        assert.isTrue(states.slice(0, -1).every(Boolean));
+        assert.isTrue(
+          events.some(
+            (event) => event.type === "message.updated" && event.message.text === "GRANDCHILD_OK",
+          ),
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("publishes idle when a pending nested report is cancelled without a wake", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...nestedLaunch,
+        event("session.execution.succeeded", { sessionID: DEEP }),
+        deepReport("completed"),
+        event("session.inbox.cancelled", { sessionID: MIDDLE, inboxID: "msg_deep_report" }),
+      ]);
+      const idle = yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.id === thread.id &&
+            event.providerThread.pendingBackgroundWork === false,
+        ),
+        Stream.runHead,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      assert.isTrue(Option.isSome(yield* Fiber.join(idle)));
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
 
   it.effect("stops a foreground subagent's background subagent after the turn ended", () =>
     Effect.gen(function* () {

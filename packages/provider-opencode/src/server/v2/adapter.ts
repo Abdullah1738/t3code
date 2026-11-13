@@ -864,6 +864,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const strays = new Map<string, ThreadState>();
     const busy = new Set<string>();
     const shells = new Map<string, string>(); // running shell id -> the session that started it
+    const shellWakePending = new Set<string>();
     const runsShell = (sessionId: string) => [...shells.values()].includes(sessionId);
     const pending = new Map<RuntimeRequestId, PendingRequest>();
     const lock = yield* Semaphore.make(1);
@@ -892,7 +893,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       subagent: ThreadState["subagent"],
     ): ThreadState => ({
       sessionId,
-      providerThread,
+      providerThread:
+        providerThread.pendingBackgroundWork === true
+          ? { ...providerThread, pendingBackgroundWork: false }
+          : providerThread,
       providerTurns: new Map(),
       active: undefined,
       model: undefined,
@@ -1348,6 +1352,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     const syncRoster = Effect.fnUntraced(function* (state: ThreadState) {
+      // This snapshot follows output on the same stream; a live liveness probe cannot drain it.
+      const pendingBackgroundWork =
+        hasBackground(state) ||
+        sessionsOf(state).some(
+          (child) =>
+            (child.subagent !== undefined && child.active !== undefined) ||
+            shellWakePending.has(child.sessionId),
+        );
       const roster = runningCalls(state)
         .filter((call) => call.background)
         .map((call) => ({
@@ -1360,6 +1372,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }));
       const current = state.providerThread.pendingBackgroundTasks ?? [];
       if (
+        (state.providerThread.pendingBackgroundWork ?? false) === pendingBackgroundWork &&
         current.length === roster.length &&
         current.every(
           (task, index) =>
@@ -1374,6 +1387,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state.providerThread = {
         ...state.providerThread,
         pendingBackgroundTasks: roster,
+        pendingBackgroundWork,
         updatedAt: yield* DateTime.now,
       };
       yield* emit({
@@ -1624,6 +1638,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         yield* emit({ type: "message.updated", driver, message: artifacts.message });
         yield* emit({ type: "turn_item.updated", driver, turnItem: artifacts.turnItem });
       }
+      yield* syncRoster(rootOf(child));
     });
 
     const offerWake = Effect.fnUntraced(function* (state: ThreadState, wake: Wake) {
@@ -1743,6 +1758,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             yield* settleCall(attached, terminal.status, terminal.failure.message);
           }
         }
+        yield* syncRoster(rootOf(state));
         return;
       }
       state.providerThread = {
@@ -1779,6 +1795,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             }
           : { ...base, status: terminal.status, failure: null },
       );
+      yield* syncRoster(state);
       // A spawned server lists its models lazily, so a window still unknown is
       // read again for the next turn, off this stream so it never delays one.
       if (window === undefined) {
@@ -2340,6 +2357,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         children: new Set(),
       };
       state.wakes.push(wake);
+      yield* syncRoster(rootOf(state));
       const route = state.providerThread.appThreadId;
       if (route !== null) {
         wake.messageId = yield* idAllocator.allocate.message({ threadId: route, ordinal: 0 });
@@ -2493,6 +2511,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             else state.unsettledStarted = true;
           }
           busy.add(sessionId);
+          shellWakePending.delete(sessionId);
         } else if (event.type === "unreadable.execution.ended" || executionEnd(event.type)) {
           busy.delete(sessionId);
         }
@@ -2523,7 +2542,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
         return;
       }
-      return yield* route(event, sessionId);
+      yield* route(event, sessionId);
+      if (event.type === "unreadable.execution.ended" || executionEnd(event.type)) {
+        const state = sessionId === undefined ? undefined : ownerOf(sessionId);
+        if (state !== undefined) yield* syncRoster(rootOf(state));
+      }
     });
 
     const route = Effect.fnUntraced(function* (
@@ -2599,10 +2622,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         const owner = stringField(event.data.info.metadata, "sessionID");
         if (owner !== undefined && event.data.info.status === "running")
           shells.set(event.data.info.id, owner);
+        const state = owner === undefined ? undefined : ownerOf(owner);
+        if (state !== undefined) yield* syncRoster(rootOf(state));
         return;
       }
       if (event.type === "shell.exited" || event.type === "shell.deleted") {
+        const owner = shells.get(event.data.id);
         shells.delete(event.data.id);
+        // Exit queues a native wake; deletion does not. Hold the ordered snapshot across that gap.
+        if (owner !== undefined && event.type === "shell.exited") shellWakePending.add(owner);
+        const state = owner === undefined ? undefined : ownerOf(owner);
+        if (state !== undefined) yield* syncRoster(rootOf(state));
         return;
       }
       if (event.type === "location.shutdown") {
@@ -2698,6 +2728,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           turn.settledInbox.add(event.data.inboxID);
           if (event.type === "session.inbox.cancelled") yield* endIfSettled(state, turn);
         }
+        yield* syncRoster(rootOf(state));
         return;
       }
       if (
@@ -3099,7 +3130,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           yield* settleRequest(entry, "cancelled");
         }
       }
-    });
+    }).pipe(
+      Effect.ensuring(
+        Effect.suspend(() =>
+          Effect.forEach(
+            [...threads.values()].filter((state) => state.subagent === undefined),
+            syncRoster,
+            { discard: true },
+          ),
+        ),
+      ),
+    );
 
     const reconnect = Effect.gen(function* () {
       // Returned on any failure, including the interrupt a closing session
@@ -3124,6 +3165,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
       // Shell events sent while the stream was down are lost, so a stale entry must not pin a thread forever.
       shells.clear();
+      shellWakePending.clear();
       yield* lock.withPermit(reconcile).pipe(Effect.timeout(RECONCILE_TIMEOUT));
       return stream;
     }).pipe(Effect.retry(RECONNECT_SCHEDULE));
@@ -3294,7 +3336,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       providerThread = withReportedModel(providerThread, native.model);
       const existing = threads.get(native.id);
       if (existing !== undefined) {
-        existing.providerThread = providerThread;
+        existing.providerThread = {
+          ...providerThread,
+          pendingBackgroundWork: existing.providerThread.pendingBackgroundWork,
+        };
         existing.model = native.model;
         existing.directory = directory;
         existing.agent = native.agent ?? existing.agent;
@@ -3773,6 +3818,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const stopBackground = Effect.fnUntraced(function* (state: ThreadState) {
       const calls = runningCalls(state).filter((call) => call.background);
       const callers = sessionsOf(state);
+      for (const caller of callers) shellWakePending.delete(caller.sessionId);
       // A subagent whose call ended runs again when OpenCode wakes it to
       // answer a report of its own background subagent.
       const followUps = callers.filter(
@@ -3840,6 +3886,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }),
       );
       yield* stopStrays(state);
+      yield* syncRoster(rootOf(state));
     });
 
     const submit = Effect.fnUntraced(function* (
@@ -4455,10 +4502,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           return;
         }
         threads.delete(nativeId);
+        shellWakePending.delete(nativeId);
         for (const [child, owner] of childOwners) {
           if (owner !== state) continue;
           childOwners.delete(child);
           threads.delete(child);
+          shellWakePending.delete(child);
         }
         if (state.mcp !== undefined) yield* removeMcp(state.mcp);
       }),

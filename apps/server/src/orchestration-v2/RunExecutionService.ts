@@ -1508,6 +1508,15 @@ export const layer: Layer.Layer<
           // thread-scoped probe: session-wide pending work (siblings, wake
           // buffers, session subagents) must not pin this root subscription.
           const latestProviderThreadSnapshot = yield* Ref.get(latestProviderThread);
+          // The live adapter can already be idle while its output is still queued.
+          // Failed ingestion uses native termination evidence: the clearing snapshot may not persist.
+          if (
+            latestProviderThreadSnapshot.pendingBackgroundWork === true &&
+            (yield* Ref.get(ingestionFailure)) === null &&
+            !(yield* Ref.get(startupFailurePending))
+          ) {
+            return false;
+          }
           if (input.session.hasPendingBackgroundWorkForThread !== undefined) {
             const hasPendingWork = yield* input.session
               .hasPendingBackgroundWorkForThread(latestProviderThreadSnapshot)
@@ -1793,8 +1802,7 @@ export const layer: Layer.Layer<
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
           Stream.runDrain,
-          // Race the consumer as a whole: a stream merge adds a handoff after every
-          // event, letting answers and native liveness run ahead of queued rows.
+          // Interrupt a blocked write as well as a blocked event pull when cleanup expires.
           Effect.raceFirst(
             Deferred.await(shutdownCleanupDeadline).pipe(
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),

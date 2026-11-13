@@ -1930,6 +1930,95 @@ it.effect("ingests the trailing subagent item completion after the subagent row 
   }),
 );
 
+it.effect.each(["completed", "interrupted"] as const)(
+  "drains a queued %s child follow-up before accepting the adapter's live idle state",
+  (status) =>
+    Effect.gen(function* () {
+      const followUps = yield* Ref.make<ReadonlyArray<string>>([]);
+      const result = yield* captureRootRunTermination({
+        key: `queued-follow-up:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+        events: (ids) => {
+          const pending = (
+            pendingBackgroundWork: boolean,
+          ): ProviderAdapter.ProviderAdapterV2Event => ({
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              id: ids.providerThreadId,
+              pendingBackgroundWork,
+            } as OrchestrationV2ProviderThread,
+          });
+          const childTurn = (
+            status: "running" | "completed" | "interrupted",
+          ): ProviderAdapter.ProviderAdapterV2Event => ({
+            type: "provider_turn.updated",
+            driver,
+            threadId: ids.childThreadId,
+            providerTurn: {
+              id: ProviderTurnId.make(`${ids.childThreadId}:follow-up`),
+              providerThreadId: ProviderThreadId.make(`${ids.childThreadId}:provider`),
+              runAttemptId: null,
+              status,
+            } as OrchestrationV2ProviderTurn,
+          });
+          return Stream.make(
+            pending(true),
+            childThreadCreatedEvent(ids),
+            rootTerminalEvent(ids, "completed"),
+            childTurn("running"),
+            {
+              type: "message.updated",
+              driver,
+              message: {
+                id: MessageId.make(`${ids.childThreadId}:follow-up`),
+                threadId: ids.childThreadId,
+                runId: null,
+                role: "assistant",
+                text: status === "completed" ? "GRANDCHILD_OK" : "Grandchild interrupted",
+                streaming: false,
+              },
+            } as ProviderAdapter.ProviderAdapterV2Event,
+            childTurn(status),
+            pending(false),
+          );
+        },
+        ingestNormalized: ({ event, threadId, providerInstanceId }) =>
+          Effect.gen(function* () {
+            if (event.type === "message.updated") {
+              yield* Ref.update(followUps, (texts) => [...texts, event.message.text]);
+            }
+            yield* Effect.yieldNow;
+            if (event.type === "provider_thread.updated") {
+              return [
+                {
+                  sequence: event.providerThread.pendingBackgroundWork ? 1 : 2,
+                  commandId: null,
+                  event: {
+                    id: EventId.make(
+                      `event:${event.providerThread.id}:${event.providerThread.pendingBackgroundWork}`,
+                    ),
+                    type: "provider-thread.updated",
+                    threadId,
+                    driver,
+                    providerInstanceId,
+                    occurredAt: yield* DateTime.now,
+                    payload: event.providerThread,
+                  },
+                },
+              ] satisfies ReadonlyArray<OrchestrationV2StoredEvent>;
+            }
+            return [];
+          }),
+      });
+      assert.deepEqual(yield* Ref.get(followUps), [
+        status === "completed" ? "GRANDCHILD_OK" : "Grandchild interrupted",
+      ]);
+      assert.deepEqual(result.observed, ["run:waiting", "pull-requests-refreshed"]);
+    }),
+);
+
 it.effect("keeps ingesting a child thread's late background item completion", () =>
   Effect.gen(function* () {
     const observed = yield* runBackgroundItemScenario("bg-child-item", (ids) => [
