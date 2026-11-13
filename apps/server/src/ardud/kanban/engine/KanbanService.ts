@@ -3982,10 +3982,13 @@ const make = Effect.gen(function* () {
       const specific = card?.asks.find((ask) => ask.id === askId);
       const recorded = row?.askers ?? null;
       const nowMs = yield* nowMillis;
+      // Freeze open-ask eligibility before routing closes it; late picks retain no asker.
       const asks = recorded
         ? (card?.asks ?? []).filter((ask) => recorded.ids.includes(ask.id))
         : specific
-          ? [specific]
+          ? specific.closedAt === null
+            ? [specific]
+            : []
           : card
             ? // A reply in words answers only the asks that take words alone.
               kanbanOpenAsks(card).filter((ask) => Asks.takesReply(ask, nowMs))
@@ -4013,13 +4016,9 @@ const make = Effect.gen(function* () {
             if (by._tag === "thread" && needsOwner && by.threadId === card?.workThreadId) continue;
             const current = yield* discussionOf(discussionId);
             const next = current.cardId ? yield* cardOf(current.cardId) : null;
-            // Retaining an asker must not copy a closed-ask pick back to an old evaluator.
             const live =
               by._tag === "evaluator"
-                ? (askId === undefined ||
-                    ask.closedAt === null ||
-                    by.threadId === current.evaluatorThreadId) &&
-                  (yield* liveEvaluator(by.threadId))
+                ? yield* liveEvaluator(by.threadId)
                 : by.threadId === next?.activeThreadId;
             if (live)
               yield* deliver(

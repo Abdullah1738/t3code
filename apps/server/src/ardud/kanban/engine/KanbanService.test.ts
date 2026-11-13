@@ -9358,6 +9358,133 @@ it.effect("an owner's pick on an archived evaluator's choice reaches its replace
 );
 
 const choiceRouteModes = ["inline", "await"] as const;
+const legacyChoiceAsk = Effect.gen(function* () {
+  const { kanban, board } = yield* toyBoard;
+  const store = yield* KanbanStore.KanbanStore;
+  const card = yield* kanban.createCard(board.id, { prompt: "Plan", title: "Plan" }, owner);
+  const asker = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Ask once" });
+  const asked = yield* kanban.askOwner(
+    card.id,
+    { question: "Legacy plan?", blocking: false, options: ["Yes", "No"] },
+    { _tag: "evaluator", threadId: asker },
+    "evaluator",
+  );
+  const ask = asked.asks.at(-1)!;
+  // Older asks stored their choices only in their discussion message.
+  yield* store.putCard({
+    ...asked,
+    asks: asked.asks.map((entry) => ({
+      ...entry,
+      kind: undefined,
+      options: undefined,
+      respond: undefined,
+    })),
+  });
+  const channel = yield* kanban.cardDiscussion(card.id);
+  const current = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Current" });
+  yield* store.putDiscussion({ ...channel, evaluatorThreadId: current });
+  assert.notStrictEqual(current, asker);
+  return { kanban, card, asker, current, channel, ask };
+});
+
+const legacyChoiceRouteCases = choiceRouteModes.flatMap((mode) =>
+  [false, true].flatMap((closed) =>
+    (["none", "rejected", "accepted then failed"] as const).map((failure) => ({
+      mode,
+      closed,
+      failure,
+    })),
+  ),
+);
+
+it.effect.each(legacyChoiceRouteCases)(
+  "$mode: legacy choice retains initial asker eligibility (closed: $closed, send: $failure)",
+  ({ mode, closed, failure }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, asker, current, channel, ask } = yield* legacyChoiceAsk;
+        if (closed) yield* kanban.changeAsk(card.id, ask.id, "drop", owner, "owner");
+        const target = closed ? current : asker;
+        if (failure === "rejected") fake.conclusiveReject.add(target);
+        if (failure === "accepted then failed") fake.commitThenReject.add(target);
+
+        yield* kanban.answer(channel.id, ask.seq!, ask.id, ["o1"], owner);
+        yield* kanban.answer(channel.id, ask.seq!, ask.id, ["o1"], owner);
+
+        const all = yield* Ref.get(fake.threads);
+        const notes = all
+          .get(asker)!
+          .messages.filter((text) => text.includes('Owner answered "Legacy plan?"'));
+        assert.lengthOf(notes, closed ? 0 : 1);
+        if (closed)
+          assert.lengthOf(
+            all
+              .get(current)!
+              .messages.filter((text) => text.includes('Owner answered "Legacy plan?"')),
+            1,
+          );
+        assert.isNotNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+      }).pipe(Effect.provide(withOwnerRouteMode(testLayer(fake.layer), mode)));
+    }),
+);
+
+it.effect.each([false, true])(
+  "a legacy choice preserves initial asker eligibility across restart (closed: %s)",
+  (closed) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-kanban-choice-retry-",
+      });
+      const dbPath = path.join(directory, "state.sqlite");
+      const fake = yield* makeFake;
+      const ids = yield* Effect.gen(function* () {
+        const fixture = yield* legacyChoiceAsk;
+        const { kanban, card, asker, current, channel, ask } = fixture;
+        if (closed) yield* kanban.changeAsk(card.id, ask.id, "drop", owner, "owner");
+        fake.rejectSends.add(closed ? current : asker);
+
+        yield* kanban.answer(channel.id, ask.seq!, ask.id, ["o1"], owner);
+
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql<{ done_at: string | null }>`
+        SELECT done_at FROM ardud_kanban_owner_routes WHERE json_extract(json, '$.kind') = 'answer'`;
+        assert.deepStrictEqual(rows, [{ done_at: null }]);
+        assert.isNotNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+        return { asker, current, channelId: channel.id, seq: ask.seq!, askId: ask.id };
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, dbPath)));
+
+      fake.rejectSends.clear();
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.ready;
+        // Repeating the saved answer waits for its existing route to finish replaying.
+        yield* kanban.answer(ids.channelId, ids.seq, ids.askId, ["o1"], owner);
+
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql<{ outcome: string }>`
+        SELECT json_extract(json, '$.outcome') AS outcome FROM ardud_kanban_owner_routes
+        WHERE json_extract(json, '$.kind') = 'answer'`;
+        assert.deepStrictEqual(rows, [{ outcome: "delivered" }]);
+        const all = yield* Ref.get(fake.threads);
+        assert.lengthOf(
+          all
+            .get(ids.asker)!
+            .messages.filter((text) => text.includes('Owner answered "Legacy plan?"')),
+          closed ? 0 : 1,
+        );
+        assert.lengthOf(
+          all
+            .get(ids.current)!
+            .messages.filter((text) => text.includes('Owner answered "Legacy plan?"')),
+          1,
+        );
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, dbPath)));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 const choiceRouteCases = choiceRouteModes.flatMap((mode) =>
   [false, true].flatMap((currentAuthor) =>
     (
