@@ -169,6 +169,7 @@ test("first bootstrap stays unready until every projection is exported", () => {
   const out = f.connect();
   expect(metaValue(out, "ready")).toBe("0");
   expect(metaValue(out, "updated_at")).toBeUndefined();
+  expect(metaValue(out, "lineage_repair_watermark")).toBeUndefined();
   let steps = 0;
   while (f.exporter.step()) {
     expect(metaValue(out, "ready")).toBe("0");
@@ -178,6 +179,8 @@ test("first bootstrap stays unready until every projection is exported", () => {
   expect(steps).toBeGreaterThan(1);
   expect(metaValue(out, "ready")).toBe("1");
   expect(metaValue(out, "updated_at")).toBeDefined();
+  expect(metaValue(out, "lineage_repair_revision")).toBe("0");
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
 });
 
 test("routine refresh cycles keep ready=1 and only advance updated_at at cycle end", () => {
@@ -225,11 +228,13 @@ test("a compacted event gap clears readiness until the reset and rebuild finish"
   f.finish();
   const out = f.connect();
   const published = metaValue(out, "updated_at");
+  const revision = Number(metaValue(out, "lineage_repair_revision"));
   f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','a','{}')");
   expect(f.exporter.step()).toBe(true);
   expect(metaValue(out, "ready")).toBe("0");
   expect(metaValue(out, "resetting_events")).toBe("1");
   expect(metaValue(out, "updated_at")).toBe(published);
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
   // A worker restart in the middle of the reset must not republish it.
   f.restart();
   expect(metaValue(out, "ready")).toBe("0");
@@ -241,6 +246,8 @@ test("a compacted event gap clears readiness until the reset and rebuild finish"
   expect(metaValue(out, "ready")).toBe("1");
   expect(metaValue(out, "resetting_events")).toBe("0");
   expect(metaValue(out, "sequence")).toBe("4");
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
 });
 
 test("reopening a published replica keeps it ready; an abandoned cycle is discarded", () => {
@@ -950,10 +957,16 @@ test("a rebuild pages the source exactly like a first bootstrap", () => {
       .prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}')")
       .run(`t${i}`);
   f.finish();
+  const before = f.connect();
+  const epoch = metaValue(before, "last_rebuild_at");
+  const watermark = metaValue(before, "updated_at");
   f.exporter.close();
   f.source.exec("DELETE FROM orchestration_events");
   const exporter = openExporter(f);
   const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_rebuild_at")).not.toBe(epoch);
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(watermark);
   const count = () =>
     Number(out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n);
   expect(count()).toBe(0);
@@ -969,6 +982,7 @@ test("a rebuild pages the source exactly like a first bootstrap", () => {
   }
   expect(count()).toBe(12);
   expect(steps).toBeGreaterThanOrEqual(6);
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
 });
 
 test("a busy source cannot hold a cycle open; updated_at tracks what was confirmed", () => {
@@ -1104,3 +1118,94 @@ test.each(["primary", "replica"] as const)("annotates actual corrupt %s export h
     expect(error).toMatchObject({ errcode: 26, sqliteFile: file, sqliteRole: role });
   }
 });
+
+test("lineage repair revision changes only for eventless reconciliation", () => {
+  const f = fixture(100);
+  f.source.exec("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt','{}')");
+  f.finish();
+  const out = f.connect();
+  const original = Number(metaValue(out, "lineage_repair_revision"));
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"event"}' WHERE thread_id='a';
+    INSERT INTO orchestration_events VALUES(2,'thread.updated','a','{}');`);
+  for (let i = 0; i < 18; i++) f.finish();
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(original);
+
+  // Neither repair advances orchestration sequence; both must fence readers.
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_threads SET payload_json='{"lineage":{"parentThreadId":"a"}}' WHERE thread_id='b';
+    UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"repaired"}}' WHERE provider_thread_id='pt';`);
+  for (let i = 0; i < 18; i++) f.finish();
+  const repaired = Number(metaValue(out, "lineage_repair_revision"));
+  expect(repaired).toBe(original + 2);
+  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
+  for (let i = 0; i < 18; i++) f.finish();
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(repaired);
+  f.source.exec("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='b'");
+  for (let i = 0; i < 18; i++) f.finish();
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(repaired + 1);
+});
+
+test.each([
+  {
+    name: "direct parent",
+    table: "orchestration_v2_projection_threads",
+    key: "thread_id",
+    id: "b",
+    eventPayload: { lineage: { parentThreadId: "c" } },
+    payload: { lineage: { parentThreadId: "a" } },
+    event: "thread.updated",
+  },
+  {
+    name: "root hint",
+    table: "orchestration_v2_projection_threads",
+    key: "thread_id",
+    id: "b",
+    eventPayload: { lineage: { rootThreadId: "c" } },
+    payload: { lineage: { rootThreadId: "a" } },
+    event: "thread.updated",
+  },
+  {
+    name: "provider native binding",
+    table: "orchestration_v2_projection_provider_threads",
+    key: "provider_thread_id",
+    id: "pt",
+    eventPayload: { nativeThreadRef: { nativeId: "event-native" } },
+    payload: { nativeThreadRef: { nativeId: "repaired" } },
+    event: "provider-thread.updated",
+  },
+])(
+  "$name repairs fence readers, event catchup does not",
+  ({ table, key, id, payload, eventPayload, event }) => {
+    const f = fixture(100);
+    f.source.exec("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt','{}')");
+    f.finish();
+    const out = f.connect();
+    const revision = Number(metaValue(out, "lineage_repair_revision"));
+    const update = f.source.prepare(`UPDATE ${table} SET payload_json=? WHERE ${key}=?`);
+    const read = out.prepare(`SELECT payload_json FROM ${table} WHERE ${key}=?`);
+    const caughtUpPayload = JSON.stringify(eventPayload);
+    update.run(caughtUpPayload, id);
+    f.source
+      .prepare("INSERT INTO orchestration_events VALUES (2,?,?,?)")
+      .run(event, id, JSON.stringify({ id }));
+    for (let i = 0; i < 18; i++) f.finish();
+    expect(read.get(id)?.payload_json).toBe(caughtUpPayload);
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision);
+
+    const repairedPayload = JSON.stringify(payload);
+    update.run(repairedPayload, id);
+    for (let i = 0; i < 18; i++) f.finish();
+    expect(read.get(id)?.payload_json).toBe(repairedPayload);
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+    expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
+    for (let i = 0; i < 18; i++) f.finish();
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+
+    f.source.prepare(`DELETE FROM ${table} WHERE ${key}=?`).run(id);
+    for (let i = 0; i < 18; i++) f.finish();
+    expect(read.get(id)).toBeUndefined();
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 2);
+  },
+);
