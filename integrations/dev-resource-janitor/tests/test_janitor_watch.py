@@ -96,6 +96,7 @@ def scan():
     while not (root / 'release').exists(): time.sleep(0.02)
     return {'resources': [], 'candidates': []}
 def apply(ids): raise AssertionError('no candidates')
+def log_run(*args): pass
 """)
         env = {**os.environ, "DEV_JANITOR_WATCH_STATE": str(self.state_dir), "FAKE_ROOT": str(self.root),
                "PYTHONDONTWRITEBYTECODE": "1"}

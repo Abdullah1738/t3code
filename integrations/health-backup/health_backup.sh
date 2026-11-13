@@ -12,6 +12,17 @@
 #      system's dropbox_mirror.py (dbxcli upload, verified by Dropbox content_hash)
 # Status: ~/.local/share/health-backup/backup_last.json. LaunchAgent com.abdullah.health-backup.
 set -u
+mac_log() { :; }
+. "${MAC_LOG_HOME:-$HOME/.local/lib/mac-logging}/toollog.sh" 2>/dev/null || :
+TL_START=$(date +%s)
+TL_RESTIC_RC=-1
+TL_SNAPSHOT_AT=0
+summary=""
+backup_log_exit() {
+  local status=$?
+  printf '%s' "$summary" | mac_log backup health "$TL_START" "$TL_RESTIC_RC" "$status" "$TL_SNAPSHOT_AT"
+}
+trap backup_log_exit EXIT
 VAULT="${HEALTH_VAULT:-$HOME/health-data/abdullah}"
 ROOT="$HOME/.local/share/health-backup"
 STAGE="$ROOT/stage"
@@ -41,7 +52,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   log "removing stale lock (holder ${holder:-?} gone)"; rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+trap 'backup_log_exit; rm -rf "$LOCK"' EXIT
 START=$(date +%s)
 
 write_status() { # ok stage message snapshot files
@@ -130,9 +141,11 @@ done
 # 3. snapshot
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag health-data --json --quiet "$STAGE" 2>&1)
 rc=$?
+TL_RESTIC_RC=$rc
 summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 400)"
 snap=$(printf '%s' "$summary" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["snapshot_id"][:8])')
+TL_SNAPSHOT_AT=$(date +%s)
 log "snapshot $snap"
 
 # 4. retention, daily
