@@ -896,7 +896,7 @@ def wait(run_id: str, timeout: float | None) -> int:
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
         return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
-    return _wait_locked(r, echo=False, timeout=timeout)
+    return _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
@@ -1005,7 +1005,7 @@ def _truncate(path, size: int) -> None:
             pass
 
 
-def _wait_locked(r, echo, timeout=None):
+def _wait_locked(r, echo, timeout=None, *, show_failure=False):
     """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
     holds the lock, poll the run row (and tail the local log) instead of failing on the lock.
     `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
@@ -1015,7 +1015,7 @@ def _wait_locked(r, echo, timeout=None):
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     if r['status'] == 'lost' and r['exit_code'] is not None:
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     from . import start_check
     if start_check.recovery_marked(db(), r) and not start_check.api_pid(db(), r):
         r = _wait_start_receipt(r, deadline)
@@ -1023,9 +1023,9 @@ def _wait_locked(r, echo, timeout=None):
         r = _wait_for_start(r, deadline)
     if (r['status'] == 'lost' and db().execute(
             "SELECT 1 FROM kv WHERE k=? AND v='fenced'", (f"lost_confirmed:{r['run_id']}",)).fetchone()):
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     if r['status'] not in ('starting', 'running', 'lost') or not r['box_id']:
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     _refresh_running_ttl(r, deadline)
     pos, said = 0, False
     polled, ended_at = None, None
@@ -1047,7 +1047,7 @@ def _wait_locked(r, echo, timeout=None):
                 if cur['status'] not in ('starting', 'running'):
                     # The holder wrote its last output, recorded the end and released the lock between two polls.
                     # Nothing will be replayed now, so drain the whole rest of the log.
-                    return _settled(cur, echo=echo, pos=pos, locked=True, until=deadline)
+                    return _settled(cur, echo=echo, pos=pos, locked=True, until=deadline, show_failure=show_failure)
                 ck = checkpoint(log_path)
                 # Nothing below may touch the original log before the replay is confirmed. A deadline that has already
                 # passed ends the wait here, with the log and its checkpoint exactly as they were.
@@ -1062,7 +1062,8 @@ def _wait_locked(r, echo, timeout=None):
                 else:
                     # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
                     start, keep = (0, 0), 0
-                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None)
+                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None,
+                                        show_failure=show_failure)
             finally:
                 guard.__exit__(None, None, None)
         ck = checkpoint(log_path)
@@ -1073,7 +1074,7 @@ def _wait_locked(r, echo, timeout=None):
                 cur['exit_code'] is not None or db().execute(
                     'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone())):
             # Settled: nothing will be replayed, so drain the whole rest of the log.
-            return _settled(cur, echo=echo, pos=pos, until=deadline)
+            return _settled(cur, echo=echo, pos=pos, until=deadline, show_failure=show_failure)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                               f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
@@ -1097,7 +1098,7 @@ def _wait_locked(r, echo, timeout=None):
             else:
                 ended_at = (ended_at or now()) if st else None
             if st and ended_at is not None and now() - ended_at >= _grace(cur):
-                return _holder_stuck(cur, st, log_path, pos, echo, deadline)
+                return _holder_stuck(cur, st, log_path, pos, echo, deadline, show_failure=show_failure)
         if not said:
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
                 f"waiting for it to record the end")
@@ -1114,7 +1115,7 @@ def _grace(r) -> int:
     return PULL_GRACE_S if pulls else HOLDER_GRACE_S
 
 
-def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
+def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_failure=False) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
@@ -1125,9 +1126,12 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     receipt_code = code
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     _tail(log_path, pos, echo)
+    failure = show_failure and not echo and r['mode'] == 'bg' and code not in (0, None)
+    if failure:
+        _failure_tail(log_path)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
-    out(f"{r['run_id']}: exit={code}")
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}")
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
@@ -1285,7 +1289,7 @@ def _has_data(log_path) -> bool:
         return False
 
 
-def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False):
+def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False, *, show_failure=False):
     """Take over a run's follow without touching the original local log until the replay is confirmed.
 
     The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
@@ -1297,10 +1301,11 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
         if ck is not None:
             start, keep = (ck['stdoutOffset'], ck['stderrOffset']), ck['logBytes']
             has_checkpoint = True
-        return _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint)
+        return _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint,
+                                        show_failure=show_failure)
 
 
-def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint):
+def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint, *, show_failure=False):
     tmp = log_path.with_name(log_path.name + ".takeover")
     tmp_ck = offsets_path(tmp)
     try:
@@ -1321,13 +1326,13 @@ def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_chec
             if confirmed:
                 tmp.unlink(missing_ok=True)
                 tmp_ck.unlink(missing_ok=True)
-                return _finalize(cur, code, log_path, until=deadline, echo=echo)
+                return _finalize(cur, code, log_path, until=deadline, echo=echo, show_failure=show_failure)
             raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
         # Publish the replacement log and checkpoint before the run is recorded as settled.
         os.replace(tmp, log_path)
         if os.path.exists(tmp_ck):
             os.replace(tmp_ck, offsets_path(log_path))
-        return _finalize(cur, code, log_path, until=deadline, echo=echo)
+        return _finalize(cur, code, log_path, until=deadline, echo=echo, show_failure=show_failure)
     except BaseException:
         for p in (tmp, tmp_ck):
             try:
@@ -1369,11 +1374,12 @@ def _report_deps_hint(r, code, log_path) -> None:
             say(hint)
 
 
-def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
+def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message, settled_steps_code)
+    show_failure = show_failure and not echo and dict(r).get('mode') == 'bg'
     receipt_code = code
     delivered = delivered_bytes(log_path)
     try:
@@ -1385,16 +1391,21 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         finish(r['run_id'], EXIT_INFRA, 'infra', until=until)
         if echo:
             _tail(log_path, delivered, True)
+        elif show_failure:
+            _failure_tail(log_path)
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
     from .runs import state_warning
     quarantine_pending = code == 97
+    failure_tail_shown = False
     try:
         con = db()
         with contextlib.nullcontext() if until is None else api.budget(max(0, until-now())):
             wedged = settle_box_wedged(con, r, code)
         quarantine_pending = False
         if wedged:
+            if show_failure:
+                _failure_tail(log_path)
             say(wedged_message(r['box_id'], *wedged))
             return EXIT_INFRA
         pulls = json.loads(r["pulls"] or "[]")
@@ -1420,13 +1431,19 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         # Catch-up must also drain bytes whose stream echo failed before recording later bytes as delivered.
         if echo:
             _tail(log_path, delivered, True)
+        elif show_failure and code not in (0, None):
+            _failure_tail(log_path)
+            failure_tail_shown = True
         go_std_glitch(r["box_id"], r["run_id"], log_path, code)
         _report_deps_hint(r, code, log_path)
     except sqlite3.Error as error:
         if not quarantine_pending:
             code = finish(r['run_id'], code, until=until, run=r)
         state_warning(r['run_id'], code, error)
-    out(f"{r['run_id']}: exit={code}")
+    failure = show_failure and code not in (0, None)
+    if failure and not failure_tail_shown:
+        _failure_tail(log_path)
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}")
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=until, receipt_code=receipt_code)
@@ -1434,14 +1451,14 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     return 90 if code is None else code
 
 
-def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
+def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None, *, show_failure=False):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
     from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
-        return _settled(r, echo=echo, locked=True, until=until)
+        return _settled(r, echo=echo, locked=True, until=until, show_failure=show_failure)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
-    return _finalize(r, code, log_path, until=until, echo=echo)
+    return _finalize(r, code, log_path, until=until, echo=echo, show_failure=show_failure)
 
 
 def stats(days: float, as_json: bool) -> None:
