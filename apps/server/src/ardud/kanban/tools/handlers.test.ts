@@ -461,7 +461,7 @@ it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("#566 review replies distinguish a recorded verdict from an exact replay", () => {
+it.effect("#769 review replies name exact replays and refuse expired verdicts", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -492,12 +492,29 @@ it.effect("#566 review replies distinguish a recorded verdict from an exact repl
     });
     assert.isFalse(replay.isError, replay.text);
     assert.strictEqual(replay.structured.recorded, false);
-    assert.include(String(replay.structured.note), "nothing new written");
+    const review = (yield* kanban.card(card.id)).events.findLast(
+      (event) => event.kind === "review",
+    )!;
+    assert.strictEqual(
+      replay.structured.note,
+      `Already recorded as review event ${review.id} at ${review.at}; not saved again.`,
+    );
     assert.deepStrictEqual(replay.structured.card, first.structured.card);
     assert.lengthOf(
       (yield* kanban.card(card.id)).events.filter((event) => event.kind === "review"),
       1,
     );
+    const before = yield* kanban.card(card.id);
+    yield* TestClock.adjust("11 minutes");
+    const expired = yield* call(reviewer, "card_review_result", {
+      verdict: "clear",
+      head: "abc1234",
+    });
+    assert.isTrue(expired.isError, expired.text);
+    assert.include(expired.text, "stage completed");
+    assert.include(expired.text, "review step 1 of 1");
+    assert.include(expired.text, "Your verdict was not recorded.");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
   }).pipe(Effect.provide(layer));
 });
 

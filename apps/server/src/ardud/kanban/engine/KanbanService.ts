@@ -2146,6 +2146,7 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
     kind: KanbanCardEvent["kind"],
     extra: {
+      readonly at?: string;
       readonly fromStage?: KanbanStage | null;
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
@@ -2154,7 +2155,7 @@ const make = Effect.gen(function* () {
   ) {
     return yield* store.addCardEvent({
       cardId: card.id,
-      at: yield* nowIso,
+      at: extra.at ?? (yield* nowIso),
       actor,
       kind,
       fromStage: extra.fromStage ?? null,
@@ -10344,6 +10345,7 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const REVIEW_REPLAY_WINDOW_MS = 10 * 60_000;
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     SavedWrite.recover(
       guardDeferred(
@@ -10365,6 +10367,9 @@ const make = Effect.gen(function* () {
             if (sha !== null && /^[0-9a-f]{7,40}$/.test(sha)) {
               const events = yield* store.cardEvents(card.id);
               const lastReview = events.findLast((event) => event.kind === "review");
+              const at = yield* nowIso;
+              const ageMs =
+                lastReview === undefined ? Number.NaN : Date.parse(at) - Date.parse(lastReview.at);
               const dispatchedSince =
                 lastReview !== undefined &&
                 events.some(
@@ -10378,6 +10383,9 @@ const make = Effect.gen(function* () {
                 lastReview.actor.threadId === threadId &&
                 lastReview.head === sha &&
                 lastReview.body === body &&
+                ageMs >= 0 &&
+                ageMs <= REVIEW_REPLAY_WINDOW_MS &&
+                card.movedAt === lastReview.at &&
                 lastReview.toStage === card.stage &&
                 !dispatchedSince
               ) {
@@ -10389,13 +10397,16 @@ const make = Effect.gen(function* () {
                 return {
                   card,
                   recorded: false,
-                  note: `Already recorded at ${lastReview.at}; nothing new written.`,
+                  note: `Already recorded as review event ${lastReview.id} at ${lastReview.at}; not saved again.`,
                 };
               }
             }
+            const board = yield* boardOf(card.boardId);
+            const steps = Rules.chainFor(board, card)?.steps.length ?? 1;
+            const step = Math.min(card.reviewStep + 1, steps);
             return yield* failWith(
               "conflict",
-              `card #${card.number} is not in review with this thread`,
+              `card #${card.number} is not in review with this thread (stage ${card.stage}, review step ${step} of ${steps}${card.stage === "needs_review" ? " waits for the dispatcher" : ""}). Your verdict was not recorded. Check card_get for the current assignment.`,
             );
           }
           if (verdict === "findings" && findings.length === 0) {
@@ -10442,6 +10453,7 @@ const make = Effect.gen(function* () {
             updatedAt: at,
           };
           yield* logEvent(next, { _tag: "thread", threadId }, "review", {
+            at,
             fromStage: card.stage,
             toStage: next.stage,
             body,
