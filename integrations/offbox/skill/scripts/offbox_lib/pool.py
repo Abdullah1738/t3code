@@ -623,7 +623,14 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         break
                     except OffboxError as e:
                         if resume_stall is not None:
-                            raise OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran") from e
+                            from . import home
+                            refused = 400 <= (getattr(e, 'status', None) or 0) < 500
+                            wrapped = OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran",
+                                                  code=e.code, started=e.started or resume_stall.started,
+                                                  outage=not refused and home.may_fail_over()
+                                                  and (e.outage or resume_stall.outage))
+                            wrapped.status = getattr(e, 'status', None)
+                            raise wrapped from e
                         raise
                     # acquire_private hands over the box lock it took before the row existed.
                     guard = got.pop("_guard", None)

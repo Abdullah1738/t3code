@@ -77,7 +77,9 @@ def setup(box_id: str) -> Path:
             log(f"ssh_setup_retry {box_id} attempt={attempt + 1} {str(last)[:200]}")
             time.sleep(1 + attempt if left is None else min(1 + attempt, left))
     else:
-        raise OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
+        error = OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
+        error.status = getattr(last, 'status', None)
+        raise error
     ep = r.get("sshEndpoint")
     if ep:
         host, port = ep.rsplit(":", 1)

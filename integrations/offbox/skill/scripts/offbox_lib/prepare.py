@@ -16,9 +16,11 @@ _MOVES = contextvars.ContextVar('prepare_moves', default=None)
 
 class Stalled(OffboxError):
     def __init__(self, box, phase, seconds):
+        from . import home
         self.box, self.phase = box, phase
         super().__init__(f'could not get a box ready in {seconds:g}s '
-                         f'(stuck in {phase} on {box}); nothing ran')
+                         f'(stuck in {phase} on {box}); nothing ran',
+                         outage=phase == 'bring_up' and home.may_fail_over())
 
 
 class _Expired(BaseException):
@@ -42,8 +44,14 @@ def move_once(error):
     moves = _MOVES.get()
     if moves is not None:
         if moves:
-            raise OffboxError(f'{error}. Replacement failed after: {moves[0]}') from error
-        moves.append(str(error))
+            from . import home
+            refused = 400 <= (getattr(error, 'status', None) or 0) < 500
+            wrapped = OffboxError(f'{error}. Replacement failed after: {moves[0]}', code=error.code,
+                                  started=error.started or moves[0].started,
+                                  outage=not refused and home.may_fail_over() and (error.outage or moves[0].outage))
+            wrapped.status = getattr(error, 'status', None)
+            raise wrapped from error
+        moves.append(error)
 
 
 def can_move():

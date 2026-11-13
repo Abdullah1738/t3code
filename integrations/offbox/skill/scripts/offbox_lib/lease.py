@@ -869,6 +869,7 @@ class BoxNotReady(OffboxError):
     def __init__(self, box_id: str, state: dict, cause: OffboxError):
         super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
                          code=cause.code, started=cause.started, outage=cause.outage)
+        self.status = getattr(cause, 'status', None)
         self.box_id, self.state = box_id, state
 
 
@@ -882,6 +883,10 @@ class ResumeUnresolved(OffboxError):
 
 class ResumeProvisionStalled(OffboxError):
     """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+    def __init__(self, message):
+        from . import home
+        super().__init__(message, outage=home.may_fail_over())
 
 
 def _wait_unanswered_resume(con, box_id):
