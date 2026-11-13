@@ -918,6 +918,18 @@ class GuardTests(unittest.TestCase):
             refusals.append((label, dict(init=init, select=select, wrapper=wrapper), environment or {}, setup))
 
         chain('init-live-read', init=live_read)
+        real_init = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/init.sh').read_text()
+        real_select = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/select.py').read_text()
+        reader = lambda home, helper: (home / 'reader.sh').write_text(live_read)
+        chain('init-runs-live-reader', init=real_init + 'bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-only-runs-live-reader', init='bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-runs-unresolved', init='bash "$UNRESOLVED"\n')
+        chain('init-redefines-mktemp', init='mktemp() { printf "%s\\n" "$HOME"; }\n')
+        chain('init-exports-mktemp', init=real_init + 'mktemp() { printf "%s\\n" "$HOME"; }; export -f mktemp\n')
+        chain('init-comment-drift', init=real_init + '# reviewed?\n')
+        chain('select-runs-live-reader', select='import os, subprocess\nsubprocess.run(["bash", os.environ["HOME"] + "/reader.sh"])\n', setup=reader)
+        chain('select-appends-reader', select=real_select + '\nimport os\nos.system("bash $HOME/reader.sh")\n', setup=reader)
+        chain('wrapper-whitespace-drift', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '\n')
         chain('init-split-live-read', init='cat "$HOME/.ro""bob/userdata/state""v2.sqlite"\n')
         chain('select-live-read', select='open(' + repr(LIVE) + ').read()\n')
         chain('init-sources-live-reader', init='. "$HOME/reader.sh"\n',
@@ -973,6 +985,102 @@ class GuardTests(unittest.TestCase):
                 for command in commands:
                     with self.subTest(case=label, command=command):
                         self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs(self):
+        # select.py opens these before the script runs (repo files from the
+        # cwd up to the repo root, NVM aliases, pnpm package.json files).
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        plain = self.write('marker/plain.json', '{}')
+        nvm = home / '.nvm'
+        corepack = home / 'corepack'
+        environment['COREPACK_HOME'] = str(corepack)
+        made = []
+
+        def link(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            made.append(path)
+
+        def hard(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.link(target, path)
+            made.append(path)
+
+        def fifo(path):
+            os.mkfifo(path)
+            made.append(Path(path))
+
+        def regular(path, text='{}'):
+            made.append(self.write(path, text) if not os.path.isabs(path) else Path(path))
+            if os.path.isabs(path):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(text)
+
+        pnpm_root = home / 'pnpm-install/lib/node_modules/pnpm'
+        rows = [
+            ('cwd-package-json-live', lambda: link(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-nvmrc-live', lambda: link(self.root / '.nvmrc', marker), SCRIPT),
+            ('cwd-node-version-live', lambda: link(self.root / '.node-version', marker), SCRIPT),
+            ('cwd-pnpm-lock-live', lambda: link(self.root / 'pnpm-lock.yaml', marker), SCRIPT),
+            ('script-dir-package-json-live', lambda: link(self.root / 'tmp/package.json', marker), None),
+            ('cwd-package-json-dangling-live', lambda: link(self.root / 'package.json', str(marker) + '-wal'), SCRIPT),
+            ('cwd-package-json-hard-link', lambda: hard(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-package-json-fifo', lambda: fifo(self.root / 'package.json'), SCRIPT),
+            ('nvm-alias-live', lambda: link(nvm / 'alias/default', marker), SCRIPT),
+            ('nvm-pnpm-package-live', lambda: link(nvm / 'versions/node/v26.0.0/lib/node_modules/pnpm/package.json', marker), SCRIPT),
+            ('corepack-package-live', lambda: link(corepack / 'v1/pnpm/10.0.0/package.json', marker), SCRIPT),
+            ('path-pnpm-root-package-live', lambda: (regular(str(pnpm_root / 'bin/pnpm.cjs'), ''),
+                                                    link(home / '.local/share/quint-guard/bin/pnpm', pnpm_root / 'bin/pnpm.cjs'),
+                                                    link(pnpm_root / 'package.json', marker)), SCRIPT),
+            ('cwd-package-json-regular', lambda: regular('package.json'), None),
+            ('cwd-package-json-plain-link', lambda: link(self.root / 'package.json', plain), None),
+            ('nvm-alias-directory', lambda: (nvm / 'alias/lts').mkdir(parents=True, exist_ok=True), None),
+        ]
+        for label, setup, expected in rows:
+            setup()
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case=label, command=command):
+                            self.assertEqual(self.classify(command), expected)
+            finally:
+                for path in reversed(made):
+                    if path.is_symlink() or path.exists():
+                        path.unlink()
+                made.clear()
+        # The selector walks from the cwd up to the repo root.
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify('bash fixture.sh', str(self.root / 'tmp')))
+            link(self.root / 'package.json', marker)
+            try:
+                self.assertEqual(guard.classify('bash fixture.sh', str(self.root / 'tmp')), SCRIPT)
+                (self.root / '.git').mkdir()
+                (self.root / 'tmp/.git').mkdir()
+                # A repo root below the link stops the walk before it.
+                self.assertIsNone(guard.classify('bash fixture.sh', str(self.root / 'tmp')))
+            finally:
+                made.pop().unlink()
+                (self.root / '.git').rmdir()
+                (self.root / 'tmp/.git').rmdir()
+        # The command must not create selector inputs on the way in.
+        with patch.dict(os.environ, environment):
+            for command in ('ln -s x package.json; bash tmp/fixture.sh', 'cp a .nvmrc && bash tmp/fixture.sh',
+                            'COREPACK_HOME=/tmp/c bash tmp/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_repo_node_pin_hashes_cover_fork_helpers(self):
+        # Editing local-helpers' repo-node-pin turns the fixture proof off
+        # until the guard reviews and pins the new bytes.
+        import hashlib
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        for part, hashes in guard.REPO_NODE_PIN_HASHES.items():
+            with self.subTest(part=part):
+                self.assertIn(hashlib.sha256((source / part).read_bytes()).hexdigest(), hashes)
 
     def test_real_repo_node_pin_bash_env_keeps_fixture_proof(self):
         # Drift in this Mac's installed chain should show up here first.

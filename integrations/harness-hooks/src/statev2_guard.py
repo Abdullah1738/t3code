@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -258,20 +259,78 @@ def _trusted_fixture_tool(executable, name, directory):
 
 
 FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', 'mkfifo')
-# integrations/local-helpers/libexec/repo-node-pin/bash-env.sh, statement by statement.
-REPO_NODE_PIN_WRAPPER = (
-    'if [ -n "${ROBOB_REPO_PREVIOUS_BASH_ENV:-}" ] && [ "$ROBOB_REPO_PREVIOUS_BASH_ENV" != "${BASH_ENV:-}" ]; then',
-    '. "$ROBOB_REPO_PREVIOUS_BASH_ENV"',
-    'fi',
-    '. "${ROBOB_REPO_NODE_HELPER:-$HOME/.local/libexec/repo-node-pin}/init.sh"',
-)
+# Reviewed integrations/local-helpers/libexec/repo-node-pin files (sha256).
+# init.sh evals select.py's output and select.py runs no other program, so
+# only these exact bytes are trusted; the read list below follows select.py.
+# A changed helper fails closed until its new hash is reviewed in here.
+REPO_NODE_PIN_HASHES = {
+    'bash-env.sh': {'84d84773c9b61952f5a39367470ad4043c463e8573259846ec3bb614931c8d60'},
+    'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0'},
+    'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
+                  '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
+}
 REPO_NODE_PIN_PYTHON = '/opt/homebrew/bin/python3'
 # select.py may move these harness guard dirs to the front of PATH.
 REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blockers',
                          '.local/share/harness-hooks/coord-blockers', '.local/share/quint-guard/bin')
+REPO_NODE_PIN_INPUTS = ('package.json', '.nvmrc', '.node-version', 'pnpm-lock.yaml')
 REPO_NODE_PIN_COMMAND = re.compile(
-    r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|'
+    r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|corepack|'
+    r'package\.json|\.nvmrc|\.node-version|pnpm-lock\.yaml|'
     r'(?<![\w$])HOME\+?=|\bunset\b[^;&|\n]*\bHOME\b|-u\s*HOME\b')
+
+
+def _repo_node_pin_input_safe(path):
+    """select.py opens this path before the script runs; it must not be live."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if LIVE.search(str(path)) or LIVE.search(os.path.realpath(path)):
+        return False
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # Opening a directory fails harmlessly. A second hard link can be the
+    # live database under another name.
+    return stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _repo_node_pin_inputs_safe(directory, home, helper, nvm, search):
+    """Every file the pinned select.py can open for this cwd and environment."""
+    if directory is None:
+        return False
+    inputs = []
+    for start in {os.path.abspath(directory), os.path.realpath(directory)}:
+        current = start
+        while True:
+            inputs += [os.path.join(current, name) for name in REPO_NODE_PIN_INPUTS]
+            parent = os.path.dirname(current)
+            if os.path.exists(os.path.join(current, '.git')) or parent == current:
+                break
+            current = parent
+
+    def children(root):
+        try:
+            return [entry.path for entry in os.scandir(root)]
+        except OSError:
+            return []
+
+    inputs += [path for path in children(os.path.join(nvm, 'alias')) if '/' not in os.path.basename(path)]
+    inputs += [os.path.join(version, 'lib/node_modules/pnpm/package.json')
+               for version in children(os.path.join(nvm, 'versions/node'))]
+    for entry in search:
+        pnpm = os.path.join(entry, 'pnpm')
+        if os.path.exists(pnpm):
+            inputs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(pnpm))), 'package.json'))
+    corepack = os.environ.get('COREPACK_HOME') or os.path.join(home, '.cache/node/corepack')
+    inputs += [os.path.join(version, 'package.json') for version in children(os.path.join(corepack, 'v1/pnpm'))]
+    return all(_repo_node_pin_input_safe(path) for path in inputs)
 
 
 def _inherited_startup_safe(name, directory, command=None, bindings=None, written=()):
@@ -279,10 +338,10 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
 
     Every agent shell here inherits it from ~/.zshenv. Its init.sh evals
     select.py's output, which no static scan resolves, so the proof pins the
-    whole chain instead: the wrapper's exact statements, default helper and
-    Python locations, clean init.sh and select.py text, and no fixture tool
-    reachable through any PATH entry the chain can add or reorder. A binding
-    set by the command itself is never inherited and stays refused by callers.
+    chain instead: reviewed file hashes, default helper and Python locations,
+    clean select.py inputs, and no fixture tool reachable through any PATH
+    entry the chain can add or reorder. A binding set by the command itself is
+    never inherited and stays refused by callers.
     """
     value = os.environ.get(name, '')
     home = os.environ.get('HOME', '')
@@ -315,34 +374,16 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
         if any(resolved == root or resolved.startswith(root + os.sep)
                for root in (real_helper, os.path.realpath(nvm))):
             return False
-    texts = {}
-    for part in ('bash-env.sh', 'init.sh', 'select.py'):
+    for part, hashes in REPO_NODE_PIN_HASHES.items():
         try:
             with open(os.path.join(real_helper, part), 'rb') as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
                     return False
-                texts[part] = handle.read(MAX_SOURCE_BYTES + 1).decode('utf-8', errors='replace')
+                if hashlib.sha256(handle.read(MAX_SOURCE_BYTES + 1)).hexdigest() not in hashes:
+                    return False
         except OSError:
             return False
-    statements = tuple(' '.join(line.split()) for line in texts['bash-env.sh'].splitlines()
-                       if line.strip() and not line.lstrip().startswith('#'))
-    if statements != REPO_NODE_PIN_WRAPPER:
-        return False
-    # select.py's reads take computed paths (fixed basenames under the cwd,
-    # NVM and Corepack dirs), which the Python reader proof cannot follow.
-    if any(_source_hit(texts[part], directory) for part in ('init.sh', 'select.py')):
-        return False
-    try:
-        # Shell words assembled from adjacent quoted pieces, as in fixtures.
-        if _fixture_shell_live(_heredocs(texts['init.sh'])[0]):
-            return False
-    except (ValueError, AmbiguousScript):
-        return False
-    # A file init.sh sources is outside the proof.
-    code = '\n'.join(line for line in texts['init.sh'].splitlines() if not line.lstrip().startswith('#'))
-    if re.search(r'(?:^|[;&|(){}`]|\$\(|\b(?:then|do|else)|\b(?:eval|exec|command|builtin)\s)\s*(?:\.|source)\s', code, re.M):
-        return False
     # Python puts the script's directory first on sys.path, even with -S.
     try:
         entries = list(os.scandir(real_helper))
@@ -374,7 +415,7 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
             candidate = os.path.join(entry, tool)
             if os.path.lexists(candidate) and os.path.realpath(candidate) not in trusted:
                 return False
-    return True
+    return _repo_node_pin_inputs_safe(directory, home, helper, nvm, search)
 
 
 def _fixture_python_paths(tree, aliases, local_module):
