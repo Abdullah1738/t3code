@@ -37,7 +37,7 @@ if not (REDACT_HELPERS / 'redact.py').is_file():
 sys.path.insert(0, str(REDACT_HELPERS))
 from redact import redact as redact_credentials, redact_fields
 try:
-    from toollog import tool_error, tool_log
+    from toollog import tool_error, tool_log, stderr_cause
 except ImportError:
     # A scratch watcher can outlive the installed helpers during a rolling update.
     def tool_log(*_args, **_kwargs):
@@ -45,6 +45,9 @@ except ImportError:
 
     def tool_error(*_args, **_kwargs):
         pass
+
+    def stderr_cause(*_args, **_kwargs):
+        return {}
 
 HOME = Path.home()
 LIVE = HOME / '.local/share/robob-watch/watchers/inbox-triage'
@@ -166,16 +169,17 @@ def run_helper(name, command, **kwargs):
         result = subprocess.run(command, **kwargs)
     except Exception as error:
         timeout = isinstance(error, subprocess.TimeoutExpired)
-        tool_error('triage', 'helper.timeout' if timeout else 'helper.launch_failed', ids)
+        cause = stderr_cause(error.stderr if timeout else str(error), timeout)
+        tool_error('triage', 'helper.timeout' if timeout else 'helper.launch_failed', ids, cause)
         tool_log({'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ids': ids, 'ok': False,
                   'durationMs': (time.perf_counter() - started) * 1000,
-                  'props': {'outcome': 'timeout' if timeout else 'fail'}})
+                  'props': {'outcome': 'timeout' if timeout else 'fail', **cause}})
         raise
     tool_log({'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ids': ids,
               'durationMs': (time.perf_counter() - started) * 1000, 'ok': result.returncode == 0,
-              'props': {'exitCode': result.returncode}})
+              'props': {'exitCode': result.returncode, **(stderr_cause(result.stderr) if result.returncode else {})}})
     if result.returncode:
-        tool_error('triage', 'helper.exit_failed', ids)
+        tool_error('triage', 'helper.exit_failed', ids, stderr_cause(result.stderr))
     return result
 
 

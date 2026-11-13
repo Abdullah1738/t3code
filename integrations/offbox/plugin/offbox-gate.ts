@@ -180,7 +180,7 @@ export default {
         gateLog("allowed", "unknown", 0, true)
         log({ event: "hook-error", session: e?.sessionID, errorTag: "hook_failed" })
       } finally {
-        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID})
+        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID}, {cwd:e?.input?.workdir ?? e?.input?.cwd ?? ctx.location?.directory})
       }
     })
 

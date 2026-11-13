@@ -52,6 +52,8 @@ export type MessageRecord =
       runId?: string;
       error?: unknown;
       retry?: unknown;
+      /** Native completion proof, independent of a settled run. */
+      interruptReplyComplete?: boolean;
       time: { created: number; completed?: number };
       [key: string]: unknown;
     }

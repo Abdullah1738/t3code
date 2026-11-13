@@ -4,7 +4,7 @@ import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
-import { nativeMessageId, opencodeFinishes, opencodeRunEvidence, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
+import { nativeMessageId, opencodeCompletedSteps, opencodeFinishes, opencodeRunEvidence, type CompletedSteps, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
 import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
@@ -71,7 +71,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   const latest = [...runs.values()].sort((a, b) => b.ordinal - a.ordinal)[0]?.runId;
   const records: MessageRecord[] = [];
   for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
-    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId));
+    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
     const run = runs.get(runId);
     const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
@@ -138,6 +138,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   title?: string;
   /** How each assistant step ended, read from OpenCode (see opencode-steps.ts). */
   finishes?: StepFinishes;
+  /** Completed native blocks for interrupted OpenCode replies. */
+  completedSteps?: CompletedSteps;
   /** Whether a native run called tools (see opencode-steps.ts opencodeRunEvidence). */
   runEvidence?: RunEvidence;
   /**
@@ -157,6 +159,7 @@ export class RobobBackend implements ChatBackend {
   private readonly directories: ThreadDirectories;
   private readonly native = new Map<string, string>();
   private readonly finishes: StepFinishes;
+  private readonly completedSteps: CompletedSteps;
   private readonly runEvidence: RunEvidence;
   /** A step's finish never changes once written, so each is looked up once. */
   private readonly finished = new Map<string, string>();
@@ -192,6 +195,7 @@ export class RobobBackend implements ChatBackend {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
+    this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
   }
 
@@ -311,7 +315,7 @@ export class RobobBackend implements ChatBackend {
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
   forChat(subdir: string, title: string): RobobBackend {
-    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, subdir, title });
+    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
   }
 
   private chatFolder(): string {
@@ -394,7 +398,7 @@ export class RobobBackend implements ChatBackend {
     // Evidence is fetched for the runs on this page only, never the whole history.
     await this.markRunEvidence(thread, page);
     // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
-    return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
+    return this.isOpenCodeThread(thread) ? this.markInterrupted(this.markAnswers(page)) : page;
   }
 
   /** The detail keeps five runs, not five outcomes. Read missing page outcomes before forwarding any partial text. */
@@ -462,15 +466,19 @@ export class RobobBackend implements ChatBackend {
     // One route read per run on this page, so each run's steps get only that run's evidence.
     const runIds = [...new Set(records.flatMap(record => record.type === "assistant" && record.runId ? [record.runId] : []))];
     const byRun = new Map<string, "ran" | "none" | "unknown">();
+    const completed = new Set<string>();
     for (const runId of runIds) {
       const key = `${thread.threadId}\u0000${runId}`;
       const proven = this.settledEvidence.get(key);
-      if (proven !== undefined) {
+      const interrupted = (thread.recentRuns.find(run => run.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined))?.status === "interrupted";
+      if (proven !== undefined && !interrupted) {
         byRun.set(runId, proven);
         continue;
       }
       try {
-        const evidence = (await this.client.runEvidence(thread.threadId, runId)).toolEvidence;
+        const proof = await this.client.runEvidence(thread.threadId, runId);
+        const evidence = proof.toolEvidence;
+        if (proof.complete && proof.status === "interrupted") completed.add(runId);
         byRun.set(runId, evidence);
         const run = thread.recentRuns.find(candidate => candidate.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined);
         // Only a settled run's proof is final. A running run may still call tools, so it is never cached.
@@ -495,7 +503,55 @@ export class RobobBackend implements ChatBackend {
       if (record.type !== "assistant") continue;
       const evidence = record.runId ? byRun.get(record.runId) : undefined;
       if (evidence !== undefined) record.toolEvidence = evidence;
+      // Only completed provider streams prove an interrupted answer finished; restart recovery also closes partial messages.
+      if (record.runId && completed.has(record.runId) && record.answer === true && !record.error) {
+        record.finish = "stop";
+        record.interruptReplyComplete = true;
+      }
     }
+  }
+
+  private markInterrupted(page: MessageRecord[]): MessageRecord[] {
+    // Robob also marks interrupted streams completed. Match every native text
+    // block against a finished step before treating that projection as a reply.
+    const interrupted: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    let run: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    for (const record of page) {
+      if (record.type === "user") run = [];
+      else if (record.type === "assistant") run.push(record);
+      else if (record.type === "idle") {
+        if (record.outcome === "interrupted") interrupted.push(...run.filter(step => step.interruptReplyComplete !== true));
+        run = [];
+      }
+    }
+    const completed = this.completedSteps(interrupted.map(step => step.id));
+    const groups = new Map<string, Extract<MessageRecord, { type: "assistant" }>[]>();
+    for (const step of interrupted) {
+      const native = nativeMessageId(step.id);
+      if (native) groups.set(native, [...groups.get(native) ?? [], step]);
+      else step.interruptReplyComplete = false;
+    }
+    for (const [native, group] of groups) {
+      const expected = completed.get(native);
+      const actual = new Map<number, string>();
+      let valid = expected !== undefined;
+      for (const step of group) {
+        let suffix = "";
+        try { suffix = decodeURIComponent(step.id.slice("message:provider:opencode:native-item:".length)); } catch { valid = false; }
+        const match = /^msg_[A-Za-z0-9]+:text:(\d+)$/.exec(suffix);
+        const part = match ? Number(match[1]) : -1;
+        if (!Number.isSafeInteger(part) || part < 0 || actual.has(part)) valid = false;
+        else actual.set(part, step.content.map(p => p.type === "text" ? p.text : "").join(""));
+      }
+      // Empty native blocks do not produce a Robob projection.
+      if (expected && (actual.size !== expected.filter(Boolean).length
+        || expected.some((text, i) => text ? actual.get(i) !== text : actual.has(i)))) valid = false;
+      for (const step of group) {
+        step.interruptReplyComplete = valid;
+        if (valid) step.finish = "stop";
+      }
+    }
+    return page;
   }
 
   /**

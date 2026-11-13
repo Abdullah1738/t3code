@@ -17,7 +17,7 @@ test('format, privacy, retention, cap, and silent write failure', () => {
   const command = 'curl --password fixture-secret --header token-secret';
   hook('shell','denied','fixture.deny',performance.now(),command,undefined,{sessionId:'fixture-session'});
   emit('fixture','event','fixture.input',{props:{count:2, command, password:'secret'},errorTag:'secret text'});
-  expect(rows()[0].ids).toEqual({sessionId:'fixture-session'});
+  expect(rows()[0].ids).toEqual({threadId:'native:opencode:fixture-session',sessionId:'fixture-session'});
   expect(rows()[0].props).toMatchObject({harness:'opencode',firstWord:'curl',commandLength:command.length});
   expect(readFileSync(file(),'utf8')).not.toContain('fixture-secret');
   expect(readFileSync(file(),'utf8')).not.toContain('token-secret');

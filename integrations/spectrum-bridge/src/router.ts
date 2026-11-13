@@ -9,6 +9,7 @@ import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./f
 import { assistantText, isDelegatedCompletionText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
+import { commandWord, controlCommand, isCommand } from "./commands.ts";
 import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
@@ -293,7 +294,7 @@ const STATUS_LIST_MS = 10_000;
  * notice this long and drop it if the conversation resumes or moves on.
  */
 const FAILURE_NOTICE_GRACE = 5 * 60_000;
-type DeferredNotice = { turn: Turn; text: string; at: number };
+type DeferredNotice = { turn: Turn; text: string; at: number; outbox?: number };
 /** A /new the agent refused because background work ran: asked again once the chat is idle and nothing happened since. */
 type NewDeferred = { generation: number; since: number; outbox: number };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -326,7 +327,7 @@ const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wak
 /** A person's plain typed text, the only kind of row steered into a running turn. */
 const steerText = (row: { id: string; payload: unknown }) => {
   const input = row.payload as Detachable;
-  return !synthetic(row.id) && !input.detached && !input.attachments.length && !!input.text.trim() && !input.text.trimStart().startsWith("/");
+  return !synthetic(row.id) && !input.detached && !input.attachments.length && !!input.text.trim() && !isCommand(input.text);
 };
 /** How long a steer that was sent but never shows up in the session holds the turn's reply. */
 const STEER_SETTLE_MS = 60_000;
@@ -644,7 +645,7 @@ export class Router {
     return this.store.pendingInbound().some(row => {
       const input = row.payload as NormalizedInbound;
       return row.state === "pending" && !synthetic(row.id) && input.source === "typed"
-        && !input.text.trimStart().startsWith("/") && !input.poll && !isTapback(input.text)
+        && !isCommand(input.text) && !input.poll && !isTapback(input.text)
         && input.receivedAt !== undefined && Date.now() - input.receivedAt >= 120_000;
     });
   }
@@ -679,7 +680,7 @@ export class Router {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
-        && !input.text.trimStart().startsWith("/") && !input.poll;
+        && !isCommand(input.text) && !input.poll;
       return !(row.state === "pending" && this.store.get(`inbound-delivered:${row.id}`) !== undefined)
         && (wake || typed) && Number.isSafeInteger(input.receivedAt)
         && now - input.receivedAt! >= (wake ? 15 * 60_000 : 120_000);
@@ -716,7 +717,7 @@ export class Router {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
-        && !input.text.trimStart().startsWith("/") && !input.poll;
+        && !isCommand(input.text) && !input.poll;
       if (!wake && !typed || !Number.isSafeInteger(input.receivedAt)) continue;
       const age = now - input.receivedAt!;
       if (age < (wake ? 15 * 60_000 : 120_000)) continue;
@@ -1242,6 +1243,7 @@ export class Router {
 
   /** The turn's prompt is confirmed admitted: it is no longer uncertain, and what it carried was delivered. Call inside a transaction. */
   private landed(turn: Turn): void {
+    if (!turn.background) this.store.set("deferredNotice", null);
     this.store.set("resendBody", null);
     this.store.set("deliveryOutage", null);
     if (turn.inboundId) {
@@ -1268,7 +1270,8 @@ export class Router {
     const held = this.store.get<DeferredNotice | null>("deferredNotice");
     if (!held) return;
     const turn = this.store.get<Turn | null>("activeTurn");
-    const moved = !this.current(held.turn) || !turn || turn.messageId !== held.turn.messageId || turn.phase !== "failed";
+    const moved = !this.current(held.turn) || held.outbox !== undefined && this.sentSince(held.turn.generation, held.outbox)
+      || !!turn && !turn.background && (turn.messageId !== held.turn.messageId || turn.phase !== "failed");
     if (moved) { this.store.set("deferredNotice", null); return; }
     if (Date.now() - held.at < (this.options.failureNoticeMs ?? FAILURE_NOTICE_GRACE)) return;
     this.store.db.transaction(() => {
@@ -1326,7 +1329,11 @@ export class Router {
       // A typed message already waiting gets a dispatch before optional background discovery.
       const dispatchFirst = this.latencyDue();
       if (dispatchFirst) await this.dispatch(preceding);
+      const beforeWatch = this.store.get<Turn | null>("activeTurn");
       await this.watch();
+      const afterWatch = this.store.get<Turn | null>("activeTurn");
+      if (afterWatch?.background && afterWatch.messageId !== beforeWatch?.messageId
+        && this.store.get("deferredNotice")) await this.poll();
       await this.nudgeDue();
       await this.nudgeDeferredNew();
       this.flushNotice();
@@ -1362,8 +1369,7 @@ export class Router {
       let latestReceivedAt = 0;
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
-        const text = input.text.trimStart();
-        if (row.state !== "pending" || (text.startsWith("/") && !/^\/(notification|context)(?:\s|$)/.test(text))) continue;
+        if (row.state !== "pending" || controlCommand(input.text)) continue;
         // Legacy rows get a durable receipt time once, including while another turn runs.
         if (input.receivedAt === undefined || !Number.isSafeInteger(input.receivedAt) || input.receivedAt < 0) {
           input.receivedAt = now;
@@ -1387,7 +1393,7 @@ export class Router {
       // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
       // What a person typed goes ahead of watcher wakes queued before it: nobody waits behind an event they never sent.
       const sendable = (row: InboundRecord) => row.state === "pending" && !this.stuckWakeAttempted(row.id) && !this.backingOff(row.id, now)
-        && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart());
+        && !controlCommand((row.payload as NormalizedInbound).text);
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
         ?? rows.find(row => sendable(row) && !row.id.startsWith("wake:"))
@@ -1410,7 +1416,7 @@ export class Router {
         return { ...leader, state: "processing", resumed };
       }
       const input = leader.payload as NormalizedInbound;
-      const ordinary = !input.text.trimStart().startsWith("/");
+      const ordinary = !isCommand(input.text);
       const members = [leader];
       if (ordinary && !resetRow(leader.id)) {
         // Include terminal rows in this scan: consumed controls still split batches after restart.
@@ -1426,7 +1432,7 @@ export class Router {
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           // Sendblue's reply_to is not the swiped message, so distinct swipes never share a batch.
           if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
-            || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo
+            || row.state !== "pending" || isCommand(next.text) || next.replyTo !== input.replyTo
             || (this.options.swipes && next.replyTo && !sameAttachmentMessage(input, next))
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
@@ -1450,7 +1456,8 @@ export class Router {
       }
       const attachments = new Map<string, NormalizedInbound["attachments"][number]>();
       for (const item of inputs) for (const file of item.attachments) if (!attachments.has(file.guid)) attachments.set(file.guid, file);
-      const named = (item: NormalizedInbound) => context && context.chat.kind !== "owner" && item.sender && item.text.trim()
+      // Sender labels would hide reference commands from submit().
+      const named = (item: NormalizedInbound) => context && context.chat.kind !== "owner" && item.sender && item.text.trim() && !isCommand(item.text)
         ? `${context.roleOf(item.sender).name}${context.roleOf(item.sender).role === "guest" ? ` (${item.sender})` : ""}: ${item.text}`
         : item.text;
       const batch: NormalizedInbound = {
@@ -1763,16 +1770,16 @@ export class Router {
 
   private async control(row: InboundRecord, input: NormalizedInbound, preceding: Set<string>): Promise<void> {
     const text = input.text.trim();
-    const command = text.split(/\s/, 1)[0];
-    if (text === "/new") {
+    const command = commandWord(text);
+    if (text.toLowerCase() === "/new") {
       await this.newChat(row.id, preceding);
       return;
     }
-    if (text === "/status") {
+    if (text.toLowerCase() === "/status") {
       this.acknowledge(row.id, this.describe(row.id));
       return;
     }
-    if (command === "/approve" || command === "/answer") {
+    if (command === "approve" || command === "answer") {
       await this.respond(row.id, input);
       return;
     }
@@ -1787,11 +1794,11 @@ export class Router {
       }
       return;
     }
-    if (text.startsWith("/") && command !== "/notification" && command !== "/context") {
+    if (controlCommand(text)) {
       this.acknowledge(row.id, "Just text me normally. /new starts fresh, /status shows what I'm up to.");
       return;
     }
-    if (text.startsWith("/") || (input as Detachable).detached) return;
+    if (isCommand(text) || (input as Detachable).detached) return;
     // While a question or approval is being asked, the next ordinary text is the answer.
     const front = this.front();
     if (!front) return;
@@ -2548,7 +2555,7 @@ export class Router {
   private ungated(row: InboundRecord): boolean {
     if (!this.isGroup() || row.state !== "pending" || synthetic(row.id) || this.store.get<string>(`group-gate:${row.id}`)) return false;
     const input = row.payload as NormalizedInbound;
-    return !input.poll && !input.text.trimStart().startsWith("/");
+    return !input.poll && !isCommand(input.text);
   }
 
   /**
@@ -2778,7 +2785,7 @@ export class Router {
     return this.store.pendingInbound().some(row => {
       if (row.state !== "pending" || handled.has(row.id)) return false;
       const input = row.payload as NormalizedInbound;
-      return input.poll !== undefined || /^\/(?!(?:notification|context)(?:\s|$))/.test(input.text.trim());
+      return input.poll !== undefined || controlCommand(input.text);
     });
   }
 
@@ -2815,7 +2822,7 @@ export class Router {
       = explicit ? this.store.findOutbox(explicit[2]!) : input.replyTo && !this.options.swipes ? this.store.byProviderId(input.replyTo) : undefined;
     let route = this.store.get<Route | null>("route");
     let quote = "";
-    if ((text.startsWith("/notification") || text.startsWith("/context")) && !explicit) {
+    if (["notification", "context"].includes(commandWord(text) ?? "") && !explicit) {
       this.acknowledge(row.id, "Use /notification ID question or /context ID question.");
       return;
     }
@@ -3936,6 +3943,27 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
+        const text = final ? replyText(assistantText(final)) : "";
+        const visible = final?.nativeMessage
+          ? replyText(replies.filter(reply => reply.nativeMessage === final.nativeMessage).map(assistantText).join("\n")) : text;
+        if (idle.outcome === "interrupted" && !idle.firstTurnFailure && !idle.modelError && !priorFailure
+          && !this.toolMode && !turn.background && turn.inboundId && !this.syntheticBatch(turn.inboundId)
+          && final && !final.error && !final.continued && final.time.completed !== undefined && final.finish === "stop"
+          && !scope.slice(scope.indexOf(final) + 1).some(record => record.type === "idle")
+          && final.answer !== false && final.interruptReplyComplete !== false && !quiet.has(final.id)
+          && text && stripInternalText(visible).trim()) {
+          const safeEarlier = earlier.filter(reply => {
+            const sameFinal = final.nativeMessage && reply.nativeMessage === final.nativeMessage;
+            const ended = scope.slice(scope.indexOf(reply) + 1).find(record => record.type === "idle");
+            return reply.time.completed !== undefined && reply.finish !== "tool-calls" && !reply.error && !reply.continued
+              && reply.answer !== false && (sameFinal ? reply.finish === "stop" && reply.interruptReplyComplete !== false
+                : ended?.type === "idle" && ended.outcome === "succeeded" && !ended.modelError && !ended.firstTurnFailure);
+          });
+          this.enqueueReply(turn, idle, replies, safeEarlier, final,
+            final.id === turn.earlySent ? "" : text, scope, entries);
+          this.stage("reply-recovered-after-interrupt", turn.inboundId);
+          return;
+        }
         const successful = new Set<string>();
         const successfulReplies = new Set<string>();
         let prompts = start >= 0 && messages[start]!.type === "user" ? [messages[start]!.id] : [];
@@ -3989,7 +4017,9 @@ export class Router {
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
           ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
           : false);
-        failAfterEarlier("Something went wrong on my end with that one. Mind trying again?", ran ? "failed" : "errored");
+        failAfterEarlier(idle.outcome === "interrupted"
+          ? "The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"
+          : "Something went wrong on my end with that one. Mind trying again?", ran ? "failed" : "errored");
         return;
       }
       // `start >= 0`: the watermark record is on the page read, so `after` is
@@ -4051,69 +4081,77 @@ export class Router {
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
-      const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
-        .find(tokens => typeof tokens?.input === "number");
-      // Tool mode: a final ending in NO_REPLY (one block or a whole multi-block message) is a deliberate silence.
-      const silent = !!final && (quiet.has(final.id) || (!!assistantText(final).trim() && !replyText(assistantText(final))));
-      if (turn.inboundId?.startsWith("wake:")) watcherLog({ component: "wakes", kind: "event", name: "wake.reply_guard", ok: true, ids: { key: turn.inboundId, thread: turn.id }, props: { accepted: silent } });
-      this.store.db.transaction(() => {
-        if (priorFailure) this.notice(turn!, "failed", firstFailureText(priorFailure.modelError));
-        // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.
-        const sent = this.toolMode ? this.turnSends(turn!) : undefined;
-        if (!this.toolMode) {
-          for (const reply of earlier) {
-            const words = replyText(assistantText(reply));
-            if (words) this.store.enqueue({
-              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn!.id, generation: turn!.generation,
-              ...this.replyTarget(turn!.inboundId),
-            });
-          }
-          if (text) this.store.enqueue({
-            id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
-            ...this.replyTarget(turn!.inboundId),
-          });
-        }
-        const said = this.toolMode ? sent ?? []
-          : [turn!.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
-        this.logTurnEnd(turn!, said.length ? "replied" : "no_reply");
-        if (said.length) this.noteGroupReply(turn!.inboundId, said);
-        if (turn!.inboundId) this.delivered(turn!.inboundId);
-        // Readback must not adopt a steer whose answer this transaction has already delivered.
-        const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
-        for (const row of this.store.pendingInbound()) {
-          const steering = row.state === "processing" && this.steering(row.id)
-            || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
-          if (steering && coveredSteers.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn!);
-        }
-        for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
-        // The agent refused a /new nudge and said why: ask again once it's idle with nothing said in the meantime.
-        // Any other reply of the same context means the conversation moved on, so the deferred reset is dropped.
-        const deferred = this.store.get<NewDeferred | null>("newDeferred");
-        const replied = this.toolMode ? !!sent?.length : !!text;
-        if (replied && turn!.inboundId && turn!.inboundId === this.store.get<string | null>("newNudge")) {
-          this.store.set("newDeferred", { generation: turn!.generation, since: this.rowidOf(turn!.inboundId), outbox: this.outboxMark() } satisfies NewDeferred);
-        } else if (deferred && deferred.generation === turn!.generation && this.sentSince(turn!.generation, deferred.outbox)) {
-          // The conversation moved on: a queued reset row for it must not be POSTed either.
-          this.dropQueuedNewIfMovedOn();
-          this.clearDeferredNew();
-        }
-        if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
-        this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
-        const waiting = entries.filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
-        // Keep already-asked requests answerable without rediscovering their run or child.
-        this.setTurn(waiting.length ? {
-          id: turn!.id, directory: turn!.directory, generation: turn!.generation,
-          messageId: idle.id, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
-        } satisfies Turn : null);
-        this.store.set("pendingApprovals", waiting.length ? waiting : null);
-        this.store.set("settledAt", Date.now());
-        // Tool mode safety net: a typed message whose turn texted nothing gets one reminder.
-        if (sent && !sent.length && !silent && !waiting.length) this.nudgeReply(turn!);
-      }).immediate();
-      if (!this.toolMode && (text || earlier.length)) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
+      this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
     } catch { toolError("router", "router.catch48");
       // Transient backend trouble: polling simply retries on the next tick.
     }
+  }
+
+  private enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
+    replies: Extract<MessageRecord, { type: "assistant" }>[], earlier: Extract<MessageRecord, { type: "assistant" }>[],
+    final: Extract<MessageRecord, { type: "assistant" }> | undefined, text: string,
+    scope: MessageRecord[], entries: Pending[], priorFailure?: Extract<MessageRecord, { type: "idle" }>): void {
+    const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
+      .find(tokens => typeof tokens?.input === "number");
+    // Tool mode: a final ending in NO_REPLY (one block or a whole multi-block message) is a deliberate silence.
+    const silent = !!final && (quietMessages(scope).has(final.id) || (!!assistantText(final).trim() && !replyText(assistantText(final))));
+    if (turn.inboundId?.startsWith("wake:")) watcherLog({ component: "wakes", kind: "event", name: "wake.reply_guard", ok: true, ids: { key: turn.inboundId, thread: turn.id }, props: { accepted: silent } });
+    this.store.db.transaction(() => {
+      if (priorFailure) this.notice(turn, "failed", firstFailureText(priorFailure.modelError));
+      // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.
+      const sent = this.toolMode ? this.turnSends(turn) : undefined;
+      if (!this.toolMode) {
+        for (const reply of earlier) {
+          const words = replyText(assistantText(reply));
+          if (words && (!turn.background || stripInternalText(words).trim())) this.store.enqueue({
+            id: `reply:${turn.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn.id, generation: turn.generation,
+            ...this.replyTarget(turn.inboundId),
+          });
+        }
+        if (text && (!turn.background || stripInternalText(text).trim())) this.store.enqueue({
+          id: `reply:${turn.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn.id, generation: turn.generation,
+          ...this.replyTarget(turn.inboundId),
+        });
+      }
+      const said = this.toolMode ? sent ?? []
+        : [turn.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
+      this.logTurnEnd(turn, said.length ? "replied" : "no_reply");
+      if (said.length) this.noteGroupReply(turn.inboundId, said);
+      if (turn.background && said.some(words => stripInternalText(words).trim())) this.store.set("deferredNotice", null);
+      if (turn.inboundId) this.delivered(turn.inboundId);
+      // Readback must not adopt a steer whose answer this transaction has already delivered.
+      const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
+      for (const row of this.store.pendingInbound()) {
+        const steering = row.state === "processing" && this.steering(row.id)
+          || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
+        if (steering && coveredSteers.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn);
+      }
+      for (const id of this.syntheticBatch(turn.inboundId) ?? []) this.store.set(this.retryKey(id), null);
+      // The agent refused a /new nudge and said why: ask again once it's idle with nothing said in the meantime.
+      // Any other reply of the same context means the conversation moved on, so the deferred reset is dropped.
+      const deferred = this.store.get<NewDeferred | null>("newDeferred");
+      const replied = this.toolMode ? !!sent?.length : !!text;
+      if (replied && turn.inboundId && turn.inboundId === this.store.get<string | null>("newNudge")) {
+        this.store.set("newDeferred", { generation: turn.generation, since: this.rowidOf(turn.inboundId), outbox: this.outboxMark() } satisfies NewDeferred);
+      } else if (deferred && deferred.generation === turn.generation && this.sentSince(turn.generation, deferred.outbox)) {
+        // The conversation moved on: a queued reset row for it must not be POSTed either.
+        this.dropQueuedNewIfMovedOn();
+        this.clearDeferredNew();
+      }
+      if (usage) this.store.set("routeContext", { sessionId: turn.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
+      this.store.set("watermark", { sessionId: turn.id, id: idle.id } satisfies Watermark);
+      const waiting = entries.filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
+      // Keep already-asked requests answerable without rediscovering their run or child.
+      this.setTurn(waiting.length ? {
+        id: turn.id, directory: turn.directory, generation: turn.generation,
+        messageId: idle.id, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
+      } satisfies Turn : null);
+      this.store.set("pendingApprovals", waiting.length ? waiting : null);
+      this.store.set("settledAt", Date.now());
+      // Tool mode safety net: a typed message whose turn texted nothing gets one reminder.
+      if (sent && !sent.length && !silent && !waiting.length) this.nudgeReply(turn);
+    }).immediate();
+    if (!this.toolMode && (text || earlier.length)) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
   /**
@@ -4136,7 +4174,9 @@ export class Router {
     // While a deferred /new waits to be sent, look every tick: an answer the resumed work just
     // wrote must start its background turn (which cancels the reset) before the reset is POSTed.
     const deferredWaiting = !!queued && pending.some(row => row.id === queued.id);
-    if (!deferredWaiting && now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
+    const notice = this.store.get<DeferredNotice | null>("deferredNotice");
+    const noticeDue = notice && now - notice.at >= (this.options.failureNoticeMs ?? FAILURE_NOTICE_GRACE);
+    if (!noticeDue && !deferredWaiting && now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
     this.watchedAt = now;
     try {
       const mark = this.store.get<Watermark | null>("watermark");
@@ -4245,11 +4285,11 @@ export class Router {
         // An errored wake is retried within the notice's grace and would cancel it, so that one goes out now.
         if (typed && !turn.background && reason !== "undelivered" && text) {
           if (reason === "errored") this.notice(turn, "failed", text);
-          else this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
+          else this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         }
       }
       else {
-        if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
+        if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
         if (turn.inboundId) this.failInbound(turn.inboundId, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }

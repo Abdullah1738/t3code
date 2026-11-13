@@ -1166,9 +1166,9 @@ it.effect.each([
   },
 );
 
-it.effect(
-  "interrupt distinguishes a real already-terminal result and reads target settlement",
-  () => {
+it.effect.each([false, true])(
+  "interrupt distinguishes a real already-terminal result and reads target settlement (cancelQueued=%s)",
+  (cancelQueued) => {
     const db = Sqlite.layerMemory;
     const instanceId = ProviderInstanceId.make("codex");
     const threadId = ThreadId.make("thread:interrupt-noop");
@@ -1189,8 +1189,27 @@ it.effect(
     const management = ThreadManagementService.layer.pipe(
       Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
     );
+    let staleShell = false;
+    const observedManagement = Layer.effect(
+      ThreadManagementService.ThreadManagementService,
+      Effect.map(ThreadManagementService.ThreadManagementService, (real) =>
+        ThreadManagementService.ThreadManagementService.of({
+          ...real,
+          getThreadShell: (id) =>
+            real
+              .getThreadShell(id)
+              .pipe(
+                Effect.map((shell) =>
+                  staleShell && shell !== null
+                    ? { ...shell, activeRunId: RunId.make("stale-read") }
+                    : shell,
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provideMerge(management));
     const dependencies = Layer.mergeAll(
-      management,
+      observedManagement,
       receipts,
       Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
     );
@@ -1214,12 +1233,32 @@ it.effect(
         const threads = yield* KanbanThreads;
         yield* threads.send({ threadId, text: "Start", key: "interrupt-noop:start" });
         const run = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        if (cancelQueued) {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("interrupt-noop:queued"),
+            threadId,
+            messageId: MessageId.make("interrupt-noop:queued"),
+            text: "Queued wake",
+            attachments: [],
+            modelSelection: { instanceId, model: "gpt-5.1-codex" },
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+        }
         expect(yield* threads.runSettled(threadId, run.id)).toBe(false);
-        expect(yield* threads.interrupt(threadId, "Stop", false, run.id)).toEqual({
+        staleShell = true;
+        expect(yield* threads.interrupt(threadId, "Stop", cancelQueued, run.id)).toEqual({
           outcome: "requested",
           runId: run.id,
         });
         expect(yield* threads.runSettled(threadId, run.id)).toBe(true);
+        if (cancelQueued) {
+          expect(
+            (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)?.status,
+          ).toBe("cancelled");
+        }
         expect(yield* threads.interrupt(threadId, "Already ended", false, run.id)).toEqual({
           outcome: "noop",
         });
