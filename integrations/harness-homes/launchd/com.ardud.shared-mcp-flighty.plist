@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ardud.shared-mcp-flighty</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/ardud/.local/share/flighty-mcp/.venv/bin/python</string>
+		<string>/Users/ardud/.local/share/harness-homes/shared/serve.py</string>
+		<string>flighty</string>
+		<string>--port</string>
+		<string>18766</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/ardud/Library/Logs/com.ardud.shared-mcp-flighty.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ardud/Library/Logs/com.ardud.shared-mcp-flighty.err.log</string>
+</dict>
+</plist>

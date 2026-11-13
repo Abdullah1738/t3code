@@ -1,0 +1,7 @@
+[Unit]
+Description=offbox: boot health check and kernel trial verdict
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/offbox-boot-health
+TimeoutStartSec=10min

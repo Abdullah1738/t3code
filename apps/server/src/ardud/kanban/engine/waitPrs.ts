@@ -125,9 +125,22 @@ export const make = Effect.gen(function* () {
               url: first.url,
               projectId: first.projectId ?? request.projectId,
               needsHead: first.needsHead || request.needsHead,
+              ...(first.needsChecks || request.needsChecks ? { needsChecks: true } : {}),
               live: first.live ?? request.live,
             },
       );
+    }
+    for (const [key, request] of wanted) {
+      const live = request.live;
+      if (
+        request.needsChecks &&
+        live !== null &&
+        live.state !== "merged" &&
+        live.state !== "closed" &&
+        live.failedChecks === undefined
+      ) {
+        wanted.set(key, { ...request, live: null });
+      }
     }
     for (const [key, entry] of held) {
       if (!wanted.has(key) && nowMs - entry.wantedAt >= FORGET_AFTER_MS) held.delete(key);

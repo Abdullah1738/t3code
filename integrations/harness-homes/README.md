@@ -8,7 +8,8 @@ Claude Code and Codex agents Robob runs do not use the personal `~/.claude` or
 - Codex home: `~/.robob/harness-homes/codex` (`CODEX_HOME`)
 - Codex Terra home: `~/.robob/harness-homes/codex-cu` (`CODEX_HOME`)
 
-Stdlib Python only. Auth is never written here: credentials come from each
+The generator uses only Python's stdlib; shared servers reuse their installed
+MCP SDK venvs. Auth is never written here: credentials come from each
 instance's environment, and OAuth state stays in the home it was created in.
 
 ## Files
@@ -26,11 +27,21 @@ instance's environment, and OAuth state stays in the home it was created in.
   per-harness instructions. `codex-cu` gets the shared Codex overlay first,
   then its own draft overlay; generation fails if the latter is missing or empty.
   Its deployment still requires owner approval.
-- `install.zsh`: copies the package to `~/.local/share/harness-homes`, generates,
-  checks. `--check` only checks. `--with-agent` also loads the LaunchAgent.
+- `install.zsh`: copies the package, starts the shared Flighty/InBody servers,
+  checks their MCP endpoints, migrates those two OpenCode entries, then generates
+  and checks the native homes. Failed installs restore the previous package,
+  OpenCode config and loaded jobs. `--check` checks homes, endpoints and jobs
+  without writing. `--with-agent` also reloads the five-minute generator.
 - `launchd/com.ardud.harness-homes.plist`: runs `generate` every 5 minutes so
   new skills and AGENTS.md edits reach the homes.
 - `tests/test_generate_homes.py`: temp-dir tests only.
+
+Flighty and InBody use their existing venvs on `127.0.0.1:18766/mcp` and
+`127.0.0.1:18767/mcp`. Their LaunchAgents restart failed servers; `install.zsh
+--check` fails if either endpoint stops answering. cua-driver retains a separate
+MCP connection per client because its transport owns private session state.
+After owner-approved installation, new native sessions pick up the URLs;
+existing stdio clients finish naturally. No Robob restart is needed.
 
 ## Source parity checks
 

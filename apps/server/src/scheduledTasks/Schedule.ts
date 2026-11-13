@@ -92,7 +92,7 @@ export function isMissedFixedTimeRun(
 }
 
 /**
- * True when a one-time run is overdue by more than an hour (the server was
+ * True when a one-time run is overdue by more than 24 hours (the server was
  * down). The task is then marked missed and disabled instead of firing late.
  */
 export function isExpiredOnceRun(

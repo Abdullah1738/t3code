@@ -13,7 +13,7 @@
     <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ROBOB_STATE_DB</key><string>__HOME__/.robob/userdata/readonly/state.sqlite</string>
   </dict>
-  <key>ProcessType</key><string>Interactive</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>Nice</key><integer>10</integer>
   <key>RunAtLoad</key><false/>
   <key>StartInterval</key><integer>14400</integer>

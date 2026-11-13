@@ -199,7 +199,9 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       send: (input) =>
         Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );
@@ -211,7 +213,9 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         Effect.sync(() => {
           host.asked.push(requests.map((request) => request.url));
           const wanted = new Set(requests.map((request) => Waits.prKey(request.url)));
-          const read = host.readings.filter((reading) => wanted.has(Waits.prKey(reading.url)));
+          const read = host.readings
+            .filter((reading) => wanted.has(Waits.prKey(reading.url)))
+            .map((reading) => ({ ...reading, failedChecks: reading.failedChecks ?? [] }));
           return {
             readings: Waits.mergePrReadings(
               requests.flatMap((request) => (request.live === null ? [] : [request.live])),
@@ -451,8 +455,8 @@ it.effect("a woken reviewer reads the wake note once: the next review round does
 
       // The verdict is where the note has been read. The PR is still open, so the card stays in review.
       const cleared = yield* kanban.reviewResult(reviewer, "clear", []);
-      assert.isNull(cleared.wakeNote);
-      assert.strictEqual(cleared.stage, "in_review");
+      assert.isNull(cleared.card.wakeNote);
+      assert.strictEqual(cleared.card.stage, "in_review");
 
       // A second round on the same review thread: only its own note.
       yield* kanban.waitCard(

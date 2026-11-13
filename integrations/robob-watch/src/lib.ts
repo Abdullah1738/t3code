@@ -8,6 +8,7 @@ import { join } from "node:path";
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
 export const WATCHERS = join(ROOT, "watchers");
+export const MAINTENANCE_FILE = join(ROOT, "maintenance.json");
 export const ARCHIVE = join(ROOT, "archive");
 export const HELPERS = join(ROOT, "helpers");
 export const WA_LOCK = join(ROOT, "wa.lock");
@@ -42,6 +43,24 @@ const MAX_EVENT = 6_000;
 export const MAX_WAKE = 12_000;
 const MAX_LOG = 512 * 1024;
 
+export type Dependency = "ssd" | "phone";
+export type Maintenance = { until: string; reason: string; depends: Dependency[] };
+
+export function validDepends(value: unknown): value is Dependency[] {
+  return Array.isArray(value) && value.every(item => item === "ssd" || item === "phone");
+}
+
+export function loadMaintenance(t = now()): Maintenance | undefined {
+  const value = readJson<Maintenance>(MAINTENANCE_FILE);
+  if (!value || typeof value.until !== "string" || !(Date.parse(value.until) > t)
+    || typeof value.reason !== "string" || !validDepends(value.depends)) return undefined;
+  return value;
+}
+
+export function heldByMaintenance(watcher: Watcher, maintenance?: Maintenance): boolean {
+  return !!maintenance && !!watcher.depends?.some(dep => maintenance.depends.includes(dep));
+}
+
 export type Mode = "wake" | "notify";
 /** From start (inclusive) to end (exclusive), whole hours in time_zone; start > end wraps past midnight. */
 export type Quiet = { start: number; end: number; time_zone: string };
@@ -57,6 +76,7 @@ export type Watcher = {
   title: string;
   check: string;
   interval_s: number;
+  timeout_s?: number;
   mode: Mode;
   context: string;
   expires_at: string | null;
@@ -65,6 +85,9 @@ export type Watcher = {
   /** Serialize with every other serial check and all wa usage (the WhatsApp TUI cannot be driven concurrently). */
   serial: boolean;
   paused: boolean;
+  /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
+  max_consecutive_failures?: number;
+  depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
   /**
@@ -96,6 +119,9 @@ export type State = {
   next_at?: number;
   consecutive_failures: number;
   failure_alerted: boolean;
+  load_timeouts?: number;
+  load_timeout_since?: string;
+  failure_paused_at?: string;
   last_error?: string;
   /** When the current run of consecutive failures started. */
   failing_since?: string;
@@ -201,6 +227,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
+  const timeout = input.timeout_s;
+  if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 1 || timeout > 600)) errors.push("timeout_s must be an integer from 1 to 600");
   const mode = input.mode ?? "wake";
   if (mode !== "wake" && mode !== "notify") errors.push("mode must be wake or notify");
   let triggers = input.triggers === undefined ? [] : input.triggers;
@@ -217,6 +245,10 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (expires !== null && (typeof expires !== "string" || Number.isNaN(Date.parse(expires)))) errors.push("expires_at must be an ISO date");
   const maxFires = input.max_fires === undefined ? 1 : Number(input.max_fires);
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
+  const maxFailures = input.max_consecutive_failures;
+  if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  const depends = input.depends;
+  if (depends !== undefined && !validDepends(depends)) errors.push('depends must be an array of "ssd" or "phone"');
   const quiet = input.quiet;
   if (quiet !== undefined && !validQuiet(quiet)) errors.push("quiet must be {start, end, time_zone}: different whole hours 0-23 and an IANA time zone");
   const trip = input.trip;
@@ -237,6 +269,9 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(timeout !== undefined ? { timeout_s: timeout } : {}),
+    ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
+    ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
@@ -292,7 +327,7 @@ export type CheckResult = { code: number | null; stdout: string; stderr: string;
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = CHECK_TIMEOUT_MS): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -319,7 +354,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
       grace = setTimeout(() => {
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { /* ignore */ }
-        finish(null, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+        finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
     child.on("close", code => finish(code));
@@ -622,6 +657,12 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
 }
 
+export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
+  return threshold > 0 && state.consecutive_failures >= threshold
+    && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
+}
+
 /**
  * A real error alerts after FAILURE_ALERT_AFTER failures in a row. Timeouts are transient (a stalled CLI or a
  * load spike), so a run of them alerts only once it has also lasted TIMEOUT_ALERT_AFTER_MS.
@@ -641,12 +682,13 @@ export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_M
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
   if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
-  return t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
+  return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
 }
 
 export function escalationText(watcher: Watcher, state: State, mins: number): string {
   return [
     `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs) and is blind until fixed.`,
+    ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
     `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
     "",
     "Diagnose and repair the cause now (e.g. \"wacli sync daemon is not running\" -> `wa start`, then `wa status`; see the robob-watchers skill's Troubleshooting).",
@@ -658,7 +700,7 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
 }
 
 export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
-  const mins = Math.round((now() - Date.parse(state.failing_since!)) / 60_000);
+  const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.failing_since!)) / 60_000);
   const text = escalationText(watcher, state, mins);
   const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
   if (woke.ok) return { ok: true, via: "wake", detail: woke.out };

@@ -141,11 +141,17 @@ describe("checkMove", () => {
     expect(checkMove("dispatcher", card({ stage: "completed" }), "working").ok).toBe(false);
   });
 
-  it("lets a card thread hand off only from working", () => {
+  it("lets a card thread hand off from working or unattached todo", () => {
     expect(checkMove("cardThread", card({ stage: "working" }), "needs_review").ok).toBe(true);
     expect(checkMove("cardThread", card({ stage: "working" }), "needs_owner").ok).toBe(true);
     expect(checkMove("cardThread", card({ stage: "working" }), "completed").ok).toBe(false);
     expect(checkMove("cardThread", card({ stage: "in_review" }), "todo").ok).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_review").ok).toBe(true);
+    expect(
+      checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_review").ok,
+    ).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(false);
+    expect(checkMove("cardThread", card({ stage: "needs_owner" }), "needs_review").ok).toBe(false);
   });
 
   it("lets evaluators and the owner move freely outside thread stages, not settled cards", () => {

@@ -1,0 +1,30 @@
+{
+  "case_number": 16,
+  "reporter_id": "crpko3959",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:b68aa221-56be-40d7-b8be-f968bcbed8dc",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 131719,
+    "sources": [
+      {
+        "denial_index": 350,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T06-38-06-01a1cd9e-9b1a-7371-bbc8-b424ca1c0481.jsonl",
+        "timestamp": "2026-11-12T02:50:25.456Z",
+        "call_id": "call_44752f568a65404b9636c5a14d08e46a",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\nimport shutil\nsource=Path('/Users/ardud/checkouts/edge-api-pr471/tmp/review-3959')\ntarget=Path('/Volumes/ExternalSSD/crpko-devops/tmp/reviews/edge-api-471-33b785f587c7')\nfor name in ('offbox-focused.log','base.log'):\n    shutil.copy2(source/name,target/name)\np=target/'REVIEW.md'\ns=p.read_text().replace('Provisional Good to merge (worker Sol pass; later Sol/Astra gates still required).','Good to merge (worker Sol pass; later Sol/Astra gates still required).')\ns=s.replace('- Supplemental focused and base-overlay checks: pending at draft time. Evidence logs will be attached before handoff.', '''- offbox run --include tmp/review-3959 --pull tmp/review-3959/base.log -- bash tmp/review-3959/verify.sh: PASS, remote exit 0, box bx_qg65yqt3. At the head, all selected resolver/limiter/router cases pass under -race, and all ten supplemental probes pass (missing/empty header, three entries, empty final header line, trailing empty across lines, bare invalid final entry, whitespace-only final entry, trimmed IP, IPv6 TCP fallback, trust off).\n- The same command runs the PR's real regression tests with only trust_proxy.go overlaid from the exact base. This intentionally exits 1: all 7 new resolver rows fail, the limiter wrongly returns 200 instead of 429, the spoofed-prefix allowlist case wrongly reaches 400 instead of 403, and the allowed-rightmost control wrongly gets 403 instead of 503. The script requires these specific failures and then exits 0. No tracked source file was modified.\n- Logs: offbox-full.log, offbox-focused.log, base.log. Reproduction inputs: verify.sh, probe.go, base-overlay.json, trust_proxy_base.go (all local-only in this evidence directory). The overlay paths are relative to the service root; use the original tmp/review-3959 layout when rerunning.\n- Final reader head check at approximately 02:50 UTC: exact head/base unchanged; all five latest checks SUCCESS, MERGEABLE, mergeStateStatus BLOCKED (review protection).''')\np.write_text(s)\nprint(p)\nPY\ngit --no-optional-locks status --porcelain=v1\ngit rev-list --count HEAD --not --remotes",
+      "workdir": "/Users/ardud/checkouts/edge-api-pr471",
+      "sha256": "ce43e66b1040d61b9c0c1c7c95b69073921c71f27149fb56cd88fe5c6b07a030"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

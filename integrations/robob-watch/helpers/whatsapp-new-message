@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # whatsapp-new-message JID [--from NAME]
 # Prints new incoming WhatsApp messages (not "Me:") in that chat since the last run, one
 # "(dd-mm-yy HH:MM:SS) Name: text" line each. First run records a baseline and prints nothing.

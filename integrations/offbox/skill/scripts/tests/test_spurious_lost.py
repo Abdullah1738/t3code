@@ -7,6 +7,9 @@ from unittest.mock import patch
 from test_capacity import Isolated
 from offbox_lib import api, common, lease, misc, pool, reap, runs
 
+CATCH_UP_LOG = misc._catch_up_log
+CATCH_UP_FINISHED = misc._catch_up_finished
+
 
 class SpuriousLostTests(Isolated):
     def setUp(self):
@@ -18,6 +21,7 @@ class SpuriousLostTests(Isolated):
         self.stack.enter_context(patch.object(api, 'cmd_status', return_value={'status': 'lost', 'running': False}))
         self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         self.stack.enter_context(patch.object(misc, '_catch_up_finished'))
         self.stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
 
@@ -95,8 +99,10 @@ class SpuriousLostTests(Isolated):
     def test_logs_corrects_lost_row(self):
         self.con.execute("UPDATE runs SET status='lost',end_at=1000")
         self.con.commit()
-        with patch.object(runs, 'recorded_exit', return_value=0):
-            self.assertEqual(misc.logs('run-t', False), 0)
+        err = io.StringIO()
+        with patch.object(runs, 'recorded_exit', return_value=0), contextlib.redirect_stderr(err):
+            self.assertEqual(misc.logs('run-t', False), 1)
+        self.assertIn('no output recorded for run-t', err.getvalue())
         self.assertEqual((self.row()['status'], self.row()['exit_code']), ('done', 0))
 
     def test_same_caller_same_dir_cannot_reuse_spuriously_lost_run(self):
@@ -215,9 +221,21 @@ class SpuriousLostTests(Isolated):
                 self.assertEqual(runs.remote_alive('bx','run-t'),'gone')
 
     def test_lost_completion_catches_up_logs(self):
-        with patch.object(runs,'recorded_exit',return_value=0):
+        self.con.execute("UPDATE runs SET command_id='cmd_t'")
+        self.con.commit()
+        def history(box, command, which, offset, **kw):
+            data = 'retained output\n' if which == 'stdout' else ''
+            return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
+        with patch.object(runs,'recorded_exit',return_value=0), \
+                patch.object(misc, '_catch_up_log', CATCH_UP_LOG), \
+                patch.object(misc, '_catch_up_finished', CATCH_UP_FINISHED), \
+                patch.object(api, 'history_logs', side_effect=history):
             pool._refresh_background(self.con,'repo')
-        misc._catch_up_finished.assert_called_with(self.con,'run-t')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(misc.logs('run-t', False), 0)
+        self.assertEqual(output.getvalue(), 'retained output\n')
+        self.assertEqual((common.LOGS_DIR / 'run-t.log').read_text(), 'retained output\n')
 
     # Review matrix: kill delivery [failed, successful] x wrapper [alive, gone, ended, unknown];
     # history [available, 404, timeout] x SSH [saved rc, live, gone];

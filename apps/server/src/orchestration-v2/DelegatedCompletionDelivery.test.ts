@@ -21,6 +21,9 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -40,6 +43,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
@@ -107,7 +111,11 @@ const layerTestProviderInstanceRegistry = Layer.succeed(
   },
 );
 
-const layerTest = Layer.mergeAll(RuntimeLayer.layer, RuntimeLayer.layerEventSink).pipe(
+const layerTest = Layer.mergeAll(
+  RuntimeLayer.layer,
+  RuntimeLayer.layerEventSink,
+  ProjectionStore.layer,
+).pipe(
   Layer.provideMerge(RuntimeLayer.layerProjectService),
   Layer.provide(
     Layer.mock(WorkspacePaths.WorkspacePaths)({
@@ -1156,6 +1164,206 @@ const seedRestartCancelledChild = (input: {
     });
     return { taskId, childThreadId, childRunId };
   });
+
+it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
+  "delegated recovery deadlines",
+  (it) => {
+    it.effect(
+      "skips only the stuck recovery item at its deadline and delivers its healthy sibling",
+      () =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make("thread:recovery-deadline-parent");
+          const projectId = ProjectId.make("project:recovery-deadline");
+          const runId = RunId.make("run:recovery-deadline-parent");
+          const rootNodeId = NodeId.make("node:recovery-deadline-parent");
+          yield* seedParentWithTerminalTask({
+            threadId,
+            projectId,
+            runId,
+            rootNodeId,
+            taskId: NodeId.make("node:recovery-deadline-seed"),
+            deliveryState: "acknowledged",
+            now,
+          });
+          const stuck = yield* seedRestartCancelledChild({
+            parentThreadId: threadId,
+            projectId,
+            parentRunId: runId,
+            rootNodeId,
+            name: "recovery-deadline-stuck",
+            completionWake: "always",
+            continuationPending: false,
+            runStatus: "completed",
+            now,
+          });
+          const healthy = yield* seedRestartCancelledChild({
+            parentThreadId: threadId,
+            projectId,
+            parentRunId: runId,
+            rootNodeId,
+            name: "recovery-deadline-healthy",
+            completionWake: "always",
+            continuationPending: false,
+            runStatus: "completed",
+            now,
+          });
+          const entered = yield* Deferred.make<void>();
+          const read = store.getThreadShell;
+          const afterSequence = yield* sink.latestSequence();
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() =>
+              vi
+                .spyOn(store, "getThreadShell")
+                .mockImplementation((id) =>
+                  id === stuck.childThreadId
+                    ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                    : read(id),
+                ),
+            ),
+            () =>
+              Effect.gen(function* () {
+                const fiber = yield* orchestrator.recoverDelegatedTasks.pipe(Effect.forkChild);
+                yield* Deferred.await(entered);
+                yield* sink.stream({ afterSequence, eventType: "subagent.updated" }).pipe(
+                  Stream.filter(
+                    (stored) =>
+                      stored.event.type === "subagent.updated" &&
+                      stored.event.payload.id === healthy.taskId &&
+                      stored.event.payload.result !== null,
+                  ),
+                  Stream.take(1),
+                  Stream.runDrain,
+                );
+                yield* TestClock.adjust("30 seconds");
+                const summary = yield* Fiber.join(fiber);
+                assert.equal(summary.timedOut, 1);
+                assert.equal(summary.subagentResultThreads, 2);
+                assert.equal(summary.slowestItemId, stuck.childThreadId);
+                assert.equal(summary.slowestItemMs, 30_000);
+              }),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+          const recovered = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNull(recovered.subagents.find((task) => task.id === stuck.taskId)!.result);
+          assert.isNotNull(recovered.subagents.find((task) => task.id === healthy.taskId)!.result);
+          assert.equal((yield* requests.take).delegatedCompletion?.parentRunId, runId);
+        }),
+    );
+  },
+);
+
+it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
+  "delegated recovery without an effect worker",
+  (it) => {
+    it.effect(
+      "recovers a pre-restart result without the effect worker or repeated parent history reads",
+      () =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make("thread:bounded-recovery-parent");
+          const projectId = ProjectId.make("project:bounded-recovery");
+          const runId = RunId.make("run:bounded-recovery-parent");
+          const rootNodeId = NodeId.make("node:bounded-recovery-parent");
+          yield* seedParentWithTerminalTask({
+            threadId,
+            projectId,
+            runId,
+            rootNodeId,
+            taskId: NodeId.make("node:bounded-recovery-seed"),
+            deliveryState: "acknowledged",
+            now,
+          });
+          const child = yield* seedRestartCancelledChild({
+            parentThreadId: threadId,
+            projectId,
+            parentRunId: runId,
+            rootNodeId,
+            name: "bounded-recovery-child",
+            completionWake: "always",
+            continuationPending: false,
+            runStatus: "completed",
+            now,
+          });
+          const read = store.getThreadRecords;
+          const unboundedMessages: string[] = [];
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() =>
+              vi.spyOn(store, "getThreadRecords").mockImplementation((id, sections, filter) => {
+                if (
+                  id === threadId &&
+                  sections.includes("messages") &&
+                  filter?.messageIds === undefined
+                )
+                  unboundedMessages.push(String(id));
+                return read(id, sections, filter);
+              }),
+            ),
+            () => orchestrator.recoverDelegatedTasks,
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+          // No effect worker is started or drained: result persistence and the offer must complete on their own.
+          const recovered = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNotNull(recovered.subagents.find((task) => task.id === child.taskId)?.result);
+          assert.lengthOf(
+            recovered.contextTransfers.filter(
+              (transfer) => transfer.sourceThreadId === child.childThreadId,
+            ),
+            1,
+          );
+          const wake = yield* requests.take;
+          const delivery = recovered.runs.find((run) => run.id === runId)!.delegatedCompletion!
+            .delivery!;
+          assert.equal(wake.delegatedCompletion?.messageId, delivery.messageId);
+          yield* orchestrator.recoverDelegatedTasks;
+          const again = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(again.subagents, recovered.subagents);
+          assert.deepEqual(again.contextTransfers, recovered.contextTransfers);
+          assert.isEmpty(unboundedMessages);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("command:bounded-recovery-delivery"),
+            threadId,
+            messageId: delivery.messageId,
+            text: "Delegated task finished.",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            creationSource: "server",
+            delegatedCompletion: {
+              parentRunId: runId,
+              generation: delivery.generation,
+              taskIds: delivery.taskIds,
+            },
+          });
+          const delivered = yield* orchestrator.getThreadProjection(threadId);
+          assert.include(
+            delivered.messages.find((message) => message.id === delivery.messageId)!.text,
+            recovered.subagents.find((task) => task.id === child.taskId)!.result!,
+          );
+          yield* orchestrator.recoverDelegatedTasks;
+          const final = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(
+            final.messages.filter((message) => message.id === delivery.messageId),
+            1,
+          );
+          assert.lengthOf(
+            final.contextTransfers.filter(
+              (transfer) => transfer.sourceThreadId === child.childThreadId,
+            ),
+            1,
+          );
+        }),
+    );
+  },
+);
 
 it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
   "subagent follow-ups",

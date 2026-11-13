@@ -1,5 +1,7 @@
 """Run the repository setup preamble under real bash without root or network access."""
+import contextlib
 import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -148,10 +150,28 @@ class RepoSetupTests(unittest.TestCase):
         self.assertLess(len(wrapped.encode()) + 1, 64 * 1024)
 
     def test_real_recipe_provisions_bare_home_then_skips_installed_pieces(self):
+        self.assert_real_recipe_provisions()
+
+    def test_real_recipe_refreshes_empty_apt_lists_once(self):
+        self.assert_real_recipe_provisions(cold_apt=True)
+
+    def test_real_recipe_retries_failed_apt_update_on_next_setup(self):
+        self.assert_real_recipe_provisions(cold_apt=True,failed_update=True)
+
+    def assert_real_recipe_provisions(self, cold_apt=False, failed_update=False):
         java_home = self.home / 'jdk17'
         bins = self.home / 'bin'
+        if cold_apt:
+            (self.home/'empty-lists').touch()
+        if failed_update:
+            (self.home/'fail-update').touch()
         tools = {
-            'sudo': '#!/bin/bash\necho JDK >> "$HOME/installs"\nmkdir -p "$HOME/jdk17/bin"\n'
+            'sudo': '#!/bin/bash\necho "$*" >> "$HOME/apt-calls"\n'
+                    'if [ "$2" = update ]; then\n'
+                    ' [ ! -f "$HOME/fail-update" ] || exit 100\n'
+                    ' rm -f "$HOME/empty-lists"; exit 0\nfi\n'
+                    '[ ! -f "$HOME/empty-lists" ] || { echo "E: Unable to locate package openjdk-17-jdk-headless" >&2; exit 100; }\n'
+                    'echo JDK >> "$HOME/installs"\nmkdir -p "$HOME/jdk17/bin"\n'
                     'touch "$HOME/jdk17/bin/java"\nchmod +x "$HOME/jdk17/bin/java"\n',
             'curl': '#!/bin/bash\necho TOOLS >> "$HOME/installs"\n',
             'unzip': '#!/bin/bash\nmkdir -p "$4/cmdline-tools/bin"\n'
@@ -175,10 +195,19 @@ class RepoSetupTests(unittest.TestCase):
         path = self.home / 'real-recipe.sh'
         path.write_text(recipe)
         env = dict(self.env, OFFBOX_REPO_ROOT=str(self.root))
+        if failed_update:
+            result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.home/f'.offbox/repo-env/{KEY}.sh').exists())
+            (self.home/'fail-update').unlink()
         for _ in range(2):
             result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.home / 'installs').read_text().splitlines(), ['JDK', 'TOOLS'])
+        calls=(self.home/'apt-calls').read_text().splitlines()
+        self.assertEqual(calls.count('apt-get update -qq'),int(cold_apt)+int(failed_update))
+        self.assertEqual(calls.count('apt-get install -y -qq openjdk-17-jdk-headless'),
+                         1+int(cold_apt)+int(failed_update))
         self.assertEqual((self.home / 'packages').read_text().splitlines(), [
             'platform-tools', 'platforms;android-37.1', 'platforms;android-36',
             'build-tools;36.0.0', 'ndk;26.3.11579264'])
@@ -231,7 +260,6 @@ class RepoSetupExitTests(Isolated):
         pull.assert_not_called()
 
     def test_background_terminal_statuses_without_a_local_log(self):
-        self.log.unlink()
         marker = runs.REPO_SETUP_FAILED_MARKER
         # Both detached-run settling paths must classify the same exit/marker combinations.
         cases = [
@@ -244,20 +272,42 @@ class RepoSetupExitTests(Isolated):
         for path in ('reaper', 'pool'):
             for label, code, stderr, expected_status, expected_code, expect_pull in cases:
                 with self.subTest(path=path, case=label):
-                    self.con.execute("UPDATE runs SET status='running',exit_code=NULL,pulls='[\"artifacts\"]' "
+                    self.log.unlink(missing_ok=True)
+                    common.offsets_path(self.log).unlink(missing_ok=True)
+                    self.con.execute("UPDATE runs SET status='running',exit_code=NULL,command_id='cmd_setup',"
+                                     "pulls='[\"artifacts\"]' "
                                      "WHERE run_id='run-setup'")
                     self.con.commit()
                     status = dict(running=False, status='exited', exitCode=code, stderr=stderr)
+                    def history(box, cmd, which, offset, **kwargs):
+                        data = stderr if which == 'stderr' else ''
+                        return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
                     with patch.object(runs.api, 'cmd_status', return_value=status), \
+                         patch.object(runs.api, 'history_logs', side_effect=history), \
+                         patch.object(runs.api, 'get', return_value=None), \
+                         patch.object(runs.api, 'call', side_effect=AssertionError('offline: no API calls')), \
                          patch.object(runs, 'do_pulls') as pull:
                         if path == 'reaper':
                             reap._check_unlocked(self.con, 'bx_setup', 'running', False, [])
                         else:
                             pool._refresh_background(self.con, 'repo')
-                    self.assertFalse(self.log.exists())
-                    self.assertEqual(self.row()['status'], expected_status)
-                    self.assertEqual(self.row()['exit_code'], expected_code)
-                    self.assertEqual(misc.wait('run-setup', None), expected_code)
+                        self.assertEqual(self.log.read_text(), stderr)
+                        self.assertEqual(self.row()['status'], expected_status)
+                        self.assertEqual(self.row()['exit_code'], expected_code)
+                        out, err = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            self.assertEqual(misc.logs('run-setup', False), 0 if stderr else 1)
+                        self.assertEqual(out.getvalue(), stderr)
+                        if stderr:
+                            self.assertEqual(err.getvalue(), '')
+                        else:
+                            self.assertIn('no output recorded for run-setup', err.getvalue())
+                        out, err = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            self.assertEqual(misc.wait('run-setup', None), expected_code)
+                        self.assertEqual(out.getvalue(), f'run-setup: {expected_status} exit={expected_code}\n')
+                        self.assertEqual(err.getvalue(), '' if stderr else
+                                         'offbox: run-setup settled with no output on record\n')
                     if expect_pull:
                         pull.assert_called_once()
                         self.assertEqual(pull.call_args.args[2], ['artifacts'])

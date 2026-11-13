@@ -137,44 +137,90 @@ describe("EventLoopMonitor", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("records heap spaces past 75% of the heap limit even without a stall", () =>
+  it.effect.each([
+    { limitMb: 4096, thresholdMb: 1536, usedMb: 1638.4 },
+    { limitMb: 2048, thresholdMb: 1536, usedMb: 1536 + 1 / 1024 / 1024 },
+    { limitMb: 1024, thresholdMb: 768, usedMb: 800 },
+  ])(
+    "records heap spaces once per tick above the lower threshold ($limitMb MiB limit)",
+    ({ limitMb, thresholdMb, usedMb }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-event-loop-" });
+        const filePath = `${directory}/event-loop-stalls.ndjson`;
+        const samples = [
+          quiet,
+          { ...quiet, heapUsedBytes: thresholdMb * 1024 * 1024 },
+          { ...stalled, heapUsedBytes: usedMb * 1024 * 1024 },
+          { ...quiet, heapUsedBytes: usedMb * 1024 * 1024 },
+        ];
+        yield* Layer.build(
+          EventLoopMonitor.layerWith(
+            Effect.succeed(Effect.sync(() => samples.shift() ?? quiet)),
+            { filePath, maxBytes: 4096 },
+            () => [
+              {
+                space_name: "large_object_space",
+                space_size: 128 * 1024 * 1024,
+                space_used_size: 100 * 1024 * 1024,
+                space_available_size: 0,
+                physical_space_size: 128 * 1024 * 1024,
+              },
+            ],
+            limitMb * 1024 * 1024,
+          ),
+        );
+        yield* TestClock.adjust("120 seconds");
+        const lines = (yield* fs.readFileString(filePath))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const heaps = lines.filter((line) => line.kind === "heap-spaces");
+        assert.lengthOf(heaps, 2);
+        assert.lengthOf(
+          lines.filter((line) => line.delayMaxMs !== undefined),
+          1,
+        );
+        assert.notStrictEqual(heaps[0].at, heaps[1].at);
+        const line = heaps[0];
+        assert.isString(line.at);
+        assert.deepStrictEqual(
+          { ...line, at: "timestamp" },
+          {
+            at: "timestamp",
+            kind: "heap-spaces",
+            heapUsedMb: Math.round(usedMb),
+            heapLimitMb: limitMb,
+            rssMb: 1536,
+            spaces: [{ name: "large_object_space", usedMb: 100, sizeMb: 128 }],
+          },
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps sampling after heap-space collection throws", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-event-loop-" });
       const filePath = `${directory}/event-loop-stalls.ndjson`;
-      const samples = [quiet, { ...quiet, heapUsedBytes: 1536 * 1024 * 1024 + 1 }];
+      let calls = 0;
       yield* Layer.build(
         EventLoopMonitor.layerWith(
-          Effect.succeed(Effect.sync(() => samples.shift() ?? quiet)),
+          Effect.succeed(Effect.succeed({ ...quiet, heapUsedBytes: 1.6 * 1024 ** 3 })),
           { filePath, maxBytes: 4096 },
-          () => [
-            {
-              space_name: "large_object_space",
-              space_size: 128 * 1024 * 1024,
-              space_used_size: 100 * 1024 * 1024,
-              space_available_size: 0,
-              physical_space_size: 128 * 1024 * 1024,
-            },
-          ],
-          2048 * 1024 * 1024,
+          () => {
+            calls++;
+            if (calls === 1) throw new Error("unavailable");
+            return [];
+          },
+          4 * 1024 ** 3,
         ),
       );
-      yield* TestClock.adjust("60 seconds");
+      yield* TestClock.adjust("90 seconds");
+      assert.strictEqual(calls, 2);
       const lines = (yield* fs.readFileString(filePath)).trim().split("\n");
       assert.lengthOf(lines, 1);
-      const line = JSON.parse(lines[0]!);
-      assert.isString(line.at);
-      assert.deepStrictEqual(
-        { ...line, at: "timestamp" },
-        {
-          at: "timestamp",
-          kind: "heap-spaces",
-          heapUsedMb: 1536,
-          heapLimitMb: 2048,
-          rssMb: 1536,
-          spaces: [{ name: "large_object_space", usedMb: 100, sizeMb: 128 }],
-        },
-      );
+      assert.strictEqual(JSON.parse(lines[0]!).kind, "heap-spaces");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

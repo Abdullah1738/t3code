@@ -11,6 +11,12 @@
 # Status goes to logs/backup_last.json; the health check reads it.
 set -u
 ROOT="$HOME/.local/share/memory-system"
+if [ "${MEMORY_BACKUP_GUARDED:-}" != 1 ]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/src/backup_control.py" guard "$ROOT/logs/backup.lock" /bin/bash "$0" "$@"
+fi
+if [ "${RECALL_FENCED:-}" != 1 ]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/src/redact_lock.py" /bin/bash "$0" "$@"
+fi
 DATA="$ROOT/data"
 LOGDIR="$ROOT/logs"
 STAGE="${MEMORY_BACKUP_STAGE:-/Volumes/ExternalSSD/memory-system-backup/replica}"
@@ -34,19 +40,6 @@ RESTIC_TIMEOUT_S="${MEMORY_BACKUP_RESTIC_TIMEOUT_S:-7200}"
 mkdir -p "$LOGDIR"
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
-if ! mkdir "$LOCK" 2>/dev/null; then
-  holder=$(cat "$LOCK/pid" 2>/dev/null)
-  # launchd never overlaps runs, so this only sees manual runs or a lock left
-  # by a killed run. A hung run is reported by health_check.py (backup_lock).
-  if [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q memory_backup.sh; then
-    log "skip: backup $holder still running"; exit 0
-  fi
-  log "removing stale backup.lock (holder ${holder:-?} is gone)"
-  rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
-fi
-echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
-
 START=$(date +%s)
 write_status() { # ok stage message snapshot added_bytes
   /opt/homebrew/bin/python3 - "$STATUS" "$1" "$2" "$3" "$4" "$5" "$START" <<'PY'
@@ -59,9 +52,11 @@ except Exception:
     pass
 now = int(time.time())
 st = {
+    **prev,
     "ts": now, "ok": ok == "1", "stage": stage, "message": msg[-800:],
     "snapshot": snap or None, "data_added": int(added or 0),
     "duration_s": now - int(start),
+    "last_error": None if ok == "1" else msg[-800:],
     "last_success_ts": now if ok == "1" else prev.get("last_success_ts"),
     "last_snapshot": snap if ok == "1" and snap else prev.get("last_snapshot"),
 }
@@ -73,9 +68,14 @@ PY
 fail() { log "FAIL [$1] $2"; write_status 0 "$1" "$2" "" 0; exit 1; }
 run_bg_limited() { # seconds command...
   local seconds="$1"; shift
-  /opt/homebrew/bin/python3 "$ROOT/src/run_limited.py" --seconds "$seconds" --background -- "$@"
+  /opt/homebrew/bin/python3 "$ROOT/src/run_limited.py" --seconds "$seconds" --background --load-aware --max-seconds-under-load "${MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD:-10800}" -- "$@"
 }
 
+admission=0
+out=$(/opt/homebrew/bin/python3 "$ROOT/src/backup_control.py" defer "$STATUS" 2>&1) || admission=$?
+[ -z "$out" ] || log "$out"
+[ "$admission" -ne 10 ] || exit 0
+[ "$admission" -eq 0 ] || fail admission "cannot check host load: $out"
 log "backup start"
 [ -d "$STAGE" ] || mkdir -p "$STAGE" 2>/dev/null || fail stage "cannot create $STAGE (SSD mounted?)"
 [ -f "$RESTIC_REPOSITORY/config" ] || fail repo "restic repo missing: $RESTIC_REPOSITORY (SSD mounted?)"
@@ -105,17 +105,9 @@ replicate() { # live-path replica-name
   for attempt in 1 2; do
     replica_start=$(date +%s)
     rc=0
-    out=$(run_bg_limited "$REPLICA_TIMEOUT_S" "$SQRSYNC" -v "$src" "$STAGE/$db" 2>&1) || rc=$?
-    if [ "$rc" -eq 125 ]; then
-      out="replica $db: child survived kill: $(printf '%s' "$out" | tail -c 600)"
-      log "$out"
-      fail replica "$out"
-    fi
-    if [ "$rc" -eq 124 ]; then
-      [ -z "$out" ] || log "replica $db timeout output: $(printf '%s' "$out" | tail -c 600)"
-      fail replica "$db: sqlite3_rsync timed out after $REPLICA_TIMEOUT_S s (disk contention?)"
-    fi
-    [ "$rc" -eq 0 ] || fail replica "$db: $out"
+    out=$(/opt/homebrew/bin/python3 "$ROOT/src/backup_replica.py" "$src" "$STAGE/$db" "$SQRSYNC" "$SQLITE" "$ROOT/src/run_limited.py" "$REPLICA_TIMEOUT_S" --hwm-sql "$sql" --hwm-min "$want" 2>&1) || rc=$?
+    [ -z "$out" ] || log "$out"
+    [ "$rc" -eq 0 ] || fail replica "$db: rc=$rc elapsed_s=$(( $(date +%s) - replica_start )) $(printf '%s' "$out" | tail -c 600)"
     log "replica $db try$attempt: elapsed_s=$(( $(date +%s) - replica_start )) $(printf '%s' "$out" | tail -1)"
     [ -z "$want" ] && break
     got=$("$SQLITE" -readonly "$STAGE/$db" "$sql" 2>&1)
@@ -128,6 +120,7 @@ replicate() { # live-path replica-name
 for db in memory.db opencode_raw.db; do
   [ -f "$DATA/$db" ] && replicate "$DATA/$db" "$db"
 done
+/opt/homebrew/bin/python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)' "$STAGE/.catchup-needed" || fail replica "cannot clear catchup marker"
 # Under launchd only the Homebrew binaries (sqlite3, python3, rsync, restic)
 # may touch files on the SSD; /bin/bash redirections, rm, mv, cp and grep get
 # "Operation not permitted". So all file work in $STAGE goes through them.
@@ -243,7 +236,7 @@ vout=$(/opt/homebrew/bin/python3 "$ROOT/src/transcript_backup_manifest.py" verif
 log "transcript manifest $(basename "$MPATH") verified"
 
 # 2. snapshot
-excl=(--exclude "$STAGE/robob-state.sql.tmp" --exclude "$STAGE/files/data/backup-manifests")
+excl=(--exclude "$STAGE/*.next*" --exclude "$STAGE/.catchup-needed" --exclude "$STAGE/robob-state.sql.tmp" --exclude "$STAGE/files/data/backup-manifests")
 for p in "${RETIRED[@]}"; do excl+=(--exclude "$STAGE/$p"); done
 # Scope the second fence to transcripts so database replicas elsewhere remain.
 for p in '.credentials.json' 'auth.json' 'settings.local.json' '*.key' '*.sqlite*' '*.db' '*.db-*' '*-wal' '*-shm'; do
@@ -264,7 +257,7 @@ log "snapshot $snap added_packed=$added"
 
 # 3. retention, daily
 if [ ! -f "$PRUNE_STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$PRUNE_STAMP") )) -gt 86400 ]; then
-  pout=$(/usr/sbin/taskpolicy -d default nice -n 10 "$RESTIC" forget --host ardud-mac --tag memory-live \
+  pout=$(run_bg_limited "$RESTIC_TIMEOUT_S" "$RESTIC" forget --host ardud-mac --tag memory-live \
     --keep-last 12 --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
     --prune --max-unused 15% 2>&1)
   prc=$?

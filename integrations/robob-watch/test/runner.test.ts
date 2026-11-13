@@ -18,7 +18,7 @@ void ${JSON.stringify(failOn)};`);
 };
 const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
-const env = { ...process.env, ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
+const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 // Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
@@ -163,6 +163,8 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   const flag = join(sandbox, "esc-ok");
   expect(cli("add", "--id", "esc", "--title", "Esc", "--check", `[[ -f ${flag} ]] || { echo "wacli sync daemon is not running" >&2; exit 1; }`,
     "--interval", "30", "--context", "Owner waits for a reply.", "--no-prime").exitCode).toBe(0);
+  const definition = join(sandbox, "root/watchers/esc/watcher.json");
+  writeFileSync(definition, JSON.stringify({ ...JSON.parse(readFileSync(definition, "utf8")), max_consecutive_failures: 0 }));
   const file = join(sandbox, "root/watchers/esc/state.json");
   // Failing 5 min: no escalation yet.
   writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 7, failure_alerted: true,

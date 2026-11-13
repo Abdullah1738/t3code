@@ -23,6 +23,15 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("accepts finite idle timeout overrides independently of the wait budget", () => {
+    for (const idleTimeoutMs of [0, 1, 60_000, 120_000, 8_000_000]) {
+      expect(
+        decodeDelegateTaskInput({ task: "Review", idleTimeoutMs, timeoutMs: 10 }).idleTimeoutMs,
+      ).toBe(idleTimeoutMs);
+    }
+    expect(() => decodeDelegateTaskInput({ task: "Review", idleTimeoutMs: Number.NaN })).toThrow();
+  });
+
   it("preserves known fields in partial task status and rejects an unmarked incomplete result", () => {
     const decode = Schema.decodeUnknownSync(OrchestratorMcpTaskStatusResult);
     const partial = {

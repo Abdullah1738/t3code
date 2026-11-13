@@ -1,0 +1,31 @@
+{
+  "case_number": 26,
+  "reporter_id": "robob-evaluator",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:d4a65891-ca43-49e7-b88d-54ba6bb0aa44",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "claude",
+    "tool_name": "Bash",
+    "nested_tool": null,
+    "card_comment_event_id": 134302,
+    "sources": [
+      {
+        "session_file": "/Users/ardud/.robob/harness-homes/claude/projects/-Volumes-ExternalSSD-t3code-fork/1ccb9cfb-a05f-46cd-91e9-157c2301aed4.jsonl",
+        "timestamp": "2026-11-12T06:19:52.397Z",
+        "tool_use_id": "toolu_01NxAyNm6Fh5sLBMLsdF87BM",
+        "call_line": 112,
+        "result_line": 113
+      }
+    ],
+    "workdir_source": "Bash has no workdir field; session cwd retained. Literal cd inside cmd is unchanged."
+  },
+  "commands": [
+    {
+      "cmd": "cd /Volumes/ExternalSSD/t3code-fork/integrations/offbox/skill/scripts && for c in 'print -rl -- /opt/homebrew/lib/python3.15/site-packages/pytest(N)' 'print -rl -- /opt/homebrew/lib/python3.15/site-packages/pytest' 'ls /opt/homebrew/lib/python3.15/site-packages/pytest' 'echo pytest(N)'; do printf '%s => ' \"$c\"; /usr/bin/python3 classify.py --cwd /tmp \"$c\"; echo; done",
+      "workdir": "/Volumes/ExternalSSD/t3code-fork",
+      "sha256": "4b6d7b5f9612ccf29888fc74b72fa277d4ae2a3c444f38c1a4f7943150bf444a"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/t3code-fork",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

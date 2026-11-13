@@ -968,7 +968,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall"})
+                             {"hook-adapters", "live-database", "rootwide-search", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())
@@ -1210,7 +1210,7 @@ class McpParityTests(HarnessTestCase):
     def test_url_transport_command_and_args_mismatches_are_reported(self) -> None:
         self.mcp["recall"]["url"] = "http://127.0.0.1:9999/mcp"
         self.mcp["betterstack"] = {"type": "local", "command": ["/bin/betterstack"], "enabled": True}
-        self.mcp["inbody"]["command"] = ["/usr/local/bin/inbody-mcp"]
+        self.mcp["perplexity"]["command"] = ["/usr/local/bin/perplexity-mcp"]
         self.mcp["cua-driver"]["command"] = [self.mcp["cua-driver"]["command"][0], "serve"]
         self.write_oc()
         self.gen()
@@ -1219,8 +1219,8 @@ class McpParityTests(HarnessTestCase):
         self.assertIn("mcp parity: recall url differs (opencode http://127.0.0.1:9999/mcp, "
                       "native http://127.0.0.1:18765/mcp)", out)
         self.assertIn("mcp parity: betterstack transport differs (opencode command, native url)", out)
-        self.assertIn("mcp parity: inbody command differs (opencode /usr/local/bin/inbody-mcp, "
-                      "native /Users/ardud/bin/inbody-mcp)", out)
+        self.assertIn("mcp parity: perplexity command differs (opencode /usr/local/bin/perplexity-mcp, "
+                      "native /Users/ardud/bin/perplexity-mcp)", out)
         self.assertIn('cua-driver args differ (opencode ["serve"], native ["mcp"])', out)
         rc, diff = self.diff()
         self.assertEqual(next(r for r in diff["servers"] if r["id"] == "recall")["status"], "mismatch")

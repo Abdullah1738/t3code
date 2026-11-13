@@ -1,0 +1,259 @@
+import { expect, test, setSystemTime } from "bun:test";
+import { cardPreviewImage } from "../src/card-preview.ts";
+import { liveCardChatsConfig } from "../src/config.ts";
+import { Sendblue } from "../src/sendblue.ts";
+import { sbTransport } from "../src/sb-transport.ts";
+import { Store } from "../src/store.ts";
+import { Delivery, RETRY_WINDOW } from "../src/delivery.ts";
+
+const url = "https://mac.tailnet.ts.net:18400/delivery-noon-fgbcnno52e6n0ka/";
+const json = (body: unknown) => Response.json(body);
+
+test("owner delivery card has a static image layout with a private tap-through; retry sends once", async () => {
+  const requests: { path: string; body: unknown }[] = [];
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const media = "https://media.example/preview.png";
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const target = String(input);
+    if (target === url) return new Response('<meta property="og:image" content="preview.png">', { headers: { "content-type": "text/html" } });
+    if (target === url + "preview.png") return new Response(bytes, { headers: { "content-type": "image/png" } });
+    const path = new URL(target).pathname;
+    if (path === "/api/upload-file") {
+      const file = (init!.body as FormData).get("file") as File;
+      expect(new Uint8Array(await file.arrayBuffer())).toEqual(bytes);
+      requests.push({ path, body: { name: file.name, type: file.type } });
+      return json({ media_url: media });
+    }
+    const body: unknown = JSON.parse(init!.body as string);
+    requests.push({ path, body });
+    return json({ message_handle: "accepted" });
+  }) as unknown as typeof fetch;
+  const line = new Sendblue({ keyId: "test", secret: "test", number: "+15555550001", fetch: fetchFn,
+    cardApp: { appName: "Robob Cards", extensionBundleId: "com.abdullah.robob.cards.MessagesExtension", teamId: "HVG39427R3" } });
+  const store = new Store(":memory:");
+  try {
+    const transport = sbTransport(line, "dm:+15555550002", store, undefined,
+      liveCardChatsConfig(undefined).includes("owner") ? {} : { static: true, previewImage: cardPreviewImage(file => line.upload(file), fetchFn) });
+    store.enqueue({ id: "app:delivery-test", kind: "conversation", text: "", app: { url, caption: "Delivery tracking", summary: "Open your order" } });
+    const delivery = new Delivery(store, transport, {projectScope: "test", enabled: () => true, chatGuid: () => "dm:+15555550002"});
+    await delivery.tick();
+    await delivery.tick();
+    expect(store.getOperation("app:delivery-test")?.state).toBe("sent");
+    expect(requests).toEqual([
+      { path: "/api/upload-file", body: { name: "preview.png", type: "image/png" } },
+      { path: "/api/send-message", body: { number: "+15555550002", from_number: "+15555550001", app_card: {
+        appName: "Robob Cards", extensionBundleId: "com.abdullah.robob.cards.MessagesExtension", teamId: "HVG39427R3",
+        url, interactive: false, layout: { caption: "Delivery tracking", summary: "Open your order", imageUrl: media },
+      } } },
+    ]);
+  } finally { store.close(); }
+});
+
+test("live extension bubbles remain an explicit opt-in", () => {
+  expect(liveCardChatsConfig(undefined)).toEqual([]);
+  expect(liveCardChatsConfig(["owner"])).toEqual(["owner"]);
+});
+
+for (const change of ["cancelled", "rotated", "disabled", "destination", "readiness", "expired"] as const) {
+  test(`preview preparation cannot send after dispatch guard changes: ${change}`, async () => {
+    const store = new Store(":memory:");
+    const entered = Promise.withResolvers<void>();
+    const preview = Promise.withResolvers<string>();
+    let enabled = true;
+    let destination = "dm:+15555550002";
+    let ready = true;
+    let sends = 0;
+    const line = new Sendblue({ keyId: "test", secret: "test", number: "+15555550001", fetch: (async () => {
+      sends++;
+      return json({ message_handle: "must-not-send" });
+    }) as unknown as typeof fetch });
+    const transport = sbTransport(line, "dm:+15555550002", store, undefined, {
+      static: true, previewImage: async () => { entered.resolve(); return preview.promise; },
+    });
+    store.set("route", {id: "session", generation: 1});
+    store.enqueue({id: "card", kind: "conversation", text: "", sessionId: "session", generation: 1, app: {url, caption: "Delivery tracking"}});
+    store.set("firstAttempt:card", Date.now());
+    store.set("sendAmbiguous:card", false);
+    const delivery = new Delivery(store, transport, {projectScope: "test", enabled: () => enabled, chatGuid: () => destination,
+      beforeSend: async () => ready ? "send" : "wait"});
+    try {
+      const ticking = delivery.tick();
+      await entered.promise;
+      if (change === "cancelled") store.outboxState("card", "cancelled");
+      if (change === "rotated") store.set("route", {id: "session", generation: 2});
+      if (change === "disabled") enabled = false;
+      if (change === "destination") destination = "dm:+15555550003";
+      if (change === "readiness") ready = false;
+      if (change === "expired") setSystemTime(Date.now() + RETRY_WINDOW + 1);
+      preview.resolve("https://media.example/preview.png");
+      await ticking;
+      expect(sends).toBe(0);
+      expect(store.getOperation("card")?.state).toBe(change === "cancelled" || change === "rotated" ? "cancelled" : change === "expired" ? "failed" : "pending");
+    } finally {setSystemTime(); store.close();}
+  });
+}
+
+test("preview upload failure stays pending and known unsent, then retries the same card", async () => {
+  const store = new Store(":memory:");
+  let attempts = 0;
+  let sends = 0;
+  const line = new Sendblue({keyId:"test",secret:"test",number:"+15555550001",fetch:(async()=>{
+    sends++;
+    return json({message_handle:"accepted"});
+  }) as unknown as typeof fetch});
+  const transport = sbTransport(line,"dm:+15555550002",store,undefined,{static:true,previewImage:cardPreviewImage(async()=>{
+    if (++attempts === 1) throw new Error("upload offline");
+    return "https://media.example/preview.png";
+  },(async(input: string | URL | Request)=> String(input) === url
+    ? new Response('<meta property="og:image" content="preview.png">',{headers:{"content-type":"text/html"}})
+    : new Response("bytes",{headers:{"content-type":"image/png"}})) as unknown as typeof fetch)});
+  store.enqueue({id:"card",kind:"conversation",text:"",app:{url,caption:"Delivery tracking"}});
+  const delivery = new Delivery(store,transport,{projectScope:"test",enabled:()=>true,chatGuid:()=>"dm:+15555550002"});
+  try {
+    await delivery.tick();
+    expect(store.getOperation("card")?.state).toBe("pending");
+    expect(store.get<boolean>("sendAmbiguous:card")).toBe(false);
+    expect(delivery.status().lastError).toBe("card_preview_unavailable");
+    expect(sends).toBe(0);
+    setSystemTime(store.get<number>("retry:card")!);
+    await delivery.tick();
+    expect(sends).toBe(1);
+    expect(store.getOperation("card")?.state).toBe("sent");
+  } finally {setSystemTime();store.close();}
+});
+
+for (const change of ["cancelled", "rotated", "disabled", "destination", "readiness", "expired"] as const) {
+  test(`retry history cannot send after dispatch guard changes: ${change}`, async () => {
+    const store = new Store(":memory:");
+    const entered = Promise.withResolvers<void>();
+    const history = Promise.withResolvers<Response>();
+    let enabled = true;
+    let destination = "dm:+15555550002";
+    let ready = true;
+    let sends = 0;
+    let previews = 0;
+    const line = new Sendblue({keyId:"test",secret:"test",number:"+15555550001",fetch:(async(input: string | URL | Request)=>{
+      if (new URL(String(input)).pathname === "/api/v2/messages") {entered.resolve(); return history.promise;}
+      sends++;
+      return json({message_handle:"must-not-send"});
+    }) as unknown as typeof fetch});
+    const transport = sbTransport(line,"dm:+15555550002",store,undefined,{static:true,previewImage:async()=>{previews++;return "https://media.example/p.png";}});
+    const now = Date.now();
+    store.set("route",{id:"session",generation:1});
+    store.enqueue({id:"card",kind:"conversation",text:"",sessionId:"session",generation:1,app:{url,caption:"Delivery tracking"}});
+    const {createHash} = await import("node:crypto");
+    const chunkId = `bridge-${createHash("sha256").update("test:card:0").digest("hex")}`;
+    store.set(`sent-attempt:${chunkId}`, {first:now-180_000,last:now-180_000});
+    store.set("firstAttempt:card",now-180_000);
+    store.set("sendAmbiguous:card",true);
+    const delivery = new Delivery(store,transport,{projectScope:"test",enabled:()=>enabled,chatGuid:()=>destination,beforeSend:async()=>ready?"send":"wait"});
+    try {
+      const ticking=delivery.tick();
+      await entered.promise;
+      if(change==="cancelled")store.outboxState("card","cancelled");
+      if(change==="rotated")store.set("route",{id:"session",generation:2});
+      if(change==="disabled")enabled=false;
+      if(change==="destination")destination="dm:+15555550003";
+      if(change==="readiness")ready=false;
+      if(change==="expired")setSystemTime(now+RETRY_WINDOW+1);
+      history.resolve(json({data:[],has_more:false}));
+      await ticking;
+      expect(sends).toBe(0);
+      expect(previews).toBe(1);
+      expect(store.getOperation("card")?.state).toBe(change==="cancelled"||change==="rotated"?"cancelled":change==="expired"?"uncertain":"pending");
+    } finally {setSystemTime();store.close();}
+  });
+}
+
+test("lost app acknowledgement reconciles before preview lookup, including a legacy attempt without a prepared image", async () => {
+  const store=new Store(":memory:");
+  let sends=0;
+  let previews=0;
+  const at=Date.now();
+  const line=new Sendblue({keyId:"test",secret:"test",number:"+15555550001",fetch:(async(input: string|URL|Request)=>{
+    if(new URL(String(input)).pathname==="/api/v2/messages")return json({data:[{message_handle:"landed",is_outbound:true,number:"+15555550002",status:"DELIVERED",date_sent:new Date(at+1000).toISOString(),app_card:{url,layout:{caption:"Delivery tracking"}}}],has_more:false});
+    sends++;throw new Error("must not send");
+  }) as unknown as typeof fetch});
+  const transport=sbTransport(line,"dm:+15555550002",store,()=>at+180_000,{static:true,previewImage:async()=>{previews++;throw new Error("page offline");}});
+  store.set("sent-attempt:legacy",{first:at,last:at});
+  try {
+    expect(await transport.sendApp({id:"legacy",chatGuid:"x",url,caption:"Delivery tracking"})).toMatchObject({providerId:"landed",duplicate:true});
+    expect(previews).toBe(0);
+    expect(sends).toBe(0);
+  } finally {store.close();}
+});
+
+test("a prepared image is reused after a definite provider rejection", async () => {
+  const store=new Store(":memory:");
+  let previews=0;
+  let sends=0;
+  const line=new Sendblue({keyId:"test",secret:"test",number:"+15555550001",fetch:(async()=>{
+    return ++sends===1?new Response("",{status:400}):json({message_handle:"accepted"});
+  }) as unknown as typeof fetch});
+  const transport=sbTransport(line,"dm:+15555550002",store,undefined,{static:true,previewImage:async()=>{
+    if(++previews>1)throw new Error("page offline");return "https://media.example/p.png";
+  }});
+  const input={id:"same-card",chatGuid:"x",url,caption:"Delivery tracking"};
+  try {
+    await expect(transport.sendApp(input)).rejects.toBeDefined();
+    expect(await transport.sendApp(input)).toMatchObject({providerId:"accepted"});
+    expect(previews).toBe(1);
+    expect(sends).toBe(2);
+  } finally {store.close();}
+});
+
+test("preparation failures count toward backoff and the attempt limit", async () => {
+  const store=new Store(":memory:");
+  const {LineError}=await import("../src/line.ts");
+  const {MAX_ATTEMPTS}=await import("../src/delivery.ts");
+  const photon={sendText:async()=>({}),sendApp:async()=>{throw new Error("must not send");},prepareApp:async()=>{throw new LineError("offline","card_preview_unavailable",true,false);}};
+  const delivery=new Delivery(store,photon,{projectScope:"test",enabled:()=>true,chatGuid:()=>"x"});
+  store.enqueue({id:"card",kind:"conversation",text:"",app:{url,caption:"Delivery tracking"}});
+  try {
+    const at=Date.now();
+    await delivery.tick();
+    expect(store.getOperation("card")).toMatchObject({state:"pending",attempts:1});
+    const first=store.get<number>("retry:card")!;
+    expect(first-at).toBeGreaterThanOrEqual(10_000);
+    setSystemTime(first);
+    await delivery.tick();
+    expect(store.getOperation("card")).toMatchObject({state:"pending",attempts:2});
+    expect(store.get<number>("retry:card")!-first).toBe(20_000);
+    store.db.query("UPDATE outbox SET attempts = ? WHERE id = 'card'").run(MAX_ATTEMPTS-1);
+    setSystemTime(store.get<number>("retry:card")!);
+    await delivery.tick();
+    expect(store.getOperation("card")).toMatchObject({state:"failed",attempts:MAX_ATTEMPTS});
+    expect(store.get<boolean>("sendAmbiguous:card")).toBe(false);
+  } finally {setSystemTime();store.close();}
+});
+
+for (const outcome of ["resolved", "rejected"] as const) {
+  test(`a fresh card expires during ${outcome} preparation without resetting its first-attempt timestamp`, async () => {
+  const store=new Store(":memory:");
+  const entered=Promise.withResolvers<void>();
+  const preview=Promise.withResolvers<string>();
+  const start=Date.parse("2026-11-13T00:00:00Z");
+  setSystemTime(start);
+  let sends=0;
+  const line=new Sendblue({keyId:"test",secret:"test",number:"+15555550001",fetch:(async()=>{sends++;return json({message_handle:"must-not-send"});}) as unknown as typeof fetch});
+  const transport=sbTransport(line,"dm:+15555550002",store,undefined,{static:true,previewImage:async()=>{entered.resolve();return preview.promise;}});
+  const delivery=new Delivery(store,transport,{projectScope:"test",enabled:()=>true,chatGuid:()=>"dm:+15555550002"});
+  store.enqueue({id:"fresh",kind:"conversation",text:"",app:{url,caption:"Delivery tracking"}});
+  try {
+    const ticking=delivery.tick();
+    await entered.promise;
+    expect(store.get<number>("firstAttempt:fresh")).toBe(start);
+    setSystemTime(start+RETRY_WINDOW+1);
+    if (outcome === "resolved") preview.resolve("https://media.example/p.png");
+    else {
+      const {LineError}=await import("../src/line.ts");
+      preview.reject(new LineError("offline","card_preview_unavailable",true,false));
+    }
+    await ticking;
+    expect(sends).toBe(0);
+    expect(store.getOperation("fresh")?.state).toBe("failed");
+    expect(store.get<number>("firstAttempt:fresh")).toBe(start);
+  } finally {setSystemTime();store.close();}
+});
+
+}

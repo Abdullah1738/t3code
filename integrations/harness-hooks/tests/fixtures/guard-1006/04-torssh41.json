@@ -1,0 +1,38 @@
+{
+  "case_number": 4,
+  "reporter_id": "torssh41",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:7ab623c4-6c8c-4208-92bc-811b26cf3997",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T21-11-20-01a1cb97-ba09-7950-916d-1dc268d4f171.jsonl",
+    "source_call_line_0": 106,
+    "timestamp": "2026-11-11T17:15:02.750Z",
+    "call_id": "call_07264a6b600f4016b75074470bb747b9",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 194,
+    "intentionally_absent_from_setup_files": [
+      "qa/fixtures/device-tool.py",
+      "qa/selftest.py"
+    ]
+  },
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "commands": [
+    {
+      "cmd": "mkdir -p qa/fixtures && cat > qa/fixtures/device-tool.py <<'PY'\n\"\"\"Synthetic command fixture; never calls a device or service.\"\"\"\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport signal\nimport sys\nimport time\nfrom urllib.parse import parse_qs, urlparse\n\ntool = Path(sys.argv[0]).name\nargs = sys.argv[1:]\nif tool == 'adb':\n    assert args[:2] == ['-s', '002473611000997']\n    args = args[2:]\nwith Path('calls.jsonl').open('a') as f:\n    f.write(json.dumps([tool, *args]) + '\\n')\nscenario = os.environ.get('QA_SCENARIO', '')\nskew = int(os.environ.get('QA_CLOCK_SKEW', '0'))\n\ndef installed():\n    return json.loads(Path('installed.json').read_text())\n\ndef lines(nonce):\n    now = time.time() + skew\n    apk = installed()['sha256'] if scenario != 'probe-hash' else '0' * 64\n    if scenario == 'missing-nonce':\n        nonce = ''\n    elif scenario == 'wrong-nonce':\n        nonce = 'f' * 16\n    code = f'TORSSH_PROBE PASS sdk={35 if tool == \"adb\" else 36} apk={apk}'\n    if nonce:\n        code += ' run=' + nonce\n    stale = f'TORSSH_PROBE PASS sdk=35 apk={apk} run={\"e\" * 16}'\n    if scenario == 'stale-only':\n        code = stale\n    result = [(now - .2, 'TorSSHChecks', stale)]\n    if scenario == 'stale-fail':\n        result.append((now, 'TorSSHChecks', 'TORSSH_PROBE FAIL run=' + 'e' * 16))\n        # A right-nonce FAIL before the device bound is also stale.\n        if tool == 'adb':\n            result.append((now - 3600, 'TorSSHChecks', 'TORSSH_PROBE FAIL run=' + nonce))\n    result.append((now, 'TorSSHChecks', code))\n    if scenario == 'noise':\n        result += [(now + .01, 'OtherApp', 'TORSSH_PROBE FAIL run=' + nonce)] * 5000\n    return result\n\nif (tool == 'rcsim' and args[0] == 'create') or args[0] == 'install':\n    apk = Path(args[args.index('--install') + 1] if tool == 'rcsim' else args[-1])\n    Path('installed.json').write_text(json.dumps(dict(\n        path=str(apk), sha256=hashlib.sha256(apk.read_bytes()).hexdigest())))\n    print(json.dumps(dict(id='test-session')))\nelif tool == 'rcsim' and args[0] == 'release':\n    Path('released').touch()\n    print('released')\nelif 'list' in args and 'packages' not in args:\n    print('[]')\nelif 'open-url' in args or ('am' in args and 'start' in args):\n    url = next(a for a in args if a.startswith('torssh-debug:'))\n    Path('nonce').write_text(parse_qs(urlparse(url).query)['run'][0])\n    print('Starting: synthetic')\nelif 'logs' in args or 'logcat' in args:\n    if tool != 'adb' and '-f' in args:\n        if scenario == 'follow-error':\n            raise SystemExit(1)\n        assert '--json' in args\n        Path('reader-pid').write_text(str(os.getpid()))\n        def stop(*_):\n            Path('reader-stopped').touch()\n            raise SystemExit(0)\n        signal.signal(signal.SIGTERM, stop)\n        while not Path('nonce').exists():\n            time.sleep(.01)\n        for epoch, tag, message in lines(Path('nonce').read_text()):\n            print(json.dumps(dict(timestamp=epoch, tag=tag, message=message)), flush=True)\n        while True:\n            time.sleep(.05)\n    elif tool == 'adb':\n        rows = lines(Path('nonce').read_text())\n        if '-s' in args:\n            assert args[args.index('-s') + 1:] == ['TorSSHChecks:V', '*:S']\n            rows = [r for r in rows if r[1] == 'TorSSHChecks']\n        if '--uid' in args:\n            assert args[args.index('--uid') + 1] == '10234'\n        if '-T' in args:\n            since = float(args[args.index('-T') + 1])\n            rows = [r for r in rows if r[0] >= since]\n        if '-t' in args:\n            rows = rows[-int(args[args.index('-t') + 1]):]\n        for epoch, tag, message in rows:\n            print(f'{epoch:.9f} 10234 123 123 I {tag}: {message}')\n    else:\n        assert '--tail' in args\n        for epoch, tag, message in lines(Path('nonce').read_text())[-1000:]:\n            print(f'{epoch} {tag}: {message}')\nelif 'pm' in args and 'path' in args:\n    print('package:/data/app/~~safe/dev.torssh-token/base.apk')\n    if scenario == 'split-apk':\n        print('package:/data/app/~~safe/dev.torssh-token/split.apk')\nelif 'sha256sum' in args:\n    print(('0' * 64 if scenario == 'installed-hash' else installed()['sha256']) + '  ' + args[-1])\nelif 'date' in args:\n    value = time.time() + skew\n    print(str(value) if args[-1] == '+%s.%N' and scenario != 'integer-date' else\n          (str(int(value)) if args[-1] == '+%s' else str(int(value)) + '.%N'))\nelif 'packages' in args:\n    print('package:dev.torssh uid:10234')\nelif 'pidof' in args:\n    print('123')\nelif 'screenshot' in args:\n    Path(args[args.index('--output') + 1]).write_bytes(b'stub screenshot')\nelif 'accessibility-tree' in args:\n    print('{}')\nelif 'getprop' in args:\n    print('35')\nelif 'getconf' in args:\n    print('4096')\nelse:\n    print('stub evidence')\nPY\npython3 - <<'PY'\nfrom pathlib import Path\np=Path('qa/selftest.py');s=p.read_text(); start=s.index(\"        stub = '''#!\"); end=s.index(\"        row = next\", start)\ns=s[:start]+\"        stub = '#!' + sys.executable + '\\\\n' + (HERE / 'fixtures/device-tool.py').read_text()\\n\"+s[end:]\np.write_text(s)\nPY\npython3 qa/selftest.py > tmp/selftest.log 2>&1",
+      "workdir": "/Users/ardud/checkouts/qa-log-freshness",
+      "sha256": "645e42ad0c2476bc3efe03c76cd62fe265d8ab54aa2a012a5dfc6c8bc888caa4"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.",
+  "setup_files": {
+    "/Users/ardud/checkouts/qa-log-freshness/qa/selftest.py": "print('representative existing selftest source')\n"
+  },
+  "setup_provenance": "Representative original on-disk source. The fixture file written by cat remains absent."
+}

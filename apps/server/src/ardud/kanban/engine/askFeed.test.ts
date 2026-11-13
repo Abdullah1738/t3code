@@ -5,6 +5,7 @@ import { kanbanSchedule, type KanbanCard } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
@@ -241,4 +242,71 @@ it.effect(
       assert.strictEqual(schedule.get(id(405))?.holds, 0);
       assert.isBelow(ms, 1_000);
     }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("bounds each ask scan before matching, including gaps and an empty trailing batch", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* KanbanStore.KanbanStore;
+    for (const boardId of ["board-a", "board-b"]) {
+      yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${boardId}, ${boardId.slice(6)}, ${`{"name":"${boardId}"}`})`;
+      yield* sql.withTransaction(
+        Effect.forEach(
+          Array.from({ length: 1_500 }, (_, i) => (i + 1) * 2),
+          (number) => {
+            const stored = JSON.parse(cardJson(number, boardId));
+            if (number > 2_800) stored.asks = [];
+            else if (!stored.asks.some((ask: { closedAt: string | null }) => ask.closedAt === null))
+              stored.asks.push({
+                id: "q3",
+                text: "Go?",
+                blocking: false,
+                by: { _tag: "owner" },
+                at: AT,
+                seq: null,
+                closedAt: null,
+              });
+            const json = JSON.stringify(stored);
+            return sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json) VALUES (${`card-${boardId}-${number}`}, ${boardId}, ${number}, 'todo', ${json})`;
+          },
+          { discard: true },
+        ),
+      );
+    }
+    const batches: Array<number> = [];
+    const observe: Statement.Transformer = (statement) => {
+      const [query, params] = statement.compile();
+      if (!query.includes("'boardId', c.board_id")) return Effect.succeed(statement);
+      return sql.unsafe<{ count: number }>(`SELECT COUNT(*) AS count FROM (${query})`, params).pipe(
+        Effect.provideService(Statement.CurrentTransformer, undefined),
+        Effect.tap((rows) => Effect.sync(() => batches.push(rows[0]!.count))),
+        Effect.as(statement),
+        Effect.orDie,
+      );
+    };
+    const all = yield* readAskFeed(sql, {}, AT).pipe(
+      Effect.provideService(Statement.CurrentTransformer, observe),
+    );
+    assert.isAtMost(Math.max(...batches), 64);
+    assert.strictEqual(
+      batches.reduce((a, b) => a + b, 0),
+      3_000,
+    );
+    assert.deepStrictEqual(
+      all.open.map((item) => item.cardRef),
+      ["a", "b"].flatMap((slug) =>
+        Array.from({ length: 1_400 }, (_, i) => `${slug}:${(i + 1) * 2}`),
+      ),
+    );
+    const one = yield* readAskFeed(sql, { boardId: "board-b" as never }, AT);
+    assert.deepStrictEqual(
+      one.open,
+      all.open.filter((item) => item.boardId === "board-b"),
+    );
+    const history = yield* readAskFeed(sql, { closedSince: "2026-11-10T09:00:00.000Z" }, AT);
+    assert.strictEqual(history.closed.length, 2 * Math.floor(2_800 / 30));
+    assert.deepStrictEqual(history.open, all.open);
+    yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.asks', json('[]'))`;
+    assert.deepStrictEqual((yield* readAskFeed(sql, {}, AT)).open, []);
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );

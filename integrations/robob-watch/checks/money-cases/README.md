@@ -1,6 +1,6 @@
 # Money cases
 
-One place for open money cases (refunds, disputes, failed or unexpected charges, debts), so none of them is dropped. Each case is one row: amount, currency, merchant, reference, state, next action, deadline and who acts. The `money-cases` watcher wakes the owner's iMessage agent when a case is due within 24 hours, once a day while it is overdue, and when a reply watcher linked to the case ends (done, expired or removed before it finished) while the case is still open. Linked watchers must exist when they are added. Moving a deadline, even back to an earlier date, or reopening a case re-arms its pings. No pings go out from 23:00 to 08:00 Dubai; the check holds them until 08:00.
+One place for open money cases (refunds, disputes, failed or unexpected charges, debts and payment deadlines), so none of them is dropped. Each case is one row: amount, currency, merchant, reference, state, next action, deadline and who acts. The `money-cases` watcher wakes the owner's iMessage agent when a case is due within 24 hours, once a day while it is overdue, and when a reply watcher linked to the case ends (done, expired or removed before it finished) while the case is still open. Linked watchers must exist when they are added. Moving a deadline, even back to an earlier date, or reopening a case re-arms its pings. No pings go out from 23:00 to 08:00 Dubai; the check holds them until 08:00.
 
 The code lives here. The cases live in `~/Documents/assistant/money-cases/cases.json` (mode 600), never in git.
 
@@ -14,8 +14,8 @@ money-cases add acme-refund --merchant Acme --amount 120.50 --currency AED \
   --next "card dispute" --deadline 2026-10-25 --who Abdullah --watcher acme-refund-reply
 money-cases list [--all] [--json]
 money-cases show ID
-money-cases update ID --state "..." --next "..." --deadline 2026-10-28 --because "Acme agreed to Wed" [--add-watcher ID] [--note "..."]
-# a deadline change needs --because (the reason) or --reply (his reply id); it is refused otherwise and recorded in history
+money-cases update ID --state "..." --next "..." --deadline 2026-10-28 --source mail:abc --because "Acme agreed to Wed" [--add-watcher ID] [--note "..."]
+# deadline changes need --source (evidence) or --reply (his reply id); --because alone is refused
 money-cases update ID --state "..." --reply msg-9001      # his answer: restarts the two-day clock
 money-cases add boat-sms --merchant boat.dev --amount 25 --currency USD --charged 2026-10-25 --repeat boat-mail ...
 # the SMS is the same charge: a note goes on boat-mail, no second case
@@ -28,19 +28,41 @@ money-cases add pre-auth-x --merchant Acme --amount 90.30 --currency AED --kind 
 money-cases close pre-auth-x --outcome "dropped off"   # a hold is recorded as "released", not "refunded"
 money-cases close ID --outcome "refund landed 27 Oct"
 money-cases reopen ID --deadline 2026-11-01 --note "..."
+money-cases card-dead 5542 --note "cancelled 30 Oct, replaced by 2342"
+money-cases cards      # list dead cards
 money-cases brief      # one line for the morning brief, nothing when no case is open
 ```
 
 A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open case needs one. Setting a new deadline re-arms the ping. Every change is kept in the case's `history`.
 
 Rules added 2026-10-30 (money-cases fixes, card #10):
-- **No self-moved deadlines.** A deadline change without `--because` or `--reply` is refused and changes nothing. The reason goes into `history`.
+- **No self-moved deadlines.** A deadline change needs `--source mail:<id>`, `sms:<id>`, `imessage:<id>`, `statement:<path>#<line>`, or `--reply` (his reply id). `--because` is an optional reason and cannot move a deadline alone. The source is kept in the history text and its `source` field; it can also be recorded without a deadline change. Only his reply counts as an owner answer.
 - **One reminder a case a day.** A second reminder the same day is held until the next day.
 - **One yes/no after two silent days.** The clock starts at the first reminder delivered after his last answer, not at case creation, so a case that was never reminded is never asked about. After two days with no answer the check sends one yes/no and then stays quiet until he answers. An answer is a `close`, a `reopen`, or an update with `--reply` (his reply id). A `--because` reason is recorded but is not an answer, so a process that moves a deadline leaves the case quiet.
 - **Charges are never merged or split silently.** A new charge with the same merchant, amount, currency, day and kind as a recorded one is refused, and the refusal names the candidate. The caller decides: `--repeat ID` if it is the same charge (seen again, a note is added to that case), or `--distinct` if it is a second transaction. Free-form references such as "email 09:13" describe where a charge was seen, so they never tell two charges apart. An unmatched charge is never a candidate.
 - **Build once, acknowledge delivery separately.** Event keys and the case’s daily cap are recorded in `built` before the check prints an event; they suppress another build even if the runner never accepts or acknowledges it. Existing outbox keys migrate on the first check. Delivery still controls the reminder clock: The runner acks a run before it delivers the event and may retry it later or the next day. A reminder is recorded as sent, and it counts toward the one-a-day cap and starts the two-day clock, only when the runner's `state.json` confirms delivery (`fires` rose and `last_fire_at` is the delivery time). An event the runner owns stays pending; a lost event releases the outbox, while its keys remain consumed.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
+
+## Renewals on dead cards
+
+`card-dead LAST4 --note "..."` records a cancelled card in `cards.json` next to the case book; `cards` lists it. Non-dry `card-swap --old OLD --new NEW [--also STALE]` also marks the old and stale cards dead, even without `--case`. Case text still changes only for explicit `--case` picks. `--dry-run` writes neither book.
+
+Inbox triage opens a charge case when a renewal notice names a dead card, one amount with USD/$/AED/EUR/GBP, and an explicit date with a year (ISO, day/month/year, or a named month). A last-4 ending or masked card is required. The case records the renewal date, the source message ID and the action to move the subscription to a live card or cancel it. The same merchant and renewal date create one case, including after closure. Live cards and incomplete or ambiguous notices stay with ordinary triage. No payment or subscription change happens automatically.
+
+Generic plan or billing labels use the sender's identity. Email fallback retains the full domain so shared display names and mail subdomains cannot merge vendors; long case slugs include a hash. Body merchant names are used when they agree with the supplied sender, or when no sender was supplied. An explicitly cancelled or disabled renewal stays with ordinary triage; cancellation instructions, conditional consequences and cancelled-card notices do not suppress an upcoming renewal. A standalone “will be charged” notice also needs subscription, membership, recurring-service or product-tier plan context.
+
+No-charge wording bounded by “until” or “before” the billing date describes when charging starts and preserves the stated renewal. Unqualified no-charge statements and explicit cancellation or disabled-renewal states still prevent automatic case creation.
+
+The case keeps the original renewal date and exact mailbox identity separately from its readable name. Later wording changes reuse that case, including after closure or a deadline update. An SMS merchant can match one unique mailbox-domain label in either arrival order; the first corroborating email binds its mailbox identity and records the source without reopening it. Ambiguous matches stay in ordinary triage. If distinct identities share a readable slug, a hash of the exact identity distinguishes their case IDs.
+
+## Bank payment deadlines
+
+Inbox triage records bank repayment/failure notices as `payment_deadline` cases and scheduled card payments as `autopay_expected`, using the notice time in Dubai. Wio, ENBD, Mashreq, ADCB, FAB and Amex are supported. A bank sender and one unambiguous currency/amount are required; promotions and merchant purchase declines are excluded. `before midnight` means 23:59 that day. A date or “tonight/today” without a clock means 23:59; a failure with no readable deadline stays with normal triage for full-message review. The automatic due+3h fallback applies only to an already scheduled autopay.
+
+One institution/amount/currency/deadline is one case, including mail/SMS copies and replays. The check looks for a bank success confirmation at due+1h, with at most 6 seconds total and 4 seconds per lookup from its existing 40-second budget. Without confirmation it opens an unconfirmed payment deadline, using the bank's stated repayment deadline or due+3h. A later bank deadline supersedes that fallback. Lookup time is separate from the reserved case-save budget, so a slow archive cannot skip reminder generation. Archive errors leave the payment unconfirmed and are recorded in pings; they do not establish that the debit failed.
+
+The initial payment alert and reminders go alone through the existing outbox: once on detection, once 60–75 minutes before the deadline (the watcher's 15-minute cadence), then at most once at/after it. The usual one-per-day/third-question flow does not apply to these two reminders. Existing 23:00–08:00 quiet hours still apply, so a midnight deadline gets its first reminder before quiet hours and its final reminder in the morning. Payment deadlines come first in `brief`. Bank payment-received/autopay-success notices close matching rows; `money-cases close ID --outcome paid` (or `done`) is the existing chat-confirmation path and closes the related autopay row too. Closed cases are never reopened by replays.
 
 ## Charge questions
 
@@ -62,7 +84,7 @@ shared `ROBOB_READONLY_DB`. A missing, incomplete or >120-second-old export is a
 failed lookup, never evidence that he said nothing, and never falls back to the
 live writer. Symlink and hardlink aliases of the writer are refused too.
 
-Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), raises a wait that ran out once, turns a question asked twice and unanswered for 12 hours, or open for a week, into a money case, and keeps looking for 30 days after that, closing a case nobody has touched when the receipt comes. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of both books in their own folder.
+Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), raises a wait that ran out once, turns a question asked twice and unanswered for 12 hours, or open for a week, into a money case, and keeps looking for 30 days after that, closing a case nobody has touched when the receipt comes. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
 

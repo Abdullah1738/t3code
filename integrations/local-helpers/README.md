@@ -52,6 +52,41 @@ Tokens, passwords, cached IPs, OTP state and generated pages stay outside the
 repo: Keychain, `~/.local/state/{mail-oauth,otp-watch}`, `~/.cache`,
 `~/.local/share/imessage-apps`.
 
+The Mirage watchdog runs every minute as `com.ardud.mirage-beacon-keepalive`.
+Its helper is `bin/mirage-beacon-keepalive`, with client detection and restart
+functions in `libexec/mirage/`. Three failed health checks allow a restart only
+when every Mirage process has no established remote TCP or connected UDP flow.
+`lsof` and `nettop` are combined because Network.framework UDP flows may only
+appear in nettop. Duplicate descriptors/rows count once by transport 5-tuple;
+idle connections still block a restart, as do unavailable or malformed samples.
+There are no force-failure switches. State stays in
+`~/.local/state/mirage-beacon-keepalive`, logs in
+`~/Library/Logs/mirage-beacon-keepalive.log`.
+
+Before installation, while a client is streaming, run this from the checkout
+for a read-only detector check (no probes, state writes, quit or launch):
+
+```bash
+./integrations/local-helpers/bin/mirage-beacon-keepalive --detect-clients
+```
+
+It prints JSON: `streaming` with at least one flow and the client's peer is
+the expected result (exit 10). `clear` exits 0; `unknown` exits 20 and blocks
+restarts. A real-stream check must be repeated after installation with
+`~/.local/bin/mirage-beacon-keepalive --detect-clients`. Fixture tests and a
+dummy listener do not establish that the live iPad stream is detected.
+
+After approval, from the merged checkout: `./integrations/local-helpers/install.zsh`
+then `./integrations/local-helpers/install.zsh --check`. This installs all
+managed local helpers and loads/reloads their plists, so inspect `--dry-run`
+before approving. The Mirage agent is a short run and picks up code on its
+next tick; it needs no forced kickstart.
+
+Focused watchdog tests: from this directory,
+`/usr/bin/python3 -B -m unittest discover -s tests -p test_mirage.py -v`.
+They use normalized socket captures and a disposable loopback listener with
+stubbed application commands, never the installed watchdog or Mirage app.
+
 The delivery card builder that used to live in `~/.local/libexec/delivery-card`
 is retired; delivery cards come from `app-api-cli/delivery_cards.py`.
 

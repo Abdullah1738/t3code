@@ -571,11 +571,13 @@ const makeThreads = (watch: Watch) => {
           thread.failure = null;
           if (input.model) thread.model = input.model;
         }),
+      withdraw: () => Effect.void,
       setModel: (threadId, model) =>
         Effect.sync(() => {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
+      cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {
           counts.interrupts += 1;

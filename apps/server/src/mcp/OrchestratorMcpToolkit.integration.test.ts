@@ -4401,7 +4401,15 @@ describe("orchestrator MCP toolkit", () => {
         const cwd = yield* checkpointWorkspace("delegated-task-status");
         const rawTranscript = yield* readDelegatedTaskStatusTranscript(result);
         const transcript = yield* CodexOrchestratorReplayHarness.decodeTranscript(
-          materializeReplayTranscriptWorkspace(rawTranscript, cwd),
+          materializeReplayTranscriptWorkspace(
+            {
+              ...rawTranscript,
+              // The parent calls tools after the child finishes. Keep its replay
+              // process alive until the test scope closes.
+              entries: rawTranscript.entries.filter((entry) => entry.type !== "runtime_exit"),
+            },
+            cwd,
+          ),
         );
         const layerOrchestrator = ProviderReplayHarness.layerProviderReplay(
           {
@@ -4512,12 +4520,15 @@ describe("orchestrator MCP toolkit", () => {
             issuedAt: 1,
           };
           const invoke = (name: string, args: Record<string, unknown>) =>
-            server
-              .callTool({ name, arguments: args })
-              .pipe(
-                Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
-                Effect.provideService(McpSchema.McpServerClient, client),
-              );
+            server.callTool({ name, arguments: args }).pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+              Effect.tap((response) =>
+                Effect.sync(() =>
+                  expect(response.isError, JSON.stringify({ name, response })).not.toBe(true),
+                ),
+              ),
+            );
 
           const delegationStartSequence =
             yield* orchestrator.getThreadEventSequence(parentThreadId);

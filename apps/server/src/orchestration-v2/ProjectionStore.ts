@@ -354,14 +354,16 @@ const UNFINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
   "waiting",
 ]);
 /** In-memory twin of the SQL `recentRunLimit` filter. */
-const recentRuns = <T extends ReadonlyArray<ProjectionRun>>(runs: T, limit: number | undefined): T => {
+const recentRuns = <T extends ReadonlyArray<ProjectionRun>>(
+  runs: T,
+  limit: number | undefined,
+): T => {
   if (limit === undefined) return runs;
-  const floor = runs
-    .map((run) => run.ordinal)
-    .toSorted((left, right) => right - left)[Math.max(0, Math.floor(limit) - 1)];
+  const floor = runs.map((run) => run.ordinal).toSorted((left, right) => right - left)[
+    Math.max(0, Math.floor(limit) - 1)
+  ];
   return runs.filter(
-    (run) =>
-      UNFINISHED_RUN_STATUSES.has(run.status) || floor === undefined || run.ordinal >= floor,
+    (run) => UNFINISHED_RUN_STATUSES.has(run.status) || floor === undefined || run.ordinal >= floor,
   ) as unknown as T;
 };
 const settledLeafNodeKinds: ReadonlySet<ProjectionNode["kind"]> = new Set([
@@ -815,6 +817,9 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...(next.delegatedTaskStall === undefined && current.delegatedTaskStall !== undefined
+      ? { delegatedTaskStall: current.delegatedTaskStall }
+      : {}),
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
       : {}),
@@ -2222,7 +2227,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
                 payload_json = ${keepRecordedRunField(
-                  keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                  keepRecordedRunField(
+                    keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                    "$.delegatedTaskStall",
+                  ),
                   "$.restartCancelledBackgroundWork",
                 )}
             `;
@@ -4284,6 +4292,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         return rows.map((row) => ThreadId.make(row.thread_id));
       },
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+      // These lifetime-table scans run after readiness; a synchronous writer
+      // scan would still freeze requests even from a background Effect fiber.
+      (effect, kind) =>
+        kind === "subagent-results" || kind === "delegated-completions"
+          ? effect.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
+          : effect,
     );
 
     const getUnreadableThreadIds = Effect.fn("ProjectionStore.getUnreadableThreadIds")(

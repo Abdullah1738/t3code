@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import { HttpClient, HttpRouter, HttpServerRequest } from "effect/http";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
@@ -390,4 +391,77 @@ it.effect("runs the named cap before Brotli without encoding a large text body",
     expect(before.status).toBe(413);
     expect(yield* before.text).toContain("16 MiB limit");
   }).pipe(Effect.scoped),
+);
+
+it.effect.each(["application/json", "application/octet-stream", "text/event-stream"])(
+  "records the total size of a streamed %s reply without retaining its chunks",
+  (contentType) =>
+    Effect.gen(function* () {
+      const entries: LargeReplyLog.LargeReply[] = [];
+      const chunks = [new Uint8Array(600_000), new Uint8Array(600_000)];
+      const response = guardResponse(
+        HttpServerResponse.stream(Stream.fromIterable(chunks), { contentType }),
+        "GET /stream/:id",
+        { record: (entry) => entries.push(entry) },
+      );
+      expect(response.body._tag).toBe("Stream");
+      if (response.body._tag !== "Stream") return;
+      expect(
+        yield* Stream.runCollect(
+          response.body.stream.pipe(
+            Stream.orDie,
+            Stream.map((chunk) => chunk.byteLength),
+          ),
+        ),
+      ).toEqual([600_000, 600_000]);
+      expect(entries).toEqual([{ kind: "http", name: "GET /stream/:id", bytes: 1_200_000 }]);
+    }),
+);
+
+it.effect("a failed HTTP diagnostic cannot stop a reply or bypass the stream cap", () =>
+  Effect.gen(function* () {
+    const log = {
+      record: () => {
+        throw new Error("log unavailable");
+      },
+    };
+    const rejected = guardResponse(
+      HttpServerResponse.empty({
+        status: 413,
+        headers: { "x-robob-reply-rejected": "true" },
+      }),
+      "GET /probe/:id",
+      log,
+    );
+    expect(rejected.status).toBe(413);
+    const chunks = [new Uint8Array(MAX_REPLY_BYTES), new Uint8Array(1)];
+    const response = guardResponse(
+      HttpServerResponse.stream(Stream.fromIterable(chunks), {
+        contentType: "application/json",
+      }),
+      "GET /stream/:id",
+      log,
+    );
+    if (response.body._tag !== "Stream") throw new Error("expected stream");
+    const result = yield* Stream.runDrain(response.body.stream.pipe(Stream.orDie)).pipe(
+      Effect.exit,
+    );
+    expect(result._tag).toBe("Failure");
+    const accepted = guardResponse(
+      HttpServerResponse.stream(Stream.fromIterable(chunks.slice(0, 1)), {
+        contentType: "application/json",
+      }),
+      "GET /stream/:id",
+      log,
+    );
+    if (accepted.body._tag !== "Stream") throw new Error("expected stream");
+    expect(
+      yield* Stream.runCollect(
+        accepted.body.stream.pipe(
+          Stream.orDie,
+          Stream.map((chunk) => chunk.byteLength),
+        ),
+      ),
+    ).toEqual([MAX_REPLY_BYTES]);
+  }),
 );

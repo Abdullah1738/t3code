@@ -1,0 +1,30 @@
+{
+  "case_number": 21,
+  "reporter_id": "crpko2724",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:e51e6b19-3424-470f-8044-307c26ac743b",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 133545,
+    "sources": [
+      {
+        "denial_index": 348,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T08-40-23-01a1ce0e-8f86-75e0-9278-5c672bcdf169.jsonl",
+        "timestamp": "2026-11-12T04:43:32.659Z",
+        "call_id": "call_79df15ac78e7419e994bd0184e3cbebc",
+        "command_index": 1
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "mkdir -p tmp/card-2724\ncat > tmp/card-2724/check-approved-lifeline.py <<'PY'\nimport json\nimport subprocess\nimport sys\n\nsys.path.insert(0, '/Volumes/ExternalSSD/crpko-devops/tmp/card-CRP-12001-P3')\nimport guard_ci_role_v2 as guard\n\nresults = []\nfor ref in ['HEAD', 'origin/native-v1']:\n    content = subprocess.check_output(['git', 'show', ref + ':plan/iam/roles/crpko-dev-gha-plan.json']).decode()\n    spec = json.loads(content.replace('<account_id>', '434793037400').replace('<region>', 'ap-south-1').replace('<env>', 'dev'))\n    inline = spec['inline_policy']\n    managed = [entry['policy'] for entry in spec.get('managed_policies', [])]\n    # Compare the file to itself: this isolates rule L from any historical/live\n    # mismatch and still demonstrates that managed Allows cannot satisfy L.\n    checked = guard.check('plan', inline, inline, managed)\n    results.append({\n        'ref': ref,\n        'commit': subprocess.check_output(['git', 'rev-parse', ref]).decode().strip(),\n        'verdict': checked['verdict'],\n        'refusals': checked['refusals'],\n        'inline_length': checked['len_after'],\n        'managed_policy_names': [entry['name'] for entry in spec.get('managed_policies', [])],\n    })\nprint(json.dumps(results, indent=2))\nPY\npython3 tmp/card-2724/check-approved-lifeline.py > tmp/card-2724/approved-lifeline-results.json\ngit status --short",
+      "workdir": "/Users/ardud/checkouts/crp-12001-p3a",
+      "sha256": "c4103a5a6528cefb845ecf067f33d574e7a25557906c972ed78faeb0cfe368d7"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

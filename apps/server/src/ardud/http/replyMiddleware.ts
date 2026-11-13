@@ -75,37 +75,41 @@ export const guardResponse = (
     /json/i.test(contentType) ||
     (body._tag === "Uint8Array" && /^text\/(?!event-stream)/i.test(contentType));
   const length = "contentLength" in body ? body.contentLength : undefined;
-  if (response.headers["x-robob-reply-rejected"] === "true")
-    log?.record({ kind: "http", name, bytes: MAX_REPLY_BYTES + 1, rejected: true });
-  if (length !== undefined && length >= LargeReplyLog.LARGE_REPLY_BYTES) {
+  const record = (bytes: number, rejected = false) => {
     try {
-      log?.record({
-        kind: "http",
-        name,
-        bytes: length,
-        ...(structured && length > MAX_REPLY_BYTES ? { rejected: true } : {}),
-      });
+      if (bytes >= LargeReplyLog.LARGE_REPLY_BYTES)
+        log?.record({ kind: "http", name, bytes, ...(rejected ? { rejected: true } : {}) });
     } catch {
-      /* Diagnostics cannot bypass the cap. */
+      // Diagnostics must not change a reply or interrupt its stream.
     }
-  }
+  };
+  if (response.headers["x-robob-reply-rejected"] === "true") record(MAX_REPLY_BYTES + 1, true);
+  if (length !== undefined) record(length, structured && length > MAX_REPLY_BYTES);
   if (structured && length !== undefined && length > MAX_REPLY_BYTES)
     return HttpServerResponse.jsonUnsafe(
       { error: "reply_too_large", message: REPLY_TOO_LARGE },
       { status: 413, headers: { "cache-control": "no-store" } },
     );
-  if (body._tag === "Stream" && structured) {
+  if (body._tag === "Stream") {
     let bytes = 0;
+    let rejected = false;
     response = HttpServerResponse.setBody(
       response,
       HttpBody.stream(
         body.stream.pipe(
           Stream.mapEffect((chunk) => {
             bytes += chunk.byteLength;
-            if (bytes <= MAX_REPLY_BYTES) return Effect.succeed(chunk);
-            log?.record({ kind: "http", name, bytes, rejected: true });
+            if (!structured || bytes <= MAX_REPLY_BYTES) return Effect.succeed(chunk);
+            rejected = true;
             return Effect.die(new Error(REPLY_TOO_LARGE));
           }),
+          Stream.ensuring(
+            Effect.sync(() => {
+              // Known lengths were recorded before sending; unknown streams are
+              // counted without retaining chunks or encoding another copy.
+              if (length === undefined || rejected) record(bytes, rejected);
+            }),
+          ),
         ),
         body.contentType,
         body.contentLength,

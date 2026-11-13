@@ -275,7 +275,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
         event = self.event('python3 "$UNKNOWN_SCRIPT"')
         self.check(event, 'live-database-script-unresolved')
         result = engine.decide(event, 'codex')
-        for text in ('$UNKNOWN_SCRIPT', str(self.root), 'literal path', 'split the steps'):
+        for text in ('$UNKNOWN_SCRIPT', str(self.root), 'literal absolute script path'):
             self.assertIn(text, result['reason'])
 
     def test_interpreter_stdin_data_and_executed_controls(self):

@@ -1,3 +1,4 @@
+import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -49,6 +50,14 @@ type WorkerMessage =
       readonly type: "failed";
       readonly stage: string;
       readonly error: string;
+      readonly native?: {
+        readonly errcode?: unknown;
+        readonly errstr?: unknown;
+        readonly code?: unknown;
+        readonly sqliteFile?: unknown;
+        readonly sqliteRole?: unknown;
+        readonly sqliteOperation?: unknown;
+      };
       readonly quiet?: boolean;
     };
 
@@ -116,6 +125,7 @@ const fail = (stage, error) => {
     type: 'failed',
     stage: pendingRedaction ? 'redaction-pending' : held ? 'rebuild-held' : stage,
     error: describe(error),
+    native: { errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code, sqliteFile: error && error.sqliteFile, sqliteRole: error && error.sqliteRole, sqliteOperation: error && error.sqliteOperation },
     quiet: pendingRedaction || (held && error.notify === false),
   });
 };
@@ -146,6 +156,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   spawn: () => ExportWorker,
   options: SupervisorOptions = defaultSupervisorOptions,
 ): Effect.fn.Return<never, ReadonlyExportUnavailable> {
+  const observer = yield* ErrorObserver;
   const clock = yield* Clock.Clock;
   const stallMs = Duration.toMillis(Duration.fromInputUnsafe(options.stallTimeout));
   let lastBeat = clock.currentTimeMillisUnsafe();
@@ -158,6 +169,27 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     Effect.callback<never, ReadonlyExportUnavailable>((resume) => {
       const onMessage = (message: WorkerMessage) => {
         if (message?.type === "failed") {
+          if (message.native)
+            annotateSqliteError(
+              message.native,
+              {
+                file:
+                  typeof message.native.sqliteFile === "string"
+                    ? message.native.sqliteFile
+                    : "readonly-export:unknown",
+                role:
+                  message.native.sqliteRole === "primary" || message.native.sqliteRole === "replica"
+                    ? message.native.sqliteRole
+                    : "unknown",
+                connection: "export-worker",
+                operation:
+                  typeof message.native.sqliteOperation === "string"
+                    ? message.native.sqliteOperation
+                    : message.stage,
+                span: "ReadonlyReplica.superviseExportWorker",
+              },
+              observer,
+            );
           resume(
             Effect.fail(
               new ReadonlyExportUnavailable({

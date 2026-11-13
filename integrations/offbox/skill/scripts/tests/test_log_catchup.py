@@ -116,17 +116,18 @@ class LogCatchupTests(Isolated):
         self.history.assert_not_called()
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
 
-    def test_running_plain_logs_never_fetch_or_write(self):
+    def test_running_plain_logs_leave_active_followers_log_alone(self):
         for status in ('starting', 'running'):
             with self.subTest(status=status):
                 self.state(status, None)
                 ck = common.offsets_path(self.path).read_bytes()
                 before = self.path.stat()
-                code, out, err = self.invoke()
+                with common.file_lock('box-bx_a', timeout=0), patch.object(misc, '_refresh_running_ttl'):
+                    code, out, err = self.invoke()
                 self.assertEqual((code, out), (0, 'prefix\n'))
                 self.assertIn('is still running', err)
                 self.assertIn('7 bytes, last written ', err)
-                self.assertIn('only grows while someone follows it', err)
+                self.assertIn('includes the output fetched so far', err)
                 self.assertIn('offbox logs --follow run-x', err)
                 self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
                 self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
@@ -136,7 +137,8 @@ class LogCatchupTests(Isolated):
         self.state('running', None)
         self.path.unlink()
         ck = common.offsets_path(self.path).read_bytes()
-        code, out, err = self.invoke()
+        with common.file_lock('box-bx_a', timeout=0), patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
         self.assertEqual((code, out), (0, ''))
         self.assertIn('0 bytes, last written never', err)
         self.assertFalse(self.path.exists())

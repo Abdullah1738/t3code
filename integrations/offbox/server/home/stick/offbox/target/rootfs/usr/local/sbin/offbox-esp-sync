@@ -1,0 +1,94 @@
+#!/bin/bash
+# offbox-esp-sync: keep the second ESP a copy of the first, so either disk can boot the machine alone.
+# The grub packages update every ESP themselves (debconf grub-efi/install_devices); this is the safety net
+# and also carries our own EFI/offbox files. The source is the ESP mounted at /boot/efi.
+#   offbox-esp-sync            copy, and restore missing firmware boot entries / the removable path
+#   offbox-esp-sync firmware   the installer's last step: make both disks bootable for the firmware
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+src=/boot/efi
+mountpoint -q "$src" || { say "esp-sync: /boot/efi is not mounted, nothing to copy from"; exit 0; }
+srcdev=$(findmnt -n -o SOURCE "$src")
+sync_one() {
+  local dst=$1 changed=0 f rel
+  while IFS= read -r -d '' f; do
+    rel=${f#"$src"/}
+    case $rel in EFI/offbox/grubenv) continue ;; esac   # the trial flag is per ESP: GRUB clears its own copy
+    if ! cmp -s "$f" "$dst/$rel"; then
+      mkdir -p "$(dirname "$dst/$rel")"
+      cp -f "$f" "$dst/$rel.offbox-new" && mv -f "$dst/$rel.offbox-new" "$dst/$rel" && changed=$((changed + 1))
+    fi
+  done < <(find "$src" -type f -print0)
+  [ -s "$dst/EFI/offbox/grubenv" ] || { mkdir -p "$dst/EFI/offbox"; grub-editenv "$dst/EFI/offbox/grubenv" create; }
+  sync
+  echo "$changed"
+}
+copy_all() {
+  local dev n
+  for dev in $(esp_parts); do
+    [ "$dev" = "$srcdev" ] && continue
+    n=$(with_esp "$dev" sync_one) || { say "esp-sync: could not mount $dev"; continue; }
+    [ "$n" != 0 ] && say "esp-sync: copied $n file(s) to $dev"
+  done
+  return 0
+}
+
+# firmware_ok: every ESP has a firmware boot entry (when the firmware variables are reachable) and the
+# removable path, so the firmware can start either disk with or without its boot entries.
+has_entry() { efibootmgr -v 2>/dev/null | grep -i "$(blkid -o value -s PARTUUID "$1")" | grep -qi 'shimx64'; }
+has_removable() { [ -s "$1/EFI/BOOT/BOOTX64.EFI" ]; }
+firmware_ok() {
+  local dev
+  for dev in $(esp_parts); do
+    with_esp "$dev" has_removable || return 1
+    if [ -d /sys/firmware/efi/efivars ] && efibootmgr >/dev/null 2>&1; then has_entry "$dev" || return 1; fi
+  done
+  return 0
+}
+# make_bootable: let grub's own tooling write the boot entries and the removable path on every ESP
+# (debconf: update_nvram + force_efi_extra_removable), add any entry that is still missing, disks first.
+make_bootable() {
+  local dev disk i=0 nums="" num rest order
+  printf 'grub-efi-amd64 grub2/update_nvram boolean true\ngrub-efi-amd64 grub2/force_efi_extra_removable boolean true\n' |
+    debconf-set-selections
+  /usr/lib/grub/grub-multi-install || say "esp-sync: grub-multi-install returned an error"
+  copy_all
+  [ -d /sys/firmware/efi/efivars ] || return 0
+  for dev in $(esp_parts); do
+    i=$((i + 1))
+    if ! has_entry "$dev"; then
+      disk=/dev/$(lsblk -no PKNAME "$dev" | head -1)
+      efibootmgr -c -d "$disk" -p 1 -L "ubuntu-disk$i" -l '\EFI\ubuntu\shimx64.efi' >/dev/null 2>&1 ||
+        say "esp-sync: could not create a firmware boot entry for $dev"
+    fi
+    num=$(efibootmgr -v 2>/dev/null | grep -i "$(blkid -o value -s PARTUUID "$dev")" | grep -i 'shimx64' |
+      sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | head -1)
+    [ -n "$num" ] && nums="$nums${nums:+,}$num"
+  done
+  if [ -n "$nums" ]; then
+    order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p')
+    rest=$(printf '%s\n' "$order" | tr ',' '\n' | grep -vxF -f <(printf '%s\n' "$nums" | tr ',' '\n') | paste -sd, -)
+    [ "$order" = "$nums${rest:+,$rest}" ] || efibootmgr -o "$nums${rest:+,$rest}" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+case ${1:-sync} in
+  firmware)
+    # called by the installer as its last step, after the finished-install mark is written
+    make_bootable
+    firmware_ok || { say "esp-sync: the disks are not fully bootable for the firmware"; exit 1; }
+    say "esp-sync: both disks are bootable for the firmware"
+    ;;
+  *)
+    copy_all
+    # A finished install whose last installer step was cut short (or whose firmware entries were lost with
+    # the firmware settings) is completed here; offbox-boot-health runs this after every healthy boot.
+    if [ -s /etc/offbox/installed ] && ! firmware_ok; then
+      say "esp-sync: firmware boot entries or the removable path are missing; restoring them"
+      make_bootable
+      if firmware_ok; then say "esp-sync: both disks are bootable for the firmware again"; else say "esp-sync: could not restore them"; fi
+    fi
+    ;;
+esac
+exit 0

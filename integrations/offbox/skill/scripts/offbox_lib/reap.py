@@ -4,19 +4,44 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 
 from __future__ import annotations
 
-from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, now, say)
+import time
+
+from . import api, bases, capacity, lease, prune
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
+                     RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+                     iso_ts, kv_set, mine, now, say)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
 REAP_BUDGET_S = 100
+START_GRACE_S = 300
+START_CHECKS_PER_PASS = 3
+# Leave cleanup time after a fair, bounded pass over run keepalives.
+RENEW_BUDGET_S = 60
+RENEW_BOX_BUDGET_S = 5
 
 
 def _protected(con) -> set[str]:
     ids = {r[0] for r in con.execute("SELECT box_id FROM bases")}
     ids |= {r[0] for r in con.execute("SELECT box_id FROM templates")}
     return ids
+
+
+def _recheck_prune_holds(con, actions: list[str]) -> None:
+    # Check least recently probed first so an unreachable worker cannot starve the rest on every tick.
+    rows = con.execute("SELECT h.box_id, h.run_id FROM prune_holds h JOIN leases l USING(box_id) "
+                       "LEFT JOIN kv k ON k.k='prunecheck:' || h.box_id "
+                       f"WHERE l.state='running' AND {mine('l')} AND h.created_at<? "
+                       "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id "
+                       "AND r.status IN ('starting','running')) "
+                       "ORDER BY CAST(COALESCE(k.v, '0') AS REAL), h.created_at", (now() - 300,)).fetchall()
+    deadline = time.monotonic() + 10
+    for hold in rows:
+        if time.monotonic() >= deadline:
+            break
+        kv_set(con, 'prunecheck:' + hold['box_id'], now())
+        released = prune.recheck(con, hold['box_id'], hold['run_id'], deadline - time.monotonic())
+        actions.append(f"prune hold {'released' if released else 'kept'} {hold['box_id']}")
 
 
 def reap(dry: bool = False) -> list[str]:
@@ -45,11 +70,11 @@ def _bringup_lock(row) -> str:
 
 
 def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
-    actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from boat")
+    actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from {api.NAME}")
     if not dry:
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         con.commit()
-        event(con, box_id, "reap_forget", "recipe box no longer exists on boat")
+        event(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
 
 
 def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
@@ -104,13 +129,14 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
                         "AND status IN ('starting','running')", (now(), "client ended before it got a box", rid))
             con.commit()
+    start_budget = {'checks': START_CHECKS_PER_PASS}
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
     protected = _protected(con)
     try:
         live = {b["id"]: b for b in api.list_boxes()}
     except OffboxError as e:
-        return [f"boat list failed: {e}"]
+        return [f"{api.NAME} list failed: {e}"]
 
     def act(box_id, what, why, fn, expected=None):
         line = f"{'would ' if dry else ''}{what} {box_id}: {why}"
@@ -142,8 +168,14 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     refreshes = 0  # resume+stop of pinned leases near boat's 14-day limit; a few per pass (120 s budget)
     # A lease with an open prune hold stays on the list even if it is marked deleted: its hold is released only
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
-    rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
-                       "OR box_id IN (SELECT box_id FROM prune_holds)").fetchall()
+    # `live` is what this process's token can see. On the home server that is one owner's boxes, while the database
+    # holds every owner's leases: only this owner's are compared with it (mine()). 12 Nov: a pass with our token
+    # did not find Moni's box in its list, forgot her lease, and her next call made a second, empty box.
+    rows = con.execute("SELECT * FROM leases WHERE (state IN ('running','stopped') "
+                       f"OR box_id IN (SELECT box_id FROM prune_holds)) AND {mine()}").fetchall()
+    _renew_live_runs(con, rows, live, protected, dry)
+    if not dry:
+        _recheck_prune_holds(con, actions)
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -159,12 +191,12 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 if lease.release_if_confirmed(con, bid):
                     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
                     con.commit()
-                    event(con, bid, "reap_forget", "box no longer exists on boat")
-                    actions.append(f"forget {bid}: gone from boat")
+                    event(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    actions.append(f"forget {bid}: gone from {api.NAME}")
                 else:
-                    actions.append(f"hold kept {bid}: gone from boat, not yet confirmed")
+                    actions.append(f"hold kept {bid}: gone from {api.NAME}, not yet confirmed")
             else:
-                actions.append(f"forget {bid}: gone from boat")
+                actions.append(f"forget {bid}: gone from {api.NAME}")
             continue
         if b.get("dataExpiredAt"):
             # Same release rule as a box gone from boat: nothing can run on a box whose data is deleted, but the
@@ -173,21 +205,17 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 if lease.release_if_confirmed(con, bid):
                     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
                     con.commit()
-                    event(con, bid, "reap_expired", f"boat deleted its data at {b['dataExpiredAt']}")
-                    actions.append(f"forget {bid}: boat deleted its data")
+                    event(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    actions.append(f"forget {bid}: {api.NAME} deleted its data")
                 else:
-                    actions.append(f"hold kept {bid}: boat deleted its data, not yet confirmed")
+                    actions.append(f"hold kept {bid}: {api.NAME} deleted its data, not yet confirmed")
             else:
-                actions.append(f"forget {bid}: boat deleted its data")
+                actions.append(f"forget {bid}: {api.NAME} deleted its data")
             continue
         state = b.get("state")
-        if not dry and state in api.LIVE_STATES and con.execute(
-                "SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
-            released = lease.release_hold_if_worker_gone(con, bid)
-            actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
-            _check_stale_runs(con, bid, state, dry, actions)
+            _check_stale_runs(con, bid, state, dry, actions, start_budget)
             running_runs = lease.active_runs(con, bid)
             # Failed history reconciliation must not be overwritten by release_if_confirmed's generic lost update.
             if running_runs:
@@ -253,7 +281,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     # lock without waiting and re-reads the row under it. A selection made before the lock is stale: a row that became
     # running (or was reused) is skipped, never deleted.
     for r in con.execute("SELECT box_id, owner, repo_root, state FROM leases "
-                         "WHERE state IN ('quarantined','bringing_up')").fetchall():
+                         f"WHERE state IN ('quarantined','bringing_up') AND {mine()}").fetchall():
         bid = r["box_id"]
         if r["state"] == "bringing_up" and not dry and not _still_bringing_up(con, bid):
             continue
@@ -290,24 +318,105 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     return actions
 
 
-def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
+def _renew_live_runs(con, rows, live: dict, protected: set[str], dry: bool) -> None:
+    if dry:
+        return
+    running = {r[0] for r in con.execute("SELECT DISTINCT box_id FROM runs WHERE status='running'")}
+    boxes = sorted(r['box_id'] for r in rows if r['box_id'] in running and r['box_id'] not in protected
+                   and (b := live.get(r['box_id'])) and b.get('state') in api.LIVE_STATES
+                   and not b.get('dataExpiredAt') and not con.execute(
+                       "SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{r['box_id']}",)).fetchone())
+    cursor = con.execute("SELECT v FROM kv WHERE k='reap:renew_cursor'").fetchone()
+    if cursor:
+        boxes = [bid for bid in boxes if bid > cursor[0]] + [bid for bid in boxes if bid <= cursor[0]]
+    with api.budget(RENEW_BUDGET_S):
+        for bid in boxes:
+            if api.left() < RENEW_BOX_BUDGET_S:
+                break
+            # Persist before I/O so timeouts or a killed pass cannot restart at the same slow prefix forever.
+            con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('reap:renew_cursor',?)", (bid,))
+            con.commit()
+            with api.budget(RENEW_BOX_BUDGET_S):
+                _keep_live_runs(con, bid, live[bid], dry)
+
+
+def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
+    from .runs import remote_alive
+    if dry or box.get('state') not in api.LIVE_STATES:
+        return
+    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status='running'", (bid,)).fetchall():
+        if now() - (run['start_at'] or 0) >= ORPHAN_RUN_MAX_S:
+            inserted = con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
+                                   (f"run_orphan_cap:{run['run_id']}", '1')).rowcount
+            con.commit()
+            if inserted:
+                event(con, bid, 'run_orphan_cap', run['run_id'])
+            continue
+        if not run['process_id']:
+            continue
+        try:
+            with api.budget(10):
+                st = api.cmd_status(bid, run['process_id'], timeout=5, retries=0)
+                alive = bool(st and st.get('running') is True)
+                # A missing/lost tracker is not evidence of death; #770's wrapper marker is independent.
+                if not alive and (st is None or st.get('status') == 'lost'):
+                    left = api.left()
+                    alive = bool(left and left > 0 and remote_alive(bid, run['run_id'], timeout=min(5, left)) == 'alive')
+                if alive:
+                    # Background startup may have extended the deadline since list_boxes() took its snapshot.
+                    current = api.get(bid)
+                    if current and current.get('state') in api.LIVE_STATES:
+                        lease.ensure_ttl(bid, RUN_TTL_S, current)
+                    return
+        except OffboxError:
+            continue
+
+
+def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str], budget=None) -> None:
     try:
-        with file_lock('box-'+bid, timeout=0):
-            _check_unlocked(con, bid, state, dry, actions)
+        with file_lock('box-'+bid, timeout=0), api.budget(RENEW_BOX_BUDGET_S + 10):
+            _check_unlocked(con, bid, state, dry, actions, budget)
     except OffboxError:
         pass
 
 
-def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
+def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], budget=None) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
     from .runs import confirmed_lost, reconcile_lost
+    from . import start_check
+    from .misc import _client_alive
+    budget = budget if budget is not None else {'checks': START_CHECKS_PER_PASS}
+    if not dry and state in api.STOPPED_STATES and con.execute(
+            "SELECT 1 FROM kv WHERE k LIKE 'start_unknown:%' AND v=?", (bid,)).fetchone():
+        lease._release_locked(con, bid)
     if not dry:
         reconcile_lost(con, bid, state=state)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
         status, code = None, None
-        if run['status'] == 'starting' and not run['process_id'] and now()-(run['start_at'] or 0) < 3600:
-            continue
+        unattached = con.execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{run['run_id']}",)).fetchone()
+        if (run['status'] == 'starting' and not run['process_id']) or unattached:
+            age = now() - (run['start_at'] or 0)
+            orphan = bool(run['error']) or not _client_alive(run['client_pid'], run['start_at'])
+            if orphan and age >= START_GRACE_S:
+                if dry:
+                    actions.append(f"would check run {run['run_id']} on {bid} over ssh")
+                    continue
+                left = api.left()
+                if budget['checks'] <= 0 or (left is not None and left < start_check.SSH_TIMEOUT_S + 2):
+                    continue
+                budget['checks'] -= 1
+                modern = start_check.claims_enabled(con, run['run_id'])
+                result = (start_check.check(bid, run['run_id'], claim=modern)
+                          if state in api.LIVE_STATES else start_check.Result())
+                # Legacy wrappers cannot be fenced; receipts are still authoritative.
+                if modern or result.code is not None:
+                    start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
+                                       until=None if api.left() is None else now() + max(0, api.left()))
+                    actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
+                    continue
+            if age < 3600 or not orphan:
+                continue
         if state in api.STOPPED_STATES or state in ('error','cancelled'):
             status = "lost"
             if run['command_id']:
@@ -327,6 +436,9 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
             if st is None:
                 # Missing/unavailable status is not proof a process stopped.
                 continue
+            elif not st.get("running") and st.get('status') == 'interrupted':
+                # Our server restarted under the run and did not run it again (runs.Interrupted).
+                status, code = 'interrupted', EXIT_INTERRUPTED
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 if st.get('status') == 'lost':
                     try:

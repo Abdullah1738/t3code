@@ -1,0 +1,4 @@
+offbox home server   \n   kernel \r
+addresses: \4   \6
+reach it over SSH as root with the offbox key; after a login here: offbox-status
+

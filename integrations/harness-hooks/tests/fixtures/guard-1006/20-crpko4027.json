@@ -1,0 +1,30 @@
+{
+  "case_number": 20,
+  "reporter_id": "crpko4027",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:30bd8f36-8558-4fb0-add1-e52a7e224b4d",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 133458,
+    "sources": [
+      {
+        "denial_index": 205,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T08-16-25-01a1cdf8-9d8c-7141-b638-26b83f48db6e.jsonl",
+        "timestamp": "2026-11-12T04:35:16.287Z",
+        "call_id": "call_fa37f41205904edba80e94e1ba35a1bd",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\nimport shutil,json\nroot=Path('/Volumes/ExternalSSD/crpko-devops/tmp/cards/4027')\nshutil.copytree('tmp/carry-4027', root/'regression-proof',dirs_exist_ok=True)\np=root/'facts.json';d=json.loads(p.read_text());d['focused']={'run_id':'run-1112-083306-a5c4','command':'offbox run --include tmp/carry-4027 -- \\'PYTHONPATH=. RUN_SPEC=1 uv run python tmp/carry-4027/prove.py\\'','head':d['head'],'exit':0,'base':'bbcf8bbe7cf51902b8bb9aa95ce8d34049a7d872','base_result':'6 failed, 1 passed; pytest exit 1. Storage ClientError escapes command/parallel/cancellation; startup and watermark leave IN_PROGRESS instead of FAILED. All five production files restored from the pre-carry parent for the red run.','head_result':'12 passed, pytest exit 0; 7 carried PostgreSQL cases and 5 scratch boundary checks (pause, migration, ExecutionDeferralUnavailable, KeyboardInterrupt, SystemExit). No carried test edits needed.','probe_path':str(root/'regression-proof/test_manifest_controls.py')};p.write_text(json.dumps(d,indent=2)+'\\n')\nPY\noffbox logs run-1112-083306-a5c4 > /Volumes/ExternalSSD/crpko-devops/tmp/cards/4027/regression-proof.log",
+      "workdir": "/Users/ardud/checkouts/reporting-nv1-carry-219",
+      "sha256": "98b9aea45b354a995a8aa1ba311dd4cbcc51cc06ba251047290d5ac803d52977"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

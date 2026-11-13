@@ -1,0 +1,12 @@
+{
+  "id": "python-shadow",
+  "title": "Python import shadows in shared scratch directories",
+  "check": "./check.sh",
+  "interval_s": 900,
+  "mode": "notify",
+  "context": "Report only. Do not execute, import, delete, move or rename any reported file. Confirm metadata using isolated Python and inspect source only with cat/head or grep. Never open a live OpenCode/Robob database. Cleanup needs the owner's explicit choice. The first run records a silent baseline; run check.py --report before registration to review existing files.",
+  "expires_at": null,
+  "max_fires": 0,
+  "serial": false,
+  "triggers": []
+}

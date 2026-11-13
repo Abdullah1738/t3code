@@ -64,7 +64,7 @@ else: raise AssertionError(sys.argv)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(self.loaded.exists())
         config = plistlib.loads(self.plist.read_bytes())
-        self.assertEqual(config['ProcessType'], 'Interactive')
+        self.assertEqual(config['ProcessType'], 'Standard')
         self.assertEqual(config['StartInterval'], 14400)
         self.assertFalse(config['RunAtLoad'])
         self.assertEqual(config['ProgramArguments'], ['/usr/bin/caffeinate', '-i', '/bin/bash',

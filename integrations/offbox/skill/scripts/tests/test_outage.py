@@ -67,7 +67,7 @@ class ApiOutageTests(OutageBase):
         self.urlopen.side_effect = cf(525)
         with self.assertRaises(api.ApiError):
             api.cmd_start("bx", "true")
-        self.assertEqual(self.urlopen.call_count, 1 + api.CONNECT_RETRIES)
+        self.assertEqual(self.urlopen.call_count, 1)
 
     def test_resume_is_sent_once_on_525(self):
         self.urlopen.side_effect = cf(525)
@@ -167,8 +167,7 @@ class CmdRunOutageTests(OutageBase):
     def run_cli(self, argv, side_effect, wait=None, fallback_rc=0):
         a = cli.build_parser().parse_args(["run", "--"] + argv)
         err = io.StringIO()
-        with patch("offbox_lib.localfirst.decide", return_value="test"), \
-                patch.object(runs, "run_remote", side_effect=side_effect) as rr, \
+        with patch.object(runs, "run_remote", side_effect=side_effect) as rr, \
                 patch.object(outage, "wait_until_up", return_value=wait) as w, \
                 patch.object(fallback, "run_local", return_value=fallback_rc) as loc, \
                 patch.object(fallback, "note_infra_failure"), \

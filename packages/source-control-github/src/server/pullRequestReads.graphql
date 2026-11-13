@@ -75,6 +75,7 @@ query PullRequestCore(
       closedAt
       headRefName
       baseRefName
+      baseRefOid
       headRefOid
       isCrossRepository
       headRepositoryOwner {
@@ -88,6 +89,9 @@ query PullRequestCore(
       }
       headRef {
         id
+        target {
+          oid
+        }
       }
       author {
         login
@@ -138,6 +142,7 @@ query PullRequestCore(
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
               contexts(first: 100) {
                 nodes {
@@ -169,6 +174,7 @@ query PullRequestCheckContexts(
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
               contexts(first: 100, after: $after) {
                 nodes {

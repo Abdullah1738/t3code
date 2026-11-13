@@ -1,3 +1,4 @@
+import * as DelegatedTaskProgressGuard from "./DelegatedTaskProgressGuard.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -366,6 +367,9 @@ export const layer = Layer.mergeAll(
   layerOrchestratorProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
+  DelegatedTaskProgressGuard.layer.pipe(
+    Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
+  ),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,

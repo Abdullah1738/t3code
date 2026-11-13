@@ -20,6 +20,7 @@ import {
   TurnItemId,
 } from "./baseSchemas.ts";
 import {
+  ScheduledTask,
   ScheduledTaskRunStatus,
   ScheduledTaskSchedule,
   ScheduledTaskUpsertSchedule,
@@ -44,6 +45,7 @@ import {
   ProviderOptionSelectionValue,
 } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { ModelSelectionRouting } from "./modelSelection.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000)).annotate({
   description: "Complete task or message text for the target agent.",
@@ -185,6 +187,10 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
     description:
       "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child.",
   }),
+  idleTimeoutMs: Schema.optional(Schema.Finite).annotate({
+    description:
+      "No-progress limit for the child, including follow-ups. 0 or omitted uses 15 minutes; other values clamp to 1 minute–2 hours. Thinking and provider retries do not count as progress.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   runtimeMode: Schema.optional(
     OrchestratorMcpRuntimeMode.annotate({
@@ -233,12 +239,17 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   latestTerminalResultContextTransferId: Schema.NullOr(ContextTransferId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.NullOr(Schema.String),
+  selectionRouting: Schema.optional(Schema.NullOr(ModelSelectionRouting)),
   options: Schema.optional(
     Schema.Array(ProviderOptionSelection).annotate({
       description:
         "Stored model option selections for the child run, or its thread before a run starts. Omitted selections use provider defaults.",
     }),
   ),
+  failureReason: Schema.optional(Schema.Literal("stalled")),
+  lastProgressAt: Schema.optional(Schema.NullOr(Schema.String)),
+  lastProgressKind: Schema.optional(Schema.NullOr(Schema.String)),
+  thinkingSince: Schema.optional(Schema.NullOr(Schema.String)),
   summary: Schema.NullOr(Schema.String),
   resultLooksIncomplete: Schema.optional(Schema.Boolean),
   incompleteReason: Schema.optional(Schema.String),
@@ -616,6 +627,8 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   schedule: ScheduledTaskSchedule,
   nextRunAt: Schema.NullOr(IsoDateTime),
   lastRunStatus: ScheduledTaskRunStatus,
+  lastRunError: Schema.optional(ScheduledTask.fields.lastRunError),
+  missedRuns: ScheduledTask.fields.missedRuns,
   webhookUrl: Schema.optional(Schema.String).annotate({
     description:
       "Public URL to give the sender. Absent when this environment has no T3 Connect managed tunnel; the user must enable T3 Connect remote access first.",
@@ -714,6 +727,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "caller_unresolved",
+      "delegation_timeout",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",

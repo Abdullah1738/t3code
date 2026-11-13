@@ -8,12 +8,14 @@
   money-cases update ID [--merchant M] [--amount A] [--currency C] [--reference R]
                   [--state S] [--next N] [--deadline D] [--why TEXT] [--who W]
                   [--add-watcher ID] [--drop-watcher ID] [--note TEXT]
-                  [--because TEXT | --reply ID]   required with --deadline
+                  [--source REF | --reply ID]   required for deadline changes; [--because TEXT] is optional
   money-cases add ... --unmatched     no merchant match: recorded as "unmatched", never guessed
                   [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
   money-cases card-swap --old OLD --new NEW [--also STALE ...] [--case ID ...] [--dry-run]
                   lists open cases naming the old card; writes only the cases picked with --case; never closes a case
                   and leaves a next line that holds a card number or code as is
+  money-cases card-dead LAST4 --note TEXT
+  money-cases cards    list dead cards
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
   money-cases brief    one line for the morning brief, nothing when no case is open
@@ -33,6 +35,7 @@ import argparse
 from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
+from email.utils import parseaddr
 import fcntl
 import faulthandler
 import hashlib
@@ -49,6 +52,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charges  # noqa: E402
+import payments  # noqa: E402
 
 TZ = ZoneInfo('Asia/Dubai')
 DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
@@ -234,6 +238,13 @@ def check_text(name, text, required=True):
     return check_secret(name, text)
 
 
+def check_source(source):
+    source = check_text('source', source)
+    if not re.fullmatch(r'(?:mail|sms|imessage):\S(?:.*\S)?|statement:\S(?:.*\S)?#[1-9][0-9]*', source):
+        raise CaseError('source must be mail:<id>, sms:<id>, imessage:<id> or statement:<path>#<line> (value not shown)')
+    return source
+
+
 def check_watcher(watcher_id, root=None):
     if not ID.fullmatch(watcher_id):
         raise CaseError(f'watcher id {watcher_id!r} is not a robob-watch id')
@@ -243,7 +254,7 @@ def check_watcher(watcher_id, root=None):
 
 
 UNMATCHED = 'unmatched'
-KINDS = ('charge', 'hold')
+KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected')
 # Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
 ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
        'I stay quiet on it until you answer')
@@ -390,6 +401,21 @@ def load_questions(data=None):
     return book
 
 
+def load_cards(data=None):
+    book = read_json((data or DATA) / 'cards.json', {'dead': {}})
+    if not isinstance(book, dict) or not isinstance(book.get('dead'), dict):
+        raise CaseError('cards.json is not a cards file')
+    for last4, info in book['dead'].items():
+        last4_arg('dead card', last4)
+        if not isinstance(info, dict) or not isinstance(info.get('since'), str) or not isinstance(info.get('note'), str):
+            raise CaseError('cards.json has an invalid dead card entry')
+    return book
+
+
+def dead_cards(data=None):
+    return load_cards(data)['dead']
+
+
 class Locked:
     """Serialise read-modify-write of cases.json (or questions.json) between CLI calls and checks."""
 
@@ -403,7 +429,7 @@ class Locked:
         try:
             with within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
                 fcntl.flock(self.lock, fcntl.LOCK_EX)
-            self.book = load(self.data) if self.name == 'cases' else load_questions(self.data)
+            self.book = {'cases': load, 'questions': load_questions, 'cards': load_cards}[self.name](self.data)
         except BaseException:
             self.lock.close()
             raise
@@ -470,7 +496,7 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
 
 
 def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None,
-           because='', reply=''):
+           because='', reply='', source=''):
     checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline}
     with Locked(data) as book:
         case = find(book, case_id)
@@ -492,12 +518,15 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
                     moved = True
         because = check_text('because', because, False)
         reply = check_text('reply', reply, False)
-        if moved and not (because or reply):
-            raise CaseError('a deadline change needs --because (the reason) or --reply (his reply id); nothing was changed')
+        source = check_source(source) if source else ''
+        if moved and not (source or reply):
+            raise CaseError('deadline changes need --source (mail:, sms:, imessage: or statement:) or --reply (his reply id); nothing was changed')
         if because:
             said.append(f'because: {because}')
         if reply:
             said.append(f'owner reply {reply}')
+        if source:
+            said.append(f'source: {source}')
         for w in add_watchers:
             check_watcher(w, root)
             if w not in case['watchers']:
@@ -513,6 +542,8 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
             raise CaseError('nothing to change')
         case['updated'] = stamp(at)
         entry = {'at': stamp(at), 'text': '; '.join(said)}
+        if source:
+            entry['source'] = source
         if reply:
             # Only his reply id is an owner answer; a --because reason alone is recorded, not answered.
             entry['owner'] = True
@@ -531,6 +562,13 @@ class _DryRun(Exception):
     """Raised inside Locked so nothing is written."""
 
 
+def card_dead(data, last4, note, at=None):
+    last4, note = last4_arg('card', last4), check_text('note', note)
+    with Locked(data, 'cards') as book:
+        book['dead'][last4] = {'since': book['dead'].get(last4, {}).get('since', stamp(at)), 'note': note}
+    return book['dead'][last4]
+
+
 def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
     """Point open cases at a replacement card: rewrite the old (and stale planned) last-4 in `next` only.
 
@@ -541,6 +579,8 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
     if old == new:
         raise CaseError('old and new card are the same last 4')
     stale = sorted({old, *(last4_arg('also', a) for a in also)})
+    if new in stale:
+        raise CaseError('new card is also listed as stale')
     token = re.compile(r'(?<!\d)(?:' + '|'.join(stale) + r')(?!\d)')
     picks = set(cases)
     changes = []
@@ -574,6 +614,11 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
                 raise CaseError(f'case {redact(nothing[0])!r} has nothing to swap; pick from the list')
             for _, _, change in rewrites:
                 change['picked'] = change['id'] in picks
+            if not dry_run:
+                with Locked(data, 'cards') as cards:
+                    for last4 in stale:
+                        cards['dead'][last4] = {'since': cards['dead'].get(last4, {}).get('since', stamp(at)),
+                                                'note': f'replaced by {new}'}
             for case, after, change in rewrites:
                 if dry_run or not change['picked']:
                     continue
@@ -588,6 +633,380 @@ def card_swap(data, old, new, also=(), dry_run=False, at=None, cases=()):
     return changes
 
 
+RENEWAL = re.compile(r'\b(?:renews on|will renew|auto[ -]?renew(?:al)?|next billing date|will be charged|subscription renewal)\b', re.I)
+RENEWAL_DATE = re.compile(r'\b(?:20\d{2}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2}|'
+                          r'\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+20\d{2}|'
+                          r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+20\d{2})\b', re.I)
+RENEWAL_CARD = re.compile(r'\bending\s+(?:in\s+)?([0-9]{4})(?!\d)|[•*]{4}\s*([0-9]{4})(?!\d)', re.I)
+RENEWAL_TIER = r'(?:pro|plus|premium|basic|business|starter|standard|enterprise|free|team|individual|family)'
+
+
+def renewal_disabled(text):
+    entity = r'auto[ -]?renew(?:al)?|subscription|renewal|membership|plan|card'
+    negative = re.compile(r'\b(?:not|never|no longer|no|without|[a-z]+n[’\']t)\s+'
+                          r'(?:(?:be|been|being|to|set to|going to|scheduled to|ever|currently|[a-z]+ly)\s+){0,5}'
+                          r'(?:auto[ -]?)?(?P<verb>renew(?:ed|s|al)?|charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?)\b', re.I)
+    state = re.compile(r'(?:^|\b(?:is|was|has|have|had|remains|stays)\s+|[:=]\s*)'
+                       r'(?:(?:already|been|set to|[a-z]+ly|still|now)\s+){0,5}'
+                       r'(?:cancell?ed|disabled|deactivated|turned off|switched off|off)\b', re.I)
+    # Payment-method adjuncts aren't the subject of a trailing renewal status.
+    text = re.sub(r'\b(?:using|with) (?:your )?card (?:ending (?:in )?|[•*]{4}\s*)[0-9]{4}\b', '', text, flags=re.I)
+    for clause in re.split(r'(?<=[.!?;])\s+|\bbut\b|\bhowever\b|\bbecause\b', text, flags=re.I):
+        # Instructions and conditional consequences don't establish the renewal's
+        # current state. A cancelled card is precisely why this case needs action.
+        if clause.rstrip().endswith('?'):
+            continue
+        assertions = []
+        boundaries = [0] + [m.end() for m in re.finditer(r',\s+(?!\d)', clause, re.I)]
+        for lo, hi in zip(boundaries, boundaries[1:] + [len(clause)]):
+            part = clause[lo:hi]
+            for subject in re.finditer(r'\b(?:' + entity + r')\b', part, re.I):
+                if subject[0].lower() == 'card':
+                    continue
+                tail = part[subject.end():]
+                offset = subject.end() + len(tail) - len(tail.lstrip())
+                for match in state.finditer(tail.lstrip()):
+                    if not re.search(r'\bcard\b', part[subject.end():offset + match.start()], re.I):
+                        assertions.append((lo + offset + match.start(), lo + offset + match.end(), lo))
+            for match in negative.finditer(part):
+                if re.fullmatch(r'charg(?:e|ed)|bill(?:ed)?|debit(?:ed)?', match['verb'], re.I):
+                    tail = clause[lo + match.end():].lstrip()
+                    amount = payments.MONEY.match(tail)
+                    if amount:
+                        tail = tail[amount.end():]
+                    date_ref = (r'(?:then|(?:this|that) date|(?:your|the|next)(?: next)? '
+                                r'(?:renewal|billing|payment) (?:date|cycle|period)|today|tomorrow|'
+                                r'next (?:week|month|year)|' + RENEWAL_DATE.pattern + r')')
+                    # "Not charged until renewal" schedules billing; it doesn't
+                    # cancel the renewal. Only qualify this billing assertion.
+                    timing = re.match(r'\s*(?:(?:again|at all|anything|any amount)\s*)?(?P<comma>,?)\s*'
+                                      r'(?:until|before|prior to)\s+' + date_ref + r'(?=$|[\s,.;!?])', tail, re.I)
+                    if timing:
+                        # After a comma, a date followed by another action can start
+                        # independent advice ("before tomorrow please read...").
+                        if not timing['comma'] or not re.search(r'\w', tail[timing.end():]):
+                            continue
+                    if re.fullmatch(r'\s*(?:until|before|prior to)\s+' + date_ref +
+                                    r'\s*,?\s*(?:you|we|your card|your account)\s+'
+                                    r'(?:(?:will|are|is|do|does|have|has)\s+)?', clause[:lo + match.start()], re.I):
+                        continue
+                assertions.append((lo + match.start(), lo + match.end(), lo))
+            for match in re.finditer(r'\b(?:cancell?ed|disabled|deactivated|turned off|switched off) '
+                                     r'(?:your |the )?(?:' + entity + r')\b', part, re.I):
+                if not re.search(r'\b(?:not|never|no longer|[a-z]+n[’\']t)\b', part[:match.start()], re.I) and not re.search(r'\bcard$', match[0], re.I):
+                    assertions.append((lo + match.start(), lo + match.end(), lo))
+        conditions = list(re.finditer(r'\b(?:if|unless|in case)\b', clause, re.I))
+        for start, end, lo in assertions:
+            prefix = clause[lo:start]
+            if re.match(r'\s*and\b', prefix, re.I):
+                # A comma doesn't end the control of "ensure X, and Y".
+                # Causal clauses are split above because they assert their own fact.
+                prefix = clause[:start]
+            if re.search(r'\b(?:can|could|may|might|would|should|ensure|make sure|how to)\b|'
+                         r'^\s*(?:please )?(?:set|keep)\b', prefix, re.I):
+                continue
+            # A condition attached to the assertion qualifies it. Advice in a later
+            # comma clause ("cancelled, contact us if...") leaves the fact intact.
+            conditional = any(c.start() < end or ',' not in clause[end:c.start()] or
+                              not re.search(r'\w', clause[end:c.start()].rsplit(',', 1)[-1]) for c in conditions)
+            if not conditional:
+                return True
+    return False
+
+
+def renewal(text, sender='', subject=''):
+    """Only dated renewal notices with one explicit money value and card can become cases."""
+    body = ' '.join(text.split())
+    text = ' '.join((subject + ' ' + body).split()).replace('$', 'USD ')
+    marker = RENEWAL.search(text)
+    if not marker or renewal_disabled(text):
+        return None
+    if re.search(r'\bwill be charged\b', text, re.I) and not re.search(
+            r'\b(?:subscription|membership|recurring|renews on|will renew|auto[ -]?renew(?:al)?)\b|\b' +
+            RENEWAL_TIER + r'\s+plan\b', text, re.I):
+        return None
+    try:
+        amounts = {(m['c'] or m['d']).upper() + ':' + check_amount(m['a'] or m['b'])
+                   for m in payments.MONEY.finditer(text)}
+    except CaseError:
+        return None
+    cards = {m[1] or m[2] for m in RENEWAL_CARD.finditer(text)}
+    dates = set()
+    for marker in RENEWAL.finditer(text):
+        if re.search(r'\b(?:last|previous|prior)\s*$', text[:marker.start()], re.I):
+            continue
+        tail = text[marker.end():]
+        link = re.match(r'\s*(?:[:\-]\s*)?(?:(?:is|for|at)\s+)?', tail)
+        price = payments.MONEY.match(tail, link.end())
+        pos = price.end() if price else link.end()
+        link = re.match(r'\s*(?:(?:on|scheduled for)\s+)?', tail[pos:])
+        if RENEWAL_DATE.match(tail, pos + link.end()):
+            # Only an immediately linked date is evidence. Other sentences may quote
+            # the notice date, an old bill or a card's expiry instead of the renewal.
+            clause = re.split(r'[.!?;](?:\s+|$)', tail, maxsplit=1)[0]
+            dates.update(m[0] for m in RENEWAL_DATE.finditer(clause))
+    if len(amounts) != 1 or len(cards) != 1 or len(dates) != 1:
+        return None
+    date_text = re.sub(r'(\d)(?:st|nd|rd|th)\b', r'\1', dates.pop(), flags=re.I).replace(',', '')
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%d %b %Y', '%d %B %Y', '%b %d %Y', '%B %d %Y'):
+        try:
+            date = dt.datetime.strptime(date_text, fmt).date().isoformat()
+            break
+        except ValueError:
+            pass
+    else:
+        return None
+    name = (re.search(r'\byour\s+([\w&.-]+(?:\s+[\w&.-]+){0,4}?)\s+(?:plan|subscription|membership)\b', body, re.I) or
+            re.search(r'\b([\w&.-]+(?:\s+[\w&.-]+){0,2}?)\s+(?:plan|subscription|membership)\b', body, re.I))
+    merchant = name[1] if name else ''
+    merchant = re.sub(r'^(?:your|the)\s+', '', merchant, flags=re.I)
+    merchant = re.sub(r'(?:^|\s+)' + RENEWAL_TIER + r'(?:\s+' + RENEWAL_TIER + r')*$', '', merchant, flags=re.I)
+    if re.search(r'\b(?:your|the|subscription|renewal|monthly|annual|annually|yearly|quarterly|weekly|daily|trial)\b', merchant, re.I):
+        merchant = ''
+    domain = ''
+    if sender:
+        address = re.fullmatch(r'[^@\s]+@([a-z0-9.-]+)', parseaddr(sender)[1], re.I)
+        domain = address[1].strip('.').lower() if address else ''
+        identity = domain or sender.strip()
+        key = lambda value: re.sub(r'[^a-z0-9]', '', value.lower())
+        # A generic plan label must not identify two unrelated senders as one merchant.
+        # Only a simple brand domain can confirm a body name. Neither display names
+        # nor shared subdomain labels establish which merchant sent the notice.
+        if domain:
+            brand = domain.split('.')[0] if domain.count('.') == 1 else ''
+        else:
+            brand = identity
+        if not key(merchant) or key(merchant) != key(brand):
+            merchant = identity
+    if not merchant:
+        return None
+    currency, amount = amounts.pop().split(':')
+    try:
+        merchant = check_text('merchant', merchant)
+    except CaseError:
+        return None
+    notice = {'merchant': merchant, 'amount': amount, 'currency': currency,
+              'date': date, 'last4': cards.pop()}
+    if domain:
+        notice['identity'] = domain
+    return notice
+
+
+def renewal_case(data, notice, source, now=None, end=None, include_existing=False):
+    data, now = data or DATA, now or now_dubai()
+    if notice['last4'] not in dead_cards(data):
+        return None
+    source = check_text('source', source)
+    merchant = check_text('merchant', notice['merchant'])
+    identity = check_text('renewal identity', notice.get('identity', ''), False).lower()
+    identity_key = identity or merchant.lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', merchant.lower()).strip('-')
+    if len(slug) > 29:
+        slug = slug[:20].rstrip('-') + '-' + hashlib.sha256(identity_key.encode()).hexdigest()[:8]
+    if not slug:
+        raise CaseError('renewal merchant needs letters or digits for a case id')
+    due = check_charged(notice['date'])
+    cid = f'renewal-{slug}-{due}'
+    try:
+        with Locked(data, wait=lock_wait(end)) as book:
+            existing = next((c for c in book['cases'] if identity and c.get('renewal_identity') == identity
+                             and c.get('renewal_date') == due), None)
+            if not existing:
+                # SMS has a merchant name but no mailbox domain. Match a unique
+                # domain label in either arrival order; ambiguous aliases stay in triage.
+                neutral = {'notifications', 'notification', 'mail', 'email', 'billing', 'alerts', 'alert',
+                           'noreply', 'support', 'updates', 'accounts', 'account', 'co', 'com', 'org', 'net', 'gov', 'edu', 'ac'}
+                def domain_alias(name, domain):
+                    key = re.sub(r'[^a-z0-9]', '', name.lower())
+                    return key and key not in neutral and key in {
+                        re.sub(r'[^a-z0-9]', '', label) for label in domain.split('.')[:-1]}
+                aliases = [c for c in book['cases'] if c.get('renewal_date') == due and (
+                    (not identity and c.get('renewal_identity') and domain_alias(merchant, c['renewal_identity'])) or
+                    (identity and not c.get('renewal_identity') and domain_alias(c['merchant'], identity)))]
+                if len(aliases) > 1:
+                    case = None
+                    raise _DryRun
+                if aliases:
+                    existing = aliases[0]
+            named = next((c for c in book['cases'] if c['id'] == cid), None)
+            if not existing and named and (not identity or not named.get('renewal_identity')) and named['merchant'].lower() == merchant.lower():
+                existing = named
+            if existing:
+                if identity and not existing.get('renewal_identity'):
+                    # Every senderless match must bind through this common path,
+                    # including names containing dots that match a readable id.
+                    existing['renewal_identity'] = identity
+                    existing['history'].append({'at': stamp(now), 'text': f'renewal sender confirmed; source: {source}',
+                                                'source': source})
+                    return existing if include_existing else None
+                case = existing
+                raise _DryRun
+            if named:
+                # Different domains can have the same readable slug (dots vs dashes).
+                # Keep the first readable id and disambiguate the other exact identity.
+                slug = slug[:20].rstrip('-') + '-' + hashlib.sha256(('collision:' + identity_key).encode()).hexdigest()[:8]
+                cid = f'renewal-{slug}-{due}'
+                alternate = next((c for c in book['cases'] if c['id'] == cid), None)
+                if alternate:
+                    if alternate['merchant'].lower() == merchant.lower() and (not identity or alternate.get('renewal_identity') == identity):
+                        case = alternate
+                        raise _DryRun
+                    raise CaseError('renewal identity conflicts with an existing case; review it by hand')
+            case = {'id': cid, 'kind': 'charge', 'merchant': merchant,
+                    'amount': check_amount(notice['amount']), 'currency': check_currency(notice['currency']),
+                    'charged': due, 'reference': source,
+                    'state': f"renews {due} on dead card {notice['last4']}",
+                    'next': 'move the subscription to a live card or cancel it', 'deadline': due,
+                    'who': 'Abdullah', 'why': '', 'watchers': [], 'status': 'open', 'rev': 0, 'cycle': 0,
+                    'opened': stamp(now), 'updated': stamp(now), 'closed': None, 'outcome': None,
+                    'renewal_identity': identity, 'renewal_date': due,
+                    'history': [{'at': stamp(now), 'text': f'opened; source: {source}', 'source': source}]}
+            book['cases'].append(case)
+    except _DryRun:
+        return case if include_existing else None
+    return case
+
+
+def payment_matches(case, notice):
+    return (case.get('kind') in ('payment_deadline', 'autopay_expected') and
+            case.get('merchant') == notice['institution'] and case['amount'] == notice['amount'] and
+            case['currency'] == notice['currency'])
+
+
+def payment_close(case, outcome, at, owner=False):
+    case.update(status='closed', closed=stamp(at), outcome=outcome, updated=stamp(at))
+    case['history'].append({'at': stamp(at), 'text': 'closed: ' + outcome, 'owner': owner})
+
+
+def payment_in(book, notice, source, now):
+    source = check_text('source', source)
+    observed = parse_time(notice['at'])
+    matches = [c for c in book['cases'] if payment_matches(c, notice)]
+    if notice['kind'] == 'payment_success':
+        receipts = book.setdefault('payment_successes', [])
+        if not any(r['source'] == source for r in receipts):
+            receipts.append({**notice, 'source': source})
+        book['payment_successes'] = [r for r in receipts if parse_time(r['at']) >= now - KEEP_SENT]
+        closed = []
+        for case in matches:
+            if case['status'] == 'open' and parse_time(case['opened']) <= observed <= deadline_of(case) + dt.timedelta(days=7):
+                payment_close(case, 'payment confirmed by ' + source, now)
+                closed.append(case['id'])
+        return closed
+    due = check_deadline(notice['deadline'])
+    key = '|'.join((notice['kind'], notice['institution'], notice['currency'], notice['amount'], stamp(parse_time(due))))
+    cid = ('pay-' if notice['kind'] == 'payment_deadline' else 'auto-') + hashlib.sha256(key.encode()).hexdigest()[:20]
+    for case in matches:
+        if case['id'] == cid or source in case.get('sources', []) or (
+                case.get('kind') == notice['kind'] and deadline_of(case) == parse_time(due)):
+            if source not in case.setdefault('sources', []):
+                case['sources'].append(source)
+            if notice.get('deadline_basis') != 'scheduled_fallback':
+                case['deadline_basis'] = 'bank_notice'
+            return case['id']
+    # A delayed/replayed failure must not resurrect a payment already confirmed.
+    for receipt in book.get('payment_successes', []):
+        if payment_matches({'kind': 'payment_deadline', 'merchant': receipt['institution'],
+                            'amount': receipt['amount'], 'currency': receipt['currency']}, notice) and \
+                observed <= parse_time(receipt['at']) <= parse_time(due) + dt.timedelta(days=7):
+            return None
+    case = {'id': cid, 'kind': notice['kind'], 'merchant': notice['institution'],
+            'amount': check_amount(notice['amount']), 'currency': check_currency(notice['currency']),
+            'deadline': due, 'due': due if notice['kind'] == 'autopay_expected' else None,
+            'stated_deadline': notice.get('repayment_deadline'), 'sources': [source],
+            'deadline_basis': notice.get('deadline_basis', 'bank_notice'),
+            'charged': observed.date().isoformat(), 'reference': source, 'why': '',
+            'state': 'autopay expected' if notice['kind'] == 'autopay_expected' else 'payment needs confirmation',
+            'next': 'check payment confirmation; close with --outcome paid when confirmed', 'who': 'Abdullah',
+            'watchers': [], 'status': 'open', 'rev': 0, 'cycle': 0,
+            'opened': stamp(observed), 'updated': stamp(now), 'closed': None, 'outcome': None,
+            'history': [{'at': stamp(now), 'text': 'bank notice: ' + source}]}
+    if notice['kind'] == 'payment_deadline':
+        expected = [c for c in matches if c.get('kind') == 'autopay_expected' and c['status'] == 'open' and
+                    -dt.timedelta(hours=1) <= observed - parse_time(c.get('due') or c['deadline']) <= dt.timedelta(days=1)]
+        if expected:
+            parent = min(expected, key=lambda c: abs(observed - parse_time(c.get('due') or c['deadline'])))
+            case['autopay_case'] = parent['id']
+            previous = next((c for c in matches if c['id'] == parent.get('payment_case')), None)
+            if previous and previous['status'] == 'open' and previous.get('deadline_basis') == 'scheduled_fallback' and notice.get('deadline_basis') != 'scheduled_fallback':
+                payment_close(previous, 'superseded by bank deadline ' + cid, now)
+            parent['payment_case'] = cid
+    book['cases'].append(case)
+    return cid
+
+
+def record_payment(data, notice, source, now=None, end=None):
+    now = now or now_dubai()
+    with Locked(data or DATA, wait=lock_wait(end)) as book:
+        return payment_in(book, notice, source, now)
+
+
+def follow_payments(data, now, deadline, find=None, stats=None, end=None):
+    errors = []
+    source = find or (lambda *args, **kwargs: charges.search(*args, **kwargs, stats=stats))
+    write_end = end if end is not None else deadline + 2
+    candidates = [c for c in load(data)['cases'] if c.get('kind') == 'autopay_expected' and c['status'] == 'open'
+                  and now >= parse_time(c.get('due') or c['deadline']) + dt.timedelta(hours=1)]
+    for case in sorted(candidates, key=lambda c: c.get('payment_checked', '')):
+        if deadline - time.time() < 1:
+            break
+        each = min(deadline, time.time() + 4)
+        due = parse_time(case.get('due') or case['deadline'])
+        success = None
+        try:
+            with within(each, LookupTimeout('autopay lookup out of time')):
+                if stats is not None:
+                    stats['lookups'] += 1
+                # One query spans email and SMS. Parse the returned body as a bank notice;
+                # an amount or a success keyword in an unrelated receipt is not confirmation.
+                query = ' OR '.join(f'"{v}"' for v in charges.amounts(case))
+                rows = source(query, since=charges.day(parse_time(case['opened'])),
+                              until=charges.day(now + dt.timedelta(days=1)), n=20, deadline=each)
+                success = None
+                for row in rows[:20]:
+                    if row.get('from_me') or row.get('source') not in ('email', 'mail', 'imessage', 'sms'):
+                        continue
+                    observed = (dt.datetime.fromtimestamp(row['ts'], TZ) if isinstance(row.get('ts'), (float, int))
+                                else moment(row.get('at') or row.get('date')))
+                    if not observed or not parse_time(case['opened']) <= observed <= now:
+                        continue
+                    if payments.institution(str(row.get('sender') or '')) != case['merchant']:
+                        continue
+                    text = ' '.join(str(row.get(k) or '') for k in ('subject', 'snippet', 'text', 'body'))
+                    if not row.get('body') and not row.get('text'):
+                        text = charges.alert_text(charges.show(row, deadline=each, stats=stats))
+                    notice = payments.parse(text, str(row.get('sender') or ''), observed)
+                    if notice and notice['kind'] == 'payment_success' and payment_matches(case, notice):
+                        success = (notice, str(row['id']))
+                        break
+        except (charges.Lookup, LookupTimeout) as e:
+            errors.append(str(e))
+        # No confirmation is still unconfirmed when the archive is unavailable.
+        # Do not claim the debit failed; keep the deadline visible for checking.
+        with Locked(data, wait=lock_wait(write_end)) as book:
+            current = next(c for c in book['cases'] if c['id'] == case['id'])
+            if current['status'] != 'open':
+                continue
+            current['payment_checked'] = stamp(now)
+            if success:
+                payment_in(book, success[0], success[1], now)
+            else:
+                existing = next((c for c in book['cases'] if c.get('kind') == 'payment_deadline' and c['status'] == 'open' and
+                                 payment_matches(c, {'institution': case['merchant'], 'amount': case['amount'],
+                                                     'currency': case['currency']}) and
+                                 (c['id'] == current.get('payment_case') or
+                                  (deadline_of(c) and abs(deadline_of(c) - due) <= dt.timedelta(days=1)))), None)
+                repayment = (existing['deadline'] if existing else current.get('stated_deadline')) or stamp(due + dt.timedelta(hours=3))
+                notice = {'kind': 'payment_deadline', 'institution': case['merchant'],
+                          'currency': case['currency'], 'amount': case['amount'],
+                          'at': case['opened'], 'deadline': repayment, 'deadline_basis': 'scheduled_fallback'}
+                child = existing['id'] if existing else payment_in(book, notice, 'missing-' + case['id'], now)
+                current['payment_case'] = child
+                if child:
+                    next(c for c in book['cases'] if c['id'] == child)['autopay_case'] = case['id']
+    return errors
+
+
 def close(data, case_id, outcome, at=None):
     with Locked(data) as book:
         case = find(book, case_id)
@@ -598,6 +1017,14 @@ def close(data, case_id, outcome, at=None):
         # A pre-auth hold that drops off was released, not refunded.
         word = 'released' if case.get('kind') == 'hold' else 'closed'
         case['history'].append({'at': stamp(at), 'text': f'{word}: {outcome}', 'owner': True})
+        if case.get('kind') in ('payment_deadline', 'autopay_expected'):
+            notice = {'institution': case['merchant'], 'amount': case['amount'], 'currency': case['currency']}
+            for other in book['cases']:
+                if other['status'] == 'open' and payment_matches(other, notice) and (
+                        other['id'] in (case.get('autopay_case'), case.get('payment_case')) or
+                        (deadline_of(other) and deadline_of(case) and
+                         abs(deadline_of(other) - deadline_of(case)) <= dt.timedelta(days=1))):
+                    payment_close(other, outcome, at, owner=True)
     with Locked(data, 'questions') as questions:
         for q in questions['questions']:
             if linked_case(q) == case_id:
@@ -666,6 +1093,8 @@ def attention(cases, now, sent, root=None, since=None):
     entries = []
     for case in cases:
         if case.get('status') != 'open' or case_owner(case) != 'abdullah':
+            continue
+        if case.get('kind') in ('payment_deadline', 'autopay_expected'):
             continue
         deadline = deadline_of(case)
         cid = case['id']
@@ -782,7 +1211,7 @@ def live_keys(cases):
     for case in cases:
         if case.get('status') == 'open':
             cid, rev, cycle = case['id'], case.get('rev', 0), case.get('cycle', 0)
-            keys += [f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|']
+            keys += [f'{cid}|r{rev}|c{cycle}|payment|', f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|']
     return tuple(keys)
 
 
@@ -1286,6 +1715,26 @@ def question_entries(questions, now, sent):
     return entries
 
 
+def payment_entries(cases, now, sent):
+    entries = []
+    for case in sorted(cases, key=lambda c: deadline_of(c) or now):
+        if case.get('kind') != 'payment_deadline' or case['status'] != 'open' or case_owner(case) != 'abdullah':
+            continue
+        due = deadline_of(case)
+        if not due:
+            continue
+        base = f"{case['id']}|r{case.get('rev', 0)}|c{case.get('cycle', 0)}|payment|"
+        # The watcher ticks every 15 min. Start one tick early so a 23:59 deadline
+        # gets its hour-before reminder before the existing 23:00 quiet window.
+        stage = 'deadline' if now >= due else 'hour' if now >= due - dt.timedelta(minutes=75) else 'initial'
+        if stage is None or base + stage in sent:
+            continue
+        head = f"- {case['id']}: {clip(redact(case['merchant']), 80)} {clip(money(case), 40)}"
+        entries.append((head, [(base + stage, f'Payment deadline {day(due)} {due:%H:%M} Dubai; still unconfirmed')],
+                        'Send this payment reminder alone. Confirm paid/done with money-cases close ID --outcome paid.', None))
+    return entries
+
+
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     started = time.time()
     end = started + CHECK_BUDGET
@@ -1332,7 +1781,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             retained_outbox = state.get('outbox')
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'follow', time.time()
-            errors = follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
+            errors = follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
+            errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
@@ -1367,7 +1817,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                         tail = tail + '. ' + next_action
                         case_id = cid
                     combined.append((head, items, tail, case_id))
-                entries = [entry for entry in due if entry[3] not in covered.values()] + combined
+                payment_due = payment_entries(cases, now, handled)
+                entries = payment_due[:1] if payment_due else [entry for entry in due if entry[3] not in covered.values()] + combined
                 phases[phase] = time.time() - phase_at
                 phase, phase_at = 'build_write', time.time()
                 if entries:
@@ -1459,13 +1910,14 @@ def brief(cases, now=None):
         return ''
     due, changed = [], []
     far = dt.datetime.max.replace(tzinfo=TZ)
-    for case in sorted(open_cases, key=lambda c: deadline_of(c) or far):
+    for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', deadline_of(c) or far)):
         deadline = deadline_of(case)
         if deadline is None:
             due.append(f"{case['merchant']} {money(case)} (no valid deadline)")
-        elif deadline <= now + BRIEF_DUE:
+        elif case.get('kind') == 'payment_deadline' or deadline <= now + BRIEF_DUE:
             late = 'overdue since ' if deadline <= now else ''
-            due.append(f"{case['merchant']} {money(case)} ({late}{when(deadline)})")
+            display = f'{day(deadline)} {deadline:%H:%M} Dubai' if case.get('kind') == 'payment_deadline' else when(deadline)
+            due.append(f"{case['merchant']} {money(case)} ({late}{display})")
         elif parse_time(case['updated']) >= now - BRIEF_CHANGED:
             changed.append(f"{case['merchant']} {money(case)}")
     parts = [f'Money: {len(open_cases)} open']
@@ -1519,8 +1971,9 @@ def main(argv=None):
             p.add_argument('--add-watcher', action='append', default=[])
             p.add_argument('--drop-watcher', action='append', default=[])
             p.add_argument('--note', default='')
-            p.add_argument('--because', default='', help='reason for a deadline change (required with --deadline)')
-            p.add_argument('--reply', default='', help="his reply id for a deadline change (or use --because)")
+            p.add_argument('--because', default='', help='optional reason for a deadline change')
+            p.add_argument('--source', default='', help='evidence: mail:, sms:, imessage: or statement:<path>#<line>')
+            p.add_argument('--reply', default='', help="his reply id for a deadline change (or use --source)")
     p = sub.add_parser('close')
     p.add_argument('id')
     p.add_argument('--outcome', required=True)
@@ -1542,6 +1995,10 @@ def main(argv=None):
     p.add_argument('--also', action='append', default=[], metavar='LAST4', help='another stale planned card')
     p.add_argument('--case', action='append', default=[], metavar='ID', help='an open case to move (repeatable)')
     p.add_argument('--dry-run', action='store_true')
+    p = sub.add_parser('card-dead', help='record a cancelled card by its last 4 digits')
+    p.add_argument('last4')
+    p.add_argument('--note', required=True)
+    sub.add_parser('cards', help='list dead cards')
     sub.add_parser('brief')
     sub.add_parser('check')
     p = sub.add_parser('charge')
@@ -1641,14 +2098,21 @@ def main(argv=None):
         elif args.command == 'update':
             changes = {f: getattr(args, f) for f in FIELDS}
             update(DATA, args.id, changes, args.add_watcher, args.drop_watcher, args.note,
-                   because=args.because, reply=args.reply)
+                   because=args.because, reply=args.reply, source=args.source)
             print(table([find(load(), args.id)]))
         elif args.command == 'corroborate':
             corroborate(DATA, args.id, args.merchant, args.amount, args.currency, args.charged, args.kind,
                         args.observation)
             print(table([find(load(), args.id)]))
+        elif args.command == 'card-dead':
+            card_dead(DATA, args.last4, args.note)
+            print(f'card {args.last4} marked dead')
+        elif args.command == 'cards':
+            print(json.dumps(redact_all(dead_cards(DATA)), ensure_ascii=False, indent=1))
         elif args.command == 'card-swap':
             changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run, cases=args.case)
+            if not args.dry_run:
+                print('marked dead: ' + ', '.join(sorted({args.old, *args.also})))
             for c in changes:
                 # Same redaction as show/list: a hand-edited case may hold a card number or code in next.
                 cid = redact(c['id'])
@@ -1661,7 +2125,7 @@ def main(argv=None):
                     print(f"{cid}: next {redact(c['before'])!r} -> {redact(c['after'])!r}{unpicked}")
             rewritable = [c for c in changes if c['after'] is not None]
             if not args.case:
-                print(f"{len(rewritable)} case(s) would change; nothing written. Pick with --case ID (repeatable)")
+                print(f"{len(rewritable)} case(s) would change; cases unchanged. Pick with --case ID (repeatable)")
             else:
                 picked = sum(1 for c in rewritable if c['picked'])
                 verb = 'would update' if args.dry_run else 'updated'

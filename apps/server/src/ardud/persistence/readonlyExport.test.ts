@@ -1085,3 +1085,22 @@ test("incomplete redaction prevents startup and refresh until maintenance comple
   f.restart();
   f.finish();
 });
+
+test.each(["primary", "replica"] as const)("annotates actual corrupt %s export handles", (role) => {
+  const f = fixture();
+  f.exporter.close();
+  const file =
+    role === "primary"
+      ? NodePath.join(NodePath.dirname(f.options.sourcePath), "bad-source.sqlite")
+      : NodePath.join(NodePath.dirname(f.options.sourcePath), "bad-replica.sqlite");
+  NodeFS.writeFileSync(file, "bad database".repeat(1024));
+  try {
+    createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...f.options,
+      ...(role === "primary" ? { sourcePath: file } : { replicaPath: file }),
+    });
+    throw new Error("expected corruption");
+  } catch (error) {
+    expect(error).toMatchObject({ errcode: 26, sqliteFile: file, sqliteRole: role });
+  }
+});

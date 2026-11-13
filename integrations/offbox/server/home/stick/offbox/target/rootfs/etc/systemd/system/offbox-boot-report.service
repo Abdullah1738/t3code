@@ -1,0 +1,11 @@
+[Unit]
+Description=offbox: boot report, stick log and marker check
+After=local-fs.target network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/offbox-boot-report boot
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

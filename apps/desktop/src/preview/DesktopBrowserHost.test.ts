@@ -92,7 +92,6 @@ const makeDebuggee = (
 };
 
 /** Commands wait behind a focus emulation change; it settles within a macrotask. */
-// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary, not a wait for time
 const settle = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
 
 const takeEvents = (host: DesktopBrowserHost.DesktopBrowserHost["Service"], count: number) =>
@@ -970,3 +969,24 @@ describe("DesktopBrowserHost", () => {
     }),
   );
 });
+
+it.effect.each(["Runtime.evaluate", "Runtime.callFunctionOn"])(
+  "paints hidden tabs for %s before any screenshot is requested",
+  (method) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        const replies = yield* watchReplies(host);
+        const painting = yield* watchPainting(host);
+        yield* command(host, 1, method);
+        yield* settle;
+        expect(painting).toEqual([true]);
+        debuggee.release();
+        yield* Queue.take(replies);
+        yield* settle;
+        expect(painting).toEqual([true, false]);
+      }),
+    ),
+);

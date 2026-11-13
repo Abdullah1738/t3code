@@ -67,7 +67,7 @@ def script(dirs: list[str], run_id: str) -> str:
     # Every filesystem probe (absent/symlink test, dir test, mv) runs inside one child per dir, in its own
     # process group, so a hung probe is killed as a whole at the budget. No probe starts once the budget is
     # spent: remaining dirs are reported "left" without being touched. "busy" means a group member could not
-    # be confirmed gone; no later dir is touched and the supervisor waits for that group before exiting.
+    # be confirmed gone; no later dir is touched and its pgid is recorded before the supervisor exits.
     # A dropped ssh (HUP/PIPE) is ignored so this confirmation survives the caller's timeout.
     # The done marker (named by run_id, known to the caller) is written last, so a caller can tell the worker
     # finished even after its ssh gave up.
@@ -79,7 +79,12 @@ def script(dirs: list[str], run_id: str) -> str:
              'mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0',
              f't="$HOME/.offbox/trash/{run_id}"', 'mkdir -p "$t" || exit 0',
              # Probe classes: 0 moved, 5 settled (absent or not a real dir), 4 busy, anything else left.
-             'one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; mv "$1" "$2"; exit $? ) & p=$!; '
+             'one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; '
+             # Reserve a second for mv: a watchman timeout must not consume the remaining probe budget.
+             f'w=$(({BUDGET_S}-SECONDS-1)); [ "$w" -le 5 ] || w=5; [ "$w" -gt 0 ] || w=0.1; '
+             'if command -v watchman >/dev/null 2>&1; then '
+             'timeout --foreground -s KILL "$w" watchman watch-del "$1" >/dev/null 2>&1 || true; fi; '
+             'mv "$1" "$2"; exit $? ) & p=$!; '
              # kill -0 on the negative pgid checks every member of the group, not only the leader.
              f'while kill -0 -- -"$p" 2>/dev/null; do '
              f'if [ "$SECONDS" -ge {BUDGET_S} ]; then kill -KILL -- -"$p" 2>/dev/null; k=0; '
@@ -94,10 +99,11 @@ def script(dirs: list[str], run_id: str) -> str:
                      f'else one "$HOME"/{q} "$t/{i}"; rc=$?; '
                      f'case "$rc" in 0) echo "pruned "{q};; 5) echo "skip "{q};; 4) echo "busy "{q}; busy=1;; '
                      f'*) echo "left "{q};; esac; fi')
-    # Earlier groups are confirmed gone and busy prevents later children from starting. Keep the supervisor
-    # alive while the last group survives, so worker_gone cannot mistake its dead PID for completed cleanup.
+    # A busy group can outlive its supervisor. Persist it outside trash, where the background delete cannot
+    # erase the evidence needed by subsequent probes. A busy pass never signals completion.
     lines += ['if [ -n "$busy" ]; then',
-              '  while kill -0 -- -"$p" 2>/dev/null; do sleep 0.2; done', 'fi',
+              f'  printf "%s\\n" "$p" > {marker}.busy || '
+              '{ while kill -0 -- -"$p" 2>/dev/null; do sleep 0.2; done; exit 1; }', '  exit 0', 'fi',
               f'echo ok > {marker}; echo "done {run_id}"', BACKGROUND, "exit 0"]
     return "\n".join(lines) + "\n"
 
@@ -119,8 +125,12 @@ def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 
     """Probe one worker over SSH. An unreachable box or an unreadable marker is unknown, never gone."""
     try:
         rid = shlex.quote(run_id)
-        command = (f'done_file="$HOME/.offbox/done/"{rid}; started="$HOME/.offbox/started/"{rid}; '
+        command = (f'set -f; done_file="$HOME/.offbox/done/"{rid}; started="$HOME/.offbox/started/"{rid}; '
                    'if [ -f "$done_file" ]; then :; '
+                   'elif [ -f "$done_file.busy" ]; then '
+                   'groups=$(cat "$done_file.busy") || exit 2; [ -n "$groups" ] || exit 2; '
+                   'count=0; for pgid in $groups; do case "$pgid" in *[!0-9]*|0) exit 2;; esac; '
+                   'count=$((count+1)); kill -0 -- -"$pgid" 2>/dev/null && exit 1; done; [ "$count" -gt 0 ] || exit 2; '
                    f'elif {"false" if run_id.startswith(WORKER_ID_PREFIX) else "true"}; then exit 2; '
                    'elif [ -f "$started" ]; then '
                    'pid=$(cat "$started") || exit 2; '
@@ -128,11 +138,78 @@ def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 
                    'kill -0 "$pid" 2>/dev/null && exit 1; '
                    'elif [ -e "$started" ] || [ -e "$done_file" ]; then exit 2; '
                    f'elif {"true" if hold_age_s > 120 else "false"}; then :; else exit 1; fi; '
-                   'rm -f -- "$started" "$done_file" || exit 2; exit 0')
+                   'rm -f -- "$started" "$done_file" "$done_file.busy" || exit 2; exit 0')
         p = ssh_sync.ssh(box_id, command, timeout=timeout_s)
         return {0: True, 1: False}.get(p.returncode)
     except Exception:  # noqa: BLE001 - housekeeping must keep the hold on every unknown outcome
         return None
+
+
+def _recheck_script(run_id: str, hold_age_s: float) -> str:
+    # Send via stdin: a process-table scan must not match the probe's own command line. Legacy bash -s
+    # supervisors have no trash path in argv, so keep the hold while any other such supervisor exists too.
+    return '\n'.join([
+        'set -f',
+        f'rid={shlex.quote(run_id)}',
+        'marker="$HOME/.offbox/done/$rid"; started="$HOME/.offbox/started/$rid"',
+        'held() { echo held; exit 0; }',
+        'if [ -f "$marker" ]; then echo done; exit 0; fi',
+        'if [ -f "$marker.busy" ]; then',
+        '  groups=$(cat "$marker.busy") || held; [ -n "$groups" ] || held',
+        '  count=0; for pgid in $groups; do',
+        '    case "$pgid" in *[!0-9]*|0) held;; esac',
+        '    count=$((count+1))',
+        '    kill -0 -- -"$pgid" 2>/dev/null && held',
+        '  done',
+        '  [ "$count" -gt 0 ] || held; echo quiet; exit 0',
+        'fi',
+        'if [ -f "$started" ]; then',
+        '  pid=$(cat "$started") || held',
+        '  case "$pid" in ""|*[!0-9]*|0) held;; esac',
+        '  kill -0 "$pid" 2>/dev/null && held',
+        'elif [ -e "$started" ] || [ -e "$marker" ] || [ -e "$marker.busy" ]; then held',
+        # Preserve the deployed v2 protocol's grace period for SSH that has not started its worker yet.
+        f'elif {"true" if run_id.startswith(WORKER_ID_PREFIX) and hold_age_s <= 120 else "false"}; then held',
+        'fi',
+        'processes=$(ps -eww -o pid=,ppid=,args=) || held',
+        'printf "%s\\n" "$processes" | awk -v me="$$" -v parent="$PPID" -v trash=".offbox/trash/$rid" \'',
+        '  $1 != me && $1 != parent && (index($0, trash) || index($0, "bash -s")) { found=1 }',
+        '  END { exit !found }\'',
+        '[ "$?" -eq 1 ] || held',
+        'echo quiet',
+    ]) + '\n'
+
+
+def recheck(con, box_id: str, run_id: str, budget_s: float) -> bool:
+    """Release only this idle, running box's confirmed prune generation; never wait for its box lock."""
+    if budget_s <= 0:
+        return False
+    try:
+        with common.file_lock('box-' + box_id, timeout=0):
+            hold = con.execute("SELECT h.created_at FROM prune_holds h JOIN leases l USING(box_id) "
+                               f"WHERE h.box_id=? AND h.run_id=? AND l.state='running' AND {common.mine('l')} "
+                               "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id "
+                               "AND r.status IN ('starting','running'))",
+                               (box_id, run_id)).fetchone()
+            if hold is None or _protected(con, box_id) or con.execute(
+                    "SELECT 1 FROM kv WHERE k=?", (f'resume_unanswered:{box_id}',)).fetchone():
+                return False
+            p = ssh_sync.ssh(box_id, 'bash -s',
+                             input=_recheck_script(run_id, max(0, now() - hold['created_at'])).encode(),
+                             timeout=min(5, budget_s))
+            state = p.stdout.decode(errors='replace').strip()
+            if p.returncode != 0 or state not in ('done', 'quiet'):
+                return False
+            cur = con.execute("DELETE FROM prune_holds WHERE box_id=? AND run_id=? "
+                              "AND NOT EXISTS (SELECT 1 FROM runs WHERE box_id=? "
+                              "AND status IN ('starting','running'))", (box_id, run_id, box_id))
+            con.commit()
+            if cur.rowcount:
+                log(f'prune {box_id} hold released: {state}')
+                return True
+    except Exception:  # noqa: BLE001 - unknown worker state must keep the hold and never fail allocation
+        pass
+    return False
 
 
 def _settled_map(raw) -> dict[str, int]:
@@ -204,7 +281,9 @@ def run(con, box_id: str, current: str) -> Result:
         # Settled outcomes are pruned and skipped (absent or not a real dir); everything else stays pending.
         left_n = len(dirs) - len(done) - len(skipped)
         if not finished:
-            log(f"prune {box_id}: remote worker not confirmed finished; box held, {left_n} left for retry")
+            reason = ('busy group' if any(ln.startswith('busy ') for ln in out) else
+                      f'ssh rc {rc}' if rc != 0 else 'missing done line')
+            log(f"prune {box_id}: remote worker not confirmed finished; box held, {left_n} left for retry ({reason})")
         elif left_n:
             log(f"prune {box_id}: {left_n} left for retry (ssh rc {rc})")
         lasts = dict(rows)

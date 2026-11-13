@@ -185,6 +185,7 @@ export interface ThreadManagementInterruptInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly attemptId?: RunAttemptId;
+  readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
 }
 
@@ -425,6 +426,7 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -1314,6 +1316,9 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        ...(input.delegatedTaskStall === undefined
+          ? {}
+          : { delegatedTaskStall: input.delegatedTaskStall }),
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(input.runId === undefined
           ? {}
@@ -1509,6 +1514,9 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
+      receipts.getByCommandId,
+    ),
     waitForThread,
     settleAfterRun,
     settleThread,
