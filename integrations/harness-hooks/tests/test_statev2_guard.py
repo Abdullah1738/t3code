@@ -22,7 +22,7 @@ UNRESOLVED = "live-database-script-unresolved"
 
 class GuardTests(unittest.TestCase):
     def setUp(self):
-        clean = patch.dict(os.environ, isolated_source_cases.fixture_environment())
+        clean = isolated_source_cases.fixture_environment_patch()
         clean.start()
         self.addCleanup(clean.stop)
         self.temp = tempfile.TemporaryDirectory()
