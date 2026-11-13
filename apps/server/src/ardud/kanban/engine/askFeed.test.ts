@@ -368,10 +368,18 @@ it.effect("uses partial indexes for three asking cards among 5,100 cards, includ
         );
         assert.strictEqual(pages.length, 1);
         assert.isAtMost(pages[0]!.rows, closedSince === undefined ? 3 : 5);
-        assert.include(pages[0]!.plan, "USING INDEX ardud_kanban_cards_open_asks");
+        assert.match(
+          pages[0]!.plan,
+          /USING (?:COVERING )?INDEX ardud_kanban_cards_open_asks/,
+          pages[0]!.plan,
+        );
         assert.notMatch(pages[0]!.plan, /SCAN (?:c|ardud_kanban_cards)(?:$|\s)/m);
         if (closedSince !== undefined)
-          assert.include(pages[0]!.plan, "USING INDEX ardud_kanban_cards_closed_asks");
+          assert.match(
+            pages[0]!.plan,
+            /USING (?:COVERING )?INDEX ardud_kanban_cards_closed_asks/,
+            pages[0]!.plan,
+          );
         const scoped = cards.filter((card) => boardId === undefined || card.boardId === boardId);
         // Full-card scan oracle: the old query's per-ask predicate, card order and history cap.
         const expected = scoped.flatMap((card) =>
@@ -403,7 +411,7 @@ it.effect("uses partial indexes for three asking cards among 5,100 cards, includ
     const measured = yield* readAskFeed(sql, {}, AT);
     const ms = performance.now() - started;
     assert.strictEqual(measured.open.length, 3);
-    console.log(
+    yield* Effect.logInfo(
       JSON.stringify({
         fixtureCards: cards.length,
         openAsks: measured.open.length,
