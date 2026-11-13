@@ -34,6 +34,18 @@ const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEG
 const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
 export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
 
+/** Native OpenCode reports also reach Robob as provider-created user messages. */
+export function subagentNoticeState(text: string): string | undefined {
+  const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>[\s\S]*<\/subagent>$/.exec(text.trim())?.[1];
+  if (!header) return;
+  const states = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
+  return states.length === 1 ? states[0]![2] : undefined;
+}
+
+export const isCompletionNoticeText = (text: string): boolean => isDelegatedCompletionText(text)
+  // OpenCode calls a failed native report "error" (reportOutcome in its provider adapter).
+  || ["completed", "failed", "error", "cancelled"].includes(subagentNoticeState(text) ?? "");
+
 export type MessageRecord =
   | { id: string; type: "user"; text: string; time: { created: number }; createdBy?: string; [key: string]: unknown }
   | {

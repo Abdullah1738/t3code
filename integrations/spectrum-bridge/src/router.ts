@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isDelegatedCompletionText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -477,9 +477,19 @@ export function quietMessages(records: readonly MessageRecord[]): Set<string> {
   return quiet;
 }
 
-/** T3's continuation prompt, never an explicitly owner-authored desktop message. */
-function delegatedCompletion(record: MessageRecord): boolean {
-  return record.type === "user" && record.createdBy !== "user" && isDelegatedCompletionText(record.text);
+/** Native reports can be synthetic in OpenCode or provider-created user messages in Robob. */
+function backgroundNotice(record: MessageRecord): boolean {
+  return (record.type === "user" || record.type === "synthetic") && record.createdBy !== "user"
+    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeState(record.text) !== undefined);
+}
+
+function backgroundCompletion(record: MessageRecord): boolean {
+  return backgroundNotice(record) && typeof record.text === "string" && isCompletionNoticeText(record.text);
+}
+
+function suppressesBackgroundReply(record: MessageRecord): boolean {
+  return !backgroundCompletion(record) && (record.type === "user"
+    || record.type === "synthetic" && typeof record.text === "string" && subagentNoticeState(record.text) !== undefined);
 }
 
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
@@ -3336,7 +3346,7 @@ export class Router {
         size += said.length + 1;
       }
       if (full) break;
-      const said = record.type === "user" && !delegatedCompletion(record) ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
+      const said = record.type === "user" && !backgroundNotice(record) ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
         : !this.toolMode && record.type === "assistant" && !providerRefusal(record) && replyText(assistantText(record)) ? `You: ${replyText(assistantText(record))}` : "";
       if (!said || said === "Owner: ") continue;
       if (size + said.length > MAX_RECAP) break;
@@ -3706,7 +3716,7 @@ export class Router {
     let settled: string | undefined;
     for (const record of records) {
       if (record.type !== "idle") { scope.push(record); continue; }
-      if (!scope.some(delegatedCompletion) || scope.some(m => m.type === "user" && !delegatedCompletion(m))) { scope = []; continue; }
+      if (!scope.some(backgroundCompletion) || scope.some(suppressesBackgroundReply)) { scope = []; continue; }
       const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = steps.at(-1);
       if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
@@ -3719,7 +3729,7 @@ export class Router {
     }
     // mode:auto can steer the wake into the notice's run. Its completed answer
     // still belongs to the notice, even though the shared idle will follow the wake.
-    if (scope.some(delegatedCompletion) && !scope.some(m => m.type === "user" && !delegatedCompletion(m))) {
+    if (scope.some(backgroundCompletion) && !scope.some(suppressesBackgroundReply)) {
       const quiet = quietMessages(scope);
       const answered = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
         && m.answer === true && m.time.completed !== undefined && !m.error && !m.continued && m.finish !== "tool-calls" && !quiet.has(m.id));
@@ -3885,6 +3895,12 @@ export class Router {
       // at its end keeps every block of it out of the chat.
       const scope = end < 0 ? after : after.slice(0, end);
       const quiet = quietMessages(scope);
+      // watch() can begin following a busy run before its prompt is visible.
+      // Apply the same ownership/progress boundary once that prompt arrives.
+      if (turn.background && idle && scope.some(suppressesBackgroundReply)) {
+        this.enqueueReply(turn, idle, replies, [], undefined, "", scope, entries);
+        return;
+      }
       const failedReplies = new Set<string>();
       let priorFailure: Extract<MessageRecord, { type: "idle" }> | undefined;
       let runReplies: string[] = [];
@@ -4221,7 +4237,12 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
-      if (after.some(m => m.type === "user" && !delegatedCompletion(m))) {
+      if (after.some(suppressesBackgroundReply)) {
+        // Progress and completion runs can arrive between the same two polls.
+        // Keep the completed results without forwarding the progress replies.
+        if (after.some(backgroundNotice) && !after.some(record => record.type === "user" && !backgroundNotice(record))) {
+          this.settlePrecedingCompletions({ ...route, messageId: mark.id, startedAt: now, phase: "running", background: true }, after);
+        }
         // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");
         if (idle && statuses[route.id] === undefined) this.store.set("watermark", { sessionId: route.id, id: idle.id } satisfies Watermark);
