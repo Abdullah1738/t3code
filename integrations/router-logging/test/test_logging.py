@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import datetime as dt
 import importlib.util
@@ -179,7 +180,7 @@ class LoggingTests(unittest.TestCase):
         self.assertTrue(image.request_image('cx/gpt-image-2', '1024x1024', 'private prompt', 1, success)['data'])
         def fail(*_, **__):
             raise urllib.error.HTTPError('http://localhost', 502, 'bad', {}, io.BytesIO(b'{"error":"not_entitled sk-fixture-do-not-log"}'))
-        with self.assertRaisesRegex(RuntimeError, 'http_502_not_entitled'):
+        with self.assertRaisesRegex(RuntimeError, 'error 502: .*not_entitled'):
             image.request_image('cx/gpt-image-2', '1024x1024', 'private prompt', 1, fail)
         image.request_image('cx/gpt-image-2', '1024x1024', 'private prompt', 1, fail, lambda *_: {'data': [1]})
         def fallback_fail(*_):
@@ -191,6 +192,88 @@ class LoggingTests(unittest.TestCase):
             self.assertIn(name, names)
         self.assertNotIn('private prompt', json.dumps(self.rows()))
         self.assertNotIn('sk-fixture-do-not-log', json.dumps(self.rows()))
+
+    def image_cli(self, fixture):
+        script = ROOT.parent / 'local-helpers/libexec/image-generation/genimg.py'
+        command = '''
+import base64, io, json, runpy, sys, urllib.error, urllib.request
+fixture = json.load(sys.stdin)
+class ErrorBody(io.BytesIO):
+    reads = 0
+    def read(self, size=-1):
+        self.reads += 1
+        assert self.reads == 1
+        assert size == 4096
+        return super().read(size)
+body = ErrorBody(base64.b64decode(fixture.get('body', '')))
+def opener(*args, **kwargs):
+    if 'status' in fixture:
+        raise urllib.error.HTTPError('http://localhost', fixture['status'], 'bad', {}, body)
+    if 'url_error' in fixture:
+        raise urllib.error.URLError(fixture['url_error'])
+    return io.BytesIO(json.dumps(fixture['response']).encode())
+urllib.request.urlopen = opener
+sys.argv = sys.argv[1:]
+try:
+    runpy.run_path(sys.argv[0], run_name='__main__')
+finally:
+    if 'status' in fixture:
+        assert body.reads == 1
+'''
+        return subprocess.run(
+            [sys.executable, '-I', '-c', command, str(script), 'private prompt', str(Path(self.tmp.name) / 'out.png')],
+            input=json.dumps(fixture), text=True, capture_output=True, timeout=15,
+        )
+
+    def test_image_cli_errors_show_detail_only_on_stderr(self):
+        body = b'{"error":"upstream_down SECRETBODY"}'
+        long_body = b'upstream_down \xff' + ('\u00e9' * 600).encode()
+        url_error = 'upstream unavailable ' + 'x' * 400
+        cases = [
+            ({'status': 500, 'body': base64.b64encode(body).decode()}, 'error 500: ' + body.decode(), 'http_500'),
+            ({'status': 500, 'body': base64.b64encode(long_body).decode()}, 'error 500: ' + long_body.decode(errors='replace')[:500], 'http_500'),
+            ({'status': 500}, 'error 500: ', 'http_500'),
+            ({'url_error': url_error}, str(urllib.error.URLError(url_error))[:300], 'image_failed'),
+            ({'response': {'data': []}}, 'no image returned', 'image_failed'),
+        ]
+        for fixture, message, tag in cases:
+            with self.subTest(fixture=fixture):
+                result = self.image_cli(fixture)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, message + '\n')
+                row = self.rows()[-1]
+                self.assertEqual(row['name'], 'img.result')
+                self.assertIs(row['ok'], False)
+                self.assertEqual(row['error'], {'tag': tag, 'message': tag})
+        log = ''.join(p.read_text() for p in self.root.glob('*.ndjson'))
+        for private in ('SECRETBODY', 'upstream_down', 'upstream unavailable', 'private prompt'):
+            self.assertNotIn(private, log)
+        self.assertFalse((Path(self.tmp.name) / 'out.png').exists())
+
+    def test_image_cli_not_entitled_tag_and_stderr(self):
+        for body in (b'{"error":"not_entitled SECRETBODY"}', b'x' * 600 + b'NOT_ENTITLED SECRETBODY'):
+            with self.subTest(body=body):
+                result = self.image_cli({'status': 502, 'body': base64.b64encode(body).decode()})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, 'error 502: ' + body.decode()[:500] + '\n')
+                self.assertEqual(self.rows()[-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
+        log = ''.join(p.read_text() for p in self.root.glob('*.ndjson'))
+        self.assertNotIn('SECRETBODY', log)
+        self.assertNotIn('private prompt', log)
+
+    def test_image_cli_success_is_unchanged(self):
+        result = self.image_cli({'response': {'data': [{'b64_json': 'aGVsbG8='}]}})
+        path = Path(self.tmp.name) / 'out.png'
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '')
+        self.assertEqual(result.stdout, str(path) + '\n')
+        self.assertEqual(path.read_bytes(), b'hello')
+        rows = self.rows()
+        self.assertEqual([r['name'] for r in rows], ['img.request', 'img.result', 'img.write'])
+        self.assertTrue(all(r['ok'] for r in rows[1:]))
+        self.assertNotIn('private prompt', json.dumps(rows))
 
     def test_image_write_paths(self):
         args = ['genimg', 'private prompt', str(Path(self.tmp.name)/'out.png')]
