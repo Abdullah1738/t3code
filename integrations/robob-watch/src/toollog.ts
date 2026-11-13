@@ -11,8 +11,8 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
-const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs", "failedSources", "totalSources"]);
-const boolean = new Set(["deduped", "accepted", "timedOut"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {

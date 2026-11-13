@@ -159,6 +159,7 @@ export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
   guessedGates?: KanbanBoard["guessedGates"],
+  intent: "do" | "skip" = "do",
 ): string | null => {
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
@@ -186,6 +187,17 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
+  if (intent === "skip") {
+    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    const reason =
+      answer?.verdict === "dropped"
+        ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
+        : `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}`.replace(
+      /[\r\n]+/g,
+      " ",
+    );
+  }
   // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
   const others =
     answer?.optionIds?.length === 1

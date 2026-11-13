@@ -10108,7 +10108,7 @@ it.effect.each([
       );
       const patch = { subtasks: [{ id: "s1", text: "Restart Robob", owner: next }] };
       const denied = yield* kanban.editCard(card.id, patch, evaluator).pipe(Effect.flip);
-      assert.include(denied.detail, "needs Abdullah's approval");
+      assert.include(denied.detail, "needs Abdullah's answer before it can be skipped");
       assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]?.owner, previous);
       yield* kanban.askOwner(
         card.id,
@@ -30477,4 +30477,119 @@ it.effect("board step wakes share a card scope while owner relays do not coalesc
       ),
     );
   }),
+);
+
+it.effect(
+  "9router #19: Skip deploy permits skipping or removing s6 and then verification, but not doing it",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { guessedGates: ["money", "secret"] });
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        for (const removal of [false, true]) {
+          const card = yield* kanban.createCard(
+            board.id,
+            {
+              prompt: removal ? "Remove test-only deploy" : "Skip test-only deploy",
+              subtasks: [
+                ...Array.from({ length: 5 }, (_, i) => ({
+                  text: `Prepare ${i + 1}`,
+                  owner: "evaluator" as const,
+                  step: 1,
+                })),
+                {
+                  text: "If a code bug was fixed (not just tests): ask Abdullah to deploy",
+                  owner: "evaluator",
+                  step: 2,
+                  gate: "deploy",
+                },
+              ],
+            },
+            owner,
+          );
+          for (const subtask of card.subtasks.slice(0, 5)) {
+            yield* kanban.markSubtask(
+              card.id,
+              subtask.id,
+              "done",
+              "Prepared",
+              evaluator,
+              "evaluator",
+            );
+          }
+          yield* kanban.askOwner(
+            card.id,
+            { question: "Status?", blocking: false },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.answerAsk(
+            card.id,
+            "q1",
+            { verdict: "answered", revision: 0, text: "Test-only" },
+            owner,
+          );
+          yield* kanban.askOwner(
+            card.id,
+            {
+              question: "Skip s6 deploy?",
+              blocking: false,
+              options: [
+                { id: "o1", label: "Skip deploy" },
+                { id: "o2", label: "Deploy anyway" },
+              ],
+            },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.answerAsk(
+            card.id,
+            "q2",
+            { verdict: "picked", revision: 0, optionIds: ["o1"] },
+            owner,
+          );
+          const denied = yield* kanban
+            .markSubtask(card.id, "s6", "done", "Deployed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(denied.detail, "doesn't read as approving deploy");
+          if (removal) {
+            const edited = yield* kanban.editCard(
+              card.id,
+              { subtasks: card.subtasks.slice(0, 5).map(({ id }) => ({ id })) },
+              evaluator,
+            );
+            assert.isFalse(edited.subtasks.some(({ id }) => id === "s6"));
+          } else {
+            const skipped = yield* kanban.markSubtask(
+              card.id,
+              "s6",
+              "skipped",
+              "Test-only change; owner chose Skip deploy",
+              evaluator,
+              "evaluator",
+            );
+            assert.strictEqual(skipped.subtasks[5]!.state, "skipped");
+          }
+          const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
+          assert.strictEqual(verified.stage, "verified");
+          if (!removal) {
+            yield* kanban.askOwner(
+              card.id,
+              { question: "Follow up status?", blocking: true },
+              evaluator,
+              "evaluator",
+            );
+            const returned = yield* kanban.answerAsk(
+              card.id,
+              "q3",
+              { verdict: "answered", revision: 0, text: "Recorded" },
+              owner,
+            );
+            assert.strictEqual(returned.card.stage, "verified");
+          }
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );

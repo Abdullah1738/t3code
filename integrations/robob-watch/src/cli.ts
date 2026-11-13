@@ -17,7 +17,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                   [--depends ssd,phone]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, timeout_s, max_consecutive_failures, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, timeout_s, max_consecutive_failures, failure_notice_after, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID                 full saved context (wakes carry only its start)
@@ -38,7 +38,8 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
-print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; pause and alert after 5 in a row).
+print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; failure notice from the 2nd in a row).
+watcher.json failure_notice_after overrides 2 (1 = every failure); pause and alert after 5 in a row.
 watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
@@ -149,6 +150,7 @@ async function main(argv: string[]): Promise<void> {
       if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
       if (values.json === undefined && previous?.depends) input.depends = previous.depends;
       if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
+      if (values.json === undefined && previous?.failure_notice_after !== undefined) input.failure_notice_after = previous.failure_notice_after;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;
       if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
       if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);

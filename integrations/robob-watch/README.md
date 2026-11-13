@@ -2,6 +2,8 @@
 
 Durable watcher runner for Robob (the iMessage agent). Watchers run a check command on an interval (default every 15s, minimum 5s) or within about a second of a trigger file changing and, on a new event, wake the live iMessage agent turn with context via the spectrum-bridge `POST /wake` endpoint (fallbacks: bridge `send` to the live route session, then telegram-bridge `notify`). Wakes still pending after 120s trigger a one-time heads-up text.
 
+Failed checks back off, with a failure notice from the 2nd failure in a row (`failure_notice_after`), pause and alert after 5 (`max_consecutive_failures`). Set `failure_notice_after` to 1 to notify on every failure, or `max_consecutive_failures` to 0 to keep retrying without pausing. Timed-out checks need 10 minutes of failures before either notice or pause; host-load timeout grace still applies. Wake watchers escalate at pause or after 15 minutes of failures. A successful check resets the streak.
+
 Layout (runtime lives at `~/.local/share/robob-watch`; this directory is the canonical source):
 - `src/runner.ts` runner loop (1s tick), `src/cli.ts` CLI (add/list/show/remove/pause/resume/test/fire-test/relay-ok/relays-off), `src/lib.ts` shared logic
 - `helpers/` check helpers: whatsapp-new-message, output-changed, email-new-message, wa-lock; plus `ride-card` and `card-check` (compact-bubble acceptance checks for ride, delivery and quick cards, linked as `~/.local/bin/card-check`; `card-check reply` lints a chat reply for structured data that has to go as a card)
