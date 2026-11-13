@@ -1,16 +1,23 @@
 """Payment text corpus: only synthetic test PANs, no owner data."""
 import json
 from pathlib import Path
+import random
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from card_mask import mask_text, mask_value
+from card_mask import mask_json_text, mask_recall_value, mask_text, mask_value
 
 PAN = '4111111111111111'
 
 
 class CardMaskTests(unittest.TestCase):
+    def setUp(self):
+        self.year = patch('card_mask.REFERENCE_YEAR', 2026)
+        self.year.start()
+        self.addCleanup(self.year.stop)
+
     def test_pan_corpus(self):
         for value, last in [(PAN, '1111'), ('4111 1111 1111 1111', '1111'),
                             ('5555-5555-5555-4444', '4444'), ('3782 822463 10005', '0005')]:
@@ -82,6 +89,87 @@ class CardMaskTests(unittest.TestCase):
     def test_hook_masker_preserves_numeric_output_types(self):
         value = {'number': int(PAN), 'cvv': 123, 'count': 123, 'ok': True}
         self.assertEqual(mask_value(value), (value, False))
+
+    def test_embedded_pan_expiry_shapes(self):
+        for pan in [PAN, '5555555555554444', '378282246310005']:
+            expected = '•••• ' + pan[-4:]
+            for expiry in ['1227', '122027']:
+                for prefix in ['', '753']:
+                    value = prefix + pan + expiry + '123'
+                    for separator in ['', ' ', '-']:
+                        run = separator.join(value)
+                        with self.subTest(last4=pan[-4:], expiry=expiry, prefix=prefix, separator=separator):
+                            self.assertEqual(mask_text(run), expected)
+                            self.assertEqual(json.loads(mask_text(json.dumps({'amt': run}))), {'amt': expected})
+                            self.assertEqual(mask_value({'amt': run}), ({'amt': expected}, True))
+                            dia = {'inputs': [{'value': run}]}
+                            self.assertEqual(mask_value(dia), ({'inputs': [{'value': expected}]}, True))
+                            self.assertEqual(mask_recall_value(dia), ({'inputs': [{'value': expected}]}, True))
+                            self.assertEqual(json.loads(mask_text(json.dumps(dia))), {'inputs': [{'value': expected}]})
+
+    def test_embedded_pan_label_shapes(self):
+        # No expiry: the field label alone supplies the required context.
+        value = '753' + PAN + '9999999'
+        expected = '•••• 1111'
+        for label in ['card', 'CC', 'pan', 'cardnumber', 'CARD_NUMBER', 'amt', 'Amount']:
+            for separator in ['=', ': ', '": "', '\\":\\"']:
+                prefix = ('"' if '"' in separator else '') + label + separator
+                self.assertEqual(mask_text(prefix + value), prefix + expected)
+            for leaf in [value, int(value)]:
+                original = {label: leaf}
+                self.assertEqual(mask_recall_value(original), ({label: expected}, True))
+                self.assertEqual(json.loads(mask_json_text(json.dumps(original))), {label: expected})
+                self.assertEqual(mask_value(original), ({label: expected}, True) if isinstance(leaf, str) else (original, False))
+        for label in ['order', 'reference', 'total_amount', 'card_id', 'discount', 'account']:
+            self.assertEqual(mask_value({label: value}), ({label: value}, False))
+            self.assertEqual(mask_text(label + '=' + value), label + '=' + value)
+        nested = json.dumps({'result': json.dumps({'amt': int(value)})})
+        self.assertEqual(json.loads(json.loads(mask_json_text(nested))['result']), {'amt': expected})
+
+    def test_embedded_pan_expiry_year_boundaries(self):
+        for expiry in ['0126', '1226', '0136', '1236', '012026', '122026', '012036', '122036']:
+            value = PAN + expiry + '999'
+            with self.subTest(expiry=expiry):
+                self.assertEqual(mask_text(value), '•••• 1111')
+                self.assertEqual(mask_recall_value(int(value)), ('•••• 1111', True))
+        for expiry in ['0125', '1237', '012025', '122037', '0027', '1327']:
+            value = PAN + expiry + '999'
+            with self.subTest(expiry=expiry):
+                self.assertEqual(mask_text(value), value)
+                self.assertEqual(mask_recall_value(int(value)), (int(value), False))
+                self.assertEqual(mask_value({'amt': value}), ({'amt': '•••• 1111'}, True))
+        with patch('card_mask.REFERENCE_YEAR', 2028):
+            value = PAN + '1227' + '999'
+            self.assertEqual(mask_text(value), value)
+            self.assertEqual(mask_value({'amount': value}), ({'amount': '•••• 1111'}, True))
+        with patch('card_mask.REFERENCE_YEAR', 2098):
+            for expiry in ['1200', '122100']:
+                self.assertEqual(mask_text(PAN + expiry + '999'), '•••• 1111')
+
+    def test_embedded_pan_limits_and_identifier_boundaries(self):
+        value = '753' + PAN + '1227' + '123'
+        for token in ['a' + value, value + 'f', '0x' + value, 'id_' + value, value + '_id',
+                      'id-' + value, value + '-id', '9' * 31, '0' * 26,
+                      '9' * 12 + PAN + '1227', '753' + PAN + '1327999']:
+            self.assertEqual(mask_text(token), token)
+        no_pan = '9' * 26
+        self.assertEqual(mask_value({'amt': no_pan}), ({'amt': no_pan}, False))
+        masked = mask_text(value)
+        self.assertEqual(mask_text(masked), masked)
+
+    def test_embedded_pan_false_positive_corpus(self):
+        for value in ['1000000000000000000000', '4500000000000000000000',
+                      '25000000000000000000000000', '00000000000000000001',
+                      '12345678901234567890123456']:
+            self.assertEqual(mask_text(value), value)
+            self.assertEqual(mask_value({'order_id': value}), ({'order_id': value}, False))
+        rng = random.Random(792)
+        masked = 0
+        for _ in range(10000):
+            value = ''.join(rng.choices('0123456789', k=rng.randint(20, 30)))
+            masked += mask_text(value) != value
+        print(f'Embedded PAN false positives: {masked}/10000 ({masked / 100:.2f}%)')
+        self.assertLess(masked, 50)
 
     def test_nested_shape_and_original_unchanged(self):
         value = {'stdout': PAN, 'stderr': '', 'interrupted': False, 'count': 123,

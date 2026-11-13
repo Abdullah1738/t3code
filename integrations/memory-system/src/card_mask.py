@@ -1,6 +1,7 @@
 """Payment-card redaction shared by tool hooks and recall capture (stdlib only)."""
 from __future__ import annotations
 
+import datetime
 import json
 import math
 import re
@@ -9,6 +10,11 @@ import re
 # number must not be mistaken for a PAN. ASCII boundaries protect UUIDs and SHAs.
 _CARD_RUN = re.compile(r"[0-9](?:[ -]?[0-9])*")
 _ID_NEIGHBOUR = re.compile(r"[A-Za-z0-9_-]")
+REFERENCE_YEAR = datetime.date.today().year
+_CARD_LABEL = re.compile(r"(?:card|cc|pan|card_?number|amt|amount)", re.I)
+_CARD_TEXT_LABEL = re.compile(
+    r'''(?<![A-Za-z0-9_-])(?:\\?["'])?(?:card|cc|pan|card_?number|amt|amount)'''
+    r'''(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?\Z''', re.I)
 # Match the bounded label/value gap used by the Dia and phone maskers, including
 # quoted JSON, parenthesised values and short phrases such as 'CVC for card is'.
 _PUNCT = r"(?:[\s:=\-\"'()\[\]{},]|\\[\"'])"
@@ -37,14 +43,53 @@ def _luhn(digits):
     return total % 10 == 0
 
 
-def mask_text(s: str) -> str:
+def _card_prefix(digits):
+    return (digits.startswith(("4", "34", "37", "6011", "65"))
+            or 51 <= int(digits[:2]) <= 55
+            or 2221 <= int(digits[:4]) <= 2720
+            or 644 <= int(digits[:3]) <= 649)
+
+
+def _plausible_expiry(digits):
+    if len(digits) < 4 or not 1 <= int(digits[:2]) <= 12:
+        return False
+    for size in (4, 6):
+        if len(digits) < size:
+            continue
+        year = int(digits[2:size])
+        if any(year == (candidate % 100 if size == 4 else candidate)
+               for candidate in range(REFERENCE_YEAR, REFERENCE_YEAR + 11)):
+            return True
+    return False
+
+
+def _embedded_pan(digits, labelled):
+    for start in range(len(digits) - 14):
+        for size in (16, 15):
+            pan = digits[start:start + size]
+            if len(pan) != size or not _card_prefix(pan) or not _luhn(pan):
+                continue
+            expiry = digits[start + size:]
+            if labelled or _plausible_expiry(expiry):
+                return pan
+    return None
+
+
+def mask_text(s: str, *, _card_label=False) -> str:
     def card(match):
         before = s[match.start() - 1:match.start()] if match.start() else ""
         after = s[match.end():match.end() + 1]
         if _ID_NEIGHBOUR.fullmatch(before) or _ID_NEIGHBOUR.fullmatch(after):
             return match.group()
         digits = match.group().replace(" ", "").replace("-", "")
-        return "•••• " + digits[-4:] if 13 <= len(digits) <= 19 and _luhn(digits) else match.group()
+        if 13 <= len(digits) <= 19 and _luhn(digits):
+            return "•••• " + digits[-4:]
+        if 20 <= len(digits) <= 30:
+            labelled = _card_label or _CARD_TEXT_LABEL.search(s[:match.start()]) is not None
+            pan = _embedded_pan(digits, labelled)
+            if pan:
+                return "•••• " + pan[-4:]
+        return match.group()
 
     s = _CARD_RUN.sub(card, s)
     s = _CVC.sub(lambda m: m[1] + "•••", s)
@@ -54,6 +99,8 @@ def mask_text(s: str) -> str:
 def _labelled_value(label, value):
     # Match the key only as context. Redacting it together with the value would
     # shift offsets when a key itself contains card data and truncate the value.
+    if _CARD_LABEL.fullmatch(label):
+        value = mask_text(value, _card_label=True)
     for key_pattern, value_pattern, replacement in _LABELLED_VALUES:
         if key_pattern.search(label):
             value = value_pattern.sub(lambda m: m[1] + replacement, value)
@@ -116,3 +163,8 @@ def mask_json_text(s: str) -> str:
         return mask_text(s)
     masked, changed = mask_recall_value(value)
     return json.dumps(masked, ensure_ascii=False) if changed else s
+
+
+def mask_json_bytes(value: bytes) -> bytes:
+    """Keep undecodable archive bytes intact while masking any card text."""
+    return mask_json_text(value.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")

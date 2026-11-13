@@ -12,7 +12,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
-from card_mask import mask_json_text, mask_text
+from card_mask import mask_json_bytes, mask_json_text, mask_text
 from recall_hook_state import Store
 
 PAN = '4111111111111111'
@@ -42,6 +42,11 @@ PROJECTION_CASES = [
 
 
 class CardMaskCaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.year = patch('card_mask.REFERENCE_YEAR', 2026)
+        self.year.start()
+        self.addCleanup(self.year.stop)
+
     def assert_masked(self, text):
         self.assertNotIn(PAN, text)
         self.assertNotIn('CVV: 123', text)
@@ -51,6 +56,13 @@ class CardMaskCaptureTests(unittest.TestCase):
     def test_masker_copies_are_byte_identical(self):
         self.assertEqual((ROOT / 'src/card_mask.py').read_bytes(),
                          (ROOT.parent / 'harness-hooks/src/card_mask.py').read_bytes())
+
+    def test_archive_masking_preserves_undecodable_bytes(self):
+        original = b'{"text":"caf\xff"}\n'
+        self.assertEqual(mask_json_bytes(original), original)
+        original = b'{"text":"caf\xff ' + PAN.encode() + b'"}\n'
+        self.assertEqual(json.loads(mask_json_bytes(original).decode('utf-8', 'surrogateescape')),
+                         {'text': 'caf\udcff •••• 1111'})
 
     def test_json_records_keep_types_and_escaped_text(self):
         original = {'sessionId': 'fixture', 'input': {'cvv': '123'}, 'count': 123, 'ok': True,
@@ -326,6 +338,49 @@ class CardMaskCaptureTests(unittest.TestCase):
             for (raw,) in db.execute('SELECT raw FROM native_capture_raw'):
                 self.assert_masked(raw.decode())
                 json.loads(raw)
+
+    def test_claude_ingest_masks_embedded_pan_amount_in_tool_result(self):
+        import test_sync_claude as fixture
+        f = fixture.ClaudeSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        value = '753' + PAN + '1227' + '123'
+        fixture.write_lines(f.top, [fixture.rec('embedded-result', 'user', '', block=[
+            {'type': 'tool_result', 'tool_use_id': 'call1',
+             'content': json.dumps({'amt': value, 'numeric': int(value)})}])])
+        f.sync()
+        with sqlite3.connect(f.db) as db:
+            rows = db.execute('SELECT content,metadata_json FROM episodic_events').fetchall()
+            self.assertEqual(len(rows), 1)
+            for content, metadata in rows:
+                self.assertNotIn(PAN, content + metadata)
+                self.assertIn('•••• 1111', content)
+            raw_rows = db.execute('SELECT raw FROM native_capture_raw').fetchall()
+            self.assertEqual(len(raw_rows), 1)
+            for (raw,) in raw_rows:
+                self.assertNotIn(PAN, raw.decode())
+                result = json.loads(json.loads(raw)['message']['content'][0]['content'])
+                self.assertEqual(result, {'amt': '•••• 1111', 'numeric': '•••• 1111'})
+
+    def test_claude_ingest_still_honors_main_redaction_tombstones(self):
+        import redact_guard
+        import test_sync_claude as fixture
+        f = fixture.ClaudeSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        with sqlite3.connect(f.db) as db:
+            db.executescript(redact_guard.DDL)
+            db.execute('INSERT INTO recall_redacted_ids VALUES (?,?,?)',
+                       ('id', json.dumps([fixture.SESSION, 'call1']), 'removed fixture'))
+        fixture.write_lines(f.top, [fixture.rec('removed-result', 'user', '', block=[
+            {'type': 'tool_result', 'tool_use_id': 'call1',
+             'content': json.dumps({'amt': '753' + PAN + '1227' + '123'})}])])
+        f.sync()
+        with sqlite3.connect(f.db) as db:
+            self.assertEqual(db.execute('SELECT content,metadata_json FROM episodic_events').fetchall(),
+                             [('removed fixture', json.dumps({'redacted': True}))])
+            raw = db.execute('SELECT raw FROM native_capture_raw').fetchone()[0]
+            self.assertEqual(json.loads(raw), {'redacted': 'removed fixture'})
 
     def test_codex_ingest_masks_projection_and_raw_tool_input(self):
         import test_sync_codex as fixture

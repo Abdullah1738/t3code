@@ -78,6 +78,39 @@ class CardMaskHookTests(unittest.TestCase):
                         self.assertEqual(bool(out.getvalue()), not flags)
                 finish.assert_called_once()
 
+    def test_turn_end_flush_precedes_masking_and_identity(self):
+        for harness in ['claude', 'codex']:
+            for kind in engine.desktop_lease.TURN_END:
+                with self.subTest(harness=harness, kind=kind), \
+                        tempfile.TemporaryDirectory() as directory, \
+                        patch.dict(os.environ, HARNESS_HOOKS_STATE_DIR=directory), \
+                        patch.object(engine.desktop_lease, 'flush', return_value=('desktop-flush', None)) as flush, \
+                        patch.object(engine.card_mask, 'mask_value') as mask, \
+                        patch.object(engine, 'resolve_identity') as identity:
+                    event = {'hook_event_name': kind, 'tool_response': PAN, 'session_id': 'fixture'}
+                    result = engine.decide(event, harness)
+                    self.assertEqual(result['context'], {'rule': 'desktop-flush'})
+                    flush.assert_called_once()
+                    mask.assert_not_called()
+                    identity.assert_not_called()
+
+    def test_pre_tool_database_guard_precedes_identity_and_masking(self):
+        for harness in ['claude', 'codex']:
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, HARNESS_HOOKS_STATE_DIR=directory), \
+                    patch.object(engine.rootwide_search_guard, 'classify', return_value=None), \
+                    patch.object(engine.statev2_guard, 'classify_detail', return_value=('live-database-read', None)) as guard, \
+                    patch.object(engine.card_mask, 'mask_value') as mask, \
+                    patch.object(engine, 'resolve_identity') as identity:
+                event = {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'session_id': 'fixture',
+                         'tool_input': {'command': 'echo fixture', 'workdir': directory}, 'tool_response': PAN}
+                result = engine.decide(event, harness)
+                self.assertEqual(result['decision'], 'deny')
+                self.assertEqual(result['context'], {'rule': 'live-database-read'})
+                guard.assert_called_once_with('echo fixture', directory)
+                mask.assert_not_called()
+                identity.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

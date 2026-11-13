@@ -47,7 +47,7 @@ import time
 import traceback
 import zlib
 
-from card_mask import mask_json_text, mask_recall_value, mask_text
+from card_mask import mask_json_bytes, mask_json_text, mask_recall_value, mask_text
 import robob_readonly
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer, with_retry
 
@@ -392,7 +392,7 @@ class Sync:
                     data, tu = row
                     b = data.encode("utf-8")
                     consumed_bytes += len(b)
-                    safe_raw = mask_json_text(self.redactor.raw(b, mid, sid).decode("utf-8", "replace")).encode("utf-8")
+                    safe_raw = mask_json_bytes(self.redactor.raw(b, mid, sid))
                     digest = hashlib.sha256(safe_raw).hexdigest()
                     if have != (tu, digest):
                         raw_row = (mid, sid, mtype, seq, tc, tu, digest, len(safe_raw), zlib.compress(safe_raw, 6))
