@@ -17,7 +17,6 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -165,12 +164,16 @@ const stopEarlierBackgroundWork = ({
         const sink = yield* EventSink.EventSinkV2;
         const threadId = ThreadId.make("thread:background-work-stop");
         const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
-          orchestrator.streamDomainEvents.pipe(
-            Stream.filter(predicate),
-            Stream.take(1),
-            Stream.runDrain,
-            Effect.forkScoped,
-          );
+          Effect.gen(function* () {
+            // Replay from before the action, even when it commits before we begin waiting.
+            const afterSequence = yield* sink.latestSequence({ threadId });
+            return sink.stream({ threadId, afterSequence }).pipe(
+              Stream.map((stored) => stored.event),
+              Stream.filter(predicate),
+              Stream.take(1),
+              Stream.runDrain,
+            );
+          });
         yield* orchestrator.dispatch({
           type: "thread.create",
           commandId: CommandId.make("create"),
@@ -200,7 +203,7 @@ const stopEarlierBackgroundWork = ({
           creationSource: "web",
         });
         yield* worker.drain();
-        yield* Fiber.join(running);
+        yield* running;
         if (wakeAfterStop || lateWorkAfterStop !== undefined) {
           const send = (id: string, provider = false) =>
             orchestrator.dispatch({
@@ -317,13 +320,16 @@ const stopEarlierBackgroundWork = ({
           if (stalledRun === "missing-session" || stalledRun === "missing-session-terminal") {
             const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
             const failed = yield* watch(
-              (event) => event.type === "run.updated" && event.payload.status === "failed",
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.id === run.id &&
+                event.payload.status === "failed",
             );
             yield* sessions.release({
               providerSessionId: first.providerThread.providerSessionId!,
               reason: "runtime_error",
             });
-            yield* Fiber.join(failed);
+            yield* failed;
             yield* sink.write({
               events: [
                 {
@@ -504,7 +510,7 @@ const stopEarlierBackgroundWork = ({
           failure: null,
           threadDisposition: "reusable",
         });
-        yield* Fiber.join(settled);
+        yield* settled;
         yield* worker.drain();
 
         const codexProviderThread = (yield* orchestrator.getThreadProjection(threadId))
