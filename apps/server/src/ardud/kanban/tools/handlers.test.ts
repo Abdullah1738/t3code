@@ -107,6 +107,23 @@ const fakeThreads = (
   const deleted = new Set<ThreadId>();
   const unreadable = new Set<ThreadId>();
   const models = new Map<ThreadId, ModelSelection>();
+  const getThreadShell = (threadId: ThreadId) => {
+    if (unreadable.has(threadId)) {
+      return Effect.fail(new OrchestratorProjectionError({ threadId }));
+    }
+    if (missing.has(threadId)) return Effect.succeed(null);
+    const parentThreadId = parents.get(threadId) ?? null;
+    const shell = liveThreadShell(threadId);
+    return Effect.succeed({
+      ...shell,
+      deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
+      lineage: {
+        ...shell.lineage,
+        parentThreadId,
+        relationshipToParent: parentThreadId === null ? null : ("subagent" as const),
+      },
+    });
+  };
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
@@ -264,23 +281,8 @@ const fakeThreads = (
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
-        getThreadShell: (threadId) => {
-          if (unreadable.has(threadId)) {
-            return Effect.fail(new OrchestratorProjectionError({ threadId }));
-          }
-          if (missing.has(threadId)) return Effect.succeed(null);
-          const parentThreadId = parents.get(threadId) ?? null;
-          const shell = liveThreadShell(threadId);
-          return Effect.succeed({
-            ...shell,
-            deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
-            lineage: {
-              ...shell.lineage,
-              parentThreadId,
-              relationshipToParent: parentThreadId === null ? null : "subagent",
-            },
-          });
-        },
+        getCallerRow: getThreadShell,
+        getThreadShell,
       }),
     ),
     Layer.provideMerge(serviceLayer),
