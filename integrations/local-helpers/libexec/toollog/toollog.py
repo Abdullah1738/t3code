@@ -343,6 +343,8 @@ def rollup(board, day, top_n=20):
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
+    component_totals, component_errors = Counter(), defaultdict(Counter)
+    component_samples, component_durations = defaultdict(dict), defaultdict(list)
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     caps = []
     recorded = 0
@@ -377,6 +379,14 @@ def rollup(board, day, top_n=20):
         if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
             durations[name].append((duration, weight))
         if board == 'orders':
+            component = row.get('component')
+            if not isinstance(component, str) or component not in {
+                    'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                    'amazon', 'uber', 'toollog', 'money-cases'}:
+                component = 'unknown'
+            component_totals[component] += weight
+            if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+                component_durations[f'{component}:{name}'].append((duration, weight))
             merchant = (row.get('props') or {}).get('merchant')
             if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
                 merchant = 'unknown'
@@ -387,6 +397,9 @@ def rollup(board, day, top_n=20):
                 status = (error.get('cause') or {}).get('httpStatus')
                 status = status if type(status) is int and 100 <= status <= 599 else None
                 code = error.get('tag') or 'OPERATION_FAILED'
+                component_errors[component][code] += weight
+                component_samples[component].setdefault(code, {
+                    'file': day + '.ndjson', 'line': line_number})
                 item = order_errors.setdefault((code, status, merchant), {
                     'tag': code, 'httpStatus': status, 'merchant': merchant, 'count': 0,
                     'sampleId': {'file': day + '.ndjson', 'line': line_number}})
@@ -452,6 +465,23 @@ def rollup(board, day, top_n=20):
                 for merchant, values in sorted(order_polls.items())}
         result['topErrors'] = sorted(order_errors.values(), key=lambda x: (
             -x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20]
+        result['durationsMs'].update({
+            key: {**percentiles(values), 'count': sum(weight for _, weight in values)}
+            for key, values in sorted(component_durations.items())
+            if key not in result['durationsMs']})
+        result['errorsByComponent'] = {
+            component: dict(sorted(component_errors[component].items()))
+            for component in sorted(component_totals)}
+        result['failureShare'] = {
+            component: sum(component_errors[component].values()) / component_totals[component]
+            for component in sorted(component_totals)}
+        # Match topErrorTags' frequency ranking, but never copy an IDs dictionary.
+        result['topErrorSamplesByComponent'] = {
+            component: [{'tag': code, 'count': count,
+                         'sampleId': component_samples[component][code]}
+                        for code, count in sorted(component_errors[component].items(),
+                                                  key=lambda item: (-item[1], item[0]))[:5]]
+            for component in sorted(component_totals)}
     return result
 
 
