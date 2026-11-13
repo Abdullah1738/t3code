@@ -1,6 +1,7 @@
 """A quiet push is bounded even when a child or the stdin writer holds a pipe."""
 import contextlib
 import io
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,24 @@ from test_capacity import Isolated
 
 STATS = 'Total bytes sent: 1,234\nNumber of regular files transferred: 1\n'
 REMOTE_STALL = ssh_sync._remote_stall
+
+
+class FailingStderr:
+    def __init__(self, error, operation):
+        self.error, self.operation, self.attempts = error, operation, 0
+
+    def write(self, text):
+        self.attempts += 1
+        if self.operation == 'write':
+            raise self.error('stderr disappeared')
+        return len(text)
+
+    def flush(self):
+        if self.operation == 'flush':
+            raise self.error('stderr disappeared')
+
+    def fileno(self):
+        raise io.UnsupportedOperation('no underlying descriptor')
 
 
 class SyncStallTests(Isolated):
@@ -95,6 +114,51 @@ print('\\r'+{STATS!r})
         self.assertIn('pass=files2 bytes_sent=', self.err.getvalue())
         self.assertIn('bytes_sent=5000', self.err.getvalue())
 
+    def test_failing_status_output_preserves_healthy_transfer(self):
+        for error in (BrokenPipeError, OSError, ValueError):
+            for operation in ('write', 'flush'):
+                with self.subTest(error=error, operation=operation):
+                    self.script(f'''
+for i in range(5):
+    print('progress', flush=True)
+    time.sleep(.04)
+print({STATS!r})
+''')
+                    stderr = FailingStderr(error, operation)
+                    with contextlib.redirect_stderr(stderr), patch.object(ssh_sync, 'SYNC_PROGRESS_S', .05):
+                        self.assertEqual(ssh_sync._stats(self.sync())['sent'], 1234)
+                    self.assertGreater(stderr.attempts, 0)
+        self.close.assert_not_called()
+        self.setup.assert_not_called()
+        self.assertFalse(self.quarantined())
+        self.assertEqual(len(self.launches.read_text().splitlines()), 6)
+
+    def test_failing_status_output_preserves_stall_recovery(self):
+        for error in (BrokenPipeError, OSError, ValueError):
+            for operation in ('write', 'flush'):
+                with self.subTest(error=error, operation=operation):
+                    before = len(self.launches.read_text().splitlines()) if self.launches.exists() else 0
+                    self.script(f'if n == {before}: time.sleep(600)\nprint({STATS!r})\n')
+                    stderr = FailingStderr(error, operation)
+                    with contextlib.redirect_stderr(stderr), patch.object(ssh_sync, 'STALL_S', .5):
+                        self.assertEqual(ssh_sync._stats(self.sync())['sent'], 1234)
+                    self.assertGreater(stderr.attempts, 0)
+                    self.assertEqual(len(self.launches.read_text().splitlines()), before + 2)
+        self.assertEqual(self.close.call_count, 6)
+        self.assertEqual(self.setup.call_count, 6)
+        self.assertFalse(self.quarantined())
+
+    def test_failing_status_output_preserves_connection_retry(self):
+        self.script(f'if n == 0: sys.exit(12)\nprint({STATS!r})\n')
+        stderr = FailingStderr(BrokenPipeError, 'write')
+        with contextlib.redirect_stderr(stderr), patch.object(ssh_sync, 'RETRY_PAUSES', (0,)), \
+                patch.object(api, 'get', return_value={'state': 'running'}):
+            self.assertEqual(ssh_sync._stats(self.sync())['sent'], 1234)
+        self.assertGreater(stderr.attempts, 0)
+        self.close.assert_called_once()
+        self.setup.assert_called_once()
+        self.assertFalse(self.quarantined())
+
     def test_stderr_bytes_and_split_utf8_are_drained(self):
         self.script('''
 for _ in range(5):
@@ -118,6 +182,73 @@ print('done')
             self.assertEqual(ssh_sync._push_git('testbox', self.base, 'w/repo-abcdef', 10)['sent'], 1234)
         self.assertIn('pass=git', str(self.log.call_args_list))
         self.assertFalse(self.quarantined())
+
+    def test_slow_git_progress_completes_with_growing_byte_heartbeats(self):
+        self.script(f'''
+for i in range(1, 7):
+    print('\\r%d 50%% 1MB/s 0:00:01 (xfr#1, to-chk=1/2)' % (i*1000), end='\\r', flush=True)
+    time.sleep(.15)
+print({STATS!r})
+''')
+        with patch.object(ssh_sync, 'ssh', return_value=subprocess.CompletedProcess([], 0, b'', b'')), \
+                patch.object(ssh_sync, 'STALL_S', .5), patch.object(ssh_sync, 'SYNC_PROGRESS_S', .1):
+            self.assertEqual(ssh_sync._push_git('testbox', self.base, 'w/repo-abcdef', 10)['sent'], 1234)
+        sent = list(map(int, re.findall(r'pass=git bytes_sent=(\d+)', self.err.getvalue())))
+        self.assertGreater(len(set(sent)), 2)
+        self.assertEqual(sent, sorted(sent))
+        self.close.assert_not_called()
+        self.setup.assert_not_called()
+        self.assertFalse(self.quarantined())
+        self.assertEqual(len(self.launches.read_text().splitlines()), 1)
+
+    def test_files_to_git_switch_resets_idle_clock(self):
+        self.script(f'if n == 0: print("ready", flush=True)\ntime.sleep(.65)\nprint({STATS!r})\n')
+
+        def stage(box, cmd, **kwargs):
+            if cmd.startswith('mkdir'):
+                time.sleep(.45)
+            return subprocess.CompletedProcess([], 0, b'', b'')
+
+        with patch.object(ssh_sync, 'ssh', side_effect=stage), patch.object(ssh_sync, 'STALL_S', 1):
+            self.assertEqual(ssh_sync._stats(self.sync())['sent'], 1234)
+            self.assertEqual(ssh_sync._push_git('testbox', self.base, 'w/repo-abcdef', 10)['sent'], 1234)
+        self.assertEqual(len(self.launches.read_text().splitlines()), 2)
+        self.close.assert_not_called()
+        self.setup.assert_not_called()
+
+    def test_git_progress_then_silence_retries_and_quarantines(self):
+        # No trailing delimiter: rsync can leave its last 100% frame on the terminal while waiting for the box.
+        self.script('''
+print('1234 100% 1MB/s 0:00:00 (xfr#1, to-chk=0/1)', end='', flush=True)
+time.sleep(600)
+''')
+        with patch.object(ssh_sync, 'ssh', return_value=subprocess.CompletedProcess([], 0, b'', b'')), \
+                patch.object(ssh_sync, 'STALL_S', .5), patch.object(ssh_sync, 'SYNC_PROGRESS_S', .1):
+            with self.assertRaisesRegex(OffboxError, 'stalled:.*twice.*source sent; waiting on box') as cm:
+                ssh_sync._push_git('testbox', self.base, 'w/repo-abcdef', 10)
+        self.assertEqual(cm.exception.code, 90)
+        self.assertEqual(len(self.launches.read_text().splitlines()), 2)
+        self.assertEqual(self.close.call_count, 2)
+        self.setup.assert_called_once_with('testbox')
+        self.assertTrue(self.quarantined())
+        self.assertIn('pass=git bytes_sent=1234', self.err.getvalue())
+        self.assertIn('source sent; waiting on box', self.err.getvalue())
+        self.assertNotIn('source read stalled', self.err.getvalue())
+        self.assertIn("wait='source sent; waiting on box'", str(self.log.call_args_list))
+
+    def test_incomplete_scan_progress_does_not_claim_source_sent(self):
+        for frame in ('1234 100% 1MB/s 0:00:00 (xfr#1, ir-chk=0/1)',
+                      '1234 100% 1MB/s 0:00:00 (xfr#1, to-chk=1/2)',
+                      '1234 50% 1MB/s 0:00:00 (xfr#1, to-chk=0/1)'):
+            with self.subTest(frame=frame):
+                self.err.seek(0)
+                self.err.truncate()
+                self.script(f'print({frame!r}, end="", flush=True)\ntime.sleep(600)\n')
+                with patch.object(ssh_sync, 'STALL_S', .5), self.assertRaises(OffboxError) as cm:
+                    self.sync()
+                self.assertIn('waiting for transfer progress', str(cm.exception))
+                self.assertNotIn('source sent;', str(cm.exception))
+                self.assertNotIn('source read stalled', str(cm.exception))
 
     def test_outer_prepare_alarm_still_kills_term_ignoring_group(self):
         self.script('''
@@ -168,10 +299,12 @@ time.sleep(600)
                 output = f'42 1 {state} {channel} 00:10 rsync rsync --server .\n43 1 S do_wait 00:10 mv mv w/old .offbox/trash/old\n'.encode()
                 with patch.object(ssh_sync, '_remote_stall', REMOTE_STALL), \
                         patch.object(ssh_sync, '_bounded_command', return_value=subprocess.CompletedProcess([], 0, output, b'')), \
-                        patch.object(ssh_sync, 'STALL_S', .5):
+                        patch.object(ssh_sync, 'STALL_S', 1):
                     with self.assertRaises(OffboxError) as cm:
                         self.sync()
                 self.assertIn(reason, str(cm.exception))
+                self.assertIn('remote receiver blocked', str(cm.exception))
+                self.assertNotIn('source read stalled', str(cm.exception))
                 self.assertTrue(self.quarantined())
         self.assertEqual(len(self.launches.read_text().splitlines()), 3)
         self.setup.assert_not_called()
@@ -231,6 +364,7 @@ class StallDiagnosisTests(unittest.TestCase):
             self.assertEqual(result['src_fs'], 'apfs')
             self.assertLessEqual(probe.call_args.args[1], 10)
             self.assertIn('src_fs=apfs bytes_seen=123', log.call_args.args[0])
+            self.assertEqual(result['wait'], 'waiting on remote receiver')
 
     def test_unreaped_statfs_helper_cannot_hold_diagnosis(self):
         from unittest.mock import MagicMock
@@ -253,6 +387,20 @@ class StallDiagnosisTests(unittest.TestCase):
 
 
 class ProgressFormatTests(unittest.TestCase):
+    def test_wait_label_uses_evidence_instead_of_assuming_source_read(self):
+        for sent, blocked, sample, expected in (
+                (False, None, '', 'waiting for transfer progress'),
+                (False, None, 'map_ptr -> read', 'local source read stalled'),
+                (False, None, 'map_ptr -> stalled_read -> sleep', 'local source read stalled'),
+                (False, None, 'read_ndx_and_attrs -> read_a_msg', 'waiting on remote receiver'),
+                (False, None, 'write_buf -> poll', 'waiting on remote receiver'),
+                (True, None, '', 'source sent; waiting on box'),
+                (True, 'box disk I/O blocked', '', 'remote receiver blocked: box disk I/O blocked'),
+                (False, 'box workspace filesystem (FUSE) blocked', 'map_ptr -> read',
+                 'remote receiver blocked: box workspace filesystem (FUSE) blocked')):
+            with self.subTest(sent=sent, blocked=blocked, sample=sample):
+                self.assertEqual(ssh_sync._sync_wait(sent, blocked, sample), expected)
+
     def test_progress_variants_preserve_items_stats_and_filename_bytes(self):
         for progress in ['\r 1,234 50% 1MB/s 0:01:00', ' 1,234 100% 1MB/s 0:00:00 (xfr#1, to-chk=0/1)',
                          ' 1,234 100% 1MB/s 0:00:00 (xfr#1, ir-chk=0/1)']:

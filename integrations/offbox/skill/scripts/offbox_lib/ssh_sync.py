@@ -631,14 +631,14 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
     """One attempt with independent pipe draining and a wall/idle bound, reusable by artifact pulls."""
     started = last = time.monotonic()
     chunks = [[], []]
-    count, sent = 0, 0
+    count, sent, source_sent = 0, 0, False
     lock = threading.Lock()
     changed = threading.Event()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
 
     def read(stream, index):
-        nonlocal last, count, sent
+        nonlocal last, count, sent, source_sent
         pending = b""
         try:
             while data := os.read(stream.fileno(), 65536):
@@ -650,10 +650,13 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
                         pending += data
                         parts = re.split(rb"[\r\n]", pending)
                         pending = parts.pop()[-4096:]
-                        for line in parts:
-                            m = re.match(rb"\s*([\d,]+)\s+\d+%\s+", line)
+                        # Progress frames can end at the next CR rather than at this read's boundary.
+                        for line in [*parts, pending]:
+                            m = re.match(rb"\s*([\d,]+)\s+(\d+)%\s+", line)
                             if m:
                                 sent = int(m[1].replace(b",", b""))
+                                # 100% during an incremental scan can still discover more files.
+                                source_sent = m[2] == b"100" and b"to-chk=0/" in line
                 changed.set()
         finally:
             stream.close()
@@ -681,17 +684,17 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
         while proc.poll() is None or any(t.is_alive() for t in readers):
             now = time.monotonic()
             with lock:
-                idle, seen, transferred = now - last, count, sent
+                idle, seen, transferred, complete = now - last, count, sent, source_sent
             if now - started >= timeout:
                 raise subprocess.TimeoutExpired(cmd, timeout)
             if idle >= STALL_S:
                 if on_stall:
-                    on_stall(proc, seen)
+                    on_stall(proc, seen, complete)
                 if time.monotonic() - started >= timeout:
                     raise subprocess.TimeoutExpired(cmd, timeout)
                 raise SyncStalled()
             if on_progress and now >= report_at:
-                on_progress(seen, transferred)
+                on_progress(seen, transferred, complete)
                 report_at = now + SYNC_PROGRESS_S
             changed.wait(min(.05, max(0, timeout - (now - started)), max(0, STALL_S - idle)))
             changed.clear()
@@ -777,21 +780,38 @@ def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
     return f"{' '.join(states) or 'remote_rsync_stat=none'} prune_workers={prune!r}", blocked
 
 
-def _stall_diagnosis(box_id, pid, source, run_id, phase, count, timeout):
+def _sync_wait(source_sent: bool, blocked: str | None = None, sample: str = "") -> str:
+    if blocked:
+        return f"remote receiver blocked: {blocked}"
+    if source_sent:
+        return "source sent; waiting on box"
+    if re.search(r"\b(?:read_ndx\w*|read_a_msg|write_buf)\b", sample):
+        return "waiting on remote receiver"
+    if "map_ptr" in sample and re.search(r"\b(?:read|pread|stalled_read)\b", sample):
+        return "local source read stalled"
+    return "waiting for transfer progress"
+
+
+def _stall_diagnosis(box_id, pid, source, run_id, phase, count, timeout, source_sent=False):
     deadline = time.monotonic() + timeout
     fs = _source_fs(source) if timeout >= 2 else "unknown"
+    sample = ""
     if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id) and sys.platform == "darwin" and Path("/usr/bin/sample").exists():
         try:
             path = common.LOGS_DIR / f"{run_id}.stall.sample"
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("ab") as out:
+            with path.open("a+b") as out:
+                start = out.tell()
                 _bounded_command(["/usr/bin/sample", str(pid), "2"],
                                  min(5, max(.001, deadline - time.monotonic())), stdout=out)
+                out.seek(start)
+                sample = out.read(65536).decode(errors="replace")
         except (OSError, subprocess.TimeoutExpired):
             pass
     remote, blocked = _remote_stall(box_id, min(10, max(.001, deadline - time.monotonic())))
-    log(f"push_stall {box_id} idle={STALL_S:g}s pass={phase} src_fs={fs} bytes_seen={count} {remote}")
-    return {"src_fs": fs, "blocked": blocked}
+    wait = _sync_wait(source_sent, blocked, sample)
+    log(f"push_stall {box_id} idle={STALL_S:g}s pass={phase} src_fs={fs} bytes_seen={count} {remote} wait={wait!r}")
+    return {"src_fs": fs, "blocked": blocked, "wait": wait}
 
 
 def _refresh_master(box_id, *, close=True, refresh=True):
@@ -813,13 +833,13 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
             raise subprocess.TimeoutExpired(cmd, timeout)
         diagnosis = {}
 
-        def stalled(proc, count):
+        def stalled(proc, count, source_sent):
             diagnosis.update(_stall_diagnosis(box_id, proc.pid, source, run_id, phase, count,
-                                             min(15, max(0, deadline - time.monotonic()))))
+                                             min(15, max(0, deadline - time.monotonic())), source_sent))
 
-        def progress(count, sent):
-            print(f"offbox: still syncing -> {box_id} pass={phase} bytes_sent={sent} bytes_seen={count}",
-                  file=sys.stderr, flush=True)
+        def progress(count, sent, source_sent):
+            common.say(f"still syncing -> {box_id} pass={phase} bytes_sent={sent} bytes_seen={count}; "
+                       f"{_sync_wait(source_sent)}")
 
         try:
             p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress)
@@ -828,15 +848,16 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                 _refresh_master(box_id, refresh=False)
             source_note = "; source is on nfs (ovnfs checkout)" if diagnosis.get("src_fs") == "nfs" else ""
             reason = diagnosis.get("blocked")
+            wait = diagnosis.get("wait", "waiting for transfer progress")
             if reason or stalls:
                 from . import lease
                 why = reason or f"push stalled twice (pass={phase})"
                 lease.quarantine(box_id, why)
-                detail = reason or f"no data for {STALL_S:g}s, twice"
+                detail = wait if reason else f"no data for {STALL_S:g}s, twice; {wait}"
                 raise OffboxError(f"rsync to {box_id} stalled: {detail}{source_note}; box {box_id} quarantined; "
                                   "the next run picks another box. Nothing ran.") from None
-            print(f"offbox: rsync to {box_id} stalled (no data for {STALL_S:g}s{source_note}), "
-                  "retrying once with a fresh ssh connection", file=sys.stderr, flush=True)
+            common.say(f"rsync to {box_id} stalled (no data for {STALL_S:g}s; {wait}{source_note}), "
+                       "retrying once with a fresh ssh connection")
             with api.budget(max(0, deadline - time.monotonic())):
                 _refresh_master(box_id, close=False)
             stalls += 1
@@ -861,8 +882,7 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         new = _endpoint(box_id)
         endpoint = f" endpoint={old} -> {new}" if old and new and old != new else ""
         pause = RETRY_PAUSES[attempt]
-        print(f"offbox: rsync exit {p.returncode} to {box_id}, retry {attempt + 1}/3 in {pause}s",
-              file=sys.stderr, flush=True)
+        common.say(f"rsync exit {p.returncode} to {box_id}, retry {attempt + 1}/3 in {pause}s")
         log(f"push_retry {box_id} exit={p.returncode} try={attempt + 1}{endpoint}")
         time.sleep(min(pause, max(0, deadline - time.monotonic())))
         attempt += 1

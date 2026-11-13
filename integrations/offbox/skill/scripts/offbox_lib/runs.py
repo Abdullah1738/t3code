@@ -1390,7 +1390,7 @@ class Runner:
         push_exc = None
         try:
             if not a.no_sync:
-                with prepare.phase("push (source read stalled if no transfer progress)", self.box):
+                with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
