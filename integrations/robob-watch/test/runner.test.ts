@@ -205,6 +205,10 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   await runnerFor(2_000);
   expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(0);
   expect(state("esc").next_at - Date.now()).toBeLessThanOrEqual(300_000);
+  expect(events("watch.run", "esc")).toContainEqual(expect.objectContaining({
+    error: { tag: "watch.check_failed", message: "watch.check_failed" },
+    props: expect.objectContaining({ exitCode: 1, signal: null, timedOut: false }),
+  }));
   // Failing 16 min: one wake with the error and repair instructions.
   writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0, failing_since: new Date(Date.now() - 16 * 60_000).toISOString() }));
   await runnerFor(2_000);
@@ -353,7 +357,7 @@ test("timeouts alert into the burst immediately but pause only after ten minutes
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
   expect(state("slow").failure_paused_at).toBeUndefined();
-  expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout" }), ok: false }));
+  expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout", exitCode: null, signal: "SIGKILL", timedOut: true }), ok: false }));
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
   expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));

@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-source "${0:A:h}/toollog.zsh" time-reached 2>/dev/null || true
+source "${0:A:h}/toollog.zsh" time-reached "$0" "$@" || true
 # time-reached ISO_TIME [TEXT...]
 # Prints TEXT (or "Reminder due") once the given time has passed; prints nothing before.
 # Used for iMessage reminders via robob-watch (mode notify or wake, max-fires 1).
