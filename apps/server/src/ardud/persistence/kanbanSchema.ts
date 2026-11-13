@@ -27,6 +27,8 @@ export const kanbanDDL = [
     ON ardud_kanban_cards (board_id, number) WHERE instr(json, '"closedAt":null') > 0`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_closed_asks
     ON ardud_kanban_cards (board_id, number) WHERE instr(json, '"closedAt":"') > 0`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_open ON ardud_kanban_cards(board_id, number)
+    WHERE json_extract(json, '$.settledAt') IS NULL`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_thread ON ardud_kanban_cards (active_thread_id)`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_card_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, json TEXT NOT NULL

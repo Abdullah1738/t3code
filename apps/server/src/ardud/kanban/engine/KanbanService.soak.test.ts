@@ -479,6 +479,7 @@ const watchedStore = (watch: Watch) =>
         ...store,
         ...recorded,
         cards: (boardId) => watch.boardLoad(store.cards(boardId)),
+        openCards: (boardId) => watch.boardLoad(store.openCards(boardId)),
         card: (cardId) => watch.cardRead(cardId, store.card(cardId)),
         putCard: (card) => watch.cardWrite(card.id, recorded.putCard(card)),
       });
