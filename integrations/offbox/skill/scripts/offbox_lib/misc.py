@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from time import monotonic, sleep
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
@@ -24,6 +25,7 @@ from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
 
 WAIT_POLL_S = 5
+KILL_CONFIRM_S = 40
 # A lock-blocked waiter asks boat about the process this often, and once boat has said it ended for HOLDER_GRACE_S
 # while the holder still hasn't recorded the end, the waiter stops waiting for that holder (it looks stuck).
 STATUS_POLL_S = 30
@@ -383,14 +385,34 @@ def _kill_run(run_id: str, me: dict | None, locks: contextlib.ExitStack) -> int:
         api.cmd_kill(box, pid)
     except OffboxError as e:
         kill_err = str(e)
-    try:
-        st = api.cmd_status(box, pid)
-    except OffboxError as e:
-        say(f"run {rid}: could not read process {pid} on {box} after kill ({e}); row left as {r['status']}")
+    say(f"run {rid}: kill requested for process {pid} on {box}; waiting up to {KILL_CONFIRM_S} s for it to stop")
+    started = monotonic()
+    deadline = started + KILL_CONFIRM_S
+    st = {}
+    status_err = None
+    while True:
+        left = deadline - monotonic()
+        if left <= 0:
+            break
+        try:
+            # Home boatd acknowledges DELETE before its cgroup has stopped. Bound each GET too, so a slow or
+            # failing tracker cannot turn the confirmation window into several minutes of HTTP retries.
+            st = api.cmd_status(box, pid, timeout=min(5, left), retries=0, deadline=time.time() + left)
+            status_err = None
+            if st is None or st.get('status') == 'lost' or st.get('running') is False:
+                break
+        except OffboxError as e:
+            status_err = str(e)
+        left = deadline - monotonic()
+        if left <= 0:
+            break
+        sleep(min(1 if monotonic() - started < 5 else 2, left))
+    if status_err is not None:
+        say(f"run {rid}: could not read process {pid} on {box} after kill ({status_err}); row left as {r['status']}")
         return 1
     if st is not None and st.get('status') == 'lost':
         try:
-            st = confirmed_lost(box, rid)
+            st = confirmed_lost(box, rid, timeout=min(20, max(0, deadline - monotonic())))
         except OffboxError:
             st = None
         if st is None:
@@ -398,8 +420,10 @@ def _kill_run(run_id: str, me: dict | None, locks: contextlib.ExitStack) -> int:
             return 1
     if st is not None and st.get("running") is not False:
         why = "still reports it running" if st.get("running") else "returned no clear running state"
-        say(f"run {rid}: boat {why} for process {pid} on {box}; row left as {r['status']}"
-            + (f" (kill error: {kill_err})" if kill_err else ""))
+        say(f"run {rid}: boat {why} after {KILL_CONFIRM_S} s for process {pid} on {box}; row left as {r['status']}"
+            + (f" (kill error: {kill_err})" if kill_err else "")
+            + f". The box may still be stopping it: re-run `offbox kill {rid}` (safe to repeat), "
+              f"or check `offbox logs {rid}`.")
         return 1
     con = db()
     con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
