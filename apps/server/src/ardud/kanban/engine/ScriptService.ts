@@ -24,6 +24,7 @@ import {
   KanbanError,
   KanbanScriptId,
   kanbanWaiting,
+  KanbanScriptDeliveryRef,
   type KanbanActor,
   type KanbanBoard,
   type KanbanCard,
@@ -31,6 +32,7 @@ import {
   type KanbanDiscussion,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanScriptAcknowledgeInput,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -66,6 +68,7 @@ const STDOUT_LIMIT = 4 * 1024 * 1024;
 /** The shortest schedule a script can have. */
 const MIN_EVERY_MS = 60_000;
 const sameCommand = Schema.toEquivalence(Scripts.ScriptCommand);
+const sameDelivery = Schema.toEquivalence(KanbanScriptDeliveryRef);
 
 export interface NewScript {
   readonly boardId: KanbanBoard["id"];
@@ -99,6 +102,10 @@ export interface KanbanScriptsShape {
   readonly setEnabled: (
     scriptId: KanbanScript["id"],
     enabled: boolean,
+  ) => Effect.Effect<KanbanScript, KanbanError>;
+  /** Clears operator-checked unresolved outcomes without requeueing or sending them. */
+  readonly acknowledge: (
+    input: KanbanScriptAcknowledgeInput,
   ) => Effect.Effect<KanbanScript, KanbanError>;
   /** Starts a run now and returns it open; it finishes in the background. */
   readonly run: (
@@ -1080,6 +1087,45 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const acknowledge: KanbanScriptsShape["acknowledge"] = Effect.fn("KanbanScripts.acknowledge")(
+    function* ({ scriptId, deliveries }) {
+      if (deliveries.length === 0 || deliveries.length > 100) {
+        return yield* fail("invalid", "Acknowledge between 1 and 100 checked deliveries.");
+      }
+      const done = yield* Deferred.make<void>();
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          // Own the script's slot so apply cannot overwrite the acknowledged set from its snapshot.
+          if (!(yield* claim(scriptId, done))) {
+            return yield* fail(
+              "conflict",
+              "The script is running. Wait for it to finish before acknowledging deliveries.",
+            );
+          }
+          return yield* Effect.gen(function* () {
+            const script = yield* scriptOf(scriptId);
+            if (
+              deliveries.some(
+                (ref) => !script.unresolved?.some((entry) => sameDelivery(entry, ref)),
+              )
+            ) {
+              return yield* fail(
+                "conflict",
+                "Unresolved deliveries changed. Read the script again before acknowledging them.",
+              );
+            }
+            return yield* update(scriptId, (latest) => ({
+              ...latest,
+              unresolved: (latest.unresolved ?? []).filter(
+                (entry) => !deliveries.some((ref) => sameDelivery(entry, ref)),
+              ),
+            }));
+          }).pipe(Effect.ensuring(handOff(scriptId, done)));
+        }),
+      );
+    },
+  );
+
   const run: KanbanScriptsShape["run"] = Effect.fn("KanbanScripts.run")(
     function* (scriptId, trigger) {
       // The owner can still run a script that is off; a webhook caller can't.
@@ -1313,6 +1359,7 @@ const make = Effect.gen(function* () {
     runs,
     register,
     setEnabled,
+    acknowledge,
     run,
     tick,
     checkWaits,

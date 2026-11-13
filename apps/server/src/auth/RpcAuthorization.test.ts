@@ -16,6 +16,8 @@ import {
   AuthRelayWriteScope,
   AuthTerminalReadScope,
   AuthTerminalOperateScope,
+  KANBAN_WS_METHODS,
+  CLIENT_GUARDED_RPC_SCOPES,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -34,6 +36,15 @@ import * as RpcAuthorization from "./RpcAuthorization.ts";
 describe("RPC authorization scopes", () => {
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
+  });
+
+  it("requires operate access for script delivery acknowledgement on server and client", () => {
+    expect(requiredScopeForRpcMethod(KANBAN_WS_METHODS.scriptAcknowledge)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(CLIENT_GUARDED_RPC_SCOPES[KANBAN_WS_METHODS.scriptAcknowledge]).toBe(
+      AuthOrchestrationOperateScope,
+    );
   });
 
   it("requires operate access to stop a workflow", () => {

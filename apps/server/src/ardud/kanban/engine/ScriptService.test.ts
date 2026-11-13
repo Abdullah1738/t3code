@@ -15,6 +15,9 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  AuthSessionId,
+  KANBAN_WS_METHODS,
+  KanbanScriptAcknowledgeInput,
   KanbanBoardId,
   KanbanError,
   KanbanScript as KanbanScriptSchema,
@@ -28,6 +31,11 @@ import {
   type KanbanScript,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
+
+import { Etag, HttpPlatform, HttpRouter } from "effect/http";
+import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import { kanbanRouteLayer } from "../http.ts";
+import { makeKanbanWsHandlers } from "../ws.ts";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerConfig from "../../../config.ts";
@@ -87,6 +95,9 @@ const makeTestLayer = (
   wrap: (
     service: KanbanService.KanbanService["Service"],
   ) => KanbanService.KanbanService["Service"] = (service) => service,
+  wrapStore: (store: KanbanStore.KanbanStore["Service"]) => KanbanStore.KanbanStore["Service"] = (
+    store,
+  ) => store,
 ) =>
   ScriptService.layer.pipe(
     Layer.provideMerge(
@@ -96,7 +107,11 @@ const makeTestLayer = (
     ),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threadsLayer),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(
+      Layer.effect(KanbanStore.KanbanStore, Effect.map(KanbanStore.KanbanStore, wrapStore)).pipe(
+        Layer.provide(KanbanStore.layer),
+      ),
+    ),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -109,6 +124,7 @@ const testLayer = makeTestLayer(threads);
 const owner: KanbanActor = { _tag: "owner" };
 const manual: KanbanScriptTrigger = { _tag: "manual" };
 const decodeScript = Schema.decodeUnknownEffect(KanbanScriptSchema);
+const decodeAcknowledgement = Schema.decodeUnknownEffect(KanbanScriptAcknowledgeInput);
 const encodeScript = Schema.encodeEffect(KanbanScriptSchema);
 
 const scriptFile = (body: string, name = "script.sh") => {
@@ -2250,4 +2266,261 @@ it.effect(
         assert.lengthOf((yield* store.script(script.id))!.held!, 1);
       }).pipe(Effect.provide(fixture.layer));
     }),
+);
+
+const scriptHttp = Effect.gen(function* () {
+  const context = yield* Effect.context<
+    ScriptService.KanbanScripts | KanbanService.KanbanService | ServerSettings.ServerSettingsService
+  >();
+  const handler = yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      HttpRouter.toWebHandler(
+        kanbanRouteLayer.pipe(
+          Layer.provide(Layer.succeedContext(context)),
+          Layer.provide(
+            Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+              authenticateHttpRequest: (request) =>
+                Effect.succeed({
+                  sessionId: AuthSessionId.make("scripts-test"),
+                  subject: "operator",
+                  method: "bearer-access-token",
+                  scopes:
+                    request.headers.authorization === "Bearer operate"
+                      ? ["orchestration:read", "orchestration:operate"]
+                      : ["orchestration:read"],
+                }),
+            }),
+          ),
+          Layer.provide(
+            HttpPlatform.layer.pipe(
+              Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(Etag.layerWeak),
+            ),
+          ),
+        ),
+        { disableLogger: true },
+      ),
+    ),
+    (handler) => Effect.promise(() => handler.dispose()),
+  );
+  return (
+    scriptId: KanbanScript["id"],
+    deliveries: KanbanScriptAcknowledgeInput["deliveries"],
+    token = "operate",
+  ) =>
+    Effect.promise(() =>
+      handler.handler(
+        new Request(`http://env.local/api/ardud/kanban/scripts/${scriptId}/acknowledge`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ deliveries }),
+        }),
+        context,
+      ),
+    );
+});
+
+it.effect.each(["service", "http", "ws"] as const)(
+  "#577 acknowledgement via %s releases full-cap capacity without replaying uncertain commands",
+  (entry) =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () =>
+          new KanbanError({
+            code: "conflict",
+            detail: "Unknown outcome",
+            writeOutcome: "may-have-applied",
+          }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const path = scriptFile(
+          Array.from(
+            { length: 101 },
+            (_, n) => `echo '{"kanban":"card","prompt":"Ticket ${n}","title":"Ticket ${n}"}'`,
+          ).join("\n"),
+        );
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 100);
+        const full = (yield* store.script(script.id))!;
+        assert.lengthOf(full.unresolved!, 100);
+        assert.lengthOf(full.held!, 1);
+        const deliveries = [full.unresolved![0]!];
+        if (entry === "http") {
+          const request = yield* scriptHttp;
+          assert.strictEqual((yield* request(script.id, deliveries, "read")).status, 403);
+          assert.lengthOf((yield* store.script(script.id))!.unresolved!, 100);
+          assert.strictEqual((yield* request(script.id, [])).status, 400);
+          assert.strictEqual((yield* request(script.id, deliveries)).status, 200);
+        } else if (entry === "ws") {
+          const input = yield* decodeAcknowledgement({ scriptId: script.id, deliveries });
+          yield* makeKanbanWsHandlers(kanban, scripts)[KANBAN_WS_METHODS.scriptAcknowledge](input);
+        } else yield* scripts.acknowledge({ scriptId: script.id, deliveries });
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 99);
+        assert.strictEqual(fixture.calls(), 100);
+        fixture.failWith(() => null);
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 101);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        assert.strictEqual((yield* kanban.snapshot(board.id)).cards[0]!.title, "Ticket 100");
+        const remaining = (yield* store.script(script.id))!.unresolved!;
+        yield* scripts.acknowledge({ scriptId: script.id, deliveries: remaining });
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 101);
+      }).pipe(Effect.scoped, Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect.each(["command", "firstFailedAt", "attempts"] as const)(
+  "#577 acknowledgement refuses a stale %s without clearing any checked outcomes",
+  (field) =>
+    Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      const checked = {
+        command: { kanban: "post" as const, text: "Checked" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      const stale = {
+        ...checked,
+        ...(field === "command" ? { command: { kanban: "post" as const, text: "Changed" } } : {}),
+        ...(field === "firstFailedAt" ? { firstFailedAt: "2026-11-13T00:00:00.000Z" } : {}),
+        ...(field === "attempts" ? { attempts: 2 } : {}),
+      };
+      yield* store.putScript({ ...script, unresolved: [checked] });
+      const conflict = yield* scripts
+        .acknowledge({ scriptId: script.id, deliveries: [checked, stale] })
+        .pipe(Effect.flip);
+      assert.strictEqual(conflict.code, "conflict");
+      assert.deepStrictEqual((yield* store.script(script.id))!.unresolved, [checked]);
+      yield* scripts.acknowledge({ scriptId: script.id, deliveries: [checked] });
+      assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("#577 acknowledgement refuses an active script and preserves unrelated fields", () =>
+  Effect.gen(function* () {
+    const attempted = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = makeTestLayer(threads, false, (service) => ({
+      ...service,
+      createCard: (boardId, input, actor) =>
+        actor._tag !== "script"
+          ? service.createCard(boardId, input, actor)
+          : Deferred.succeed(attempted, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(
+                Effect.fail(new KanbanError({ code: "failed", detail: "Not delivered" })),
+              ),
+            ),
+    }));
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(cardLine));
+      const existing = {
+        command: { kanban: "post" as const, text: "Uncertain" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      yield* store.putScript({ ...script, unresolved: [existing] });
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(attempted);
+      assert.strictEqual(
+        (yield* scripts
+          .acknowledge({ scriptId: script.id, deliveries: [existing] })
+          .pipe(Effect.flip)).code,
+        "conflict",
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* scripts.idle;
+      yield* scripts.setEnabled(script.id, false);
+      const before = (yield* store.script(script.id))!;
+      const after = yield* scripts.acknowledge({ scriptId: script.id, deliveries: [existing] });
+      assert.isFalse(after.enabled);
+      assert.deepStrictEqual(after.lastRun, before.lastRun);
+      assert.deepStrictEqual(after.held, before.held);
+      assert.lengthOf(after.unresolved!, 0);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("#577 events queued during acknowledgement still run after it commits", () =>
+  Effect.gen(function* () {
+    const saving = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const eventRead = yield* Deferred.make<void>();
+    let hold = false;
+    const layer = makeTestLayer(
+      threads,
+      false,
+      (service) => service,
+      (store) => ({
+        ...store,
+        scripts: (boardId) =>
+          store
+            .scripts(boardId)
+            .pipe(Effect.tap(() => (hold ? Deferred.succeed(eventRead, undefined) : Effect.void))),
+        putScript: (script) =>
+          hold && script.unresolved?.length === 0
+            ? Deferred.succeed(saving, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(store.putScript(script)),
+              )
+            : store.putScript(script),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile('echo "$KANBAN_TRIGGER"'), {
+        _tag: "event",
+        event: "card.created",
+      });
+      const checked = {
+        command: { kanban: "post" as const, text: "Checked" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      yield* store.putScript({ ...script, unresolved: [checked] });
+      yield* scripts.listen;
+      hold = true;
+      const acknowledging = yield* Effect.forkChild(
+        scripts.acknowledge({ scriptId: script.id, deliveries: [checked] }),
+      );
+      yield* Deferred.await(saving);
+      yield* kanban.createCard(board.id, { prompt: "Event", title: "Event" }, owner);
+      yield* Deferred.await(eventRead);
+      yield* TestClock.adjust(0);
+      hold = false;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(acknowledging);
+      yield* scripts.idle;
+      const runs = yield* scripts.runs(script.id, 10);
+      assert.lengthOf(runs, 1);
+      assert.strictEqual(runs[0]!.trigger, "event");
+      assert.include(runs[0]!.output, "event");
+      assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+    }).pipe(Effect.scoped, Effect.provide(layer));
+  }),
 );

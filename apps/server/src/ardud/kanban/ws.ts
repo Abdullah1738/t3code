@@ -4,6 +4,7 @@ import {
   type KanbanCardId,
   type KanbanCardPatchInput,
   type KanbanDiscussionUpdateInput,
+  type KanbanScriptAcknowledgeInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -169,5 +170,6 @@ export const makeKanbanWsHandlers = (
       scripts.setEnabled(input.scriptId, input.enabled),
     [M.scriptRun]: (input: { readonly scriptId: ScriptId }) =>
       scripts.run(input.scriptId, "manual"),
+    [M.scriptAcknowledge]: (input: KanbanScriptAcknowledgeInput) => scripts.acknowledge(input),
   } as const;
 };

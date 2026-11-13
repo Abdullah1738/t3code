@@ -2096,12 +2096,27 @@ export const KanbanScriptPostCommand = Schema.Struct({
   card: Schema.optional(Schema.Int),
 });
 
-const KanbanScriptHeldCommand = Schema.Struct({
+export const KanbanScriptDeliveryRef = Schema.Struct({
   command: Schema.Union([KanbanScriptCardCommand, KanbanScriptPostCommand]),
   firstFailedAt: IsoDateTime,
-  lastError: Schema.String,
   /** Total delivery attempts, including retries within a run. */
   attempts: NonNegativeInt,
+});
+export type KanbanScriptDeliveryRef = typeof KanbanScriptDeliveryRef.Type;
+
+/** Acknowledgement clears checked outcomes; it never sends the commands again. */
+export const KanbanScriptAcknowledgeInput = Schema.Struct({
+  scriptId: KanbanScriptId,
+  deliveries: Schema.Array(KanbanScriptDeliveryRef).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(100),
+  ),
+});
+export type KanbanScriptAcknowledgeInput = typeof KanbanScriptAcknowledgeInput.Type;
+
+const KanbanScriptHeldCommand = Schema.Struct({
+  ...KanbanScriptDeliveryRef.fields,
+  lastError: Schema.String,
 });
 
 export const KanbanScript = Schema.Struct({
