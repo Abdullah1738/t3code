@@ -175,6 +175,8 @@ const annotateAcquired = (
   if (span?._tag !== "Span" || acquired === undefined) return;
   span.attribute("db.connection", acquired.connection);
   span.attribute("db.lock_wait_ms", acquired.lockWaitMs);
+  span.attribute("db.reader.acquired", true);
+  span.attribute("db.reader.wait_ms", acquired.lockWaitMs);
   if (acquired.connection === "reader")
     span.attribute("db.reader.acquire_wait_ms", acquired.lockWaitMs);
   span.attribute("db.reader.waiting", false);
@@ -198,6 +200,7 @@ interface TransactionPending {
   readonly owner: object;
   readonly started: bigint;
   acquired?: Acquired;
+  permitStarted?: bigint;
   restore: typeof Effect.interruptible | undefined;
   retire?: Effect.Effect<void>;
   /** The transaction's span, annotated with the reader hold when the permit is released. */
@@ -2093,6 +2096,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const fiber = Fiber.getCurrent()!;
         const scope = Context.getUnsafe(fiber.context, Scope.Scope);
         const pending = pendingForClient(fiber);
+        if (pending !== undefined) pending.permitStarted = start;
         if (
           pending !== undefined &&
           target.name === "reader" &&
@@ -2146,6 +2150,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
           const pending = pendingForClient(fiber);
           if (pending?.acquired === undefined && pending?.span !== undefined) {
             pending.span.attribute("db.reader.waiting", true);
+            pending.span.attribute("db.reader.acquired", false);
+            pending.span.attribute(
+              "db.reader.wait_ms",
+              Number(
+                fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe() -
+                  (pending.permitStarted ?? pending.started),
+              ) / 1e6,
+            );
             pending.span.attribute("db.reader.wait_interrupted", Exit.hasInterrupts(exit));
             const waited =
               Number(fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe() - pending.started) / 1e6;
@@ -2206,6 +2218,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
                   );
                   span.attribute("db.reader.waiting", true);
                   span.attribute("db.reader.acquire_stage", "admission");
+                  span.attribute("db.reader.acquired", false);
                 }
               }
               return span;
