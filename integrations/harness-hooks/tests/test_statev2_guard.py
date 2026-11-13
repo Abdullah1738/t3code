@@ -162,6 +162,75 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.classify("cat > tmp/p.py <<'EOF'\nprint(1)\nEOF\noffbox run -- 'echo hi' > tmp/p.py\npython3 tmp/p.py"), UNRESOLVED)
         self.assertEqual(self.classify('offbox run -- cd /; python3 tmp/live.py'), SCRIPT)
 
+    def test_remote_argv_preserves_caller_expansion(self):
+        self.write('safe.py', 'print(1)')
+        self.write('with space/safe.py', 'print(1)')
+        self.write('safe__suffix__.py', 'print(1)')
+        rows = [
+            ('quoted reader', 'DB=' + LIVE, 'cat "$DB"', READ),
+            ('braced reader', 'DB=' + LIVE, 'cat "${DB}"', READ),
+            ('bare reader', 'DB=' + LIVE, 'cat $DB', READ),
+            ('reader suffix', 'D=/Users/x/.robob/userdata', 'cat "$D"/statev2.sqlite', READ),
+            ('conditional reader', 'DB=' + LIVE + '; if true; then DB=tmp/t.py; fi', 'cat "$DB"', READ),
+            ('quoted script', 'S=safe.py', 'python3 "$S"', None),
+            ('braced script', 'S=safe.py', 'python3 "${S}"', None),
+            ('bare script', 'S=safe.py', 'python3 $S', None),
+            ('script suffix', 'D=tmp', 'python3 "$D"/t.py', None),
+            ('live script', 'S=tmp/live.py', 'python3 "$S"', SCRIPT),
+            ('unknown script', '', 'python3 "$UNKNOWN"', UNRESOLVED),
+            ('conditional script', 'S=tmp/live.py; if true; then S=safe.py; fi', 'python3 "$S"', SCRIPT),
+            ('double-quoted prefix', 'S=tmp/li; Sve=tmp/t', 'python3 "$S"ve.py', SCRIPT),
+            ('single-quoted suffix', 'S=tmp/li; Sve=tmp/t', 'python3 $S\'ve.py\'', SCRIPT),
+            ('double-quoted suffix', 'S=tmp/li; Sve=tmp/t', 'python3 $S"ve.py"', SCRIPT),
+            ('escaped suffix', 'S=tmp/li; Sve=tmp/t', r'python3 $S\ve.py', SCRIPT),
+            ('home reader', '', 'cat "$HOME/.t3/userdata/statev2.sqlite"', READ),
+            ('braced home reader', '', 'cat "${HOME}/.t3/userdata/statev2.sqlite"', READ),
+            ('pwd live script', '', 'python3 "$PWD/tmp/live.py"', SCRIPT),
+            ('pwd safe script', '', 'python3 "${PWD}/safe.py"', None),
+        ]
+        for wrapper in ['offbox run -- ', 'ssh box ', 'python3 /abs/offbox.py ssh box ']:
+            for label, prefix, command, expected in rows:
+                with self.subTest(wrapper=wrapper, form=label):
+                    self.assertEqual(self.classify((prefix + '; ' if prefix else '') + wrapper + command), expected)
+        self.table([
+            ('S="with space/safe.py"; offbox run -- python3 "$S"', None),
+            ('S="cat ' + LIVE + '"; offbox run -- $S', UNRESOLVED),
+            ('S="tmp/live.py extra"; offbox run -- python3 ${S}', UNRESOLVED),
+            ('S="tmp/live.py extra"; offbox run -- python3 $S', UNRESOLVED),
+            ('S="with space/safe.py"; offbox run -- python3 "${S}"', None),
+            ('S=safe; offbox run -- python3 "$S"__suffix__.py', None),
+            ('S=tmp/t; python3 "$S"\'.py\'', None),
+            ('S=tmp/live; python3 "$S"\'.py\'', SCRIPT),
+            ('S=safe.py; offbox run -- python3 "$S"; python3 tmp/live.py', SCRIPT),
+            ('S=safe.py; offbox run -- bash -c \'S=tmp/live.py; python3 "$S"\'', SCRIPT),
+            ('S=tmp/live.py; offbox run -- bash -c \'S=safe.py; python3 "$S"\'', None),
+            ('S=tmp/live.py; offbox run -- \'S=safe.py; python3 "$S"\'', None),
+            ('S="python3 safe.py"; offbox run -- "$S"', None),
+            ('DB=' + LIVE + '; offbox run -- bash -c "echo \\$S; cat $DB"', READ),
+            ('DB=safe.py; offbox run -- bash -c "echo \\$S; python3 $DB"', None),
+            ('CODE=\'S=safe.py; python3 "$S"\'; offbox run -- "$CODE"', None),
+            ('results_dir=$(mktemp -d); offbox run -- python3 -I - "$results_dir" <<\'PY\'\nimport sys; print(sys.argv[1])\nPY\n', None),
+            ('offbox run -- python3 -I - "$(mktemp -d)" <<\'PY\'\nprint(1)\nPY\n', None),
+            ('results_dir=$(mktemp -d); offbox run -- python3 -I - "$results_dir" <<\'PY\'\nimport sqlite3; sqlite3.connect(' + repr(LIVE) + ')\nPY\n', READ),
+            ('DB=' + LIVE + '; offbox run -- cat \'$DB\' "$DB"', READ),
+            ('S=; offbox run -- $S python3 tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- ${S} python3 tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- python3 $S tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- "$S" python3 tmp/live.py', None),
+            ('S=; offbox run -- ""$S python3 tmp/live.py', None),
+            ('S=; offbox run -- python3 -I - "$S" <<\'PY\'\nprint(1)\nPY\n', None),
+        ])
+
+    def test_remote_argv_keeps_literal_dollar_segments(self):
+        self.write('$S', 'print(1)')
+        self.write('tmp/$S.py', 'print(1)')
+        for operand in ["'$S'", r'\$S', r'"\$S"']:
+            with self.subTest(operand=operand):
+                self.assertEqual(self.classify('S=tmp/live.py; offbox run -- python3 ' + operand), UNRESOLVED)
+        self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/\'$S.py\''), UNRESOLVED)
+        self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/"$S.py"'), SCRIPT)
+        self.assertIsNone(self.classify('S=tmp/live.py; offbox run -- cat \'$S\''))
+
     def test_substitution_quotes_cannot_hide_later_documents(self):
         prefixes = [
             "echo \"`printf '\"'`\"",

@@ -1382,9 +1382,13 @@ def _quoted_punctuation(source, script_literals=False):
             index = end
             continue
         if char == "\\" and index + 1 < len(source):
-            if script_literals and source[index + 1] == '$':
+            if script_literals:
+                if source[index + 1] == '\n':
+                    output.append(source[index:index + 2])
+                    index += 2
+                    continue
                 key = f"\0guard_literal_{len(quoted)}__"
-                quoted[key] = '$'
+                quoted[key] = source[index + 1]
                 output.append(key)
                 index += 2
                 continue
@@ -1433,10 +1437,11 @@ def _quoted_punctuation(source, script_literals=False):
                     break
                 end += 1
             value = source[index + 1:end]
-            literal = script_literals and ('$' in value if char == "'" else '\\$' in value)
-            double = script_literals and char == '"' and '$' in value and not literal
+            literal = script_literals and (char == "'" or '\\$' in value or '\\`' in value)
+            double = script_literals and char == '"' and not literal
             if end < len(source) and (re.fullmatch(r"[;&|(){}\n<>]+", value) or literal or double):
-                key = (f"\0guard_literal_{len(quoted)}__" if literal else
+                literal_prefix = '\0guard_literal_double_' if char == '"' else '\0guard_literal_'
+                key = (f"{literal_prefix}{len(quoted)}__" if literal else
                        f"\0guard_double_{len(quoted)}__" if double else f"{prefix}{len(quoted)}__")
                 if double:
                     value = shlex.split(source[index:end + 1])[0]
@@ -1624,15 +1629,16 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return False
         return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
 
-    def script_variants(value):
-        if value in invocation_literals or unsafe_bindings:
+    def script_variants(value, *, literal=None, bindings=None):
+        if (value in invocation_literals if literal is None else literal) or unsafe_bindings:
             return {value}
+        bindings = script_values if bindings is None else bindings
         candidates, end = {''}, 0
         for match in re.finditer(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", value):
             name = match[1] or match[2]
             expanded = set()
             for candidate in candidates:
-                for replacement in script_values.get(name, {match[0]}):
+                for replacement in bindings.get(name, {match[0]}):
                     expanded.add(candidate + value[end:match.start()] + replacement)
                     if len(expanded) > MAX_SCRIPTS:
                         raise AmbiguousScript("too many variable script paths")
@@ -1896,7 +1902,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         unquoted_words = set()
         def decode(value):
             decoded = decode_word(value, directory, depth, quoted, checked, cwd_only, bodies)
-            if '\0guard_literal_' in value:
+            if any(key in value and key.startswith('\0guard_literal_') and re.search(r'[$`]', text)
+                   for key, text in quoted.items()):
                 literal_words.add(decoded)
             if '\0guard_double_' in value and not re.search(r'[$`]', value) and '\0guard_quoted_' not in value:
                 double_words.add(decoded)
@@ -1925,9 +1932,75 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 del words[index:index + 2]
             else:
                 index += 1
+        raw_words = list(words)
         words = [decode(word) for word in words]
         invocation_literals = literal_words
         invocation_quoted = double_words - unquoted_words
+
+        def caller_argv(count):
+            # Prefix unwrapping only removes words from the front. Preserve
+            # literal quote segments until caller expansions are complete.
+            bindings = {'HOME': {str(Path.home())}, **({'PWD': {str(directory)}} if directory is not None else {}), **script_values}
+            arguments = [[]]
+            variable = r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)'
+            markers = dict(quoted)
+
+            def double_text(text):
+                parts, index = [], 0
+                while index < len(text):
+                    char = text[index]
+                    if char == '\\' and index + 1 < len(text) and text[index + 1] in '$`"\\\n':
+                        index += 1
+                        char = text[index]
+                        if char in '$`':
+                            marker = f'\0guard_literal_remote_{len(markers)}__'
+                            markers[marker] = char
+                            char = marker
+                        elif char == '\n':
+                            char = ''
+                    parts.append(char)
+                    index += 1
+                return ''.join(parts)
+
+            def resolve(text, quoted_context=False):
+                pieces, end = [], 0
+                for match in re.finditer(r'\0guard_(?:quoted|double|literal(?:_double|_remote)?)_\d+__', text):
+                    pieces.append((text[end:match.start()], None))
+                    pieces.append((match[0], markers[match[0]]))
+                    end = match.end()
+                pieces.append((text[end:], None))
+                result = {''}
+                for key, literal in pieces:
+                    if literal is not None:
+                        if key.startswith('\0guard_literal_double_'):
+                            values = resolve(double_text(literal), True)
+                        elif key.startswith('\0guard_literal_'):
+                            values = {literal}
+                        else:
+                            values = resolve(literal, quoted_context or key.startswith('\0guard_double_'))
+                    else:
+                        if not quoted_context:
+                            key = key.replace('\n', '')
+                        if unsafe_bindings and re.search(variable, key):
+                            raise AmbiguousScript('unresolved caller-expanded remote argument ' + _token(key))
+                        if not quoted_context:
+                            for match in re.finditer(variable, key):
+                                if any(re.search(r'\s|[*?\[]', candidate) for candidate in bindings.get(match[1] or match[2], ())):
+                                    raise AmbiguousScript('ambiguous unquoted remote argument ' + _token(key))
+                        values = script_variants(key, literal=False, bindings=bindings)
+                    result = {prior + value for prior in result for value in values}
+                    if len(result) > MAX_SCRIPTS:
+                        raise AmbiguousScript('too many caller-expanded remote argument combinations')
+                return result
+
+            for raw in raw_words[-count:]:
+                resolved = resolve(raw)
+                if '' in resolved and not re.search(r'\0guard_(?:literal|double)_', raw):
+                    raise AmbiguousScript('unquoted remote argument may disappear after expansion')
+                arguments = [prior + [candidate] for prior in arguments for candidate in resolved]
+                if len(arguments) > MAX_SCRIPTS:
+                    raise AmbiguousScript('too many caller-expanded remote argument combinations')
+            return arguments
         if not cwd_only and any(re.match(r'^[A-Za-z_]\w*(?:\+|\[)', word) for word in words):
             script_values.clear()
             opaque_written.clear()
@@ -1997,8 +2070,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     if op == '<':
                         remote_input.extend([op, target])
                 if words:
-                    scan_remote(words[0] if len(words) == 1 else shlex.join(words), directory, depth + 1,
-                                remote_input, remote_bodies)
+                    for argv in caller_argv(len(words)):
+                        scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
+                                    remote_input, remote_bodies)
                     if may_change_scripts(words, directory, documents):
                         changed_sources.update(written)
                         fresh_variables.clear()
@@ -2272,7 +2346,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         raise AmbiguousScript('missing ssh option operand ' + _token(flag))
                     remote.pop(0)
             if len(remote) > 1:
-                scan_remote(' '.join(remote[1:]), directory, depth + 1)
+                for argv in caller_argv(len(remote) - 1):
+                    scan_remote(' '.join(argv), directory, depth + 1)
             return after
         interpreter = binary in shells | {"node", "bun", "deno"} or re.fullmatch(r"python[\d.]*", binary)
         if interpreter or binary in {"source", "."}:
@@ -2319,7 +2394,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         add(target, directory, binary, migration_args, target if node_test else None)
                         if python and Path(target).name == 'offbox.py' and args[1:2] == ['ssh'] and len(args) > 3:
                             remote = args[3:]
-                            scan_remote(remote[0] if len(remote) == 1 else shlex.join(remote), directory, depth + 1)
+                            for argv in caller_argv(len(remote)):
+                                scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1)
         elif words[0].startswith(("/", "./", "../", "~/", "$HOME/", "${HOME}/")) and re.search(r"\.(?:py|mjs|cjs|js|ts|sh)$", words[0]):
             add(words[0], directory, binary)
         return after
