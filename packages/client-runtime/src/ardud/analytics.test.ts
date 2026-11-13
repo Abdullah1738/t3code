@@ -7,6 +7,8 @@ import {
   clientRpcRequiredScopes,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import { Atom } from "effect/reactivity";
 import { createKanbanClient } from "./kanban/client.ts";
 import type { KanbanTransport } from "./kanban/transport.ts";
@@ -22,12 +24,17 @@ import {
   sanitizeAnalyticsEvent,
   sampleAnalyticsFrames,
   type ClientAnalyticsEvent,
+  type AnalyticsDetails,
   analyticsRpcSerialization,
   flushEnvironmentAnalytics,
   setActiveAnalyticsEnvironment,
 } from "./analytics.ts";
 
 const disposers: Array<() => void> = [];
+const encodeRpcExit = Schema.encodeSync(
+  Schema.toCodecJson(Schema.Exit(Schema.Unknown, Schema.Unknown, Schema.Defect())),
+);
+const encodeRpcDefect = Schema.encodeSync(Schema.Defect());
 afterEach(() => {
   for (const dispose of disposers.splice(0)) dispose();
   vi.useRealTimers();
@@ -779,6 +786,377 @@ const mutationCorpus = [
     classification,
   })),
 ];
+
+describe("RPC context and subscription measurement corpus", () => {
+  it("bounds pending streams and releases their measurement context on cancellation or disconnect", async () => {
+    const { value, send } = collector();
+    disposers.push(registerEnvironmentAnalytics("bounded-streams", value));
+    const serialization = analyticsRpcSerialization("bounded-streams");
+    const parser = serialization.makeUnsafe();
+    for (let id = 1; id <= 1_025; id++)
+      parser.encode({ _tag: "Request", id, tag: KANBAN_WS_METHODS.subscribe, payload: {} });
+    const chunk = (requestId: number) =>
+      JSON.stringify({ _tag: "Chunk", requestId, values: ["private content"] });
+    parser.decode(chunk(1));
+    parser.decode(chunk(1_025));
+    expect(send).not.toHaveBeenCalled();
+    await value.flush();
+    expect(send.mock.calls.flatMap(([batch]) => batch)).toMatchObject([
+      { props: { phase: "stream", count: 1 } },
+    ]);
+    parser.encode({ _tag: "Interrupt", requestId: 1_025 });
+    parser.decode(chunk(1_025));
+    serialization.disconnected();
+    serialization.disconnected();
+    await value.flush();
+    const errors = send.mock.calls
+      .flatMap(([batch]) => batch)
+      .filter((event) => event.props?.errorTag);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.props).toMatchObject({ count: 1_023, errorTag: "RpcClientError", bytes: 0 });
+    expect(JSON.stringify(errors)).not.toContain("private");
+  });
+
+  it("bounds entity partitions without sending one message for each stream chunk", async () => {
+    const { value, send } = collector(undefined, 100);
+    for (let index = 0; index < 500; index++)
+      value.receivedRpc(
+        KANBAN_WS_METHODS.subscribe,
+        { route: "board", boardId: `board-${index}` },
+        1,
+        undefined,
+        true,
+      );
+    expect(value.pending()).toBeLessThanOrEqual(100);
+    expect(send).not.toHaveBeenCalled();
+    await value.flush();
+    await value.flush();
+    expect(send.mock.calls.every(([batch]) => batch.length <= 100)).toBe(true);
+    const events = send.mock.calls.flatMap(([batch]) => batch);
+    expect(events.filter((event) => event.kind === "rpc.summary")).toHaveLength(100);
+    expect(events.find((event) => event.kind === "analytics.dropped")!.props?.count).toBe(400);
+  });
+
+  it.each(
+    (["boardId", "cardId", "discussionId", "threadId"] as const).flatMap((id) =>
+      (["before navigation", "after navigation"] as const).map((completion) => ({
+        id,
+        completion,
+      })),
+    ),
+  )("retains $id when a request completes $completion", async ({ id, completion }) => {
+    vi.useFakeTimers();
+    const { value, send } = collector();
+    value.setRoute({ route: "board", [id]: "entity-a" });
+    const finishA = value.beginRpc(WS_METHODS.serverGetConfig);
+    if (completion === "before navigation") finishA(10, 11);
+    value.setRoute({ route: "board", [id]: "entity-b" });
+    if (completion === "after navigation") finishA(10, 11);
+    value.beginRpc(WS_METHODS.serverGetConfig)(20, 22);
+    expect(send).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    const summaries = send.mock.calls
+      .flatMap(([batch]) => batch)
+      .filter((event) => event.kind === "rpc.summary");
+    expect(summaries).toHaveLength(2);
+    expect(
+      summaries.map((event) => [
+        event[id],
+        event.props?.count,
+        event.props?.bytes,
+        event.props?.p95Ms,
+      ]),
+    ).toEqual([
+      ["entity-a", 1, 11, 10],
+      ["entity-b", 1, 22, 20],
+    ]);
+  });
+
+  it("does not inherit new IDs or retain mutable route details and props", async () => {
+    const { value, send } = collector();
+    const context = { route: "board", boardId: "board-a", props: { key: "private-route-prop" } };
+    value.setRoute(context);
+    const finishA = value.beginRpc(WS_METHODS.serverGetConfig);
+    context.boardId = "mutated";
+    value.setRoute({ route: "home" });
+    const finishHome = value.beginRpc(WS_METHODS.serverGetConfig);
+    value.setRoute({
+      route: "card",
+      boardId: "board-b",
+      cardId: "card-b",
+      discussionId: "discussion-b",
+      threadId: "thread-b",
+      props: { key: "new-route-prop" },
+    });
+    finishA(1, 10);
+    finishHome(2, 20);
+    await value.flush();
+    const summaries = send.mock.calls
+      .flatMap(([batch]) => batch)
+      .filter((event) => event.kind === "rpc.summary");
+    expect(summaries).toMatchObject([{ route: "board", boardId: "board-a" }, { route: "home" }]);
+    expect(summaries[1]).not.toHaveProperty("boardId");
+    for (const summary of summaries) {
+      expect(summary).not.toHaveProperty("cardId");
+      expect(summary).not.toHaveProperty("discussionId");
+      expect(summary).not.toHaveProperty("threadId");
+      expect(summary.props).not.toHaveProperty("key");
+    }
+  });
+
+  it("keeps unary transport bytes and timing in the context captured before navigation", async () => {
+    const { value, send } = collector();
+    disposers.push(registerEnvironmentAnalytics("context-wire", value));
+    const parser = analyticsRpcSerialization("context-wire").makeUnsafe();
+    const context: AnalyticsDetails = {
+      route: "board",
+      boardId: "board-a",
+      cardId: "card-a",
+      discussionId: "discussion-a",
+      threadId: "thread-a",
+    };
+    value.setRoute(context);
+    const finish = value.beginRpc(WS_METHODS.serverGetConfig);
+    parser.encode({ _tag: "Request", id: 1, tag: WS_METHODS.serverGetConfig, payload: {} });
+    value.setRoute({ route: "board", boardId: "board-b" });
+    const raw = JSON.stringify({
+      _tag: "Exit",
+      requestId: 1,
+      exit: { _tag: "Success", value: "private 😀" },
+    });
+    parser.decode(raw);
+    finish(30, 0);
+    await value.flush();
+    const summaries = send.mock.calls
+      .flatMap(([batch]) => batch)
+      .filter((event) => event.kind === "rpc.summary");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({
+      ...context,
+      props: { count: 1, p95Ms: 30, bytes: new TextEncoder().encode(raw).byteLength },
+    });
+    expect(JSON.stringify(summaries)).not.toContain("private");
+  });
+
+  it("does not collide when identifiers contain separators", async () => {
+    const { value, send } = collector();
+    value.setRoute({ route: "board", boardId: "a:b", cardId: "c" });
+    value.beginRpc(WS_METHODS.serverGetConfig)(1, 1);
+    value.setRoute({ route: "board", boardId: "a", cardId: "b:c" });
+    value.beginRpc(WS_METHODS.serverGetConfig)(2, 2);
+    await value.flush();
+    expect(
+      send.mock.calls.flatMap(([batch]) => batch).filter((event) => event.kind === "rpc.summary"),
+    ).toHaveLength(2);
+  });
+
+  it.each(mutationCorpus.filter(({ classification }) => classification === "stream"))(
+    "measures $method failures before the first stream chunk",
+    async ({ method }) => {
+      const { value, send } = collector();
+      disposers.push(registerEnvironmentAnalytics("initial-stream-failure", value));
+      const parser = analyticsRpcSerialization("initial-stream-failure").makeUnsafe();
+      parser.encode({ _tag: "Request", id: 1, tag: method, payload: {} });
+      const raw = JSON.stringify({
+        _tag: "Exit",
+        requestId: 1,
+        exit: encodeRpcExit(Exit.die(new TypeError("private initial failure"))),
+      });
+      parser.decode(raw);
+      await value.flush();
+      const summaries = send.mock.calls
+        .flatMap(([batch]) => batch)
+        .filter((event) => event.kind === "rpc.summary");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]!.props).toMatchObject({
+        method,
+        phase: "stream",
+        count: 1,
+        errorTag: "TypeError",
+        bytes: new TextEncoder().encode(raw).byteLength,
+      });
+      expect(summaries[0]!.props).not.toHaveProperty("p95Ms");
+      expect(JSON.stringify(summaries)).not.toContain("private");
+    },
+  );
+
+  it.each(mutationCorpus.filter(({ classification }) => classification === "stream"))(
+    "periodically measures open $method streams with no per-chunk sends",
+    async ({ method }) => {
+      vi.useFakeTimers();
+      const { value, send } = collector();
+      disposers.push(registerEnvironmentAnalytics("stream-wire", value));
+      const parser = analyticsRpcSerialization("stream-wire").makeUnsafe();
+      value.setRoute({ route: "board", boardId: "board-a" });
+      parser.encode({ _tag: "Request", id: 1, tag: method, payload: { text: "private request" } });
+      value.setRoute({ route: "board", boardId: "board-b" });
+      const raw = JSON.stringify({
+        _tag: "Chunk",
+        requestId: 1,
+        values: [{ text: "private chunk 😀" }],
+      });
+      for (let index = 0; index < 150; index++) parser.decode(raw);
+      expect(send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10_000);
+      const first = send.mock.calls
+        .flatMap(([batch]) => batch)
+        .filter((event) => event.kind === "rpc.summary");
+      expect(first).toHaveLength(1);
+      expect(first[0]).toMatchObject({
+        boardId: "board-a",
+        props: {
+          method,
+          phase: "stream",
+          count: 150,
+          bytes: 150 * new TextEncoder().encode(raw).byteLength,
+        },
+      });
+      expect(first[0]!.props).not.toHaveProperty("p95Ms");
+      parser.decode(raw);
+      expect(send).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const summaries = send.mock.calls
+        .flatMap(([batch]) => batch)
+        .filter((event) => event.kind === "rpc.summary");
+      expect(summaries).toHaveLength(2);
+      expect(summaries[1]).toMatchObject({
+        boardId: "board-a",
+        props: { count: 1, bytes: new TextEncoder().encode(raw).byteLength },
+      });
+      expect(JSON.stringify(summaries)).not.toContain("private");
+    },
+  );
+
+  it.each(["typed failure", "defect", "connection defect", "disconnect", "interrupted"])(
+    "measures subscription errors and cleanup for %s",
+    async (outcome) => {
+      const { value, send } = collector();
+      disposers.push(registerEnvironmentAnalytics("stream-failure", value));
+      const serialization = analyticsRpcSerialization("stream-failure");
+      const parser = serialization.makeUnsafe();
+      value.setRoute({ route: "thread", threadId: "thread-a" });
+      parser.encode({
+        _tag: "Request",
+        id: 1,
+        tag: ORCHESTRATION_V2_WS_METHODS.subscribeThread,
+        payload: {},
+      });
+      value.setRoute({ route: "thread", threadId: "thread-b" });
+      if (outcome === "disconnect") {
+        serialization.disconnected();
+        serialization.disconnected();
+      } else if (outcome === "interrupted") parser.encode({ _tag: "Interrupt", requestId: 1 });
+      else if (outcome === "connection defect")
+        parser.decode(
+          JSON.stringify({
+            _tag: "Defect",
+            defect: encodeRpcDefect(new TypeError("private cause")),
+          }),
+        );
+      else
+        parser.decode(
+          JSON.stringify({
+            _tag: "Exit",
+            requestId: 1,
+            exit: encodeRpcExit(
+              outcome === "typed failure"
+                ? Exit.fail({ _tag: "KanbanError", message: "private error" })
+                : Exit.die(new TypeError("private defect")),
+            ),
+          }),
+        );
+      parser.decode(
+        JSON.stringify({ _tag: "Chunk", requestId: 1, values: ["ignored late chunk"] }),
+      );
+      await value.flush();
+      const summaries = send.mock.calls
+        .flatMap(([batch]) => batch)
+        .filter((event) => event.kind === "rpc.summary");
+      expect(summaries).toHaveLength(outcome === "interrupted" ? 0 : 1);
+      if (outcome !== "interrupted")
+        expect(summaries[0]).toMatchObject({
+          threadId: "thread-a",
+          props: {
+            phase: "stream",
+            count: 1,
+            errorTag:
+              outcome === "disconnect"
+                ? "RpcClientError"
+                : outcome === "typed failure"
+                  ? "KanbanError"
+                  : "TypeError",
+          },
+        });
+      expect(JSON.stringify(summaries)).not.toContain("private");
+      expect(JSON.stringify(summaries)).not.toContain("ignored");
+    },
+  );
+
+  it.each(
+    [
+      {
+        name: "typed failure",
+        exit: () => Exit.fail({ _tag: "KanbanError", message: "private failure" }),
+        tag: "KanbanError",
+      },
+      { name: "defect", exit: () => Exit.die(new TypeError("private defect")), tag: "TypeError" },
+      {
+        name: "interrupt before typed failure",
+        exit: () =>
+          Exit.failCause(
+            Cause.combine(
+              Cause.interrupt(),
+              Cause.fail({ _tag: "KanbanError", message: "private failure" }),
+            ),
+          ),
+        tag: "KanbanError",
+      },
+      {
+        name: "interrupt before defect",
+        exit: () =>
+          Exit.failCause(
+            Cause.combine(Cause.interrupt(), Cause.die(new TypeError("private defect"))),
+          ),
+        tag: "TypeError",
+      },
+      { name: "interruption", exit: () => Exit.interrupt(), tag: "Interrupted" },
+      { name: "empty cause", exit: () => Exit.failCause(Cause.empty), tag: "unknown" },
+      {
+        name: "unrecognized failure",
+        exit: () => Exit.fail({ _tag: "private-tag", message: "private failure" }),
+        tag: "unknown",
+      },
+    ].flatMap((row) =>
+      [WS_METHODS.serverGetConfig, KANBAN_WS_METHODS.subscribe].map((method) => ({
+        ...row,
+        method,
+      })),
+    ),
+  )(
+    "classifies Effect-encoded $name for $method without retaining error text",
+    async ({ exit, tag, method }) => {
+      const { value, send } = collector();
+      disposers.push(registerEnvironmentAnalytics("encoded-cause", value));
+      const parser = analyticsRpcSerialization("encoded-cause").makeUnsafe();
+      parser.encode({ _tag: "Request", id: 1, tag: method, payload: {} });
+      const encoded = encodeRpcExit(exit());
+      expect(encoded).toMatchObject({ _tag: "Failure", cause: expect.any(Array) });
+      const raw = JSON.stringify({ _tag: "Exit", requestId: 1, exit: encoded });
+      parser.decode(raw);
+      await value.flush();
+      const summaries = send.mock.calls
+        .flatMap(([batch]) => batch)
+        .filter((event) => event.kind === "rpc.summary");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]!.props).toMatchObject({
+        method,
+        errorTag: tag,
+        bytes: new TextEncoder().encode(raw).byteLength,
+      });
+      expect(JSON.stringify(summaries)).not.toContain("private");
+    },
+  );
+});
 
 describe("owner mutation method corpus", () => {
   it("makes an independent decision for every current RPC method", () => {

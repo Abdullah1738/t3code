@@ -174,9 +174,11 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
     // when it drops so subscriptions can move to the replacement session.
     const transportClosed = yield* Deferred.make<void>();
     const pingTimedOut = yield* Ref.make(false);
+    const analyticsSerialization = analyticsRpcSerialization(connection.environmentId);
     const hooks = RpcClient.ConnectionHooks.of({
       onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
-      onDisconnect: Deferred.succeed(transportClosed, undefined).pipe(
+      onDisconnect: Effect.sync(analyticsSerialization.disconnected).pipe(
+        Effect.andThen(Deferred.succeed(transportClosed, undefined)),
         Effect.andThen(Effect.all([Deferred.isDone(connected), Ref.get(pingTimedOut)])),
         Effect.flatMap(([wasConnected, timedOut]) =>
           Deferred.fail(
@@ -222,10 +224,7 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
       Layer.provide(
         Layer.mergeAll(
           layerSocket,
-          Layer.succeed(
-            RpcSerialization.RpcSerialization,
-            analyticsRpcSerialization(connection.environmentId),
-          ),
+          Layer.succeed(RpcSerialization.RpcSerialization, analyticsSerialization),
           Layer.succeed(RpcClient.ConnectionHooks, hooks),
         ),
       ),

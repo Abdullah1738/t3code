@@ -31,7 +31,7 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   analyticsForEnvironment,
-  analyticsErrorTag,
+  analyticsCauseTag,
   analyticsOwnerAction,
   recordSettingsKeys,
   recordAnalyticsSearch,
@@ -253,7 +253,7 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
         complete?.(
           performance.now() - started,
           0,
-          Exit.isFailure(exit) ? analyticsErrorTag(Cause.squash(exit.cause)) : undefined,
+          Exit.isFailure(exit) ? analyticsCauseTag(exit.cause) : undefined,
         );
       }),
     ),

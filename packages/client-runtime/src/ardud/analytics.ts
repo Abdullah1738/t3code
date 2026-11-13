@@ -342,6 +342,7 @@ const labels: Readonly<Record<string, ReadonlySet<string>>> = {
     "ask",
     "pick",
     "poll",
+    "stream",
   ]),
   reason: new Set([
     "capacity",
@@ -440,10 +441,43 @@ export function analyticsErrorTag(error: unknown): string {
   return typeof tag === "string" && errorTags.has(tag) ? tag : "unknown";
 }
 
+function analyticsDefectTag(defect: unknown): string {
+  const value = record(defect);
+  // Schema.Defect turns message-bearing objects into Error instances and discards other tags.
+  return typeof value.message === "string"
+    ? analyticsErrorTag({ name: typeof value.name === "string" ? value.name : "Error" })
+    : analyticsErrorTag(defect);
+}
+
+// Wire causes are arrays; runtime causes wrap the same reasons. Both paths must group failures alike.
+export function analyticsCauseTag(cause: unknown): string {
+  const value = record(cause);
+  const reasons = Array.isArray(cause) ? cause : Array.isArray(value.reasons) ? value.reasons : [];
+  const failure = record(
+    reasons.find((reason) => {
+      const tag = record(reason)._tag;
+      return tag === "Fail" || tag === "Die";
+    }),
+  );
+  if (failure._tag === "Fail") return analyticsErrorTag(failure.error);
+  if (failure._tag === "Die") return analyticsDefectTag(failure.defect);
+  return reasons.some((reason) => record(reason)._tag === "Interrupt") ? "Interrupted" : "unknown";
+}
+
+function captureRpcContext(details: AnalyticsDetails) {
+  const cleanIds: Partial<Record<(typeof ids)[number], string>> = {};
+  for (const key of ids) if (token(details[key], 512)) cleanIds[key] = details[key];
+  return {
+    route: typeof details.route === "string" && routes.has(details.route) ? details.route : "other",
+    ...cleanIds,
+  };
+}
+
 /** Counts encoded bytes without retaining the encoded value or its text. */
 interface RpcSamples {
   method: string;
-  route: string;
+  context: ReturnType<typeof captureRpcContext>;
+  stream: boolean;
   errorTag?: string;
   count: number;
   bytes: number;
@@ -458,7 +492,13 @@ export interface AnalyticsCollector {
   readonly beginRpc: (
     method: string,
   ) => (durationMs: number, bytes: number, errorTag?: string) => void;
-  readonly receivedRpc: (method: string, route: string, bytes: number, errorTag?: string) => void;
+  readonly receivedRpc: (
+    method: string,
+    context: AnalyticsDetails,
+    bytes: number,
+    errorTag?: string,
+    stream?: boolean,
+  ) => void;
   readonly flush: () => Promise<void>;
   readonly background: (phase: "background" | "close") => Promise<void>;
   readonly foreground: () => void;
@@ -495,12 +535,16 @@ export function createAnalyticsCollector(options: {
       void flush();
     }, options.flushMs ?? ANALYTICS_FLUSH_MS);
   };
-  const enqueue = (kind: string, details: AnalyticsDetails = {}) => {
+  const enqueue = (kind: string, details: AnalyticsDetails = {}, inheritContext = true) => {
     if (disposed) return;
     const event = sanitizeAnalyticsEvent({
-      ...route,
+      ...(inheritContext ? route : {}),
       ...details,
-      props: { originKind: options.surface, ...route.props, ...details.props },
+      props: {
+        originKind: options.surface,
+        ...(inheritContext ? route.props : {}),
+        ...details.props,
+      },
       kind,
       surface: options.surface,
       ts: new Date(now()).toISOString(),
@@ -527,17 +571,21 @@ export function createAnalyticsCollector(options: {
       sample.samples.sort((a, b) => a - b);
       const percentile = (p: number) =>
         sample.samples[Math.max(0, Math.ceil(sample.samples.length * p) - 1)] ?? 0;
-      enqueue("rpc.summary", {
-        route: sample.route,
-        props: {
-          method: sample.method,
-          count: sample.count,
-          bytes: sample.bytes,
-          p50Ms: percentile(0.5),
-          p95Ms: percentile(0.95),
-          ...(sample.errorTag ? { errorTag: sample.errorTag } : {}),
+      enqueue(
+        "rpc.summary",
+        {
+          ...sample.context,
+          props: {
+            method: sample.method,
+            count: sample.count,
+            bytes: sample.bytes,
+            ...(sample.samples.length ? { p50Ms: percentile(0.5), p95Ms: percentile(0.95) } : {}),
+            ...(sample.stream ? { phase: "stream" } : {}),
+            ...(sample.errorTag ? { errorTag: sample.errorTag } : {}),
+          },
         },
-      });
+        false,
+      );
     }
     rpc.clear();
     if (dropped && queue.length < maxEvents - inFlight.length) {
@@ -601,13 +649,27 @@ export function createAnalyticsCollector(options: {
     if (visible)
       for (const screen of screens) screen.elapsed += Math.max(0, now() - screen.started);
   };
-  const rpcSample = (method: string, requestRoute: string, errorTag?: string) => {
-    const key = `${method}:${requestRoute}:${errorTag ?? "ok"}`;
+  const rpcSample = (
+    method: string,
+    context: ReturnType<typeof captureRpcContext>,
+    errorTag?: string,
+    stream = false,
+  ) => {
+    const safeErrorTag =
+      errorTag === undefined ? undefined : errorTags.has(errorTag) ? errorTag : "unknown";
+    const key = JSON.stringify([
+      method,
+      context.route,
+      ...ids.map((id) => context[id]),
+      safeErrorTag,
+      stream,
+    ]);
     if (!rpc.has(key) && rpc.size >= 128) drainSamples();
     const sample = rpc.get(key) ?? {
       method,
-      route: requestRoute,
-      ...(errorTag ? { errorTag } : {}),
+      context,
+      stream,
+      ...(safeErrorTag ? { errorTag: safeErrorTag } : {}),
       count: 0,
       bytes: 0,
       samples: [],
@@ -645,11 +707,11 @@ export function createAnalyticsCollector(options: {
       };
     },
     beginRpc: (method) => {
-      const requestRoute = route.route ?? "other";
+      const context = captureRpcContext(route);
       if (!methods.has(method) || method === WS_METHODS.analyticsIngest) return () => {};
       return (durationMs, bytes, errorTag) => {
         if (disposed) return;
-        const sample = rpcSample(method, requestRoute, errorTag);
+        const sample = rpcSample(method, context, errorTag);
         sample.count++;
         sample.bytes += bytes;
         if (sample.samples.length === 256) sample.samples.shift();
@@ -657,9 +719,11 @@ export function createAnalyticsCollector(options: {
         arm();
       };
     },
-    receivedRpc: (method, requestRoute, bytes, errorTag) => {
+    receivedRpc: (method, context, bytes, errorTag, stream = false) => {
       if (!disposed && methods.has(method) && method !== WS_METHODS.analyticsIngest) {
-        rpcSample(method, requestRoute, errorTag).bytes += bytes;
+        const sample = rpcSample(method, captureRpcContext(context), errorTag, stream);
+        sample.bytes += bytes;
+        if (stream) sample.count++;
         arm();
       }
     },
@@ -725,10 +789,12 @@ const streamMethods = new Set<string>([
   WS_METHODS.providerAuthSubscribe,
   WS_METHODS.providerInstallSubscribe,
   ORCHESTRATION_V2_WS_METHODS.subscribeShell,
+  ORCHESTRATION_V2_WS_METHODS.subscribeArchivedShell,
   ORCHESTRATION_V2_WS_METHODS.subscribeThread,
   ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput,
   ORCHESTRATION_V2_WS_METHODS.searchThreadStream,
   WS_METHODS.subscribeAuthAccess,
+  WS_METHODS.subscribeBackgroundPolicy,
   WS_METHODS.subscribeServerConfig,
   WS_METHODS.subscribeServerLifecycle,
   WS_METHODS.scheduledTasksSubscribe,
@@ -798,15 +864,29 @@ function jsonFrameBytes(data: Uint8Array | string, count: number): number[] {
 /** Count the bytes already received by the JSON transport; never serialize a result again. */
 export function analyticsRpcSerialization(
   environmentId: string,
-): RpcSerialization.RpcSerialization["Service"] {
+): RpcSerialization.RpcSerialization["Service"] & { readonly disconnected: () => void } {
+  // One serialization service belongs to one WebSocket session, including its disconnect hook.
+  const pending = new Map<
+    string | number,
+    {
+      method: string;
+      context: ReturnType<typeof captureRpcContext>;
+      collector: AnalyticsCollector;
+      stream: boolean;
+    }
+  >();
+  const failStreams = (errorTag: string) => {
+    for (const request of pending.values()) {
+      if (request.stream)
+        request.collector.receivedRpc(request.method, request.context, 0, errorTag, true);
+    }
+    pending.clear();
+  };
   return {
     ...RpcSerialization.json,
+    disconnected: () => failStreams("RpcClientError"),
     makeUnsafe: () => {
       const parser = RpcSerialization.json.makeUnsafe();
-      const pending = new Map<
-        string | number,
-        { method: string; route: string; collector: AnalyticsCollector }
-      >();
       return {
         encode: (input) => {
           const message = record(input);
@@ -815,7 +895,6 @@ export function analyticsRpcSerialization(
             (typeof message.id === "string" || typeof message.id === "number") &&
             typeof message.tag === "string" &&
             methods.has(message.tag) &&
-            !streamMethods.has(message.tag) &&
             message.tag !== WS_METHODS.analyticsIngest
           ) {
             const collector = analyticsForEnvironment(environmentId);
@@ -823,8 +902,9 @@ export function analyticsRpcSerialization(
               if (pending.size >= 1_024) pending.delete(pending.keys().next().value!);
               pending.set(message.id, {
                 method: message.tag,
-                route: collector.context().route ?? "other",
+                context: captureRpcContext(collector.context()),
                 collector,
+                stream: streamMethods.has(message.tag),
               });
             }
           }
@@ -844,21 +924,22 @@ export function analyticsRpcSerialization(
           const sizes = relevant ? jsonFrameBytes(data, decoded.length) : [];
           for (let i = 0; i < decoded.length; i++) {
             const message = record(decoded[i]);
+            if (message._tag === "Defect") {
+              failStreams(analyticsDefectTag(message.defect));
+              continue;
+            }
             if (typeof message.requestId !== "string" && typeof message.requestId !== "number")
               continue;
             const request = pending.get(message.requestId);
             if (!request) continue;
+            if (message._tag === "Chunk") request.stream = true;
             const exit = record(message.exit);
-            const cause = record(exit.cause);
-            const reasons = Array.isArray(cause.reasons) ? cause.reasons : [];
-            const failure = record(reasons[0]);
             request.collector.receivedRpc(
               request.method,
-              request.route,
+              request.context,
               sizes[i] ?? 0,
-              exit._tag === "Failure"
-                ? analyticsErrorTag(failure.error ?? failure.defect)
-                : undefined,
+              exit._tag === "Failure" ? analyticsCauseTag(exit.cause) : undefined,
+              request.stream || message._tag === "Chunk",
             );
             if (message._tag === "Exit") pending.delete(message.requestId);
           }
