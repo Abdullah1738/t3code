@@ -933,20 +933,19 @@ export function resolveWait(
   checks: ReadonlyMap<string, WaitChecker> = WAIT_CHECKS,
 ): WaitStep {
   if (card.wait !== undefined && card.activeThreadId === null && kanbanWaitStale(card)) {
-    // Someone moved the card after the wait was set: they have it now.
-    return {
-      _tag: "end",
-      card: { ...kanbanWithoutWait(card), updatedAt: at },
-      event: {
-        kind: waitEventKind("wait_cleared"),
-        body: waitEndedBody(
-          `the card was moved to ${card.stage} while it waited ${waitingFor(card.wait, facts.cards)}`,
-        ),
-        fromStage: null,
-        toStage: null,
+    // Use the normal wake path so its note, dispatch stage and evaluator hold are saved too.
+    const ended = endWait(
+      card,
+      {
+        result: "wake",
+        to: card.wait.wakeRole ?? "none",
+        note: `the card was moved to ${card.stage} while it waited ${waitingFor(card.wait, facts.cards)}`,
       },
-      wake: { to: "none", why: "whoever moved the card has it" },
-    };
+      facts,
+      ctx,
+      at,
+    );
+    return { _tag: "end", ...ended };
   }
   const input = kanbanWaiting(card) ? checkInput(card, facts, ctx) : null;
   if (input === null) return { _tag: "none" };

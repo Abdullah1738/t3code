@@ -4004,3 +4004,39 @@ it.effect("board_nightly_review toggles on and off with read-back and rejects ca
     assert.include(denied.text, "Only evaluators");
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each([true, false])("card_move reports its wait decision (keepWait=%s)", (keepWait) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, card, other } = yield* waitFixture;
+    const set = yield* call(evaluatorThread, "card_wait", {
+      card: card.id,
+      on: "card",
+      waitsOn: other.id,
+      note: "dependency first",
+    });
+    assert.isFalse(set.isError, set.text);
+    yield* TestClock.adjust("1 minute");
+    const result = yield* call(evaluatorThread, "card_move", {
+      card: card.id,
+      to: "todo",
+      keepWait,
+    });
+    assert.isFalse(result.isError, result.text);
+    assert.include(
+      result.text,
+      `Wait for card #${other.number} ${keepWait ? "kept" : "cleared by this move; set it again with card_wait or pass keepWait"}`,
+    );
+    const saved = (yield* kanban.card(card.id)).card;
+    assert.strictEqual(saved.wait !== undefined, keepWait);
+    if (keepWait) assert.strictEqual(saved.wait?.at, saved.movedAt);
+    else
+      assert.isTrue(
+        (yield* kanban.card(card.id)).events.some(
+          (event) =>
+            event.body ===
+            `Wait ended: the card was moved to todo; it was waiting for card #${other.number}`,
+        ),
+      );
+  }).pipe(Effect.provide(layer));
+});

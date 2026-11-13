@@ -7,6 +7,7 @@ import type { ThreadManagementTerminalRunStatus } from "../../../orchestration-v
 
 import {
   KANBAN_BACKLOG,
+  type KanbanMoveOptions,
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
@@ -425,10 +426,7 @@ export interface KanbanServiceShape {
     to: KanbanStage,
     role: Rules.MoveRole,
     actor: KanbanActor,
-    options?: {
-      readonly note?: string | null | undefined;
-      readonly question?: string | null | undefined;
-    },
+    options?: KanbanMoveOptions,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   readonly flagCard: (
     cardId: KanbanCard["id"],
@@ -2514,7 +2512,6 @@ const make = Effect.gen(function* () {
     ...release(card),
     stage:
       card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage,
-    movedAt: at,
     updatedAt: at,
   });
 
@@ -2627,15 +2624,35 @@ const make = Effect.gen(function* () {
     return true;
   });
 
+  const moveWait = Effect.fn("KanbanService.moveWait")(function* (
+    card: KanbanCard,
+    to: KanbanStage,
+    at: string,
+    actor: KanbanActor,
+    keep = false,
+  ) {
+    if (card.wait === undefined) return card;
+    if (keep) return { ...card, wait: { ...card.wait, at } };
+    const dependency =
+      card.wait.card === null ? null : yield* store.card(KanbanCardId.make(card.wait.card));
+    const cards =
+      dependency === null ? undefined : new Map([[dependency.id as string, dependency]]);
+    const next = kanbanWithoutWait(card);
+    yield* logEvent(next, actor, Waits.waitEventKind("wait_cleared"), {
+      at,
+      body: Waits.waitEndedBody(
+        `the card was moved to ${to}; it was waiting ${Waits.waitingFor(card.wait, cards)}`,
+      ),
+    });
+    return next;
+  });
+
   const moveUnlocked = Effect.fn("KanbanService.moveUnlocked")(function* (
     card: KanbanCard,
     to: KanbanStage,
     role: Rules.MoveRole,
     actor: KanbanActor,
-    options: {
-      readonly note?: string | null | undefined;
-      readonly question?: string | null | undefined;
-    } = {},
+    options: KanbanMoveOptions = {},
   ) {
     const check = Rules.checkMove(role, card, to);
     if (!check.ok) return yield* failWith("denied", check.reason);
@@ -2659,7 +2676,22 @@ const make = Effect.gen(function* () {
     const asked = options.question?.trim() || null;
     let next: KanbanCard = {
       // A real move ends the attempt its automatic retry belonged to.
-      ...Retries.withoutRetries(base),
+      ...Retries.withoutRetries(
+        yield* moveWait(
+          base,
+          to,
+          at,
+          actor,
+          card.activeThreadId === null &&
+            (options.keepWait === true ||
+              ((to === "completed" || to === "deployed") &&
+                card.subtasks.some(
+                  (subtask) =>
+                    subtask.state === "open" &&
+                    (subtask.owner === "evaluator" || subtask.owner === "script"),
+                ))),
+        ),
+      ),
       stage: to,
       movedAt: at,
       updatedAt: at,
@@ -4553,6 +4585,7 @@ const make = Effect.gen(function* () {
    */
   // in_review with no thread: its review passed and it waits for its PRs.
   const stepTurn = (card: KanbanCard) =>
+    !kanbanWaiting(card) &&
     kanbanEvaluatorStep(card) &&
     card.activeThreadId === null &&
     card.settledAt === null &&
@@ -4706,7 +4739,7 @@ const make = Effect.gen(function* () {
         (asker?._tag !== "evaluator" ||
           answered.some((ask) => ask.by._tag === "thread" && ask.by.threadId === workThread));
       next = {
-        ...next,
+        ...(yield* moveWait(next, stage, at, answeredBy)),
         stage,
         question: null,
         stalled: null,
@@ -6520,7 +6553,7 @@ const make = Effect.gen(function* () {
             ...card,
             workThreadId: null,
             wakeNote: withFreshNote(card.wakeNote),
-            movedAt: at,
+            // Preserve queue age and any parked wait during recovery.
             updatedAt: at,
           };
           yield* logEvent(fresh, system, "moved", {
@@ -6616,7 +6649,7 @@ const make = Effect.gen(function* () {
     }
     const to: KanbanStage = dispatch.role === "work" ? "working" : "in_review";
     const next: KanbanCard = {
-      ...synced,
+      ...(yield* moveWait(synced, to, at, system)),
       // A weighted card runs on the model that had room; its thread keeps it.
       model: dispatch.role === "work" ? dispatch.model : synced.model,
       stage: to,
@@ -6660,6 +6693,10 @@ const make = Effect.gen(function* () {
                 if (owns && !pending.revoked) {
                   const restored: KanbanCard = {
                     ...current,
+                    // An undelivered hand-off must not consume the old wait's requested wake.
+                    ...(current.wait === undefined && card.wait !== undefined
+                      ? { wait: card.wait }
+                      : {}),
                     stage: card.stage,
                     activeThreadId: card.activeThreadId,
                     activeRole: card.activeRole,
@@ -7451,7 +7488,7 @@ const make = Effect.gen(function* () {
         stalled: null,
         nudgedAt: null,
         retries: retry.retries,
-        movedAt: at,
+        // Preserve queue age and any parked wait during recovery.
         updatedAt: at,
       };
       yield* logEvent(again, system, "moved", {
@@ -7468,7 +7505,7 @@ const make = Effect.gen(function* () {
       stage: "needs_review",
       stalled: { reason, by: system, at },
       nudgedAt: null,
-      movedAt: at,
+      // Preserve queue age and any parked wait during recovery.
       updatedAt: at,
     };
     yield* logEvent(next, system, "flagged", {
@@ -8018,7 +8055,7 @@ const make = Effect.gen(function* () {
               stage: "todo",
               stalled: null,
               nudgedAt: null,
-              movedAt: at,
+              // Preserve queue age and any parked wait during recovery.
               updatedAt: at,
             };
             yield* logEvent(compacting, system, "moved", {
@@ -8063,7 +8100,7 @@ const make = Effect.gen(function* () {
               stalled: null,
               nudgedAt: null,
               wakeNote: withFreshNote(entry.wakeNote),
-              movedAt: at,
+              // Preserve queue age and any parked wait during recovery.
               updatedAt: at,
             };
             yield* logEvent(fresh, system, "moved", {
@@ -8106,7 +8143,7 @@ const make = Effect.gen(function* () {
                   stage: "todo",
                   stalled: { reason, by: system, at },
                   nudgedAt: null,
-                  movedAt: at,
+                  // Preserve queue age and any parked wait during recovery.
                   updatedAt: at,
                 };
           if (
@@ -8187,7 +8224,7 @@ const make = Effect.gen(function* () {
           reviewThreadId: null,
           stalled: null,
           nudgedAt: null,
-          movedAt: at,
+          // Preserve queue age and any parked wait during recovery.
           updatedAt: at,
         };
         yield* logEvent(fresh, system, "moved", {
@@ -8237,7 +8274,7 @@ const make = Effect.gen(function* () {
         stage: "needs_review",
         stalled: { reason, by: system, at },
         nudgedAt: null,
-        movedAt: at,
+        // Preserve queue age and any parked wait during recovery.
         updatedAt: at,
       };
       yield* logEvent(next, system, "flagged", {
@@ -8536,15 +8573,17 @@ const make = Effect.gen(function* () {
       evaluatorMutex = Semaphore.makeUnsafe(1);
       evaluating.set(boardId, evaluatorMutex);
     }
-    yield* locks.outside(
-      evaluatorMutex.withPermitsIfAvailable(1)(
-        locks.fresh(locks.run(drainEvaluatorQueue(KanbanBoardId.make(boardId)))),
-      ),
-    ).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("kanban evaluator queue delivery pending", { boardId, cause }),
-      ),
-    );
+    yield* locks
+      .outside(
+        evaluatorMutex.withPermitsIfAvailable(1)(
+          locks.fresh(locks.run(drainEvaluatorQueue(KanbanBoardId.make(boardId)))),
+        ),
+      )
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator queue delivery pending", { boardId, cause }),
+        ),
+      );
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
       const planned = turnEndLinks.get(threadId);
       const link =
@@ -8890,7 +8929,7 @@ const make = Effect.gen(function* () {
                     stage: review ? "needs_review" : "todo",
                     workThreadId: review ? current.workThreadId : null,
                     reviewThreadId: review ? null : current.reviewThreadId,
-                    movedAt: at,
+                    // Preserve queue age and any parked wait during recovery.
                     updatedAt: at,
                   };
                   yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
@@ -9917,7 +9956,7 @@ const make = Effect.gen(function* () {
                   const at = yield* nowIso;
                   const dispatcher: KanbanActor = { _tag: "system", component: "dispatcher" };
                   const landed: KanbanCard = {
-                    ...synced,
+                    ...(yield* moveWait(synced, to, at, dispatcher)),
                     stage: to,
                     reviewStep: to === "completed" ? synced.reviewStep : 0,
                     wakeNote:
@@ -10865,7 +10904,7 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
-      ...card,
+      ...(yield* moveWait(card, "working", at, actor)),
       model: Rules.modelOnPool(card, pool, yield* store.pools(card.boardId)) ?? card.model,
       stage: "working",
       activeThreadId: threadId,
@@ -11001,7 +11040,18 @@ const make = Effect.gen(function* () {
     if (next.priority !== KANBAN_BACKLOG || card.activeThreadId === null) return next;
     yield* letGo(card, false, "was moved to the backlog", "when it leaves the backlog");
     const paused: KanbanCard = {
-      ...release(next),
+      ...release(
+        yield* moveWait(
+          next,
+          card.stage === "working"
+            ? "todo"
+            : card.stage === "in_review"
+              ? "needs_review"
+              : card.stage,
+          at,
+          actor,
+        ),
+      ),
       stage:
         card.stage === "working"
           ? "todo"
@@ -12431,7 +12481,7 @@ const make = Effect.gen(function* () {
           to === null
             ? marked
             : {
-                ...marked,
+                ...(yield* moveWait(marked, to, at, actor)),
                 stage: to,
                 reviewStep: 0,
                 // Findings or the owner's words already waiting stay ahead of the plan.
@@ -12647,7 +12697,16 @@ const make = Effect.gen(function* () {
           const moreWork = passed && Subtasks.workAfterReview({ subtasks });
           const next: KanbanCard = {
             // A verdict is a review that ended normally: its retry record goes.
-            ...Retries.withoutRetries(release(card)),
+            ...Retries.withoutRetries(
+              release(
+                yield* moveWait(
+                  card,
+                  moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
+                  at,
+                  { _tag: "thread", threadId },
+                ),
+              ),
+            ),
             // The dispatcher's no-verdict flag is answered by the verdict; a
             // reviewer's own flag stays for the evaluator.
             stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
@@ -12825,7 +12884,14 @@ const make = Effect.gen(function* () {
             text.trim() ? `was stopped: ${text.trim()}` : "was stopped",
           );
           const next: KanbanCard = {
-            ...release(card),
+            ...release(
+              yield* moveWait(
+                card,
+                KANBAN_THREAD_STAGES.includes(card.stage) ? "todo" : card.stage,
+                at,
+                actor,
+              ),
+            ),
             // A thread that goes on with other cards dropped this one for good.
             workThreadId: kept ? null : card.workThreadId,
             stage: KANBAN_THREAD_STAGES.includes(card.stage) ? "todo" : card.stage,
@@ -12850,7 +12916,7 @@ const make = Effect.gen(function* () {
                 ? "needs_review"
                 : card.stage;
           const next: KanbanCard = {
-            ...release(card),
+            ...release(yield* moveWait(card, stage, at, actor)),
             workThreadId: null,
             reviewThreadId: null,
             stage,
@@ -12910,7 +12976,16 @@ const make = Effect.gen(function* () {
         }
         const next: KanbanCard = {
           // Woken out of Needs Owner: the wake text stands in for the answer.
-          ...Asks.closeAsks(card, at, (ask) => ask.blocking && card.stage === "needs_owner"),
+          ...Asks.closeAsks(
+            yield* moveWait(
+              card,
+              card.stage === "needs_review" ? "needs_review" : "todo",
+              at,
+              actor,
+            ),
+            at,
+            (ask) => ask.blocking && card.stage === "needs_owner",
+          ),
           stage: card.stage === "needs_review" ? "needs_review" : "todo",
           stalled: null,
           question: null,

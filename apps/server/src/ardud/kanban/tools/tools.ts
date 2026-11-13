@@ -11,6 +11,7 @@ import {
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
+  KanbanMoveOptions,
   KanbanWaitKind,
   NonNegativeInt,
   OrchestratorMcpFailure,
@@ -230,11 +231,12 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
     to: KanbanStage,
+    keepWait: KanbanMoveOptions.fields.keepWait,
     note: Schema.optional(describe(Schema.String, "One line for the card history.")),
     question: Schema.optional(
       describe(Schema.String, "Required for needs_owner: what the owner must decide."),
