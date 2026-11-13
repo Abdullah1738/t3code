@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import sqlite3
 import shlex
 import subprocess
 
 from . import ssh_sync
-from .common import OffboxError, db_retry, event, local_error, now, write
+from .common import OffboxError, db, db_retry, event, local_error, now, write
 
 SSH_TIMEOUT_S = 10
 GRACE_S = 5
@@ -33,6 +34,11 @@ def claims_enabled(con, run: str) -> bool:
     return con.execute('SELECT 1 FROM kv WHERE k=?', (f'start_claim:{run}',)).fetchone() is not None
 
 
+def claim_id(con, run: str) -> str:
+    row = con.execute('SELECT v FROM kv WHERE k=?', ('start_claim:' + run,)).fetchone()
+    return row[0] if row and row[0].startswith('claim-') else run
+
+
 def recovery_marked(con, row) -> bool:
     return con.execute('SELECT 1 FROM kv WHERE k IN (?,?)',
                        (f"start_unattached:{row['run_id']}", f"start_unknown:{row['run_id']}")).fetchone() is not None
@@ -53,19 +59,20 @@ def remember_wrapper(con, row, pid: int | None) -> None:
                 (trusted, pid, legacy, row['run_id']))
 
 
-def script(run: str, claim: bool) -> str:
-    # Only $r appears in the pgrep pattern: this checking shell must not match itself.
+def script(run: str, claim: bool, claim_key: str | None = None) -> str:
+    # Keep IDs out of the literal pgrep pattern: this checking shell must not match itself.
     return '\n'.join([
         f'r={shlex.quote(run)}',
-        'd="$HOME/.offbox/claim/$r"; c=legacy',
+        f'k={shlex.quote(claim_key or run)}',
+        'd="$HOME/.offbox/claim/$k"; c=legacy',
         ('mkdir -p "$HOME/.offbox/claim" 2>/dev/null; '
          'if mkdir "$d" 2>/dev/null; then c=won; : > "$d/by-fence"; '
          'elif [ -f "$d/by-fence" ]; then c=won; '
          'elif [ -d "$d" ]; then c=taken; else c=error; fi') if claim else ':',
-        '[ "$c" = won ] && rm -f "$HOME/.offbox/env/$r.env"',
+        '[ "$c" = won ] && rm -f "$HOME/.offbox/env/$k.env"',
         'rc=-; [ -f "$HOME/.offbox/exit/$r.rc" ] && rc=$(cat "$HOME/.offbox/exit/$r.rc" 2>/dev/null)',
         'p=x; if command -v pgrep >/dev/null 2>&1; then '
-        'pgrep -f "offbox/(claim/$r|exit/$r[.]rc)" >/dev/null 2>&1; s=$?; '
+        'pgrep -f "offbox/(claim/$k|exit/$r[.]rc)" >/dev/null 2>&1; s=$?; '
         'case "$s" in 0) p=1;; 1) p=0;; esac; fi',
         # Completion may race the first read and the process probe.
         '[ -f "$HOME/.offbox/exit/$r.rc" ] && rc=$(cat "$HOME/.offbox/exit/$r.rc" 2>/dev/null)',
@@ -76,7 +83,12 @@ def script(run: str, claim: bool) -> str:
 
 def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOUT_S) -> Result:
     try:
-        p = ssh_sync.ssh(box, script(run, claim), timeout=timeout)
+        con = db()
+        try:
+            key = claim_id(con, run)
+        finally:
+            con.close()
+        p = ssh_sync.ssh(box, script(run, claim, key), timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, OffboxError):
         return Result()
     m = re.search(r'^offbox-start claim=(won|taken|legacy|error) rc=(-|\d+) proc=([01x]) pid=(-|\d+)$',
@@ -121,7 +133,9 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
                 status, error = (('infra', 'steps incomplete') if code is None else
                                  (('done' if code == 0 else 'failed'), None))
             elif result.verdict == 'fenced':
-                status, error = 'lost', f'{reason}; never started, nothing ran'
+                from .runs import BACKGROUND_RUN_ENV
+                pending = row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid
+                status, error = ('starting' if pending else 'lost'), f'{reason}; never started, nothing ran'
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
             else:
                 status = 'infra'
@@ -130,7 +144,7 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
             con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=? "
                         "WHERE run_id=? AND (status IN ('starting','running') OR "
                         "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
-                        (status, code, now(), error, rid))
+                        (status, code, None if status == 'starting' else now(), error, rid))
             if result.code is not None or result.verdict == 'fenced':
                 con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
             log_row = claim_terminal_log(con, con.execute("SELECT * FROM runs WHERE run_id=?", (rid,)).fetchone())

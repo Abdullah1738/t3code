@@ -20,7 +20,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
+from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, log, month_key, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
@@ -224,6 +224,10 @@ def _cancel_before_start(r):
     sent = False
     while True:
         r = _run_row(rid)
+        if r['status'] == 'forwarded':
+            return r, _follow_forwarded(r, 'kill')
+        if (r['client_pid'], r['start_at']) != (client, start_at):
+            return _cancel_before_start(r)
         if r["status"] not in ("starting", "running"):
             if r["status"] == "killed":
                 where = f"box {r['box_id']} returned to the pool" if r["box_id"] else "queued, no box used"
@@ -263,10 +267,11 @@ def _cancel_before_start(r):
             # including evidence the client records between our read and this write.
             changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? "
                                   "AND process_id IS NULL AND status IN ('starting','running') "
+                                  "AND client_pid IS ? AND start_at IS ? "
                                   "AND (box_id IS NULL OR (COALESCE(error,'')='' AND command_id IS NULL "
                                   "AND NOT EXISTS (SELECT 1 FROM kv WHERE k IN (?,?,?))))"
                                   + (" AND box_id IS NULL" if not r["box_id"] else ""),
-                                  (now(), error, rid, *start_keys)).rowcount
+                                  (now(), error, rid, client, start_at, *start_keys)).rowcount
             con.commit()
             if not changed:
                 alive = False
@@ -289,6 +294,8 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
         require_proven(me, "kill")
         if r["owner"] != me["owner"]:
             raise OffboxError(f"run {rid} belongs to another caller; only its owner can kill it", code=2)
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'kill')
     if r["status"] not in ("starting", "running"):
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
@@ -538,6 +545,8 @@ def _run_row(run_id: str):
     if not r:
         raise OffboxError(f"no run {run_id}", code=2)
     _require_my_run(r)
+    if r['status'] == 'forwarded':
+        return r  # The shared receipt now belongs to the destination backend, not this forwarding row.
     from .runs import finish, restore_run_state, terminal_result
     from . import start_check
     recovered = restore_run_state(r)
@@ -840,9 +849,43 @@ def _validated_step_row(r, code):
     return dict(r, status=status, exit_code=code)
 
 
+def _follow_forwarded(r, command, *, timeout=None, follow=False) -> int:
+    env = dict(os.environ, OFFBOX_BACKEND=r['error'])
+    env.pop('OFFBOX_BACKGROUND_RUN', None)
+    args = [sys.executable, str(Path(__file__).resolve().parents[1] / 'offbox.py'), command, r['run_id']]
+    if timeout is not None:
+        args += ['--timeout', str(max(0, timeout))]
+    if follow:
+        args += ['--follow']
+    return subprocess.call(args, env=env)
+
+
+def _never_started(r) -> bool:
+    if r['mode'] == 'local':
+        return False
+    if r['status'] == 'killed':
+        return not r['box_id'] and not r['process_id']
+    return (r['status'] == 'lost' and r['exit_code'] is None
+            and (r['error'] == 'client ended before it got a box' or
+                 (not r['box_id'] and not r['process_id'])))
+
+
+def _report_never_started(r) -> int:
+    if r['status'] == 'killed':
+        say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        return 130
+    say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box "
+        "(caller interrupted?); nothing ran, safe to rerun")
+    return EXIT_NOT_STARTED
+
+
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'logs', follow=do_follow)
+    if _never_started(r):
+        return _report_never_started(r)
     p = LOGS_DIR / f"{r['run_id']}.log"
     if r['status'] == 'lost' and r['exit_code'] is None and r['box_id']:
         if do_follow:
@@ -900,6 +943,11 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'logs' if echo else 'wait', follow=echo,
+                                 timeout=None if echo or until is None else until-now())
+    if _never_started(r):
+        return _report_never_started(r)
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
@@ -1261,11 +1309,9 @@ def _wait_for_start(r, deadline):
             if not cur['box_id']:
                 con = db()
                 con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
-                            "AND status IN ('starting','running')",
-                            (now(), "client ended before it got a box", cur['run_id']))
+                            "AND status IN ('starting','running') AND client_pid IS ? AND start_at IS ?",
+                            (now(), "client ended before it got a box", cur['run_id'], pid, cur['start_at']))
                 con.commit()
-                say(f"{cur['run_id']}: its offbox client (pid {pid}) ended before it got a box; never started, "
-                    "nothing ran")
                 continue
             return _wait_start_receipt(cur, deadline)
         if deadline is not None and now() >= deadline:
