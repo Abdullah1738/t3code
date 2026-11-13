@@ -27,6 +27,8 @@ export function nativeMessageId(id: string): string | undefined {
 
 /** Native `finish` per control message id; ids it can't resolve are simply absent. */
 export type StepFinishes = (ids: readonly string[]) => Map<string, string>;
+/** Native text blocks whose stop and completion timestamp were persisted. */
+export type CompletedSteps = (ids: readonly string[]) => Map<string, string[]>;
 
 export const OPENCODE_DB = join(homedir(), ".local/share/opencode/opencode.db");
 
@@ -150,6 +152,46 @@ export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
         for (const id of wanted.get(row.id) ?? []) found.set(id, row.finish);
       }
     } catch { toolError("opencode-steps", "opencode-steps.catch7");
+      close();
+      found.clear();
+    }
+    return found;
+  };
+}
+
+export function opencodeCompletedSteps(path = OPENCODE_DB): CompletedSteps {
+  let db: Database | undefined;
+  let inode: number | undefined;
+  const close = () => {
+    try { db?.close(); } catch { /* already gone */ }
+    db = undefined;
+  };
+  return ids => {
+    const found = new Map<string, string[]>();
+    const wanted = new Set<string>();
+    for (const id of ids) {
+      const native = nativeMessageId(id);
+      if (native) wanted.add(native);
+    }
+    if (!wanted.size) return found;
+    try {
+      const current = statSync(path).ino;
+      if (db && current !== inode) close();
+      if (!db) {
+        db = new Database(path, { readonly: true });
+        inode = current;
+      }
+      const rows = db.query<{ id: string; content: string }, [string]>(
+        "SELECT id, json_extract(data, '$.content') AS content FROM session_message WHERE id IN (SELECT value FROM json_each(?)) AND json_extract(data, '$.finish') = 'stop' AND json_type(data, '$.time.completed') IN ('integer', 'real') AND (json_type(data, '$.error') IS NULL OR json_type(data, '$.error') = 'null')",
+      ).all(JSON.stringify([...wanted]));
+      for (const row of rows) {
+        const content: unknown = JSON.parse(row.content);
+        if (!Array.isArray(content) || content.some(part => !part || typeof part !== "object" || !["text", "reasoning"].includes(part.type))) continue;
+        const blocks = content.filter(part => part.type === "text");
+        if (blocks.some(part => typeof part.text !== "string")) continue;
+        found.set(row.id, blocks.map(part => part.text));
+      }
+    } catch { toolError("opencode-steps", "opencode-steps.completed");
       close();
       found.clear();
     }
