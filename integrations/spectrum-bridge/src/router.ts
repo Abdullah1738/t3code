@@ -491,12 +491,18 @@ function ownerPrompt(record: MessageRecord): boolean {
   return record.type === "user" && !backgroundNotice(record);
 }
 
-/** A progress prompt only silences its own steps, until the next prompt or idle. */
+/** Adjacent notices share a response; a later prompt after a response starts a new batch. */
 function withoutProgressReplies(records: MessageRecord[]): MessageRecord[] {
   let progress = false;
+  let pending = false;
   return records.filter(record => {
-    if (backgroundNotice(record)) progress = !backgroundCompletion(record);
-    else if (record.type === "user" || record.type === "idle") progress = false;
+    if (backgroundNotice(record)) {
+      progress = pending ? progress && !backgroundCompletion(record) : !backgroundCompletion(record);
+      pending = true;
+    } else if (record.type === "user" || record.type === "idle") {
+      progress = false;
+      pending = false;
+    } else if (record.type === "assistant") pending = false;
     return record.type !== "assistant" || !progress;
   });
 }

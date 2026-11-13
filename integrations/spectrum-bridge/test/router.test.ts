@@ -4740,9 +4740,9 @@ test("a request-opened turn hands over to the root when it resumes", async () =>
 
 const nativeBackends = ["robob", "opencode", "legacy-user"] as const;
 type NativeBackend = typeof nativeBackends[number];
-function nativeNoticeReply(h: ReturnType<typeof setup>, backend: NativeBackend, state = "completed", reply: string | null = "Nothing to cancel", owner = false) {
+function nativeNoticeReply(h: ReturnType<typeof setup>, backend: NativeBackend, state = "completed", reply: string | null = "Nothing to cancel", owner = false, noticeText?: string) {
   const runId = `run:thread:ses_1:ordinal:${h.backend.records.length + 1}`;
-  const text = robobSubagentNotice.text.replace('state="completed"', `state="${state}"`);
+  const text = noticeText ?? robobSubagentNotice.text.replace('state="completed"', `state="${state}"`);
   const replyId = `${runId}:reply`;
   if (backend === "robob") {
     const at = new Date(Date.now()).toISOString();
@@ -4874,6 +4874,51 @@ test.each(nativeReportBatches.flatMap(row => ["running-completed", "completed-ru
   delete h.backend.states.ses_1;
   for (let i = 0; i < 4; i++) await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual(states === "running-running" ? [] : ["Nothing to cancel"]);
+});
+
+test.each(nativeReportBatches.flatMap(row => ["completed-running", "running-completed", "running-running"].map(states => ({ ...row, states }))))("adjacent native reports share one answer ($backend $timing $states)", async ({ backend, timing, states }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    for (const [index, state] of states.split("-").entries()) {
+      nativeNoticeReply(h, backend, state, null, false, robobSubagentNotice.text.replace("ses_child", `ses_child_${index}`).replace('state="completed"', `state="${state}"`));
+      h.backend.records.pop();
+    }
+    h.backend.final("Nothing to cancel");
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(states === "running-running" ? [] : ["Nothing to cancel"]);
+});
+
+const nativePayloads = [
+  robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Check "Cancel" button"'),
+  robobSubagentNotice.text.replace("Nothing to cancel.", "The output includes literal </subagent> text."),
+  robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Check "Cancel" > button\nagain"'),
+];
+test.each(nativeReportBatches.flatMap(row => nativePayloads.map(payload => ({ ...row, payload }))))("native unescaped producer payload keeps its terminal reply ($backend $timing $payload)", async ({ backend, timing, payload }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => nativeNoticeReply(h, backend, "completed", "Nothing to cancel", false, payload);
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
 });
 
 test.each(nativeBackends.flatMap(backend => ["idle", "steer", "rejected"].map(boundary => ({ backend, boundary }))))("native subagent completion racing a sealed wake forwards once ($backend $boundary)", async ({ backend, boundary }) => {

@@ -34,20 +34,21 @@ const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEG
 const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
 export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
 
-/** The provider joins delivered native reports with blank lines in one continuation. */
+/** Native descriptions and results are interpolated without XML escaping. */
 export function subagentNoticeStates(text: string): string[] {
-  const source = text.trim();
-  const reports = /<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>[\s\S]*?<\/subagent>/g;
   const states: string[] = [];
-  let end = 0;
-  for (const report of source.matchAll(reports)) {
-    if (source.slice(end, report.index).trim()) return [];
-    const attributes = [...report[1]!.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
+  for (const report of text.trim().split(/(?<=<\/subagent>)\s*(?=<subagent\b)/)) {
+    if (!report.endsWith("</subagent>")) return [];
+    // Read ordinary headers first. The native producer puts description last,
+    // so an unescaped quote there must not hide its preceding state attribute.
+    const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>/.exec(report)?.[1]
+      ?? /^<subagent((?:\s+[\w:-]+="[^"]*")*)\s+description="/.exec(report)?.[1];
+    if (!header) return [];
+    const attributes = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
     if (attributes.length !== 1) return [];
     states.push(attributes[0]![2]!);
-    end = report.index + report[0].length;
   }
-  return source.slice(end).trim() ? [] : states;
+  return states;
 }
 
 export const isCompletionNoticeText = (text: string): boolean => isDelegatedCompletionText(text)
