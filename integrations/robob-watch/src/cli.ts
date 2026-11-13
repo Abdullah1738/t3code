@@ -281,6 +281,7 @@ async function main(argv: string[]): Promise<void> {
         delete s.failure_escalated;
         delete s.failing_since;
         delete s.last_error;
+        delete s.last_error_sources;
       }
       s.next_at = 0;
       saveState(w.id, s);

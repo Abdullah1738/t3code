@@ -2,7 +2,7 @@ import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  alert, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
@@ -229,6 +229,7 @@ export async function tickOne(id: string): Promise<void> {
       fresh.load_timeout_since ??= iso();
       if (now() - Date.parse(fresh.load_timeout_since) < LOAD_GRACE_MS) {
         fresh.last_error = `timed out after ${timeoutMs / 1000}s under host load ${Math.max(startLoad, endLoad).toFixed(1)}/core`;
+        delete fresh.last_error_sources;
         fresh.next_at = now() + Math.min(watcher.interval_s, TIMEOUT_BACKOFF_CAP_S) * 1_000;
         saveState(id, fresh);
         log(id, `load timeout (${fresh.load_timeouts}): ${fresh.last_error}`);
@@ -238,7 +239,10 @@ export async function tickOne(id: string): Promise<void> {
     fresh.consecutive_failures += 1;
     fresh.failure_alerted = false;
     if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
+    const sources = timedOut ? [] : failureSources(result.stderr);
     fresh.last_error = timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
+    if (sources.length) fresh.last_error_sources = sources;
+    else delete fresh.last_error_sources;
     fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
     log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : ""}`);
     if (shouldPause(watcher, fresh, timedOut)) {
@@ -293,6 +297,7 @@ export async function tickOne(id: string): Promise<void> {
   fresh.failure_alerted = false;
   delete fresh.failure_escalated;
   delete fresh.last_error;
+  delete fresh.last_error_sources;
   delete fresh.failing_since;
   const event = result.stdout.trim();
   if (!event) { saveState(id, fresh); ackRun(); return; }

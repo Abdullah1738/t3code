@@ -1729,6 +1729,9 @@ def track_health(state, errors, now):
     due = []
     for source in sorted(set(health) | set(errors)):
         h = health.get(source, {})
+        for field in ('alerted_at', 'escalated_at'):
+            if field in h:
+                h['last_notice_at'] = max(h.get('last_notice_at', h[field]), h[field])
         fails = [ts for ts in h.get('fails', []) if now - ts < HEALTH_WINDOW]
         if source in errors:
             if not h.get('streak'):
@@ -1745,14 +1748,14 @@ def track_health(state, errors, now):
                 h['recovered_at'] = now
             h['streak'] = 0
         h['fails'] = fails
-        quiet = 'alerted_at' not in h or now - h['alerted_at'] >= HEALTH_REALERT
-        escalate = (h['streak'] and h.get('transient') and 'alerted_at' in h
+        quiet = 'last_notice_at' not in h or now - h['last_notice_at'] >= HEALTH_REALERT
+        escalate = (h['streak'] and h.get('transient')
                     and 'escalated_at' not in h and now - h['since'] >= HEALTH_TRANSIENT_ESCALATE)
         recover = not h['streak'] and ('alerted_at' in h or 'notified_since' in h)
         if recover or escalate or (source in errors and (h['streak'] >= HEALTH_STREAK or len(fails) >= HEALTH_FAILS)
                                   and quiet and (not h.get('transient') or 'alerted_at' not in h)):
             due.append(source)
-        if not h['streak'] and not fails and not recover and source not in state.get('health_pending', {}).get('sources', []):
+        if not h['streak'] and not fails and not recover and quiet and source not in state.get('health_pending', {}).get('sources', []):
             health.pop(source, None)
         else:
             health[source] = h
@@ -1778,7 +1781,7 @@ def health_alert(state, due, now):
         if not h['streak']:
             kind = 'recovery'
             lines.append(f'{s} reading again after {mins} min.')
-        elif h.get('transient') and 'alerted_at' in h and now - h['since'] >= HEALTH_TRANSIENT_ESCALATE:
+        elif h.get('transient') and now - h['since'] >= HEALTH_TRANSIENT_ESCALATE:
             kind = 'escalation'
             lines.append(f'{s} still failing after {mins} min: provider/network problem. Needs attention. Its cursor holds. Last error: {h["last_error"]}')
         else:
@@ -1826,13 +1829,17 @@ def send_health(state, due, wd, now):
                     if not h['streak']:
                         h.pop('alerted_at', None)
                         h.pop('escalated_at', None)
-            elif notice['kind'] == 'escalation' and notice['since'] == h['since']:
-                h['escalated_at'] = now
+            elif notice['kind'] == 'escalation':
+                h['last_notice_at'] = now
+                h['notified_since'] = min(h.get('notified_since', notice['since']), notice['since'])
+                if notice['since'] == h['since']:
+                    h['escalated_at'] = h['alerted_at'] = now
             elif notice['kind'] == 'outage':
                 # A delivered old notice still needs a recovery, even if a new outage
                 # began while its send was pending. It does not acknowledge the new one.
                 h['notified_since'] = min(h.get('notified_since', notice['since']), notice['since'])
                 h['alerts'] = h.get('alerts', 0) + 1
+                h['last_notice_at'] = now
                 if notice['since'] == h['since']:
                     h['alerted_at'] = now
     del state['health_pending']

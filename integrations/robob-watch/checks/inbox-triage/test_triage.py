@@ -1304,6 +1304,50 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1500)
             self.assertEqual(run.call_count, 3)
 
+    def test_delivered_notices_keep_six_hour_cooldown_across_flapping(self):
+        for error in ('TimeoutExpired: worker', 'IMAP auth failed'):
+            with self.subTest(error=error):
+                state = {}
+                bad = {'outlook': error}
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    for n in range(12):
+                        errors = bad if n < 3 or n % 2 == 0 else {}
+                        self.tick(state, t.LIVE, errors, 10_000 + n * 300)
+                    # These sends succeeded; one outage and one recovery, no repeat at five/hour.
+                    self.assertEqual(run.call_count, 2)
+                    texts = [c.args[0][c.args[0].index('--text') + 1] for c in run.call_args_list]
+                    self.assertNotIn('reading again', texts[0])
+                    self.assertIn('outlook reading again', texts[1])
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], 10_600)
+                    self.tick(state, t.LIVE, {}, 10_600 + t.HEALTH_REALERT - 1)
+                    self.assertIn('outlook', state['source_health'])
+                    self.tick(state, t.LIVE, {}, 10_600 + t.HEALTH_REALERT)
+                    self.assertNotIn('outlook', state['source_health'])
+                    for n in range(3):
+                        self.tick(state, t.LIVE, bad, 10_600 + t.HEALTH_REALERT + n * 300)
+                    self.assertEqual(run.call_count, 3)
+
+    def test_cooldown_does_not_delay_escalation_of_a_new_continuous_outage(self):
+        state = {}
+        bad = {'outlook': 'TimeoutExpired'}
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            for now in (10_000, 10_300, 10_600):
+                self.tick(state, t.LIVE, bad, now)
+            self.tick(state, t.LIVE, {}, 10_900)
+            for now in (11_200, 11_500, 11_800):
+                self.tick(state, t.LIVE, bad, now)
+            self.assertEqual(run.call_count, 2)
+            self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE)
+            self.assertEqual(run.call_count, 3)
+            args = run.call_args.args[0]
+            self.assertIn('outlook still failing after 180 min', args[args.index('--text') + 1])
+            self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 300)
+            self.assertEqual(run.call_count, 3)
+            self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 600)
+            self.assertEqual(run.call_count, 4)
+            self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 900)
+            self.assertEqual(run.call_count, 4)
+
     def test_recovery_retry_cannot_suppress_the_next_outage_notice(self):
         state = {'read_sources': ['gmail']}
         bad = {'outlook': 'TimeoutError'}
@@ -1323,7 +1367,12 @@ class SourceHealthTests(unittest.TestCase):
             self.assertEqual(args[args.index('--text') + 1], pending['text'])
             self.tick(state, t.LIVE, bad, 11_500)
             self.tick(state, t.LIVE, bad, 11_800)
-            self.assertEqual(run.call_count, 3)  # old recovery, then the new outage
+            self.assertEqual(run.call_count, 2)  # recovery retries do not erase the outage cooldown
+            later = 10_600 + t.HEALTH_REALERT
+            self.tick(state, t.LIVE, {}, later)
+            for now in (later + 300, later + 600, later + 900):
+                self.tick(state, t.LIVE, bad, now)
+            self.assertEqual(run.call_count, 3)
             self.assertNotIn('reading again', run.call_args.args[0][run.call_args.args[0].index('--text') + 1])
 
     def test_outage_notice_retry_after_health_window_still_has_one_recovery(self):
@@ -1349,9 +1398,11 @@ class SourceHealthTests(unittest.TestCase):
             self.assertIn('outlook reading again after 15 min', args[args.index('--text') + 1])
             self.tick(state, t.LIVE, {}, 15_400)
             self.assertEqual(run.call_count, 2)
+            self.assertEqual(state['source_health']['outlook']['last_notice_at'], 14_800)
+            self.tick(state, t.LIVE, {}, 14_800 + t.HEALTH_REALERT)
             self.assertNotIn('outlook', state['source_health'])
 
-    def test_legacy_recovered_state_gets_a_new_outage_notice_at_threshold(self):
+    def test_legacy_recovered_state_keeps_cooldown_then_allows_a_new_notice(self):
         for extra in ({}, {'recovered_at': 9000}, {'escalated_at': 8500}):
             with self.subTest(extra=extra):
                 state = {'source_health': {'outlook': {'streak': 0, 'since': 8000, 'fails': [],
@@ -1359,10 +1410,35 @@ class SourceHealthTests(unittest.TestCase):
                 with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
                     for now in (10_000, 10_300, 10_600):
                         self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, now)
-                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(run.call_count, 0)
                     self.assertEqual(state['source_health']['outlook']['since'], 10_000)
-                    self.assertEqual(state['source_health']['outlook']['alerted_at'], 10_600)
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], 8600)
                     self.assertNotIn('escalated_at', state['source_health']['outlook'])
+                    self.tick(state, t.LIVE, {}, 10_900)
+                    for now in (30_300, 30_600, 30_900):
+                        self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, now)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(state['source_health']['outlook']['alerted_at'], 30_900)
+
+    def test_legacy_escalation_is_the_last_notice_across_upgrade_and_recovery(self):
+        for newest in (10_800, 15_000):
+            with self.subTest(newest=newest):
+                state = {'source_health': {'outlook': {
+                    'since': 0, 'streak': 75, 'fails': [21_000, 21_300, 21_600, 21_900],
+                    'alerted_at': 600, 'escalated_at': 10_800, 'notified_since': 0,
+                    'last_error': 'TimeoutExpired', 'transient': True,
+                    **({'last_notice_at': newest} if newest > 10_800 else {})}}}
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    self.tick(state, t.LIVE, {}, 22_200)  # upgrade and recovery at 06:10
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], newest)
+                    self.tick(state, t.LIVE, {'outlook': 'TimeoutExpired'}, 22_500)
+                    self.assertEqual(run.call_count, 1)  # five/hour cannot bypass the escalation cooldown
+                    self.tick(state, t.LIVE, {}, 22_800)
+                    self.tick(state, t.LIVE, {}, newest + t.HEALTH_REALERT - 1)
+                    self.assertIn('outlook', state['source_health'])
+                    self.tick(state, t.LIVE, {}, newest + t.HEALTH_REALERT)
+                    self.assertNotIn('outlook', state['source_health'])
 
     def test_old_outage_delivery_during_new_failure_still_gets_recovery(self):
         for legacy in (False, True):
@@ -1387,6 +1463,26 @@ class SourceHealthTests(unittest.TestCase):
                     self.assertIn('outlook reading again after', args[args.index('--text') + 1])
                     self.tick(state, t.LIVE, {}, 11_800)
                     self.assertEqual(run.call_count, 2)
+
+    def test_old_escalation_delivery_still_sets_cooldown_and_recovery_obligation(self):
+        # This outage's initial notice was suppressed by the previous outage's cooldown.
+        state = {'source_health': {'outlook': {'streak': 4, 'since': 11_000, 'fails': [21_800],
+                    'transient': True, 'last_notice_at': 10_600, 'last_error': 'TimeoutError'}},
+                 'health_pending': {'key': 'old-escalation', 'text': 'outlook still failing',
+                    'sources': ['outlook'], 'at': 21_800,
+                    'notices': {'outlook': {'kind': 'escalation', 'since': 11_000}}}}
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stderr='bridge down', stdout='')):
+            self.tick(state, t.LIVE, {}, 22_100)
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 22_400)
+            self.assertEqual(state['source_health']['outlook']['last_notice_at'], 22_400)
+            self.assertNotIn('escalated_at', state['source_health']['outlook'])
+            self.tick(state, t.LIVE, {}, 22_700)
+            self.assertEqual(run.call_count, 2)
+            args = run.call_args.args[0]
+            self.assertIn('outlook reading again', args[args.index('--text') + 1])
+            self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 23_000)
+            self.assertEqual(run.call_count, 2)
 
     def test_error_classes(self):
         for error in ('TimeoutExpired', 'TimeoutError', 'timed out after 10s', 'time budget; completed prefix saved', 'TLS handshake stalled', 'SSL handshake failure',
