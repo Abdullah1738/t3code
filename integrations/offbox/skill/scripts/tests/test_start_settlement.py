@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -142,6 +143,27 @@ class StartPaths(Isolated):
             self.assertEqual(cli.cmd_run(a, self.me), 0)
         row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
         self.assertEqual((row['process_id'], row['command_id'], row['wrapper_pid']), (1001, 'cmd-own', None))
+
+    def test_step_receipt_does_not_save_unvalidated_exit_before_pull_lock(self):
+        for bg in (False, True):
+            with self.subTest(bg=bg):
+                args = cli.build_parser().parse_args(['run', '--remote'] + (['--bg'] if bg else []) +
+                                                     ['--pull', 'artifact', '--step', 'first', '--step', 'second'])
+                def receipt(box, rid):
+                    (runs.LOGS_DIR / (rid + '.log')).write_text('offbox step 1 rc=0: first\n')
+                    return start_check.Result('started', 0, 321)
+                with patch.object(api, 'cmd_start', side_effect=api.NetworkError('reset')), \
+                        patch.object(start_check, 'check', side_effect=receipt), \
+                        patch.object(runs, 'do_pulls', side_effect=sqlite3.OperationalError('database is locked')), \
+                        contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cli.cmd_run(args, self.me), common.EXIT_LOCAL)
+                row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
+                restored = runs.restore_run_state(row)
+                self.assertIsNone(restored['exit_code'])
+                self.assertFalse(runs.terminal_result(restored))
+                self.assertEqual(restored['known_exit_code'], 0)
+                self.assertEqual(restored['wrapper_pid'], 321)
+                self.local.assert_not_called()
 
     def test_start_recovery_records_only_wrapper_pid_foreground_and_background(self):
         for backend in ('boat', 'server'):

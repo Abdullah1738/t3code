@@ -15,6 +15,27 @@ from test_capacity import Isolated
 
 
 class DatabaseMerge(Isolated):
+    def test_step_wrapper_exit_is_not_authoritative_before_validation(self):
+        rid = 'steps-pull-lock'
+        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count) "
+                         "VALUES (?,'box','running','fg',2)", (rid,))
+        log = runs.LOGS_DIR / (rid + '.log')
+        log.write_text('offbox step 1 rc=0: first\n')
+        runner = SimpleNamespace(run_id=rid, box='box', started=True, registered=True, remote_code=None,
+                                 lease_row=None, recovered_code=None, log_path=log,
+                                 start=lambda: None, stream=lambda: 0)
+        args = SimpleNamespace(bg=False, pull=['artifact'], cmd=[], steps=['first', 'second'])
+        with patch.object(runs, 'Runner', return_value=runner), \
+                patch.object(runs, 'do_pulls', side_effect=sqlite3.OperationalError('database is locked')), \
+                patch.object(api, '_request', side_effect=AssertionError('unexpected API')), \
+                self.assertRaises(common.OffboxError) as error:
+            runs._run_attempt(args, self.me)
+        self.assertEqual(error.exception.code, common.EXIT_LOCAL)
+        self.assertTrue(error.exception.started)
+        self.assertIn('offbox wait ' + rid, str(error.exception))
+        self.assertIsNone(runs.restore_run_state(self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,))
+                                               .fetchone())['exit_code'])
+
     def test_step_completion_under_writer_keeps_only_validated_results(self):
         connect = common.db
         connections = []

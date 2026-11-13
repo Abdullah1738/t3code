@@ -1414,9 +1414,10 @@ class Runner:
                 result = start_check.check(self.box, self.run_id)
                 if result.code is not None:
                     self.recovered_code = result.code
-                    self.remote_code = result.code
-                    save_run_state(self.run_id, box_id=self.box, wrapper_pid=result.pid,
-                                   status='done' if result.code == 0 else 'failed', exit_code=result.code, end_at=now())
+                    self.remote_code = None if steps else result.code
+                    saved = {'known_exit_code': result.code} if steps else {
+                        'status': 'done' if result.code == 0 else 'failed', 'exit_code': result.code, 'end_at': now()}
+                    save_run_state(self.run_id, box_id=self.box, wrapper_pid=result.pid, **saved)
                     try:
                         self.record(wrapper_pid=result.pid, status='running')
                     except sqlite3.Error as error:
@@ -2447,7 +2448,7 @@ def _run_remote(a, rn) -> int:
         code = None
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
-            rn.remote_code = code
+            rn.remote_code = None if getattr(a, 'steps', None) else code
         except Interrupted:
             code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             if code is None:
@@ -2470,7 +2471,7 @@ def _run_remote(a, rn) -> int:
         code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
-    rn.remote_code = code
+    rn.remote_code = None if getattr(a, 'steps', None) else code
     if code not in (0, None) and scope_failed(rn.log_path):
         rn.started = False
         rn.record(error="box could not start the command (systemd scope)")

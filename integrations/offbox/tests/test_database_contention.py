@@ -219,7 +219,7 @@ class DatabaseContention(Isolated):
         resolved = {'resolution':'resolved', 'robobThreadId':'thread'}
         self.con.execute('BEGIN IMMEDIATE')
         for command in ('list', 'status'):
-            with self.subTest(command=command), patch.object(identity, '_resolve_identity', return_value=(200, {'identity':resolved})), \
+            with self.subTest(command=command), patch.object(identity, '_resolve_identity', return_value=(200, {'identity':resolved}, None)), \
                     patch.object(identity, 'whoami', side_effect=lambda: {
                         **self.me, 'identity':identity.identity_for('native', 'codex')}), \
                     patch.object(api, 'list_boxes', return_value=[]), patch.object(api, 'limits', return_value={}), patch.object(misc, 'outage') as outage, \
@@ -251,13 +251,14 @@ class DatabaseContention(Isolated):
         self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('identity:codex:native',json.dumps(old),
                                                          common.now()-identity.RESOLVED_TTL-10))
         self.con.execute('BEGIN IMMEDIATE')
-        def pending(path, invalidate):
+        def pending(path, invalidate, has_stale):
             answer = {'resolution':'pending'}
             invalidate(answer)
-            return 200, {'identity':answer}
+            self.assertFalse(has_stale())
+            return 200, {'identity':answer}, None
         with patch.object(identity, '_resolve_identity', side_effect=pending):
             self.assertEqual(identity.identity_for('native','codex')['resolution'], 'pending')
-        with patch.object(identity, '_resolve_identity', return_value=(0, {'error':'unreachable'})):
+        with patch.object(identity, '_resolve_identity', return_value=(0, {'error':'unreachable'}, None)):
             self.assertEqual(identity.identity_for('native','codex')['resolution'], 'unavailable')
         self.con.rollback()
 
@@ -279,9 +280,9 @@ class DatabaseContention(Isolated):
                 self.con.execute('BEGIN IMMEDIATE')
                 answer = {'resolution':resolution,'robobThreadId':owner}
                 try:
-                    with patch.object(identity, '_resolve_identity', return_value=(200, {'identity':answer})):
+                    with patch.object(identity, '_resolve_identity', return_value=(200, {'identity':answer}, None)):
                         self.assertEqual(identity.identity_for(native, 'codex')['resolution'], resolution)
-                    with patch.object(identity, '_resolve_identity', return_value=(0, {'error':'offline'})):
+                    with patch.object(identity, '_resolve_identity', return_value=(0, {'error':'offline'}, None)):
                         result = identity.identity_for(native, 'codex')
                         self.assertNotEqual(result.get('robobThreadId'), 'old-owner')
                         self.assertEqual(result.get('robobThreadId'), owner)
