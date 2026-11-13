@@ -17,10 +17,10 @@ _MOVES = contextvars.ContextVar('prepare_moves', default=None)
 class Stalled(OffboxError):
     def __init__(self, box, phase, seconds):
         from . import home
-        self.box, self.phase = box, phase
+        self.phase = phase
         super().__init__(f'could not get a box ready in {seconds:g}s '
                          f'(stuck in {phase} on {box}); nothing ran',
-                         outage=phase == 'bring_up' and home.may_fail_over())
+                         outage=phase == 'bring_up' and home.may_fail_over(), box=box)
 
 
 class _Expired(BaseException):

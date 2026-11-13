@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_capacity import Isolated
 from test_exit_and_queue import FakeClock
-from offbox_lib import api, cli, common, lease, pool, prepare, runs
+from offbox_lib import api, cli, common, home, lease, pool, prepare, runs
 
 
 class PrepareTests(Isolated):
@@ -23,6 +23,21 @@ class PrepareTests(Isolated):
         self.stack.enter_context(patch.object(lease, 'cap_check'))
         self.stack.enter_context(patch.object(pool, '_refresh_background'))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
+
+    def test_stalled_keeps_box_and_failure_metadata(self):
+        for phase in ('lock_wait', 'bring_up', 'push'):
+            for may_fail_over in (False, True):
+                with self.subTest(phase=phase, may_fail_over=may_fail_over), \
+                        patch.object(home, 'may_fail_over', return_value=may_fail_over):
+                    error = prepare.Stalled('new-1', phase, 1.5)
+                    self.assertEqual(error.box, 'new-1')
+                    self.assertEqual(error.phase, phase)
+                    self.assertIsNone(error.run_id)
+                    self.assertEqual(error.code, common.EXIT_INFRA)
+                    self.assertFalse(error.started)
+                    self.assertEqual(error.outage, phase == 'bring_up' and may_fail_over)
+                    self.assertEqual(str(error), f'could not get a box ready in 1.5s '
+                                                f'(stuck in {phase} on new-1); nothing ran')
 
     def create_and_claim(self, lock_seconds, replacement=False):
         clock = FakeClock()
