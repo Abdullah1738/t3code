@@ -224,6 +224,15 @@ Focused verification:
 NDJSON. Use `--day YYYY-MM-DD` for another day, `--name dotted.name` to filter,
 or another board slug for that board's logs. `toollog rollup --board agent-tools`
 writes `~/.robob/logs/tools/agent-tools/rollup-YYYY-MM-DD.json`.
+Non-error hook rows stop when the day file reaches 35 MiB; other components
+continue to 50 MiB. Errors always continue. `logCaps` identifies any reached
+budget, including older markers as `component: all`.
+Allowed/rewritten non-error decisions are sampled 1-in-128 and omit default
+optional props. Missing `repeatCount` means 1, `cwdClass` means `other`, and
+`matchedRoot`/`argv0Class` mean `none`. Rollup weights counts, rates, duration
+percentiles and loop windows by `sampleRate`; `sampled: true` marks estimates,
+while `recordedRows` reports the stored count. Denials and other hook errors
+keep every row and all their context.
 Hook rollups include `topThreadsByRule` (`--top N`, default 20) and `repeatLoops`
 for a thread/rule appearing more than 20 times in a sliding hour. Loop windows
 can include the previous UTC day's last hour; daily totals stay local.

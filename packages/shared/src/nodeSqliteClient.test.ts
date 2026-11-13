@@ -608,6 +608,70 @@ it.effect("labels SQL spans with their connection and how long they waited for i
   );
 });
 
+it.effect.each([false, true])(
+  "records reader permit wait even before acquisition (interrupted=%s)",
+  (interrupted) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const waiting = yield* Deferred.make<void>();
+        const spans: Tracer.NativeSpan[] = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            const attribute = span.attribute.bind(span);
+            span.attribute = (key, value) => {
+              attribute(key, value);
+              if (
+                key === "db.reader.acquire_stage" &&
+                value === "slot" &&
+                span.attributes.get("db.reader.requested_lane") === "foreground"
+              )
+                Deferred.doneUnsafe(waiting, Effect.void);
+            };
+            return span;
+          },
+        });
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(SqliteClient.readOnly, Effect.forkChild);
+        yield* Deferred.await(held);
+        const waiter = yield* sql
+          .withTransaction(countEntries(sql))
+          .pipe(
+            SqliteClient.readOnly,
+            SqliteClient.foregroundReads,
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+            Effect.withTracer(tracer),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(waiting);
+        yield* TestClock.adjust("25 millis");
+        if (interrupted) yield* Fiber.interrupt(waiter);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        if (!interrupted) assert.equal(yield* Fiber.join(waiter), 1);
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.equal(span.attributes.get("db.reader.requested_lane"), "foreground");
+        assert.equal(span.attributes.get("db.reader.effective_lane"), "background");
+        assert.equal(span.attributes.get("db.reader.acquired"), !interrupted);
+        assert.equal(span.attributes.get("db.reader.wait_ms"), 25);
+        assert.equal(
+          span.attributes.get("db.reader.wait_interrupted"),
+          interrupted ? true : undefined,
+        );
+        assert.equal(
+          span.attributes.get("db.reader.acquire_stage"),
+          interrupted ? "slot" : "acquired",
+        );
+      }),
+    ),
+);
+
 it.effect("labels only the span of the statement or transaction that took the lock", () => {
   const spans: Array<Tracer.NativeSpan> = [];
   const tracer = Tracer.make({

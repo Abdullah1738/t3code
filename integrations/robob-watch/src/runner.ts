@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -62,6 +64,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(watcher, pending.event, pending.key, state);
+  await recordHealthDelivery(watcher.id, pending.healthRun, delivery);
   toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: watcher.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!delivery.ok) return false;
@@ -199,6 +202,7 @@ export async function tickOne(id: string): Promise<void> {
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
   const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const healthRun = isHealthNag(id) ? randomUUID().replaceAll("-", "") : undefined;
   let startLoad = 0;
   let timeoutMs = 0;
   const result = await slots.run(async () => {
@@ -210,7 +214,7 @@ export async function tickOne(id: string): Promise<void> {
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId }, timeoutMs);
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs);
   });
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
@@ -315,7 +319,7 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.failing_since;
   const event = result.stdout.trim();
   if (!event) { saveState(id, fresh); ackRun(); await runPendingCheck(watcher, t, true); return; }
-  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso() };
+  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), ...(healthRun ? { healthRun } : {}) };
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);

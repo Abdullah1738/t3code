@@ -162,6 +162,109 @@ describe("inferGate", () => {
   ] as const)("%s → %s", (text, gate) => expect(inferGate(text)).toBe(gate));
 });
 
+describe("board gate guessing", () => {
+  const cases = [
+    ["Tag the main-dev tip and dev-deploy it", "deploy"],
+    ["Pay the invoice", "money"],
+    ["Share the API key", "secret"],
+  ] as const;
+  const policies = [
+    undefined,
+    [],
+    ["deploy"],
+    ["money"],
+    ["secret"],
+    ["money", "secret"],
+    ["deploy", "money", "secret"],
+  ] as const;
+
+  for (const guessedGates of policies) {
+    for (const owner of ["evaluator", "script"] as const) {
+      it.each(cases)(`${owner}, guesses ${JSON.stringify(guessedGates)}: %s`, (text, kind) => {
+        const subtask: KanbanSubtask = {
+          id: "s1",
+          step: 1,
+          text,
+          owner,
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        };
+        const card = { number: 3329, asks: [], createdAt: at, subtasks: [subtask] };
+        const expected =
+          guessedGates === undefined || guessedGates.some((gate) => gate === kind)
+            ? kind
+            : undefined;
+        expect(gateOf(subtask, guessedGates)).toBe(expected);
+        expect(approvalProblem(card, subtask, guessedGates) === null).toBe(expected === undefined);
+        for (const gate of ["deploy", "money", "secret"] as const) {
+          const stored = { ...subtask, gate };
+          expect(gateOf(stored, guessedGates)).toBe(gate);
+          expect(approvalProblem({ ...card, subtasks: [stored] }, stored, guessedGates)).toContain(
+            "needs Abdullah's approval",
+          );
+        }
+        const plan = planSubtasks([], [{ text, owner }], 0, at, guessedGates);
+        expect(plan.ok).toBe(true);
+        if (plan.ok) expect(plan.subtasks[0]!.gate).toBe(expected);
+        const explicit = planSubtasks([], [{ text, owner, gate: kind }], 0, at, guessedGates);
+        expect(explicit).toMatchObject({ ok: true, subtasks: [{ gate: kind }] });
+        const edited = planSubtasks([subtask], [{ id: "s1", text }], 1, at, guessedGates);
+        expect(edited.ok).toBe(true);
+        if (edited.ok) expect(edited.subtasks[0]!.gate).toBe(expected);
+        const legacy = planSubtasks(
+          [{ ...subtask, gate: kind }],
+          [{ id: "s1", text: "Read back" }],
+          1,
+          at,
+          guessedGates,
+        );
+        expect(legacy).toMatchObject({ ok: true, subtasks: [{ gate: kind }] });
+      });
+    }
+  }
+});
+
+it("disabled guesses do not make a stored deploy gate's unnamed approval ambiguous", () => {
+  const action: KanbanSubtask = {
+    id: "s1",
+    step: 1,
+    text: "Tag the main-dev tip and dev-deploy it",
+    owner: "evaluator",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const production = {
+    ...action,
+    id: "s2",
+    step: 2,
+    text: "Deploy production",
+    gate: "deploy" as const,
+  };
+  const card = {
+    number: 3329,
+    createdAt: at,
+    subtasks: [action, production],
+    asks: [
+      {
+        id: "q1",
+        text: "Deploy production?",
+        blocking: false,
+        by: owner,
+        at,
+        seq: null,
+        closedAt: at,
+        answer: { verdict: "approved" as const, by: owner, at },
+      },
+    ],
+  };
+  expect(approvalProblem(card, production, ["money", "secret"])).toBeNull();
+  expect(approvalProblem(card, production)).toContain("needs Abdullah's approval");
+});
+
 describe("approvalProblem", () => {
   const card = { number: 8, asks: [], createdAt: at, subtasks: [] };
   const subtask: KanbanSubtask = {

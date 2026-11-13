@@ -580,7 +580,9 @@ const handlers = {
             ? {
                 message:
                   input.to === moved.stage
-                    ? `already in ${moved.stage}; nothing changed`
+                    ? moved.stage === "needs_review" && caller.link?.role === "work"
+                      ? "already queued for review; note added"
+                      : `already in ${moved.stage}; nothing changed`
                     : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
               }
             : {}),
@@ -1101,6 +1103,23 @@ const handlers = {
             replaces: input.replaces,
           }),
         };
+      }),
+    ),
+  ),
+
+  board_instructions_set: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card = yield* cardFor(service, caller, input.card);
+        return yield* service.applyApprovedInstructions(
+          board.id,
+          input.field,
+          input.text,
+          card.id,
+          input.ask,
+          caller.actor,
+        );
       }),
     ),
   ),

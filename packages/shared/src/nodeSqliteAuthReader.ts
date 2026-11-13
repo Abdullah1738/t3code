@@ -2,6 +2,9 @@
 import * as NodeUtil from "node:util";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
+import * as References from "effect/References";
+import * as Statement from "effect/sql/Statement";
+import * as Tracer from "effect/Tracer";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
@@ -118,6 +121,7 @@ const prepare = (sql, cached) => {
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
   if (workerData.reportStarted) parentPort.postMessage({ started: id });
   let operation = "open";
+  const executionStarted = performance.now();
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
     operation = "prepare";
@@ -126,14 +130,16 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
     statement.setReadBigInts(safeIntegers);
     if (statement.columns().length > 0) {
       statement.setReturnArrays(values);
-      parentPort.postMessage({ id, rows: statement.all(...params) });
+      const rows = statement.all(...params);
+      parentPort.postMessage({ id, rows, executionMs: performance.now() - executionStarted });
     } else {
       const result = statement.run(...params);
-      parentPort.postMessage({ id, rows: raw ? result : [] });
+      parentPort.postMessage({ id, rows: raw ? result : [], executionMs: performance.now() - executionStarted });
     }
   } catch (error) {
     parentPort.postMessage({
       id,
+      executionMs: performance.now() - executionStarted,
       error: {
         operation,
         message: String(error && error.message ? error.message : error),
@@ -159,10 +165,11 @@ type ReaderStartup =
   | { readonly type: "unavailable"; readonly message: string };
 
 type ReaderReply =
-  | { readonly id: number; readonly rows: ReadonlyArray<any> }
+  | { readonly id: number; readonly rows: ReadonlyArray<any>; readonly executionMs?: number }
   | {
       readonly id: number;
       readonly failure?: SqlError;
+      readonly executionMs?: number;
       readonly error: {
         readonly operation: "open" | "prepare" | "execute";
         readonly message: string;
@@ -506,6 +513,15 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             post: () => worker.postMessage({ id, safeIntegers, ...input, cached }),
             reject: (error) => resume(Effect.fail(error)),
             resume: (reply) => {
+              if (
+                reply.executionMs !== undefined &&
+                fiber.getRef(References.TracerEnabled) &&
+                fiber.getRef(Statement.SpanPropagationEnabled)
+              ) {
+                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                if (span?._tag === "Span")
+                  span.attribute("db.statement.execution_ms", reply.executionMs);
+              }
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;

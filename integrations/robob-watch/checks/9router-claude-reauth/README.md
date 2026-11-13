@@ -156,8 +156,11 @@ node --test "$D/supervisor.test.mjs"
 
 The tests use temporary state, real OS lease primitives, and injected fake
 router/control/Telegram functions only; they do not call the live router,
-create a thread, deliver notifications, start OAuth, or mutate accounts. The
-normal `robob-watch test` uses a scratch directory and is deliberately
+create a thread, deliver notifications, start OAuth, or mutate accounts.
+Both `node --test` and `bun test` support this suite. Cases requiring the real
+lease primitive run only on macOS with `/usr/bin/lockf`; other hosts report
+explicit skips while portable cases still run. Run on macOS for full coverage.
+The normal `robob-watch test` uses a scratch directory and is deliberately
 refused: a copied check must never accidentally launch or alert. Do not use
 `fire-test` for this watcher. The temporary deployment hold has been removed;
 do not run the live check by hand or manufacture a real auth failure to test it.

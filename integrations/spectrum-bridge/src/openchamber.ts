@@ -296,6 +296,7 @@ export type OwnerWords = { inboundId: string; text: string };
  * became (or waits for) a run of its own; `refused` means nothing was sent.
  */
 export type SteerDelivery = "steered" | "started" | "queued" | "refused";
+export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean> };
 
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
@@ -317,7 +318,7 @@ export interface ChatBackend {
    */
   runToolEvidence?(id: string, directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown">;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
-  children(id: string, directory: string): Promise<SessionRecord[]>;
+  children(id: string, directory: string, complete?: boolean): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
   promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
   /**
@@ -328,12 +329,12 @@ export interface ChatBackend {
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
     model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords): Promise<void>;
   /**
-   * Adds text to the session's running turn, never queueing behind it. Backends
+   * Adds a message to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
    */
-  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
+  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
-  statuses(): Promise<Record<string, SessionStatus>>;
+  statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;
    * backends whose full list is slow (Robob) implement this cheap single lookup.

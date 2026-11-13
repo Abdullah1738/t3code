@@ -7,6 +7,7 @@ import {
   kanbanStepSubtasks,
   type KanbanActor,
   type KanbanCard,
+  type KanbanBoard,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
@@ -40,11 +41,16 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 
 export const gateOf = (
   subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
-): KanbanSubtask["gate"] =>
+  guessedGates?: KanbanBoard["guessedGates"],
+): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
-  subtask.owner === "work" || subtask.owner === "review"
-    ? undefined
-    : (subtask.gate ?? inferGate(subtask.text));
+  if (subtask.owner === "work" || subtask.owner === "review") return undefined;
+  if (subtask.gate !== undefined) return subtask.gate;
+  const guessed = inferGate(subtask.text);
+  return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
+    ? guessed
+    : undefined;
+};
 
 export const isNegativeOption = (label: string): boolean =>
   /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
@@ -84,6 +90,7 @@ const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
   task: string,
+  others: readonly string[],
 ): boolean => {
   const words = label
     .trim()
@@ -122,13 +129,28 @@ const approvesGate = (
   }
   const operation = action !== command ? normalized : action;
   const matched = verb.exec(operation)?.[0];
-  if (!matched) return false;
-  const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
-  if (suffix !== null && action === command && normalized === target)
-    return harmlessFollowup(task, target);
+  if (matched) {
+    const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
+    if (suffix !== null && action === command && normalized === target) {
+      if (harmlessFollowup(task, target)) return true;
+    } else if (
+      /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
+      (suffix !== null && harmlessFollowup(task, target))
+    ) {
+      return true;
+    }
+  }
+  if (gate === "secret") return false;
+  const choiceVerb =
+    gate === "deploy"
+      ? /\b(?:deploy\w*|release|install|restart|ship)\b/i
+      : /\b(?:pay|purchase|buy|charge|refund|transfer)\b/i;
   return (
-    /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
-    (suffix !== null && harmlessFollowup(task, target))
+    choiceVerb.test(command) &&
+    !/\b(?:not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead|partial|dry[- ]?run|draft|plan|preview|prepare)\b/i.test(
+      command,
+    ) &&
+    others.some((other) => isNegativeOption(other) || !choiceVerb.test(other))
   );
 };
 
@@ -136,8 +158,9 @@ const approvesGate = (
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
+  guessedGates?: KanbanBoard["guessedGates"],
 ): string | null => {
-  const gate = gateOf(subtask);
+  const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
@@ -152,7 +175,7 @@ export const approvalProblem = (
       if (ids.size > 0) return ids.has(subtask.id);
       const candidates = card.subtasks.filter(
         (entry) =>
-          gateOf(entry) === gate &&
+          gateOf(entry, guessedGates) === gate &&
           entry.state !== "skipped" &&
           (entry.createdAt ?? card.createdAt) <= answer.at,
       );
@@ -163,13 +186,20 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
+  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
+  const others =
+    answer?.optionIds?.length === 1
+      ? (latest?.options ?? [])
+          .filter((option) => !answer.optionIds!.includes(option.id))
+          .map((option) => option.label)
+      : [];
   const approved =
     answer?.verdict === "approved" ||
     (answer?.verdict === "picked" &&
       Boolean(answer.optionIds?.length) &&
       answer.optionIds!.every((id) => {
         const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && approvesGate(option.label, gate, subtask.text);
+        return option !== undefined && approvesGate(option.label, gate, subtask.text, others);
       }));
   if (approved) return null;
   let reason: string;
@@ -254,6 +284,7 @@ export function planSubtasks(
   inputs: ReadonlyArray<SubtaskInput>,
   seq = 0,
   at?: string,
+  guessedGates?: KanbanBoard["guessedGates"],
 ): SubtaskPlan {
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
@@ -302,7 +333,7 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined });
+    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates);
     const script = input.script?.trim() || undefined;
     if (script && owner !== "script") {
       return {
@@ -316,7 +347,7 @@ export function planSubtasks(
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
       const { script: _old, gate: _oldGate, ...rest } = known;
-      const previousGate = gateOf(known);
+      const previousGate = gateOf(known, guessedGates);
       const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
       planned.push({
         ...rest,

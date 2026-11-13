@@ -80,7 +80,7 @@ class ResumeRecoveryTests(Isolated):
         self.preserved_source('template:crpko-harness', size='xlarge', template='crpko-harness')
 
     def test_stalled_resume_replacement_preserves_auto_template(self):
-        with patch.object(lease, 'pick_template', return_value='crpko-go'):
+        with patch.object(lease, 'pick_template', return_value=('crpko-go', 'go.mod')):
             self.preserved_source('template:crpko-go')
 
     def test_release_delete_clears_markers_and_allows_real_replacement(self):

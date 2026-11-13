@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -41,9 +42,9 @@ elif name=='sqlite3':
 
 
 class ShellJobsTests(unittest.TestCase):
- def fixture(self):
+ def fixture(self,home_name='home'):
   temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
-  root=Path(temp.name);home=root/'home';home.mkdir();fake=root/'bin';fake.mkdir()
+  root=Path(temp.name);home=root/home_name;home.mkdir();fake=root/'bin';fake.mkdir()
   for name in ['python3','restic','rsync','df','stat','getconf','nice','bun','rm','sqlite3']:
    p=fake/name;p.write_text(FAKE.replace('PYTHON',sys.executable));p.chmod(0o755)
   logs=root/'logs'
@@ -55,6 +56,29 @@ class ShellJobsTests(unittest.TestCase):
 
  def rows(self,logs):
   return [json.loads(line) for p in logs.glob('*.ndjson') for line in p.read_text().splitlines()]
+
+ def job_installer_fixture(self,home_name='home'):
+  root,home,fake,logs,env=self.fixture(home_name)
+  git=fake/'git'
+  git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\nelif "status" in a and any(p.startswith("integrations/memory-system/") for p in a): print(" M integrations/memory-system/src/backup_control.py")\n')
+  git.chmod(0o755)
+  io_log=root/'installer-io.jsonl'
+  env['INSTALL_IO_LOG']=str(io_log)
+  for name in ('cmp','cp','install','mkdir'):
+   executable=shutil.which(name)
+   self.assertIsNotNone(executable)
+   wrapper=fake/name
+   wrapper.write_text('#!'+sys.executable+'''\nimport json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['INSTALL_IO_LOG'],'a') as log: log.write(json.dumps(args)+'\\n')
+memory=Path.home()/'.local/share/memory-system'
+if any(Path(os.path.abspath(arg)).is_relative_to(memory) for arg in args):
+ sys.exit('unexpected memory-system access')
+os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
+''')
+   wrapper.chmod(0o755)
+  return root,home,env,io_log
 
  def test_health_and_memory_full_success_and_restic_failure(self):
   for target in ('health','memory'):
@@ -104,21 +128,37 @@ class ShellJobsTests(unittest.TestCase):
 
  @unittest.skipUnless(shutil.which('zsh'),'installer uses zsh')
  def test_installer_check_verifies_rendered_plist_and_modes(self):
-  root,home,fake,logs,env=self.fixture()
-  git=fake/'git'
-  git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
-  git.chmod(0o755)
-  command=['zsh',str(HERE/'install.zsh')]
-  installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
-  self.assertEqual(installed.returncode,0,installed.stderr)
-  plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
-  original=plist.read_text()
-  def check():
-   return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
-  self.assertEqual(check(),0)
-  plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
-  plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)
-  plist.rename(plist.with_suffix('.saved'));self.assertNotEqual(check(),0)
+  for home_name in ('home','home with spaces'):
+   with self.subTest(home=home_name):
+    root,home,fake,logs,env=self.fixture(home_name)
+    git=fake/'git'
+    git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
+    git.chmod(0o755)
+    command=['zsh',str(HERE/'install.zsh')]
+    dry_run=subprocess.run(command+['--dry-run'],env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(dry_run.returncode,0,dry_run.stderr)
+    self.assertFalse((home/'.local').exists())
+    self.assertFalse((home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist').exists())
+    installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(installed.returncode,0,installed.stderr)
+    plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
+    original=plist.read_text()
+    rendered=plistlib.loads(original.encode())
+    collector=home/'.local/lib/mac-logging/collector.py'
+    arguments=['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}"']
+    self.assertEqual(rendered,dict(Label='com.abdullah.mac-log-collector',ProgramArguments=arguments,
+                                   StartInterval=3600,RunAtLoad=True,ProcessType='Background'))
+    self.assertNotIn('__HOME__',original)
+    def check():
+     return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
+    self.assertEqual(check(),0)
+    plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
+    plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)
+    plist.rename(plist.with_suffix('.saved'));self.assertNotEqual(check(),0)
+    collector.write_text('import sys\nprint(sys.argv[0])\n')
+    launched=subprocess.run(rendered['ProgramArguments'],env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(launched.returncode,0,launched.stderr)
+    self.assertEqual(launched.stdout.strip(),str(collector))
 
  @unittest.skipUnless(shutil.which('zsh'),'installers use zsh')
  def test_each_job_installer_rejects_missing_executable_permissions(self):
@@ -129,8 +169,7 @@ class ShellJobsTests(unittest.TestCase):
   cases=[
    (REPO/'integrations/cve-sweep/install.zsh',['.local/bin/cve-sweep']),
    (REPO/'integrations/health-backup/install.zsh',['health-data/abdullah/backup/health_backup.sh','health-data/abdullah/backup/snapshot_extra.py']),
-   (HERE/'install-jobs.zsh',['.local/share/memory-system/scripts/memory_backup.sh',
-     '.local/share/robob-watch/watchers/disk-space-guard/check.sh',
+   (HERE/'install-jobs.zsh',['.local/share/robob-watch/watchers/disk-space-guard/check.sh',
      '.config/opencode/skills/dev-resource-janitor/scripts/dev_janitor.py',
      '.config/opencode/skills/dev-resource-janitor/scripts/janitor_watch.py'])]
   for installer,files in cases:
@@ -140,18 +179,66 @@ class ShellJobsTests(unittest.TestCase):
    def check():
     return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=15).returncode
    self.assertEqual(check(),0)
-   if installer == HERE/'install-jobs.zsh':
-    for name in ('backup_control.py','redact_lock.py'):
-     guard=home/'.local/share/memory-system/src'/name
-     original=guard.read_text()
-     guard.chmod(0o755);self.assertNotEqual(check(),0);guard.chmod(0o644)
-     guard.write_text('stale guard');self.assertNotEqual(check(),0)
-     guard.write_text(original);self.assertEqual(check(),0)
    for relative in files:
     with self.subTest(installer=str(installer),file=relative):
      path=home/relative
+     self.assertEqual(path.stat().st_mode & 0o777,0o755)
      path.chmod(0o644);self.assertNotEqual(check(),0)
      path.chmod(0o755);self.assertEqual(check(),0)
+
+ @unittest.skipUnless(shutil.which('zsh'),'installer uses zsh')
+ def test_job_installer_leaves_memory_system_untouched_in_every_mode(self):
+  for home_name in ('home','home with spaces'):
+   for existing in (False,True):
+    with self.subTest(home=home_name,existing=existing):
+     root,home,env,io_log=self.job_installer_fixture(home_name)
+     memory=home/'.local/share/memory-system'
+     sentinels={}
+     if existing:
+      for name in ('scripts/memory_backup.sh','src/backup_control.py','src/redact_lock.py'):
+       path=memory/name;path.parent.mkdir(parents=True,exist_ok=True)
+       path.write_text('Recall owns this file\n');path.chmod(0o600)
+       sentinels[name]=(path.read_bytes(),path.stat().st_mode,path.stat().st_mtime_ns)
+     command=['zsh',str(HERE/'install-jobs.zsh')]
+     # Reinstall as well, so backup copies are covered by the access trap.
+     for args in (['--dry-run'],[],[],['--check']):
+      result=subprocess.run(command+args,env=env,capture_output=True,text=True,timeout=15)
+      self.assertEqual(result.returncode,0,result.stderr)
+      self.assertNotIn(str(memory),result.stdout+result.stderr)
+      if args == ['--dry-run']:
+       self.assertFalse((home/'.config').exists())
+       self.assertFalse(io_log.exists())
+      self.assertEqual(memory.exists(),existing)
+      if existing:
+       self.assertEqual({str(p.relative_to(memory)):(p.read_bytes(),p.stat().st_mode,p.stat().st_mtime_ns)
+                         for p in memory.rglob('*') if p.is_file()},sentinels)
+     calls=[json.loads(line) for line in io_log.read_text().splitlines()]
+     self.assertTrue(calls)
+     self.assertFalse(any(str(memory) in arg for args in calls for arg in args))
+     for relative in ('.local/share/robob-watch/watchers/disk-space-guard/check.sh',
+                      '.config/opencode/skills/dev-resource-janitor/scripts/dev_janitor.py',
+                      '.config/opencode/skills/dev-resource-janitor/scripts/janitor_watch.py'):
+      self.assertEqual((home/relative).stat().st_mode & 0o777,0o755)
+
+ @unittest.skipUnless(shutil.which('zsh'),'installer uses zsh')
+ def test_job_installer_refuses_memory_system_targets_in_every_mode(self):
+  for home_name in ('home','home with spaces'):
+   root,home,env,io_log=self.job_installer_fixture(home_name)
+   (root/'pushed.zsh').write_text((HERE/'pushed.zsh').read_text())
+   script=root/'install-jobs.zsh'
+   original=(HERE/'install-jobs.zsh').read_text()
+   for suffix in ('','/','/.','/scripts/memory_backup.sh','/src/backup_control.py','/src/redact_lock.py'):
+    target='$HOME/.local/share/memory-system'+suffix
+    pair='  "integrations/robob-watch/watchers/disk-space-guard/check.sh:'+target+'" \\\n'
+    script.write_text(original.replace('for pair in \\\n','for pair in \\\n'+pair,1))
+    for args in ([],['--dry-run'],['--check']):
+     with self.subTest(home=home_name,target=target,args=args):
+      result=subprocess.run(['zsh',str(script)]+args,env=env,capture_output=True,text=True,timeout=15)
+      self.assertEqual(result.returncode,2,result.stderr)
+      self.assertIn('refusing memory-system target',result.stderr)
+      self.assertEqual(result.stdout,'')
+      self.assertFalse(io_log.exists())
+      self.assertFalse((home/'.local').exists())
 
  def test_shell_bridge_is_silent_even_if_helper_missing(self):
   root,home,fake,logs,env=self.fixture()

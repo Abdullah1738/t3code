@@ -164,6 +164,21 @@ describe("checkMove", () => {
     ).toBe(false);
   });
 
+  it.each(["in_review", "completed"] as const)(
+    "lets an unattached %s card return to review",
+    (stage) => {
+      expect(checkMove("cardThread", card({ stage }), "needs_review").ok).toBe(true);
+      expect(
+        checkMove(
+          "cardThread",
+          card({ stage, activeThreadId: ThreadId.make("reviewer") }),
+          "needs_review",
+        ).ok,
+      ).toBe(false);
+      expect(checkMove("cardThread", card({ stage }), "deployed").ok).toBe(false);
+    },
+  );
+
   it("lets a script move a card only to completed, deployed or verified, off a quiet stage", () => {
     expect(checkMove("script", card({ stage: "todo" }), "deployed").ok).toBe(true);
     expect(checkMove("script", card({ stage: "completed" }), "verified").ok).toBe(true);

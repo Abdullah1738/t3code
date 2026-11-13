@@ -44,9 +44,10 @@ export const wrap = (
     boards: locks.observe(store.boards),
     board: (id) => locks.access(id, store.board(id), false, "board"),
     putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
-    putBoardWithPools: (row, pools) =>
-      locks.access(row.id, store.putBoardWithPools(row, pools), true, "board"),
+    putBoardWithPools: (row, pools, application) =>
+      locks.access(row.id, store.putBoardWithPools(row, pools, application), true, "board"),
     cards: (id) => locks.access(id, store.cards(id)),
+    dispatchCards: (id) => locks.access(id, store.dispatchCards(id)),
     openCards: (id) => locks.access(id, store.openCards(id)),
     summaryCards: (id) => locks.access(id, store.summaryCards(id)),
     card: (id) => card(id, store.card(id)),
@@ -54,7 +55,10 @@ export const wrap = (
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
     putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),
-    addCardEvent: (row) => card(row.cardId, store.addCardEvent(row), true),
+    addCardEvent: (row, applicationId) =>
+      card(row.cardId, store.addCardEvent(row, applicationId), true),
+    pendingInstructionApplications: (cardId, boardId, field, askId) =>
+      card(cardId, store.pendingInstructionApplications(cardId, boardId, field, askId)),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     boardEvents: (id, since, until) => locks.access(id, store.boardEvents(id, since, until)),
     lastTransitions: (id, cardIds, beforeId) =>
@@ -70,7 +74,10 @@ export const wrap = (
     groups: (id) => locks.access(id, store.groups(id)),
     putGroups: (id, rows) => locks.access(id, store.putGroups(id, rows), true),
     discussions: (id) => locks.access(id, store.discussions(id)),
+    openDiscussions: (id) => locks.access(id, store.openDiscussions(id)),
     discussion: (id) => discussion(id, store.discussion(id)),
+    latestSystemDiscussion: (id, component) =>
+      locks.access(id, store.latestSystemDiscussion(id, component)),
     discussionByEvaluator: (id) => thread(id, store.discussionByEvaluator(id)),
     discussionBoardIdsByEvaluator: (id) => thread(id, store.discussionBoardIdsByEvaluator(id)),
     putDiscussion: (row) =>

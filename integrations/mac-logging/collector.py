@@ -3,12 +3,14 @@
 from collections import Counter
 import datetime as dt
 import json
+import math
 import fcntl
 import os
 import plistlib
 import tempfile
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
@@ -20,55 +22,121 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
                Path.home() / 'Library/Logs/DiagnosticReports']
 
 
-def reports(root, since, until):
-    counts = Counter()
+UNIFIED_WINDOW_S = 3600
+UNIFIED_CHUNK_S = 900
+UNIFIED_BUDGET_S = 90
+
+
+def deadline_call(deadline, operation, *args, **kwargs):
+    if deadline is None:
+        return operation(*args, **kwargs)
+    started = time.monotonic()
+    remaining = deadline-started
+    if remaining <= 0:
+        raise SourceFailure('timeout', 'collector budget exhausted')
+
+    def expired(signum, frame):
+        raise SourceFailure('timeout', 'collector I/O budget exhausted')
+
+    # This is a single-threaded macOS LaunchAgent. Alarm only the I/O call,
+    # never the counter/checkpoint updates that follow a completed report.
+    handler = signal.signal(signal.SIGALRM, expired)
+    previous = signal.setitimer(signal.ITIMER_REAL, remaining)
     try:
-        root.stat()
-    except FileNotFoundError:
+        result = operation(*args, **kwargs)
+        if time.monotonic() > deadline:
+            raise SourceFailure('timeout', 'collector I/O budget exhausted')
+        return result
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if previous[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, previous[0]-(time.monotonic()-started)), previous[1])
+
+
+class ReportFailure(Exception):
+    def __init__(self, cause, counts):
+        self.cause = cause
+        self.counts = counts
+
+
+def report_header(path):
+    with path.open() as stream:
+        return stream.readline(4096)
+
+
+def report(path, since, until, deadline):
+    counts = Counter()
+    st = deadline_call(deadline, path.stat)
+    if not since < st.st_mtime <= until:
         return counts
-    for path in root.iterdir():
-        if path.suffix not in ('.panic', '.ips', '.crash', '.hang', '.spin', '.shutdownStall'):
-            continue
-        st = path.stat()
-        if not since < st.st_mtime <= until:
-            continue
-        kind = 'panic' if path.suffix == '.panic' else 'hang' if path.suffix in ('.hang', '.spin', '.shutdownStall') else 'app_crash'
-        # Parse only the small .ips header. Stack traces, exception messages, and
-        # process arguments never enter either the state or the shared log.
-        process = re.split(r'[_-]\d{4}-?\d{2}', path.stem)[0]
-        if path.suffix == '.ips':
-            with path.open() as stream:
-                header = stream.readline(4096)
-            try:
-                meta = json.loads(header)
-                process = meta.get('app_name') or meta.get('name') or process
-                bug = str(meta.get('bug_type', ''))
-                if bug == '210':
-                    kind, process = 'panic', 'kernel'
-                elif bug in ('109', '309'):
-                    kind = 'app_crash'
-                else:
-                    # Stackshots, Jetsam and resource diagnostics are not proof
-                    # that the system hung or an application crashed.
-                    continue
-            except ValueError:
-                continue
-        if kind == 'panic':
-            process = 'kernel'
-        # Whitelist process-name characters; a diagnostic filename is untrusted.
-        if not re.fullmatch(r'[A-Za-z0-9_. +()-]{1,100}', process):
-            process = 'unknown'
-        counts[kind, process] += 1
+    kind = 'panic' if path.suffix == '.panic' else 'hang' if path.suffix in ('.hang', '.spin', '.shutdownStall') else 'app_crash'
+    # Parse only the small .ips header. Stack traces, exception messages, and
+    # process arguments never enter either the state or the shared log.
+    process = re.split(r'[_-]\d{4}-?\d{2}', path.stem)[0]
+    if path.suffix == '.ips':
+        header = deadline_call(deadline, report_header, path)
+        try:
+            meta = json.loads(header)
+            process = meta.get('app_name') or meta.get('name') or process
+            bug = str(meta.get('bug_type', ''))
+            if bug == '210':
+                kind, process = 'panic', 'kernel'
+            elif bug in ('109', '309'):
+                kind = 'app_crash'
+            else:
+                # Stackshots, Jetsam and resource diagnostics are not proof
+                # that the system hung or an application crashed.
+                return counts
+        except ValueError:
+            return counts
+    if kind == 'panic':
+        process = 'kernel'
+    # Whitelist process-name characters; a diagnostic filename is untrusted.
+    if not re.fullmatch(r'[A-Za-z0-9_. +()-]{1,100}', process):
+        process = 'unknown'
+    counts[kind, process] += 1
     return counts
 
 
-def unified(since, until, run=subprocess.run):
+def reports(root, since, until, deadline=None, completed=None):
+    counts = Counter()
+    completed = set() if completed is None else completed
+    try:
+        try:
+            deadline_call(deadline, root.stat)
+        except FileNotFoundError:
+            return counts
+        paths = iter(deadline_call(deadline, root.iterdir))
+        while True:
+            try:
+                path = deadline_call(deadline, next, paths)
+            except StopIteration:
+                break
+            if path.name in completed or path.suffix not in ('.panic', '.ips', '.crash', '.hang', '.spin', '.shutdownStall'):
+                continue
+            try:
+                observed = report(path, since, until, deadline)
+            except FileNotFoundError:
+                observed = Counter()
+            counts.update(observed)
+            completed.add(path.name)
+    except Exception as exc:
+        raise ReportFailure(exc, counts) from None
+    return counts
+
+
+def unified(since, until, run=subprocess.run, timeout=60):
+    if timeout <= 0:
+        raise SourceFailure('timeout', 'collector budget exhausted')
+    since = max(since, until-UNIFIED_WINDOW_S)
     def stamp(value):
         return dt.datetime.fromtimestamp(value, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
                   '--start', stamp(since), '--end', stamp(until+1), '--predicate',
                   'eventMessage CONTAINS "=== system boot" OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
-                 capture_output=True, text=True, timeout=60,
+                 capture_output=True, text=True, timeout=min(60, timeout),
                  env={**os.environ, 'LC_ALL': 'C'})
     if result.returncode:
         message = stderr_line(getattr(result, 'stderr', ''))
@@ -83,59 +151,116 @@ def unified(since, until, run=subprocess.run):
         raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
     for row in rows:
         timestamp = row.get('timestamp')
-        if timestamp:
-            try:
-                at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
-            except (AttributeError, TypeError, ValueError):
-                raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
-            if at.tzinfo is None:
-                at = at.replace(tzinfo=dt.timezone.utc)
-            if not since < at.timestamp() <= until:
-                continue
+        try:
+            at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
+        except (AttributeError, TypeError, ValueError):
+            raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=dt.timezone.utc)
+        if not since < at.timestamp() <= until:
+            continue
         message = row.get('eventMessage', '')
         if not isinstance(message, str):
             raise SourceFailure('parse', 'invalid unified log data', result.returncode)
         if '=== system boot' in message:
-            counts['restart', 'kernel'] += 1
+            # Preserve boot time and collapse duplicate markers at that instant.
+            counts['restart', 'kernel', at.timestamp()] = 1
         elif 'wdog' in message.lower() or 'unresponsive' in message.lower():
             counts['hang', 'system'] += 1
     return counts
 
 
-def collect(now=None, roots=None, log_reader=unified):
+def crash_observations(counts):
+    for key, count in counts.items():
+        kind, process = key[:2]
+        props = dict(resourceKind=kind, process=process, count=count)
+        if len(key) == 3:
+            props['observedAt'] = key[2]
+        emit('crashes', 'event', 'crash.observed', ok=True, props=props)
+
+
+def collect(now=None, roots=None, log_reader=None, deadline=None):
     started = time.monotonic()
+    deadline = min(started+120, deadline) if deadline is not None else started+120
     now = time.time() if now is None else now
     state = read_state('crashes')
     counts, errors = Counter(), 0
-    for i, root in enumerate(REPORT_DIRS if roots is None else roots):
+    report_roots = list(REPORT_DIRS if roots is None else roots)
+    for i, root in enumerate(report_roots):
         key = 'reports%d' % i
         source_started = time.monotonic()
+        pending = state.get(key+'Pending') or dict(since=state.get(key, now-3600), until=now, done=[])
+        completed = set(pending['done'])
         try:
-            counts.update(reports(root, state.get(key, now-3600), now))
-            state[key] = now
+            # Leave later sources a chance to run, but never outlive the
+            # collector's absolute deadline. Unified uses whatever remains.
+            source_deadline = min(deadline, source_started+10)
+            if source_started >= source_deadline:
+                raise SourceFailure('timeout', 'collector budget exhausted')
+            observed = reports(root, pending['since'], pending['until'], source_deadline, completed)
+            counts.update(observed)
+            state[key] = pending['until']
+            state.pop(key+'Pending', None)
         except Exception as exc:
+            if isinstance(exc, ReportFailure):
+                counts.update(exc.counts)
+                exc = exc.cause
+            pending['done'] = sorted(completed)
+            state[key+'Pending'] = pending
             errors += 1
-            source_error('crashes', 'crash.source', root, source_started, exc)
+            source_error('crashes', 'crash.source', root, source_started, exc,
+                         {'partial': bool(completed)})
+    crash_observations(counts)
+    save_state('crashes', state)
     source_started = time.monotonic()
+    since = state.get('unified', now-3600)
+    window = state.get('unifiedRetry') or dict(windowStart=max(since, now-UNIFIED_WINDOW_S),
+                                             windowEnd=now, skippedS=max(0, now-UNIFIED_WINDOW_S-since))
+    window = dict(window, windowS=window['windowEnd']-window['windowStart'])
+    window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
+    cursor = window['windowStart']
+    unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
     try:
-        counts.update(log_reader(state.get('unified', now-3600), now))
-        state['unified'] = now
+        if time.monotonic() >= unified_deadline:
+            raise SourceFailure('timeout', 'collector budget exhausted')
+        while cursor < window['windowEnd']:
+            end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
+            remaining = min(60, unified_deadline-time.monotonic())
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'unified log budget exhausted')
+            if log_reader is None:
+                observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
+            else:
+                observed = deadline_call(unified_deadline, log_reader, cursor, end)
+            counts.update(observed)
+            crash_observations(observed)
+            cursor = end
+            state['unified'] = cursor
+            window['chunksDone'] += 1
+            # The gap remains pending until the source result reports it.
+            state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                         skippedS=window['skippedS'])
+            save_state('crashes', state)
+        state['unified'] = window['windowEnd']
+        state.pop('unifiedRetry', None)
+        emit('crashes', 'event', 'crash.source', ok=True,
+             props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000, **window))
     except Exception as exc:
         errors += 1
-        source_error('crashes', 'crash.source', 'unified', source_started, exc)
-    for (kind, process), count in counts.items():
-        emit('crashes', 'event', 'crash.observed', ok=True,
-             props={'resourceKind': kind, 'process': process, 'count': count})
+        state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                     skippedS=window['skippedS'])
+        source_error('crashes', 'crash.source', 'unified', source_started, exc, window)
+        state['unifiedRetry']['skippedS'] = 0
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
-         props={'count': sum(counts.values()), 'sourceErrors': errors},
+         props={'count': sum(counts.values()), 'sourceErrors': errors, **window},
          error_tag='crash.source_unavailable' if errors else None)
     save_state('crashes', state)
     utc = dt.datetime.fromtimestamp(now, dt.timezone.utc)
     day = (utc.date()-dt.timedelta(days=1)).isoformat()
     if (utc.hour > 0 or utc.minute >= 5) and state.get('rollupDay') != day:
         try:
-            rollup(day)
+            deadline_call(deadline, rollup, day)
             state['rollupDay'] = day
             save_state('crashes', state)
             emit('rollup', 'event', 'log.rollup', ok=True)
@@ -347,15 +472,16 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 
 
 def main():
-    disk_tooling_probe()
+    deadline = time.monotonic()+290
     try:
-        directory_inventory()
-    except Exception:
-        emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
-    try:
-        collect()
+        collect(deadline=deadline)
     except Exception:
         emit('crashes', 'error', 'crash.collect', ok=False, error_tag='crash.collect_failed')
+    disk_tooling_probe()
+    try:
+        directory_inventory(deadline=deadline)
+    except Exception:
+        emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
 
 
 if __name__ == '__main__':

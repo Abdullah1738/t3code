@@ -407,6 +407,7 @@ export interface ThreadManagementServiceShape {
   readonly getCallerRow: Orchestrator.OrchestratorV2["Service"]["getCallerRow"];
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly getThreadIdsForWorktree: Orchestrator.OrchestratorV2["Service"]["getThreadIdsForWorktree"];
+  readonly getThreadListCandidates: Orchestrator.OrchestratorV2["Service"]["getThreadListCandidates"];
   readonly listProjectThreads: (input: {
     readonly projectId: ProjectId;
     readonly includeSubagents: boolean;
@@ -963,28 +964,44 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
-    orchestrator.getShellSnapshot({ projectId: input.projectId, location: "active" }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ThreadManagementProjectThreadsListError({
-            projectId: input.projectId,
-            cause,
-          }),
-      ),
-      Effect.map((snapshot) =>
-        snapshot.threads
-          .filter(
-            (thread) =>
-              input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
-          )
-          .toSorted(
-            (left, right) =>
-              DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
-              right.id.localeCompare(left.id),
+  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = Effect.fn(
+    "ThreadManagementService.listProjectThreads",
+  )(function* (input) {
+    const threads: OrchestrationV2ThreadShell[] = [];
+    let afterThreadId: string | undefined;
+    // Each page releases the reader before the next one. MCP lists must not
+    // monopolize the background slot while building every shell in a project.
+    while (true) {
+      const snapshot = yield* orchestrator
+        .getShellSnapshot({
+          projectId: input.projectId,
+          location: "active",
+          limit: 100,
+          ...(afterThreadId === undefined ? {} : { afterThreadId }),
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ThreadManagementProjectThreadsListError({
+                projectId: input.projectId,
+                cause,
+              }),
           ),
-      ),
-    );
+        );
+      threads.push(...snapshot.threads);
+      if (snapshot.threads.length < 100) break;
+      afterThreadId = snapshot.threads.at(-1)?.id;
+    }
+    return threads
+      .filter(
+        (thread) => input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
+      )
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
+          right.id.localeCompare(left.id),
+      );
+  });
 
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
@@ -1528,6 +1545,7 @@ const make = Effect.gen(function* () {
     getThreadShell: orchestrator.getThreadShell,
     getThreadIdsForWorktree: orchestrator.getThreadIdsForWorktree,
     listProjectThreads,
+    getThreadListCandidates: orchestrator.getThreadListCandidates,
     sendToThread,
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
