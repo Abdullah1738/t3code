@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -73,10 +74,28 @@ def configure_fixture(root, backend):
 def fixture(root, bg, backend):
     a, me = configure_fixture(root, backend)
     a.bg = bg
+    if os.environ.get('OFFBOX_TEST_THREADED_CALLER'):
+        threading.Thread(target=threading.Event().wait, daemon=True).start()
+    masked = bool(os.environ.get('OFFBOX_TEST_MASKED_MAIN'))
+    if masked:
+        interruptions = 0
+        def interrupted(signum, frame):
+            nonlocal interruptions
+            interruptions += 1
+            (root / 'caller-interrupted').write_text(str(interruptions))
+        signal.signal(signal.SIGINT, interrupted)
+        signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,))
+    if os.environ.get('OFFBOX_TEST_READY_TIMEOUT'):
+        runs.BG_READY_TIMEOUT_S = float(os.environ['OFFBOX_TEST_READY_TIMEOUT'])
     code = runs.run_remote(a, me)
+    if masked:
+        (root / 'mask-restored').write_text(str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
     (root / 'returned').write_text(str(code))
     while True:
-        signal.pause()
+        if masked:
+            time.sleep(.01)
+        else:
+            signal.pause()
 
 
 class BackgroundQueueTests(Isolated):
@@ -207,20 +226,52 @@ class BackgroundQueueTests(Isolated):
         self.assertFalse((Path(self.tmp.name) / 'starts').exists())
 
     def test_caller_sigint_during_readiness_does_not_cancel_the_child(self):
+        self.readiness_sigint(threaded=False)
+
+    def test_threaded_caller_sigint_during_readiness_does_not_cancel_the_child(self):
+        self.readiness_sigint(threaded=True)
+
+    def test_threaded_caller_sigint_does_not_waive_readiness_timeout(self):
+        self.readiness_sigint(threaded=True, timeout=True)
+
+    def test_masked_main_replays_sigint_through_an_unmasked_thread(self):
+        self.readiness_sigint(threaded=True, masked=True)
+
+    def readiness_sigint(self, *, threaded, timeout=False, masked=False):
         root = Path(self.tmp.name)
         with common.file_lock('fixture-handoff'):
             proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
                                      self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    start_new_session=True, env=dict(os.environ, OFFBOX_TEST_HANDOFF='1'))
+                                    start_new_session=True, env=dict(os.environ, OFFBOX_TEST_HANDOFF='1',
+                                                                   OFFBOX_TEST_THREADED_CALLER='1' if threaded else '',
+                                                                   OFFBOX_TEST_MASKED_MAIN='1' if masked else '',
+                                                                   OFFBOX_TEST_READY_TIMEOUT='1' if timeout else ''))
             self.addCleanup(self.stop, proc)
             self.until(lambda: (root / 'handoff').exists(), proc)
             child = int((root / 'handoff').read_text())
             self.addCleanup(self.stop_child, child, proc.pid)
             os.killpg(proc.pid, signal.SIGINT)
-        proc.communicate(timeout=5)
-        self.assertNotEqual(proc.returncode, 0)
+            if timeout:
+                # Keep readiness blocked until the original deadline fences the transferred worker.
+                proc.communicate(timeout=5)
+                row = self.con.execute('SELECT status,exit_code FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+                self.assertEqual(tuple(row), ('local_error', common.EXIT_LOCAL))
+                self.assertFalse(misc._client_alive(child, None))
+                self.assertFalse((root / 'starts').exists())
+                return
+        if masked:
+            self.until(lambda: (root / 'returned').exists(), proc)
+            self.until(lambda: (root / 'caller-interrupted').exists(), proc)
+            self.assertEqual((root / 'caller-interrupted').read_text(), '1')
+            self.assertEqual((root / 'mask-restored').read_text(), 'True')
+            self.assertEqual((root / 'returned').read_text(), '0')
+        else:
+            proc.communicate(timeout=5)
+            self.assertNotEqual(proc.returncode, 0)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.assertNotEqual(row['status'], 'local_error')
         self.until(lambda: (root / 'ttl').exists())
-        self.assertEqual(len((root / 'starts').read_text().splitlines()), 1)
+        self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
 
     def test_partial_payload_then_caller_sigkill_has_a_proven_dead_client(self):
         root = Path(self.tmp.name)

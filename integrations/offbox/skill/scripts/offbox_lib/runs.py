@@ -2558,6 +2558,13 @@ def _background(a, me: dict) -> int:
     client_log = rn.log_path.with_suffix('.client.log')
     ready_r = ready_w = accept_r = accept_w = None
     mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
+    interrupted = False
+    def defer_interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+    # Other caller threads can still receive SIGINT and schedule its Python handler on main.
+    # Defer that handler too, so caller interruption cannot reject a transferred worker.
+    old_sigint = signal.signal(signal.SIGINT, defer_interrupt)
     child = None
     try:
         ready_r, ready_w = os.pipe()
@@ -2617,7 +2624,10 @@ def _background(a, me: dict) -> int:
         if accept_w is not None:
             os.close(accept_w)
         # Deliver caller interruptions after handoff; they must not cancel the acknowledged detached worker.
+        signal.signal(signal.SIGINT, old_sigint)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if interrupted:
+            os.kill(os.getpid(), signal.SIGINT)
     print(rn.run_id, flush=True)
     say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
         f"client log: {client_log}")
