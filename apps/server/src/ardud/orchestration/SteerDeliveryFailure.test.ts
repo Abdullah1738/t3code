@@ -27,6 +27,7 @@ import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessions from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ProviderControl from "../../orchestration-v2/ProviderTurnControlService.ts";
@@ -79,7 +80,7 @@ const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
 );
 const testLayer = EventSink.layer.pipe(Layer.provideMerge(stores));
 
-const seed = Effect.fn("SteerDeliveryFailureTest.seed")(function* () {
+const seed = Effect.fn("SteerDeliveryFailureTest.seed")(function* (completion = false) {
   const sink = yield* EventSink.EventSinkV2;
   const base = { threadId, occurredAt: now };
   const events: OrchestrationV2DomainEvent[] = [
@@ -184,6 +185,15 @@ const seed = Effect.fn("SteerDeliveryFailureTest.seed")(function* () {
         nodeId,
         role: "user",
         text: "SECRET_SAVED_MESSAGE",
+        ...(completion
+          ? {
+              delegatedCompletion: {
+                parentRunId: runId,
+                generation: 1,
+                taskIds: [nodeId],
+              },
+            }
+          : {}),
         attachments: [],
         streaming: false,
         createdAt: now,
@@ -352,6 +362,58 @@ it.effect("does not report failure after the completed-turn fallback succeeds", 
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect.each([
+  { stage: "projection read", willRetry: false },
+  { stage: "projection read", willRetry: true },
+  { stage: "mailbox acknowledgement", willRetry: false },
+  { stage: "mailbox acknowledgement", willRetry: true },
+] as const)(
+  "does not report delivery failure after acceptance when $stage fails (retry=$willRetry)",
+  ({ stage, willRetry }) =>
+    Effect.gen(function* () {
+      yield* seed(true);
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const bookkeepingFailure = new Orchestrator.OrchestratorProjectionError({
+        threadId,
+        cause: "post-acceptance bookkeeping failed",
+      });
+      let accepted = 0;
+      let acknowledgements = 0;
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        const result = yield* executor.execute(effect, { willRetry }).pipe(Effect.result);
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) assert.strictEqual(result.failure.cause, bookkeepingFailure);
+      }).pipe(
+        Effect.provide(
+          executorLayer(
+            () =>
+              Effect.sync(() => {
+                accepted += 1;
+              }),
+            {
+              getThreadRecords: (id, fields, filter) =>
+                stage === "projection read"
+                  ? Effect.fail(bookkeepingFailure)
+                  : projections
+                      .getThreadRecords(id, fields, filter)
+                      .pipe(Effect.mapError(() => bookkeepingFailure)),
+              dispatch: (command) =>
+                Effect.suspend(() => {
+                  assert.equal(command.type, "notification.delivery.accept");
+                  acknowledgements += 1;
+                  return Effect.fail(bookkeepingFailure);
+                }),
+            },
+          ),
+        ),
+      );
+      assert.equal(accepted, 1);
+      assert.equal(acknowledgements, stage === "projection read" ? 0 : 1);
+      assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 0);
+    }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("bounds public notice copy even for an oversized message identity", () =>
   Effect.gen(function* () {
     yield* seed();
@@ -369,5 +431,39 @@ it.effect("bounds public notice copy even for an oversized message identity", ()
     assert.isBelow(notice.message.length, 300);
     assert.notInclude(notice.message, "\n");
     assert.include(notice.message, "was saved, but delivery to the provider failed.");
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("scopes provider acceptance to each execution of the steer effect", () =>
+  Effect.gen(function* () {
+    yield* seed();
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    let refuse = false;
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const execution = executor.execute(effect, { willRetry: false }).pipe(Effect.result);
+      assert.isTrue(Result.isFailure(yield* execution));
+      assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 0);
+      refuse = true;
+      const refusal = yield* execution;
+      assert.isTrue(Result.isFailure(refusal));
+      if (Result.isFailure(refusal)) assert.strictEqual(refusal.failure.cause, controlFailure);
+      assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 1);
+    }).pipe(
+      Effect.provide(
+        executorLayer(
+          () => Effect.suspend(() => (refuse ? Effect.fail(controlFailure) : Effect.void)),
+          {
+            getThreadRecords: () =>
+              Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: "post-acceptance read failed",
+                }),
+              ),
+          },
+        ),
+      ),
+    );
   }).pipe(Effect.provide(testLayer)),
 );

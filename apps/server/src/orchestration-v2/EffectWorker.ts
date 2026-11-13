@@ -113,7 +113,11 @@ export const layerExecutor: Layer.Layer<
         switch (effect.request.type) {
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
-            return continueRestartedRun({ threadId: effect.threadId, sourceRunId, queued: effect.request.queued }).pipe(
+            return continueRestartedRun({
+              threadId: effect.threadId,
+              sourceRunId,
+              queued: effect.request.queued,
+            }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
               Effect.tapError(() =>
@@ -242,135 +246,146 @@ export const layerExecutor: Layer.Layer<
                 ),
               );
           }
-          case "provider-turn.steer":
-            return providerTurnControl
-              .steer({
-                threadId: effect.threadId,
-                providerSessionId: effect.request.providerSessionId,
-                providerThreadId: effect.request.providerThreadId,
-                providerTurnId: effect.request.providerTurnId,
-                messageId: effect.request.messageId,
-              })
-              .pipe(
-                Effect.tap(() =>
-                  Effect.gen(function* () {
-                    if (effect.request.type !== "provider-turn.steer") return;
-                    const messageId = effect.request.messageId;
-                    const projection = yield* threads.getThreadRecords(
-                      effect.threadId,
-                      ["messages", "runs"],
-                      { messageIds: [effect.request.messageId] },
-                    );
-                    const message = projection.messages.find((row) => row.id === messageId);
-                    if (message?.delegatedCompletion === undefined) return;
-                    yield* threads.dispatch({
-                      type: "notification.delivery.accept",
-                      commandId: CommandId.make(`command:mailbox-accepted:${effect.id}`),
-                      threadId: effect.threadId,
-                      messageId: message.id,
-                    });
-                  }),
-                ),
-                Effect.catch((error) =>
-                  Effect.gen(function* () {
-                    if (
-                      !("turnCompleted" in error) ||
-                      !error.turnCompleted ||
-                      effect.request.type !== "provider-turn.steer"
-                    ) {
-                      return yield* error;
-                    }
-                    // Board-held workers may hear a live steer but must never be woken by it.
-                    if (effect.request.activeTurnOnly) return;
-                    const projection = yield* threads.getThreadRecords(
-                      effect.threadId,
-                      ["messages", "runs"],
-                      { messageIds: [effect.request.messageId] },
-                    );
-                    const messageId = effect.request.messageId;
-                    const message = projection.messages.find((item) => item.id === messageId);
-                    const run = projection.runs.find((item) => item.id === message?.runId);
-                    if (message === undefined || run === undefined) return yield* error;
-                    // Reuse the message identity and a stable command receipt so an outbox
-                    // retry cannot append a duplicate message or start a second follow-up.
-                    yield* threads
-                      .dispatch({
-                        type: "message.dispatch",
-                        commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
+          case "provider-turn.steer": {
+            const request = effect.request;
+            return Effect.suspend(() => {
+              let providerAccepted = false;
+              return providerTurnControl
+                .steer({
+                  threadId: effect.threadId,
+                  providerSessionId: request.providerSessionId,
+                  providerThreadId: request.providerThreadId,
+                  providerTurnId: request.providerTurnId,
+                  messageId: request.messageId,
+                })
+                .pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      providerAccepted = true;
+                    }),
+                  ),
+                  Effect.tap(() =>
+                    Effect.gen(function* () {
+                      if (effect.request.type !== "provider-turn.steer") return;
+                      const messageId = effect.request.messageId;
+                      const projection = yield* threads.getThreadRecords(
+                        effect.threadId,
+                        ["messages", "runs"],
+                        { messageIds: [effect.request.messageId] },
+                      );
+                      const message = projection.messages.find((row) => row.id === messageId);
+                      if (message?.delegatedCompletion === undefined) return;
+                      yield* threads.dispatch({
+                        type: "notification.delivery.accept",
+                        commandId: CommandId.make(`command:mailbox-accepted:${effect.id}`),
                         threadId: effect.threadId,
                         messageId: message.id,
-                        text: message.text,
-                        ...(message.context ? { context: message.context } : {}),
-                        attachments: message.attachments,
-                        ...(message.delegatedCompletion === undefined
-                          ? {}
-                          : { modelSelection: run.modelSelection }),
-                        dispatchMode: {
-                          type:
-                            message.delegatedCompletion === undefined
-                              ? "start_immediately"
-                              : "queue_after_active",
-                        },
-                        createdBy: message.createdBy,
-                        creationSource: message.creationSource,
-                        ...(message.delegatedCompletion === undefined
-                          ? {}
-                          : { delegatedCompletion: message.delegatedCompletion }),
-                        ...(message.notification === undefined
-                          ? {}
-                          : { notification: message.notification }),
-                        ...(message.scheduledTaskId === undefined
-                          ? {}
-                          : { scheduledTaskId: message.scheduledTaskId }),
-                        ...(message.senderThreadId === undefined
-                          ? {}
-                          : { senderThreadId: message.senderThreadId }),
-                      })
-                      .pipe(
-                        // The turn that just completed leaves no further retry
-                        // target once the instance is off: the completed turn
-                        // stands as the thread's result instead of going
-                        // through the outbox's bounded retry on a refusal that
-                        // retrying cannot change.
-                        Effect.catchTags({
-                          ThreadManagementProviderInstanceDisabledError: (disabledError) =>
-                            Effect.logInfo(
-                              "orchestration-v2.effect-worker.steer-follow-up-disabled",
-                              {
-                                threadId: effect.threadId,
-                                messageId: message.id,
-                                projectId: disabledError.projectId,
-                                instanceId: disabledError.instanceId,
-                              },
-                            ),
-                        }),
+                      });
+                    }),
+                  ),
+                  Effect.catch((error) =>
+                    Effect.gen(function* () {
+                      if (
+                        !("turnCompleted" in error) ||
+                        !error.turnCompleted ||
+                        effect.request.type !== "provider-turn.steer"
+                      ) {
+                        return yield* error;
+                      }
+                      // Board-held workers may hear a live steer but must never be woken by it.
+                      if (effect.request.activeTurnOnly) return;
+                      const projection = yield* threads.getThreadRecords(
+                        effect.threadId,
+                        ["messages", "runs"],
+                        { messageIds: [effect.request.messageId] },
                       );
-                  }),
-                ),
-                Effect.tapError(() =>
-                  willRetry
-                    ? Effect.void
-                    : SteerDeliveryFailure.persist(effect).pipe(
-                        Effect.provideService(EventSink.EventSinkV2, eventSink),
-                        Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
-                        Effect.retry({ times: 2 }),
-                        Effect.catchCause(() =>
-                          Effect.logWarning(
-                            "orchestration-v2.effect-worker.steer-delivery-notice-failed",
-                            { effectId: effect.id, threadId: effect.threadId },
+                      const messageId = effect.request.messageId;
+                      const message = projection.messages.find((item) => item.id === messageId);
+                      const run = projection.runs.find((item) => item.id === message?.runId);
+                      if (message === undefined || run === undefined) return yield* error;
+                      // Reuse the message identity and a stable command receipt so an outbox
+                      // retry cannot append a duplicate message or start a second follow-up.
+                      yield* threads
+                        .dispatch({
+                          type: "message.dispatch",
+                          commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
+                          threadId: effect.threadId,
+                          messageId: message.id,
+                          text: message.text,
+                          ...(message.context ? { context: message.context } : {}),
+                          attachments: message.attachments,
+                          ...(message.delegatedCompletion === undefined
+                            ? {}
+                            : { modelSelection: run.modelSelection }),
+                          dispatchMode: {
+                            type:
+                              message.delegatedCompletion === undefined
+                                ? "start_immediately"
+                                : "queue_after_active",
+                          },
+                          createdBy: message.createdBy,
+                          creationSource: message.creationSource,
+                          ...(message.delegatedCompletion === undefined
+                            ? {}
+                            : { delegatedCompletion: message.delegatedCompletion }),
+                          ...(message.notification === undefined
+                            ? {}
+                            : { notification: message.notification }),
+                          ...(message.scheduledTaskId === undefined
+                            ? {}
+                            : { scheduledTaskId: message.scheduledTaskId }),
+                          ...(message.senderThreadId === undefined
+                            ? {}
+                            : { senderThreadId: message.senderThreadId }),
+                        })
+                        .pipe(
+                          // The turn that just completed leaves no further retry
+                          // target once the instance is off: the completed turn
+                          // stands as the thread's result instead of going
+                          // through the outbox's bounded retry on a refusal that
+                          // retrying cannot change.
+                          Effect.catchTags({
+                            ThreadManagementProviderInstanceDisabledError: (disabledError) =>
+                              Effect.logInfo(
+                                "orchestration-v2.effect-worker.steer-follow-up-disabled",
+                                {
+                                  threadId: effect.threadId,
+                                  messageId: message.id,
+                                  projectId: disabledError.projectId,
+                                  instanceId: disabledError.instanceId,
+                                },
+                              ),
+                          }),
+                        );
+                    }),
+                  ),
+                  Effect.tapError(() =>
+                    // Mailbox bookkeeping can fail after the provider accepted the input.
+                    willRetry || providerAccepted
+                      ? Effect.void
+                      : SteerDeliveryFailure.persist(effect).pipe(
+                          Effect.provideService(EventSink.EventSinkV2, eventSink),
+                          Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+                          Effect.retry({ times: 2 }),
+                          Effect.catchCause(() =>
+                            Effect.logWarning(
+                              "orchestration-v2.effect-worker.steer-delivery-notice-failed",
+                              { effectId: effect.id, threadId: effect.threadId },
+                            ),
                           ),
                         ),
-                      ),
-                ),
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationEffectExecutionError({
-                      effectId: effect.id,
-                      effectType: effect.request.type,
-                      cause,
-                    }),
-                ),
-              );
+                  ),
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationEffectExecutionError({
+                        effectId: effect.id,
+                        effectType: effect.request.type,
+                        cause,
+                      }),
+                  ),
+                );
+            });
+          }
           case "provider-turn.restart":
             return providerTurnControl
               .interruptAndAwaitTerminal({
