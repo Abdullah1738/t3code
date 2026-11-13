@@ -5139,3 +5139,132 @@ it.effect("tool results respect disabled board guesses after create and edit", (
     assert.deepStrictEqual(edited.structured.gated, []);
   }).pipe(Effect.provide(layer));
 });
+
+const clearGateCallerCases = [
+  { label: "worker child", role: "work", shape: "plain", state: "healthy", linked: false },
+  { label: "worker grandchild", role: "work", shape: "nested", state: "healthy", linked: false },
+  { label: "native task child", role: "work", shape: "task", state: "healthy", linked: false },
+  { label: "reviewer child", role: "review", shape: "plain", state: "healthy", linked: false },
+  { label: "evaluator child", role: "evaluator", shape: "plain", state: "healthy", linked: false },
+  {
+    label: "outside orchestrator child",
+    role: null,
+    shape: "plain",
+    state: "healthy",
+    linked: false,
+  },
+  { label: "linked evaluator child", role: "work", shape: "plain", state: "healthy", linked: true },
+  { label: "missing parent", role: "work", shape: "plain", state: "missing", linked: false },
+  { label: "deleted parent", role: "work", shape: "plain", state: "deleted", linked: false },
+  { label: "unreadable parent", role: "work", shape: "plain", state: "unreadable", linked: false },
+  { label: "self cycle", role: "work", shape: "plain", state: "self-cycle", linked: false },
+  { label: "parent cycle", role: "work", shape: "plain", state: "parent-cycle", linked: false },
+] as const;
+
+it.effect.each(clearGateCallerCases)("clearGate caller ancestry: $label", (row) => {
+  const { layer, parents, missing, deleted, unreadable } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "clear-ancestry",
+      name: "Clear ancestry",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const work = yield* kanban.createCard(
+      board.id,
+      { title: "Parent work", prompt: "Work" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+    assert.isNotNull(worker);
+    const store = yield* KanbanStore.KanbanStore;
+    const link = yield* kanban.caller(worker);
+    assert.isNotNull(link);
+    const parent = row.role === null ? ThreadId.make("outside-root") : worker;
+    if (row.role !== null) yield* store.putThreadLink({ ...link!, role: row.role });
+    const child = ThreadId.make(
+      row.shape === "task" ? "thread:delegated-task:command%3Amcp%3Aclear-gate" : "gate-child",
+    );
+    parents.set(child, parent);
+    if (row.shape === "nested") {
+      const middle = ThreadId.make("gate-middle");
+      parents.set(child, middle);
+      parents.set(middle, parent);
+    }
+    if (row.linked) yield* store.putThreadLink({ ...link!, threadId: child, role: "evaluator" });
+    if (row.state === "missing") missing.add(parent);
+    if (row.state === "deleted") deleted.add(parent);
+    if (row.state === "unreadable") unreadable.add(parent);
+    if (row.state === "self-cycle") parents.set(child, child);
+    if (row.state === "parent-cycle") parents.set(parent, child);
+    for (const [gate, text] of [
+      ["deploy", "Restart Robob now"],
+      ["money", "Pay the invoice"],
+      ["secret", "Share the token"],
+    ] as const) {
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: `Guessed ${gate}`,
+          prompt: `Gate ${gate}`,
+          subtasks: [{ text, owner: "evaluator" }],
+        },
+        owner,
+      );
+      assert.strictEqual(card.subtasks[0]!.gate, gate);
+      const before = yield* kanban.card(card.id);
+      const refused = yield* call(child, "card_edit", {
+        card: card.id,
+        subtasks: [{ id: "s1", clearGate: "This gate was guessed incorrectly" }],
+      });
+      assert.isTrue(refused.isError, refused.text);
+      assert.match(
+        refused.text,
+        /only the board evaluator|Cannot verify the calling thread's ancestry/,
+      );
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["outside orchestrator", "board evaluator"] as const)(
+  "clearGate caller ancestry allows a top-level %s",
+  (role) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "clear-root",
+        name: "Clear root",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const root =
+        role === "board evaluator"
+          ? yield* kanban.startEvaluator(board.id, { kind: "request", text: "Review the gate" })
+          : ThreadId.make("outside-root");
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Top-level clear",
+          prompt: "Work",
+          subtasks: [{ text: "Pay the invoice", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const cleared = yield* call(root, "card_edit", {
+        card: card.id,
+        subtasks: [{ id: "s1", clearGate: "This is only a test invoice fixture" }],
+      });
+      assert.isFalse(cleared.isError, cleared.text);
+      const saved = (yield* kanban.card(card.id)).card;
+      assert.isUndefined(saved.subtasks[0]!.gate);
+      assert.deepStrictEqual(saved.subtasks[0]!.gateCleared?.by, {
+        _tag: "evaluator",
+        threadId: root,
+      });
+      assert.lengthOf(saved.asks, 1);
+    }).pipe(Effect.provide(layer));
+  },
+);

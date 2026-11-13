@@ -1058,6 +1058,12 @@ const handlers = {
   card_edit: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if (
+          input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
+          (yield* ancestorThreadIds(caller)).length > 0
+        ) {
+          return yield* refuse("only the board evaluator can clear a guessed gate");
+        }
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
         const model = input.model ? yield* modelOf(input.model, false) : undefined;
