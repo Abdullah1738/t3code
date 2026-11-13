@@ -11,18 +11,21 @@ const day = () => new Date().toISOString().slice(0, 10);
 const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-test("format is private and allowlisted", async () => {
+test("watcher and Telegram loggers share the same private, allowlisted format", async () => {
   const dir = fixture();
-  const secret = "private subject OTP 123456 password=abcdef card 4111111111111111";
+  const secret = "private subject OTP 123456 password=abcdef card 4111111111111111 /Users/private/message.txt";
   const entry = { component: "runner", kind: "perf" as const, name: "watch.run", durationMs: 2, ok: true,
-    ids: { watcher: "fixture", key: secret, password: secret },
-    props: { outcome: "fire", exitCode: 0, subject: secret, health: 88, source: secret, severity: "info" },
+    ids: { watcher: "fixture", key: secret, password: secret, path: secret },
+    props: { outcome: "fire", exitCode: 0, subject: secret, health: 88, source: secret, severity: "info", path: secret, message: secret },
     error: { tag: "fixture.failure", message: secret } };
   toolLog(entry);
+  const copy = await import("../../robob-watch/src/toollog.ts");
+  copy.toolLog(entry);
   const all = rows(dir);
-  expect(all).toHaveLength(1);
+  expect(all).toHaveLength(2);
+  expect(all[1]).toEqual({ ...all[0], ts: all[1].ts });
   for (const row of all) {
-    expect(row).toMatchObject({ tool: "watchers", component: "runner", kind: "perf", name: "watch.run", ok: true, durationMs: 2, ids: { watcher: "fixture" }, props: { outcome: "fire", exitCode: 0, severity: "info" }, error: { tag: "fixture.failure", message: "fixture.failure" } });
+    expect(row).toEqual({ ts: expect.any(String), tool: "watchers", component: "runner", kind: "perf", name: "watch.run", ok: true, durationMs: 2, ids: { watcher: "fixture", key: expect.stringMatching(/^[a-f0-9]{24}$/) }, props: { outcome: "fire", exitCode: 0, severity: "info" }, error: { tag: "fixture.failure", message: "fixture.failure" } });
     expect(row.ts).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     expect(JSON.stringify(row)).not.toContain(secret);
     expect(row.ids.password).toBeUndefined();
@@ -49,13 +52,16 @@ test("retention runs on first write and the shared cap keeps errors once event/p
   expect(readdirSync(dir)).toContain("unrelated.txt");
   const file = join(dir, `${day()}.ndjson`), cap = 50 * 1024 * 1024 + 1;
   truncateSync(file, cap);
+  const copy = await import("../../robob-watch/src/toollog.ts");
   toolLog({ component: "runner", kind: "event", name: "dropped.event" });
-  toolLog({ component: "wakes", kind: "perf", name: "dropped.perf" });
+  copy.toolLog({ component: "wakes", kind: "perf", name: "dropped.perf" });
   toolLog({ component: "runner", kind: "error", name: "retained.error", ok: false, error: { tag: "fixture.failure" } });
+  copy.toolLog({ component: "runner", kind: "error", name: "retained.copy_error", ok: false, error: { tag: "fixture.failure" } });
   const tail = readFileSync(file).subarray(cap).toString();
   expect(tail.match(/"name":"log.cap"/g)).toHaveLength(1);
   if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + tail.trim().split("\n")[0]);
   expect(tail).toContain('"name":"retained.error"'); expect(tail).not.toContain("dropped.");
+  expect(tail).toContain('"name":"retained.copy_error"');
 });
 
 test("rollup counts fixture names/kinds, rates, percentiles and top error tags, skipping malformed lines", async () => {
