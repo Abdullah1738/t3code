@@ -74,15 +74,39 @@ def collect():
             db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)', ('phone', now, 0, type(e).__name__))
 
 
+def journal_errors(db):
+    health = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
+    if not health or time.time() - health['checked'] > 90:
+        return ['notification_collector_stale']
+    if not health['ok']:
+        return ['notifications_' + health['detail']]
+    return []
+
+
+def rows(app, since, until):
+    path = ROOT / 'delivery.sqlite'
+    if not path.exists():
+        return [], ['notification_collector_stale']
+    try:
+        db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            errors = journal_errors(db)
+            found = db.execute('SELECT posted, detected, text FROM pushes '
+                               'WHERE app=? AND posted>=? AND posted<=? ORDER BY posted',
+                               (app, since, until))
+            return [dict(row) for row in found], errors
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        return [], ['notifications_' + type(exc).__name__]
+
+
 def evidence(cfg, classifier, single=False):
     placed = dt.datetime.fromisoformat(cfg['placed_at'].replace('Z', '+00:00')).timestamp()
     out, errors = [], []
     with connect() as db:
-        health = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
-        if not health or time.time() - health['checked'] > 90:
-            errors.append('notification_collector_stale')
-        elif not health['ok']:
-            errors.append('notifications_' + health['detail'])
+        errors.extend(journal_errors(db))
         for row in db.execute('SELECT * FROM pushes WHERE app=? AND posted>=? ORDER BY posted', (cfg['app'], placed)):
             exact = cfg['order'] in json.loads(row['ids'])
             stage = classifier(row['text'])

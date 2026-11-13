@@ -4,6 +4,7 @@ import time
 import unittest
 import json
 import io
+import tempfile
 from contextlib import redirect_stdout
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -782,6 +783,207 @@ class RetireTest(unittest.TestCase):
         self.assertIs(cfg['active'], False)
         self.assertIs(write.call_args.args[1], cfg)
         self.assertEqual(output.getvalue().strip(), f'Removed {self.wid}')
+
+
+class CareemLiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        for obj, name, value in ((t, 'ROOT', root), (t.store, 'ROOT', root),
+                                 (t, 'WATCHERS', root / 'watchers')):
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(t, 'mail_evidence', return_value=([], ['email_account_unavailable:fixture']))
+        p.start()
+        self.addCleanup(p.stop)
+        from native_orders import OrderError
+        p = mock.patch('native_orders.track', side_effect=OrderError('account_capture_required_guest_catalog_only'))
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg = {'app': 'careem', 'order': '177487014', 'for': 'owner',
+                    'placed_at': '2026-11-11T14:48:48+04:00',
+                    'registered_at': '2026-11-11T14:48:48+04:00',
+                    'eta': '2026-11-11T15:15:00+04:00',
+                    'label': 'Starbucks - JLT Drive Thru: Iced Shaken White Mocha',
+                    'vertical': 'food', 'single_active_order': True,
+                    'watcher': 'order-careem-177487014', 'active': True}
+        self.food = json.loads((Path(__file__).parent / 'fixture_careem_food_pushes.json').read_text())
+        self.register(self.cfg)
+
+    def register(self, cfg):
+        t.write(t.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
+        t.write(t.WATCHERS / cfg['watcher'] / 'watcher.json', {'enabled': True})
+
+    def load(self, rows, healthy=True):
+        with t.store.connect() as db:
+            db.execute('DELETE FROM pushes')
+            for i, row in enumerate(rows):
+                db.execute('INSERT INTO pushes VALUES (?,?,?,?,?,?)',
+                           (str(i), 'careem', row['posted'], row['detected'], row['text'],
+                            json.dumps(row.get('ids', []))))
+            db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)',
+                       ('phone', time.time() if healthy else time.time() - 600, 1, 'ok'))
+
+    def quik(self):
+        cfg = dict(self.cfg, vertical='quik', label='Careem Quik: Groceries',
+                   placed_at='2026-10-14T17:06:30+04:00', registered_at='2026-10-14T17:06:30+04:00',
+                   eta='2026-10-14T17:20:00+04:00')
+        literals = [
+            ('17:03:54', "Time for a restock! 🗓️ Your kitchen isn't complete without Apple Cinnamon Protein Porridge. Order on Quik to stay on track! ✅", 'unknown'),
+            ('17:06:37', 'Great picks! Your order is confirmed, and our team will have it ready ultra-fast ⚡', 'placed'),
+            ('17:06:38', 'Careem Quik 17:15-17:20', 'preparing'),
+            ('17:08:42', 'Your order’s on its way! Your captain has picked up your order and is on the way  🚗', 'picked up'),
+            ('17:08:42', 'Careem Quik 10 minutes', 'out for delivery'),
+            ('17:09:18', 'Careem Quik 6 minutes', 'out for delivery'),
+            ('17:11:19', 'Careem Quik 5 minutes', 'out for delivery'),
+            ('17:11:59', 'Careem Quik 4 minutes', 'out for delivery'),
+            ('17:13:19', 'Careem Quik 3 minutes', 'out for delivery'),
+            ('17:13:59', 'Careem Quik 2 minutes', 'out for delivery'),
+            ('17:14:39', 'Careem Quik 1 minute', 'nearby'),
+            ('17:14:46', "Your order's nearby Get ready to collect it from your Captain 🛍️", 'nearby'),
+            ('17:17:18', 'Careem Quik Delivered in 10 minutes', 'delivered'),
+            ('17:17:18', "Thank you for your order 💚 We hope you're pleased with it and can't wait to deliver your next order!", 'delivered'),
+        ]
+        rows = [{'posted': t.epoch('2026-10-14T' + at + '+04:00'),
+                 'detected': t.epoch('2026-10-14T' + at + '+04:00') + 1,
+                 'text': text, 'stage': stage} for at, text, stage in literals]
+        return cfg, rows
+
+    def test_every_live_text(self):
+        stages = ['preparing'] + ['out for delivery'] * 6 + ['unknown', 'nearby', 'nearby']
+        for row, expected in zip(self.food, stages, strict=True):
+            with self.subTest(text=row['text']):
+                self.assertEqual(t.careem_live_stage(row['text'], 'Starbucks - JLT Drive Thru')[0], expected)
+        _, rows = self.quik()
+        for row in rows:
+            with self.subTest(text=row['text']):
+                self.assertEqual(t.careem_live_stage(row['text'], 'Careem Quik')[0], row['stage'])
+
+    def test_foreign_merchant_and_box_wording_never_count(self):
+        for text in ('Burger King 5 minutes', 'Burger King Arrives 15:05-15:15',
+                     'Burger King Delivered in 10 minutes', 'Burger King Your order is confirmed',
+                     'Burger King Your order is cancelled', "Burger King Your order's nearby",
+                     'Careem Quik 5 minutes', 'Package will be delivered in 5 minutes Captain driving to Home',
+                     'Order delivered! Delivered at 15:00'):
+            with self.subTest(text=text):
+                self.assertEqual(t.careem_live_stage(text, 'Starbucks - JLT Drive Thru'), ('unknown', None))
+
+    def test_only_matching_order_updates_can_clear_tracking_failure(self):
+        at = t.epoch('2026-11-11T15:05:00+04:00')
+        for text in ('Burger King 5 minutes', 'Burger King Your order is cancelled',
+                     'Your Plus perks don\'t stop at food', '1 minute',
+                     'Arrives 15:05-15:15', 'Delivered in 10 minutes'):
+            with self.subTest(text=text):
+                self.load([{'posted': at - 10, 'detected': at - 9, 'text': text}])
+                result = t.fetch(self.cfg, {}, at)
+                self.assertEqual(result['status'], 'unknown')
+                self.assertNotIn('live_source_ok', result)
+                self.assertEqual(result['evidence'], [])
+                self.assertEqual(result['eta_source'], 'checkout_supplied')
+
+    def test_matching_cancellation_and_problem_are_preserved(self):
+        for text, expected in [('Starbucks - JLT Drive Thru Your order is cancelled', 'cancelled'),
+                               ('Your order is canceled', 'cancelled'),
+                               ('Starbucks - JLT Drive Thru Delivery failed', 'problem'),
+                               ('Your order is delayed', 'problem')]:
+            with self.subTest(text=text):
+                self.assertEqual(t.careem_live_stage(text, 'Starbucks - JLT Drive Thru'), (expected, None))
+
+    def test_food_fixture_stages_and_eta(self):
+        self.load(self.food)
+        for at, stage, eta in [('14:50:00', 'preparing', '15:15:00'),
+                               ('14:56:00', 'out for delivery', None),
+                               ('15:01:00', 'nearby', None),
+                               ('15:05:00', 'nearby', '15:05:50.587000')]:
+            with self.subTest(at=at):
+                result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T' + at + '+04:00'))
+                self.assertEqual(result['status'], stage)
+                self.assertTrue(result['live_source_ok'])
+                self.assertEqual(result['eta_source'], 'careem_notification')
+                self.assertEqual(result['evidence'][0]['confidence'], 'careem_single_active')
+                self.assertNotIn('candidate', result)
+                if eta:
+                    self.assertAlmostEqual(t.epoch(result['eta']), t.epoch('2026-11-11T' + eta + '+04:00'), places=2)
+
+    def test_quik_lifecycle_and_terminal_retirement(self):
+        cfg, rows = self.quik()
+        self.load(rows)
+        at = t.epoch('2026-10-14T17:18:00+04:00')
+        result = t.fetch(cfg, {}, at)
+        self.assertEqual(result['status'], 'delivered')
+        self.assertNotEqual(result['eta_source'], 'careem_notification')
+        state = {'primed': True, 'status': 'nearby'}
+        events = t.transition(result, state, cfg, at)
+        self.assertEqual(state['terminal_at'], at)
+        self.assertIn({'kind': 'stage_change', 'status': 'delivered'}, events)
+        # Both terminal forms independently close the order.
+        for row in rows[-2:]:
+            self.load([row])
+            self.assertEqual(t.fetch(cfg, {}, at)['status'], 'delivered')
+
+    def test_second_active_careem_order_including_box_uses_candidates(self):
+        cfg, rows = self.quik()
+        self.load(rows)
+        for vertical in ('food', 'quik', 'box'):
+            other = dict(cfg, order='other', watcher='order-careem-other', vertical=vertical)
+            self.register(other)
+            self.assertFalse(t.single_allowed(cfg))
+            result = t.fetch(cfg, {}, t.epoch('2026-10-14T17:18:00+04:00'))
+            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(result['candidate']['confidence'], 'app_unassigned_unconfirmed')
+            self.assertNotIn('live_source_ok', result)
+
+    def test_non_single_and_box_keep_existing_evidence_path(self):
+        at = t.epoch('2026-11-11T15:05:00+04:00')
+        for cfg in (dict(self.cfg, single_active_order=False), dict(self.cfg, vertical='box')):
+            with mock.patch.object(t.store, 'evidence', return_value=([], [])) as evidence, \
+                    mock.patch.object(t.store, 'rows') as rows:
+                result = t.fetch(cfg, {}, at)
+                evidence.assert_called_once_with(cfg, t.classify, cfg['single_active_order'])
+                rows.assert_not_called()
+                self.assertEqual(result['status'], 'unknown')
+
+    def test_rows_outside_order_window_cannot_advance_or_close(self):
+        placed = t.epoch(self.cfg['placed_at'])
+        for text in ('Starbucks - JLT Drive Thru Delivered in 10 minutes',
+                     "Thank you for your order, can't wait to deliver your next order!",
+                     'Your order is confirmed', 'Starbucks - JLT Drive Thru 5 minutes',
+                     'Your order is cancelled'):
+            for posted in (placed - 1, t.epoch(self.cfg['eta']) + 3601):
+                with self.subTest(text=text, posted=posted):
+                    self.load([{'posted': posted, 'detected': posted + 1, 'text': text}])
+                    evidence, eta, errors = t.careem_live_evidence(self.cfg, placed + 5 * 3600)
+                    self.assertEqual((evidence, eta, errors), ([], None, []))
+
+    def test_late_preparing_does_not_regress_countdown_stage(self):
+        rows = self.food[:2] + [dict(self.food[0], posted=self.food[1]['posted'] + 1)]
+        self.load(rows)
+        result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T15:05:00+04:00'))
+        self.assertEqual(result['status'], 'out for delivery')
+        self.assertEqual(t.epoch(result['eta']), t.epoch(self.cfg['eta']))
+
+    def test_eta_only_changes_do_not_wake(self):
+        cfg, rows = self.quik()
+        state = {'primed': True, 'status': 'out for delivery'}
+        etas = []
+        for row in rows[4:10]:
+            self.load([row])
+            at = row['posted'] + 2
+            result = t.fetch(cfg, {}, at)
+            self.assertEqual(t.transition(result, state, cfg, at), [])
+            etas.append(result['eta'])
+            self.assertEqual(state['known_eta'], result['eta'])
+        self.assertGreater(len(set(etas)), 1)
+        self.assertEqual(state['tracking_problem_streak'], 0)
+
+    def test_stale_journal_preserves_evidence_but_not_live_health(self):
+        self.load(self.food, healthy=False)
+        result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T15:05:00+04:00'))
+        self.assertEqual(result['status'], 'nearby')
+        self.assertNotIn('live_source_ok', result)
+        self.assertIn('notification_collector_stale', result['errors'])
 
 
 if __name__ == '__main__':
