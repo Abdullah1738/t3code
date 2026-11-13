@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 /**
  * Sendblue implementation of the provider-neutral Line interface. Wire shapes
  * are read defensively (unknown + narrowing) because Sendblue's responses carry
@@ -218,15 +219,15 @@ export class Sendblue implements Line {
     let response: Response;
     try {
       response = await this.#fetch(url, { method, headers, body, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    } catch (error) {
+    } catch (error) { toolError("sendblue", "sendblue.catch1");
       throw new LineError(`Sendblue ${method} ${path} failed: ${describe(error)}`, "network", true, send);
     }
 
-    const text = await response.text().catch(() => "");
+    const text = await response.text().catch(() => { toolError("sendblue", "sendblue.catch2"); return ""; });
     let parsed: unknown;
     try {
       parsed = text ? JSON.parse(text) : undefined;
-    } catch {
+    } catch { toolError("sendblue", "sendblue.catch3");
       parsed = undefined;
     }
     if (response.status === 404 && options.allow404) return undefined;
@@ -267,7 +268,7 @@ export class Sendblue implements Line {
           const event = this.#toEvent(frame, seen);
           if (event) yield event;
         }
-      } catch {
+      } catch { toolError("sendblue", "sendblue.catch4");
         // Stream errors and stall aborts both end in a reconnect below; only the caller's signal stops the loop.
       } finally {
         clearTimeout(stall);
@@ -283,7 +284,7 @@ export class Sendblue implements Line {
     let envelope: unknown;
     try {
       envelope = JSON.parse(frame.data);
-    } catch {
+    } catch { toolError("sendblue", "sendblue.catch5");
       return undefined;
     }
     if (!isObject(envelope)) return undefined;
@@ -414,7 +415,12 @@ export class Sendblue implements Line {
   }
 
   async react(handle: string, reaction: string): Promise<void> {
-    await this.#call("POST", "/api/send-reaction", { json: { from_number: this.number, message_handle: handle, reaction }, send: true });
+    const at = performance.now();
+    let ok = false;
+    try {
+      await this.#call("POST", "/api/send-reaction", { json: { from_number: this.number, message_handle: handle, reaction }, send: true });
+      ok = true;
+    } finally { toolLog.capture(() => toolLog.write({ component: "sendblue", kind: "perf", name: "reaction.sent", ok, durationMs: performance.now() - at, ids: { messageId: handle } })); }
   }
 
   async typing(chat: ChatKey, options: TypingOptions = {}): Promise<void> {
@@ -428,7 +434,7 @@ export class Sendblue implements Line {
     };
     try {
       await this.#call("POST", "/api/send-typing-indicator", { json });
-    } catch (error) {
+    } catch (error) { toolError("sendblue", "sendblue.catch6");
       // Workers without typing-v2 firmware 503 on state/duration; the legacy start always works.
       if (!v2 || options.state === "stop" || !(error instanceof LineError) || !error.code.startsWith("http_503")) throw error;
       await this.#call("POST", "/api/send-typing-indicator", { json: base });
@@ -480,7 +486,7 @@ export class Sendblue implements Line {
       let response: Response;
       try {
         response = await this.#fetch(url, { signal: controller.signal });
-      } catch (error) {
+      } catch (error) { toolError("sendblue", "sendblue.catch7");
         throw new LineError(`download failed: ${describe(error)}`, "download_failed", true, false);
       }
       if (!response.ok) throw new LineError(`download returned ${response.status}`, `http_${response.status}`, response.status === 429 || response.status >= 500, false);
@@ -504,7 +510,7 @@ export class Sendblue implements Line {
           }
           chunks.push(value);
         }
-      } catch (error) {
+      } catch (error) { toolError("sendblue", "sendblue.catch8");
         if (error instanceof LineError) throw error;
         throw new LineError(`download aborted: ${describe(error)}`, "download_failed", true, false);
       }
@@ -530,7 +536,7 @@ export class Sendblue implements Line {
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
-  } catch {
+  } catch { toolError("sendblue", "sendblue.catch9");
     return value;
   }
 }

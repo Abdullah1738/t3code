@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
 // telegram-bridge carries its own variant of this file, since each package is
@@ -153,6 +154,9 @@ export class ControlClient {
   }
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+    const loggingAt = performance.now();
+    let loggingOk = false;
+    try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
@@ -171,17 +175,25 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch { toolError("control", "control.catch1");
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch { /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch { toolError("control", "control.catch2"); /* Non-JSON bodies only come from proxies or crashes. */ }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
+    loggingOk = true;
     return data as T;
+    } finally {
+      toolLog.capture(() => {
+      const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+      toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
+        ok: loggingOk, props: { method, route } }));
+      });
+    }
   }
 
   thread(threadId: string): Promise<{ thread: ThreadDetail }> {
@@ -241,10 +253,10 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch { toolError("control", "control.catch3");
       throw new ControlError(0, "upload_failed");
     }
-    await response.body?.cancel().catch(() => {});
+    await response.body?.cancel().catch(() => { toolError("control", "control.catch4");});
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -269,11 +281,11 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch { toolError("control", "control.catch5");
       throw new ControlError(0);
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("control", "control.catch6");});
       throw new ControlError(response.status);
     }
     yield* parseSse(response.body, options.signal);
@@ -299,7 +311,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
         if (line === "") {
           if (data.length) {
             let parsed: unknown;
-            try { parsed = JSON.parse(data.join("\n")); } catch { parsed = undefined; }
+            try { parsed = JSON.parse(data.join("\n")); } catch { toolError("control", "control.catch7"); parsed = undefined; }
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
               yield { ...frame, data: parsed as Record<string, unknown> };
             }
@@ -319,7 +331,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => { toolError("control", "control.catch8");});
     reader.releaseLock();
   }
 }

@@ -1876,3 +1876,20 @@ print(json.dumps(res))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderLogTest(unittest.TestCase):
+    def test_render_success_failure_and_logger_failure_do_not_change_result(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ride_log_test', CARD)
+        rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rc)
+        for ok in (True, False):
+            with unittest.mock.patch.object(rc, '_render_preview', return_value=ok), unittest.mock.patch.object(rc, 'log_render') as log:
+                self.assertEqual(rc.render_preview({}, None), ok)
+                self.assertEqual(log.call_args.args[1], ok)
+        with unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+            rc.log_render(time.monotonic(), False)
+            self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'ride'])
+        with unittest.mock.patch.object(rc.subprocess, 'Popen', side_effect=OSError('unavailable')):
+            rc.log_render(time.monotonic(), True)

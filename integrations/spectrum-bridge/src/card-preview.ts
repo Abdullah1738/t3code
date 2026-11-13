@@ -1,3 +1,4 @@
+import { cardKind, toolError, toolLog } from "./toollog.ts";
 /**
  * Sendblue fetches a static card's image outside the tailnet. Read it here and use the existing
  * media upload, so the page can stay private and the provider never receives an unreachable image URL.
@@ -26,7 +27,7 @@ async function boundedBody(response: Response, limit: number): Promise<Uint8Arra
     }
     return size ? new Uint8Array(Buffer.concat(chunks)) : undefined;
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => { toolError("card-preview", "card-preview.catch1");});
     reader.releaseLock();
   }
 }
@@ -35,7 +36,7 @@ function httpsUrl(value: string, base?: string): URL | undefined {
   try {
     const url = new URL(value, base);
     return url.protocol === "https:" && !url.username && !url.password && url.href.length <= 2048 ? url : undefined;
-  } catch {
+  } catch { toolError("card-preview", "card-preview.catch2");
     return undefined;
   }
 }
@@ -54,6 +55,9 @@ export function ogImageOf(html: string, pageUrl: string): string | undefined {
 
 export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fetchFn: typeof fetch = fetch) {
   return async (pageUrl: string): Promise<string | undefined> => {
+    const at = performance.now();
+    let ok = false;
+    try {
     if (!httpsUrl(pageUrl)) throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     try {
       const page = await fetchFn(pageUrl, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS) });
@@ -64,7 +68,7 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
       const html = await boundedBody(page, MAX_HTML);
       if (!html) throw new Error("invalid preview page");
       const image = ogImageOf(new TextDecoder().decode(html), page.url || pageUrl);
-      if (!image) return undefined;
+      if (!image) { ok = true; return undefined; }
       const response = await fetchFn(image, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
       const mimeType = (response.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase();
       const extension = Object.hasOwn(IMAGE_EXTENSIONS, mimeType) ? IMAGE_EXTENSIONS[mimeType] : undefined;
@@ -74,9 +78,11 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
       const uploaded = await upload({ data, name: `preview.${extension}`, mimeType });
       const result = httpsUrl(uploaded);
       if (!result) throw new Error("invalid preview upload");
+      ok = true;
       return result.href;
-    } catch {
+    } catch { toolError("card-preview", "card-preview.catch3");
       throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
+    } finally { toolLog.capture(() => toolLog.write({ component: "cards", kind: "perf", name: "card.render", ok, durationMs: performance.now() - at, props: { cardKind: cardKind(pageUrl) } })); }
   };
 }

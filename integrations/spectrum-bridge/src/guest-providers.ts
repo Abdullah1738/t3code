@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Read-only data providers a guest grant can switch on. Each one turns a small, fixed slice of
  * the owner's data into prompt text for the tool-less guest model; nothing else of his reaches
@@ -60,7 +61,7 @@ export const PROVIDERS: Record<ProviderKind, GuestProvider> = {
     summary: () => "your free/busy times (no titles) to propose a meeting",
     view: async (_arg, _grant, deps) => {
       const now = deps.now();
-      const busy = await (deps.busy ?? applecalBusy)(now, now + HORIZON_DAYS * 86_400_000).catch(() => "unavailable" as const);
+      const busy = await (deps.busy ?? applecalBusy)(now, now + HORIZON_DAYS * 86_400_000).catch(() => { toolError("guest-providers", "guest-providers.catch1"); return "unavailable" as const; });
       const windows = busy === "unavailable" ? "unavailable" : freeWindows(busy, now, deps.timezone, deps.hours ?? DEFAULT_HOURS);
       const prompt = windows === "unavailable" ? "Calendar: it can't be read right now. Don't propose times; say you'll check with Abdullah and use action escalate."
         : windows.length === 0 ? "Calendar: Abdullah has no free time in the next two weeks within working hours. Say you'll check with him and use action escalate."

@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { isAbsolute } from "node:path";
 
 /** The only tailnet HTTPS ports this bridge may create or remove. */
@@ -26,7 +27,7 @@ export function tailscaleExec(bin = process.env.TAILSCALE_BIN ?? DEFAULT_TAILSCA
     let child;
     try {
       child = Bun.spawn([bin, ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-    } catch {
+    } catch { toolError("publish", "publish.catch1");
       throw new PublishError("tailscale is unavailable");
     }
     const timer = setTimeout(() => child.kill(), timeoutMs);
@@ -45,7 +46,7 @@ export function tailscaleExec(bin = process.env.TAILSCALE_BIN ?? DEFAULT_TAILSCA
 export function localTarget(proxy: unknown): number | undefined {
   if (typeof proxy !== "string") return;
   let url: URL;
-  try { url = new URL(proxy); } catch { return; }
+  try { url = new URL(proxy); } catch { toolError("publish", "publish.catch2"); return; }
   if (url.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(url.hostname) || url.username || url.password
     || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) return;
   const port = Number(url.port);
@@ -54,7 +55,7 @@ export function localTarget(proxy: unknown): number | undefined {
 
 export function parseServeStatus(text: string): ServeState {
   let raw: unknown;
-  try { raw = text.trim() ? JSON.parse(text) : {}; } catch { throw new PublishError("tailscale returned invalid serve status"); }
+  try { raw = text.trim() ? JSON.parse(text) : {}; } catch { toolError("publish", "publish.catch3"); throw new PublishError("tailscale returned invalid serve status"); }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new PublishError("tailscale returned invalid serve status");
   const { TCP: tcp, Web: web } = raw as { TCP?: unknown; Web?: unknown };
   const ports = new Set<number>();
@@ -93,7 +94,7 @@ const readServe = async (exec: Exec) => parseServeStatus(await run(exec, ["serve
 
 async function selfDnsName(exec: Exec): Promise<string> {
   let status: unknown;
-  try { status = JSON.parse(await run(exec, ["status", "--json"])); } catch (error) {
+  try { status = JSON.parse(await run(exec, ["status", "--json"])); } catch (error) { toolError("publish", "publish.catch4");
     throw error instanceof PublishError ? error : new PublishError("tailscale returned invalid status");
   }
   const name = (status as { Self?: { DNSName?: unknown } })?.Self?.DNSName;
@@ -114,7 +115,7 @@ async function mutate(exec: Exec, port: number, args: string[]): Promise<void> {
 let queue: Promise<unknown> = Promise.resolve();
 function serialized<T>(task: () => Promise<T>): Promise<T> {
   const next = queue.then(task, task);
-  queue = next.catch(() => {});
+  queue = next.catch(() => { toolError("publish", "publish.catch5");});
   return next;
 }
 

@@ -1,3 +1,4 @@
+import { toolLog } from "./toollog.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ChatContext } from "./chats.ts";
@@ -57,5 +58,10 @@ export async function notifyFailedInbound(text: string, key: string): Promise<bo
     "notify", "--source", "iMessage bridge", "--severity", "attention", "--text", text, "--key", key],
   { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: { ...process.env, BUN_INSPECT: undefined } });
   const timer = setTimeout(() => child.kill(), 10_000);
-  try { return await child.exited === 0; } finally { clearTimeout(timer); }
+  try {
+    const exitCode = await child.exited;
+    toolLog.capture(() => toolLog.write({ component: "recovery", kind: exitCode === 0 ? "event" : "error", name: exitCode === 0 ? "recovery.notice_sent" : "recovery.notice_failed", ok: exitCode === 0,
+      props: { exitCode: Math.max(0, exitCode) }, error: { tag: "recovery.notification_failed", message: "" } }));
+    return exitCode === 0;
+  } finally { clearTimeout(timer); }
 }

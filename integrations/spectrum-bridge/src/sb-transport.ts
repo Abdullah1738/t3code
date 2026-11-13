@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Photon-shaped transport over one chat of the shared Line, so Router and Delivery run unchanged.
  * Sendblue has no idempotency key; an uncertain send is checked against the line's outbound
@@ -45,7 +46,7 @@ export type CardOptions = { static?: boolean; previewImage?: (pageUrl: string) =
 
 export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () => Date.now(), cards: CardOptions = {}) {
   const wrap = async <T>(work: () => Promise<T>): Promise<T> => {
-    try { return await work(); } catch (error) { throw classifyLineFailure(error); }
+    try { return await work(); } catch (error) { toolError("sb-transport", "sb-transport.catch1"); throw classifyLineFailure(error); }
   };
   const sentKey = (id: string) => `sent:${id}`;
   const attemptKey = (id: string) => `sent-attempt:${id}`;
@@ -89,7 +90,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     let sent: { handle: string };
     try {
       sent = await wrap(send);
-    } catch (error) {
+    } catch (error) { toolError("sb-transport", "sb-transport.catch2");
       // Nothing went out, so the next try need not wait for a copy that will never show up.
       if (error instanceof TransportError && !error.ambiguous) {
         if (own) store.set(attemptKey(id), own);
@@ -116,11 +117,11 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     const run = typingQueue.then(() => line.typing(chat, active
       ? { state: "start", maxDurationMs: TYPING_MAX_MS }
       : { state: "stop" }));
-    typingQueue = run.catch(() => {});
+    typingQueue = run.catch(() => { toolError("sb-transport", "sb-transport.catch3");});
     return wrap(() => run);
   };
   // Our own message clears the bubble on the recipient's phone, so put it back while the turn runs.
-  const rearm = () => { if (typingOn) void typingCall(true).catch(() => {}); };
+  const rearm = () => { if (typingOn) void typingCall(true).catch(() => { toolError("sb-transport", "sb-transport.catch4");}); };
 
   return {
     async typing(_chatGuid: string, active: boolean): Promise<void> {

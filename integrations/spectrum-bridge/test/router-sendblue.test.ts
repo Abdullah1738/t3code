@@ -1464,6 +1464,9 @@ test("owner, Moni and group outages each get one notice, with held messages orde
 
 
 test.each(["dm", "group"] as const)("late steer fallback in %s preserves named members and holds newer context", async kind => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  let adoptedPrompt = "";
+  const captured = await captureLogs(async () => {
   const start = Date.now();
   setSystemTime(start);
   const h = live(context(kind));
@@ -1480,6 +1483,7 @@ test.each(["dm", "group"] as const)("late steer fallback in %s preserves named m
   expect(steers).toHaveLength(1);
   const sealed = h.store.get<NormalizedInbound>("batch:followup")!;
   const original = steers[0]!;
+  adoptedPrompt = original.messageId;
   expect(original.text).toContain("Moni:");
   expect(original.text).toContain("Tom (+447700900123):");
   h.backend.final("Original answer");
@@ -1507,6 +1511,9 @@ test.each(["dm", "group"] as const)("late steer fallback in %s preserves named m
     expect(newer!.type === "user" && newer!.text).toContain("UNIQUE_OBSERVED_CONTEXT");
     expect(h.store.get<string[]>("group-observed")).toEqual([]);
   }
+  });
+  expect(captured.some(line => line.name === "turn.start" && line.ids?.messageId === adoptedPrompt)).toBe(true);
+
 });
 
 test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own reply after the foreground closes", async kind => {
@@ -1637,4 +1644,24 @@ test.each(["owner", "moni", "critical"])("failed-inbound stale %s rows never ale
   setSystemTime(now + 60_000); await h.router.checkFailedInbound(); await h.router.tick();
   expect(alerts).toEqual([]); expect(h.backend.prompts).toEqual([]);
   expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
+});
+
+test("router logs batch, turn start and terminal success/failure without prompt text", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = live(context("dm"));
+    h.input("log-success", "PRIVATE_PROMPT", DM_KEY);
+    await h.router.tick();
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+    const f = live(context("dm"));
+    f.input("log-failure", "PRIVATE_FAILED_PROMPT", DM_KEY);
+    await f.router.tick();
+    f.backend.records.push({ id: "log-idle-failed", type: "idle", outcome: "failed", firstTurnFailure: true, time: { created: Date.now() } } as MessageRecord);
+    await f.router.tick();
+  });
+  expect(logs.filter(l => l.name === "msg.batched")).toHaveLength(2);
+  expect(logs.filter(l => l.name === "turn.start")).toHaveLength(2);
+  expect(logs.filter(l => l.name === "turn.end").map(l => l.props?.outcome)).toEqual(["replied", "failed"]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });

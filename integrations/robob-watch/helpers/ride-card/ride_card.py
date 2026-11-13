@@ -30,6 +30,7 @@ command, space separated), RIDE_CARD_BRIDGE_STATE (bridge state dir, read only),
 RIDE_CARD_NO_IMAGE=1 (skip Chrome, tests), UBER_BIN.
 """
 import argparse, fcntl, hashlib, tempfile, html, json, math, os, re, shlex, shutil, sqlite3, subprocess, sys, time
+import threading
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -642,7 +643,28 @@ def preview_pending(uuid):
     return meta.get("preview") != meta.get("sig") or not (d / "preview.png").exists()
 
 
+def log_render(started, ok):
+    try:
+        env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
+        child = subprocess.Popen([str(HOME / '.bun/bin/bun'), str(HOME / '.local/share/spectrum-bridge/src/cli.ts'),
+                                  'log-card-render', '--kind', 'ride', '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--ok', str(ok).lower()],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        threading.Thread(target=child.wait, daemon=True).start()
+    except Exception:
+        pass
+
+
 def render_preview(c, d):
+    started = time.monotonic()
+    ok = False
+    try:
+        ok = _render_preview(c, d)
+        return ok
+    finally:
+        log_render(started, ok)
+
+
+def _render_preview(c, d):
     """Render preview.png for the card as it is now. False (and no partial file) on failure."""
     if os.environ.get("RIDE_CARD_NO_IMAGE") == "1":
         return True

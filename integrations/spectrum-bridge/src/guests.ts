@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Scoped third parties (owner rule, 2026-10-21): someone the owner told to text the line gets a
  * narrow, expiring grant for one purpose. Grants live in guests.json beside access.json and are
@@ -146,7 +147,7 @@ export class GuestBook {
     try {
       appendFileSync(this.auditPath, JSON.stringify({ at: new Date(this.now()).toISOString(), address, event, ...detail }) + "\n", { mode: 0o600 });
       chmodSync(this.auditPath, 0o600);
-    } catch { /* The audit log is best effort; it never blocks a message. */ }
+    } catch { toolError("guests", "guests.catch1"); /* The audit log is best effort; it never blocks a message. */ }
   }
 }
 

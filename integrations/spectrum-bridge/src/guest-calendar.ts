@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /** Free/busy and holds for the scoped responder: start and end times only, never titles. */
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -73,7 +74,7 @@ export async function applecalBusy(from: number, to: number): Promise<Busy[] | "
     return events.filter(event => !event.isAllDay && event.startDate && event.endDate)
       .map(event => ({ start: Date.parse(event.startDate!), end: Date.parse(event.endDate!) }))
       .filter(entry => Number.isFinite(entry.start) && Number.isFinite(entry.end));
-  } catch { return "unavailable"; }
+  } catch { toolError("guest-calendar", "guest-calendar.catch1"); return "unavailable"; }
 }
 
 export async function applecalHold(input: { title: string; start: number; end: number; notes: string }): Promise<boolean> {
@@ -85,5 +86,5 @@ export async function applecalHold(input: { title: string; start: number; end: n
     const code = await child.exited;
     clearTimeout(timer);
     return code === 0;
-  } catch { return false; }
+  } catch { toolError("guest-calendar", "guest-calendar.catch2"); return false; }
 }

@@ -803,3 +803,23 @@ class CardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RenderLoggingTests(unittest.TestCase):
+    def test_render_success_failure_and_no_payload_in_emitter(self):
+        from unittest.mock import Mock
+        with patch.object(c, '_build', return_value={'has_preview': True}), patch.object(c, 'log_render') as log:
+            self.assertEqual(c.build({}, {}), {'has_preview': True})
+            self.assertTrue(log.call_args.args[1])
+        with patch.object(c, '_build', return_value={'has_preview': False}), patch.object(c, 'log_render') as log:
+            self.assertFalse(c.build({}, {})['has_preview'])
+            self.assertFalse(log.call_args.args[1])
+        with patch.object(c, '_build', side_effect=ValueError('PRIVATE_CARD')), patch.object(c, 'log_render') as log:
+            with self.assertRaises(ValueError):
+                c.build({}, {})
+            self.assertFalse(log.call_args.args[1])
+        with patch.object(c.subprocess, 'Popen') as child, patch.object(c.threading, 'Thread'):
+            c.log_render(time.monotonic(), False)
+            self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'delivery'])
+        with patch.object(c.subprocess, 'Popen', side_effect=OSError('unavailable')):
+            c.log_render(time.monotonic(), True)

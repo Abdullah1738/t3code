@@ -7375,6 +7375,26 @@ test.each(["permission", "question"] as const)("an incomplete child scan cannot 
   expect(h.backend.prompts).toHaveLength(1);
 });
 
+test("background follow-up turns have paired start/end records", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const captured = await captureLogs(async () => {
+    const h = setup(":memory:", { watchMs: 0 });
+    h.input("log-first", "PRIVATE_PROMPT");
+    await h.router.tick();
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+    h.backend.step("PRIVATE_BACKGROUND\nNO_REPLY");
+    h.backend.settle();
+    await h.router.tick();
+    await h.router.tick();
+  });
+  const starts = captured.filter(l => l.name === "turn.start");
+  expect(starts).toHaveLength(2);
+  for (const start of starts) expect(captured.some(l => l.name === "turn.end" && l.ids?.messageId === start.ids?.messageId)).toBe(true);
+  expect(captured.filter(l => l.name === "turn.end").map(l => l.props?.outcome)).toEqual(["replied", "no_reply"]);
+  expect(JSON.stringify(captured)).not.toContain("PRIVATE_");
+});
+
 test("watcher reply guard logs accepted silence and visible replies without text", async () => {
   const previous = process.env.TOOLLOG_DIR;
   const logs = mkdtempSync(join(tmpdir(), "wake-guard-log-")); directories.push(logs);
@@ -7388,9 +7408,10 @@ test("watcher reply guard logs accepted silence and visible replies without text
       await h.router.tick();
       const raw = readFileSync(join(logs, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8");
       const rows = raw.trim().split("\n").map(line => JSON.parse(line));
-      expect(rows.at(-1)).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
-      expect(rows.at(-1).ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
-      if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(rows.at(-1)));
+      const entry = rows.findLast(row => row.tool === "watchers" && row.name === "wake.reply_guard");
+      expect(entry).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
+      expect(entry.ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
+      if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(entry));
       expect(raw).not.toContain("private fixture");
       expect(raw).not.toContain("NO_REPLY");
     }

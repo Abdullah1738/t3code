@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -19,7 +20,7 @@ export function nativeMessageId(id: string): string | undefined {
   if (!match) return undefined;
   try {
     return /^msg_[A-Za-z0-9]+$/.exec(decodeURIComponent(match[1]!).split(":")[0]!)?.[0];
-  } catch {
+  } catch { toolError("opencode-steps", "opencode-steps.catch1");
     return undefined;
   }
 }
@@ -47,7 +48,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
   let db: Database | undefined;
   let inode: number | undefined;
   const close = () => {
-    try { db?.close(); } catch { /* already gone */ }
+    try { db?.close(); } catch { toolError("opencode-steps", "opencode-steps.catch2"); /* already gone */ }
     db = undefined;
   };
   return (sessionId, sinceMs) => {
@@ -77,7 +78,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
       if (idle < 0 || typeof rows[idle]!.outcome !== "string") return "unknown";
       if (rows.slice(idle + 1).some(row => row.type === "assistant")) return "unknown";
       return steps.every(stepIsTerminalNoTool) ? "none" : "unknown";
-    } catch {
+    } catch { toolError("opencode-steps", "opencode-steps.catch3");
       close();
       return "unknown";
     }
@@ -88,7 +89,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
 function stepRan(row: { finish: unknown; content: unknown }): boolean {
   if (row.finish === "tool-calls") return true;
   if (typeof row.content === "string") {
-    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch { return true; }
+    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch { toolError("opencode-steps", "opencode-steps.catch4"); return true; }
   }
   return Array.isArray(row.content) && row.content.some(part => (part as { type?: unknown })?.type === "tool");
 }
@@ -114,14 +115,14 @@ function stepIsTerminalNoTool(row: { finish: unknown; content: unknown; retry: u
 }
 
 function parseParts(text: string): unknown {
-  try { return JSON.parse(text); } catch { return undefined; }
+  try { return JSON.parse(text); } catch { toolError("opencode-steps", "opencode-steps.catch5"); return undefined; }
 }
 
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
   let db: Database | undefined;
   let inode: number | undefined;
   const close = () => {
-    try { db?.close(); } catch { /* already gone */ }
+    try { db?.close(); } catch { toolError("opencode-steps", "opencode-steps.catch6"); /* already gone */ }
     db = undefined;
   };
   return ids => {
@@ -148,7 +149,7 @@ export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
         if (typeof row.finish !== "string") continue;
         for (const id of wanted.get(row.id) ?? []) found.set(id, row.finish);
       }
-    } catch {
+    } catch { toolError("opencode-steps", "opencode-steps.catch7");
       close();
       found.clear();
     }
