@@ -7121,11 +7121,26 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               }),
             )
           : undeleted;
+        const eligible = visible.filter(
+          (thread) => options?.afterThreadId === undefined || thread.id > options.afterThreadId,
+        );
+        const page =
+          options?.limit === undefined
+            ? eligible
+            : eligible
+                .toSorted(
+                  (left, right) =>
+                    (options.recentFirst
+                      ? DateTime.toEpochMillis(right.updatedAt) -
+                        DateTime.toEpochMillis(left.updatedAt)
+                      : 0) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+                )
+                .slice(0, options.limit);
         return {
           schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
           snapshotSequence: yield* Ref.get(sequence),
-          threads: visible.filter((thread) => thread.archivedAt === null),
-          archivedThreads: visible.filter((thread) => thread.archivedAt !== null),
+          threads: page.filter((thread) => thread.archivedAt === null),
+          archivedThreads: page.filter((thread) => thread.archivedAt !== null),
         };
       }),
       readShellSnapshot: (options) =>

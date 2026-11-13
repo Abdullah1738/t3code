@@ -1122,7 +1122,8 @@ class MissingTemplates(Isolated):
                 self.assertEqual(self.new_box(), ({"id": "bx_recipe"}, "recipe:crpko-go", None, "large"))
                 self.create.assert_called_with("large", common.RUN_TTL_S, lease.box_name(self.me, "example"),
                                                "lease-test-recipe")
-                self.assertEqual(self.err.getvalue(), f"offbox: template crpko-go not built on the {label}; "
+                self.assertEqual(self.err.getvalue(), "offbox: template crpko-go (go.mod; --template to override)\n"
+                                 f"offbox: template crpko-go not built on the {label}; "
                                  "building this box from its recipe (a few minutes). "
                                  "offbox template build crpko-go makes the next one fast.\n")
         self.fork.assert_not_called()

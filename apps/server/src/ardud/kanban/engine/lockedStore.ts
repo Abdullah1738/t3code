@@ -47,6 +47,7 @@ export const wrap = (
     putBoardWithPools: (row, pools) =>
       locks.access(row.id, store.putBoardWithPools(row, pools), true, "board"),
     cards: (id) => locks.access(id, store.cards(id)),
+    dispatchCards: (id) => locks.access(id, store.dispatchCards(id)),
     openCards: (id) => locks.access(id, store.openCards(id)),
     summaryCards: (id) => locks.access(id, store.summaryCards(id)),
     card: (id) => card(id, store.card(id)),
@@ -70,7 +71,10 @@ export const wrap = (
     groups: (id) => locks.access(id, store.groups(id)),
     putGroups: (id, rows) => locks.access(id, store.putGroups(id, rows), true),
     discussions: (id) => locks.access(id, store.discussions(id)),
+    openDiscussions: (id) => locks.access(id, store.openDiscussions(id)),
     discussion: (id) => discussion(id, store.discussion(id)),
+    latestSystemDiscussion: (id, component) =>
+      locks.access(id, store.latestSystemDiscussion(id, component)),
     discussionByEvaluator: (id) => thread(id, store.discussionByEvaluator(id)),
     discussionBoardIdsByEvaluator: (id) => thread(id, store.discussionBoardIdsByEvaluator(id)),
     putDiscussion: (row) =>

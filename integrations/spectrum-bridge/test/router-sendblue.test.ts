@@ -3,6 +3,7 @@ import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
 import { Router, sendblueContextPrompt } from "../src/router.ts";
+import { MAX_INCOMING_BYTES } from "../src/inbound-files.ts";
 import { Store } from "../src/store.ts";
 import type { Swipes, SwipeTarget } from "../src/swipe.ts";
 import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionRequest, type SessionRecord } from "../src/openchamber.ts";
@@ -80,6 +81,29 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
 
 const stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.db.close(); });
+
+test.each(["owner", "dm", "group"] as const)("%s skips an oversized file without directing non-owner files to the Mac", async kind => {
+  const h = setup(context(kind), { quietMs: 0 });
+  const name = 'private"\nfile.heic';
+  h.input("file", kind === "group" ? "Robob, read this" : "Read this", kind === "owner" ? "owner" : DM_KEY, { attachments: [{
+    guid: "guid", fileName: name, mimeType: "image/heic", totalBytes: MAX_INCOMING_BYTES + 1,
+    transferState: "finished", uti: "", isHidden: false, isOutgoing: false, isSticker: false,
+  }] });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const system = h.backend.prompts[0]!.system!;
+  expect(system).toContain(JSON.stringify(name));
+  expect(system).toContain("0 of 1 files were taken in; 1 were not");
+  if (kind === "owner") {
+    expect(system).toContain("imsg chats");
+    expect(system).toContain("may not match Messages");
+  } else {
+    expect(system).toContain("existing permissions and privacy rules");
+    expect(system).toContain("do not assume it is in this Mac's Messages");
+    expect(system).not.toContain("match transfer_name to the file name");
+  }
+  expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toEqual([]);
+});
 
 test("sendblue debounce waits 2 s of quiet after the latest member, not 15 s", async () => {
   const start = Date.parse("2026-10-21T10:00:00Z");

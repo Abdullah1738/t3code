@@ -14,7 +14,7 @@ CAP_BYTES = 50 * 1024 * 1024
 COMPONENTS = {'food', 'hlog', 'validate', 'whoop', 'cards', 'took', 'whoop-sync',
               'meds-nag', 'nutrition-checkin', 'nutrition-nudge', 'forge-workouts', 'gym-nudge', 'rollup'}
 COMMANDS = {
-    'food': 'search log quick meal-log del flag add-food show-food recipe-new recipe-add recipe-show meal-save pantry today week phase checkin meals-count',
+    'food': 'search log quick meal-log log-order del flag add-food show-food recipe-new recipe-add recipe-show meal-save pantry today week phase checkin meals-count',
     'hlog': 'import summary weekly monthly labs site feel conflicts',
     'whoop': 'status sync authurl serve', 'cards': 'morning nutrition', 'took': 'confirm skip',
     'validate': 'validate', 'rollup': 'rollup',
@@ -26,7 +26,10 @@ TAGS = {'exit_nonzero', 'invalid_arguments', 'not_authorized', 'reauth_needed', 
         'subprocess_failed', 'renderer_failed', 'headless_chrome', 'database_error',
         'io_error', 'interrupted', 'internal_error', 'cap_reached'}
 SCHEMAS = {
-    'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed'}, 'count': int},
+    'food.order_log': {'vertical': {'food', 'nownow', 'minutes', 'main', 'supermall'},
+        'outcome': {'logged', 'partial', 'fetch_failed', 'no_items', 'unmatched', 'bad_exclude', 'bad_portion', 'duplicate'},
+        'lines': int, 'unmatched': int, 'options_not_counted': int, 'fetch_ms': int},
+    'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed', 'option_not_counted', 'partial'}, 'count': int},
     'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'help'}},
     'watcher.run': {}, 'sync.run': {'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool},

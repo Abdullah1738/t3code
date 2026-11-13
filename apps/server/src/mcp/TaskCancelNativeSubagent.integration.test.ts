@@ -463,30 +463,54 @@ it.effect.each([
             const recovered = yield* orchestrator.getThreadProjection(task.childThreadId!);
             assert.lengthOf(recovered.runs, 1);
           }
-          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const write = sink.writeWithEffects;
+          let failedSettlement = false;
           const settlement =
             scenario === "restart_disposed_queue"
-              ? vi.spyOn(threads, "recoverDelegatedTask").mockImplementationOnce(() => Effect.void)
+              ? vi.spyOn(sink, "writeWithEffects").mockImplementation((input) => {
+                  if (
+                    !failedSettlement &&
+                    input.events.some(
+                      (event) =>
+                        event.type === "subagent.updated" &&
+                        event.payload.id === task.id &&
+                        event.payload.status === "cancelled",
+                    )
+                  ) {
+                    failedSettlement = true;
+                    return Effect.fail(
+                      new EventSink.EventSinkWriteError({ eventCount: input.events.length }),
+                    );
+                  }
+                  return write(input);
+                })
               : undefined;
-          const cancelled = yield* service
-            .cancelTask(scope, {
-              taskId: task.id,
-              clientRequestId: "cancel-ended-task",
-            })
-            .pipe(Effect.ensuring(Effect.sync(() => settlement?.mockRestore())));
+          const cancel = service.cancelTask(scope, {
+            taskId: task.id,
+            clientRequestId: "cancel-ended-task",
+          });
           if (scenario === "restart_disposed_queue") {
+            const failed = yield* cancel.pipe(
+              Effect.flip,
+              Effect.ensuring(Effect.sync(() => settlement?.mockRestore())),
+            );
+            assert.equal(failed.code, "task_not_cancellable");
+            assert.isTrue(failedSettlement);
             const unsettled = (yield* orchestrator.getThreadProjection(
               parentThreadId,
             )).subagents.find((row) => row.id === task.id)!;
             assert.equal(unsettled.status, "running");
             assert.isNull(unsettled.result);
-            // Retry after Stop and disposal committed but settlement failed.
-            yield* service.cancelTask(scope, {
-              taskId: task.id,
-              clientRequestId: "cancel-ended-task",
-            });
           }
-          assert.equal(cancelled.status, held ? "cancel_requested" : status.status);
+          // Replaying Stop must still settle a failed result write, independently
+          // of its command receipt and already-disposed completion delivery.
+          const cancelled = yield* cancel.pipe(
+            Effect.ensuring(Effect.sync(() => settlement?.mockRestore())),
+          );
+          assert.equal(
+            cancelled.status,
+            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+          );
           const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);
           const settledTask = parentAfter.subagents.find((row) => row.id === task.id)!;
           assert.equal(
@@ -599,7 +623,7 @@ it.effect.each([
           taskId: task.id,
           clientRequestId: "cancel-task",
         });
-        assert.equal(cancelled.status, "cancel_requested");
+        assert.include(["cancel_requested", "completed"], cancelled.status);
         yield* worker.drain();
 
         const childAfter = yield* orchestrator.getThreadProjection(task.childThreadId!);

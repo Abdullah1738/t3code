@@ -216,6 +216,7 @@ const BoardBody = Schema.Struct({
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
   ),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
 });
 
 const PoolBody = Schema.Struct({
@@ -476,6 +477,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(evaluatorModel ? { evaluatorModel } : {}),
           ...(defaultCardModel ? { defaultCardModel } : {}),
           ...(reviewChains ? { reviewChains } : {}),
+          ...(input.guessedGates !== undefined ? { guessedGates: input.guessedGates } : {}),
           ...(input.defaultReviewChain !== undefined
             ? { defaultReviewChain: input.defaultReviewChain }
             : {}),

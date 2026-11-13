@@ -25,6 +25,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
@@ -114,6 +116,7 @@ const layerTestProviderInstanceRegistry = Layer.succeed(
 const layerTest = Layer.mergeAll(
   RuntimeLayer.layer,
   RuntimeLayer.layerEventSink,
+  EffectOutbox.layer,
   ProjectionStore.layer,
 ).pipe(
   Layer.provideMerge(RuntimeLayer.layerProjectService),
@@ -2190,6 +2193,106 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         yield* orchestrator.delegatedTaskResultPending(child.childThreadId, child.taskId),
       );
     }),
+  );
+
+  it.effect.each(["absent", "pending", "running"] as const)(
+    "Stop settles a restart-cancelled child with continuation %s and fences late dispatch",
+    (continuationState) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const now = yield* DateTime.now;
+        const continuationPending = continuationState !== "absent";
+        const threadId = ThreadId.make(`thread:restart-stop-parent:${continuationState}`);
+        const projectId = ProjectId.make(`project:restart-stop:${continuationState}`);
+        const runId = RunId.make(`run:restart-stop-parent:${continuationState}`);
+        const rootNodeId = NodeId.make(`node:restart-stop-root:${continuationState}`);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make(`node:restart-stop-seed:${continuationState}`),
+          deliveryState: "acknowledged",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name: `restart-stop-child-${continuationState}`,
+          completionWake: "always",
+          continuationPending,
+          now,
+        });
+        const eventSink = yield* EventSink.EventSinkV2;
+        const { runs } = yield* orchestrator.getThreadRecords(child.childThreadId, ["runs"]);
+        yield* eventSink.write({
+          commandId: CommandId.make(`command:restart-stop-tag:${continuationState}`),
+          events: [
+            {
+              id: EventId.make(`event:restart-stop-tag:${continuationState}`),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              runId: child.childRunId,
+              occurredAt: now,
+              payload: { ...runs[0]!, delegatedTaskId: child.taskId },
+            },
+          ],
+        });
+        if (continuationState === "running") {
+          const claimed = yield* outbox.claimNext({
+            workerId: "restart-cancel-test",
+            threadId: child.childThreadId,
+            leaseDurationMs: 30_000,
+            onlyEffectTypes: ["provider-runtime.continue"],
+          });
+          assert.isTrue(Option.isSome(claimed));
+        }
+        const beforeStop = yield* outbox.get(`effect:restart-continuation:${child.childRunId}`);
+        if (continuationPending) {
+          assert.isTrue(Option.isSome(beforeStop));
+          if (Option.isSome(beforeStop)) assert.equal(beforeStop.value.status, continuationState);
+        }
+        assert.isFalse(
+          yield* orchestrator.delegatedTaskResultPending(child.childThreadId, child.taskId),
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make(`command:restart-stop:${continuationState}`),
+          threadId: child.childThreadId,
+        });
+        assert.isFalse(
+          yield* orchestrator.delegatedTaskResultPending(child.childThreadId, child.taskId),
+        );
+        const parent = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          parent.subagents.find((task) => task.id === child.taskId)?.status,
+          "cancelled",
+        );
+        const continuation = yield* outbox.get(`effect:restart-continuation:${child.childRunId}`);
+        if (continuationPending) {
+          assert.isTrue(Option.isSome(continuation));
+          if (Option.isSome(continuation)) assert.equal(continuation.value.status, "cancelled");
+        }
+        // An executor may already have read its source before Stop committed.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`command:restart-stop-late:${continuationState}`),
+          threadId: child.childThreadId,
+          messageId: MessageId.make(`message:restart-stop-late:${continuationState}`),
+          text: "Continue after restart.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "agent",
+          creationSource: "server",
+          restartContinuationOfRunId: child.childRunId,
+        });
+        const stopped = yield* orchestrator.getThreadProjection(child.childThreadId);
+        assert.equal(stopped.runs.length, 1);
+        assert.equal(stopped.runs[0]?.status, "cancelled");
+      }),
   );
 
   it.effect("holds a restart-cancelled child for its continuation's result", () =>
