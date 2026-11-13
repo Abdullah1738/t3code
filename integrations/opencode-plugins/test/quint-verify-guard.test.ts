@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import plugin, { classify, createGuardHook } from "../plugin/quint-verify-guard";
 
 const suiteLogs = mkdtempSync(join(tmpdir(), "quint-guard-suite-"));
@@ -14,8 +14,15 @@ afterAll(() => {
 });
 
 const source = resolve(import.meta.dir, "../../harness-hooks/src/quint_verify_guard.py");
+const fixture = join(suiteLogs, "fixture");
+mkdirSync(join(fixture, "hook"), { recursive: true });
+for (const directory of ["project", "project/node_modules/.bin", "project/sub", "project/sub/node_modules/.bin"]) {
+  const executable = join(fixture, directory, "quint");
+  mkdirSync(dirname(executable), { recursive: true });
+  writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+}
 const cases: { command: string; denied: boolean; cwd?: string; approved?: string }[] = JSON.parse(readFileSync(
-  resolve(import.meta.dir, "../../harness-hooks/tests/quint_verify_cases.json"), "utf8"));
+  resolve(import.meta.dir, "../../harness-hooks/tests/quint_verify_cases.json"), "utf8").replaceAll("{{fixture}}", fixture));
 
 test("OpenCode uses the shared matcher table and runs only refusal commands", async () => {
   const logs = mkdtempSync(join(tmpdir(), "quint-guard-logs-"));
@@ -26,6 +33,7 @@ test("OpenCode uses the shared matcher table and runs only refusal commands", as
       const hook = createGuardHook("/repo", async (command, cwd) => {
         const result = spawnSync(process.env.HARNESS_TEST_PYTHON ?? "/opt/homebrew/bin/python3", [source], {
           input: JSON.stringify({ command, cwd, approved: row.approved ?? "" }), encoding: "utf8",
+          cwd: join(fixture, "hook"),
         });
         expect(result.status).toBe(0);
         return JSON.parse(result.stdout);

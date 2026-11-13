@@ -58,7 +58,7 @@ def _runner_args(args):
               "--shell", "--reporter", "--store-dir", "--call", "-c"}
     while args and args[0].startswith("-"):
         flag = args.pop(0)
-        if flag.startswith("--call="):
+        if flag.startswith(("--call=", "-c=")):
             return [], flag.split("=", 1)[1]
         if flag == "--":
             break
@@ -195,6 +195,9 @@ def classify(command, cwd=None, *, path=None, approved=None, _depth=0, _runner=F
             shell_path = local.get("PATH")
             if shell_path is None or "$" in shell_path or "`" in shell_path:
                 return False, state
+            # Relative and empty PATH entries belong to the executing shell's
+            # directory, which can differ from this hook process after `cd`.
+            shell_path = ":".join(posixpath.join(directory or os.getcwd(), entry or ".") for entry in shell_path.split(":"))
             # which stats executable candidates; it never reads CLI contents.
             executable = shutil.which("quint", path=shell_path)
             if executable is None:

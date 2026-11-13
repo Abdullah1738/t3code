@@ -17,8 +17,21 @@ CASES = json.loads(Path(__file__).with_name('quint_verify_cases.json').read_text
 
 
 class QuintVerifyTests(unittest.TestCase):
+    def setUp(self):
+        fixture = tempfile.TemporaryDirectory(prefix='quint-path-fixture-')
+        self.addCleanup(fixture.cleanup)
+        self.root = Path(fixture.name)
+        (self.root / 'hook').mkdir()
+        for directory in ['project', 'project/node_modules/.bin', 'project/sub', 'project/sub/node_modules/.bin']:
+            executable = self.root / directory / 'quint'
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o755)
+        self.cases = [{key: value.replace('{{fixture}}', str(self.root)) if isinstance(value, str) else value
+                       for key, value in row.items()} for row in CASES]
+
     def test_matcher_table(self):
-        for row in CASES:
+        for row in self.cases:
             with self.subTest(command=row['command']):
                 self.assertEqual(guard.classify(row['command'], row.get('cwd', '/repo'), approved=row.get('approved', '')), row['denied'])
 
@@ -40,8 +53,8 @@ class QuintVerifyTests(unittest.TestCase):
                 ('codex', codex, 'mcp__shell__exec_command', 'cmd'),
                 ('claude', claude, 'mcp__shell__exec_command', 'cmd'),
             ]:
-                for row in CASES:
-                    event = {'hook_event_name': 'PreToolUse', 'tool_name': tool,
+                for row in self.cases:
+                    event = {'hook_event_name': 'PreToolUse', 'tool_name': tool, 'cwd': str(self.root / 'hook'),
                              'tool_input': {field: row['command'], 'workdir': row.get('cwd', '/repo')}}
                     with self.subTest(harness=harness, tool=tool, command=row['command']), patch.dict(os.environ, {guard.OVERRIDE: row.get('approved', '')}):
                         result = engine.decide(event, harness)
