@@ -35,10 +35,13 @@ export const withDeadline = <A, E, R>(
               (input.code === "caller_unresolved" && input.stage === "caller"
                 ? " Nothing was saved; retry the same call."
                 : "") +
-              (input.stage === "dispatch" ? " Creation may still complete." : "") +
-              (input.taskId === undefined
-                ? ""
-                : ` Task ${input.taskId} was accepted; use task_status to recover it.`) +
+              (input.stage === "dispatch"
+                ? input.taskId === undefined
+                  ? " Creation may still complete."
+                  : ` Task ${input.taskId} may still be created; check it with task_status.`
+                : input.taskId === undefined
+                  ? ""
+                  : ` Task ${input.taskId} was accepted; use task_status to recover it.`) +
               (input.requestKey === undefined
                 ? ""
                 : ` Retry only with the same clientRequestId: ${input.requestKey}.`),

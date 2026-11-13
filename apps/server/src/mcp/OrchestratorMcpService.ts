@@ -1,4 +1,5 @@
 import * as McpDeadline from "./McpDeadline.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
@@ -1916,7 +1917,10 @@ const make = Effect.gen(function* () {
     if (task === undefined || task.childThreadId === null) {
       return yield* failure(
         "task_not_found",
-        `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.`,
+        `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.` +
+          (taskId.startsWith("node:delegated-task:")
+            ? " Creation may still be in flight; retry task_status with this task id, or retry delegate_task only with the same clientRequestId."
+            : ""),
       );
     }
     onProgress?.({ childThreadId: task.childThreadId, childNodeId: task.id });
@@ -2729,6 +2733,7 @@ const make = Effect.gen(function* () {
       const key = yield* bounded("request_key", requestKey(input.clientRequestId));
       retryKey = key;
       const commandId = delegationCommandId(scope, parentRecords, key);
+      const expectedTaskId = IdAllocator.derive.delegatedTaskNode({ commandId });
       const isRetryOfAcceptedDelegation = yield* bounded(
         "receipt",
         threadManagement.hasReceipt(commandId),
@@ -2827,7 +2832,7 @@ const make = Effect.gen(function* () {
                   `Unable to create delegated task: ${errorMessage(error)}`,
                 ),
           ),
-          (effect) => bounded("dispatch", effect),
+          (effect) => bounded("dispatch", effect, expectedTaskId),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -3524,7 +3529,9 @@ const make = Effect.gen(function* () {
             const commandId =
               prior === undefined
                 ? stableCommandId({ scope, requestKey: key, operation: "thread-send" })
-                : CommandId.make(`command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`);
+                : CommandId.make(
+                    `command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`,
+                  );
             const result = yield* threadManagement
               .sendToThread({
                 projectId: target.thread.projectId,
