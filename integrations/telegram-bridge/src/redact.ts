@@ -1,6 +1,6 @@
 function urlSpans(text: string) {
   const spans: Array<{ start: number; end: number }> = [];
-  const url = /\bhttps?:\/\//gi;
+  const url = /\bhttps?:(?:\\*\/){2}/gi;
   for (let match = url.exec(text); match; match = url.exec(text)) {
     const quote = text[match.index - 1];
     const wrapped = quote === '"' || quote === "'";
@@ -10,7 +10,7 @@ function urlSpans(text: string) {
     for (; end < text.length; end++) {
       const char = text[end]!;
       if (/[\s<>]/.test(char)) break;
-      if ((wrapped ? char === quote : /["']/.test(char))
+      if ((wrapped ? char === quote : char === '"')
         && (escaped ? slashes % 4 === 1 : slashes % 2 === 0)) break;
       slashes = char === "\\" ? slashes + 1 : 0;
     }
