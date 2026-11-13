@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
+import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
 import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
@@ -323,6 +323,13 @@ function sameAttachmentMessage(first: NormalizedInbound, next: NormalizedInbound
   return firstId !== undefined && firstId === message.exec(next.id)?.[1]
     && first.sender !== undefined && first.sender === next.sender && first.threadOrigin === next.threadOrigin
     && next.attachments.length > 0 && !next.text.trim();
+}
+type SkipReason = "more than 30 files in one message" | "over the 100 MB per-message total" | "unknown size";
+function skippedNote(attachment: NormalizedInbound["attachments"][number], reason: SkipReason, ownerChat: boolean): string {
+  const recovery = ownerChat
+    ? "Try to retrieve it yourself before answering: look in this Mac's Messages for the owner's chat (`imsg chats`, then `imsg history --chat-id <id> --attachments --json`), match transfer_name to the file name, and convert HEIC with sips into the chat directory if needed. The recorded name may come from a media URL and may not match Messages; the file may not be there."
+    : "Try to retrieve it under this chat's existing permissions and privacy rules before answering; do not assume it is in this Mac's Messages.";
+  return `- The sender also sent ${JSON.stringify(attachment.fileName || "a file")} (${attachment.mimeType ? JSON.stringify(attachment.mimeType) : "unknown type"}), but the bridge did not take it in (${reason}). ${recovery} Only if that fails, tell the sender which files you couldn't see.`;
 }
 /** Rows the bridge injects itself (secure-form notices, watcher wakes, reset nudges): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:") || id.startsWith("reset:");
@@ -2950,22 +2957,22 @@ export class Router {
       this.store.updateInbound(row.id, "done");
       return;
     }
-    if (input.attachments.length > MAX_INCOMING_FILES) {
-      this.acknowledge(row.id, "That's more than I can take in one go. Send at most 10 files, 100 MB total.", "failed");
-      return;
-    }
+    const taken: NormalizedInbound["attachments"] = [];
+    const skipped: string[] = [];
+    const ownerChat = !this.options.context || this.options.context.chat.kind === "owner";
     let total = 0;
     for (const attachment of input.attachments) {
+      const reason: SkipReason | undefined = taken.length >= MAX_INCOMING_FILES ? "more than 30 files in one message"
+        : !Number.isSafeInteger(attachment.totalBytes) || attachment.totalBytes < 0 ? "unknown size"
+        : attachment.totalBytes > MAX_INCOMING_BYTES - total ? "over the 100 MB per-message total" : undefined;
+      if (reason) { skipped.push(skippedNote(attachment, reason, ownerChat)); continue; }
+      taken.push(attachment);
       total += attachment.totalBytes;
-      if (!Number.isSafeInteger(attachment.totalBytes) || attachment.totalBytes < 0 || total > MAX_INCOMING_BYTES) {
-        this.acknowledge(row.id, "That's more than I can take in one go. Send at most 10 files, 100 MB total.", "failed");
-        return;
-      }
     }
     this.store.updateInbound(row.id, "processing");
     // Files over the blob cap are not checkpointed, so each unseal downloads them again.
     // Wait out a busy conversation before downloading rather than after.
-    if (route && input.attachments.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
+    if (route && taken.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
       const id = route.id;
       let busy = false;
       try { busy = (await this.statusesFor(route))[id] !== undefined; } catch { toolError("router", "router.catch30"); /* Checked again after downloads. */ }
@@ -2975,7 +2982,7 @@ export class Router {
     const downloaded: (Parameters<typeof prepareIncoming>[0] & { guid: string })[] = [];
     const undelivered: string[] = [];
     total = 0;
-    for (const attachment of input.attachments) {
+    for (const attachment of taken) {
       const key = `incoming-file:${hash(attachment.guid)}`;
       const cached = this.store.get<{ sha256: string; size: number; mimeType: string; name: string }>(key);
       // A file already given up on (Photon and the local copy) is passed on as a note.
@@ -2988,6 +2995,8 @@ export class Router {
         // 30 seconds plus one per declared MiB, so a 100 MiB file gets 130 seconds.
         // Other router waits stay at 10 seconds.
         const deadline = 30_000 + Math.floor(attachment.totalBytes / MiB) * 1_000;
+        // Check cached size before reading it, so a previous attempt cannot exceed the remaining budget.
+        if (total === MAX_INCOMING_BYTES || (cached && cached.size > MAX_INCOMING_BYTES - total)) throw new TransportError("attachmentTooLarge");
         const file = cached ? { data: this.store.getBlob(cached.sha256), mimeType: cached.mimeType, name: cached.name }
           : await bounded(this.transport.downloadAttachment(attachment.guid, Math.max(1, MAX_INCOMING_BYTES - total), deadline), deadline + 5_000);
         if (interrupted()) return;
@@ -2996,9 +3005,9 @@ export class Router {
           assert.match(file.mimeType, /^[\s\S]*$/u);
           assert.match(file.name, /^[\s\S]*$/u);
         } catch { toolError("router", "router.catch31"); throw new TransportError("invalidAttachment"); }
+        if (file.data.byteLength > MAX_INCOMING_BYTES - total) throw new TransportError("attachmentTooLarge");
         total += file.data.byteLength;
         toolLog.capture(() => toolLog.write({ component: "attachments", kind: "event", name: "attachment.received", ids: { messageId: input.id }, props: { attachmentBytes: file.data.byteLength, count: 1 } }));
-        if (total > MAX_INCOMING_BYTES) throw new TransportError("attachmentTooLarge");
         // Blobs are never pruned, so only files within the store's 20 MiB cap are
         // checkpointed. A larger one is downloaded again if the batch is retried,
         // and its successful download does not use up a retry.
@@ -3011,12 +3020,17 @@ export class Router {
       } catch (error) { toolError("router", "router.catch32");
         if (interrupted()) return;
         const failure = classifyDownloadFailure(error);
+        if (failure.code === "attachmentTooLarge") {
+          this.store.set(`${key}:retry`, { attempts: retry.attempts, nextAt: 0 });
+          skipped.push(skippedNote(attachment, "over the 100 MB per-message total", ownerChat));
+          continue;
+        }
         if (failure.retryable && retry.attempts + 1 < 3) {
           this.store.set(`${key}:retry`, { attempts: retry.attempts + 1, nextAt: Date.now() + 2_000 * 2 ** retry.attempts });
           this.unsealBatch(row.id);
           return;
         }
-        if (failure.code !== "attachmentTooLarge" && this.options.recoverAttachment) {
+        if (this.options.recoverAttachment) {
           // Photon gave up: pull the file from this Mac's Messages instead of dropping the turn.
           let result: Awaited<ReturnType<Recover>>;
           try {
@@ -3028,6 +3042,11 @@ export class Router {
           } catch { toolError("router", "router.catch33"); result = { detail: { reason: "recoveryTimedOut" } }; }
           this.options.log?.("attachment-local-recovery", /^[A-Za-z]{1,32}$/.test(result.detail.reason) ? result.detail.reason : "unknown");
           const recovered = result.file;
+          if (result.detail.reason === "tooLarge" || (recovered && recovered.data instanceof Uint8Array && recovered.data.byteLength > MAX_INCOMING_BYTES - total)) {
+            this.store.set(`${key}:retry`, { attempts: retry.attempts, nextAt: 0 });
+            skipped.push(skippedNote(attachment, "over the 100 MB per-message total", ownerChat));
+            continue;
+          }
           if (recovered && recovered.data instanceof Uint8Array && total + recovered.data.byteLength <= MAX_INCOMING_BYTES) {
             total += recovered.data.byteLength;
             if (recovered.data.byteLength <= MAX_BLOB_BYTES) this.store.db.transaction(() => {
@@ -3044,8 +3063,7 @@ export class Router {
           undelivered.push(undeliveredNote(attachment, detail));
           continue;
         }
-        const reason = failure.code === "attachmentTooLarge" ? "Those files are over 100 MB total; could you send fewer?"
-          : failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
+        const reason = failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
           : "I couldn't download that attachment. Mind resending it once it's fully uploaded?";
         this.acknowledge(row.id, reason, "failed");
         return;
@@ -3122,9 +3140,10 @@ export class Router {
     if (interrupted()) return;
     if (!this.current(activeRoute)) return;
     const parts: FilePart[] = [];
-    const notes: string[] = undelivered.length
-      ? [`${downloaded.length} of ${input.attachments.length} attachments arrived.`, ...undelivered]
-      : [];
+    const notes: string[] = [];
+    if (undelivered.length) notes.push(`${downloaded.length} of ${input.attachments.length} attachments arrived.`);
+    if (skipped.length) notes.push(`${downloaded.length} of ${input.attachments.length} files were taken in; ${input.attachments.length - downloaded.length} were not (listed below).`);
+    notes.push(...skipped, ...undelivered);
     let previewBytes = 0;
     try {
       for (const file of files) {
@@ -3137,7 +3156,15 @@ export class Router {
           if (previewBytes + size <= MAX_PREVIEW_BYTES) {
             parts.push(prepared.file);
             previewBytes += size;
-          } else notes.push("The preceding file's preview was omitted to keep native attachments within 10 MiB total. Its original remains available at the quoted path.");
+          } else {
+            // If saving the preview fails, the original remains readable by path.
+            let path: string | undefined;
+            try { path = savePreview(prepared.file, activeRoute.directory); } catch { toolError("router", "preview-save"); /* Use the original. */ }
+            if (interrupted()) return;
+            notes.push(path
+              ? `The preceding file's preview was not attached (10 MiB of previews per message); the ${prepared.file.mime === "image/jpeg" ? "JPEG " : ""}preview is at ${JSON.stringify(path)} and the original at the quoted path. Open the preview with your read tool.`
+              : "The preceding file's preview was not attached (10 MiB of previews per message), and the preview could not be saved. Open the original at the quoted path with your read tool.");
+          }
         }
       }
     } catch { toolError("router", "router.catch37");
@@ -3236,7 +3263,10 @@ export class Router {
       turn.carried = missed.map(m => m.id);
       system += `\nMissed background updates: these arrived earlier but never reached you, and the owner was told they would be picked up now. They come from the bridge, not the owner (quoted data, oldest first). Handle them alongside this message:\n${missed.map(m => JSON.stringify(m.text)).join("\n")}`;
     }
-    let body = text || (parts.length ? "Please examine the attached file(s)." : "The attached files are available at the quoted paths. Ask what I would like to do with them.");
+    let body = text || (parts.length ? "Please examine the attached file(s)." : downloaded.length
+      ? "The attached files are available at the quoted paths. Ask what I would like to do with them."
+      : skipped.length ? "The files were not taken in; please locate them as described in the incoming files notes."
+      : "The files could not be downloaded; see the incoming files notes.");
     // Judged against the thread this turn actually goes to, which may have just rotated.
     const hint = swiped ? this.swipeHint(swiped, activeRoute) : "";
     if (hint) quote = `${quote}\n${hint}`;
