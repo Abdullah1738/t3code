@@ -1713,7 +1713,7 @@ def _quoted_punctuation(source, script_literals=False):
     return "".join(output), quoted
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     written = {}
@@ -1729,7 +1729,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         variable_written.update(prior_variable)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
-    shell_values = {"HOME": str(Path.home())}
+    inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
+    shell_values = {"HOME": str(Path.home()), **inherited_values}
     path_values = {}
     live_assignments = set()
     # Script bindings keep unknown branch values, unlike the reader's lexical
@@ -1742,7 +1743,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invocation_reader_literals = set()
     invocation_quoted = set()
     uncertain_write = 0
-    unsafe_bindings = False
+    unsafe_bindings = inherited_unsafe
     # Opaque paths need a fresh, unmodified root; existing files cannot be
     # assumed replaced when a write fails or is skipped.
     fresh_variables = set()
@@ -2064,11 +2065,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if path not in paths:
             paths.append(path)
         try:
-            redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', command)
+            proof_command = command if caller_command is None else caller_command
+            redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', proof_command)
             destination = shlex.split(redirect[1]) if redirect else []
             if redirect and (len(destination) != 1 or _direct_read(['cat', destination[0]], directory)):
                 raise LiveRead('live-database-script')
-            plain = command[:redirect.start()] if redirect else command
+            plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = shlex.split(plain, comments=True)
             if invocation[:2] == ['offbox', 'run']:
                 if invocation[2:3] == ['--']:
@@ -2082,7 +2084,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
                  os.path.basename(invocation[0]) == binary and invocation[1] == value and
                  _trusted_fixture_tool(invocation[0], binary, directory) and
-                 not value.startswith(('~', '$')) and '\\\n' not in command and '\\\r\n' not in command and
+                 not value.startswith(('~', '$')) and '\\\n' not in proof_command and '\\\r\n' not in proof_command and
                  not any(os.environ.get(name) or name in shell_values for name in ('BASH_ENV', 'ENV')) and
                  not any(name.startswith('BASH_FUNC_') for name in os.environ))
         if path in written:
@@ -2141,12 +2143,20 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def scan_remote(source, directory, depth, input_words=(), input_bodies=None):
+    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
+        # offbox may fall back to running locally, so its payload keeps the
+        # caller's startup and lookup bindings (BASH_ENV, PATH, ...), and the
+        # exact-invocation proof still reads the caller's whole command.
+        environment = None
+        if inherit_environment:
+            environment = ({name: value for name, value in shell_values.items()
+                            if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
+                           unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written),
-                                  _stdin=(input_words, input_bodies or {}))
+                                  _stdin=(input_words, input_bodies or {}), _environment=environment)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
             raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
@@ -2351,7 +2361,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if words:
                     for argv in caller_argv(len(words)):
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
-                                    remote_input, remote_bodies)
+                                    remote_input, remote_bodies, inherit_environment=True)
                     if may_change_scripts(words, directory, documents):
                         changed_sources.update(written)
                         fresh_variables.clear()

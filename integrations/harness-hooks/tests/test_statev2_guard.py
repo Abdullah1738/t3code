@@ -828,6 +828,17 @@ class GuardTests(unittest.TestCase):
                         'BASH_ENV=/tmp/preload.sh offbox run --bg -- bash ' + path):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), SCRIPT)
+        # offbox can fall back to a local run, so its payload inherits the
+        # caller's startup bindings however they were set.
+        for wrapper in ('offbox run -- ', 'offbox run --bg -- ', 'offbox run --remote --no-fallback -- '):
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'ENV=/tmp/preload.sh ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'export BASH_ENV=/tmp/preload.sh; ', 'BASH_ENV=/tmp/preload.sh; export BASH_ENV; ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace '):
+                command = prefix + wrapper + 'bash ' + path
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+            with self.subTest(command=wrapper + 'bash ' + path):
+                self.assertIsNone(self.classify(wrapper + 'bash ' + path))
         with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
             self.assertEqual(self.classify('bash ' + path), SCRIPT)
             self.assertEqual(self.classify('offbox run --bg -- bash ' + path), SCRIPT)
