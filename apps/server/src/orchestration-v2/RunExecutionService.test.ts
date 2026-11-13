@@ -4381,6 +4381,49 @@ it.effect.each(["rejected", "timeout", "exit-observation-retry"] as const)(
     }),
 );
 
+it.effect("interrupts a blocked event write at the confirmed shutdown cleanup deadline", () =>
+  Effect.gen(function* () {
+    const blocked = yield* Deferred.make<void>();
+    const stopped = yield* Deferred.make<void>();
+    const writes = yield* Ref.make(0);
+    const sourceClosed = yield* Ref.make(false);
+    const result = yield* captureRootRunTermination({
+      key: "blocked-shutdown-cleanup",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 1),
+        ).pipe(Stream.ensuring(Ref.set(sourceClosed, true))),
+      ingestNormalized: (input) =>
+        Effect.gen(function* () {
+          if ((yield* Ref.updateAndGet(writes, (count) => count + 1)) === 1) {
+            return yield* new ProviderEventIngestor.ProviderEventNormalizeError({
+              providerSessionId: input.providerSessionId,
+              threadId: input.threadId,
+              providerEvent: input.event,
+              cause: "first projection failure",
+            });
+          }
+          yield* Deferred.succeed(blocked, undefined);
+          return yield* Effect.never;
+        }),
+      interruptTurn: () => Deferred.succeed(stopped, undefined).pipe(Effect.asVoid),
+      afterStart: (closed) =>
+        Effect.gen(function* () {
+          yield* Deferred.await(stopped);
+          yield* Deferred.await(blocked);
+          yield* TestClock.adjust("9 seconds");
+          assert.isFalse(yield* Deferred.isDone(closed));
+          yield* TestClock.adjust("1 second");
+          yield* Deferred.await(closed);
+        }),
+    });
+    assert.isTrue(yield* Ref.get(sourceClosed));
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
 it.effect.each(["delivered", "terminated"] as const)(
   "drains subscriber cleanup before failing ingestion after %s Stop",
   (scenario) =>

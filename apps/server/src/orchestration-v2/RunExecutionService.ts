@@ -1792,12 +1792,14 @@ export const layer: Layer.Layer<
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
-          Stream.interruptWhen(
+          Stream.runDrain,
+          // Race the consumer as a whole: a stream merge adds a handoff after every
+          // event, letting answers and native liveness run ahead of queued rows.
+          Effect.raceFirst(
             Deferred.await(shutdownCleanupDeadline).pipe(
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
             ),
           ),
-          Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {

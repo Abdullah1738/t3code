@@ -1998,13 +1998,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         native,
       });
       yield* emit({ type: "node.updated", driver, node });
+      // An answer can arrive as soon as the request is persisted; its row must already exist.
+      yield* emit({ type: "turn_item.updated", driver, turnItem: item });
       yield* emit({
         type: "runtime_request.updated",
         driver,
         threadId: turn.input.threadId,
         runtimeRequest: request,
       });
-      yield* emit({ type: "turn_item.updated", driver, turnItem: item });
       yield* setSessionStatus("waiting", null);
     });
 
@@ -3903,186 +3904,185 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     /** The thread's session, with no turn running. */
-    const idleState = (sessionId: string) =>
-      Effect.gen(function* () {
-        const state = threads.get(sessionId);
-        if (state === undefined) {
-          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-            driver: OPENCODE_PROVIDER,
-            detail: `OpenCode session ${sessionId} is not registered`,
-          });
-        }
-        if (state.active !== undefined) {
-          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-            driver: OPENCODE_PROVIDER,
-            detail: `OpenCode session ${sessionId} already has an active turn`,
-            reason: "previous_turn_active",
-          });
-        }
-        return state;
-      });
+    const idleState = Effect.fn("OpenCode2Adapter.idleState")(function* (sessionId: string) {
+      const state = threads.get(sessionId);
+      if (state === undefined) {
+        return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+          driver: OPENCODE_PROVIDER,
+          detail: `OpenCode session ${sessionId} is not registered`,
+        });
+      }
+      if (state.active !== undefined) {
+        return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+          driver: OPENCODE_PROVIDER,
+          detail: `OpenCode session ${sessionId} already has an active turn`,
+          reason: "previous_turn_active",
+        });
+      }
+      return state;
+    });
 
     /**
      * Sets up and sends a turn on a live stream. `held` is a turn installed
      * while the stream was reconnecting; it is sent only while still the
      * session's turn, and every path after this ends it with a terminal.
      */
-    const startNow = (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput, held?: ActiveTurn) =>
-      Effect.gen(function* () {
-        // Its checks and setup take the session's gate, so a rollback or
-        // fork sees either no turn or this one installed; the prompt after
-        // it does not hold the gate.
-        const started = yield* exclusive(turnInput.providerThread)(
-          Effect.gen(function* () {
-            const sessionId = yield* sessionIdOf(turnInput.providerThread);
-            const state = held === undefined ? yield* idleState(sessionId) : threads.get(sessionId);
-            if (state === undefined || (held !== undefined && state.active !== held)) return;
-            // OpenCode already ran this turn on its own; it prompts nothing.
-            if (isContinuation(turnInput)) {
-              if (held !== undefined) {
-                held.unsent = false;
-                held.parked = false;
-              }
-              return yield* runWake(state, turnInput, held);
+    const startNow = Effect.fn("OpenCode2Adapter.startNow")(function* (
+      turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+      held?: ActiveTurn,
+    ) {
+      // Its checks and setup take the session's gate, so a rollback or
+      // fork sees either no turn or this one installed; the prompt after
+      // it does not hold the gate.
+      const started = yield* exclusive(turnInput.providerThread)(
+        Effect.gen(function* () {
+          const sessionId = yield* sessionIdOf(turnInput.providerThread);
+          const state = held === undefined ? yield* idleState(sessionId) : threads.get(sessionId);
+          if (state === undefined || (held !== undefined && state.active !== held)) return;
+          // OpenCode already ran this turn on its own; it prompts nothing.
+          if (isContinuation(turnInput)) {
+            if (held !== undefined) {
+              held.unsent = false;
+              held.parked = false;
             }
-            // After a timed-out Stop the server says whether that run is gone. A
-            // run still going is stopped again and this turn fails so it can be
-            // sent again; a run that is gone may still have its end on the
-            // stream, which the turn skips.
-            const afterUnsettled = state.unsettled;
-            let stillStopping = false;
-            if (state.unsettled) {
-              const active = yield* client.session
-                .active()
-                .pipe(Effect.timeout(ACTIVE_CHECK_TIMEOUT));
-              stillStopping = sessionId in active;
-              if (stillStopping) {
-                yield* client.session
-                  .interrupt({ sessionID: Session.ID.make(sessionId) })
-                  .pipe(Effect.timeout(INTERRUPT_TIMEOUT), Effect.ignore({ log: true }));
-              } else {
-                state.unsettled = false;
-              }
-            }
-            // Installs the turn; every path after it ends the turn with a terminal.
-            if (held !== undefined) held.awaitingStart = afterUnsettled;
-            const begin =
-              held === undefined
-                ? beginTurn(state, turnInput, afterUnsettled)
-                : Effect.succeed(held);
+            return yield* runWake(state, turnInput, held);
+          }
+          // After a timed-out Stop the server says whether that run is gone. A
+          // run still going is stopped again and this turn fails so it can be
+          // sent again; a run that is gone may still have its end on the
+          // stream, which the turn skips.
+          const afterUnsettled = state.unsettled;
+          let stillStopping = false;
+          if (state.unsettled) {
+            const active = yield* client.session
+              .active()
+              .pipe(Effect.timeout(ACTIVE_CHECK_TIMEOUT));
+            stillStopping = sessionId in active;
             if (stillStopping) {
-              yield* begin;
-              return yield* finishTurn(state, {
-                status: "failed",
-                failure: makeProviderFailure({
-                  message: OPENCODE_2_STILL_STOPPING,
-                  class: "provider_error",
-                }),
-              });
+              yield* client.session
+                .interrupt({ sessionID: Session.ID.make(sessionId) })
+                .pipe(Effect.timeout(INTERRUPT_TIMEOUT), Effect.ignore({ log: true }));
+            } else {
+              state.unsettled = false;
             }
-            // A turn T3 will not run still starts and fails, so the refusal is what
-            // the user reads.
-            const model = modelRef(turnInput.modelSelection);
-            if (model === undefined) {
-              yield* begin;
-              return yield* finishTurn(state, {
-                status: "failed",
-                failure: makeProviderFailure({
-                  message: malformedModel(turnInput.modelSelection.model),
-                  class: "validation_error",
-                }),
-              });
-            }
-            // Plan mode is OpenCode's `plan` agent, switched before the rules are
-            // written so they keep that agent's own path allows. Switching to or
-            // from `plan` queues OpenCode's own "Plan mode" reminder for the prompt.
-            const agent = agentFor(turnInput);
-            if (agent !== state.agent) {
-              yield* client.session.switchAgent({
-                sessionID: Session.ID.make(sessionId),
-                agent: Agent.ID.make(agent),
-              });
-              state.agent = agent;
-            }
-            // The thread's mode may have changed since the session was loaded,
-            // and its subagents still running hold the rules they started with.
-            // Those run on whether or not this turn starts, so theirs are best effort.
-            yield* writeRules(state, turnInput.runtimePolicy);
-            // A thread renamed since the last turn, or titled after its first prompt.
-            yield* writeTitle(state, turnInput.appThread.title).pipe(
+          }
+          // Installs the turn; every path after it ends the turn with a terminal.
+          if (held !== undefined) held.awaitingStart = afterUnsettled;
+          const begin =
+            held === undefined ? beginTurn(state, turnInput, afterUnsettled) : Effect.succeed(held);
+          if (stillStopping) {
+            yield* begin;
+            return yield* finishTurn(state, {
+              status: "failed",
+              failure: makeProviderFailure({
+                message: OPENCODE_2_STILL_STOPPING,
+                class: "provider_error",
+              }),
+            });
+          }
+          // A turn T3 will not run still starts and fails, so the refusal is what
+          // the user reads.
+          const model = modelRef(turnInput.modelSelection);
+          if (model === undefined) {
+            yield* begin;
+            return yield* finishTurn(state, {
+              status: "failed",
+              failure: makeProviderFailure({
+                message: malformedModel(turnInput.modelSelection.model),
+                class: "validation_error",
+              }),
+            });
+          }
+          // Plan mode is OpenCode's `plan` agent, switched before the rules are
+          // written so they keep that agent's own path allows. Switching to or
+          // from `plan` queues OpenCode's own "Plan mode" reminder for the prompt.
+          const agent = agentFor(turnInput);
+          if (agent !== state.agent) {
+            yield* client.session.switchAgent({
+              sessionID: Session.ID.make(sessionId),
+              agent: Agent.ID.make(agent),
+            });
+            state.agent = agent;
+          }
+          // The thread's mode may have changed since the session was loaded,
+          // and its subagents still running hold the rules they started with.
+          // Those run on whether or not this turn starts, so theirs are best effort.
+          yield* writeRules(state, turnInput.runtimePolicy);
+          // A thread renamed since the last turn, or titled after its first prompt.
+          yield* writeTitle(state, turnInput.appThread.title).pipe(
+            Effect.timeout(REQUEST_REPLY_TIMEOUT),
+            Effect.ignore({ log: true }),
+          );
+          for (const call of runningCalls(state)) {
+            if (call.child === undefined) continue;
+            yield* writeRules(call.child, turnInput.runtimePolicy).pipe(
               Effect.timeout(REQUEST_REPLY_TIMEOUT),
               Effect.ignore({ log: true }),
             );
-            for (const call of runningCalls(state)) {
-              if (call.child === undefined) continue;
-              yield* writeRules(call.child, turnInput.runtimePolicy).pipe(
-                Effect.timeout(REQUEST_REPLY_TIMEOUT),
-                Effect.ignore({ log: true }),
-              );
-            }
-            // A selection changed since the last turn applies now; OpenCode keeps
-            // the session's model otherwise.
-            if (!sameModel(model, state.model)) {
-              yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
-              state.model = model;
-            }
-            // Steers a stopped turn never delivered would reach the model first,
-            // and a revert a failed rollback left staged would be committed.
-            yield* cancelStrandedSteers(state);
-            if (stagedReverts.has(sessionId)) yield* clearRevert(sessionId);
-            yield* prepareTurn(sessionId, state, turnInput);
-            const turn = yield* begin;
-            // A held turn a Stop ended during its setup sends nothing.
-            if (state.active !== turn) return;
-            turn.unsent = true;
-            turn.parked = false;
-            // An execution OpenCode is running on its own takes this prompt at
-            // its next step, so this turn is that execution from here on.
-            yield* lock.withPermit(takeRunningWake(state));
-            return { state, sessionId, turn };
+          }
+          // A selection changed since the last turn applies now; OpenCode keeps
+          // the session's model otherwise.
+          if (!sameModel(model, state.model)) {
+            yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
+            state.model = model;
+          }
+          // Steers a stopped turn never delivered would reach the model first,
+          // and a revert a failed rollback left staged would be committed.
+          yield* cancelStrandedSteers(state);
+          if (stagedReverts.has(sessionId)) yield* clearRevert(sessionId);
+          yield* prepareTurn(sessionId, state, turnInput);
+          const turn = yield* begin;
+          // A held turn a Stop ended during its setup sends nothing.
+          if (state.active !== turn) return;
+          turn.unsent = true;
+          turn.parked = false;
+          // An execution OpenCode is running on its own takes this prompt at
+          // its next step, so this turn is that execution from here on.
+          yield* lock.withPermit(takeRunningWake(state));
+          return { state, sessionId, turn };
+        }),
+      );
+      if (started === undefined) return;
+      const { state, sessionId, turn } = started;
+      turn.submitting = true;
+      yield* submit(sessionId, turnInput, state, turn).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            turn.submitting = false;
           }),
-        );
-        if (started === undefined) return;
-        const { state, sessionId, turn } = started;
-        turn.submitting = true;
-        yield* submit(sessionId, turnInput, state, turn).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              turn.submitting = false;
-            }),
-          ),
-          // Deleted outside T3: the thread is broken, and forgetting it makes
-          // the next turn resume, fail, and recreate it with a handoff.
-          Effect.catchTags({
-            SessionNotFoundError: () =>
-              finishTurn(
-                state,
-                {
+        ),
+        // Deleted outside T3: the thread is broken, and forgetting it makes
+        // the next turn resume, fail, and recreate it with a handoff.
+        Effect.catchTags({
+          SessionNotFoundError: () =>
+            finishTurn(
+              state,
+              {
+                status: "failed",
+                failure: makeProviderFailure({
+                  message:
+                    "The OpenCode session no longer exists. Send the message again to continue in a new session.",
+                  class: "provider_error",
+                }),
+              },
+              "broken",
+            ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
+        }),
+        Effect.tapError((cause) =>
+          state.active === turn
+            ? Effect.gen(function* () {
+                // Without a clear rejection the server may have taken the
+                // prompt, so the next turn checks before it prompts again.
+                if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) markUnsettled(state);
+                yield* finishTurn(state, {
                   status: "failed",
-                  failure: makeProviderFailure({
-                    message:
-                      "The OpenCode session no longer exists. Send the message again to continue in a new session.",
-                    class: "provider_error",
-                  }),
-                },
-                "broken",
-              ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
-          }),
-          Effect.tapError((cause) =>
-            state.active === turn
-              ? Effect.gen(function* () {
-                  // Without a clear rejection the server may have taken the
-                  // prompt, so the next turn checks before it prompts again.
-                  if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) markUnsettled(state);
-                  yield* finishTurn(state, {
-                    status: "failed",
-                    failure: makeProviderFailure({ cause, class: "provider_error" }),
-                  });
-                })
-              : Effect.void,
-          ),
-        );
-      });
+                  failure: makeProviderFailure({ cause, class: "provider_error" }),
+                });
+              })
+            : Effect.void,
+        ),
+      );
+    });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
       sessionUpdateFanout: "interested_threads",

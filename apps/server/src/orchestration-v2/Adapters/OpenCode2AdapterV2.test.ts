@@ -3518,6 +3518,42 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect.each(["permission", "form"] as const)(
+    "publishes the %s row before making its request answerable",
+    (kind) =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed(
+          [
+            out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+            promptAccepted,
+            kind === "permission" ? shellAskEvent : event("form.created", { form: colorForm }),
+          ],
+          { supervised: true },
+        );
+        const published = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "runtime_request.updated"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread, bigPickle, "approval-required"));
+        const events = [...(yield* Fiber.join(published))];
+        const request = events.find((event) => event.type === "runtime_request.updated");
+        assert.isDefined(request);
+        if (request?.type !== "runtime_request.updated") return;
+        const item = events.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            (event.turnItem.type === "approval_request" ||
+              event.turnItem.type === "user_input_request") &&
+            event.turnItem.requestId === request.runtimeRequest.id,
+        );
+        assert.isDefined(item, "an immediate answer must find the row it completes");
+        if (item?.type !== "turn_item.updated") return;
+        assert.equal(item.turnItem.nodeId, request.runtimeRequest.nodeId);
+        assert.equal(item.turnItem.status, "waiting");
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("ends the turn when an answer to its request cannot be delivered", () =>
     Effect.gen(function* () {
       const failedReply = reply("permission.reply", {
