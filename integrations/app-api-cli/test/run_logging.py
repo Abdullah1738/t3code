@@ -40,6 +40,12 @@ _FIXTURE_PROGRAMS = {
 _popen = subprocess.Popen
 
 def guarded_popen(command, *args, **kwargs):
+    env = kwargs.get('env', {})
+    home = Path(env.get('HOME', '/'))
+    if (not kwargs.get('shell') and command == [sys.executable, str(base / 'commerce_cli.py'), 'capabilities']
+            and 'ROBOB_TOOL_LOG_DIR' not in env
+            and home.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()) and home.is_dir()):
+        return _popen(command, *args, **kwargs)
     state = os.environ.get('CARD_STATUS_FILE')
     if (not kwargs.get('shell') and command == [sys.executable, str(base / 'card_status.py'),
             'merchant', 'set', 'boat.dev', '7572'] and state
@@ -56,11 +62,9 @@ sys.modules['keychain'] = keychain
 package = types.ModuleType('test')
 package.__path__ = [str(base / 'test')]
 sys.modules['test'] = package
-import toollog
-
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as temp, \
-            patch.object(toollog, 'root', return_value=Path(temp) / 'logs'), \
+            patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(Path(temp) / 'tools')}), \
             patch.object(socket.socket, 'connect', guarded_connect), \
             patch.object(socket.socket, 'connect_ex', guarded_connect_ex), \
             patch.object(subprocess, 'Popen', guarded_popen):

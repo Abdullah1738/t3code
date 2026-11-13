@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -18,8 +20,9 @@ class Logs(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.folder = Path(temp.name) / 'logs'
-        p = patch.object(log, 'root', return_value=self.folder)
+        self.folder = Path(temp.name) / 'logs/orders'
+        self.folder.parent.mkdir(mode=0o700)
+        p = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(self.folder.parent)})
         p.start()
         self.addCleanup(p.stop)
         log._SEEN.clear()
@@ -52,7 +55,7 @@ class Logs(unittest.TestCase):
         self.assertEqual([r['name'] for r in self.rows()], ['cmd.start','log.cap','cmd.error'])
 
     def test_retention_and_rollup_statistics(self):
-        self.folder.mkdir()
+        self.folder.mkdir(parents=True)
         today = dt.datetime.now(dt.timezone.utc).date()
         old = (today - dt.timedelta(days=31)).isoformat()
         for name in (old+'.ndjson','rollup-'+old+'.json','rollup-'+old+'.cap'):
@@ -258,7 +261,7 @@ class Logs(unittest.TestCase):
         destination=home/'.robob/logs/tools/orders'
         previous=os.umask(0o022)
         try:
-            with patch.object(log.Path,'home',return_value=home),patch.object(log,'root',return_value=destination):
+            with patch.dict(os.environ,{'ROBOB_TOOL_LOG_DIR':str(destination.parent)}):
                 log.emit('commerce','cmd.start')
             for path in [home/'.robob',home/'.robob/logs',home/'.robob/logs/tools',destination]:
                 self.assertEqual(path.stat().st_mode & 0o777,0o700,path)
@@ -354,7 +357,7 @@ class Logs(unittest.TestCase):
     def test_intraday_rollup_is_refreshed_after_more_events_arrive(self):
         now=dt.datetime.now(dt.timezone.utc)
         yesterday=(now.date()-dt.timedelta(days=1)).isoformat()
-        self.folder.mkdir()
+        self.folder.mkdir(parents=True)
         source=self.folder/(yesterday+'.ndjson')
         row={'name':'cmd.start','kind':'event'}
         source.write_text(json.dumps(row)+'\n')
@@ -375,3 +378,56 @@ class Logs(unittest.TestCase):
                 def orders(service):return {'ok':True}
                 orders(service)
                 self.assertNotIn('ids',self.rows()[-1])
+
+
+class DirectoryIsolation(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        env = patch.dict(os.environ, {'HOME': str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop('ROBOB_TOOL_LOG_DIR', None)
+
+    def test_test_runners_disable_writes_and_rollups_without_override(self):
+        for runner in ('unittest', 'pytest'):
+            with self.subTest(runner=runner), patch.dict(sys.modules):
+                sys.modules.pop('unittest', None)
+                sys.modules.pop('pytest', None)
+                sys.modules[runner] = object()
+                self.assertIsNone(log.log_dir())
+                log.emit('order-watch', 'track.add', ok=True, props={'source': 'cli'})
+                with log.deferred():
+                    log.emit('order-watch', 'track.add', ok=True)
+                self.assertIsNone(log.rollup())
+                log.previous_day_rollup()
+                self.assertFalse((self.home / '.robob/logs').exists())
+
+    def test_override_takes_precedence_over_test_runner_and_keeps_home_untouched(self):
+        base = self.home / 'explicit-tools'
+        with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(base)}):
+            log.emit('order-watch', 'track.add', ok=True, props={'source': 'phone'})
+            path, = (base / 'orders').glob('*.ndjson')
+            row, = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(row['name'], 'track.add')
+            self.assertEqual(row['props']['source'], 'phone')
+            self.assertEqual(log.rollup()['total'], 1)
+            self.assertFalse((self.home / '.robob/logs').exists())
+
+    def test_production_capabilities_subprocess_still_logs_without_override(self):
+        # Source checkouts resolve this adapter from HOME; capabilities must never call it.
+        adapter = self.home / '.local/share/app-api-cli/capture/keychain.py'
+        adapter.parent.mkdir(parents=True)
+        adapter.write_text('def load(*args, **kwargs):\n    raise AssertionError("No credentials in fixtures")\n'
+                           'store = load\n')
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / 'commerce_cli.py'), 'capabilities'],
+            env=dict(os.environ), capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path, = (self.home / '.robob/logs/tools/orders').glob('*.ndjson')
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([row['name'] for row in rows], ['cmd.start', 'cmd.end'])
+        self.assertTrue(rows[-1]['ok'])
+        for folder in ('.robob', '.robob/logs', '.robob/logs/tools', '.robob/logs/tools/orders'):
+            self.assertEqual((self.home / folder).stat().st_mode & 0o777, 0o700)
