@@ -1745,7 +1745,7 @@ const makeRoutes = Effect.gen(function* () {
       .toSorted((left, right) => (left.createdAt ?? "").localeCompare(right.createdAt ?? ""));
     yield* Effect.annotateCurrentSpan("control.returned_count", requests.length);
     return json({ ok: true, requests });
-  });
+  }, NodeSqliteClient.foregroundReads);
 
   // -- events ---------------------------------------------------------------
 
