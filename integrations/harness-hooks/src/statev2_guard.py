@@ -12,8 +12,11 @@ import stat
 import warnings
 
 
+REPLICA = re.compile(r"(?<![\w.-])\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?(?![\w./-])")
 LIVE = re.compile(
     r"(?:\.robob/userdata/statev2|robob-data/userdata/statev2|\.robob/userdata/\*\.sqlite|"
+    # Legacy names and near-misses remain protected; only the replica is public.
+    rf"(?!{REPLICA.pattern})\.robob/userdata/(?:[\w.-]+/)*state\.sqlite|"
     r"(?:\.local/share/opencode|opencode-data)/opencode\.db|"
     # The legacy home database is protected; workspace .t3 copies stay isolated.
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
@@ -153,7 +156,7 @@ def source_touches_live(source: str) -> bool:
         return True
     # Separate fixture names and prose do not make a path. Resolve only paths
     # assembled by one Python expression (including Path.home()/... chains).
-    if "statev2" not in source and "opencode.db" not in source:
+    if "statev2" not in source and "state.sqlite" not in source and "opencode.db" not in source:
         return False
     try:
         tree, aliases, bindings = _python_tree(source)
@@ -176,13 +179,13 @@ def _relative_source_live(source, directory):
     return False
 
 
-def _python_touches_live(source, directory):
+def _python_touches_live(source, directory, replica=False):
     relative_live = _relative_source_live(source, directory)
-    mentions = source_touches_live(source) or relative_live
+    mentions = source_touches_live(source) or relative_live or bool(replica and DATABASE_NAME.search(source))
     changed_directory = bool(re.search(r"\bchdir\b", source) and
-                             ("statev2.sqlite" in source or "opencode.db" in source) and
+                             ("statev2.sqlite" in source or "state.sqlite" in source or "opencode.db" in source) and
                              (relative_live or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", source)))
-    if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "opencode.db"})):
+    if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "state.sqlite", "opencode.db"})):
         return False
     try:
         tree, aliases, bindings = _python_tree(source)
@@ -1009,8 +1012,11 @@ def _fixture_shell_live(text, depth=0):
 
 
 def _source_hit(source, directory, python=False, shell=False):
+    # Keep the root evidence so the replica cannot hide a second database name.
+    replica = REPLICA.search(source)
+    source = REPLICA.sub("guard_readonly_replica", source)
     if python:
-        return _python_touches_live(source, directory)
+        return _python_touches_live(source, directory, replica=bool(replica))
     if shell:
         original = source
         source = _shell_fixture_source(source, directory)
@@ -1040,7 +1046,7 @@ def _source_hit(source, directory, python=False, shell=False):
     source = re.sub(r"(['\"])([^'\"\\\n]+)\1", isolated_literal, source)
     # A bundle id such as com.ardud.robob is not a path segment. Keep split
     # live roots conservative, including cwd changes separate from the name.
-    live_root = re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
+    live_root = replica or re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
     home_userdata = (not shell and re.search(r"\buserdata\b", source) and
                      re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
     # Shell fixture proofs above discharge statev2/opencode paths, not other
@@ -1148,6 +1154,7 @@ def _token(value):
 
 def _database_reference(source):
     # Report the operand, never the surrounding source or JSON payload.
+    source = REPLICA.sub(lambda match: " " * len(match[0]), source)
     protected = LIVE.search(source)
     if protected:
         for match in re.finditer(r"(?:~|\$\{?HOME\}?|/)[^\s'\"\\<>]*?(?:statev2\.sqlite|opencode\.db)(?:-(?:wal|shm|journal))?", source):

@@ -60,6 +60,106 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
 
+    def test_readonly_replica_scripts_and_live_near_misses(self):
+        rows = [
+            (".robob/userdata/readonly/state.sqlite", None),
+            (".robob/userdata/readonly/state.sqlite-wal", None),
+            (".robob/userdata/readonly/state.sqlite-shm", None),
+            (".robob/userdata/readonly/opencode.sqlite", None),
+            (".robob/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/statev2.sqlite-wal", SCRIPT),
+            (".robob/userdata/statev2.sqlite-shm", SCRIPT),
+            (".robob/userdata/statev2.sqlite-journal", SCRIPT),
+            ("/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/state.sqlite", SCRIPT),
+            (".local/share/opencode/opencode.db", SCRIPT),
+            (".t3/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/readonly-x/state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/../state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite/../state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite-journal", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite.bak", SCRIPT),
+        ]
+        for relative, expected in rows:
+            python = ("from pathlib import Path\nimport sqlite3\n"
+                      f"path = Path.home() / {relative!r}\n"
+                      "sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n")
+            node = ('import * as NodeOS from "node:os";\n'
+                    'import * as NodePath from "node:path";\n'
+                    'import * as NodeSqlite from "node:sqlite";\n'
+                    f'const path = NodePath.join(NodeOS.homedir(), "{relative}");\n'
+                    'new NodeSqlite.DatabaseSync(path, { readOnly: true });\n')
+            shell_path = relative if relative.startswith('/') else '~/' + relative
+            shell = f"sqlite3 -readonly {shell_path} 'select 1'\n"
+            for extension, interpreter, stdin_flags, source in [
+                ('py', 'python3 -I', '-', python),
+                ('ts', 'node', '--input-type=module', node),
+                ('mjs', 'node', '--input-type=module', node),
+                ('sh', 'bash', '', shell),
+            ]:
+                with self.subTest(path=relative, extension=extension):
+                    script = self.write('tmp/replica-probe.' + extension, source)
+                    self.assertEqual(self.classify(f'{interpreter} {shlex.quote(str(script))} --thread-id x'), expected)
+                    inline = f"{interpreter} {stdin_flags} <<'PROBE'\n{source}PROBE\n"
+                    self.assertEqual(self.classify(inline), READ if expected else None)
+            with self.subTest(path=relative, entry='sqlite3'):
+                self.assertEqual(self.classify(shell), READ if expected else None)
+
+    def test_readonly_replica_python_split_path_parts(self):
+        for parts, expected in [
+            (['.robob', 'userdata', 'readonly', 'state.sqlite'], None),
+            (['.robob', 'userdata', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'readonly', '..', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'readonly-x', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'statev2.sqlite'], SCRIPT),
+            (['.local', 'share', 'opencode', 'opencode.db'], SCRIPT),
+            (['.t3', 'userdata', 'statev2.sqlite'], SCRIPT),
+        ]:
+            # Every grouping of adjacent segments: one suffix, all split, and
+            # partial suffixes such as '.robob/userdata' / 'readonly' / name.
+            for boundaries in range(1 << (len(parts) - 1)):
+                grouped = [parts[0]]
+                for index, part in enumerate(parts[1:]):
+                    if boundaries & (1 << index):
+                        grouped.append(part)
+                    else:
+                        grouped[-1] += '/' + part
+                with self.subTest(parts=grouped):
+                    expression = 'Path.home() / ' + ' / '.join(repr(part) for part in grouped)
+                    source = ('from pathlib import Path\nimport sqlite3\n'
+                              f'path = {expression}\n'
+                              "sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n")
+                    script = self.write('tmp/split-replica.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), expected)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'),
+                                     READ if expected else None)
+
+        script = self.write('tmp/split-name.py',
+                            'from pathlib import Path\nimport sqlite3\n'
+                            'path = Path.home() / ".robob" / "userdata" / ("statev2" + ".sqlite")\n'
+                            'sqlite3.connect(str(path))\n')
+        self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+
+    def test_replica_does_not_hide_another_database(self):
+        for other in ['statev2.sqlite', 'opencode.db', 'userdata/state.sqlite']:
+            for extension, interpreter, source in [
+                ('mjs', 'node',
+                 'const replica = ".robob/userdata/readonly/state.sqlite";\n'
+                 f'new Database("{other}");\n'),
+                ('py', 'python3 -I',
+                 'import sqlite3\nreplica = ".robob/userdata/readonly/state.sqlite"\n'
+                 f'sqlite3.connect({other!r})\n'),
+            ]:
+                with self.subTest(other=other, extension=extension):
+                    script = self.write('tmp/mixed-replica.' + extension, source)
+                    self.assertEqual(self.classify(f'{interpreter} {script}'), SCRIPT)
+
+    def test_database_reference_skips_replica_and_keeps_source_offset(self):
+        source = 'const replica = ".robob/userdata/readonly/state.sqlite";\nnew Database("statev2.sqlite");'
+        match = guard._database_reference(source)
+        self.assertEqual(match[0], 'statev2.sqlite')
+        self.assertEqual(match.start(), source.index('statev2.sqlite'))
+
     def test_heredoc_delimiters_follow_shell_quote_removal(self):
         rows = [
             (r'\EOF', 'EOF', True),
