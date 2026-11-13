@@ -1,6 +1,7 @@
 """Offline tests for `offbox kill <run>`, the release refusal message, and the reaper's no-box run cleanup."""
 import contextlib
 import io
+import itertools
 import os
 import signal
 import subprocess
@@ -8,10 +9,10 @@ import threading
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import ANY, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, common, lease, misc, reap, runs, start_check  # noqa: E402
+from offbox_lib import api, cli, common, home, identity, lease, misc, reap, runs, start_check  # noqa: E402
 from offbox_lib.common import now  # noqa: E402
 
 from test_capacity import Isolated  # noqa: E402
@@ -23,6 +24,12 @@ class KillRunTests(Isolated):
         # The fake boxes have no start claim: the SSH check fences any late start by default.
         self.start_check = self.stack.enter_context(patch.object(start_check, 'check',
                                                                 return_value=start_check.Result('fenced')))
+        self.elapsed = 0.0
+        self.stack.enter_context(patch.object(misc, 'monotonic', side_effect=lambda: self.elapsed, create=True))
+        self.sleep = self.stack.enter_context(patch.object(misc, 'sleep', side_effect=self.advance, create=True))
+
+    def advance(self, seconds):
+        self.elapsed += seconds
 
     def run_row(self, rid='run-1', box='bx_1', pid=42, status='running', mode='fg', start=None, error=None,
                 client=None, owner=None, remote_dir=None, claim=True):
@@ -39,7 +46,7 @@ class KillRunTests(Isolated):
     def patched_kill(self, kill_side_effect=None, status_values=(None,)):
         """Patch the boat calls kill_run uses; returns (kill_mock, status_mock) for assertions."""
         kill = patch.object(api, 'cmd_kill', side_effect=kill_side_effect, return_value={})
-        st = patch.object(api, 'cmd_status', side_effect=list(status_values))
+        st = patch.object(api, 'cmd_status', side_effect=itertools.chain(status_values, itertools.repeat(status_values[-1])))
         self.stack.enter_context(patch.object(lease, 'touch'))
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
         km = self.stack.enter_context(kill)
@@ -57,6 +64,118 @@ class KillRunTests(Isolated):
         self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
         self.assertIn('bx_1', out.getvalue())
         self.assertIn('offbox release', out.getvalue())
+        sm.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_home_kill_waits_for_delayed_stop_and_clears_quarantine(self):
+        self.run_row()
+        self.con.execute("UPDATE runs SET command_id='cmd-42'")
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('start_unknown:run-1','bx_1')")
+        self.con.commit()
+        km, sm = self.patched_kill()
+        def status(*args, **kwargs):
+            return {'running': self.elapsed < 15, 'commandId': 'cmd-42'}
+        sm.side_effect = status
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(misc.kill_run('run-1'), 0)
+        self.assertGreaterEqual(self.elapsed, 15)
+        self.assertLessEqual(self.elapsed, 17)
+        km.assert_called_once_with('bx_1', 42)
+        self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
+        self.assertIsNone(self.con.execute("SELECT 1 FROM kv WHERE k='start_unknown:run-1'").fetchone())
+        self.assertEqual(err.getvalue().count('waiting up to 40 s'), 1)
+
+    def test_kill_404_on_third_poll_confirms_stop(self):
+        self.run_row()
+        km, sm = self.patched_kill(status_values=({'running': True}, {'running': True}, None))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-1'), 0)
+        self.assertEqual(sm.call_count, 3)
+        self.assertEqual(self.elapsed, 2)
+        km.assert_called_once_with('bx_1', 42)
+        self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
+
+    def test_lost_mid_poll_keeps_existing_confirmation_rules(self):
+        for i, confirmation in enumerate(({'running': False, 'status': 'lost'}, None,
+                                          api.OffboxError('confirmation failed'))):
+            with self.subTest(confirmation=confirmation):
+                rid = f'run-lost-{i}'
+                self.run_row(rid)
+                km, sm = self.patched_kill(status_values=({'running': True}, {'status': 'lost', 'running': False}))
+                with patch.object(runs, 'confirmed_lost', side_effect=(
+                        confirmation if isinstance(confirmation, Exception) else None),
+                        return_value=confirmation) as confirm, contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    expected = 0 if isinstance(confirmation, dict) else 1
+                    self.assertEqual(misc.kill_run(rid), expected)
+                self.assertEqual(sm.call_count, 2)
+                self.assertEqual(confirm.call_args.args, ('bx_1', rid))
+                self.assertLessEqual(confirm.call_args.kwargs['timeout'], 39)
+                km.assert_called_once_with('bx_1', 42)
+                self.assertEqual(self.status_of(rid)['status'], 'running' if expected else 'killed')
+
+    def test_status_errors_are_retried_until_stop(self):
+        self.run_row()
+        km, sm = self.patched_kill(status_values=(api.OffboxError('GET one'), api.OffboxError('GET two'),
+                                                  {'running': False}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-1'), 0)
+        self.assertEqual(sm.call_count, 3)
+        self.assertEqual(self.elapsed, 2)
+        km.assert_called_once_with('bx_1', 42)
+        self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
+
+    def test_kill_rerun_settles_after_previous_confirmation_timed_out(self):
+        self.run_row()
+        km, sm = self.patched_kill(status_values=({'running': True},))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-1'), 1)
+            self.assertEqual(self.status_of('run-1')['status'], 'running')
+            elapsed = self.elapsed
+            self.sleep.reset_mock()
+            sm.side_effect = None
+            sm.return_value = {'running': False}
+            sm.reset_mock()
+            self.assertEqual(misc.kill_run('run-1'), 0)
+        self.assertEqual(self.elapsed, elapsed)
+        self.sleep.assert_not_called()
+        sm.assert_called_once()
+        self.assertEqual(km.call_args_list, [call('bx_1', 42), call('bx_1', 42)])
+        self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
+
+    def test_cli_still_running_returns_failure_after_bound(self):
+        self.run_row(owner=self.me['owner'])
+        km, sm = self.patched_kill(status_values=({'running': True},))
+        err = io.StringIO()
+        with patch.object(identity, 'whoami', return_value=dict(self.me, proven=True)), \
+                patch.object(home, 'person_gate'), patch.object(cli, 'log'), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(['kill', 'run-1']), 1)
+        self.assertEqual(self.elapsed, 40)
+        self.assertEqual(self.status_of('run-1')['status'], 'running')
+        self.assertIn('still reports it running after 40 s', err.getvalue())
+        self.assertIn('offbox kill run-1` (safe to repeat)', err.getvalue())
+        self.assertIn('offbox logs run-1', err.getvalue())
+        km.assert_called_once_with('bx_1', 42)
+        self.assertGreater(sm.call_count, 1)
+        for poll in sm.call_args_list:
+            self.assertEqual(poll.kwargs['retries'], 0)
+            self.assertLessEqual(poll.kwargs['timeout'], 5)
+
+    def test_slow_get_errors_cannot_extend_confirmation_bound(self):
+        self.run_row()
+        _, sm = self.patched_kill()
+        def timeout(*args, **kwargs):
+            self.advance(kwargs['timeout'])
+            raise api.OffboxError('GET timed out')
+        sm.side_effect = timeout
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(misc.kill_run('run-1'), 1)
+        self.assertEqual(self.elapsed, 40)
+        self.assertEqual(self.status_of('run-1')['status'], 'running')
+        self.assertIn('could not read process', err.getvalue())
+        self.assertIn('GET timed out', err.getvalue())
 
     def test_kill_status_none_counts_as_confirmed(self):
         self.run_row()
@@ -77,14 +196,21 @@ class KillRunTests(Isolated):
 
     def test_status_error_leaves_row_running(self):
         self.run_row()
-        self.patched_kill(status_values=(api.OffboxError('status boom'),))
-        with contextlib.redirect_stderr(io.StringIO()):
+        km, sm = self.patched_kill(status_values=(api.OffboxError('status boom'),))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
             self.assertEqual(misc.kill_run('run-1'), 1)
+        self.assertEqual(self.elapsed, 40)
+        self.assertGreater(sm.call_count, 1)
+        km.assert_called_once_with('bx_1', 42)
+        self.assertIn('could not read process', err.getvalue())
+        self.assertIn('status boom', err.getvalue())
         self.assertEqual(self.status_of('run-1')['status'], 'running')
 
     def test_empty_or_unknown_status_never_marks_killed(self):
         # An empty successful response ({}) or one without a running field is not proof the process stopped.
-        for i, bogus in enumerate(({}, {'status': 'running'}, {'exitCode': 143})):
+        for i, bogus in enumerate(({}, {'status': 'running'}, {'exitCode': 143},
+                                   {'running': 0}, {'running': None}, {'running': 'false'})):
             with self.subTest(status=bogus):
                 rid = f'run-bogus-{i}'
                 self.run_row(rid)
@@ -93,7 +219,8 @@ class KillRunTests(Isolated):
                 with contextlib.redirect_stderr(err):
                     self.assertEqual(misc.kill_run(rid), 1)
                 self.assertEqual(self.status_of(rid)['status'], 'running')
-                self.assertIn('returned no clear running state', err.getvalue())
+                self.assertIn('row left as running', err.getvalue())
+                self.assertEqual(self.elapsed, 40 * (i + 1))
 
     def test_delete_error_then_404_confirms_stop(self):
         # DELETE timed out but the process is gone: the follow-up GET returning 404 is the accepted confirmation.
@@ -198,7 +325,8 @@ class KillRunTests(Isolated):
                 patch.object(misc, '_stop_run_client', side_effect=stop), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(misc.kill_run('run-1'), 0)
         km.assert_called_once_with('bx_1', 99)
-        self.assertEqual(sm.call_args_list, [call('bx_1', 99), call('bx_1', 99)])
+        self.assertEqual(sm.call_args_list, [call('bx_1', 99),
+                                            call('bx_1', 99, timeout=5, retries=0, deadline=ANY)])
         self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
 
     def test_prestart_settlement_is_guarded_against_late_process_id(self):
@@ -219,7 +347,8 @@ class KillRunTests(Isolated):
                 patch.object(misc, '_run_row', side_effect=read_then_start), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(misc.kill_run('run-1'), 0)
         km.assert_called_once_with('bx_1', 99)
-        self.assertEqual(sm.call_args_list, [call('bx_1', 99), call('bx_1', 99)])
+        self.assertEqual(sm.call_args_list, [call('bx_1', 99),
+                                            call('bx_1', 99, timeout=5, retries=0, deadline=ANY)])
         self.assertIsNone(read('run-1')['error'])
 
     def test_prestart_client_handler_settles_first(self):
