@@ -381,10 +381,13 @@ class BackgroundRetryTests(Isolated):
                          "VALUES ('run-forward','worker','bg','starting',?,?)", (common.now(), os.getpid()))
         with patch.object(common, 'db_path_for', return_value=boat_path):
             home._forward_background('run-forward')
-            self.assertTrue(common._known('boat', 'run-forward'))
+            self.assertTrue(common._known('boat', 'run-forward', suffix=False))
+            self.assertFalse(common._known('boat', 'forward', suffix=False))
+            self.assertTrue(common._known('boat', 'forward', suffix=True))
         self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-forward'").fetchone()[0], 'forwarded')
         with patch.object(common, 'db_path_for', return_value=common.DB_PATH):
-            self.assertFalse(common._known('server', 'run-forward'))
+            self.assertFalse(common._known('server', 'run-forward', suffix=False))
+            self.assertFalse(common._known('server', 'forward', suffix=True))
         with patch.object(misc.subprocess, 'call', return_value=7) as forward, \
                 patch.object(runs, 'restore_run_state', side_effect=AssertionError('receipt belongs to Boat')):
             self.assertEqual(misc.wait('run-forward', 3), 7)
@@ -397,6 +400,95 @@ class BackgroundRetryTests(Isolated):
             self.assertEqual(forward.call_args.args[0][-3:], ['logs', 'run-forward', '--follow'])
             self.assertEqual(misc.kill_run('run-forward'), 7)
             self.assertEqual(forward.call_args.args[0][-2:], ['kill', 'run-forward'])
+
+
+class BackgroundFailoverTests(Isolated):
+    guard_home_failover = False
+
+    def test_both_backends_down_keeps_detached_run_pending_on_home_with_same_id(self):
+        a = cli.build_parser().parse_args(['run', '--bg', '--', 'proof'])
+        a.steps = []
+        a.argv = ['run', '--bg', '--', 'proof']
+        attempts = []
+        def start(runner):
+            runner.register_pending()
+            attempts.append(runner.run_id)
+            if len(attempts) == 1:
+                raise api.ApiError(503, 'server_not_ready', 'waiting for home')
+            runner.box, runner.pid, runner.started = 'home-box', 42, True
+            runner.record(box_id='home-box', process_id=42, status='running')
+        def waiting(*args):
+            row = self.con.execute("SELECT * FROM runs WHERE run_id='run-stays-home'").fetchone()
+            self.assertEqual((row['status'], row['box_id'], row['process_id']), ('starting', None, None))
+            self.assertEqual(os.environ[runs.BACKGROUND_RUN_ENV], 'run-stays-home')
+            self.assertEqual(common.backend(), 'server')
+            forward.assert_not_called()
+            execute.assert_not_called()
+            return True
+        def probe(name, timeout):
+            return 'no answer' if name == 'boat' else None
+        with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: 'run-stays-home'}), \
+                patch.object(common, '_BACKEND', 'server'), patch.object(api, 'BACKEND', 'server'), \
+                patch.object(home, 'may_fail_over', return_value=True), patch.object(home, 'active', return_value=True), \
+                patch.object(common, 'person', return_value=None), patch.object(home, 'probe', return_value=None), \
+                patch.object(api, 'probe_backend', side_effect=probe) as probes, \
+                patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
+                patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
+                patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(runs.background_client(a, self.me), 0)
+        self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])
+        self.assertEqual([call.args[0] for call in probes.call_args_list], ['server', 'boat'])
+        wait.assert_called_once()
+        forward.assert_not_called()
+        execute.assert_not_called()
+        self.assertIn("Boat's API is unavailable too; keeping this run on home", err.getvalue())
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM runs').fetchone()[0], 1)
+
+    def test_forwarding_happens_only_after_boat_answers(self):
+        class Moved(Exception):
+            pass
+        for index, answer in enumerate((None, 'no answer', 'HTTP 503')):
+            rid = f'run-probe-{index}'
+            self.con.execute("INSERT INTO runs(run_id,owner,mode,status,start_at,client_pid) "
+                             "VALUES (?,'worker','bg','starting',?,?)", (rid, common.now(), os.getpid()))
+            moved = []
+            def forward(run):
+                self.assertEqual(probe.call_count, 1)
+                moved.append(('forward', run))
+            def execute(*args):
+                self.assertEqual(moved, [('forward', rid)])
+                raise Moved()
+            with self.subTest(answer=answer), patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: rid}), \
+                    patch.object(api, 'probe_backend', return_value=answer) as probe, \
+                    patch.object(home, 'record_failure') as record, \
+                    patch.object(home, '_forward_background', side_effect=forward) as forwarded, \
+                    patch.object(os, 'execve', side_effect=execute) as executed, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                if answer is None:
+                    with self.assertRaises(Moved):
+                        home.fail_over('home unavailable', ['run', '--bg', '--', 'proof'], rid)
+                    forwarded.assert_called_once_with(rid)
+                    executed.assert_called_once()
+                else:
+                    self.assertFalse(home.fail_over('home unavailable', ['run', '--bg', '--', 'proof'], rid))
+                    forwarded.assert_not_called()
+                    executed.assert_not_called()
+                    row = self.con.execute('SELECT status FROM runs WHERE run_id=?', (rid,)).fetchone()
+                    self.assertEqual(row[0], 'starting')
+                probe.assert_called_once_with('boat', home.PROBE_TIMEOUT_S)
+                record.assert_called_once_with('home unavailable', rid)
+
+    def test_exact_and_suffix_lookup_both_filter_forwarded_rows(self):
+        for status in ('starting', 'forwarded', None):
+            self.con.execute('DELETE FROM runs')
+            self.con.execute("INSERT INTO runs(run_id,mode,status) VALUES ('run-routing','bg',?)", (status,))
+            for ident, suffix, match in (('run-routing', False, True), ('run-routing', True, True),
+                                         ('routing', False, False), ('routing', True, True),
+                                         ('missing', False, False), ('missing', True, False)):
+                with self.subTest(status=status, ident=ident, suffix=suffix), \
+                        patch.object(common, 'db_path_for', return_value=common.DB_PATH):
+                    self.assertEqual(common._known('server', ident, suffix=suffix), match and status != 'forwarded')
 
 
 if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--fixture':
