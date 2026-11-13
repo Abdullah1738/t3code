@@ -93,9 +93,6 @@ const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
 const MAX_WAIT_MS = 60 * 60 * 1000;
 
-// ---------------------------------------------------------------------------
-// Errors and responses
-// ---------------------------------------------------------------------------
 
 type ControlErrorCode =
   | "unauthorized"
@@ -188,9 +185,6 @@ const errorResponse = (error: ControlError) => {
     : response;
 };
 
-// ---------------------------------------------------------------------------
-// Request helpers
-// ---------------------------------------------------------------------------
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
@@ -238,9 +232,6 @@ const clampInt = (raw: string | null, fallback: number, max: number) => {
 const boolParam = (raw: string | null): boolean | undefined =>
   raw === null ? undefined : raw === "" || raw === "1" || raw === "true";
 
-// ---------------------------------------------------------------------------
-// Bodies
-// ---------------------------------------------------------------------------
 
 const OptionalString = Schema.optional(Schema.String);
 const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
@@ -365,9 +356,6 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-// ---------------------------------------------------------------------------
-// Event projection for SSE
-// ---------------------------------------------------------------------------
 
 export type ControlEvent =
   | {
@@ -464,9 +452,6 @@ const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
   `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
 
 const makeRoutes = Effect.gen(function* () {
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
@@ -701,7 +686,6 @@ const makeRoutes = Effect.gen(function* () {
     };
   });
 
-  // -- projects -------------------------------------------------------------
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -781,7 +765,6 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  // -- threads --------------------------------------------------------------
 
   const resolveProject = Effect.fn("ControlHttp.resolveProject")(function* (
     body: typeof CreateThreadBody.Type,
@@ -1752,7 +1735,6 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, requests });
   }, NodeSqliteClient.foregroundReads);
 
-  // -- events ---------------------------------------------------------------
 
   const events = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
