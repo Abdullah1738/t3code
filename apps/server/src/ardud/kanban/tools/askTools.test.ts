@@ -79,6 +79,7 @@ const testLayer = () => {
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: (threadId) =>
         Effect.succeed({
           threadId,
@@ -88,6 +89,7 @@ const testLayer = () => {
           updatedAt: "2026-11-10T08:00:00.000Z",
           quietSince: "2026-11-10T08:00:00.000Z",
           runStartedAt: null,
+          lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],
@@ -97,10 +99,12 @@ const testLayer = () => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
       send: () => Effect.void,
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,

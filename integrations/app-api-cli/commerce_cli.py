@@ -281,8 +281,11 @@ def prepared_result(flow, prepared):
             or not prepared['readback']):
         journal.fail('PREPARE_ONLY_READBACK_UNCONFIRMED')
     from commerce_pending import warnings
+    import owner_go
     pending = warnings(flow.flow_id)
+    approval_item=owner_go.commerce_item(journal.binding(flow.flow_id))
     return {**prepared,**({'warnings':pending} if pending else {}),'ok':True,'state':'PREPARED_NOT_ORDERED',
+            'owner_go_item':approval_item,
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 

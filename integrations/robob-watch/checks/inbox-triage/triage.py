@@ -332,7 +332,7 @@ def money_books(wd, mc, dry=False):
     data = wd / ('scratch-renewals' if dry else 'scratch-money')
     if not data.exists():
         data.mkdir(mode=0o700, parents=True)
-        for name in ('cases.json', 'questions.json', 'cards.json'):
+        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
             if (mc.DATA / name).exists():
                 shutil.copy2(mc.DATA / name, data / name)
     return data
@@ -893,6 +893,19 @@ def live_work(now):
     return work
 
 
+def open_money_questions():
+    try:
+        result = subprocess.run([str(HOME / '.local/bin/owner-go'), 'list', '--open', '--json'],
+                                capture_output=True, text=True, timeout=3)
+        rows = json.loads(result.stdout) if result.returncode == 0 else None
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or r.get('kind') != 'ask' for r in rows):
+            return {'available': False}
+        return {'available': True, 'questions': rows}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Missing/corrupt ledger is unknown, never evidence of no pending choice.
+        return {'available': False}
+
+
 def build_context(items, watchers, now):
     tokens = set(re.findall(r'[a-z]{4,}', ' '.join(str(i.get(k, '')) for i in items for k in ('sender', 'subject', 'preview')).lower()))
     def relevance(text):
@@ -914,7 +927,8 @@ def build_context(items, watchers, now):
     if len(prefs) > PREFS_LIMIT:
         prefs = prefs[:2000] + '\n[... older rules trimmed ...]\n' + prefs[-(PREFS_LIMIT - 2100):]
     return {'preferences': clean_lines(prefs, PREFS_LIMIT), 'active_watchers': '\n'.join(descriptions)[:1100],
-            'recent_activity_newest_first': '\n'.join(recent)[:1100], 'live_work': live_work(now)}
+            'recent_activity_newest_first': '\n'.join(recent)[:1100], 'live_work': live_work(now),
+            'owner_go': open_money_questions()}
 
 
 def classify(items, context):

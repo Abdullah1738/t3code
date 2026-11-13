@@ -81,6 +81,39 @@ test("all severities stay one-way notifications without a session binding", asyn
     .toEqual([["notification", undefined, undefined], ["notification", undefined, undefined], ["notification", undefined, undefined]]);
 });
 
+test("notify strips signed links and bearer text before durable queueing", async () => {
+  const h = setup();
+  const text = 'https://example.test/view?token=private-value token=other-private eyJfake.payload.signature';
+  const response = await h.post("/notify", { ...notify, text });
+  expect(response.status).toBe(202);
+  expect(h.store.pendingOutbox()[0]?.text).toBe("[tests] https://example.test/view token=[redacted] [redacted]");
+  expect((await h.post("/notify", { ...notify, text })).status).toBe(200);
+});
+
+test("identical legacy retries compare redacted content and retain the original operation", async () => {
+  const h = setup();
+  const id = `notify:${hash(notify.dedupeKey)}`;
+  const text = "https://example.test/view?token=fake-private please answer";
+  h.store.enqueue({ id, kind: "notification", text: `[tests] ${text}` });
+  h.store.set(`api:notification:${id}`, { severity: "info" });
+  expect((await h.post("/notify", { ...notify, text })).status).toBe(200);
+  expect(h.store.pendingOutbox()).toHaveLength(1);
+  expect(h.store.getOperation(id)?.text).toBe(`[tests] ${text}`);
+  expect((await h.post("/notify", { ...notify, text: text + " changed" })).status).toBe(409);
+});
+
+test("ask and burst policy validation rejects invalid keys without consuming the first alert", async () => {
+  const h = setup();
+  for (const fields of [{ askKey: "" }, { burstKey: 5 }, { askKey: "x".repeat(201) }, { askKey: "a", burstKey: "b" }]) {
+    expect((await h.post("/notify", { ...notify, ...fields })).status).toBe(400);
+  }
+  expect((await h.post("/notify", { ...notify, askKey: "card:q1" })).status).toBe(202);
+  h.store.outboxState(`notify:${hash(notify.dedupeKey)}`, "sent");
+  expect((await h.post("/notify", { ...notify, dedupeKey: "repeat", askKey: "card:q1" })).status).toBe(200);
+  setSystemTime(now + 24 * 3_600_000);
+  expect((await h.post("/notify", { ...notify, dedupeKey: "day-later", askKey: "card:q1" })).status).toBe(202);
+});
+
 test("strict schemas reject malformed notification fields and injected properties", async () => {
   const h = setup();
   for (const changed of [

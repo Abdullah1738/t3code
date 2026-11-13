@@ -3,29 +3,8 @@
 import shlex
 from pathlib import Path
 
+from . import package_manager
 from .common import read_json
-
-
-def install_command(root_files: set[str], package_manager: str | None) -> str:
-    manager = package_manager.split("@", 1)[0] if isinstance(package_manager, str) else ""
-    if manager not in {"pnpm", "bun", "yarn", "npm"}:
-        manager = next((pm for files, pm in (({"pnpm-lock.yaml"}, "pnpm"),
-                                            ({"bun.lock", "bun.lockb"}, "bun"),
-                                            ({"yarn.lock"}, "yarn"),
-                                            ({"package-lock.json"}, "npm")) if files & root_files), "npm")
-    return {"pnpm": "pnpm install --frozen-lockfile", "bun": "bun install",
-            "yarn": "yarn install --frozen-lockfile",
-            "npm": "npm ci" if "package-lock.json" in root_files else "npm install"}[manager]
-
-
-def repo_install(root: Path) -> str:
-    manifest = read_json(root / "package.json", {})
-    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
-    try:
-        files = {p.name for p in root.iterdir()}
-    except OSError:
-        files = set()
-    return install_command(files, manager)
 
 
 # Include absent bin directories and disable hashing so installs cannot leave a
@@ -127,7 +106,7 @@ def block(rdir: str, root: Path | None = None) -> str:
         if isinstance(manifest, dict) and any(isinstance(manifest.get(key), dict) and package in manifest[key]
                                               for key in ("dependencies", "devDependencies")):
             message = (f"offbox: {tool} is a repo-local tool ({package}) and node_modules isn't installed on this box yet. "
-                       f"Run: offbox run -- sh -c '{repo_install(root)} && <your command>'")
+                       f"Run: offbox run -- sh -c '{package_manager.install_command(root)} && <your command>'")
             cases.append(f"      {tool}) printf '%s\\n' {shlex.quote(message)} >&2; return 127 ;;")
     # Let Bash identify the failed command, including assignments and cd/--step forms.
     # No preflight may reject a tool that an earlier command in this run installs.

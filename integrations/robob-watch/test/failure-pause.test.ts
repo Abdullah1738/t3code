@@ -69,22 +69,34 @@ const opt = (args: string[], key: string) => args[args.indexOf(key) + 1]!;
 
 test("a: five failures pause checks and send exactly one pause notice", async () => {
   const f = fixture(); f.add("broken");
-  for (let n = 1; n <= 5; n++) await f.run("broken", s => s.consecutive_failures === n && (n < 5 || s.failure_alerted));
+  for (let n = 1; n <= 5; n++) await f.run("broken", s => s.consecutive_failures === n && s.failure_alerted);
   expect(f.state("broken").failure_paused_at).toBeString(); expect(f.runs("broken")).toBe(5);
   f.save("broken", { ...f.state("broken"), next_at: 0 });
   const child = f.start(); await Bun.sleep(2_200); await f.stop(child);
-  expect(f.runs("broken")).toBe(5); expect(f.readCalls()).toHaveLength(1);
-  const text = opt(f.readCalls()[0]!.args, "--text");
+  expect(f.runs("broken")).toBe(5); expect(f.readCalls()).toHaveLength(5);
+  const text = opt(f.readCalls().at(-1)!.args, "--text");
   expect(text).toContain('Watcher "broken" paused after 5 failures'); expect(text).toContain("robob-watch resume broken"); expect(text).not.toContain("backing off");
   for (const args of [["list"], ["show", "broken"]]) expect(f.cli(...args).stdout.toString()).toContain("paused (failing since");
 }, 20_000);
 
 test("b: success after four failures resets the streak", async () => {
   const f = fixture(); f.add("recover", { check: 'echo run >> "$WATCH_DIR/runs"; [[ $(wc -l < "$WATCH_DIR/runs") -gt 4 ]]' });
-  for (let n = 1; n <= 4; n++) await f.run("recover", s => s.consecutive_failures === n);
+  for (let n = 1; n <= 4; n++) await f.run("recover", s => s.consecutive_failures === n && s.failure_alerted);
   await f.run("recover", s => s.consecutive_failures === 0);
-  expect(f.runs("recover")).toBe(5); expect(f.state("recover").failure_paused_at).toBeUndefined(); expect(f.state("recover").failing_since).toBeUndefined(); expect(f.readCalls()).toHaveLength(0);
+  expect(f.runs("recover")).toBe(5); expect(f.state("recover").failure_paused_at).toBeUndefined(); expect(f.state("recover").failing_since).toBeUndefined(); expect(f.readCalls()).toHaveLength(4);
+  expect(f.readCalls().every(call => opt(call.args, "--burst-key") === "watcher-failure:recover")).toBe(true);
 }, 20_000);
+
+test("one failed check followed by recovery still alerts on the first failure", async () => {
+  const f = fixture();
+  f.add("once", { check: 'echo run >> "$WATCH_DIR/runs"; [[ $(wc -l < "$WATCH_DIR/runs") -gt 1 ]]' });
+  await f.run("once", s => s.consecutive_failures === 1 && s.failure_alerted);
+  expect(f.readCalls()).toHaveLength(1);
+  expect(opt(f.readCalls()[0]!.args, "--burst-key")).toBe("watcher-failure:once");
+  await f.run("once", s => s.consecutive_failures === 0);
+  expect(f.readCalls()).toHaveLength(1);
+  expect(f.state("once").failure_paused_at).toBeUndefined();
+});
 
 test("c: resume clears failure state and a new streak gets a new notice key", async () => {
   const f = fixture(); f.add("resume", { max_consecutive_failures: 1 });
@@ -98,11 +110,11 @@ test("c: resume clears failure state and a new streak gets a new notice key", as
   const keys = f.readCalls().map(c => opt(c.args, "--key")); expect(keys).toHaveLength(2); expect(keys[0]).not.toBe(keys[1]);
 });
 
-test("d: zero threshold keeps backoff and the original one-time alert", async () => {
+test("d: zero threshold keeps backoff and admits every failure to one burst source", async () => {
   const f = fixture(); f.add("retry", { max_consecutive_failures: 0 });
-  for (let n = 1; n <= 6; n++) await f.run("retry", s => s.consecutive_failures === n && (n < 5 || s.failure_alerted));
-  expect(f.state("retry").failure_paused_at).toBeUndefined(); expect(f.readCalls()).toHaveLength(1);
-  expect(opt(f.readCalls()[0]!.args, "--text")).toContain("has failed 5 times in a row (0 min) and is backing off.");
+  for (let n = 1; n <= 6; n++) await f.run("retry", s => s.consecutive_failures === n && s.failure_alerted);
+  expect(f.state("retry").failure_paused_at).toBeUndefined(); expect(f.readCalls()).toHaveLength(6);
+  expect(opt(f.readCalls()[0]!.args, "--text")).toContain("has failed 1 time in a row (0 min) and is backing off.");
 }, 20_000);
 
 test("e: failed sends leave a pause and retry the same notice after restart", async () => {
@@ -126,9 +138,9 @@ test("f/g: maintenance holds checks and pending deliveries, then expiry or off r
   const child = f.start(); await until(() => f.runs("plain") === 1); await Bun.sleep(1_100);
   expect(f.runs("ssd")).toBe(0); expect(f.state("ssd")).toEqual(held); expect(f.state("pending").pending?.key).toBe("held-event"); expect(f.readCalls()).toHaveLength(0);
   writeFileSync(join(f.root, "maintenance.json"), JSON.stringify({ until: new Date(0).toISOString(), reason: "past", depends: ["ssd"] }));
-  await until(() => f.runs("ssd") === 1 && f.state("pending").fires === 1); await f.stop(child);
+  await until(() => f.runs("ssd") === 1 && f.state("ssd").failure_alerted && f.state("pending").fires === 1); await f.stop(child);
   const logs = f.readLog(child); expect(logs.match(/maintenance started/g)).toHaveLength(1); expect(logs.match(/maintenance ended/g)).toHaveLength(1);
-  expect(f.readCalls()).toHaveLength(1); expect(opt(f.readCalls()[0]!.args, "--key")).toBe("held-event");
+  expect(f.readCalls()).toHaveLength(2); expect(f.readCalls().some(call => opt(call.args, "--key") === "held-event")).toBe(true);
   expect(f.cli("maintenance", "on", "--for", "1h").exitCode).toBe(0); expect(f.cli("maintenance", "off").exitCode).toBe(0);
   await f.run("ssd", s => s.consecutive_failures === 5 && s.failure_alerted); expect(f.runs("ssd")).toBe(2);
 }, 20_000);
@@ -179,14 +191,14 @@ test("resume during a slow notice send cannot restore the old pause", async () =
   expect(f.state("race").failure_paused_at).toBeUndefined();
 });
 
-test("a higher threshold sends no backing-off alert before the pause", async () => {
+test("a higher pause threshold still admits early failures to the burst", async () => {
   const f = fixture(); f.add("eight", { max_consecutive_failures: 8 });
   f.save("eight", { ...f.state("eight"), consecutive_failures: 4, failing_since: new Date().toISOString() });
   for (let n = 5; n <= 8; n++) {
-    await f.run("eight", s => s.consecutive_failures === n && (n < 8 || s.failure_alerted));
-    expect(f.readCalls()).toHaveLength(n === 8 ? 1 : 0);
+    await f.run("eight", s => s.consecutive_failures === n && s.failure_alerted);
+    expect(f.readCalls()).toHaveLength(n - 4);
   }
-  expect(opt(f.readCalls()[0]!.args, "--text")).toContain("paused after 8 failures");
+  expect(opt(f.readCalls().at(-1)!.args, "--text")).toContain("paused after 8 failures");
 });
 
 

@@ -25,6 +25,7 @@ import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
+import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
 import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
 import {
@@ -398,31 +399,6 @@ const cardIds = (
       );
 
 const SEARCH_LIMIT = 20;
-
-const isCardNumber = (card: KanbanCard, query: string) => {
-  const trimmed = query.trim();
-  return /^#?\d+$/.test(trimmed) && card.number === Number(trimmed.replace("#", ""));
-};
-
-/**
- * Every word must appear in the card's text; a lone "#12" (or "12") also finds
- * card 12, which sorts first so the limit never cuts it for #120 and friends.
- */
-const cardMatches = (card: KanbanCard, query: string) => {
-  const trimmed = query.trim().toLowerCase();
-  if (!trimmed) return true;
-  if (isCardNumber(card, trimmed)) return true;
-  const text = [
-    `#${card.number}`,
-    card.title,
-    card.description,
-    card.prompt,
-    ...card.links.flatMap((link) => [link.url, link.label ?? ""]),
-  ]
-    .join("\n")
-    .toLowerCase();
-  return trimmed.split(/\s+/).every((word) => text.includes(word));
-};
 
 const handlers = {
   board_get: McpToolAccess.readsAsCaller((input) =>
@@ -976,9 +952,9 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
-        const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
-        const model = input.model ? yield* modelOf(input.model, apply) : undefined;
-        const models = yield* modelsOf(input.models, apply);
+        // Keep the requested harness visible so editCard can reject a routing rewrite.
+        const model = input.model ? yield* modelOf(input.model, false) : undefined;
+        const models = yield* modelsOf(input.models, false);
         const edited = yield* service.editCard(
           card.id,
           {
@@ -1178,6 +1154,18 @@ const handlers = {
             ancestors,
           ),
         };
+      }),
+    ),
+  ),
+
+  report_bug: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      service.reportBug({
+        boardId: input.boardId,
+        title: input.title,
+        evidence: input.evidence,
+        cardHint: input.cardHint,
+        threadId: caller.threadId,
       }),
     ),
   ),

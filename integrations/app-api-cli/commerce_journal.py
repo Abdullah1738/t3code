@@ -5,6 +5,7 @@ An unknown send remains consumed on its flow; new noon flows remain independent.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import owner_go
 from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
@@ -407,6 +408,11 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                     order_card.require_purchase_fallback()
                 except RuntimeError as exc:
                     fail(str(exc))
+            try:
+                owner_go.require(vendor=flow['app'], item=owner_go.commerce_item(flow),
+                                 amount=payable_minor, currency='AED')
+            except owner_go.ApprovalError:
+                fail('OWNER_GO_REQUIRED')
         if financial and flow['app'] == 'noon':
             from commerce_pending import require_acknowledged
             require_acknowledged(db, flow)

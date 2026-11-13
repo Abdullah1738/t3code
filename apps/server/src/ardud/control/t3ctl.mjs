@@ -9,6 +9,7 @@ import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
+import { deepHealth } from "./deep-health.mjs";
 
 // Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
 export function ignoreMacosTypeOfServiceEinval(
@@ -36,7 +37,7 @@ const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
 const HELP = `t3ctl <command> [options]
 
   login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
-  health                               check the connection and token
+  health [--deep] [--json]              connection/token; deep: lag + real state read (10s bound)
   live SHA-OR-REF [--repo PATH]        check whether a commit is in the running build
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
@@ -87,7 +88,10 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
   } catch {
     return { commit, buildCommit: null, live: null, reason: "health unavailable" };
   }
-  if (response?.ok !== true || response?.status !== "healthy") {
+  if (
+    response?.ok !== true ||
+    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
+  ) {
     return { commit, buildCommit: null, live: null, reason: "invalid health response" };
   }
   const buildCommit = response.buildCommit;
@@ -276,6 +280,8 @@ async function main() {
       types: { type: "string" },
       after: { type: "string" },
       text: { type: "boolean" },
+      deep: { type: "boolean" },
+      json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -353,8 +359,14 @@ async function main() {
       request(method, path, body, { ...options, timeoutMs: requestTimeoutMs });
   }
   switch (command) {
-    case "health":
-      return print(await client.health());
+    case "health": {
+      if (!flags.deep) return print(await client.health());
+      const report = await deepHealth({ client, timeoutMs: requestTimeoutMs });
+      if (!flags.json) console.log(report.summary);
+      print(report);
+      process.exitCode = report.exitCode;
+      return;
+    }
     case "requests":
       return print(await client.pendingRequests({ origin: flags.origin }));
     case "projects":

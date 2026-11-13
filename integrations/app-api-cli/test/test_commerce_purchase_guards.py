@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import contextlib
 import io
 import json
@@ -17,6 +18,7 @@ import order_card
 
 class PurchaseGuardTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)

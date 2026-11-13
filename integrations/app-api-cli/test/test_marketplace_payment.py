@@ -20,6 +20,7 @@ import commerce_marketplace_disposition as disposition
 import noon_marketplace_checkout as market
 import test_commerce_main_order as main
 import test_commerce_supermall_order as rocket
+from owner_go_support import approve_test_flows
 
 
 def failed_responses(order, amount):
@@ -43,6 +44,7 @@ def failed_responses(order, amount):
 
 class PaymentTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         browser = patch('commerce_redirect.open_dia', return_value=True)
         self.redirect_opener = browser.start()
         self.addCleanup(browser.stop)

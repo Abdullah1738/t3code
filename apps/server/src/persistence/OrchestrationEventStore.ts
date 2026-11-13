@@ -107,6 +107,7 @@ export class OrchestrationEventStore extends Context.Service<
         readonly threads: ReadonlyArray<{
           readonly threadId: ThreadId;
           readonly sequence: number;
+          readonly redactionSequence?: number;
         }>;
         readonly projects: ReadonlyArray<{
           readonly projectId: ProjectId;
@@ -696,8 +697,13 @@ const makeEventStore = Effect.gen(function* () {
   )(
     function* (input) {
       const maxThreads = Math.max(0, Math.floor(input.maxThreads));
-      const threads = yield* sql<{ readonly streamId: string; readonly sequence: number }>`
-        SELECT stream_id AS "streamId", MAX(sequence) AS sequence
+      const threads = yield* sql<{
+        readonly streamId: string;
+        readonly sequence: number;
+        readonly redactionSequence: number | null;
+      }>`
+        SELECT stream_id AS "streamId", MAX(sequence) AS sequence,
+          MAX(CASE WHEN event_type = 'thread.item-redacted' THEN sequence END) AS "redactionSequence"
         FROM ardud_application_history_events AS orchestration_events
         WHERE sequence > ${input.afterSequence}
           AND sequence <= ${input.throughSequence}
@@ -732,6 +738,7 @@ const makeEventStore = Effect.gen(function* () {
         threads: threads.map((row) => ({
           threadId: ThreadId.make(row.streamId),
           sequence: row.sequence,
+          ...(row.redactionSequence === null ? {} : { redactionSequence: row.redactionSequence }),
         })),
         // Same rule as replay with skipUnknownEventTypes: a row a newer build wrote is dropped.
         projects: projects.flatMap((row) =>

@@ -435,9 +435,9 @@ export async function imessage(text: string, key: string): Promise<{ ok: boolean
   return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
-export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
+export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key, ...(burstKey ? ["--burst-key", burstKey] : [])]);
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
@@ -651,7 +651,8 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
 
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
 export async function alert(watcher: Watcher, text: string, key: string, severity = "attention"): Promise<Delivery> {
-  const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity);
+  const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity,
+    severity === "error" ? `watcher-failure:${watcher.id}` : undefined);
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
@@ -661,16 +662,6 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
   return threshold > 0 && state.consecutive_failures >= threshold
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
-}
-
-/**
- * A real error alerts after FAILURE_ALERT_AFTER failures in a row. Timeouts are transient (a stalled CLI or a
- * load spike), so a run of them alerts only once it has also lasted TIMEOUT_ALERT_AFTER_MS.
- */
-export function shouldAlert(state: State, timedOut: boolean, t = now()): boolean {
-  if (state.failure_alerted || state.consecutive_failures < FAILURE_ALERT_AFTER) return false;
-  if (!timedOut) return true;
-  return t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS;
 }
 
 /**

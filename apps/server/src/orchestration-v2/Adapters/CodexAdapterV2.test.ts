@@ -2189,7 +2189,7 @@ describe("CodexAdapterV2 session initialize", () => {
                     label: "cleanup-result",
                     frame: {
                       id: injectExpected ? 4 : 3,
-                      result: {},
+                      result: { status: "unsubscribed" },
                     },
                   },
                 ]),
@@ -2280,13 +2280,17 @@ describe("CodexAdapterV2 session initialize", () => {
   );
 
   it.effect.each([
-    { operation: "start", lateReply: true },
-    { operation: "fork", lateReply: true },
-    { operation: "start", lateReply: false },
-    { operation: "fork", lateReply: false },
+    { operation: "start", lateReply: true, cleanupFailures: 0 },
+    { operation: "fork", lateReply: true, cleanupFailures: 0 },
+    { operation: "start", lateReply: false, cleanupFailures: 0 },
+    { operation: "fork", lateReply: false, cleanupFailures: 0 },
+    { operation: "start", lateReply: true, cleanupFailures: 1 },
+    { operation: "fork", lateReply: true, cleanupFailures: 1 },
+    { operation: "start", lateReply: true, cleanupFailures: 3 },
+    { operation: "fork", lateReply: true, cleanupFailures: 3 },
   ] as const)(
-    "cancels native $operation allocation with lateReply=$lateReply",
-    ({ operation, lateReply }) =>
+    "cancels native $operation allocation with lateReply=$lateReply and cleanupFailures=$cleanupFailures",
+    ({ operation, lateReply, cleanupFailures }) =>
       Effect.scoped(
         Effect.gen(function* () {
           const dispatched = yield* Deferred.make<void>();
@@ -2322,20 +2326,28 @@ describe("CodexAdapterV2 session initialize", () => {
               scenario: `cancelled-allocation-${operation}`,
               entries: [
                 ...allocation,
-                {
-                  type: "expect_outbound",
-                  label: "cleanup",
-                  frame: {
-                    id: operation === "start" ? 3 : 4,
-                    method: "thread/unsubscribe",
-                    params: { threadId: allocatedId },
-                  },
-                },
-                {
-                  type: "emit_inbound",
-                  label: "cleanup-result",
-                  frame: { id: operation === "start" ? 3 : 4, result: {} },
-                },
+                ...Array.from({ length: Math.min(cleanupFailures + 1, 3) }, (_, attempt) => {
+                  const id = (operation === "start" ? 3 : 4) + attempt;
+                  return [
+                    {
+                      type: "expect_outbound" as const,
+                      label: `cleanup-${attempt}`,
+                      frame: {
+                        id,
+                        method: "thread/unsubscribe",
+                        params: { threadId: allocatedId },
+                      },
+                    },
+                    {
+                      type: "emit_inbound" as const,
+                      label: `cleanup-result-${attempt}`,
+                      frame:
+                        attempt < cleanupFailures
+                          ? { id, error: { code: -32603, message: "transient cleanup failure" } }
+                          : { id, result: { status: "unsubscribed" } },
+                    },
+                  ];
+                }).flat(),
               ],
             }),
             (entry) =>
@@ -2343,7 +2355,7 @@ describe("CodexAdapterV2 session initialize", () => {
                 ? Deferred.succeed(dispatched, undefined).pipe(
                     Effect.andThen(Deferred.await(reply)),
                   )
-                : entry.label === "cleanup-result"
+                : entry.label === "cleanup-result-0"
                   ? Deferred.succeed(cleaned, undefined)
                   : Effect.void,
           );
@@ -2366,6 +2378,11 @@ describe("CodexAdapterV2 session initialize", () => {
           if (lateReply) {
             yield* Deferred.succeed(reply, undefined);
             yield* Deferred.await(cleaned);
+            yield* TestClock.adjust("0 millis");
+            assert.equal(
+              session.requests.filter((request) => request.method === "thread/unsubscribe").length,
+              Math.min(cleanupFailures + 1, 3),
+            );
             assert.equal(session.requests.at(-1)?.method, "thread/unsubscribe");
             assert.deepEqual(session.requests.at(-1)?.params, { threadId: allocatedId });
           }
@@ -6947,6 +6964,26 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             yield* harness.runtime.hasPendingBackgroundWorkForThread!({
               ...harness.providerThread,
               id: ProviderThreadId.make("unrelated-provider-thread"),
+            }),
+          );
+          assert.isFalse(
+            yield* harness.runtime.hasPendingBackgroundWorkForThread!({
+              ...harness.providerThread,
+              nativeThreadRef: {
+                driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                nativeId: "replacement-native-thread",
+                strength: "strong",
+              },
+            }),
+          );
+          assert.isFalse(
+            yield* harness.runtime.holdsWorkForThread!({
+              ...harness.providerThread,
+              nativeThreadRef: {
+                driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                nativeId: "replacement-native-thread",
+                strength: "strong",
+              },
             }),
           );
           if (stillRunning) {

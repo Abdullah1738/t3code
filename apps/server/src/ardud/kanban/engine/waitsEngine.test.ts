@@ -159,6 +159,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         updatedAt: iso(nowMs),
         quietSince: iso(T0),
         runStartedAt: null,
+        lastActivityAt: null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
@@ -169,11 +170,13 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
   const threadsLayer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view,
       find: view,
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {
@@ -198,8 +201,13 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         }),
       send: (input) =>
         Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
-      model: () => Effect.succeed(null),
-      setModel: () => Effect.void,
+      model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
+      withdraw: () => Effect.void,
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          const thread = threads.get(threadId);
+          if (thread) threads.set(threadId, { ...thread, model });
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

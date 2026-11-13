@@ -47,16 +47,19 @@ import type * as Waits from "./waits.ts";
 const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
+    pendingUserInputs: () => Effect.succeed([]),
     view: () => Effect.succeed(null),
     find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
     findLastFailure: () => Effect.succeed(null),
     latestRun: () => Effect.succeed(null),
+    runSettled: () => Effect.succeed(true),
     compactRun: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
     model: () => Effect.succeed(null),
     setModel: () => Effect.void,
+    withdraw: () => Effect.void,
     cancelQueued: () => Effect.succeed(false),
     interrupt: () => Effect.void,
   }),
@@ -917,11 +920,13 @@ it.effect(
     const recording = Layer.succeed(
       KanbanThreads,
       KanbanThreads.of({
+        pendingUserInputs: () => Effect.succeed([]),
         view: () => Effect.succeed(null),
         find: () => Effect.succeed(null),
         lastFailure: () => Effect.succeed(null),
         findLastFailure: () => Effect.succeed(null),
         latestRun: () => Effect.succeed(null),
+        runSettled: () => Effect.succeed(true),
         compactRun: () => Effect.succeed(null),
         launch: (input) => {
           sent.push(input.text);
@@ -933,6 +938,7 @@ it.effect(
         },
         model: () => Effect.succeed(null),
         setModel: () => Effect.void,
+        withdraw: () => Effect.void,
         cancelQueued: () => Effect.succeed(false),
         interrupt: () => Effect.void,
       }),

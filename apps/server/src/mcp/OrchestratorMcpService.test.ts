@@ -57,6 +57,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { mapCodexModelCapabilities } from "../provider/CodexProvider.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -1385,6 +1386,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: () =>
               stage === "caller"
                 ? stall.pipe(Effect.as(parentProjection([])))
@@ -1468,6 +1471,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: (id) => {
               const projection =
                 id === parentThreadId ? parentProjection(accepted ? [task] : []) : childProjection;
@@ -1611,6 +1616,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const layerDependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: () => Effect.succeed(parentProjection([])),
           }),
           ServerSettings.layerTest(),
@@ -1720,6 +1727,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           getThreadRecords: () => Effect.succeed(parentProjection([])),
         }),
         ServerSettings.layerTest({
@@ -1809,6 +1818,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           getThreadRecords: () => Effect.succeed(parentProjection([])),
         }),
         ServerSettings.layerTest(),
@@ -2005,6 +2016,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           hasReceipt: () => Effect.succeed(false),
           assertProviderInstanceEnabled: () => Effect.void,
           isProviderInstanceEnabledForProject: () => Effect.succeed(true),
@@ -2086,6 +2099,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           hasReceipt: () => Effect.succeed(false),
           getThreadRecords: () => Effect.succeed(parentProjection([])),
         }),
@@ -2138,6 +2153,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           hasReceipt: () => Effect.succeed(false),
           getThreadRecords: () => Effect.succeed(parentProjection([])),
           dispatch: () =>
@@ -2205,6 +2222,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           hasReceipt: () => Effect.succeed(false),
           getThreadRecords: (threadId) =>
             Effect.succeed(
@@ -2311,6 +2330,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const layerDependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: (threadId) =>
               Ref.get(accepted).pipe(
                 Effect.map((isAccepted) =>
@@ -2607,6 +2628,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
           hasReceipt: () => Effect.succeed(false),
           assertProviderInstanceEnabled: () => Effect.void,
           getThreadRecords: (threadId) =>
@@ -2770,6 +2793,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           const layerDependencies = Layer.mergeAll(
             NodeServices.layer,
             Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: (id) =>
+                Effect.succeed({
+                  ...liveThreadShell(id),
+                  ...parentProjection([], parentModelSelection).thread,
+                }),
               hasReceipt: () => Effect.succeed(false),
               assertProviderInstanceEnabled: () => Effect.void,
               isProviderInstanceEnabledForProject: () => Effect.succeed(true),
@@ -3042,7 +3070,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                 Layer.mergeAll(
                   NodeServices.layer,
                   Layer.mock(ThreadManagementService.ThreadManagementService)({
-                    getThreadShell: () => Effect.succeed(null),
+                    getThreadShell: () => Effect.succeed(shell),
                     getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
                   }),
                   ServerSettings.layerTest(),
@@ -3291,6 +3319,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           const dependencies = Layer.mergeAll(
             NodeServices.layer,
             Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: (id) =>
+                Effect.succeed({
+                  ...liveThreadShell(id),
+                  ...parentProjection([], inherited).thread,
+                }),
               hasReceipt: () => Effect.succeed(false),
               assertProviderInstanceEnabled: () => Effect.void,
               getThreadRecords: (threadId) =>
@@ -3454,6 +3487,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([], inherited).thread }),
             hasReceipt: () => Effect.succeed(false),
             getThreadRecords: (threadId) =>
               Effect.succeed(
@@ -3537,7 +3572,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         id,
         label: id,
         type: "select" as const,
-        options: ["high", "max"].map((value) => ({ id: value, label: value })),
+        options: ["high", "max", "xhigh"].map((value) => ({ id: value, label: value })),
       });
       const haiku = "claude-haiku-5-5";
       const legacyHaiku = `opus/cc/${haiku}`;
@@ -3570,6 +3605,21 @@ describe("OrchestratorMcpService provider resolution", () => {
           },
         ],
       );
+      const codexDescriptors = mapCodexModelCapabilities({
+        id: "gpt-6.1-sol",
+        model: "gpt-6.1-sol",
+        displayName: "Sol",
+        description: "",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "high",
+        additionalSpeedTiers: [],
+        supportedReasoningEfforts: ["high", "max", "xhigh"].map((reasoningEffort) => ({
+          reasoningEffort,
+          description: "",
+        })),
+        serviceTiers: [{ id: "priority", name: "Fast", description: "" }],
+      }).optionDescriptors!;
       const providers = [
         snapshot(
           claude,
@@ -3585,16 +3635,58 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           ],
         ),
-        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", [
-          select("reasoningEffort"),
-          select("serviceTier"),
+        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", codexDescriptors, [
+          {
+            slug: "gpt-6-astra",
+            name: "Astra",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: codexDescriptors,
+            },
+          },
         ]),
+        snapshot(ProviderInstanceId.make("codex-cu"), "codex", "gpt-6.1-terra", codexDescriptors),
       ];
       const maxVariant = [{ id: "variant", value: "max" }] as const;
       const maxEffort = [{ id: "effort", value: "max" }] as const;
       const nativeParent = { instanceId: claude, model: "claude-opus-5-5" };
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        ...(
+          [
+            ["opus/cx/gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+            ["opus/cx/gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+            ["opus/gpt-6-astra", "gpt-6-astra", "codex"],
+            ["layso/gpt-6-astra", "gpt-6-astra", "codex"],
+          ] as const
+        ).flatMap(([source, model, instanceId]) =>
+          (["variant", "reasoningEffort"] as const).flatMap((effortId) =>
+            (["array", "record"] as const).map((shape) => ({
+              name: `preserves serviceTier on ${source} remap with ${effortId} ${shape}`,
+              mode: "apply" as const,
+              parent: nativeParent,
+              target: {
+                providerInstanceId: opencode,
+                model: source,
+                options:
+                  shape === "record"
+                    ? { [effortId]: "xhigh", serviceTier: "default" }
+                    : [
+                        { id: effortId, value: "xhigh" },
+                        { id: "serviceTier", value: "default" },
+                      ],
+              },
+              expected: {
+                instanceId: ProviderInstanceId.make(instanceId),
+                model,
+                options: [
+                  { id: "reasoningEffort", value: "xhigh" },
+                  { id: "serviceTier", value: "default" },
+                ],
+              },
+            })),
+          ),
+        ),
         {
           name: "reports an explicit legacy Haiku request",
           mode: "apply",
@@ -3818,7 +3910,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "variant", value: "high" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
           target: { options: { reasoningEffort: "max" } },
@@ -3827,7 +3919,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "reasoningEffort", value: "max" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
         },
@@ -3930,7 +4022,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             hasReceipt: () => Effect.succeed(false),
-            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadShell: (id) =>
+              Effect.succeed({
+                ...liveThreadShell(id),
+                ...parentProjection([], testCase.parent).thread,
+              }),
             getThreadRecords: ((threadId: ThreadId) =>
               Effect.succeed(
                 threadId === parentThreadId
@@ -3986,7 +4082,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                 : providers
               : [legacyProvider, ...providers],
           ),
-          adapterRegistryLayer([opencode, claude, codexInstanceId]),
+          adapterRegistryLayer([
+            opencode,
+            claude,
+            codexInstanceId,
+            ProviderInstanceId.make("codex-cu"),
+          ]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
@@ -4010,6 +4111,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.deepEqual(commands[0]?.modelSelection, testCase.expected, testCase.name);
             assert.equal(result.providerInstanceId, testCase.expected.instanceId, testCase.name);
             assert.equal(result.model, testCase.expected.model, testCase.name);
+            assert.deepEqual(
+              result.options,
+              commands[0]?.modelSelection.options ?? [],
+              testCase.name,
+            );
             if ("routingRequested" in testCase) {
               if (testCase.routingRequested === null) {
                 assert.isUndefined(result.selectionRouting, testCase.name);
@@ -4059,6 +4165,12 @@ describe("OrchestratorMcpService provider resolution", () => {
       const missingDestination = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (id) =>
+            Effect.succeed({
+              ...liveThreadShell(id),
+              ...parentProjection([], { instanceId: opencode, model: "opus/claude-opus-5-5#high" })
+                .thread,
+            }),
           hasReceipt: () => Effect.succeed(false),
           getThreadRecords: () =>
             Effect.succeed(

@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os
 import tempfile
 os.environ['ORDERING_PAUSE_FILE'] = os.path.join(tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -24,6 +25,7 @@ PLACED = 1794073580
 
 class CaptureCloseTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()/'commerce'
         for module in (j, food):
@@ -249,7 +251,7 @@ class CaptureCloseTests(unittest.TestCase):
         self.assertIn('close-food-captured',caught.exception.details['next'][0])
 
     def test_native_automatic_detail_numeric_zero_forms_and_missing_secret(self):
-        from test.test_noon_food_financial import NativeOrderTests
+        from test_noon_food_financial import NativeOrderTests
         import noon_vertical_reads as vertical
         flow,state,raw=NativeOrderTests().fixture()
         state.update(outlet='OUTLET1',items=flow.rows)

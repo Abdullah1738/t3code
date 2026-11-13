@@ -6,7 +6,7 @@
 	<string>com.ardud.shared-mcp-flighty</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/ardud/.local/share/flighty-mcp/.venv/bin/python</string>
+		<string>/Users/ardud/.local/share/shared-mcp-flighty/python/bin/python3.12</string>
 		<string>/Users/ardud/.local/share/harness-homes/shared/serve.py</string>
 		<string>flighty</string>
 		<string>--port</string>

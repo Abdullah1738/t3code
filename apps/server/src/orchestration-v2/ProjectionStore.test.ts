@@ -2260,6 +2260,63 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(yield* store.getTurnStartHistory(threadId, [RunId.make("run:other")]), []);
     }),
   );
+  it.effect("records latest activity on the run without reading item history", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("latest-activity");
+      const before = yield* store.getThreadProjection(threadId);
+      const first = before.turnItems[0]!;
+      const run = before.runs.find((run) => run.id === first.runId)!;
+      const earlier = DateTime.makeUnsafe("2099-11-09T10:00:00.000Z");
+      const later = DateTime.makeUnsafe("2099-11-09T10:26:00.000Z");
+      for (const [id, item] of [
+        [
+          "newer-item",
+          {
+            ...first,
+            id: TurnItemId.make("item:activity:new"),
+            ordinal: first.ordinal + 1,
+            updatedAt: earlier,
+          },
+        ],
+        ["older-item-update", { ...first, updatedAt: later }],
+        ["out-of-order-update", { ...first, updatedAt: earlier }],
+      ] as const) {
+        yield* store.apply({
+          id: EventId.make(`activity:${id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: item.updatedAt,
+          payload: item,
+        });
+      }
+      // A stale lifecycle snapshot cannot erase activity recorded after it was read.
+      yield* store.apply({
+        id: EventId.make("activity:stale-run"),
+        type: "run.updated",
+        threadId,
+        occurredAt: later,
+        payload: run,
+      });
+      const queries: string[] = [];
+      const record: Statement.Transformer = (statement) => {
+        queries.push(statement.compile()[0]);
+        return Effect.succeed(statement);
+      };
+      const records = yield* store
+        .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+        .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+      assert.equal(
+        DateTime.formatIso(records.runs[0]!.lastActivityAt!),
+        "2099-11-09T10:26:00.000Z",
+      );
+      assert.isFalse(
+        queries.some((query) =>
+          /FROM (?:ardud_history_turn_items|orchestration_v2_projection_turn_items)/.test(query),
+        ),
+      );
+    }),
+  );
   it.effect("answers empty record filters without reading the filtered tables", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;

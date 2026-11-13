@@ -33,7 +33,9 @@ reload_mark() { print -r -- "$state_dir/reload-${${1:t}%.plist}" }
 read_mark() {
   local v=''
   REPLY=''
-  [[ -r "$1" ]] && v="$(<"$1")"
+  if [[ -r "$1" ]]; then
+    v="$(<"$1")"
+  fi
   case "$v" in
     new) return 0 ;;
     bak:/*) REPLY=${v#bak:} ;;
@@ -48,10 +50,17 @@ lockfile="$state_dir/install.lock"
 lock_wait="${LOCAL_HELPERS_LOCK_WAIT:-300}"
 take_lock() {
   local how=${1:-}
-  [[ -z $how && ! -w "$lockfile" ]] && { print -u2 "local-helpers: can't write $lockfile"; exit 1 }
-  zsystem flock $how -t 0 -f lockfd "$lockfile" 2>/dev/null && return 0
+  if [[ -z $how && ! -w "$lockfile" ]]; then
+    print -u2 "local-helpers: can't write $lockfile"
+    exit 1
+  fi
+  if zsystem flock $how -t 0 -f lockfd "$lockfile" 2>/dev/null; then
+    return 0
+  fi
   print -u2 "local-helpers: waiting for another install.zsh to finish"
-  zsystem flock $how -t "$lock_wait" -f lockfd "$lockfile" 2>/dev/null && return 0
+  if zsystem flock $how -t "$lock_wait" -f lockfd "$lockfile" 2>/dev/null; then
+    return 0
+  fi
   print -u2 "local-helpers: another install.zsh is still running after ${lock_wait}s; try again later"
   exit 1
 }
@@ -71,6 +80,7 @@ typeset -A live=(
 typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
+  "$HOME/.bun/bin/hcloud:$HOME/.local/bin/hcloud"
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"
   "$HOME/.local/bin/mailsend:$HOME/.local/share/robob-watch/helpers/mailsend"
 )
@@ -108,16 +118,27 @@ pushed() {
 pairs=()
 for rel in "${(@f)$(git -C "$here" ls-files --cached --others --exclude-standard -- ${(k)live})}"; do
   [[ -n "$rel" && -f "$here/$rel" && -n "${live[${rel:h}]:-}" ]] || continue
-  [[ "${rel:t}" == *.bak* || "${rel:t}" == *.pyc ]] && continue
+  if [[ "${rel:t}" == *.bak* || "${rel:t}" == *.pyc ]]; then
+    continue
+  fi
   if (( ${+private[${rel:t}]} )); then m=700; elif [[ -x "$here/$rel" ]]; then m=755; else m=644; fi
   pairs+=("$here/$rel:${live[${rel:h}]}/${rel:t}:$m")
 done
 (( ${#pairs} )) || { print -u2 "local-helpers: no payload files found"; exit 1 }
 plists=()
-for p in "${pairs[@]}"; do [[ "${${p%:*}#*:}" == *.plist ]] && plists+=("${${p%:*}#*:}"); done
+for p in "${pairs[@]}"; do
+  if [[ "${${p%:*}#*:}" == *.plist ]]; then
+    plists+=("${${p%:*}#*:}")
+  fi
+done
 
 perm_of() { stat -f %Lp "$1" 2>/dev/null || true; }
-same() { [[ ! -L "$2" ]] && cmp -s "$1" "$2"; }
+same() {
+  if [[ -L "$2" ]]; then
+    return 1
+  fi
+  cmp -s "$1" "$2"
+}
 loaded() { "$lctl" print "$domain/$1" >/dev/null 2>&1; }
 label_of() { print -r -- "${${1:t}%.plist}"; }
 
@@ -129,15 +150,25 @@ for n in "$HOME"/.nvm/versions/node/*(N/nOn); do
   fi
 done
 uber_want=''
-[[ -n "$uber_node" ]] && uber_want="#!/bin/sh
+if [[ -n "$uber_node" ]]; then
+  uber_want="#!/bin/sh
 $uber_mark: watchers run with a short PATH, so node is pinned here.
 if [ -f \"\$HOME/.local/state/ordering-paused\" ] && [ \"\$1\" = rides ] && [ \"\$2\" = request ]; then echo \"ORDERING_PAUSED: \$(cat \"\$HOME/.local/state/ordering-paused\")\" >&2; exit 4; fi
 exec \"$uber_node\" \"$uber_js\" \"\$@\""
-uber_ours() { [[ -f "$uber" && ! -L "$uber" ]] && [[ "$(sed -n 2p "$uber")" == "$uber_mark"* ]]; }
+fi
+uber_ours() {
+  if [[ -f "$uber" && ! -L "$uber" ]]; then
+    [[ "$(sed -n 2p "$uber")" == "$uber_mark"* ]]
+  else
+    return 1
+  fi
+}
 
 # Installs hold the lock to the end; --check and --dry-run only wait for a running install (and write nothing).
 if [[ $mode == check ]] || (( dry )); then
-  [[ -e "$lockfile" ]] && take_lock -r
+  if [[ -e "$lockfile" ]]; then
+    take_lock -r
+  fi
 else
   mkdir -p "$state_dir"
   [[ -e "$lockfile" ]] || : > "$lockfile"
@@ -162,12 +193,20 @@ if [[ $mode == check ]]; then
   elif [[ "$(perm_of "$uber")" != 755 ]]; then print -u2 "local-helpers: $uber mode $(perm_of "$uber"), want 755"; rc=1; fi
   for f in "${plists[@]}"; do
     loaded "$(label_of "$f")" || { print -u2 "local-helpers: $(label_of "$f") is not loaded"; rc=1 }
-    [[ -e "$(reload_mark "$f")" ]] && { print -u2 "local-helpers: $(label_of "$f") still runs an older plist (reload pending); run install.zsh"; rc=1 }
+    if [[ -e "$(reload_mark "$f")" ]]; then
+      print -u2 "local-helpers: $(label_of "$f") still runs an older plist (reload pending); run install.zsh"
+      rc=1
+    fi
   done
   for label marker in "${(@kv)restarts}"; do
-    [[ -e "$marker" ]] && { print -u2 "local-helpers: $label still runs older code (restart pending); run install.zsh"; rc=1 }
+    if [[ -e "$marker" ]]; then
+      print -u2 "local-helpers: $label still runs older code (restart pending); run install.zsh"
+      rc=1
+    fi
   done
-  (( rc == 0 )) && print "local-helpers: live copy matches $(git -C "$repo" rev-parse --short HEAD)"
+  if (( rc == 0 )); then
+    print "local-helpers: live copy matches $(git -C "$repo" rev-parse --short HEAD)"
+  fi
   exit $rc
 fi
 
@@ -199,14 +238,18 @@ changed=()
 for p in "${pairs[@]}"; do
   src="${p%%:*}" rest="${p#*:}"; dst="${rest%:*}" want="${rest##*:}"
   if same "$src" "$dst"; then
-    [[ "$(perm_of "$dst")" == "$want" ]] && continue
+    if [[ "$(perm_of "$dst")" == "$want" ]]; then
+      continue
+    fi
     print "chmod $want $dst"
     (( dry )) || chmod "$want" "$dst"
     continue
   fi
   print "update $dst"
   changed+=("$dst")
-  (( dry )) && continue
+  if (( dry )); then
+    continue
+  fi
   case "$dst" in
     */libexec/mail/mail_oauth.py|*/libexec/mail/otp-idle.py|*/libexec/mail/otp-watch.py)
       mkdir -p "$state_dir"; : > "${restarts[local.ardud.otp-idle]}" ;;
@@ -230,7 +273,9 @@ done
 for l in "${links[@]}"; do
   ln_path="${l%%:*}" target="${l#*:}"
   if [[ ! -x "$target" ]]; then print -u2 "local-helpers: warning: $target is missing, not linking ${ln_path:t} (deploy it first)"; continue; fi
-  [[ "$(readlink "$ln_path" 2>/dev/null)" == "$target" ]] && continue
+  if [[ "$(readlink "$ln_path" 2>/dev/null)" == "$target" ]]; then
+    continue
+  fi
   if [[ -e "$ln_path" && ! -L "$ln_path" ]]; then
     print -u2 "local-helpers: $ln_path is a real file, not replacing it with a link"
     continue
@@ -254,12 +299,16 @@ elif [[ "$(perm_of "$uber")" != 755 ]]; then
   print "chmod 755 $uber"
   (( dry )) || chmod 755 "$uber"
 fi
-(( dry )) && exit 0
+if (( dry )); then
+  exit 0
+fi
 
 # Agents. Log dirs first: launchd won't create them and the job dies without them.
 for f in "${plists[@]}"; do
   for key in StandardOutPath StandardErrorPath; do
-    log="$(plutil -extract "$key" raw "$f" 2>/dev/null)" && mkdir -p "${log:h}"
+    if log="$(plutil -extract "$key" raw "$f" 2>/dev/null)"; then
+      mkdir -p "${log:h}"
+    fi
   done
 done
 agent_fail=0
@@ -285,32 +334,43 @@ for f in "${plists[@]}"; do
   if up "$f"; then
     rm -f "$mark"
     print "reloaded $label"
-    [[ -n "${restarts[$label]:-}" ]] && rm -f "${restarts[$label]}"
+    if [[ -n "${restarts[$label]:-}" ]]; then
+      rm -f "${restarts[$label]}"
+    fi
     continue
   fi
   agent_fail=1
   if [[ -n "$bak" && -e "$bak" ]]; then
     cp -p "$bak" "$f"
     # Disk and launchd agree on the old plist again; the next run sees the difference and retries.
-    up "$f" && { rm -f "$mark"; print -u2 "local-helpers: $label: the new plist didn't load, the previous one is back" }
+    if up "$f"; then
+      rm -f "$mark"
+      print -u2 "local-helpers: $label: the new plist didn't load, the previous one is back"
+    fi
   fi
   print -u2 "local-helpers: $label failed to load; fix it and run install.zsh again"
 done
 # Every run: load any managed agent that isn't loaded (a failed earlier run, a manual bootout).
 for f in "${plists[@]}"; do
   label="$(label_of "$f")"
-  loaded "$label" && continue
+  if loaded "$label"; then
+    continue
+  fi
   if up "$f"; then
     rm -f "$(reload_mark "$f")"
     print "loaded $label"
-    [[ -n "${restarts[$label]:-}" ]] && rm -f "${restarts[$label]}"
+    if [[ -n "${restarts[$label]:-}" ]]; then
+      rm -f "${restarts[$label]}"
+    fi
   else
     agent_fail=1; print -u2 "local-helpers: $label is not loaded and failed to load"
   fi
 done
 # otp-idle, the Juno proxy and the Lydia server and tunnel stay running, so their new code needs a restart; the other agents are short runs.
 for label marker in "${(@kv)restarts}"; do
-  [[ -e "$marker" ]] && loaded "$label" || continue
+  if [[ ! -e "$marker" ]] || ! loaded "$label"; then
+    continue
+  fi
   if "$lctl" kickstart -k "$domain/$label"; then
     rm -f "$marker"; print "restarted $label"
   else
@@ -325,7 +385,9 @@ lib="$HOME/.local/libexec"
 py=()
 for p in "${pairs[@]}"; do
   dst="${${p%:*}#*:}"
-  [[ "$dst" == *.py || "$(head -c 40 "$dst" 2>/dev/null)" == '#!/usr/bin/python3'* ]] && py+=("$dst")
+  if [[ "$dst" == *.py || "$(head -c 40 "$dst" 2>/dev/null)" == '#!/usr/bin/python3'* ]]; then
+    py+=("$dst")
+  fi
 done
 smoke /usr/bin/python3 -c 'import ast, sys
 for f in sys.argv[1:]:
@@ -341,7 +403,15 @@ for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tun
   smoke zsh -n "$HOME/.local/bin/$f"
 done
 # The way the watchers run it: bare PATH, no nvm.
-uber_ours && smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version
-(( fail )) && { print -u2 "local-helpers: installed, but the smoke test failed; the previous files are kept as *.bak-$stamp*"; exit 1 }
-(( agent_fail )) && { print -u2 "local-helpers: installed, but a LaunchAgent didn't load (see above); run install.zsh again after fixing it"; exit 1 }
+if uber_ours; then
+  smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version
+fi
+if (( fail )); then
+  print -u2 "local-helpers: installed, but the smoke test failed; the previous files are kept as *.bak-$stamp*"
+  exit 1
+fi
+if (( agent_fail )); then
+  print -u2 "local-helpers: installed, but a LaunchAgent didn't load (see above); run install.zsh again after fixing it"
+  exit 1
+fi
 print "local-helpers: installed $(git -C "$repo" rev-parse --short HEAD) (${#changed} files changed)"

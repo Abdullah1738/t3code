@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,9 @@ OTHER='10000000-0000-4000-8000-000000000002'
 
 
 class AccountFenceTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_new_noon_flow_allowed_but_fenced_flow_stays_closed(self):
         with tempfile.TemporaryDirectory() as temp,patch.object(j,'ROOT',Path(temp).resolve()/'commerce'):
             self.assertTrue(j.require_account_available('noon','1'*64))

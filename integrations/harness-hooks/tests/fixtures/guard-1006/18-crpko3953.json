@@ -1,0 +1,30 @@
+{
+  "case_number": 18,
+  "reporter_id": "crpko3953",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:ad6ad94e-f892-47ed-9e7d-b7cf81ba04eb",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 132126,
+    "sources": [
+      {
+        "denial_index": 313,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T06-35-28-01a1cd9c-3159-7982-912c-249709a82374.jsonl",
+        "timestamp": "2026-11-12T03:14:25.209Z",
+        "call_id": "call_52545f3867c0476fb20376c97a707b3d",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\nimport shutil\np=Path('tmp/pr247-review/REVIEW.md')\ns=p.read_text()\ns=s.replace('Card: #3953. Review in progress; final test results and verdict pending.', 'Card: #3953. Final Sol verdict: Good to merge. Findings: none. Astra gate requested for step 3 before merge.')\ns=s.replace('The same seven tests passed on base (run-1112-070117-89e1), and all 28 focused transport, build-metadata, and runtime-mode tests passed on the head. A complete unit retry, dev build, and artifact verification are running on the VM where those focused checks passed.', 'The same seven tests passed on base (run-1112-070117-89e1), and all 28 focused transport, build-metadata, and runtime-mode tests passed on the head (run-1112-070308-eac3). The complete retry passed below, including the timed-out test at 1.25 seconds.')\ns=s.replace('The real artifact check will include this committed file explicitly.', 'The final run explicitly included this committed public config file.')\ns=s.replace('Next verification: verify.mjs compares duplicate-key-rejecting YAML base/head trees, evaluates deploy admission over actor/event/ref/source combinations, checks old/new mode resolver equivalence, and executes the built HTML in offbox Chromium with application asset requests deliberately returning 503.', '''Final run run-1112-070431-41a0 on bx_h6sa8x9s returned exit 0 (three steps passed):\n\n    offbox run --git --include .env.dev --include tmp/pr247-review/verify.mjs --pull dist/index.html --step 'pnpm test:run --maxWorkers=2' --step 'BACKOFFICE_BUILD_NUMBER=812 pnpm build --mode dev' --step 'node tmp/pr247-review/verify.mjs'\n\n- Unit suite: 422 files passed, 1 skipped; 5,071 tests passed, 1 skipped. The existing skipped test is actionApiConformance.live.test.ts and requires a live environment. All six new metadata tests and 15 existing data-source tests passed. Full unit duration: 403.69 seconds.\n- Dev build: passed, including the pinned contract check and TypeScript build. Vite build: 12.29 seconds; the existing bundle-size warning remains outside this change's purpose.\n- Authorization: js-yaml rejected duplicate mapping keys. After removing the single new build-number env entry, the proposed workflow parsed tree was identical to base. All 1,152 admission cases passed across manual/automatic events, allowed/denied actors, refs, source events, conclusions, source branches, and fork/same-repository sources.\n- Runtime compatibility: base/head resolver outputs matched over 288 mode/source/dev-flag combinations, plus 12 data-source inputs (including absent, null, blank, unsupported and malformed values).\n- Real Chromium smoke: version 0.1.0, build 812, commit 2586de1, environment dev, valid build timestamp, Object.freeze, all five matching meta tags, and startup console banner were present while every application asset request returned 503. The app root remained empty, proving diagnostics do not depend on app startup.\n\nFinal head check: 2586de100686aa21a2aaa0098bc49bce13924bec, MERGEABLE/BEHIND, pull-request-contract and quality CI checks SUCCESS; conditional backend-contract check SKIPPED. The reviewed checkout had no tracked or untracked changes outside ignored scratch files. Logs and generated HTML are retained beside this report.''')\ns=s.replace('Provisional merit:', 'Merit:')\ns=s.replace('No tracked source edits, pushes, GitHub/Linear comments, merges, or deployments were performed.', 'No tracked source edits, pushes, GitHub/Linear comments, merges, or deployments were performed. Review checkouts are removed after evidence capture.')\np.write_text(s)\nshutil.copyfile('/Users/ardud/checkouts/backoffice-frontend-pr247/dist/index.html','tmp/pr247-review/built-index.html')\nPY",
+      "workdir": "/Volumes/ExternalSSD/crpko-devops",
+      "sha256": "3fe33320e1b8a0ef549fdbc325d9a7ede7d2aaade0e0470c9c79d81b547c6f3b"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

@@ -2,20 +2,26 @@
 
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from export_opencode import Exporter, ReadBudgetExceeded
+from export_opencode import Exporter, ReadBudgetExceeded, ProgressWatchdog
+import robob_readonly
 
 
 class NativeExportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        guard = mock.patch.object(robob_readonly, '_live_paths', return_value={self.root / 'live.db'})
+        guard.start()
+        self.addCleanup(guard.stop)
         self.source = self.root / 'source.sqlite'
         self.target = self.root / 'readonly/opencode.sqlite'
         self.src = sqlite3.connect(self.source, isolation_level=None)
@@ -392,6 +398,86 @@ class NativeExportTests(unittest.TestCase):
         self.start()
         with self.assertRaises(RuntimeError):
             Exporter(self.source, self.target)
+
+    def test_old_lock_file_and_four_day_unready_replica_resume_unchanged_payloads(self):
+        self.start()
+        self.finish()
+        payloads = self.exporter.out.execute('SELECT payload_id FROM ardud_native_message_rows').fetchall()
+        self.exporter.setmeta('ready', '0')
+        self.exporter.setmeta('generation', '2897')
+        self.exporter.setmeta('updated_at', '2026-11-08T15:39:36Z')
+        self.exporter.close()
+        lock = Path(str(self.target) + '.export.lock')
+        os.utime(lock, (1, 1))
+        self.start()
+        self.assertEqual(self.exporter.generation, 2898)
+        self.finish()
+        self.assertEqual(self.exporter.meta('ready'), '1')
+        self.assertEqual(self.exporter.out.execute('SELECT payload_id FROM ardud_native_message_rows').fetchall(), payloads)
+
+    def test_replaced_source_refuses_without_erasing_export(self):
+        self.start()
+        self.finish()
+        self.exporter.setmeta('source', str(self.source) + ':0:0')
+        self.exporter.close()
+        with self.assertRaisesRegex(RuntimeError, 'source replaced; rebuild'):
+            self.start()
+        with self.out() as out:
+            self.assertEqual(out.execute('SELECT count(*) FROM session_message').fetchone()[0], 1)
+
+    def test_destination_lost_or_replaced_exits_instead_of_using_old_handle(self):
+        for lost in (True, False):
+            with self.subTest(lost=lost):
+                if self.exporter:
+                    self.exporter.close()
+                self.start()
+                self.target.rename(self.target.with_suffix('.away'))
+                if not lost:
+                    self.target.write_bytes(b'other inode')
+                self.exporter.last_file_check = 0
+                with self.assertRaises((FileNotFoundError, RuntimeError)):
+                    self.exporter.step()
+                if not lost:
+                    self.target.unlink()
+                self.target.with_suffix('.away').rename(self.target)
+
+    def test_unmounted_volume_refused_before_creating_files(self):
+        with mock.patch('export_opencode.safe_path', return_value=Path('/Volumes/fixture/readonly/opencode.sqlite')), \
+                mock.patch.object(Path, 'is_mount', return_value=False), \
+                mock.patch.object(Path, 'mkdir') as mkdir:
+            with self.assertRaisesRegex(RuntimeError, 'volume is not mounted'):
+                self.start()
+            mkdir.assert_not_called()
+
+    def test_progress_stamp_is_paced_and_never_claims_ready(self):
+        self.start()
+        self.exporter.progress()
+        stamp = self.exporter.meta('progress_at')
+        self.assertGreater(float(stamp), time.time() - 5)
+        self.assertEqual(self.exporter.meta('ready'), '0')
+        self.exporter.progress()
+        self.assertEqual(self.exporter.meta('progress_at'), stamp)
+
+    def test_watchdog_exits_nonzero_when_io_or_budget_retries_stop_progress(self):
+        for operation in ('threading.Event().wait()', 'run(SimpleNamespace(source="fixture", destination="fixture", once=True), watchdog)'):
+            code = '''
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch
+from export_opencode import ProgressWatchdog, ReadBudgetExceeded, run
+with patch('export_opencode.Exporter') as exporter:
+    exporter.return_value.step.side_effect = ReadBudgetExceeded()
+    with ProgressWatchdog(timeout=0.05) as watchdog:
+        OPERATION
+'''.replace('OPERATION', operation)
+            result = subprocess.run([sys.executable, '-c', code], env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')},
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_watchdog_stops_cleanly_after_progress(self):
+        with ProgressWatchdog(timeout=5) as watchdog:
+            watchdog.progress()
+        self.assertFalse(watchdog.thread.is_alive())
 
     def test_source_reads_are_interruptible_without_holding_transaction(self):
         self.start(read_ms=1)

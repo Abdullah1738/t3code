@@ -142,7 +142,7 @@ function preparationCut(
   projection: Pick<ProjectionRuntimeRecoveryState, "providerThreads" | "providerTurns">,
 ): boolean {
   return (
-    (run.startedAt === null || run.providerThreadId === null) &&
+    (run.startedAt === null || run.providerThreadId === null || run.launchRecovery !== undefined) &&
     !(projection.providerTurns ?? []).some((turn) => turn.runAttemptId === run.activeAttemptId) &&
     (run.status === "preparing" ||
       run.status === "starting" ||

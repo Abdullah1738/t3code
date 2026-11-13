@@ -11,10 +11,12 @@ from unittest.mock import patch
 
 import commerce_journal as j
 import commerce_pending as p
+from owner_go_support import approve_test_flows
 
 
 class PendingTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.patch = patch.object(j, 'ROOT', Path(self.temp.name).resolve()/'commerce')
         self.patch.start(); self.addCleanup(self.patch.stop)
@@ -25,10 +27,10 @@ class PendingTests(unittest.TestCase):
             fixture.start();self.addCleanup(fixture.stop)
         card_status.record_declined('9546',reason='synthetic issuer decline',source='test')
 
-    def flow(self, vertical='nownow', items=None):
+    def flow(self, vertical='nownow', items=None, *, scope=None):
         flow = str(uuid.uuid4())
         j.open_flow(flow_id=flow, app='noon', vertical=vertical,
-                    account_hash=self.account, scope_hash='2'*64)
+                    account_hash=self.account, scope_hash=scope or '2'*64)
         if items:
             p.register(flow, vertical, self.account, items, card_last4='9546')
         return flow
@@ -173,8 +175,7 @@ class PendingTests(unittest.TestCase):
                 with self.subTest(lane=lane,card=card):
                     items=[{key:'LEGACY_'+card,'quantity':2}] if lane!='minutes' else [{'sku':'LEGACY_'+card,'qty':2,'modifiers':[]}]
                     scopes=p.legacy_scopes(lane,items,'7'*64)
-                    old=self.flow(lane)
-                    with j._db() as db:db.execute('UPDATE flows SET scope_hash=? WHERE id=?',(next(scope for scope,last4 in scopes.items() if last4==card),old))
+                    old=self.flow(lane,scope=next(scope for scope,last4 in scopes.items() if last4==card))
                     self.send(old)
                     new=self.flow(lane,items)
                     p.register(new,lane,self.account,items,legacy=scopes)
@@ -301,8 +302,7 @@ class PendingTests(unittest.TestCase):
             with self.subTest(lane=lane,old_note=old_note,old_home=old_home,new_home=new_home):
                 if lane=='main':scope=main._scope_hash(old_items,old_home)
                 else:scope=minutes._scope_hash(old_items,old_home,old_note)
-                old=self.flow(lane)
-                with j._db() as db:db.execute('UPDATE flows SET scope_hash=? WHERE id=?',(scope,old))
+                old=self.flow(lane,scope=scope)
                 self.send(old,outcome=None)
                 new=self.flow(lane,new_items)
                 p.register(new,lane,self.account,new_items,legacy=p.legacy_scopes(lane,new_items,new_home,extra=new_note))

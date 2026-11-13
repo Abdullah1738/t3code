@@ -15,8 +15,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_tools, node_version, pool, ssh_sync
-from . import containers, prune, prepare
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
+from . import containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
@@ -102,6 +102,7 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     body = recipe.read_bytes()
     if repo_key == "crpko-devops":
         body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
+    body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
     check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '
@@ -470,6 +471,25 @@ LDCACHE_REPAIR = r'''(
   fi
 ) || true'''
 
+# Root processes can write foreign-owned leaf files inside user-owned buckets,
+# so checking only cache parents misses poisoned entries.
+CACHE_OWNER_REPAIR = r'''(
+  _offbox_user=$(id -un) || exit 0
+  _offbox_group=$(id -gn) || exit 0
+  _offbox_box=__OFFBOX_BOX__
+  for _offbox_root in "$HOME/.npm" "$HOME/.cache" "$HOME/.local/share/pnpm" "$HOME/.yarn"; do
+    [ -d "$_offbox_root" ] && [ ! -L "$_offbox_root" ] || continue
+    _offbox_owner=$(find "$_offbox_root" ! -user "$_offbox_user" -printf '%u\n' -quit 2>/dev/null)
+    [ -n "$_offbox_owner" ] || continue
+    if sudo -n chown -h -R "$_offbox_user:$_offbox_group" -- "$_offbox_root" >/dev/null 2>&1; then
+      echo "offbox: gave $_offbox_root back to $_offbox_user (foreign-owned entries left by an earlier run)" >&2
+    else
+      printf 'offbox: %s has entries owned by %s and sudo -n chown failed; run: offbox ssh %q -- sudo chown -h -R %q -- %q\n' \
+        "$_offbox_root" "$_offbox_owner" "$_offbox_box" "$_offbox_user:$_offbox_group" "$_offbox_root" >&2
+    fi
+  done
+) || true'''
+
 # Warm boxes retain watchman roots across runs; exhaustion poisons the server until it restarts.
 WATCH_REPAIR = r'''(
   _offbox_proc=${OFFBOX_INOTIFY_PROC_DIR:-/proc/sys/fs/inotify}
@@ -681,10 +701,13 @@ def setup_failed(log_path: Path | None) -> bool:
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 
 
-def missing_deps_hint(root_files: set[str], package_manager: str | None) -> str:
-    install = node_tools.install_command(root_files, package_manager)
+def missing_deps_hint(root: Path) -> str:
+    install = package_manager.install_command(root)
+    node = node_version.want(root, root)
+    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(root)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
-            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them.")
+            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them."
+            + requirement + " Check the repo's CI install flags and manager version before running.")
 
 
 def box_deps_hint(root: Path, log_path: Path | None) -> str:
@@ -695,13 +718,7 @@ def box_deps_hint(root: Path, log_path: Path | None) -> str:
         marked = False
     if not marked:
         return ""
-    try:
-        root_files = {p.name for p in root.iterdir()}
-    except OSError:
-        root_files = set()
-    manifest = read_json(root / "package.json", {})
-    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
-    return missing_deps_hint(root_files, manager if isinstance(manager, str) else None)
+    return missing_deps_hint(root)
 
 
 def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
@@ -1116,7 +1133,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
-                  preserve_containers: str = 'private lease') -> str:
+                  preserve_containers: str = 'private lease', box_id: str = "<box>") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -1127,8 +1144,10 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
+              userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
+              CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),
               WATCH_REPAIR,
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
@@ -1273,7 +1292,7 @@ class Runner:
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                repo_key=me["repo_key"], repo_root=self.root,
-                               preserve_containers=containers.preserve_reason(con, row))
+                               preserve_containers=containers.preserve_reason(con, row), box_id=self.box)
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
         from . import start_check
@@ -1306,8 +1325,8 @@ class Runner:
                 time.sleep(start_check.GRACE_S)
                 result = start_check.check(self.box, self.run_id)
                 if result.code is not None:
-                    self.pid, self.recovered_code = result.pid, result.code
-                    self.record(process_id=self.pid, status='running')
+                    self.recovered_code = result.code
+                    self.record(wrapper_pid=result.pid, status='running')
                     say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
                         + start_check.hint(self.box, self.run_id))
                     return row
@@ -1411,10 +1430,10 @@ class Runner:
         push_exc = None
         try:
             if not a.no_sync:
-                with prepare.phase("push (source read stalled if no transfer progress)", self.box):
+                with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
-                                       seed_candidates=candidates)
+                                       seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1607,6 +1626,13 @@ def _status_code(st: dict) -> int | None:
 def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None) -> dict | None:
     """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
     request, no retries, never past the caller's deadline; any error counts as not ended."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            return None
     try:
         left = 60.0 if until is None else max(1.0, min(60.0, until - now()))
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
@@ -1674,12 +1700,24 @@ def run_kind(cmd_text: str) -> str:
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
-           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0) -> int | None:
+           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
+           receipt_locked: bool = False) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
     The per-stream offsets are saved beside the local log after every chunk, so a waiter that takes over a dead
     holder's follow resumes from them (see offsets_path) instead of replaying output."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            from .misc import _wait_start_receipt
+            row = _wait_start_receipt(row, until, locked=receipt_locked)
+            if row['status'] not in ('starting', 'running'):
+                return row['exit_code']
+            pid = row['process_id']
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -1953,8 +1991,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
 def new_checkout_hint(row: dict, root: Path) -> None:
     if not row.get("_new_checkout") or not (root / "package.json").exists():
         return
-    install = node_tools.repo_install(root)
-    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
+    install = package_manager.install_command(root)
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(root))
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
@@ -2133,7 +2171,7 @@ def _run_remote(a, rn) -> int:
             from . import start_check
             con = db()
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
-            start_check.settle(con, row, start_check.Result('started', rn.recovered_code, rn.pid),
+            start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
                                'start receipt recovered')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)

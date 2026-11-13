@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, parseCommand, validFileName, validMimeType } from "./cli.ts";
+import { redact } from "./redact.ts";
+import { enqueueNotice } from "./notification-policy.ts";
 import type { ReminderRecord, Store } from "./store.ts";
 
 type Options = {
@@ -189,17 +191,21 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
       }
 
       if (path === "/notify") {
-        fields(body, ["source", "severity", "text", "dedupeKey"]);
-        const { source, severity, text, dedupeKey } = body;
+        fields(body, ["source", "severity", "text", "dedupeKey", "askKey", "burstKey"]);
+        const { source, severity, dedupeKey, askKey, burstKey } = body;
+        const text = typeof body.text === "string" ? redact(body.text) : body.text;
         if (!string(source, 40) || /[^A-Za-z0-9 ._-]/.test(source)
           || !string(severity, 20) || !["info", "attention", "error"].includes(severity)
-          || !string(text, 12_000) || !string(dedupeKey, 200)) throw new ApiError(400);
+          || !string(body.text, 12_000) || !string(text, 12_000) || !string(dedupeKey, 200)
+          || (askKey !== undefined && !string(askKey, 200)) || (burstKey !== undefined && !string(burstKey, 200))
+          || (askKey !== undefined && burstKey !== undefined)) throw new ApiError(400);
         const id = `notify:${hash(dedupeKey)}`;
         const created = store.db.transaction(() => {
           const key = `api:notification:${id}`;
           const metadata = store.get<{ severity: string }>(key);
           if (metadata && metadata.severity !== severity) throw new ApiError(409);
-          const created = store.enqueue({ id, kind: "notification", text: `[${source}] ${text}` });
+          const created = enqueueNotice(store, { id, source, text, severity,
+            ...(askKey === undefined ? {} : { askKey }), ...(burstKey === undefined ? {} : { burstKey }) });
           store.set(key, { severity });
           return created;
         }).immediate();

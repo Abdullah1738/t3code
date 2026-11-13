@@ -16,7 +16,7 @@ locally in a macOS sandbox.
 | (link) | `~/.local/bin/offbox` -> `skill/scripts/offbox.py` in the live skill |
 
 State stays outside the repo: `~/.local/share/offbox/` (offbox.db for Boat,
-offbox-home.db for the home server, logs, backups, `server.json`,
+offbox-home.db for the home server, repo-keys.db for checkout identity shared by both, logs, backups, `server.json`,
 `backend-state.json`), gate mode `~/.config/opencode/offbox-gate.json`, boat token under
 `~/Library/Application Support/ascii/boat/`.
 

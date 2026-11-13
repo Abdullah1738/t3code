@@ -1,0 +1,14 @@
+{
+  "id": "robob-stall",
+  "title": "Robob sustained event-loop stalls",
+  "check": "./check.sh",
+  "interval_s": 120,
+  "mode": "notify",
+  "context": "Telegram only. The check queues its own notifications and leaves stdout empty; never wake an agent.",
+  "expires_at": null,
+  "max_fires": 0,
+  "timeout_s": 45,
+  "depends": ["ssd"],
+  "serial": false,
+  "triggers": []
+}

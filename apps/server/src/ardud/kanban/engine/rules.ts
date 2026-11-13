@@ -237,6 +237,40 @@ export function discussionSettleDue(
 
 export const WORKER_QUIET_MS = 30 * 60 * 1000;
 
+export const RUN_SILENT_MS = 30 * 60 * 1000;
+
+export function runSilentDue(
+  card: KanbanCard,
+  view: {
+    readonly state: string;
+    readonly lastActivityAt: string | null;
+    readonly backgroundWork: number;
+  },
+  nowMs: number,
+): boolean {
+  const eligible =
+    card.activeThreadId === null
+      ? card.stage === "todo" || card.stage === "needs_review"
+      : (card.stage === "working" && card.activeRole === "work") ||
+        (card.stage === "in_review" && card.activeRole === "review");
+  if (
+    !eligible ||
+    card.stalled !== null ||
+    view.state !== "running" ||
+    view.backgroundWork !== 0 ||
+    view.lastActivityAt === null
+  )
+    return false;
+  return (
+    nowMs -
+      Math.max(
+        Date.parse(view.lastActivityAt),
+        card.nudgedAt === null ? 0 : Date.parse(card.nudgedAt),
+      ) >=
+    RUN_SILENT_MS
+  );
+}
+
 /** A Working card whose worker sat idle, or stuck on its own question, for WORKER_QUIET_MS. */
 export function workerQuietDue(
   card: KanbanCard,
@@ -569,7 +603,7 @@ export function planDispatch(
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
-    // Once a card has a work thread it stays on that thread's model.
+    // An existing work thread follows the card's pinned model.
     const model =
       role === "work" && card.workThreadId === null
         ? weightedModel(card, pools, free, pick)
