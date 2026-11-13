@@ -72,6 +72,12 @@ const decodeTurn = Effect.callback<void>((resume) => {
   return Effect.sync(() => clearImmediate(immediate));
 });
 
+const freeze = (value: unknown): void => {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+  for (const child of Object.values(value)) freeze(child);
+  Object.freeze(value);
+};
+
 interface JsonRow {
   readonly json: string;
 }
@@ -84,6 +90,7 @@ export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
 export interface KanbanStoreShape {
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
+  readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
   readonly putBoard: (board: KanbanBoard) => Effect.Effect<void, KanbanStoreError>;
   /** The board and any new pools in one transaction: all of it commits, or none of it does. */
   readonly putBoardWithPools: (
@@ -239,6 +246,9 @@ export interface KanbanStoreShape {
   readonly threadLink: (
     threadId: string,
   ) => Effect.Effect<KanbanThreadLink | null, KanbanStoreError>;
+  readonly threadLinksByIds: (
+    threadIds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<KanbanThreadLink>, KanbanStoreError>;
   readonly threadLinks: (
     filter:
       | { readonly cardId: KanbanCardId }
@@ -286,8 +296,40 @@ const make = Effect.gen(function* () {
     Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
   ).pipe(Effect.mapError(fail("create tables")));
 
-  // Decoding runs after the reader released its slot. Yield every 32 rows so
-  // simultaneous board snapshots do not starve timers (M1a 9411874c11).
+  // A row's text is the identity, so rollbacks and writes through other connections
+  // need no invalidation. Each store owns its bounded caches and decoded values.
+  const cached = <A, E>(decode: (json: string) => Effect.Effect<A, E>, cap: number) => {
+    const values = new Map<string, A>();
+    return (json: string) =>
+      Effect.suspend(() => {
+        if (values.has(json)) {
+          const value = values.get(json)!;
+          values.delete(json);
+          values.set(json, value);
+          return Effect.succeed(value);
+        }
+        return decode(json).pipe(
+          Effect.tap((value) =>
+            Effect.sync(() => {
+              if (process.env.NODE_ENV !== "production") freeze(value);
+              values.set(json, value);
+              if (values.size > cap) values.delete(values.keys().next().value!);
+            }),
+          ),
+        );
+      });
+  };
+  const decoders = {
+    board: cached(Board.decode, 2048),
+    card: cached(Card.decode, 4096),
+    summary: cached(Summary.decode, 4096),
+    goal: cached(Goal.decode, 2048),
+    pool: cached(Pool.decode, 2048),
+    discussion: cached(Discussion.decode, 2048),
+    thread: cached(ThreadLink.decode, 4096),
+  };
+
+  // Decode under the read operation's span; per-row spans would dominate this loop.
   const decodeAll = <A, E>(
     rows: ReadonlyArray<JsonRow>,
     decode: (json: string) => Effect.Effect<A, E>,
@@ -310,9 +352,17 @@ const make = Effect.gen(function* () {
   const boards = runRead(
     "read boards",
     Effect.flatMap(sql<JsonRow>`SELECT json FROM ardud_kanban_boards ORDER BY rowid`, (rows) =>
-      decodeAll(rows, Board.decode),
+      decodeAll(rows, decoders.board),
     ),
   );
+  const board = (boardId: KanbanBoardId) =>
+    runRead(
+      "read board",
+      Effect.flatMap(
+        sql<JsonRow>`SELECT json FROM ardud_kanban_boards WHERE id = ${boardId}`,
+        (rows) => Effect.map(decodeAll(rows, decoders.board), first),
+      ),
+    );
   const putBoard = (board: KanbanBoard) =>
     run(
       "write board",
@@ -351,7 +401,7 @@ const make = Effect.gen(function* () {
       "read cards",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
-        (rows) => decodeAll(rows, Card.decode),
+        (rows) => decodeAll(rows, decoders.card),
       ),
     );
   const feedCards: KanbanStoreShape["feedCards"] = (boardId, page) =>
@@ -379,7 +429,7 @@ const make = Effect.gen(function* () {
           WHERE board_id = ${boardId} AND number > ${page?.after ?? 0}
           ORDER BY number LIMIT ${page?.limit ?? -1}
         `,
-        (rows) => decodeAll(rows, Card.decode),
+        (rows) => decodeAll(rows, decoders.card),
       ),
     );
   const cardPage: KanbanStoreShape["cardPage"] = (boardId, page) =>
@@ -392,7 +442,7 @@ const make = Effect.gen(function* () {
             ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
           ORDER BY number LIMIT ${page.limit}
         `,
-        (rows) => decodeAll(rows, Card.decode),
+        (rows) => decodeAll(rows, decoders.card),
       ),
     );
   const summaryCards = (boardId: KanbanBoardId) =>
@@ -429,7 +479,7 @@ const make = Effect.gen(function* () {
             WHERE board_id = ${boardId} AND number > ${after}
             ORDER BY number LIMIT 64
           `;
-          cards.push(...(yield* decodeAll(rows, Summary.decode)));
+          cards.push(...(yield* decodeAll(rows, decoders.summary)));
           if (rows.length < 64) return cards;
           after = rows.at(-1)!.number;
         }
@@ -440,7 +490,7 @@ const make = Effect.gen(function* () {
       "read card",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE id = ${cardId}`,
-        (rows) => Effect.map(decodeAll(rows, Card.decode), first),
+        (rows) => Effect.map(decodeAll(rows, decoders.card), first),
       ),
     );
   const cardByNumber = (boardId: KanbanBoardId, number: number) =>
@@ -448,7 +498,7 @@ const make = Effect.gen(function* () {
       "read card by number",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
-        (rows) => Effect.map(decodeAll(rows, Card.decode), first),
+        (rows) => Effect.map(decodeAll(rows, decoders.card), first),
       ),
     );
   const cardsByThread = (threadId: string) =>
@@ -456,7 +506,7 @@ const make = Effect.gen(function* () {
       "read cards by thread",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} ORDER BY number`,
-        (rows) => decodeAll(rows, Card.decode),
+        (rows) => decodeAll(rows, decoders.card),
       ),
     );
   const cardsInStage = (stage: KanbanStage) =>
@@ -464,7 +514,7 @@ const make = Effect.gen(function* () {
       "read cards in stage",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE stage = ${stage} ORDER BY board_id, number`,
-        (rows) => decodeAll(rows, Card.decode),
+        (rows) => decodeAll(rows, decoders.card),
       ),
     );
   const nextCardNumber = (boardId: KanbanBoardId) =>
@@ -524,7 +574,7 @@ const make = Effect.gen(function* () {
       "read goals",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`,
-        (rows) => decodeAll(rows, Goal.decode),
+        (rows) => decodeAll(rows, decoders.goal),
       ),
     );
   const putGoal = (goal: KanbanGoal) =>
@@ -544,7 +594,7 @@ const make = Effect.gen(function* () {
       "read pools",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_pools WHERE board_id = ${boardId} ORDER BY rowid`,
-        (rows) => decodeAll(rows, Pool.decode),
+        (rows) => decodeAll(rows, decoders.pool),
       ),
     );
   const putPool = (boardId: KanbanBoardId, pool: KanbanPool) =>
@@ -669,7 +719,7 @@ const make = Effect.gen(function* () {
       "read discussions",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
-        (rows) => decodeAll(rows, Discussion.decode),
+        (rows) => decodeAll(rows, decoders.discussion),
       ),
     );
   const discussion = (id: KanbanDiscussionId) =>
@@ -677,7 +727,7 @@ const make = Effect.gen(function* () {
       "read discussion",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_discussions WHERE id = ${id}`,
-        (rows) => Effect.map(decodeAll(rows, Discussion.decode), first),
+        (rows) => Effect.map(decodeAll(rows, decoders.discussion), first),
       ),
     );
   const discussionByEvaluator = (threadId: string) =>
@@ -687,7 +737,7 @@ const make = Effect.gen(function* () {
         sql<JsonRow>`
           SELECT json FROM ardud_kanban_discussions WHERE evaluator_thread_id = ${threadId} LIMIT 1
         `,
-        (rows) => Effect.map(decodeAll(rows, Discussion.decode), first),
+        (rows) => Effect.map(decodeAll(rows, decoders.discussion), first),
       ),
     );
   const discussionBoardIdsByEvaluator = (threadId: string) =>
@@ -908,9 +958,19 @@ const make = Effect.gen(function* () {
       "read thread link",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE thread_id = ${threadId}`,
-        (rows) => Effect.map(decodeAll(rows, ThreadLink.decode), first),
+        (rows) => Effect.map(decodeAll(rows, decoders.thread), first),
       ),
     );
+  const threadLinksByIds: KanbanStoreShape["threadLinksByIds"] = (threadIds) =>
+    threadIds.length === 0
+      ? Effect.succeed([])
+      : runRead(
+          "read thread links by ids",
+          Effect.flatMap(
+            sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE thread_id IN ${sql.in(threadIds)}`,
+            (rows) => decodeAll(rows, decoders.thread),
+          ),
+        );
   const threadLinks: KanbanStoreShape["threadLinks"] = (filter) =>
     runRead(
       "read thread links",
@@ -927,7 +987,7 @@ const make = Effect.gen(function* () {
           : filter.open
             ? sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} AND ended = 0 ORDER BY rowid`
             : sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE board_id = ${filter.boardId} ORDER BY rowid`,
-        (rows) => decodeAll(rows, ThreadLink.decode),
+        (rows) => decodeAll(rows, decoders.thread),
       ),
     );
   const putThreadLink = (link: KanbanThreadLink) =>
@@ -968,6 +1028,7 @@ const make = Effect.gen(function* () {
 
   return KanbanStore.of({
     boards,
+    board,
     putBoard,
     putBoardWithPools,
     cards,
@@ -985,7 +1046,7 @@ const make = Effect.gen(function* () {
           ORDER BY json_extract(story.value, '$.at')
         )
       ), '[]'))) AS json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`,
-          (rows) => decodeAll(rows, Goal.decode),
+          (rows) => decodeAll(rows, decoders.goal),
         ),
       ),
     card,
@@ -1027,6 +1088,7 @@ const make = Effect.gen(function* () {
     wiki,
     putWiki,
     threadLink,
+    threadLinksByIds,
     threadLinks,
     putThreadLink,
     addThreadCard,
