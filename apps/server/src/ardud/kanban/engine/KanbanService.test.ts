@@ -9756,9 +9756,86 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
           "cardThread",
         )
         .pipe(Effect.flip);
-      assert.include(edit.detail, "is not assigned to this thread");
+      assert.strictEqual(edit.code, "not-found");
+      assert.strictEqual(edit.detail, `open ask q1 on card #${created.number}`);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(["needs_owner", "todo"] as const)(
+  "#1282 an unattached own worker can revise and reply on an open ask in %s",
+  (stage) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(created.id)).card;
+        const worker: KanbanActor = { _tag: "thread", threadId: running.workThreadId! };
+        const blocking = stage === "needs_owner";
+        const asked = yield* kanban.askOwner(
+          created.id,
+          { question: "Which fee?", options: ["1%", "2%"], blocking },
+          worker,
+          "cardThread",
+        );
+        yield* store.putCard({
+          ...asked,
+          stage,
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+
+        const edited = yield* kanban.editAsk(
+          created.id,
+          "q1",
+          { question: "Which updated fee?", options: ["2%", "3%", "4%"], revisionNote: "New choices" },
+          worker,
+          "cardThread",
+        );
+        assert.strictEqual(edited.stage, stage);
+        assert.isNull(edited.activeThreadId);
+        assert.isNull(edited.activeRole);
+        assert.isNull(edited.activePool);
+        assert.strictEqual(edited.workThreadId, running.workThreadId);
+        assert.strictEqual(edited.asks[0]!.text, "Which updated fee?");
+        assert.deepStrictEqual(edited.asks[0]!.options?.map((option) => option.label), [
+          "2%",
+          "3%",
+          "4%",
+        ]);
+        assert.isNull(edited.asks[0]!.closedAt);
+        assert.strictEqual(edited.asks[0]!.blocking, blocking);
+        if (blocking) assert.strictEqual(edited.question, "Which updated fee?");
+
+        const blocks = [{ _tag: "md", text: "The revised choices include the new fee." }] as const;
+        const reply = yield* kanban.replyOnAsk(created.id, "q1", worker, blocks, "cardThread");
+        assert.deepStrictEqual(reply.author, worker);
+        assert.deepStrictEqual(reply.blocks, blocks);
+        const talk = yield* kanban.cardDiscussion(created.id);
+        assert.deepStrictEqual(
+          (yield* kanban.messages(talk.id)).find((message) => message.seq === reply.seq),
+          reply,
+        );
+        const after = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(after.stage, stage);
+        assert.isNull(after.activeThreadId);
+        assert.isNull(after.activeRole);
+        assert.isNull(after.activePool);
+        assert.strictEqual(after.workThreadId, running.workThreadId);
+        assert.strictEqual(after.asks[0]!.text, "Which updated fee?");
+        assert.deepStrictEqual(after.asks[0]!.options?.map((option) => option.label), [
+          "2%",
+          "3%",
+          "4%",
+        ]);
+        assert.isNull(after.asks[0]!.closedAt);
+        assert.strictEqual(after.asks[0]!.blocking, blocking);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect.each([false, true])(
@@ -10022,6 +10099,22 @@ it.effect.each([
           .pipe(Effect.flip);
         assert.strictEqual(change.detail, ask.detail);
       }
+      const edit = yield* kanban
+        .editAsk(
+          created.id,
+          "q1",
+          { question: "Edit?", revisionNote: "Changed" },
+          actor,
+          "cardThread",
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(edit.code, "denied");
+      assert.strictEqual(edit.detail, ask.detail);
+      const reply = yield* kanban
+        .replyOnAsk(created.id, "q1", actor, [{ _tag: "md", text: "Reply" }], "cardThread")
+        .pipe(Effect.flip);
+      assert.strictEqual(reply.code, "denied");
+      assert.strictEqual(reply.detail, ask.detail);
       const move = yield* kanban
         .moveCard(
           created.id,

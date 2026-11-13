@@ -11359,7 +11359,7 @@ const make = Effect.gen(function* () {
           ...messageTextFields(edit.blocks ?? []),
         ]);
         const card = yield* cardOf(cardId);
-        yield* checkCardThread(card, actor, role);
+        if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = yield* openAskOf(card, askId);
         const at = yield* nowIso;
         const written = Asks.reviseAsk(ask, edit, at);
@@ -11599,7 +11599,7 @@ const make = Effect.gen(function* () {
     Effect.suspend(() =>
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
-        yield* checkCardThread(card, actor, role);
+        if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = yield* openAskOf(card, askId);
         // Read beside the ask, so held to the ask's sizes, whoever writes it.
         const tooBig = Asks.replyBlocksProblem(blocks);
