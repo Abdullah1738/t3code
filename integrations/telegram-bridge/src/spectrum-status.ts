@@ -59,11 +59,21 @@ function decodeStatus(data: unknown): RouterStatus | undefined {
  */
 export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Promise<RouterStatus | undefined> {
   return new Promise(resolve => {
-    if (!isAbsolute(socketPath) || socketPath.includes("\0")) return resolve(undefined);
+    if (!isAbsolute(socketPath) || socketPath.includes("\0")) {
+      toolError("telegram", "tg.router.socket");
+      return resolve(undefined);
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const finish = (value: RouterStatus | undefined) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(undefined, "tg.router.timeout");
+      controller.abort();
+    }, timeoutMs);
+    const finish = (value: RouterStatus | undefined, tag?: string) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (tag) toolError("telegram", tag);
       resolve(value);
     };
     try {
@@ -74,31 +84,33 @@ export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Pro
       }, res => {
         const chunks: Buffer[] = [];
         let size = 0;
-        res.on("error", () => finish(undefined));
+        res.on("error", () => finish(undefined, "tg.router.response"));
+        res.on("aborted", () => finish(undefined, "tg.router.incomplete"));
+        res.on("close", () => { if (!res.complete) finish(undefined, "tg.router.incomplete"); });
         res.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > MAX_STATUS_BYTES) {
-            finish(undefined);
+            finish(undefined, "tg.router.tooLarge");
             req.destroy();
             return;
           }
           chunks.push(chunk);
         });
         res.on("end", () => {
-          if ((res.statusCode ?? 0) !== 200 || !res.complete) return finish(undefined);
+          if ((res.statusCode ?? 0) !== 200) return finish(undefined, "tg.router.httpStatus");
+          if (!res.complete) return finish(undefined, "tg.router.incomplete");
           try {
-            finish(decodeStatus(JSON.parse(Buffer.concat(chunks, size).toString("utf8"))));
+            const status = decodeStatus(JSON.parse(Buffer.concat(chunks, size).toString("utf8")));
+            finish(status, status ? undefined : "tg.router.decode");
           } catch {
-            toolError("telegram", "tg.router.decode");
-            finish(undefined);
+            finish(undefined, "tg.router.decode");
           }
         });
       });
-      req.on("error", () => finish(undefined));
+      req.on("error", () => finish(undefined, "tg.router.request"));
       req.end();
     } catch {
-      toolError("telegram", "tg.router.request");
-      finish(undefined);
+      finish(undefined, "tg.router.request");
     }
   });
 }

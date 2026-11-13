@@ -702,12 +702,22 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
 }
 
 export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
-  const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.failing_since!)) / 60_000);
-  const text = escalationText(watcher, state, mins);
-  const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
-  if (woke.ok) return { ok: true, via: "wake", detail: woke.out };
-  const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min: ${(state.last_error ?? "").slice(0, 300)}`, key);
-  return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+  const started = now();
+  let delivery: Delivery | undefined;
+  try {
+    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.failing_since!)) / 60_000);
+    const text = escalationText(watcher, state, mins);
+    const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
+    if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
+    else {
+      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min: ${(state.last_error ?? "").slice(0, 300)}`, key);
+      delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+    }
+    return delivery;
+  } finally {
+    toolLog({ component: "wakes", kind: delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
+      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(key) }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
+  }
 }
 
 export function ensureDirs(): void {

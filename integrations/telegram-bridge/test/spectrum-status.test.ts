@@ -39,6 +39,7 @@ test("decodes a well-formed ownership snapshot", async () => {
     response.end(JSON.stringify(owned));
   });
   expect(await spectrumRouterStatus(path)).toEqual(owned);
+  expect(logs.entries()).toEqual([]);
 });
 
 test("keeps the optional request session of subagent-owned entries", async () => {
@@ -52,6 +53,7 @@ test("keeps the optional request session of subagent-owned entries", async () =>
     route: owned.route, pending: [{ ...child.pending[0], sessionId: "" }],
   })));
   expect(await spectrumRouterStatus(bad)).toBeUndefined();
+  expectError("tg.router.decode");
 });
 
 test("an empty router means nothing is owned", async () => {
@@ -74,11 +76,13 @@ test.each([
 ])("rejects malformed body: %s", async (body, name) => {
   const path = await serve((request, response) => response.end(JSON.stringify(body)));
   expect(await spectrumRouterStatus(path), name).toBeUndefined();
+  expectError("tg.router.decode");
 });
 
 test("non-200 responses, broken JSON, truncation, and connection loss all mean unavailable", async () => {
   const failing = await serve((request, response) => { response.statusCode = 503; response.end("nope"); });
   expect(await spectrumRouterStatus(failing)).toBeUndefined();
+  expectError("tg.router.httpStatus");
   const malformed = await serve((request, response) => response.end("{not json"));
   expect(await spectrumRouterStatus(malformed)).toBeUndefined();
   const huge = await serve((request, response) => {
@@ -86,19 +90,49 @@ test("non-200 responses, broken JSON, truncation, and connection loss all mean u
     response.end("[".repeat(200_000));
   });
   expect(await spectrumRouterStatus(huge)).toBeUndefined();
+  expect(logs.entries().map(row => row.error?.tag)).toEqual(["tg.router.httpStatus", "tg.router.decode", "tg.router.tooLarge"]);
   const dying = await serve((request, response) => response.destroy());
   expect(await spectrumRouterStatus(dying)).toBeUndefined();
+  expect(logs.entries().map(row => row.error?.tag)).toEqual(["tg.router.httpStatus", "tg.router.decode", "tg.router.tooLarge", "tg.router.request"]);
 });
 
 test("unreachable or unsafe sockets never own attention", async () => {
   expect(await spectrumRouterStatus(join(socketPath(), "missing.sock"))).toBeUndefined();
+  expectError("tg.router.request");
   expect(await spectrumRouterStatus("relative/path.sock")).toBeUndefined();
   expect(await spectrumRouterStatus("/bad\0path")).toBeUndefined();
+  expect(logs.entries().map(row => row.error?.tag)).toEqual(["tg.router.request", "tg.router.socket", "tg.router.socket"]);
 });
 
 test("timeouts bound the ownership check", async () => {
   const path = await serve(() => { /* never respond */ });
   expect(await spectrumRouterStatus(path, 50)).toBeUndefined();
+  expectError("tg.router.timeout");
 });
 
-useToolLogFixture();
+test("timeouts after response headers log once despite abort and stream error events", async () => {
+  const path = await serve((request, response) => {
+    response.writeHead(200);
+    response.flushHeaders();
+  });
+  expect(await spectrumRouterStatus(path, 50)).toBeUndefined();
+  expectError("tg.router.timeout");
+});
+
+const logs = useToolLogFixture();
+
+
+function expectError(tag: string) {
+  expect(logs.entries()).toEqual([expect.objectContaining({ tool: "watchers", component: "telegram", name: "telegram.error", kind: "error", ok: false, error: { tag, message: tag } })]);
+}
+
+test("incomplete response bodies produce one tagged error without response or socket content", async () => {
+  const path = await serve((request, response) => {
+    response.writeHead(200, { "Content-Length": "200", Connection: "close" });
+    response.end("PRIVATE_RESPONSE_BODY");
+  });
+  expect(await spectrumRouterStatus(path)).toBeUndefined();
+  expectError("tg.router.incomplete");
+  expect(logs.text()).not.toContain("PRIVATE_RESPONSE_BODY");
+  expect(logs.text()).not.toContain(path);
+});
