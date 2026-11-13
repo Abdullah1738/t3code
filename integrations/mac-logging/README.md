@@ -161,8 +161,10 @@ zsh integrations/mac-logging/install-jobs.zsh
 ```
 
 Each accepts `--dry-run` or `--check`. The final installer updates only the
-memory backup, disk check and two janitor scripts, retaining timestamped
-copies. This avoids deploying unrelated integration changes or skill wording.
+disk check and two janitor scripts, retaining timestamped copies.
+Memory-system belongs to the Recall board and is deployed from
+`robob/recall-golive`; send changes there as port requests. This installer
+refuses targets under `~/.local/share/memory-system`.
 The helper installer writes the proposed
 `com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
 after approval. Existing job schedules and backup LaunchAgents stay in place.
