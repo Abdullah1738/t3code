@@ -1571,6 +1571,7 @@ it.effect(
                 resolve: () => Effect.succeed(runtimePolicy),
               }),
               Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+                prepareUsageBeforeStart: () => Effect.succeed(() => Effect.void),
                 startRootRun: (input) => Queue.offer(started, input).pipe(Effect.asVoid),
               }),
               ServerConfig.layerTest(process.cwd(), {
@@ -1586,7 +1587,7 @@ it.effect(
           yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({ threadId, runId });
         }).pipe(Effect.provide(startLayer));
         const delivery = yield* Queue.take(started);
-        assert.strictEqual(delivery.session, f.runtime);
+        assert.strictEqual(delivery.session.providerSession, f.runtime.providerSession);
         assert.deepEqual(delivery.session.providerSession, running);
         assertSessionRecipients(yield* f.updatesSince(head), [threadId], running);
         assert.equal(

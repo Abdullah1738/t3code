@@ -612,8 +612,15 @@ export interface RunExecutionServiceV2StartRootRunInput {
 }
 
 export interface RunExecutionServiceV2Shape {
+  readonly prepareUsageBeforeStart: (
+    input: RunUsageInput,
+  ) => Effect.Effect<
+    (status: "completed" | "failed" | "interrupted" | "cancelled") => Effect.Effect<void>
+  >;
   readonly finishUsageBeforeStart: (
-    input: RunUsageInput & { readonly status: "completed" | "failed" },
+    input: RunUsageInput & {
+      readonly status: "completed" | "failed" | "interrupted" | "cancelled";
+    },
   ) => Effect.Effect<void>;
   readonly startRootRun: (
     input: RunExecutionServiceV2StartRootRunInput,
@@ -1028,6 +1035,37 @@ export const layer: Layer.Layer<
       return { ...observer, entry };
     });
     return RunExecutionServiceV2.of({
+      prepareUsageBeforeStart: Effect.fn("RunExecutionService.prepareUsageBeforeStart")(function* (
+        input,
+      ) {
+        if (Option.isNone(localAnalytics)) return () => Effect.void;
+        const usage = yield* observeUsage({
+          ...input,
+          run: { ...input.run, startedAt: input.run.startedAt ?? (yield* DateTime.now) },
+        });
+        const finish = (status: "completed" | "failed" | "interrupted" | "cancelled") =>
+          Effect.suspend(() =>
+            usage.entry.activeAttemptId !== input.attempt.id
+              ? Effect.void
+              : usage.finish(status).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      if (usageByRun.get(input.run.id) !== usage.entry) return;
+                      usageByRun.delete(input.run.id);
+                      usageFallbacks.delete(input.run.id);
+                    }),
+                  ),
+                ),
+          );
+        if (
+          usage.entry.activeAttemptId === input.attempt.id &&
+          !usage.entry.measurements.finished
+        ) {
+          usageFallbacks.set(input.run.id, finish);
+          if (usage.entry.ended !== undefined) yield* finish(usage.entry.ended);
+        }
+        return finish;
+      }, Effect.uninterruptible),
       finishUsageBeforeStart: Effect.fn("RunExecutionService.finishUsageBeforeStart")(
         function* (input) {
           const usage = yield* observeUsage(input);
