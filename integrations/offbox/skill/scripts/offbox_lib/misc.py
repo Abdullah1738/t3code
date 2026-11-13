@@ -559,7 +559,8 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
         ck = read_json(offsets_path(path), {})
         # Reuse a completed check published by the holder we just waited for. Sequential reads still check history,
         # since a server can publish more retained output after settlement.
-        if (waited and isinstance(ck, dict) and ck != before and ck.get('settledCommandId') == r['command_id']
+        if (waited and r['command_id'] and isinstance(ck, dict) and ck != before and ck.get('settledCheck')
+                and ck.get('settledCommandId') == r['command_id']
                 and checkpoint(path) is not None and path.exists() and path.stat().st_size == ck['logBytes']):
             return 'complete'
         if not path.exists():
@@ -1282,7 +1283,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         else:
             _incomplete_log(settled, result)
     if until is not None and now() >= until:
-        raise _wait_timeout(r)
+        raise _wait_timeout(_run_row(r['run_id']))
     # finish can fill a detached run's log after its stream ended. Only these new bytes remain undelivered.
     if echo:
         _tail(log_path, delivered, True)

@@ -241,6 +241,93 @@ class LogCatchupTests(Isolated):
                 if not wait:
                     self.assertEqual(out, 'prefix\nrest\n')
 
+    def test_contended_checkpoint_reuse_requires_identity_and_success_marker(self):
+        cases = (
+            (None, {}, False),
+            (None, dict(settledCheck=1), False),
+            (None, dict(settledCommandId=None, settledCheck=1), False),
+            ('cmd_a', {}, False),
+            ('cmd_a', dict(settledCommandId='cmd_a'), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=None), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=0), False),
+            ('cmd_a', dict(settledCommandId='other', settledCheck=1), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=1), True),
+        )
+        for command, marker, reusable in cases:
+            for reader in ('logs', 'logs-follow', 'wait'):
+                with self.subTest(command=command, marker=marker, reader=reader):
+                    self.prefix(b'prefix\n')
+                    self.state('failed', 127)
+                    self.con.execute("UPDATE runs SET command_id=? WHERE run_id='run-x'", (command,))
+                    self.con.commit()
+                    self.history.reset_mock()
+                    with contextlib.ExitStack() as holder:
+                        holder.enter_context(common.file_lock('log-run-x', timeout=0))
+                        def publish(_):
+                            self.prefix(b'')
+                            ck = common.checkpoint(self.path)
+                            common.atomic_write_json(common.offsets_path(self.path), dict(ck, **marker))
+                            holder.close()
+                        with patch.object(runs.time, 'sleep', side_effect=publish), \
+                                patch.object(api, 'BACKEND', 'server'):
+                            code, out, err = self.invoke(wait=reader == 'wait', follow=reader == 'logs-follow')
+                    self.assertEqual(code, 127 if reader == 'wait' else (1 if reusable or not command else 0))
+                    if not command:
+                        self.assertIn('server history is unavailable', err)
+                        self.assertIn('may be incomplete', err)
+                        self.assertIn('run ended failed exit=127', err)
+                        self.assertNotIn('no output', err)
+                        self.history.assert_not_called()
+                    elif reusable:
+                        self.assertIn('no output', err)
+                        self.assertNotIn('incomplete', err)
+                        self.history.assert_not_called()
+                    else:
+                        self.assertEqual(self.path.read_bytes(), b'prefix\nrest\n')
+                        self.assertEqual(self.history.call_count, 2)
+                        self.assertEqual(err, '')
+
+    def test_finalization_deadline_reports_the_persisted_result(self):
+        finish_run = runs.finish
+        for route in ('takeover', 'direct-follow'):
+            for mode in ('bg', 'fg'):
+                for exit_code in (0, 127):
+                    with self.subTest(route=route, mode=mode, exit_code=exit_code):
+                        self.prefix(b'')
+                        self.state('running', None)
+                        self.con.execute("UPDATE runs SET mode=? WHERE run_id='run-x'", (mode,))
+                        self.con.commit()
+                        clock = [1000.0]
+                        out, err = io.StringIO(), io.StringIO()
+                        def finish(*args, **kwargs):
+                            finish_run(*args, **kwargs)
+                            if mode == 'fg':
+                                clock[0] = 1011.0
+                        def history(*args, **kwargs):
+                            clock[0] = 1011.0
+                            raise OffboxError('history deadline')
+                        self.history.side_effect = history
+                        self.history.reset_mock()
+                        with patch.object(misc.time, 'time', side_effect=lambda: clock[0]), \
+                                patch.object(misc, '_resolve_exit', return_value=exit_code), \
+                                patch.object(misc, '_catch_up_finished'), \
+                                patch.object(runs, 'finish', side_effect=finish), \
+                                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            with self.assertRaises(OffboxError) as raised:
+                                if route == 'takeover':
+                                    misc._replay_takeover(self.row(), False, 1010, (0, 0), self.path, 0, True)
+                                else:
+                                    misc._wait_run(self.row(), False, until=1010)
+                        status = 'failed' if exit_code else 'done'
+                        self.assertEqual((self.row()['status'], self.row()['exit_code']), (status, exit_code))
+                        self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                        self.assertIn(f'run ended {status} exit={exit_code}', str(raised.exception))
+                        self.assertNotIn('keeps running', str(raised.exception))
+                        if mode == 'bg':
+                            self.assertIn(f'run ended {status} exit={exit_code}', err.getvalue())
+                            self.assertIn('this output is incomplete', err.getvalue())
+                        self.assertNotIn('no output', err.getvalue())
+
     def test_maintenance_skips_held_run_lock_and_records_reason(self):
         ck = common.offsets_path(self.path).read_bytes()
         with common.file_lock('log-run-x', timeout=0):
