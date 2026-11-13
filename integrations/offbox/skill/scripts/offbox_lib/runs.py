@@ -18,7 +18,7 @@ from pathlib import Path
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
 from . import containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
-                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
+                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, file_lock, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
@@ -1217,8 +1217,9 @@ class Runner:
         con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
         con.commit()
         if a.bg:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.log_path.touch()
+            with log_lock(self.run_id):
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log_path.touch()
         say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
         event(con, None, "run_pending", self.run_id)
         t0 = now()
@@ -1698,6 +1699,47 @@ def run_kind(cmd_text: str) -> str:
     return " ".join(words[:2])[:60] or "?"
 
 
+_log_locks = threading.local()
+
+
+@contextlib.contextmanager
+def log_lock(run_id: str, timeout: float = 600, *, until: float | None = None):
+    """Serialize one run's log writers. Callers needing a box lock must acquire it first.
+
+    Reentrant within a thread so takeover publication and finalization can use follow/finish safely.
+    The zero-timeout file-lock attempts keep the retry pause within an interactive reader's budget.
+    """
+    held = getattr(_log_locks, 'held', set())
+    if run_id in held:
+        yield False
+        return
+    deadline = now() + timeout
+    if until is not None:
+        deadline = min(deadline, until)
+    waited = False
+    while True:
+        guard = file_lock('log-' + run_id, timeout=0)
+        try:
+            guard.__enter__()
+            break
+        except OffboxError:
+            left = deadline - now()
+            if left <= 0:
+                if until is not None and now() >= until:
+                    raise OffboxError(f"--timeout reached; {run_id} was not stopped. "
+                                      f"Wait again: offbox wait {run_id}", code=EXIT_WAIT_TIMEOUT)
+                raise
+            waited = True
+            time.sleep(min(0.1, left))
+    _log_locks.held = held
+    held.add(run_id)
+    try:
+        yield waited
+    finally:
+        held.remove(run_id)
+        guard.__exit__(None, None, None)
+
+
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
            replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
@@ -1718,6 +1760,14 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             if row['status'] not in ('starting', 'running'):
                 return row['exit_code']
             pid = row['process_id']
+    guard = log_lock(run_id or Path(log_path).stem, until=until) if log_path else contextlib.nullcontext()
+    with guard:
+        return _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
+                              replay_path, mirror_path, mirror_keep)
+
+
+def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
+                   replay_path, mirror_path, mirror_keep):
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -2125,16 +2175,17 @@ def _detach(rn, signum) -> int:
     rn.record(mode='bg')
     message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "
                f"Re-attach: offbox wait {rn.run_id}")
-    rn.log_path.parent.mkdir(parents=True, exist_ok=True)
-    ck = read_json(offsets_path(rn.log_path), {})
-    with open(rn.log_path, 'ab') as f:
-        # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
-        if ck:
-            f.truncate(ck['logBytes'])
-            f.seek(0, os.SEEK_END)
-        f.write(f"\noffbox: {message}\n".encode())
-        length = f.tell()
-    _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
+    with log_lock(rn.run_id):
+        rn.log_path.parent.mkdir(parents=True, exist_ok=True)
+        ck = read_json(offsets_path(rn.log_path), {})
+        with open(rn.log_path, 'ab') as f:
+            # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
+            if ck:
+                f.truncate(ck['logBytes'])
+                f.seek(0, os.SEEK_END)
+            f.write(f"\noffbox: {message}\n".encode())
+            length = f.tell()
+        _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
     say(message)
     log(message)
     try:

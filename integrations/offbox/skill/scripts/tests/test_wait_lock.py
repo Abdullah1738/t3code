@@ -140,6 +140,40 @@ class WaitLockTests(Isolated):
             rc = cli.main(argv)
         return rc, out.getvalue(), err.getvalue()
 
+    def test_live_follower_excludes_settled_catchup(self):
+        log = common.LOGS_DIR / 'run-x.log'
+        held, release = threading.Event(), threading.Event()
+        errors = []
+        def frames(*args, **kwargs):
+            yield dict(type='stdout', data='last output\n', nextOffset=12)
+            held.set()
+            if not release.wait(2):
+                raise AssertionError('reader did not try catchup')
+            yield dict(type='exit', exitCode=0)
+        def follower():
+            try:
+                runs.follow('bx_a', 7, log, echo=False, run_id='run-x')
+            except BaseException as e:
+                errors.append(e)
+        with patch.object(runs, '_ttl_keeper'), patch.object(api, 'cmd_attach', side_effect=frames), \
+                patch.object(api, 'history_logs', side_effect=AssertionError('follower owns log')):
+            worker = threading.Thread(target=follower)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(2))
+                self.con.execute("UPDATE runs SET status='done',exit_code=0,command_id='cmd_a' WHERE run_id='run-x'")
+                self.con.commit()
+                row = self.con.execute("SELECT * FROM runs WHERE run_id='run-x'").fetchone()
+                before = common.offsets_path(log).read_bytes()
+                self.assertEqual(misc._catch_up_log(row, locked=True), 'n/a')
+                self.assertEqual(common.offsets_path(log).read_bytes(), before)
+                self.assertEqual(log.read_bytes(), b'last output\n')
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
     def test_wait_waits_for_the_lock_holder_to_record_the_end(self):
         self.hold_box()
         clock = Clock(on_sleep=lambda t: t >= 1300 and self.end_run(1))
@@ -724,6 +758,13 @@ class EarlySignalTests(Isolated):
 
 
 class FollowUntilTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        guard = patch.object(common, 'LOCKS_DIR', Path(tmp.name) / 'locks')
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_follow_stops_at_until_without_killing(self):
         clock = Clock()
         frames = iter([{'type': 'stdout', 'data': 'hello\n', 'nextOffset': 6}])
@@ -872,6 +913,7 @@ class TakeoverPublishTests(unittest.TestCase):
         self.logs = Path(self._tmp.name)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
@@ -958,6 +1000,7 @@ class LiveAndEchoTests(unittest.TestCase):
         self.logs = Path(self._tmp.name)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
@@ -1034,9 +1077,11 @@ class LockBlockedFollowerTests(Isolated):
         super().setUp()
         self.logs = common.LOGS_DIR
         # misc and runs import LOGS_DIR by name, so the isolated directory must be patched there too.
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(misc, 'WAIT_POLL_S', 0))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
         self.stack.enter_context(patch.object(runs, 'finish'))
@@ -1213,6 +1258,9 @@ class StreamDeadlineTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(api, 'API', f'http://127.0.0.1:{self.srv.server_address[1]}'))
         stack.enter_context(patch.object(api, '_key', return_value='k'))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stack.enter_context(patch.object(common, 'LOCKS_DIR', Path(tmp.name) / 'locks'))
 
     def read_until(self, path, deadline_in):
         t0 = time.time()

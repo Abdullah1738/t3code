@@ -532,36 +532,56 @@ def _require_my_run(r) -> None:
         require_mine(db(), r["box_id"])
 
 
-def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live: bool = False) -> str:
-    """Fetch history under the writer's box lock; live reads stop at each stream's observed size."""
+LOG_READ_WAIT_S = 10
+
+
+def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live: bool = False,
+                  lock_wait: float = 0) -> str:
+    """Settled history reads need only the run lock; live recovery still takes box then run."""
+    from .runs import log_lock
     if (r['status'] in ('starting', 'running') and not live) or not r['box_id']:
         return 'n/a'
     if not r['command_id'] and (live or r['mode'] != 'bg'):
         return 'n/a'
     path = LOGS_DIR / f"{r['run_id']}.log"
-    guard = contextlib.nullcontext() if locked else file_lock('box-' + r['box_id'], timeout=0)
+    started = time.time()
+    before = read_json(offsets_path(path), {})
+    guard = contextlib.ExitStack()
     try:
-        guard.__enter__()
+        if live and not locked:
+            guard.enter_context(file_lock('box-' + r['box_id'], timeout=0))
+        waited = guard.enter_context(log_lock(r['run_id'], timeout=0 if locked or live else
+                                             min(lock_wait, lock_wait if budget is None else max(0, budget))))
     except OffboxError:
+        guard.close()
         return 'n/a'
     try:
+        ck = read_json(offsets_path(path), {})
+        # Reuse a completed check published by the holder we just waited for. Sequential reads still check history,
+        # since a server can publish more retained output after settlement.
+        if (waited and isinstance(ck, dict) and ck != before and ck.get('settledCommandId') == r['command_id']
+                and checkpoint(path) is not None and path.exists() and path.stat().st_size == ck['logBytes']):
+            return 'complete'
         if not path.exists():
-            # A detached run may never have had a follower. Its missing log has a known empty prefix.
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-        deadline = time.time() + (30 if budget is None else budget)
-        result = _catch_up_log_locked(r, path, budget, live=live) if r['command_id'] else 'n/a'
+        remaining = None if budget is None else max(0, budget - (time.time() - started))
+        deadline = time.time() + (30 if remaining is None else remaining)
+        result = _catch_up_log_locked(r, path, remaining, live=live) if r['command_id'] else 'n/a'
+        if not live and result in ('complete', 'caught_up'):
+            ck = checkpoint(path)
+            atomic_write_json(offsets_path(path), dict(ck, settledCommandId=r['command_id'], settledCheck=time.time_ns()))
         if not live and r['mode'] == 'bg' and not _has_data(path):
             return _empty_log_fallback(r, path, deadline, result)
         return result
     except OSError as e:
         return 'incomplete:' + str(e)
     finally:
-        guard.__exit__(None, None, None)
+        guard.close()
 
 
 def _empty_log_fallback(r, path, deadline, result) -> str:
-    """Only replace an empty settled log, under the box lock; never wake a box to read it."""
+    """Only replace an empty settled log, under the run lock; never wake a box to read it."""
     # boatd's history reads its full host-side logs; the container has no additional copy to recover over SSH.
     if api.BACKEND == 'server':
         return result
@@ -686,7 +706,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
             tmp = None
         atomic_write_json(offsets_path(path),
                           dict(stdoutOffset=offsets[0], stderrOffset=offsets[1], logBytes=log_bytes))
-        # No follower can own these under the box lock. Discard abandoned replay files so a stale replay cannot
+        # No follower can own these under the run lock. Discard abandoned replay files so a stale replay cannot
         # later replace the completed log with the prefix captured before the run settled.
         takeover = path.with_name(path.name + '.takeover')
         takeover.unlink(missing_ok=True)
@@ -705,21 +725,29 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
     try:
         r = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
-        if result.startswith('incomplete:'):
-            event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {result.split(':', 1)[1]}")
+        if result == 'n/a' or result.startswith('incomplete:'):
+            reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
+            event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {reason}")
     except Exception as e:
         event(con, None, 'log_catchup_failed', f"{run_id} {e}")
 
 
 def _incomplete_log(r, result) -> None:
-    if result == 'n/a' and r['status'] not in ('starting', 'running') and r['box_id'] and r['command_id']:
-        # A newer run or another catch-up may own this box lock. Skipping is safe, claiming completeness is not.
-        result = 'incomplete:box lock held'
-    if result.startswith('incomplete:'):
-        p = LOGS_DIR / f"{r['run_id']}.log"
-        size = p.stat().st_size if p.exists() else 0
+    settled = r['status'] not in ('starting', 'running')
+    p = LOGS_DIR / f"{r['run_id']}.log"
+    size = p.stat().st_size if p.exists() else 0
+    if result == 'n/a' and settled and r['mode'] != 'local':
+        reason = ("another reader is fetching this run's log" if r['box_id'] and r['command_id']
+                  else 'server history is unavailable')
+        say(f"{r['run_id']} local log is {size} bytes; {reason}, so it couldn't be checked against the server "
+            "and may be incomplete; retry")
+    elif result.startswith('incomplete:'):
         say(f"{r['run_id']} local log stops at {size} bytes and the rest couldn't be fetched "
             f"({result.split(':', 1)[1]}); this output is incomplete")
+    else:
+        return
+    if settled:
+        say(f"{r['run_id']} run ended {r['status']} exit={r['exit_code']}")
 
 
 def _refresh_running_ttl(r, until=None) -> None:
@@ -769,12 +797,13 @@ def logs(run_id: str, do_follow: bool) -> int:
                 f"{written}) includes the output fetched so far. Use `offbox logs --follow {r['run_id']}` "
                 f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
         return 0
-    result = _catch_up_log(r)
+    result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     _tail(p, 0, True)
-    if r['mode'] == 'bg' and not _has_data(p):
-        say(f"no output recorded for {r['run_id']} (local log missing or empty, {api.NAME} history empty or unavailable)")
-        return 1
     _incomplete_log(r, result)
+    if r['mode'] == 'bg' and not _has_data(p):
+        if result in ('complete', 'caught_up'):
+            say(f"no output recorded for {r['run_id']} (server history checked)")
+        return 1
     return 0
 
 
@@ -784,19 +813,20 @@ def wait(run_id: str, timeout: float | None) -> int:
     from . import start_check
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and not r['box_id']):
-        return _settled(r)
+        return _settled(r, until=None if timeout is None else now() + timeout)
     return _wait_locked(r, echo=False, timeout=timeout)
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
     from .runs import repo_setup_failed
     budget = None if until is None else max(0, until-now())
-    result = _catch_up_log(r, budget=budget, locked=locked)
+    result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
     if until is not None and now() >= until:
+        _incomplete_log(r, result)
         raise _wait_timeout(r)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
-    if r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
+    if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
         say(f"{r['run_id']} settled with no output on record")
     else:
         _incomplete_log(r, result)
@@ -849,12 +879,14 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
 
 def _truncate(path, size: int) -> None:
     """Cut a local log back to its committed length (a holder died after writing a chunk but before committing it)."""
-    try:
-        if os.path.getsize(path) > size:
-            with open(path, "r+b") as f:
-                f.truncate(size)
-    except OSError:
-        pass
+    from .runs import log_lock
+    with log_lock(Path(path).stem):
+        try:
+            if os.path.getsize(path) > size:
+                with open(path, "r+b") as f:
+                    f.truncate(size)
+        except OSError:
+            pass
 
 
 def _wait_locked(r, echo, timeout=None):
@@ -1000,6 +1032,10 @@ def _recover_by(r, log_path, deadline):
 
 
 def _wait_timeout(r) -> OffboxError:
+    if r['status'] not in ('starting', 'running'):
+        return OffboxError(f"--timeout reached while reading {r['run_id']}'s log; run ended "
+                           f"{r['status']} exit={r['exit_code']}. Retry: offbox wait {r['run_id']}",
+                           code=EXIT_WAIT_TIMEOUT)
     return OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                        f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
 
@@ -1132,6 +1168,16 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
     The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
     run still produces. It replaces the original log and checkpoint only when the replay ends with a real exit code.
     A deadline, a lost stream (unknown exit) or any error removes the temp files and keeps the original."""
+    from .runs import log_lock
+    with log_lock(cur['run_id'], until=deadline):
+        ck = checkpoint(log_path)
+        if ck is not None:
+            start, keep = (ck['stdoutOffset'], ck['stderrOffset']), ck['logBytes']
+            has_checkpoint = True
+        return _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint)
+
+
+def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint):
     tmp = log_path.with_name(log_path.name + ".takeover")
     tmp_ck = offsets_path(tmp)
     try:
@@ -1227,11 +1273,19 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     if until is not None and now() >= until:
         raise _wait_timeout(r)
     finish(r['run_id'], code, until=until)
+    if dict(r).get('mode') == 'bg' and not _has_data(log_path):
+        settled = _run_row(r['run_id'])
+        result = _catch_up_log(settled, budget=None if until is None else max(0, until-now()),
+                               lock_wait=LOG_READ_WAIT_S)
+        if result in ('complete', 'caught_up') and not _has_data(log_path):
+            say(f"{r['run_id']} settled with no output on record")
+        else:
+            _incomplete_log(settled, result)
+    if until is not None and now() >= until:
+        raise _wait_timeout(r)
     # finish can fill a detached run's log after its stream ended. Only these new bytes remain undelivered.
     if echo:
         _tail(log_path, delivered, True)
-    if dict(r).get('mode') == 'bg' and not _has_data(log_path):
-        say(f"{r['run_id']} settled with no output on record")
     go_std_glitch(r["box_id"], r["run_id"], log_path, code)
     _report_deps_hint(r, code, log_path)
     out(f"{r['run_id']}: exit={code}")

@@ -157,7 +157,8 @@ class BackgroundOutputTests(Isolated):
         self.history.side_effect = lambda *a, **kw: dict(data='', nextOffset=0, size=6, done=False)
         code, out, err = self.invoke()
         self.assertEqual((code, out), (1, ''))
-        self.assertIn('no output recorded', err)
+        self.assertIn('this output is incomplete', err)
+        self.assertNotIn('no output', err)
         self.assertEqual(self.history.call_count, 3)
 
     def test_receipt_without_command_id_can_recover_remote_copy(self):
@@ -249,13 +250,22 @@ class BackgroundOutputTests(Isolated):
         self.assertEqual(self.path.read_bytes(), b'')
         self.assertFalse(list(self.path.parent.glob('*.remote.*')))
 
-    def test_stopped_deleted_and_busy_boxes_are_not_accessed_over_ssh(self):
-        for box in (None, dict(state='archived'), dict(state='running')):
+    def test_stopped_and_deleted_boxes_are_not_accessed_over_ssh(self):
+        for box in (None, dict(state='archived')):
             with self.subTest(box=box):
                 self.box_get.return_value = box
-                guard = common.file_lock('box-bx_a', timeout=0) if box and box['state']=='running' else contextlib.nullcontext()
-                with guard, patch.object(misc.subprocess, 'run', side_effect=AssertionError('no ssh')):
+                with patch.object(misc.subprocess, 'run', side_effect=AssertionError('no ssh')):
                     self.assertEqual(self.invoke()[0], 1)
+
+    def test_empty_log_fallback_can_read_a_busy_box(self):
+        self.box_get.return_value = dict(state='running')
+        def ssh(argv, **kw):
+            kw['stdout'].write(b'retained output\n')
+            return subprocess.CompletedProcess(argv, 0)
+        with common.file_lock('box-bx_a', timeout=0), patch.object(misc.subprocess, 'run', side_effect=ssh):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, 'retained output\n'))
+        self.assertIn('no stream checkpoint', err)
 
     def test_foreground_empty_log_keeps_existing_behavior(self):
         self.con.execute("UPDATE runs SET mode='fg' WHERE run_id='run-x'")
