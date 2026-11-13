@@ -905,6 +905,8 @@ def refusal_reason(rule, cause, cwd):
         fix = "Use a literal absolute script path."
         if cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
+        elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
+            fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
         elif cause and ("MAX_SCRIPTS" in cause or "MAX_SHELL_DEPTH" in cause):
             fix = "Split the steps into separate shell calls."
         return ("statev2 guard: this command was NOT run.\n"
@@ -1664,9 +1666,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return False
             elif binary in {'node', 'bun'}:
                 args = _interpreter_args(binary, words[1:])
+                test_mode = False
+                if binary == 'node':
+                    args, inputs, test_mode, runtime_options = _node_arguments(words[1:])
+                    if inputs or runtime_options or any(arg.startswith('-') and arg != '--test' for arg in args):
+                        return True
+                    args = [arg for arg in args if arg != '--test']
+                elif args[:1] == ['test']:
+                    test_mode, args = True, args[1:]
                 if args[:1] == ['run']:
                     args = args[1:]
                 if args and not args[0].startswith('-'):
+                    if test_mode:
+                        candidates = [_literal_path(candidate, directory) for arg in args for candidate in script_variants(arg)]
+                        return not (candidates and all(path in written and path not in invalidated_written and written[path][1] and
+                                                       heredoc_preserves_sources(written[path][0], directory, False) for path in candidates))
                     opaque = invocation_written.get((directory, args[0]))
                     if opaque is not None and args[0] in invocation_quoted and not unsafe_bindings:
                         return not all(heredoc_preserves_sources(source, directory, False) for source in opaque)
@@ -1684,6 +1698,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # This proof is only for bodies retained from this batch. Arbitrary
         # on-disk programs still invalidate every source, even if DB-safe.
         if not python:
+            # A skipped test with an empty callback cannot change a source.
+            # Match the complete program; extra imports, hooks and callbacks
+            # must keep the ordinary invalidation behavior.
+            string = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
+            skipped = (r"\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+(['\"])node:test\2\s*;\s*" +
+                       r"\1\.skip\(\s*(?:" + string + r")\s*,\s*\(\s*\)\s*=>\s*\{\s*\}\s*\)\s*;?\s*")
+            if re.fullmatch(skipped, source):
+                return True
             # A small read-only JS grammar; unsupported expressions fail closed.
             source = re.sub(r"import\s*\{\s*readFileSync\s*\}\s*from\s*(['\"])node:fs\1\s*;", '', source)
             strings = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
@@ -1700,80 +1722,68 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             tree = ast.parse(source)
         except (SyntaxError, ValueError):
             return False
-        bindings, aliases, stores = {}, {}, {}
+        # The older proof already handles literal data edits and a restricted
+        # read-only helper grammar. Add only the JSON/HTTP readback grammar
+        # here, never a denylist of Python writers: unknown code can write too.
+        modules = {'json', 'sys', 'pathlib', 'urllib.request', 'unittest', 'tempfile'}
+        calls = {'print', 'len', 'dict', 'list', 'tuple', 'str', 'int', 'bool',
+                 'json.load', 'json.loads', 'json.dumps', 'pathlib.Path', 'pathlib.Path.read_text',
+                 'urllib.request.urlopen', 'tempfile.TemporaryDirectory', 'unittest.main',
+                 'self.assertTrue', 'self.assertFalse', 'self.assertEqual', 'self.assertIsNone'}
+        aliases, values = {}, {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                stores[node.id] = stores.get(node.id, 0) + 1
-            elif isinstance(node, ast.arg):
-                stores[node.arg] = stores.get(node.arg, 0) + 1
             if isinstance(node, ast.Import):
-                aliases.update((item.asname or item.name, item.name) for item in node.names)
+                if any(item.name not in modules for item in node.names):
+                    return False
+                aliases.update((item.asname or item.name.split('.')[0], item.name if item.asname else item.name.split('.')[0]) for item in node.names)
             elif isinstance(node, ast.ImportFrom):
+                if (node.level or node.module not in modules or
+                        any((node.module + '.' + item.name) not in calls for item in node.names)):
+                    return False
                 aliases.update((item.asname or item.name, (node.module or '') + '.' + item.name) for item in node.names)
-        for statement in tree.body:
-            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
-                name = statement.targets[0].id
-                if stores.get(name) == 1:
-                    value = _path_expression(statement.value, bindings, aliases)
-                    if value is not None:
-                        bindings[name] = value
-        functions = {'print', 'len', 'dict', 'map', 'range', 'str', 'bool', 'list', 'set', 'tuple', 'int', 'float',
-                     'bytes', 'sum', 'repr', 'all', 'any', 'enumerate', 'min', 'max', 'sorted', 'isinstance',
-                     'Exception', 'SystemExit', 'open'}
-        functions.update(node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef))
+        def qualified(node):
+            if isinstance(node, ast.Name):
+                return aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return qualified(node.value) + '.' + node.attr
+            if isinstance(node, ast.Call) and qualified(node.func) == 'pathlib.Path':
+                return 'pathlib.Path'
+            return ''
+        test_nodes = set()
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                if (node.decorator_list or node.keywords or len(node.bases) != 1 or qualified(node.bases[0]) != 'unittest.TestCase' or
+                        any(not isinstance(member, ast.FunctionDef) for member in node.body)):
+                    return False
+                test_nodes.add(node)
+                for method in node.body:
+                    if (not method.name.startswith('test_') or method.decorator_list or method.returns or
+                            len(method.args.args) != 1 or method.args.args[0].arg != 'self' or method.args.posonlyargs or
+                            method.args.kwonlyargs or method.args.vararg or method.args.kwarg or method.args.defaults):
+                        return False
+                    test_nodes.add(method)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or '']
-                if any(name.split('.')[0] in {'subprocess', 'shutil', 'ctypes', 'multiprocessing', 'runpy', 'importlib', 'operator', 'functools'} for name in modules):
-                    return False
-            if isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node not in test_nodes:
                 return False
-            if isinstance(node, ast.Assign) and (len(node.targets) != 1 or isinstance(node.targets[0], (ast.Tuple, ast.List))):
-                # Tuple assignment of data is fine; unpacked callables are not
-                # tracked. The source's argv-to-Path map remains a data value.
-                if not isinstance(node.value, ast.Call) or _name(node.value.func) != 'map':
+            if isinstance(node, (ast.AsyncFunctionDef, ast.Lambda, ast.AnnAssign, ast.NamedExpr, ast.AugAssign, ast.Delete)):
+                return False
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                if node.id in aliases or node.id in calls or node.id in values or node.id == 'self':
                     return False
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                value = _path_expression(node.value, bindings, aliases)
-                # A callable alias can disguise open/write/exec under any name.
-                if value is None and isinstance(node.value, (ast.Name, ast.Attribute, ast.Subscript)):
-                    return False
+                values[node.id] = True
             if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, ast.Store):
-                # Environment changes don't write scripts; other object mutation
-                # can replace APIs used by the remainder of a retained body.
-                if not ast.unparse(node).startswith('os.environ['):
-                    return False
+                return False
             if isinstance(node, ast.Attribute) and node.attr.startswith('__'):
                 return False
-            if not isinstance(node, ast.Call):
-                continue
-            if not isinstance(node.func, (ast.Name, ast.Attribute)):
+            if isinstance(node, ast.Call) and qualified(node.func) not in calls:
                 return False
-            name = _name(node.func)
-            root, *rest = name.split('.')
-            name = '.'.join([aliases.get(root, root), *rest])
-            leaf = name.rsplit('.', 1)[-1]
-            if isinstance(node.func, ast.Name) and node.func.id not in aliases and node.func.id not in functions:
+            if isinstance(node, ast.Call) and any(k.arg not in {'encoding', 'errors', 'indent', 'sort_keys'} for k in node.keywords):
                 return False
-            if leaf in {'exec', 'eval', 'compile', '__import__', 'getattr', 'setattr', 'delattr', 'system', 'popen', 'spawn', 'exec_module', 'load_extension'} or leaf.startswith(('execv', 'spawn')):
-                return False
-            destination = None
-            writes = leaf in {'write', 'write_text', 'write_bytes', 'writelines', 'rename', 'replace', 'unlink', 'remove', 'rmdir', 'truncate', 'copy', 'copyfile', 'copytree', 'move', 'symlink', 'link'}
-            if leaf == 'replace':
-                # String.replace is covered by the existing read-only proof.
-                return False
-            if leaf in {'open', 'fdopen'}:
-                mode = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords if k.arg == 'mode'), ast.Constant('r'))
-                if not isinstance(mode, ast.Constant) or not isinstance(mode.value, str):
-                    return False
-                writes = any(flag in mode.value for flag in 'wax+')
-                if writes and node.args:
-                    destination = _path_expression(node.args[0], bindings, aliases)
-            elif writes and isinstance(node.func, ast.Attribute) and leaf in {'write_text', 'write_bytes', 'unlink', 'rmdir'}:
-                destination = _path_expression(node.func.value, bindings, aliases)
-            if writes:
-                path = _literal_path(destination, directory) if destination is not None else None
-                if path is None or affected_sources(path, descendants=True):
+            if isinstance(node, ast.Call) and qualified(node.func) == 'urllib.request.urlopen':
+                # A caller-supplied Request or URL can invoke arbitrary handlers.
+                # A literal HTTP(S) GET leaves file destinations out of the API.
+                if (len(node.args) != 1 or node.keywords or not isinstance(node.args[0], ast.Constant) or
+                        not isinstance(node.args[0].value, str) or not node.args[0].value.startswith(('http://', 'https://'))):
                     return False
         return True
 
@@ -1934,6 +1944,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if _literal_path(candidate, directory) is None:
                 body = invocation_written.get((directory, value)) if value in invocation_quoted and not unsafe_bindings else None
                 if body is None:
+                    root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', value)
+                    if root and (directory, root[1] or root[2], str(Path(root[3]))) in copied_opaque:
+                        raise AmbiguousScript('unchecked copy at script path ' + _token(value))
                     script_path(candidate, directory, binary)
                 # Repeated bindings in a combined AST must not hide a read
                 # that was visible in one of its appended source fragments.
@@ -2337,7 +2350,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', args[-1])
                 source = _literal_path(args[0], directory)
                 if root and source is not None:
-                    copied_opaque.add((directory, root[1] or root[2], str(Path(root[3] or source.name))))
+                    copied = (directory, root[1] or root[2], str(Path(root[3] or source.name)))
+                    copied_opaque.add(copied)
+                    for key in list(opaque_written):
+                        retained_root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', key[1])
+                        if retained_root and (key[0], retained_root[1] or retained_root[2], str(Path(retained_root[3]))) == copied:
+                            del opaque_written[key]
         if binary == "vp" and args[:2] == ["run", "migrate-dev-db"]:
             if any(_direct_read(['cat', *values], directory)
                    for values in variants([v for op, v in redirects if op == '<'])):
@@ -2368,6 +2386,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         node_runtime_options = False
         if binary == 'node':
             args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
+        if binary == 'bun' and args[:1] == ['test']:
+            node_test, args = True, args[1:]
         if binary in {'bun', 'deno'} and args[:1] == ['run']:
             args = _interpreter_args(binary, args[1:])
         program_args = list(args)
