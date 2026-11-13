@@ -225,6 +225,82 @@ class RepoToolTests(unittest.TestCase):
         self.assertIn('vp is a repo-local tool (vite-plus)', p.stderr)
         self.assertIn('corepack pnpm@11.10.0 install --frozen-lockfile && <your command>', p.stderr)
 
+    def stripped_bash(self, command, *, missing=()):
+        # JVM launchers and non-Bash shells discard exported Bash functions.
+        launcher = ('import os, sys; '
+                    'env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_")}; '
+                    '[env.pop(k, None) for k in sys.argv[1].split(",")]; '
+                    'os.execve(sys.argv[2], sys.argv[2:], env)')
+        return shlex.join([sys.executable, '-I', '-c', launcher, ','.join(missing),
+                           shutil.which('bash'), '-c', command])
+
+    def assert_nested_hook(self, launch):
+        original = self.home / 'original-env.sh'
+        original.write_text('declare OFFBOX_NESTED_STARTUP="$BASH_ENV"\nunset -f cd\n')
+        self.env['BASH_ENV'] = '$HOME/original-env.sh'
+        bash = shlex.quote(shutil.which('bash'))
+        probe = ('printf "ok\\n%s\\n%s\\n%s\\n" "$OFFBOX_NESTED_STARTUP" "$(type -t cd)" "$PATH"; '
+                 'cd apps/server; printf "%s\\n" "$PATH"; cd /; printf "%s\\n" "$PATH"; '
+                 # Bypass the hook to prove the restored helpers are exported too.
+                 'BASH_ENV=/dev/null ' + bash + ' -c ' + shlex.quote(
+                     'declare -F __offbox_repo_path __offbox_repo_init __offbox_expand_bash_env'))
+        p = self.run_script([launch(probe) + ' 2>"$HOME/nested.stderr"'])
+        self.assertEqual((self.home / 'nested.stderr').read_text(), '')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        root = self.root.resolve()
+        self.assertEqual(p.stdout.splitlines(), [
+            'ok', '$HOME/original-env.sh', 'function',
+            f'{root}/node_modules/.bin:{self.env["PATH"]}',
+            f'{root}/apps/server/node_modules/.bin:{root}/apps/node_modules/.bin:'
+            f'{root}/node_modules/.bin:{self.env["PATH"]}',
+            self.env['PATH'], '__offbox_repo_path', '__offbox_repo_init', '__offbox_expand_bash_env'])
+        self.assertEqual(list((self.home / '.offbox').glob('bash-env.*')), [])
+
+    def test_bash_env_recovers_stripped_functions(self):
+        self.assert_nested_hook(self.stripped_bash)
+
+    @unittest.skipUnless(shutil.which('dash'), 'dash is not installed')
+    def test_bash_env_recovers_after_dash(self):
+        self.assert_nested_hook(lambda command: shlex.join([
+            shutil.which('dash'), '-c', shlex.join([shutil.which('bash'), '-c', command])]))
+
+    @unittest.skipUnless(shutil.which('node'), 'node is not installed')
+    def test_bash_env_recovers_after_node_sh_child(self):
+        def launch(command):
+            js = ('const {spawnSync} = require("node:child_process"); '
+                  'const p = spawnSync(' + json.dumps(shutil.which('dash') or '/bin/sh') + ', ["-c", ' +
+                  json.dumps(shlex.join([shutil.which('bash'), '-c', command])) +
+                  '], {encoding: "utf8"}); '
+                  'if (p.error) throw p.error; '
+                  'process.stdout.write(p.stdout); process.stderr.write(p.stderr); '
+                  'process.exit(p.status ?? 1);')
+            return shlex.join([shutil.which('node'), '-e', js])
+        self.assert_nested_hook(launch)
+
+    def test_bash_env_without_repo_state_is_a_silent_noop(self):
+        state = ('__offbox_repo_root', '__offbox_repo_bins', '__offbox_original_bash_env',
+                 '__offbox_bash_env')
+        for missing in (*[(name,) for name in state], state):
+            with self.subTest(missing=missing):
+                p = self.run_script([self.stripped_bash('echo ok', missing=missing) +
+                                     ' 2>"$HOME/nested.stderr"'])
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual((self.home / 'nested.stderr').read_text(), '')
+                self.assertEqual(p.stdout, 'ok\n')
+                self.assertEqual(list((self.home / '.offbox').glob('bash-env.*')), [])
+
+    def test_stripped_bash_keeps_optional_bootstrap_hint(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                (self.root / 'package.json').write_text('{}')
+                if enabled:
+                    self.manifest()
+                p = self.run_script([self.stripped_bash('vp i') + ' 2>"$HOME/nested.stderr"'])
+                self.assertEqual(p.returncode, 127, p.stderr)
+                stderr = (self.home / 'nested.stderr').read_text()
+                self.assertNotIn('__offbox_', stderr)
+                self.assertEqual('vp is a repo-local tool (vite-plus)' in stderr, enabled)
+
     def test_new_bash_shells_do_not_cache_global_tools_across_install(self):
         self.tool(self.global_bin, 'vp', 'global')
         install = ('vp; mkdir -p node_modules/.bin; '
