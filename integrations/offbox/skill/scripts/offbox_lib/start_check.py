@@ -32,6 +32,26 @@ def claims_enabled(con, run: str) -> bool:
     return con.execute('SELECT 1 FROM kv WHERE k=?', (f'start_claim:{run}',)).fetchone() is not None
 
 
+def recovery_marked(con, row) -> bool:
+    return con.execute('SELECT 1 FROM kv WHERE k IN (?,?)',
+                       (f"start_unattached:{row['run_id']}", f"start_unknown:{row['run_id']}")).fetchone() is not None
+
+
+def api_pid(con, row) -> int | None:
+    """Old recovery rows stored an OS PID here. Only a recorded API command identity makes those IDs trusted."""
+    if not row['command_id'] and recovery_marked(con, row):
+        return None
+    return row['process_id']
+
+
+def remember_wrapper(con, row, pid: int | None) -> None:
+    # Preserve a known API ID, but quarantine legacy recovery IDs even when today's SSH probe has no PID.
+    trusted = api_pid(con, row)
+    legacy = row['process_id'] if trusted is None else None
+    con.execute('UPDATE runs SET process_id=?, wrapper_pid=COALESCE(?,wrapper_pid,?) WHERE run_id=?',
+                (trusted, pid, legacy, row['run_id']))
+
+
 def script(run: str, claim: bool) -> str:
     # Only $r appears in the pgrep pattern: this checking shell must not match itself.
     return '\n'.join([
@@ -82,6 +102,8 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
             do_pulls(box, dict(row), pulls, until=until)
+    remember_wrapper(con, row, result.pid)
+    if result.code is not None:
         status, error = ('done' if result.code == 0 else 'failed'), None
     elif result.verdict == 'fenced':
         status, error = 'lost', f'{reason}; never started, nothing ran'
@@ -90,9 +112,12 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
         status = 'infra'
         error = f'{rid} on {box}: start unknown: {reason}; ssh check failed or command may still be running; {hint(box, rid)}'
         con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_unknown:{rid}', box))
-    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=?, process_id=COALESCE(?,process_id) "
-                "WHERE run_id=? AND status IN ('starting','running')",
-                (status, result.code, now(), error, result.pid, rid))
+    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=? "
+                "WHERE run_id=? AND (status IN ('starting','running') OR "
+                "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                (status, result.code, now(), error, rid))
+    if result.code is not None or result.verdict == 'fenced':
+        con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
     con.commit()
     if result.code is not None and row['mode'] == 'bg':
         from .misc import _catch_up_finished

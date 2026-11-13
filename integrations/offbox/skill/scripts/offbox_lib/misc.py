@@ -295,6 +295,26 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
         r, result = _cancel_before_start(r)
         if result is not None:
             return result
+    from . import start_check
+    con = db()
+    if not start_check.api_pid(con, r) and start_check.recovery_marked(con, r) and r['box_id']:
+        with file_lock('box-' + r['box_id'], timeout=1):
+            r = _run_row(rid)
+            if r['status'] not in ('starting', 'running'):
+                raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
+            if not start_check.api_pid(con, r):
+                result = start_check.check(r['box_id'], rid, claim=start_check.claims_enabled(con, rid))
+                if result.code is not None or result.verdict == 'fenced':
+                    start_check.settle(con, r, result, 'offbox kill checked an unattached start')
+                    con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
+                    con.commit()
+                    return 0
+                start_check.remember_wrapper(con, r, result.pid)
+                con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_unknown:{rid}', r['box_id']))
+                con.commit()
+                say(f"run {rid}: remote termination unconfirmed; reservation kept. "
+                    + start_check.hint(r['box_id'], rid, result.pid))
+                return 1
     if needs_id_proof:
         _require_my_run(r)
         # Concurrent recovery can overwrite process_id with an OS PID. Check the API's command identity before
@@ -553,8 +573,9 @@ def _empty_log_fallback(r, path, deadline, result) -> str:
                 return result
             # The wrapper copy is optional on older runs; boat also keeps a process log on its live machine.
             paths = [f'.offbox/out/{r["run_id"]}.log']
-            if r['process_id']:
-                paths.append(f'.ascii/processes/{int(r["process_id"])}.log')
+            wrapper_pid = r['wrapper_pid'] or r['process_id']
+            if wrapper_pid:
+                paths.append(f'.ascii/processes/{int(wrapper_pid)}.log')
             command = 'for f in ' + ' '.join(shlex.quote(p) for p in paths) + '; do '
             command += 'if test -s "$HOME/$f"; then cat "$HOME/$f"; exit $?; fi; done; exit 44'
             remaining = api.left()
@@ -727,6 +748,9 @@ def logs(run_id: str, do_follow: bool) -> int:
         with file_lock('box-' + r['box_id'], timeout=0):
             reconcile_lost(db(), r['box_id'])
             r = _run_row(r['run_id'])
+    from . import start_check
+    if do_follow and r['status'] == 'infra' and start_check.recovery_marked(db(), r):
+        return _wait_locked(r, echo=True)
     if r['status'] in ('starting', 'running'):
         if do_follow:
             return _wait_locked(r, echo=True)
@@ -757,7 +781,9 @@ def logs(run_id: str, do_follow: bool) -> int:
 def wait(run_id: str, timeout: float | None) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
-    if r["status"] not in ("starting", "running", "lost") or (r['status'] == 'lost' and not r['box_id']):
+    from . import start_check
+    unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
+    if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and not r['box_id']):
         return _settled(r)
     return _wait_locked(r, echo=False, timeout=timeout)
 
@@ -840,7 +866,8 @@ def _wait_locked(r, echo, timeout=None):
     from .runs import _ended, reconcile_lost
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
-    if db().execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{r['run_id']}",)).fetchone():
+    from . import start_check
+    if start_check.recovery_marked(db(), r) and not start_check.api_pid(db(), r):
         r = _wait_start_receipt(r, deadline)
     if r['status'] != 'lost':
         r = _wait_for_start(r, deadline)
@@ -1009,7 +1036,7 @@ def _client_alive(pid: int | None, start_at: float | None) -> bool:
     return began is None or start_at is None or began <= start_at + 2
 
 
-def _wait_start_receipt(row, deadline):
+def _wait_start_receipt(row, deadline, *, locked=False):
     """Recover a dead client's unrecorded start under the same lock as run/reap."""
     from . import start_check
     con = db()
@@ -1017,14 +1044,17 @@ def _wait_start_receipt(row, deadline):
         if deadline is not None and now() >= deadline:
             raise _wait_timeout(row)
         try:
-            guard = file_lock('box-' + row['box_id'], timeout=0)
+            guard = contextlib.nullcontext() if locked else file_lock('box-' + row['box_id'], timeout=0)
             guard.__enter__()
         except OffboxError:
             pass
         else:
             try:
                 row = _run_row(row['run_id'])
-                if row['status'] not in ('starting', 'running'):
+                if row['status'] not in ('starting', 'running') and not (
+                        row['status'] == 'infra' and start_check.recovery_marked(con, row)):
+                    return row
+                if start_check.api_pid(con, row):
                     return row
                 budget = start_check.SSH_TIMEOUT_S if deadline is None else min(start_check.SSH_TIMEOUT_S, max(0, deadline-now()))
                 result = start_check.check(row['box_id'], row['run_id'],
@@ -1042,8 +1072,8 @@ def _wait_start_receipt(row, deadline):
                     raise OffboxError(f"{row['run_id']} on {row['box_id']}: start unknown; offbox reap or check: "
                                       + start_check.hint(row['box_id'], row['run_id']), started=True,
                                       run_id=row['run_id'], box=row['box_id'])
-                con.execute("UPDATE runs SET status='running', process_id=COALESCE(?,process_id) WHERE run_id=?",
-                            (result.pid, row['run_id']))
+                start_check.remember_wrapper(con, row, result.pid)
+                con.execute("UPDATE runs SET status='running' WHERE run_id=?", (row['run_id'],))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f"start_unattached:{row['run_id']}", '1'))
                 con.commit()
             finally:
@@ -1058,9 +1088,12 @@ def _wait_for_start(r, deadline):
     said = None
     while True:
         cur = _run_row(r['run_id'])
-        if cur['status'] not in ('starting', 'running') or (cur['box_id'] and cur['process_id']):
+        from . import start_check
+        if cur['status'] not in ('starting', 'running') or (cur['box_id'] and start_check.api_pid(db(), cur)):
             return cur
         pid = cur['client_pid'] if 'client_pid' in cur.keys() else None
+        if start_check.recovery_marked(db(), cur) and cur['box_id']:
+            return _wait_start_receipt(cur, deadline)
         if not _client_alive(pid, cur['start_at']):
             if not cur['box_id']:
                 con = db()
@@ -1144,7 +1177,7 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     try:
         code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
                       start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
-                      mirror_keep=mirror_keep)
+                      mirror_keep=mirror_keep, receipt_locked=True)
     except Interrupted as e:
         # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
         finish(r["run_id"], e.code, "interrupted")

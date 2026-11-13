@@ -342,6 +342,7 @@ def _renew_live_runs(con, rows, live: dict, protected: set[str], dry: bool) -> N
 
 def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
     from .runs import remote_alive
+    from . import start_check
     if dry or box.get('state') not in api.LIVE_STATES:
         return
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status='running'", (bid,)).fetchall():
@@ -352,11 +353,15 @@ def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
             if inserted:
                 event(con, bid, 'run_orphan_cap', run['run_id'])
             continue
-        if not run['process_id']:
+        pid = start_check.api_pid(con, run)
+        if not pid:
+            if start_check.recovery_marked(con, run):
+                lease.ensure_ttl(bid, RUN_TTL_S, box)
+                return
             continue
         try:
             with api.budget(10):
-                st = api.cmd_status(bid, run['process_id'], timeout=5, retries=0)
+                st = api.cmd_status(bid, pid, timeout=5, retries=0)
                 alive = bool(st and st.get('running') is True)
                 # A missing/lost tracker is not evidence of death; #770's wrapper marker is independent.
                 if not alive and (st is None or st.get('status') == 'lost'):
@@ -388,14 +393,21 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
     budget = budget if budget is not None else {'checks': START_CHECKS_PER_PASS}
     if not dry and state in api.STOPPED_STATES and con.execute(
             "SELECT 1 FROM kv WHERE k LIKE 'start_unknown:%' AND v=?", (bid,)).fetchone():
+        for row in con.execute('SELECT * FROM runs WHERE box_id=?', (bid,)).fetchall():
+            if row['process_id'] and start_check.api_pid(con, row) is None:
+                start_check.remember_wrapper(con, row, None)
+        con.commit()
         lease._release_locked(con, bid)
     if not dry:
         reconcile_lost(con, bid, state=state)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
-    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
+    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
+                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                           (bid,)).fetchall():
         status, code = None, None
+        pid = start_check.api_pid(con, run)
         unattached = con.execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{run['run_id']}",)).fetchone()
-        if (run['status'] == 'starting' and not run['process_id']) or unattached:
+        if (run['status'] == 'starting' and not pid) or unattached or (not pid and start_check.recovery_marked(con, run)):
             age = now() - (run['start_at'] or 0)
             orphan = bool(run['error']) or not _client_alive(run['client_pid'], run['start_at'])
             if orphan and age >= START_GRACE_S:
@@ -415,6 +427,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                                        until=None if api.left() is None else now() + max(0, api.left()))
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
+            if state in api.LIVE_STATES and not pid:
+                continue
             if age < 3600 or not orphan:
                 continue
         if state in api.STOPPED_STATES or state in ('error','cancelled'):
@@ -422,15 +436,15 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if run['command_id']:
                 # Process status can disappear on stop; retained history survives it without resuming the box.
                 try:
-                    st = api.cmd_status(bid, run['process_id']) if run['process_id'] else None
+                    st = api.cmd_status(bid, pid) if pid else None
                     code = st.get('exitCode') if st else None
                 except OffboxError:
                     continue
         elif state not in api.LIVE_STATES:
             continue
-        elif run["process_id"]:
+        elif pid:
             try:
-                st = api.cmd_status(bid, run["process_id"])
+                st = api.cmd_status(bid, pid)
             except OffboxError:
                 continue
             if st is None:
