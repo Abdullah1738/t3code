@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 from time import perf_counter
 import tempfile
 
@@ -42,8 +43,18 @@ _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', '
 _ENUMS['subcommand'] = _COMMANDS
 
 
+def log_dir():
+    override = os.environ.get('ROBOB_TOOL_LOG_DIR')
+    if override:
+        return Path(override)
+    if 'unittest' in sys.modules or 'pytest' in sys.modules:
+        return None
+    return Path.home() / '.robob/logs/tools'
+
+
 def root():
-    return Path.home() / '.robob/logs/tools/orders'
+    base = log_dir()
+    return base / 'orders' if base is not None else None
 
 
 _GUARD_TAGS = frozenset("""
@@ -185,8 +196,8 @@ def _private_directory(folder):
         path = path.parent
     for path in reversed(missing):
         path.mkdir(mode=0o700, exist_ok=True)
-    log_base = Path.home() / '.robob/logs'
-    private = [log_base, log_base / 'tools', folder] if folder == log_base / 'tools/orders' else [folder]
+    private = ([folder] if os.environ.get('ROBOB_TOOL_LOG_DIR') else
+               [folder.parent.parent, folder.parent, folder])
     for path in private:
         path.chmod(0o700)
 
@@ -194,6 +205,8 @@ def _private_directory(folder):
 def _write(row):
     try:
         folder = root()
+        if folder is None:
+            return
         _private_directory(folder)
         day = row['ts'][:10]
         seen = (str(folder), day)
@@ -289,6 +302,8 @@ def rollup(day=None):
         if dt.date.fromisoformat(day).isoformat() != day:
             return None
         folder = root()
+        if folder is None:
+            return None
         counts, kinds, durations, errors = {}, {}, {}, {}
         total = oks = failures = error_lines = invalid = source_bytes = 0
         path = folder / (day + '.ndjson')
@@ -349,11 +364,13 @@ def rollup(day=None):
 
 def previous_day_rollup():
     try:
+        folder = root()
+        if folder is None:
+            return
         now = dt.datetime.now(dt.timezone.utc)
         if (now.hour, now.minute) < (0, 5):
             return
         day = (now.date() - dt.timedelta(days=1)).isoformat()
-        folder = root()
         try:
             previous = json.loads((folder / ('rollup-' + day + '.json')).read_text())
         except (OSError, ValueError):

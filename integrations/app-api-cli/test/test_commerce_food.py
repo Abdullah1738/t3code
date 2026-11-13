@@ -3,6 +3,7 @@ from unittest.mock import patch
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import commerce_food as f
@@ -60,8 +61,8 @@ class FoodTests(unittest.TestCase):
             for key,value,code in cases:
                 with self.subTest(route=route,key=key,value=value), tempfile.TemporaryDirectory() as temp:
                     changed={**data,key:value}
-                    folder=Path(temp)/'logs'
-                    with patch.object(f.toollog,'root',return_value=folder), \
+                    folder=Path(temp)/'logs/orders'
+                    with patch.dict(os.environ,{'ROBOB_TOOL_LOG_DIR':str(folder.parent)}), \
                             patch.object(cli,'PAUSE_FILE',Path(temp)/'not-paused'), \
                             patch.object(cli,'card_preflight',return_value=None), \
                             patch.object(cli,'require_moni_go',return_value=None), \

@@ -1,3 +1,4 @@
+import { hook as toolLogHook } from "../lib/toollog"
 // offbox gate (worker C, 2026-10-13). Heavy agent compute (test suites,
 // installs, local containers) runs on boat.dev boxes through `offbox run --`.
 // Every shell tool call is classified with remote-compute/heavy-rules.json.
@@ -130,13 +131,19 @@ export function denial(cmd: string, v: any): string {
 export default {
   id: "offbox-gate",
   setup: async (ctx: any) => {
-    try { ensureRules() } catch (e) { log({ event: "rules-load-error", errorTag: "rules_load_failed" }) }
+    try { ensureRules() } catch {
+      log({ event: "rules-load-error", errorTag: "rules_load_failed" })
+      toolLogHook('offbox-gate', 'allowed', 'rules-load-error', performance.now(), undefined, 'rules.load_failed')
+    }
 
     await ctx.tool.hook("execute.before", async (e: any) => {
+      const started = performance.now()
+      let decision = 'allowed', rule = 'no-policy', command: unknown, errorTag: string | undefined
       try {
         if (!SHELL_TOOLS.has(e.tool)) return
         const input = e.input as any
         const cmd = input?.command
+        command = cmd
         if (typeof cmd !== "string" || !cmd) return
         const m = mode()
         if (m === "off") { gateLog("allowed", "unknown", 0); return }
@@ -144,7 +151,9 @@ export default {
         ensureRules()
         const v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null)
         const ms = +(performance.now() - t0).toFixed(3)
+        rule = v.rule ?? "no-policy"
         if (v.error) {
+          errorTag = "hook.classifier_failed"
           gateLog("allowed", "unknown", ms, true)
           log({ event: "classify-error", session: e.sessionID, errorTag: "classify_failed" })
           return
@@ -158,16 +167,20 @@ export default {
         }
         const reason = ex ? "exempt" : !offboxAvailable() ? "no-offbox" : capped() ? "capped" : null
         const deny = m === "enforce" && !reason
+        decision = deny ? "denied" : "allowed"
         log({
           event: deny ? "deny" : "allow", mode: m, session: e.sessionID, rule: v.rule, class: v.class, size: v.size,
           would_deny: !ex, allow_reason: reason, cmd_hash: createHash("sha1").update(cmd).digest("hex").slice(0, 12),
           ms,
         })
-        gateLog(ex ? "local-override" : deny ? "denied" : "allowed", v.class, ms)
         if (deny) e.input = { ...input, command: denial(cmd, v), background: false }
+        gateLog(ex ? "local-override" : deny ? "denied" : "allowed", v.class, ms)
       } catch (err) {
+        errorTag = 'hook.error'
         gateLog("allowed", "unknown", 0, true)
         log({ event: "hook-error", session: e?.sessionID, errorTag: "hook_failed" })
+      } finally {
+        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID})
       }
     })
 
@@ -187,6 +200,7 @@ export default {
         env.OFFBOX_GATE = "1"
       } catch (err) {
         log({ event: "shell-hook-error", errorTag: "hook_failed" })
+        toolLogHook('shell', 'allowed', 'shell-hook-error', performance.now(), undefined, 'shell.hook_failed')
       }
     })
 

@@ -1,7 +1,9 @@
 #!/usr/bin/python3
 """Shell adapters. All instrumentation, including measurement, fails open."""
 import json
+import errno
 import os
+import re
 from pathlib import Path
 import sys
 import subprocess
@@ -41,20 +43,88 @@ DIRECTORY_ROOTS = [Path.home() / 'Library/Caches', Path.home() / '.cache',
                      ('wt', 't3code-wt', 'board-wt', 'coord-wt', 'caches', 'crpko-devops/tmp', 'memory-system-backup', 'memory-system-data', 'memory-system-data-v2')]]
 
 
+class SourceFailure(Exception):
+    def __init__(self, failure, message, exit_code=None):
+        super().__init__(message)
+        self.failure = failure
+        self.message = message
+        self.exit_code = exit_code
+
+
+def stderr_line(value):
+    if isinstance(value, bytes):
+        value = value.decode(errors='replace')
+    lines = (value or '').strip().splitlines()
+    return lines[0][:300] if lines else ''
+
+
+def permission_denied(value):
+    return bool(re.search(r'operation not permitted|permission denied', value, re.I))
+
+
+def source_error(component, name, source, started, exc):
+    failure, code, message = 'exit', None, 'source read failed (%s)' % type(exc).__name__
+    if isinstance(exc, SourceFailure):
+        failure, code, message = exc.failure, exc.exit_code, exc.message
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        failure, message = 'timeout', stderr_line(exc.stderr) or 'source command timed out'
+    elif isinstance(exc, OSError):
+        failure = 'permission' if exc.errno in (errno.EACCES, errno.EPERM) else 'exit'
+        message = str(exc)
+    emit(component, 'error', name, ok=False,
+         props=dict(source=str(source), failure=failure, exitCode=code,
+                    elapsedMs=max(0, (time.monotonic()-started)*1000)),
+         error_tag=component+'.source_unavailable', error_message=message)
+
+
 def directory_inventory(paths=None, run=subprocess.run):
     started = time.monotonic()
+    deadline = started + 300
     sizes, errors = {}, 0
+    partials = {}
     for path in DIRECTORY_ROOTS if paths is None else paths:
-        if not path.exists():
-            continue
+        source_started = time.monotonic()
         try:
-            result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True, timeout=15)
+            path.stat()
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
+            result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True,
+                         timeout=min(60, remaining), env={**os.environ, 'LC_ALL': 'C'})
+            stderr = getattr(result, 'stderr', '') or ''
+            denied = sum(permission_denied(line) for line in stderr.splitlines())
+            other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
+            message = stderr_line(stderr)
+            if result.returncode and (result.returncode != 1 or not denied or other_errors):
+                failure = 'permission' if not result.stdout.strip() and denied else 'exit'
+                raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
+            # Match the requested root, not an arbitrary number printed by du.
+            total = None
+            for line in result.stdout.splitlines():
+                fields = line.split('\t', 1)
+                if len(fields) == 2 and fields[1] == str(path):
+                    if not fields[0].isdigit():
+                        raise SourceFailure('parse', message or 'invalid du total', result.returncode)
+                    total = int(fields[0])*1024
+            if total is None:
+                failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
+                raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+            sizes[str(path)] = total
             if result.returncode:
-                raise OSError('directory measurement failed')
-            sizes[str(path)] = int(result.stdout.split()[0]) * 1024
-        except Exception:
+                partials[str(path)] = dict(partial=True, deniedCount=denied)
+                emit('disk', 'event', 'disk.inventory.source', ok=True,
+                     props=dict(source=str(path), partial=True, deniedCount=denied,
+                                bytes=total, exitCode=result.returncode,
+                                elapsedMs=(time.monotonic()-source_started)*1000))
+        except FileNotFoundError as exc:
+            if exc.filename == str(path):
+                continue
             errors += 1
-    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, sourceErrors=errors))
+            source_error('disk', 'disk.inventory.source', path, source_started, exc)
+        except Exception as exc:
+            errors += 1
+            source_error('disk', 'disk.inventory.source', path, source_started, exc)
+    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials, sourceErrors=errors))
     emit('disk', 'error' if errors else 'perf', 'disk.inventory', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000, props={'count': len(sizes), 'sourceErrors': errors},
          error_tag='disk.inventory_failed' if errors else None)
@@ -81,19 +151,21 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     for path in paths:
         try:
             sizes[str(path)] = Path(path).stat().st_size
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError:
+            errors += 1
     try:
         sizes[str(temp_dir)] = int((Path(watch_dir) / 'tmp_kb').read_text()) * 1024
     except (ValueError, OSError):
         pass
     inventory = read_state('disk-inventory')
+    props.update(inventorySourceErrors=inventory.get('sourceErrors', 0),
+                 inventoryAgeS=None, inventoryStale=True)
     if inventory.get('at'):
         props['inventoryAgeS'] = max(0, time.time()-inventory['at'])
+        props['inventoryStale'] = props['inventoryAgeS'] > 7200
         sizes.update(inventory.get('sizes', {}))
-        errors += inventory.get('sourceErrors', 0) + int(props['inventoryAgeS'] > 7200)
-    else:
-        errors += 1
     previous = read_state('disk').get('sizes', {})
     growers = sorted(((path, size - previous[path]) for path, size in sizes.items() if path in previous and size > previous[path]), key=lambda x: x[1], reverse=True)[:5]
     for i, (path, delta) in enumerate(growers, 1):

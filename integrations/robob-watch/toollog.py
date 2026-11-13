@@ -32,7 +32,8 @@ SCHEMAS = {
         'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool},
     'sync.gap': {'count': int}, 'card.render': {'kind': {'morning', 'nutrition'}},
     'brief.fresh': {'fresh': bool}, 'nag.sent': {'count': int}, 'nag.snoozed': {'count': int},
-    'nag.stopped': {'count': int}, 'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
+    'nag.stopped': {'count': int}, 'nag.folded': {'count': int},
+    'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
     'log.cap': {}, 'rollup.run': {},
 }
 

@@ -384,6 +384,37 @@ class GuardTests(unittest.TestCase):
             with self.subTest(case=label, command=command):
                 self.assertEqual(guard.classify_detail(command, str(self.root))[0], expected)
 
+    def test_node_test_database_names_and_live_root_siblings(self):
+        for label, source, expected in isolated_source_cases.database_name_sources():
+            self.write('names.test.mjs', source)
+            for command in ('node --test names.test.mjs', 'node names.test.mjs',
+                            'offbox run -- node --test names.test.mjs'):
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), expected)
+
+    def test_installer_node_test_and_parse_only_commands(self):
+        root = Path(__file__).resolve().parents[3]
+        for command in (
+            'node --test apps/desktop/scripts/install-robob-fast.test.mjs',
+            'node --check apps/desktop/scripts/install-robob-fast.mjs',
+            'zsh -n apps/desktop/scripts/install-robob-fast.zsh',
+            'offbox run -- node --test apps/desktop/scripts/install-robob-fast.test.mjs',
+            'vp test run apps/desktop/scripts/install-robob-fast.test.mjs',
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(guard.classify(command, str(root)))
+
+    def test_node_test_refusal_only_hints_for_vitest_imports(self):
+        for module in ('node:test', 'vitest', 'vite-plus/test', None):
+            source = f'import {{ test }} from "{module}";\n' if module else '// fixture\n'
+            self.write('names.test.mjs', source + 'const db = "~/.robob/userdata/statev2.sqlite";\n')
+            with self.subTest(module=module):
+                rule, detail = guard.classify_detail('node --test names.test.mjs', str(self.root))
+                self.assertEqual(rule, SCRIPT)
+                self.assertIn('names.test.mjs:2', detail)
+                self.assertIn('~/.robob/userdata/statev2.sqlite', detail)
+                self.assertEqual('vp test run names.test.mjs' in detail, module in {'vitest', 'vite-plus/test'})
+
     def test_migration_exemption_checks_source_and_plain_node_invocation(self):
         source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         original = source.read_text()

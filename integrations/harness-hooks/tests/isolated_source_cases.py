@@ -340,6 +340,38 @@ cat "$T/.robob/userdata/statev2.sqlite"
     return cases
 
 
+def database_name_sources():
+    """Bare names are data until the same source also names a live root."""
+    names = ('statev2.sqlite', 'state.sqlite', 'opencode.db',
+             'statev2.pre-shrink-20261105234934246.sqlite',
+             'statev2.sqlite-wal', 'statev2.sqlite-shm', 'state.sqlite-journal', 'opencode.db-wal')
+    roots = (
+        'join(homedir(), ".t3", "userdata", NAME)',
+        '"~/.robob/userdata/" + NAME',
+        'process.env.HOME + "/.t3/userdata/" + NAME',
+        'join(process.env.T3CODE_HOME, "userdata", NAME)',
+        'join(os.homedir(), ".local/share/opencode", NAME)',
+        'process.chdir(join(homedir(), ".t3/userdata"))',
+        'process.chdir("~/.robob/userdata")',
+        'process.chdir("$HOME/.t3/userdata")',
+        'process.chdir("${HOME}/.t3/userdata")',
+        'join(Path.home(), "userdata", NAME)',
+        'join(homedir(), "userdata", NAME)',
+        'join(process.env.HOME, "userdata", NAME)',
+        'join("robob-data", "userdata", NAME)',
+        'join("opencode-data", NAME)',
+        'join(os.homedir(), ".local", "share", "opencode", NAME)',
+    )
+    for name in names:
+        source = ('import { test } from "node:test";\n'
+                  'const bundle = "com.ardud.robob";\n'
+                  'const names = [' + repr(name) + '];\n')
+        yield 'bare-' + name, source, None
+        for root in roots:
+            yield root + ':' + name, source + root.replace('NAME', repr(name)) + ';\n', 'live-database-script'
+    yield 'literal-live', 'import { test } from "node:test";\nconst db = "~/.robob/userdata/statev2.sqlite";\n', 'live-database-script'
+
+
 def migration_mutations(original):
     return [
         ('harmless-edit', original + '\n// harmless comment\n', None),

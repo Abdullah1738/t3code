@@ -144,7 +144,7 @@ class Reporter1006Tests(unittest.TestCase):
                     self.check(self.event(command), expected, harness)
 
     def test_node_option_operands_preserve_entry_and_preload_inspection(self):
-        self.write('entry.mjs', f'require("fs").readFileSync({LIVE!r})\n')
+        self.write('entry.mjs', f'import {{ test }} from "vitest";\nrequire("fs").readFileSync({LIVE!r})\n')
         self.write('safe.cjs', 'console.log("safe")\n')
         value_options = [('-C', 'development'), ('--conditions', 'development'),
                          ('--input-type', 'module'), ('--title', 'title'),
@@ -252,13 +252,13 @@ class Reporter1006Tests(unittest.TestCase):
                 self.check(self.event(command), expected)
 
     def test_diagnostics_name_reference_and_single_fix(self):
-        self.write('x.mjs', f'// fixture\nrequire("fs").readFileSync({LIVE!r})\n')
+        self.write('x.mjs', f'import {{ test }} from "vitest";\nrequire("fs").readFileSync({LIVE!r})\n')
         result = reporters.engine.decide(self.event('node --test x.mjs'), 'codex')
         reason = result['reason']
         for value in ('this command was NOT run', 'x.mjs:2', LIVE, 'vp test run x.mjs'):
             self.assertIn(value, reason)
         self.assertLessEqual(len(reason.splitlines()), 3)
-        self.write('x.mjs', "const example = '/tmp/fixture/statev2.sqlite';\n" + f'require("fs").readFileSync({LIVE!r})\n')
+        self.write('x.mjs', "import { test } from 'vitest'; const example = '/tmp/fixture/statev2.sqlite';\n" + f'require("fs").readFileSync({LIVE!r})\n')
         reason = reporters.engine.decide(self.event('node --test x.mjs'), 'codex')['reason']
         self.assertIn('x.mjs:2', reason)
         self.assertIn(LIVE, reason)

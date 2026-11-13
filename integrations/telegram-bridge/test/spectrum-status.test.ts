@@ -108,6 +108,7 @@ test("timeouts bound the ownership check", async () => {
   const path = await serve(() => { /* never respond */ });
   expect(await spectrumRouterStatus(path, 50)).toBeUndefined();
   expectError("tg.router.timeout");
+  expect(logs.entries()[0]?.props?.cause).toBe("timeout");
 });
 
 test("timeouts after response headers log once despite abort and stream error events", async () => {
@@ -117,6 +118,7 @@ test("timeouts after response headers log once despite abort and stream error ev
   });
   expect(await spectrumRouterStatus(path, 50)).toBeUndefined();
   expectError("tg.router.timeout");
+  expect(logs.entries()[0]?.props?.cause).toBe("timeout");
 });
 
 const logs = useToolLogFixture();

@@ -728,6 +728,7 @@ class CanaryTests(FakeCliTestCase):
         super().setUp()
         self.gen = self.homes_pkg / "generate_homes.py"
         shutil.copy(PKG.parent / "harness-homes" / "generate_homes.py", self.gen)
+        shutil.copy(PKG.parent / "harness-homes" / "toollog.py", self.homes_pkg / "toollog.py")
         shutil.copytree(PKG.parent / "harness-homes" / "vendor", self.homes_pkg / "vendor")
         shutil.copy(PKG.parent / "harness-homes" / "manifest.json", self.homes_pkg / "manifest.json")
         shutil.copytree(PKG.parent / "harness-homes" / "overlays", self.homes_pkg / "overlays")
@@ -2308,6 +2309,7 @@ class ManifestLocationTests(FakeCliTestCase):
         installed = self.tmp / "installed"
         installed.mkdir()
         shutil.copy(PKG / "harness_cli.py", installed / "harness_cli.py")
+        shutil.copy(PKG / "toollog.py", installed / "toollog.py")
         shutil.copy(PKG / "model-manifest.json", installed / "model-manifest.json")
         env = {k: v for k, v in os.environ.items() if k != "HARNESS_CLI_MODEL_MANIFEST"}
         code = (
