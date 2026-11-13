@@ -67,6 +67,7 @@ class TookAmountTest(unittest.TestCase):
         self.assertFalse(any(x.startswith("Reta") for x in self.outstanding()))
 
     def test_matching_amount_does_not_touch_doses(self):
+        self.write("doses", {"2026-11-01": {"reta": "1mg"}, "2026-11-12": {"tadalafil": "4mg"}})
         for text in ("3mg", "3.0MG", "03.000mg"):
             with self.subTest(text=text):
                 before = (self.root / "doses.json").stat()
@@ -94,6 +95,61 @@ class TookAmountTest(unittest.TestCase):
         self.took(DAY, "reta=1mg")
         self.took(DAY, "reta=2mg")
         self.assertEqual(self.read("doses"), {DAY: {"reta": VALUE}})
+
+    def check_correction_to_schedule(self, day, first):
+        other = {"2026-11-01": {"reta": "1mg"}, day: {"tadalafil": "4mg"}}
+        self.write("taken", {})
+        self.write("doses", other)
+        self.took(day, "reta=" + first)
+        before = (self.root / "doses.json").stat()
+        r = self.took(day, "reta=3mg")
+        other[day]["reta"] = "3mg (actual)"
+        self.assertEqual(self.read("doses"), other)
+        self.assertEqual(self.read("taken"), {day: ["reta"]})
+        self.assertNotIn("flag:", r.stdout)
+        self.assertNotIn("closes Reta", r.stdout)
+        self.assertNotEqual((self.root / "doses.json").stat().st_ino, before.st_ino)
+        self.assertFalse(list(self.root.glob("*.tmp")))
+        value = self.read("doses")[day]["reta"]
+        m = re.match(r"\s*([\d.]+)\s*(mg|iu|mcg)", value, re.I)
+        self.assertEqual((float(m[1]), m[2].lower()), (3.0, "mg"))
+        corrected = self.snapshot()
+        inode = (self.root / "doses.json").stat().st_ino
+        r = self.took(day, "reta=03.000MG")
+        self.assertNotIn("flag:", r.stdout)
+        self.assertEqual(self.snapshot(), corrected)
+        self.assertEqual((self.root / "doses.json").stat().st_ino, inode)
+
+    def test_due_day_correction_back_to_schedule(self):
+        for first in ("2mg", "4mg", "250MCG", "2IU"):
+            with self.subTest(first=first):
+                self.check_correction_to_schedule("2026-11-12", first)
+
+    def test_carried_correction_back_to_schedule(self):
+        for first in ("2mg", "4mg", "250MCG", "2IU"):
+            with self.subTest(first=first):
+                self.check_correction_to_schedule(DAY, first)
+
+    def test_matching_existing_override_is_unchanged(self):
+        for day in ("2026-11-12", DAY):
+            with self.subTest(day=day):
+                self.write("doses", {day: {"reta": "03.0MG (confirmed earlier)"}})
+                self.write("taken", {day: ["reta"]})
+                before = (self.root / "doses.json").read_bytes()
+                inode = (self.root / "doses.json").stat().st_ino
+                r = self.took(day, "reta=3mg")
+                self.assertNotIn("flag:", r.stdout)
+                self.assertEqual((self.root / "doses.json").read_bytes(), before)
+                self.assertEqual(self.read("taken"), {day: ["reta"]})
+                self.assertEqual((self.root / "doses.json").stat().st_ino, inode)
+
+    def test_quiet_correction_and_flagged_change_in_one_command(self):
+        self.took("2026-11-12", "reta=2mg")
+        r = self.took("2026-11-12", "reta=3mg", "tadalafil=4mg")
+        self.assertEqual(self.read("doses"), {"2026-11-12": {
+            "reta": "3mg (actual)", "tadalafil": "4mg (actual, not the scheduled 5mg)"}})
+        self.assertEqual(r.stdout.count("flag:"), 1)
+        self.assertIn("flag: Tadalafil", r.stdout)
 
     def test_bad_dose_file_never_changes_overrides_or_confirmations(self):
         for content in ('{"2026-11-01": {"reta": "1mg"},}', '', '{"2026-11-01":',

@@ -65,10 +65,18 @@ with (_tl.run('took', _log_sys.argv[1:], name='cli.run')
         except (OSError, ValueError) as e:
             sys.exit("could not read doses.json: " + str(e))
         flags = []
+        changed = False
         for name, (amt, unit) in amounts.items():
             label, due_date = scheduled(name, dt.date.fromisoformat(day), taken)
             match = re.search(r"([\d.]+)\s*(mg|mcg|iu)", label, re.I) if label else None
-            if match and (Decimal(amt), unit) == (Decimal(match[1]), match[2].lower()): continue
+            if match and (Decimal(amt), unit) == (Decimal(match[1]), match[2].lower()):
+                if name in doses.get(day, {}):
+                    current = doses[day][name]
+                    previous = re.match(r"\s*([\d.]+)\s*(mg|iu|mcg)", current, re.I) if isinstance(current, str) else None
+                    if not previous or (Decimal(previous[1]), previous[2].lower()) != (Decimal(amt), unit):
+                        doses[day][name] = amt + unit + " (actual)"
+                        changed = True
+                continue
             actual = amt + unit
             carried = due_date.strftime("%a %-d %b") if due_date else None
             if match:
@@ -80,8 +88,9 @@ with (_tl.run('took', _log_sys.argv[1:], name='cli.run')
             value = actual + " (" + note + ")"
             if doses.get(day, {}).get(name) == value: continue
             doses.setdefault(day, {})[name] = value
+            changed = True
             flags.append("flag: %s %s %s; logged as %s" % (name.capitalize(), actual, reason, actual))
-        if flags: atomic_write("doses.json", doses)
+        if changed: atomic_write("doses.json", doses)
         return flags
     def write_snoozes(active):
         atomic_write("snooze.json", active)
