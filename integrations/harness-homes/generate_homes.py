@@ -348,6 +348,7 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
+            "PATH": ":".join(manifest["shellPathPrefix"] + manifest["shellPath"]),
             "BUN_INSPECT": "",
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:20128",
             "ANTHROPIC_CUSTOM_HEADERS": "x-9router-token-saver: off",
