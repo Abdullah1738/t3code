@@ -303,3 +303,34 @@ it.live("identity import reads bypass a held boards reader", () =>
     assert.strictEqual(rows[0]?.thread_id, "thread-1");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it.live("imports versioned rows without copying or rewinding the target cache clock", () =>
+  Effect.gen(function* () {
+    const { legacy, boards } = yield* fixture;
+    yield* Effect.sync(() => {
+      const source = new NodeSqlite.DatabaseSync(legacy);
+      try {
+        source.exec(`CREATE TABLE ardud_kanban_cache_clock (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+          INSERT INTO ardud_kanban_cache_clock VALUES (1, 0);
+          CREATE TABLE ardud_kanban_boards (id TEXT PRIMARY KEY, slug TEXT UNIQUE, json TEXT, cache_version INTEGER);
+          INSERT INTO ardud_kanban_boards VALUES ('imported', 'imported', '{}', 999);`);
+      } finally {
+        source.close();
+      }
+    });
+    const context = yield* Layer.build(BoardsDatabase.layerFromPaths(boards, legacy));
+    const db = Context.get(context, BoardsDatabase.BoardsDatabase);
+    yield* db.ready;
+    const imported = yield* db.sql<{
+      cache_version: number;
+    }>`SELECT cache_version FROM ardud_kanban_boards`;
+    const before = imported[0]!.cache_version;
+    assert.isAbove(before, 0);
+    assert.notStrictEqual(before, 999);
+    yield* db.sql`UPDATE ardud_kanban_boards SET json = '{"changed":true}' WHERE id = 'imported'`;
+    const changed = yield* db.sql<{
+      cache_version: number;
+    }>`SELECT cache_version FROM ardud_kanban_boards`;
+    assert.isAbove(changed[0]!.cache_version, before);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

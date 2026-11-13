@@ -42,6 +42,7 @@ import {
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
@@ -176,6 +177,7 @@ it.effect("compact pages read the split boards database, not orchestration stora
     const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
     const sql = Context.get(context, SqlClient.SqlClient);
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     const split = BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
     yield* Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
@@ -1594,6 +1596,64 @@ it.effect("invalidates same-length row text with unchanged timestamps", () =>
     assert.strictEqual(warm.card!.misses - cold.card!.misses, 3);
     assert.strictEqual(warm.card!.entries, 1);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "invalidates large cards and discussions on rewrites, replacements and rollback revision reuse",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const originalCard = { ...card(1, "todo"), prompt: "a".repeat(8192) };
+      const originalDiscussion = { ...discussion(1), title: "a".repeat(8192) };
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const read = Effect.all({
+        card: store.card(originalCard.id),
+        discussion: store.discussion(originalDiscussion.id),
+      });
+      const write = (text: string) =>
+        Effect.all([
+          sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ ...originalCard, prompt: text })} WHERE id = ${originalCard.id}`,
+          sql`UPDATE ardud_kanban_discussions SET json = ${JSON.stringify({ ...originalDiscussion, title: text })} WHERE id = ${originalDiscussion.id}`,
+        ]);
+      const before = yield* read;
+      // Every case keeps serialized length and timestamps, including rewriting old text.
+      for (const text of ["b".repeat(8192), originalCard.prompt]) {
+        yield* write(text);
+        const changed = yield* read;
+        assert.deepStrictEqual(changed.card, { ...originalCard, prompt: text });
+        assert.deepStrictEqual(changed.discussion, { ...originalDiscussion, title: text });
+        const warm = yield* read;
+        assert.strictEqual(warm.card, changed.card);
+        assert.strictEqual(warm.discussion, changed.discussion);
+      }
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* write("c".repeat(8192));
+            assert.strictEqual((yield* read).card!.prompt, "c".repeat(8192));
+            return yield* Effect.fail("rollback");
+          }),
+        )
+        .pipe(Effect.flip);
+      // These writes reuse the rolled-back revisions, with different text.
+      yield* write("d".repeat(8192));
+      assert.strictEqual((yield* read).card!.prompt, "d".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "d".repeat(8192));
+      yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${originalCard.id}`;
+      yield* sql`DELETE FROM ardud_kanban_discussions WHERE id = ${originalDiscussion.id}`;
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const replaced = yield* read;
+      assert.deepStrictEqual(replaced, before);
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_cards (id, board_id, number, stage, json)
+      VALUES (${originalCard.id}, ${boardId}, 1, 'todo', ${JSON.stringify({ ...originalCard, prompt: "e".repeat(8192) })})`;
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_discussions (id, board_id, json)
+      VALUES (${originalDiscussion.id}, ${boardId}, ${JSON.stringify({ ...originalDiscussion, title: "e".repeat(8192) })})`;
+      assert.strictEqual((yield* read).card!.prompt, "e".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "e".repeat(8192));
+    }).pipe(Effect.provide(TestLayer)),
 );
 
 it.effect("replaces a row version and drops deleted card and thread entries", () =>

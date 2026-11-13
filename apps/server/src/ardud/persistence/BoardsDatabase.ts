@@ -12,6 +12,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as ServerConfig from "../../config.ts";
 import { ensureRunFollowTables } from "../schedules/runFollow.ts";
 import { controlDDL, controlTables } from "./boardsSchema.ts";
+import { ensureKanbanCacheVersions } from "./kanbanCacheVersions.ts";
 import { kanbanDDL } from "./kanbanSchema.ts";
 import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
 import { BOARDS_READER_LANES, readerLaneOptions } from "./readerLanes.ts";
@@ -74,9 +75,10 @@ const copyTables = Effect.fn("BoardsDatabase.copyTables")(function* (
   source: SqlClient.SqlClient,
   target: SqlClient.SqlClient,
 ) {
+  // The target triggers own their clock, including resumed and versioned imports.
   const tables = yield* source<LegacyTable>`
     SELECT name, sql FROM sqlite_schema
-    WHERE type = 'table' AND (name GLOB 'ardud_kanban_*' OR name IN ${source.in(controlTables)})
+    WHERE type = 'table' AND name != 'ardud_kanban_cache_clock' AND (name GLOB 'ardud_kanban_*' OR name IN ${source.in(controlTables)})
     ORDER BY name
   `.pipe(NodeSqliteClient.readOnly);
   const hasSequence =
@@ -217,6 +219,7 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
         yield* Effect.forEach([markerDDL, ...kanbanDDL, ...controlDDL], (ddl) => raw.unsafe(ddl), {
           discard: true,
         });
+        yield* ensureKanbanCacheVersions(raw);
         yield* ensureRunFollowTables(raw);
 
         const complete = yield* raw<{ completed: number }>`
