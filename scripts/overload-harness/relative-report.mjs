@@ -40,6 +40,12 @@ export const baseMean = (runs) => {
       average(values.map((row) => row.logical[key])),
     ]),
   );
+  mean.perRun = Object.fromEntries(
+    ["providerLaunches", "providerSends", "persisted:thread.created"].map((key) => [
+      key,
+      average(runs.map((run) => run.logical?.[key] ?? 0)),
+    ]),
+  );
   mean.resultSizes = values[0].resultSizes;
   mean.end = Object.fromEntries(
     ["pending", "outbox", "dispatcher"].map((key) => [
@@ -90,11 +96,99 @@ export const selectReference = (bases, candidates) => {
     noise,
   };
 };
+export const reviewLaunchSubstitution = (run, mean) => {
+  const launches = run.logical?.providerLaunches;
+  const sends = run.logical?.providerSends;
+  const creations = run.logical?.["persisted:thread.created"] ?? 0;
+  const extra = launches - mean.perRun.providerLaunches;
+  if (
+    !Number.isInteger(extra) ||
+    extra < 1 ||
+    extra > 4 ||
+    creations - mean.perRun["persisted:thread.created"] !== extra ||
+    Math.abs(mean.perRun.providerSends - sends - extra) > 1e-9
+  )
+    return false;
+  if (
+    !equivalent(
+      { dispatchDecisions: mean.logical.dispatchDecisions },
+      { dispatchDecisions: normalise(run).logical.dispatchDecisions },
+      0.1,
+    ) ||
+    Math.abs(launches + sends - mean.perRun.providerSends) >
+      Math.abs(mean.perRun.providerSends) * 0.1
+  )
+    return false;
+  const proof = run.reviewLaunchSubstitution;
+  if (
+    !proof ||
+    proof.offboxRunId !== run.offboxRunId ||
+    proof.home !== run.home ||
+    proof.readOnly !== true ||
+    proof.sourcePath !== `${run.home}/userdata/boards.sqlite` ||
+    proof.attributedThreadCreatedWriterTransactions !== extra ||
+    !Array.isArray(proof.launches) ||
+    proof.launches.length !== extra ||
+    !Array.isArray(proof.allLaunches) ||
+    proof.allLaunches.length !== proof.totalLaunchLinks
+  )
+    return false;
+  const end = Date.parse(run.completedAt);
+  const start = end - run.wallMs;
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    proof.allLaunches.some(
+      (row) => !row || typeof row !== "object" || !Number.isFinite(Date.parse(row.startedAt)),
+    ) ||
+    proof.launches.some((row) => !row || typeof row !== "object")
+  )
+    return false;
+  if (
+    proof.allLaunches.some(
+      (row) =>
+        Math.min(
+          Math.abs(Date.parse(row.startedAt) - start),
+          Math.abs(Date.parse(row.startedAt) - end),
+        ) <= 60000,
+    )
+  )
+    return false;
+  const selected = proof.allLaunches.filter(
+    (row) => Date.parse(row.startedAt) >= start && Date.parse(row.startedAt) <= end,
+  );
+  const keys = ["threadId", "cardId", "role", "startedAt", "reviewStep", "chainLength", "seeded"];
+  return (
+    selected.length === extra &&
+    new Set(selected.map((row) => row.cardId)).size === extra &&
+    new Set(selected.map((row) => row.threadId)).size === extra &&
+    selected.every(
+      (row) =>
+        row.seeded === true &&
+        /^load-card-\d+-\d+$/.test(row.cardId) &&
+        /^load-launched-\d+$/.test(row.threadId) &&
+        row.role === "review" &&
+        Number.isInteger(row.reviewStep) &&
+        Number.isInteger(row.chainLength) &&
+        row.chainLength > 0 &&
+        row.reviewStep >= row.chainLength &&
+        proof.launches.some((entry) => keys.every((key) => entry[key] === row[key])),
+    )
+  );
+};
 export const relativeFailures = (run, mean) => {
   const value = normalise(run);
   const failures = [];
-  if (!equivalent(mean.logical, value.logical, 0.1))
-    failures.push("logical work outside ±10% of base mean");
+  const substituted = reviewLaunchSubstitution(run, mean);
+  const exempt = substituted
+    ? new Set(["providerLaunches", "providerSends", "persisted:thread.created"])
+    : new Set();
+  const strict = (logical) =>
+    Object.fromEntries(Object.entries(logical).filter(([key]) => !exempt.has(key)));
+  if (!equivalent(strict(mean.logical), strict(value.logical), 0.1))
+    failures.push(
+      "logical work outside ±10% of base mean (review substitution requires per-card evidence)",
+    );
   if (!equivalent(mean.resultSizes, value.resultSizes, 0))
     failures.push("poller logical result size changed");
   if (!(value.busy <= mean.busy)) failures.push("main-thread busy above base mean");
@@ -119,11 +213,14 @@ const main = async () => {
     throw new Error(
       "Usage: relative-report.mjs OUTPUT [--latency=VERDICT_JSON] base=RESULT ... candidate=RESULT ...",
     );
+  const informationOnly = args.includes("--information-only");
   const latencyPath = args.find((arg) => arg.startsWith("--latency="))?.slice(10);
-  const runArgs = args.filter((arg) => !arg.startsWith("--latency="));
+  const runArgs = args.filter(
+    (arg) => !arg.startsWith("--latency=") && arg !== "--information-only",
+  );
   await NodeFSP.mkdir(destination, { recursive: true });
   // Reuse the audited schema2 evidence validator; its old absolute verdict is retained separately.
-  const evidenceDir = NodePath.join(destination, "absolute-evidence");
+  const evidenceDir = await NodeFSP.mkdtemp(NodePath.join(destination, "absolute-evidence-"));
   const checked = NodeChildProcess.spawnSync(
     process.execPath,
     [NodeURL.fileURLToPath(new URL("./report.mjs", import.meta.url)), evidenceDir, ...runArgs],
@@ -137,7 +234,7 @@ const main = async () => {
   const rows = evidence.rows;
   const bases = rows.filter((row) => row.role === "base");
   const candidates = rows.filter((row) => row.role === "candidate");
-  const invalid = [];
+  const invalid = Array.isArray(evidence.invalid) ? [...evidence.invalid] : [];
   if (bases.length !== 3 || candidates.length !== 3 || rows.length !== 6)
     invalid.push("exactly3 base and3 candidate artifacts required");
   for (const row of rows) {
@@ -201,8 +298,14 @@ const main = async () => {
   const lines = [
     "# Relative gate (.11)",
     "",
-    `Release verdict: **${verdict}**. Overload relative line: **${overloadVerdict}**. Latency: **${latency?.verdict ?? "NOT_RUN"}**.`,
+    `${informationOnly ? "Information-only score" : "Release verdict"}: **${verdict}**. Overload relative line: **${overloadVerdict}**. Latency: **${latency?.verdict ?? "NOT_RUN"}**.`,
     "",
+    ...(informationOnly
+      ? [
+          "The release verdict requires the post-#1386 rerun on the evaluator's new pin; this rescore does not authorize a release.",
+          "",
+        ]
+      : []),
     `Base: ${BASE}. R11: ${R11}. Frozen v1 workload: a99eff438d2e57abb41c28b60c71292786740576b5624dc0a91b5decb06c179d. Evaluator amendment written13 Nov21:12Z before candidate launch; original absolute thresholds remain on file.`,
     "",
     "| Run | Busy % | Lag p50 / p99 / max ms | GC ms/min | GC wall / busy % | Open rows/s | Discussion misses/s | Tick steps/s | Writer tx/min | Stalls | Relative |",
@@ -257,6 +360,21 @@ const main = async () => {
       `Revision: ${row.run.revision}. Log: ${row.run.offboxLogPath}. Result: ${row.filename}.`,
       "",
       ...row.relativeFailures.map((reason) => `- FAIL: ${reason}`),
+      ...(Array.isArray(row.run.reviewLaunchSubstitution?.launches) &&
+      row.run.reviewLaunchSubstitution.launches.length &&
+      row.run.reviewLaunchSubstitution.launches.every((entry) => entry && typeof entry === "object")
+        ? [
+            "",
+            `Review launch substitution: ${mean && reviewLaunchSubstitution(row.run, mean) ? "verified under q1 clarification" : "not accepted"}; ${row.run.reviewLaunchSubstitution.attributedThreadCreatedWriterTransactions} thread.created writer transactions reported without subtracting them from any other check.`,
+            "",
+            "| Seeded card | Launched thread | Review step | Chain length |",
+            "|---|---|---:|---:|",
+            ...row.run.reviewLaunchSubstitution.launches.map(
+              (entry) =>
+                `| ${entry.cardId} | ${entry.threadId} | ${entry.reviewStep} | ${entry.chainLength} |`,
+            ),
+          ]
+        : []),
       "",
       "```json",
       JSON.stringify(
@@ -267,6 +385,7 @@ const main = async () => {
           backlogSlopes: row.run.backlogSlopes,
           source: row.run.source,
           conditions: row.run.conditions,
+          reviewLaunchSubstitution: row.run.reviewLaunchSubstitution,
           limitations: row.run.limitations,
         },
         null,
@@ -299,8 +418,11 @@ const main = async () => {
   await NodeFSP.writeFile(NodePath.join(destination, "REPORT.md"), lines.join("\n") + "\n");
   await NodeFSP.writeFile(
     NodePath.join(destination, "relative-verdict.json"),
-    JSON.stringify({ verdict, overloadVerdict, invalid, reference, mean, rows, latency }, null, 2) +
-      "\n",
+    JSON.stringify(
+      { verdict, overloadVerdict, informationOnly, invalid, reference, mean, rows, latency },
+      null,
+      2,
+    ) + "\n",
   );
   process.stdout.write(`${verdict}: ${NodePath.join(destination, "REPORT.md")}\n`);
   process.exitCode = verdict === "PASS" ? 0 : 1;

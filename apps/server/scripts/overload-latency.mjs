@@ -411,7 +411,16 @@ const program = Effect.scoped(
       });
       const body = await reply.json();
       if (reply.status !== 200 || body.threads?.length !== 1)
-        throw new Error("Control response failed logical-size check: " + JSON.stringify({ status: reply.status, count: body.threads?.length, ok: body.ok, error: body.error ?? body.message, total: body.total }));
+        throw new Error(
+          "Control response failed logical-size check: " +
+            JSON.stringify({
+              status: reply.status,
+              count: body.threads?.length,
+              ok: body.ok,
+              error: body.error ?? body.message,
+              total: body.total,
+            }),
+        );
     });
     const providerAuth = credentials
       .resolve(providerToken)

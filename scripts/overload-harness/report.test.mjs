@@ -81,9 +81,12 @@ const fixture = (index) => {
       "offered:boardGet": 0,
       "completed:boardGet": 0,
       "served:boardGet": 0,
-      ...Object.fromEntries(Object.keys(targets.eventWriteBatches.all).flatMap((kind) => [
-        [`persisted:${kind}`, 100], [`offeredEventType:${kind}`, 100],
-      ])),
+      ...Object.fromEntries(
+        Object.keys(targets.eventWriteBatches.all).flatMap((kind) => [
+          [`persisted:${kind}`, 100],
+          [`offeredEventType:${kind}`, 100],
+        ]),
+      ),
     },
     physical: {
       writerTransactions: workTargets.writerTransactionsPerMinute * 10,
@@ -111,7 +114,7 @@ const profile = () => ({
   samples: [1],
   timeDeltas: [60000000],
 });
-const run = async (change = () => {}, relative = false) => {
+const run = async (change = () => {}, relative = false, reusedInput) => {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "overload-report-test-"));
   try {
     const rows = Array.from({ length: 4 }, (_, index) => ({
@@ -121,17 +124,34 @@ const run = async (change = () => {}, relative = false) => {
       filename: NodePath.join(dir, String(index), "result.json"),
     }));
     if (relative) {
-      rows.splice(1, 0, ...[4, 5].map((index) => ({ role: "base", run: fixture(0), profile: profile(), filename: NodePath.join(dir, String(index), "result.json") })));
+      rows.splice(
+        1,
+        0,
+        ...[4, 5].map((index) => ({
+          role: "base",
+          run: fixture(0),
+          profile: profile(),
+          filename: NodePath.join(dir, String(index), "result.json"),
+        })),
+      );
       for (const [index, row] of rows.entries()) {
         row.run.startedAt = `2026-11-13T${String(index).padStart(2, "0")}:00:00Z`;
         row.run.offboxRunId = index === 0 ? "run-1114-000117-d5e7" : `relative-fixture-${index}`;
         row.run.offboxBoxId = `box-${index}`;
         row.run.offboxBoxSize = "xlarge";
-        row.run.conditions = { verified: true, boxId: row.run.offboxBoxId, boxSize: "xlarge", coLoads: [], metadataPath: "fixture.json" };
-        row.run.revision = row.role === "base" ? baseSha : "aeb6617ef8219665cf7ce2e89f834a8abb801a05";
+        row.run.conditions = {
+          verified: true,
+          boxId: row.run.offboxBoxId,
+          boxSize: "xlarge",
+          coLoads: [],
+          metadataPath: "fixture.json",
+        };
+        row.run.revision =
+          row.role === "base" ? baseSha : "aeb6617ef8219665cf7ce2e89f834a8abb801a05";
         row.run.source.productRevision = row.run.revision;
         row.run.source.harnessIndexTree = "5f055a5cc28ff8ed9f00de1ea515f486786e17f3";
-        row.run.source.workloadHash = "a99eff438d2e57abb41c28b60c71292786740576b5624dc0a91b5decb06c179d";
+        row.run.source.workloadHash =
+          "a99eff438d2e57abb41c28b60c71292786740576b5624dc0a91b5decb06c179d";
       }
     }
     change(rows);
@@ -143,15 +163,32 @@ const run = async (change = () => {}, relative = false) => {
         JSON.stringify(row.profile),
       );
     }
-    const output = NodeChildProcess.spawnSync(
+    let output = NodeChildProcess.spawnSync(
       process.execPath,
       [
-        relative ? "scripts/overload-harness/relative-report.mjs" : "scripts/overload-harness/report.mjs",
+        relative
+          ? "scripts/overload-harness/relative-report.mjs"
+          : "scripts/overload-harness/report.mjs",
         NodePath.join(dir, "report"),
         ...rows.map((row) => `${row.role}=${row.filename}`),
       ],
       { cwd: root, encoding: "utf8" },
     );
+    if (reusedInput) {
+      if (reusedInput === "missing") await NodeFSP.rm(rows[0].filename);
+      else await NodeFSP.writeFile(rows[0].filename, "{");
+      output = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          relative
+            ? "scripts/overload-harness/relative-report.mjs"
+            : "scripts/overload-harness/report.mjs",
+          NodePath.join(dir, "report"),
+          ...rows.map((row) => `${row.role}=${row.filename}`),
+        ],
+        { cwd: root, encoding: "utf8" },
+      );
+    }
     const report = await NodeFSP.readFile(NodePath.join(dir, "report/REPORT.md"), "utf8");
     return { status: output.status, report, stderr: output.stderr };
   } finally {
@@ -164,27 +201,108 @@ describe("overload report evidence", () => {
     expect((await run()).status).toBe(0);
   });
   it.each([
-    ["frozen source", (row) => { row.run.source.harnessIndexTree = "e".repeat(40); }],
-    ["box size", (row) => { row.run.offboxBoxSize = "large"; }],
-    ["co-load provenance", (row) => { delete row.run.conditions; }],
+    [
+      "frozen source",
+      (row) => {
+        row.run.source.harnessIndexTree = "e".repeat(40);
+      },
+    ],
+    [
+      "box size",
+      (row) => {
+        row.run.offboxBoxSize = "large";
+      },
+    ],
+    [
+      "co-load provenance",
+      (row) => {
+        delete row.run.conditions;
+      },
+    ],
   ])("never labels candidates PASS after global invalid %s", async (_, change) => {
     const result = await run((rows) => change(rows[0]), true);
     expect(result.report).toContain("INVALID");
     expect(result.report).not.toMatch(/\| PASS \|/);
   });
+  it.each([
+    [true, "missing"],
+    [true, "malformed"],
+    [false, "missing"],
+    [false, "malformed"],
+  ])("invalidates reused output (relative=%s, input=%s)", async (relative, kind) => {
+    const result = await run(() => {}, relative, kind);
+    expect(result.report).toContain("**INVALID**");
+    expect(result.report).not.toMatch(/\| PASS \|/);
+  });
+  it.each([["not-an-array"], [[null]]])(
+    "fails work instead of crashing on malformed substitution evidence %j",
+    async (launches) => {
+      const result = await run((rows) => {
+        rows[3].run.logical.providerLaunches = 4;
+        rows[3].run.logical.providerSends = 122;
+        rows[3].run.logical["persisted:thread.created"] = 4;
+        rows[3].run.reviewLaunchSubstitution = { launches };
+      }, true);
+      expect(result.report).toContain("Release verdict: **FAIL**");
+      expect(result.report).toContain("logical work outside ±10%");
+    },
+  );
   const cases = [
-    ...["providerLaunches", "providerSends", "offered:boardGet", "completed:boardGet", "served:boardGet",
-      ...Object.keys(targets.eventWriteBatches.all).flatMap((kind) => [`persisted:${kind}`, `offeredEventType:${kind}`]),
-    ].map((key) => [`missing frozen counter ${key}`, (rows) => {
-      for (const row of rows) delete row.run.logical[key];
-    }, "missing logical work"]),
-    ...["pending", "outbox", "dispatcher"].map((key) => [`forged ${key} slope`, (rows) => {
-      rows[3].run.backlog = rows[3].run.backlog.map((sample, index) => ({...sample, [key]: index}));
-    }, `inconsistent ${key} backlog slope`]),
-    ...[null, {}, "x".repeat(61)].map((value, index) => [`invalid backlog container ${index}`, (rows) => { rows[3].run.backlog = value; }, "missing steady backlog samples"]),
-    ...[-1, 0.5, "0"].map((value, index) => [`invalid logical count ${index}`, (rows) => { rows[3].run.logical.providerLaunches = value; }, "missing logical work"]),
-    ["invalid backlog row", (rows) => { rows[3].run.backlog[10] = null; }, "missing steady backlog samples"],
-    ["repeated backlog time", (rows) => { rows[3].run.backlog[1].seconds = 0; }, "backlog timestamps not strictly increasing"],
+    ...[
+      "providerLaunches",
+      "providerSends",
+      "offered:boardGet",
+      "completed:boardGet",
+      "served:boardGet",
+      ...Object.keys(targets.eventWriteBatches.all).flatMap((kind) => [
+        `persisted:${kind}`,
+        `offeredEventType:${kind}`,
+      ]),
+    ].map((key) => [
+      `missing frozen counter ${key}`,
+      (rows) => {
+        for (const row of rows) delete row.run.logical[key];
+      },
+      "missing logical work",
+    ]),
+    ...["pending", "outbox", "dispatcher"].map((key) => [
+      `forged ${key} slope`,
+      (rows) => {
+        rows[3].run.backlog = rows[3].run.backlog.map((sample, index) => ({
+          ...sample,
+          [key]: index,
+        }));
+      },
+      `inconsistent ${key} backlog slope`,
+    ]),
+    ...[null, {}, "x".repeat(61)].map((value, index) => [
+      `invalid backlog container ${index}`,
+      (rows) => {
+        rows[3].run.backlog = value;
+      },
+      "missing steady backlog samples",
+    ]),
+    ...[-1, 0.5, "0"].map((value, index) => [
+      `invalid logical count ${index}`,
+      (rows) => {
+        rows[3].run.logical.providerLaunches = value;
+      },
+      "missing logical work",
+    ]),
+    [
+      "invalid backlog row",
+      (rows) => {
+        rows[3].run.backlog[10] = null;
+      },
+      "missing steady backlog samples",
+    ],
+    [
+      "repeated backlog time",
+      (rows) => {
+        rows[3].run.backlog[1].seconds = 0;
+      },
+      "backlog timestamps not strictly increasing",
+    ],
     [
       "missing physical counters",
       (rows) => {
