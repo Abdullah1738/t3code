@@ -138,6 +138,16 @@ export const KanbanSubtask = Schema.Struct({
   text: Schema.String,
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  gateSource: Schema.optional(Schema.Literals(["guessed", "set"])),
+  gateCleared: Schema.optional(
+    Schema.Struct({
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      text: Schema.String,
+    }),
+  ),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),

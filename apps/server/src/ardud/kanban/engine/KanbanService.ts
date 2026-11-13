@@ -987,7 +987,13 @@ const cardTextFields = (input: NewCard | CardPatch) =>
     ["prompt", input.prompt],
     ...("question" in input ? [["question", input.question] as const] : []),
     ...("comment" in input ? [["comment", input.comment] as const] : []),
-    ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
+    ...(input.subtasks ?? []).flatMap(
+      (subtask) =>
+        [
+          ["subtask text", subtask.text],
+          ["clearGate reason", subtask.clearGate],
+        ] as const,
+    ),
   ] as const;
 
 const normalizeMessageBlock = (block: KanbanBlock): KanbanBlock => {
@@ -11607,6 +11613,13 @@ const make = Effect.gen(function* () {
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
+        if (
+          patch.subtasks?.some((input) => input.clearGate !== undefined) &&
+          actor._tag !== "evaluator" &&
+          actor._tag !== "owner"
+        ) {
+          return yield* failWith("denied", "only the board evaluator can clear a guessed gate");
+        }
         const board = yield* boardOf(card.boardId);
         const plan = patch.subtasks
           ? Subtasks.planSubtasks(
@@ -11615,13 +11628,16 @@ const make = Effect.gen(function* () {
               card.subtaskSeq,
               at,
               board.guessedGates,
+              actor,
             )
           : null;
-        if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
+        if (plan && !plan.ok) return yield* failWith(plan.code ?? "invalid", plan.reason);
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
             if (subtask.state !== "open") continue;
             const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
+            if (replacement?.gateCleared && replacement.gateCleared !== subtask.gateCleared)
+              continue;
             if (replacement && Subtasks.gateOf(replacement, board.guessedGates) !== undefined)
               continue;
             const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
@@ -11636,7 +11652,7 @@ const make = Effect.gen(function* () {
         }
         const keptLinks = card.links.filter((link) => !removeUrls.includes(link.url));
         const links = patch.links ? mergeLinks(keptLinks, patch.links) : keptLinks;
-        const next: KanbanCard = {
+        let next: KanbanCard = {
           ...card,
           title: patch.title?.trim() || card.title,
           description: patch.description?.trim() ?? card.description,
@@ -11676,6 +11692,27 @@ const make = Effect.gen(function* () {
               "invalid",
               `Asked for ${Rules.poolKey(next.model)}; card keeps ${Rules.poolKey(card.model)}. ${reason}`,
             );
+          }
+        }
+        if (plan?.ok) {
+          for (const subtask of plan.subtasks) {
+            const cleared = subtask.gateCleared;
+            const previous = card.subtasks.find((entry) => entry.id === subtask.id);
+            if (!cleared || cleared === previous?.gateCleared) continue;
+            yield* logEvent(next, actor, "comment", {
+              body: `Cleared guessed ${cleared.gate} gate on ${subtask.id} ("${cleared.text}"): ${cleared.reason}`,
+            });
+            if (actor._tag === "owner") continue;
+            const text =
+              `An evaluator cleared the ${cleared.gate} gate the board guessed on ${subtask.id}: "${cleared.text}". Reason: ${cleared.reason}.` +
+              (previous?.gateSource === undefined ? " (origin not recorded: an older gate)" : "");
+            const askId = Asks.nextAskId(next);
+            next = Asks.updateAsk(Asks.addAsk(next, text, false, actor, at), askId, {
+              kind: "notice",
+              respond: { ack: true },
+              title: `Gate cleared on #${card.number} ${subtask.id}`,
+              batchKey: "gate-cleared",
+            });
           }
         }
         const changed = Object.entries(patch)

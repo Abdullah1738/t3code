@@ -1,4 +1,5 @@
 import {
+  ThreadId,
   kanbanEvaluatorStep,
   kanbanOpenStep,
   kanbanStepSubtasks,
@@ -562,7 +563,9 @@ describe("planSubtasks", () => {
   it("applies a gate to an open id with omitted text and owner", () => {
     const known = { ...planned()[3]!, step: 7 };
     const plan = planSubtasks([known], [{ id: known.id, gate: "money" }], 4, at);
-    expect(plan.ok && plan.subtasks).toEqual([{ ...known, gate: "money", createdAt: at }]);
+    expect(plan.ok && plan.subtasks).toEqual([
+      { ...known, gate: "money", gateSource: "set", createdAt: at },
+    ]);
     expect(planSubtasks([planned()[0]!], [{ id: "s1", gate: "money" }])).toMatchObject({
       ok: false,
     });
@@ -1102,4 +1105,213 @@ it.each([
 ])("pending wake preserves descriptive context: %s", (wakeNote) => {
   const subtasks = markSubtask(planned(), "s1", "done", null, owner, at);
   expect(pendingWakeNote({ subtasks, wakeNote })).toBe(wakeNote);
+});
+
+describe("clearing guessed gates", () => {
+  const evaluator = { _tag: "evaluator", threadId: ThreadId.make("evaluator") } as const;
+  const reason = "This is a test-only merge; nothing goes live";
+  const later = "2026-11-13T18:00:00.000Z";
+  const make = (text: string, gate?: KanbanSubtask["gate"]) => {
+    const plan = planSubtasks([], [{ text, owner: "evaluator", gate }], 4, at);
+    if (!plan.ok) throw new Error(plan.reason);
+    return plan.subtasks[0]!;
+  };
+  const clear = (subtask: KanbanSubtask) => {
+    const plan = planSubtasks(
+      [subtask],
+      [{ id: subtask.id, clearGate: `  ${reason}  ` }],
+      6,
+      later,
+      undefined,
+      evaluator,
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    return plan.subtasks[0]!;
+  };
+
+  it("records guessed and deliberate origins", () => {
+    expect(make("Restart Robob so the fix goes live")).toMatchObject({
+      gate: "deploy",
+      gateSource: "guessed",
+    });
+    expect(make("Do the next step", "deploy")).toMatchObject({ gate: "deploy", gateSource: "set" });
+  });
+
+  it.each([
+    "Merge the reviewed branch into 9router master from a worktree (test-only, nothing goes live)",
+    "Tell the Crpko #4274 reporter thread the outcome once installed (stable clientRequestId, once)",
+  ])("clears and preserves the clear for %s", (text) => {
+    const known = { ...make(text), gate: "deploy" as const, gateSource: "guessed" as const };
+    const cleared = clear(known);
+    expect(cleared).not.toHaveProperty("gate");
+    expect(cleared).not.toHaveProperty("gateSource");
+    expect(cleared.gateCleared).toEqual({ gate: "deploy", reason, by: evaluator, at: later, text });
+    expect(gateOf(cleared)).toBeUndefined();
+    expect(
+      approvalProblem({ number: 21, asks: [], createdAt: at, subtasks: [cleared] }, cleared),
+    ).toBeNull();
+    for (const input of [{ id: cleared.id }, { id: cleared.id, text, gate: null }]) {
+      const saved = planSubtasks([cleared], [input], 6, later, undefined, evaluator);
+      expect(saved.ok && saved.subtasks[0]).toEqual(cleared);
+    }
+  });
+
+  it.each(["Restart Robob now", "Read the result"])("reconsiders changed text: %s", (text) => {
+    const cleared = clear(make("Restart Robob"));
+    const fresh = "2026-11-13T19:00:00.000Z";
+    const plan = planSubtasks(
+      [cleared],
+      [{ id: cleared.id, text }],
+      6,
+      fresh,
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.subtasks[0]).not.toHaveProperty("gateCleared");
+    expect(gateOf(plan.subtasks[0]!)).toBe(inferGate(text));
+    if (inferGate(text))
+      expect(plan.subtasks[0]).toMatchObject({ createdAt: fresh, gateSource: "guessed" });
+  });
+
+  it("an explicit gate re-gates an unchanged cleared step", () => {
+    const cleared = clear(make("Restart Robob"));
+    const plan = planSubtasks(
+      [cleared],
+      [{ id: cleared.id, gate: "money" }],
+      6,
+      later,
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok && plan.subtasks[0]).toMatchObject({ gate: "money", gateSource: "set" });
+    expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+  });
+
+  it("upgrades a guessed gate when deliberately set and refuses clearing it", () => {
+    const known = make("Restart Robob");
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, gate: "deploy" }],
+      6,
+      later,
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok && plan.subtasks[0]).toMatchObject({ gateSource: "set" });
+    if (!plan.ok) return;
+    expect(
+      planSubtasks(
+        plan.subtasks,
+        [{ id: known.id, clearGate: reason }],
+        6,
+        later,
+        undefined,
+        evaluator,
+      ),
+    ).toMatchObject({
+      ok: false,
+      reason: `subtask ${known.id} has a deploy gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
+    });
+  });
+
+  it("clears a legacy 9router s6 gate with no recorded origin", () => {
+    const { gateSource: _, ...legacy } = make(
+      "Read the card back, re-check the plain tests command on master, then tell the #17, #19 and #20 threads",
+      "deploy",
+    );
+    expect(gateOf(clear(legacy))).toBeUndefined();
+  });
+
+  it.each([
+    { text: "Restart", owner: "evaluator" as const, clearGate: reason },
+    { id: "s5", gate: "deploy" as const, clearGate: reason },
+    { id: "s5", clearGate: "short" },
+    { id: "s5", clearGate: " ".repeat(20) },
+    { id: "s5", clearGate: "x".repeat(301) },
+  ])("rejects invalid clear: %j", (input) => {
+    expect(planSubtasks([make("Restart")], [input], 6, later, undefined, evaluator)).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it.each(["work", "review"] as const)("clearGate is a no-op on %s", (owner) => {
+    const known = { ...make("Restart"), owner };
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, clearGate: reason }],
+      6,
+      later,
+      undefined,
+      evaluator,
+    );
+    expect(plan.ok && gateOf(plan.subtasks[0]!)).toBeUndefined();
+    expect(plan.ok && plan.subtasks[0]).not.toHaveProperty("gateCleared");
+  });
+});
+
+it("clearing a script-owned gate keeps its script binding", () => {
+  const planned = planSubtasks(
+    [],
+    [{ text: "Restart the helper", owner: "script", script: "helper" }],
+    0,
+    at,
+  );
+  expect(planned.ok).toBe(true);
+  if (!planned.ok) return;
+  const plan = planSubtasks(
+    planned.subtasks,
+    [{ id: "s1", clearGate: "Only exercises restart logic in a fixture" }],
+    1,
+    at,
+    undefined,
+    owner,
+  );
+  expect(plan.ok && plan.subtasks[0]).toMatchObject({ script: "helper", owner: "script" });
+  expect(plan.ok && gateOf(plan.subtasks[0]!)).toBeUndefined();
+});
+
+it("board guess settings preserve stored clears and deliberate gates", () => {
+  const guessed = planSubtasks([], [{ text: "Restart Robob", owner: "evaluator" }], 0, at);
+  if (!guessed.ok) throw new Error(guessed.reason);
+  const cleared = planSubtasks(
+    guessed.subtasks,
+    [{ id: "s1", clearGate: "This only reports a result to a thread" }],
+    1,
+    at,
+    [],
+    owner,
+  );
+  if (!cleared.ok) throw new Error(cleared.reason);
+  expect(gateOf(cleared.subtasks[0]!, ["deploy"])).toBeUndefined();
+  const changed = planSubtasks(
+    cleared.subtasks,
+    [{ id: "s1", text: "Restart the helper" }],
+    1,
+    at,
+    [],
+    owner,
+  );
+  if (!changed.ok) throw new Error(changed.reason);
+  expect(changed.subtasks[0]).not.toHaveProperty("gateCleared");
+  expect(changed.subtasks[0]).not.toHaveProperty("gate");
+  const deliberate = planSubtasks(
+    [],
+    [{ text: "Restart Robob", owner: "evaluator", gate: "deploy" }],
+    0,
+    at,
+    [],
+  );
+  if (!deliberate.ok) throw new Error(deliberate.reason);
+  expect(
+    planSubtasks(
+      deliberate.subtasks,
+      [{ id: "s1", clearGate: "It was set on purpose and stays set" }],
+      1,
+      at,
+      [],
+      owner,
+    ),
+  ).toMatchObject({ ok: false, code: "denied" });
 });

@@ -1,5 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
+  ProviderInstanceId,
+  KanbanScriptId,
   ThreadId,
   type KanbanActor,
   type KanbanCard,
@@ -999,6 +1001,263 @@ it.effect("dropping a blocking ask cannot restore a verified stage over an open 
       const dropped = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
       assert.strictEqual(dropped.stage, "completed");
       assert.strictEqual(dropped.subtasks[0]?.state, "open");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit trail", (actor) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Clear guessed gate",
+          prompt: "Work",
+          subtasks: [{ text: "Tell the reporter once installed", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const reason = "Only reports the result; no live operation";
+      const edited = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", clearGate: reason }] },
+        actor,
+      );
+      assert.isUndefined(edited.subtasks[0]!.gate);
+      assert.deepStrictEqual(edited.subtasks[0]!.gateCleared?.by, actor);
+      const events = (yield* kanban.card(card.id)).events;
+      assert.lengthOf(
+        events.filter(
+          (event) =>
+            event.body ===
+            `Cleared guessed deploy gate on s1 ("Tell the reporter once installed"): ${reason}`,
+        ),
+        1,
+      );
+      assert.lengthOf(edited.asks, actor._tag === "owner" ? 0 : 1);
+      if (actor._tag === "evaluator") {
+        assert.deepStrictEqual(edited.asks[0], {
+          id: "q1",
+          text: `An evaluator cleared the deploy gate the board guessed on s1: "Tell the reporter once installed". Reason: ${reason}.`,
+          blocking: false,
+          by: actor,
+          at: edited.updatedAt,
+          seq: null,
+          closedAt: null,
+          kind: "notice",
+          respond: { ack: true },
+          title: `Gate cleared on #${card.number} s1`,
+          batchKey: "gate-cleared",
+        });
+        const feed = yield* kanban.askFeed({ boardId: board.id });
+        assert.isTrue(
+          feed.open.some(
+            (item) => item.cardId === card.id && item.ask.id === "q1" && item.kind === "notice",
+          ),
+        );
+      }
+      // Retrying the clear must not send a second notice or append another clear event.
+      const retry = yield* kanban.editCard(
+        card.id,
+        { subtasks: [{ id: "s1", clearGate: reason }] },
+        actor,
+      );
+      assert.lengthOf(retry.asks, edited.asks.length);
+      const dropped = yield* kanban.editCard(card.id, { subtasks: [] }, evaluator);
+      assert.lengthOf(dropped.subtasks, 0);
+      // Exercise completion independently of removal on the same saved clear.
+      yield* KanbanStore.KanbanStore.pipe(Effect.flatMap((store) => store.putCard(edited)));
+      const done = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Reporter told",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(done.subtasks[0]!.state, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "legacy clears name the missing origin, and acknowledgements cannot approve a later gate",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Legacy",
+            prompt: "Work",
+            subtasks: [{ text: "Read the card and tell the 9router threads", owner: "evaluator" }],
+          },
+          owner,
+        );
+        yield* store.putCard({
+          ...card,
+          subtasks: card.subtasks.map((s) => ({ ...s, gate: "deploy" })),
+        });
+        const cleared = yield* kanban.editCard(
+          card.id,
+          { subtasks: [{ id: "s1", clearGate: "A report to threads, nothing goes live" }] },
+          evaluator,
+        );
+        assert.include(cleared.asks[0]!.text, "(origin not recorded: an older gate)");
+        yield* TestClock.adjust("1 second");
+        const regated = yield* kanban.editCard(
+          card.id,
+          { subtasks: [{ id: "s1", text: "Restart Robob now" }] },
+          evaluator,
+        );
+        const ack = {
+          ...regated.asks[0]!,
+          closedAt: regated.updatedAt,
+          at: regated.updatedAt,
+          answer: { verdict: "approved" as const, by: owner, at: regated.updatedAt },
+        };
+        for (const ask of [ack, { ...ack, kind: "custom" }, { ...ack, respond: undefined }]) {
+          assert.include(
+            approvalProblem({ ...regated, asks: [ask] }, regated.subtasks[0]!)!,
+            "no owner answer",
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("deliberate deploy, money and secret gates cannot be cleared or bypassed", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      for (const gate of ["deploy", "money", "secret"] as const) {
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: `Deliberate ${gate}`,
+            prompt: "Work",
+            subtasks: [{ text: "Do the operation", owner: "evaluator", gate }],
+          },
+          owner,
+        );
+        for (const patch of [
+          { subtasks: [{ id: "s1", clearGate: "This gate was set by mistake" }] },
+          { subtasks: [{ id: "s1", text: "Read result", gate: null }] },
+          {
+            subtasks: [
+              { id: "s1", owner: "work" as const, clearGate: "Give it back to the worker" },
+            ],
+          },
+          { subtasks: [] },
+        ]) {
+          const result = yield* kanban.editCard(card.id, patch, evaluator).pipe(Effect.result);
+          // Rewording keeps the deliberate gate; removing it needs an owner answer.
+          if (patch.subtasks[0] && "text" in patch.subtasks[0]) {
+            assert.strictEqual(result._tag, "Success");
+            if (result._tag === "Success")
+              assert.strictEqual(result.success.subtasks[0]!.gate, gate);
+          } else {
+            assert.strictEqual(result._tag, "Failure");
+          }
+        }
+        const saved = (yield* kanban.card(card.id)).card;
+        assert.lengthOf(saved.asks, 0);
+        assert.strictEqual(saved.subtasks[0]!.gateSource, "set");
+        const before = yield* kanban.card(card.id);
+        for (const actor of [evaluator, owner]) {
+          const denied = yield* kanban
+            .editCard(
+              card.id,
+              { subtasks: [{ id: "s1", clearGate: "This gate was set by mistake" }] },
+              actor,
+            )
+            .pipe(Effect.flip);
+          assert.strictEqual(denied.code, "denied");
+          assert.include(denied.detail, "only Abdullah's answer clears it (card_ask naming s1)");
+          assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        }
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("work, script and system actors cannot pass clearGate", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Actor guard",
+          prompt: "Work",
+          subtasks: [{ text: "Restart Robob", owner: "evaluator" }],
+        },
+        owner,
+      );
+      for (const actor of [
+        { _tag: "thread", threadId: ThreadId.make("work") },
+        { _tag: "script", scriptId: KanbanScriptId.make("script") },
+        { _tag: "system", component: "test" },
+      ] as const) {
+        const denied = yield* kanban
+          .editCard(
+            card.id,
+            { subtasks: [{ id: "s1", clearGate: "This gate was guessed wrong" }] },
+            actor,
+          )
+          .pipe(Effect.flip);
+        assert.strictEqual(denied.code, "denied");
+        assert.strictEqual(denied.detail, "only the board evaluator can clear a guessed gate");
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card, card);
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a rejected model edit leaves no clear event or notice, including retries", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const other = {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "opus/gpt-6-astra",
+        options: [{ id: "variant", value: "xhigh" }],
+      };
+      yield* kanban.setPool(board.id, other, 1);
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Rejected clear",
+          prompt: "Work",
+          subtasks: [{ text: "Tell the reporter once installed", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const before = yield* kanban.card(card.id);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const refused = yield* kanban
+          .editCard(
+            card.id,
+            {
+              model: other,
+              models: [{ model: card.model, weight: 1 }],
+              subtasks: [{ id: "s1", clearGate: "Only reports the result; no live operation" }],
+            },
+            evaluator,
+          )
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "invalid");
+        assert.include(refused.detail, "different work model");
+        assert.deepStrictEqual(yield* kanban.card(card.id), before);
+      }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

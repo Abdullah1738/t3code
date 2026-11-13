@@ -2,6 +2,7 @@ import { vi } from "vite-plus/test";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  KanbanCard,
   KanbanCardId,
   KanbanDiscussionId,
   KanbanError,
@@ -65,6 +66,8 @@ const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationSco
   capabilities: new Set(["orchestration"]),
   issuedAt: 0,
 });
+
+const decodeKanbanCard = Schema.decodeUnknownEffect(KanbanCard);
 
 const mcpClient = McpSchema.McpServerClient.of({
   clientId: 1,
@@ -4995,6 +4998,94 @@ it.effect.each([true, false])("card_move reports its wait decision (keepWait=%s)
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("card_create and card_edit report guessed gates and expose clearGate", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "gate-results",
+      name: "Gate results",
+      defaultProjectId: null,
+    });
+    const evaluator = ThreadId.make("gate-evaluator");
+    const created = yield* call(evaluator, "card_create", {
+      boardId: board.id,
+      title: "Guesses",
+      prompt: "Work",
+      subtasks: [
+        { text: "Tell the reporter once installed", owner: "evaluator", gate: null },
+        { text: "Do the operation", owner: "evaluator", gate: "money" },
+        { text: "Test restart handling", owner: "work" },
+        { text: "Review the release", owner: "review" },
+      ],
+    });
+    assert.isFalse(created.isError, created.text);
+    assert.deepStrictEqual(created.structured.gated, [
+      { id: "s1", gate: "deploy", source: "guessed" },
+    ]);
+    assert.strictEqual(
+      created.structured.message,
+      "s1 got a guessed deploy gate from its wording; if that's wrong, pass clearGate with a reason on this id",
+    );
+    const card = yield* decodeKanbanCard(created.structured.card);
+    const edited = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [{ id: "s1", gate: null }, { id: "s2", gate: "money" }, { id: "s3" }, { id: "s4" }],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    assert.deepStrictEqual(edited.structured.gated, [
+      { id: "s1", gate: "deploy", source: "guessed" },
+    ]);
+    assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.gate, "deploy");
+    const cleared = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [
+        { id: "s1", clearGate: "This is a report, nothing goes live" },
+        { id: "s2" },
+        { id: "s3" },
+        { id: "s4" },
+      ],
+    });
+    assert.isFalse(cleared.isError, cleared.text);
+    assert.deepStrictEqual(cleared.structured.gated, []);
+    assert.lengthOf((yield* kanban.card(card.id)).card.asks, 1);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("guessed gate results follow allocated ids even when plan steps are out of order", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "sorted-gates",
+      name: "Sorted gates",
+      defaultProjectId: null,
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Sort plan",
+        prompt: "Work",
+        subtasks: [{ text: "Read result", owner: "evaluator" }],
+      },
+      owner,
+    );
+    yield* kanban.markSubtask(card.id, "s1", "done", "Read", owner, "evaluator");
+    const edited = yield* call(ThreadId.make("gate-evaluator"), "card_edit", {
+      card: card.id,
+      subtasks: [
+        { text: "Restart Robob", owner: "evaluator", step: 5 },
+        { text: "Pay the invoice", owner: "evaluator", step: 2, gate: null },
+      ],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    assert.deepStrictEqual(edited.structured.gated, [
+      { id: "s2", gate: "deploy", source: "guessed" },
+      { id: "s3", gate: "money", source: "guessed" },
+    ]);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("board_get returns the board's persisted gate guessing policy", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -5017,5 +5108,34 @@ it.effect("board_get returns the board's persisted gate guessing policy", () => 
       };
       assert.deepStrictEqual(snapshot.board.guessedGates, guessedGates);
     }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("tool results respect disabled board guesses after create and edit", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "disabled-guesses",
+      name: "Disabled guesses",
+      defaultProjectId: null,
+    });
+    yield* kanban.updateBoard(board.id, { guessedGates: [] });
+    const evaluator = ThreadId.make("guess-evaluator");
+    const made = yield* call(evaluator, "card_create", {
+      boardId: board.id,
+      title: "Disabled",
+      prompt: "Work",
+      subtasks: [{ text: "Restart the helper", owner: "evaluator", gate: null }],
+    });
+    assert.isFalse(made.isError, made.text);
+    assert.deepStrictEqual(made.structured.gated, []);
+    const card = yield* decodeKanbanCard(made.structured.card);
+    const edited = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [{ id: "s1", gate: null }],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    assert.deepStrictEqual(edited.structured.gated, []);
   }).pipe(Effect.provide(layer));
 });

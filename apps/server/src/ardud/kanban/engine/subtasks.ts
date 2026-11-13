@@ -6,8 +6,8 @@ import {
   kanbanOpenStep,
   kanbanStepSubtasks,
   type KanbanActor,
-  type KanbanCard,
   type KanbanBoard,
+  type KanbanCard,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
@@ -40,9 +40,10 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 };
 
 export const gateOf = (
-  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "gateCleared">,
   guessedGates?: KanbanBoard["guessedGates"],
 ): KanbanSubtask["gate"] => {
+  if (subtask.gateCleared !== undefined) return undefined;
   // Older plans stored inferred gates on coding and review checklists too.
   if (subtask.owner === "work" || subtask.owner === "review") return undefined;
   if (subtask.gate !== undefined) return subtask.gate;
@@ -165,6 +166,7 @@ export const approvalProblem = (
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
     .filter((ask) => {
+      if (ask.kind === "notice" || ask.respond?.ack) return false;
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
       if (answer.verdict === "dropped") return true;
@@ -232,6 +234,7 @@ export interface SubtaskInput {
   readonly text?: string | undefined;
   readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
+  readonly clearGate?: string | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -259,7 +262,7 @@ export type SubtaskPlan =
       /** The card's counter after this plan; store it with the card. */
       readonly subtaskSeq: number;
     }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: string; readonly code?: "denied" };
 
 /**
  * Who is marking a subtask. Evaluators can mark any; a worker only its own
@@ -285,7 +288,30 @@ export function planSubtasks(
   seq = 0,
   at?: string,
   guessedGates?: KanbanBoard["guessedGates"],
+  actor?: KanbanActor,
 ): SubtaskPlan {
+  const planGate = (
+    input: SubtaskInput,
+    owner: KanbanSubtask["owner"],
+    text: string,
+    known?: KanbanSubtask,
+  ) => {
+    const previousGate = known && gateOf(known, guessedGates);
+    const keepClear = known?.gateCleared !== undefined && text === known.text && input.gate == null;
+    const gate =
+      owner === "work" || owner === "review" || keepClear
+        ? undefined
+        : (previousGate ?? gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates));
+    const gateSource =
+      gate === undefined
+        ? undefined
+        : input.gate != null
+          ? ("set" as const)
+          : previousGate
+            ? (known?.gateSource ?? ("guessed" as const))
+            : ("guessed" as const);
+    return { gate, gateSource };
+  };
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
   let nextId = existing.reduce((max, subtask) => Math.max(max, idNumber(subtask.id)), seq);
@@ -294,6 +320,14 @@ export function planSubtasks(
   let step = 0;
   for (const input of inputs) {
     const id = input.id?.trim();
+    const reason = input.clearGate?.trim();
+    if (reason !== undefined) {
+      if (!id) return { ok: false, reason: "clearGate needs an existing subtask id" };
+      if (input.gate != null)
+        return { ok: false, reason: "clearGate cannot be combined with an explicit gate" };
+      if (reason.length < 10 || reason.length > 300)
+        return { ok: false, reason: "clearGate needs a reason of 10–300 characters" };
+    }
     const known = id ? byId.get(id) : undefined;
     if (id) {
       if (!known)
@@ -310,6 +344,7 @@ export function planSubtasks(
           input.owner === undefined &&
           input.step === undefined &&
           input.gate === undefined &&
+          input.clearGate === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -333,8 +368,9 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates);
-    const script = input.script?.trim() || undefined;
+    const { gate, gateSource } = planGate(input, owner, text, known);
+    const script =
+      (input.script ?? (reason !== undefined ? known?.script : undefined))?.trim() || undefined;
     if (script && owner !== "script") {
       return {
         ok: false,
@@ -346,15 +382,43 @@ export function planSubtasks(
     }
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
-      const { script: _old, gate: _oldGate, ...rest } = known;
+      const {
+        script: _old,
+        gate: _oldGate,
+        gateSource: _oldSource,
+        gateCleared: _oldClear,
+        ...rest
+      } = known;
       const previousGate = gateOf(known, guessedGates);
-      const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
+      const keepClear =
+        known.gateCleared !== undefined && text === known.text && input.gate == null;
+      // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
+      const clearing =
+        reason !== undefined && owner !== "work" && owner !== "review"
+          ? (previousGate ?? gate)
+          : undefined;
+      if (clearing && known.gateSource === "set") {
+        return {
+          ok: false,
+          code: "denied",
+          reason: `subtask ${known.id} has a ${clearing} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
+        };
+      }
+      if (clearing && (!actor || !at))
+        return { ok: false, reason: "clearGate needs the clearing actor and time" };
+      const gateCleared =
+        clearing && actor && at
+          ? { gate: clearing, reason: reason!, by: actor, at, text }
+          : keepClear
+            ? known.gateCleared
+            : undefined;
       planned.push({
         ...rest,
         step,
         text,
         owner,
-        ...(gate === undefined ? {} : { gate }),
+        ...(gate === undefined || clearing ? {} : { gate, gateSource }),
+        ...(gateCleared ? { gateCleared } : {}),
         ...((text !== known.text || script !== known.script || !previousGate) && gate && at
           ? { createdAt: at }
           : {}),
@@ -362,13 +426,12 @@ export function planSubtasks(
       });
     } else {
       nextId += 1;
-      const gate = inputGate;
       planned.push({
         id: `s${nextId}`,
         step,
         text,
         owner,
-        ...(gate === undefined ? {} : { gate }),
+        ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
         state: "open",

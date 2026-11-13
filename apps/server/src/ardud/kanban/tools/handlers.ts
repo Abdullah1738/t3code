@@ -8,6 +8,7 @@ import {
   kanbanAskIsNotice,
   ProjectId,
   type KanbanActor,
+  type KanbanBoard,
   type KanbanBlock,
   type KanbanCard,
   type KanbanCardModel,
@@ -25,6 +26,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
+import { gateOf, type SubtaskInput } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -39,6 +41,35 @@ import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
+
+const gatedResult = (
+  card: KanbanCard,
+  inputs: ReadonlyArray<SubtaskInput> = [],
+  guessedGates?: KanbanBoard["guessedGates"],
+) => {
+  let nextId = card.subtaskSeq - inputs.filter((input) => !input.id?.trim()).length;
+  const gated = inputs.flatMap((input) => {
+    const id = input.id?.trim() || `s${++nextId}`;
+    const subtask = card.subtasks.find((entry) => entry.id === id);
+    const gate = subtask && gateOf(subtask, guessedGates);
+    return input.gate == null && gate && subtask && subtask.gateSource !== "set"
+      ? [{ id: subtask.id, gate, source: "guessed" as const }]
+      : [];
+  });
+  return {
+    gated,
+    ...(gated.length
+      ? {
+          message: gated
+            .map(
+              ({ id, gate }) =>
+                `${id} got a guessed ${gate} gate from its wording; if that's wrong, pass clearGate with a reason on this id`,
+            )
+            .join("\n"),
+        }
+      : {}),
+  };
+};
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -412,7 +443,11 @@ const handlers = {
           BoardReplies.BOARD_PAGE_MAX,
         );
         if (input.since !== undefined) {
-          const window = Activity.parseWindow(input.since, undefined, yield* Clock.currentTimeMillis);
+          const window = Activity.parseWindow(
+            input.since,
+            undefined,
+            yield* Clock.currentTimeMillis,
+          );
           if (typeof window === "string") return yield* invalid(window);
           const read = yield* service.activity(board.id, window);
           const byCard = Activity.groupEvents(read.events);
@@ -967,7 +1002,8 @@ const handlers = {
           subtasks: input.subtasks,
         };
         if (input.assignToSelf) {
-          return yield* service.createForThread(caller.threadId, fields);
+          const result = yield* service.createForThread(caller.threadId, fields);
+          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
         }
         if (isWorker && input.stage === "needs_owner") {
           return yield* refuse("Work threads ask the owner with card_ask on their own card.");
@@ -977,7 +1013,7 @@ const handlers = {
           { ...fields, stage: input.stage, question: input.question ?? null },
           caller.actor,
         );
-        return { card };
+        return { card, ...gatedResult(card, input.subtasks, board.guessedGates) };
       }),
     ),
   ),
@@ -1051,7 +1087,8 @@ const handlers = {
           },
           caller.actor,
         );
-        return { card: edited };
+        const board = yield* boardFor(service, caller, card.boardId);
+        return { card: edited, ...gatedResult(edited, input.subtasks, board.guessedGates) };
       }),
     ),
   ),
