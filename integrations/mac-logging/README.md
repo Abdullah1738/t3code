@@ -60,6 +60,8 @@ unified log query has a 60 s timeout; readable report sources advance independen
 
 Each hourly collector run emits `disk.tooling_probe`: a 20 s `diskutil list
 -plist` check, daemon PID/uptime/state, and a 10 s `hdiutil info` control.
+`storagekitdPid` and `storagekitdUptimeS` are numbers when available; both are
+omitted if `ps` cannot read them within 3 s.
 A timeout records `blockedIn` and a private sample path under the log's
 `state/diskutil-samples/` (retained for 7 days). Sampling has a separate
 15 s budget before the child is killed and reaped. A PID marker and a run lock
@@ -71,8 +73,16 @@ Two consecutive timeouts for the same storagekitd PID trigger one Telegram
 attention alert; failed sends retry on the next timeout or surviving-child
 skip using the same key and message. Success resets
 the consecutive count. A StorageKit wait means storagekitd isn't answering.
-The owner can run `sudo killall storagekitd`; launchd respawns it on demand.
-The collector never restarts daemons or changes mounts.
+First run `sudo killall storagekitd`. If `diskutil list` still times out after
+10 s, run `sudo kill -9 <pid>` using storagekitd's PID from the alert. The alert
+also includes its uptime. If the PID is unavailable or has changed since the
+alert, read the current one with `ps -axo pid,etime,comm` before using it.
+launchd respawns storagekitd on demand. The collector never runs `sudo` or
+daemon kill commands, restarts daemons, or changes mounts.
+
+On 13 Nov 2026, `sudo killall storagekitd` returned 0 but pid 80846 (up 17 h
+52 m) ignored SIGTERM. `sudo kill -9 80846` cleared it; launchd restarted
+storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
 ## Install after review and owner approval
 
