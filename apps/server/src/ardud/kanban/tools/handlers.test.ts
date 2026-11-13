@@ -123,6 +123,7 @@ const fakeThreads = (
             updatedAt: "2026-10-26T08:00:00.000Z",
             quietSince: "2026-10-26T08:00:00.000Z",
             runStartedAt: null,
+            lastActivityAt: null,
             backgroundWork: 0,
             prWatches: 0,
             prs: [],
@@ -139,6 +140,7 @@ const fakeThreads = (
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) => {
         const launch = Effect.sync(() => {

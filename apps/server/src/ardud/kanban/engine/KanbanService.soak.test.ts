@@ -519,6 +519,7 @@ const makeThreads = (watch: Watch) => {
         updatedAt: at,
         quietSince: at,
         runStartedAt: thread.running ? at : null,
+        lastActivityAt: thread.running ? at : null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
@@ -541,6 +542,7 @@ const makeThreads = (watch: Watch) => {
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {

@@ -52,6 +52,7 @@ const threads = Layer.succeed(
     lastFailure: () => Effect.succeed(null),
     findLastFailure: () => Effect.succeed(null),
     latestRun: () => Effect.succeed(null),
+    runSettled: () => Effect.succeed(true),
     compactRun: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
     send: () => Effect.void,
@@ -923,6 +924,7 @@ it.effect(
         lastFailure: () => Effect.succeed(null),
         findLastFailure: () => Effect.succeed(null),
         latestRun: () => Effect.succeed(null),
+        runSettled: () => Effect.succeed(true),
         compactRun: () => Effect.succeed(null),
         launch: (input) => {
           sent.push(input.text);
