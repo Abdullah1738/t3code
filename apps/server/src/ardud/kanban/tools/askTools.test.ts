@@ -308,46 +308,55 @@ it.effect(
     }).pipe(Effect.provide(testLayer())),
 );
 
-it.effect("discussion_post with ask replies on the ask without closing it", () =>
+it.effect("owner free-text closes an ask, while discussion_post keeps agent replies open", () =>
   Effect.gen(function* () {
     const { kanban, card } = yield* setup;
     yield* call(evaluator, "card_ask", { card: card.id, question: "Which fee?", blocking: true });
     yield* kanban.replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "Fee on what?" }], "owner");
-    assert.strictEqual(kanbanAskWaitsOn((yield* kanban.card(card.id)).card.asks[0]!), "agent");
+    const answered = (yield* kanban.card(card.id)).card.asks[0]!;
+    assert.isNotNull(answered.closedAt);
+    assert.strictEqual(answered.answer?.verdict, "text");
+    assert.strictEqual(answered.answer?.text, "Fee on what?");
+    assert.deepStrictEqual(answered.answer?.by, owner);
+    assert.isNull(kanbanAskWaitsOn(answered));
+
+    yield* call(evaluator, "card_ask", { card: card.id, question: "Which fee?", blocking: true });
 
     const posted = yield* call(evaluator, "discussion_post", {
       card: card.id,
-      ask: "q1",
+      ask: "q2",
       text: "On withdrawals.",
       blocks: [{ _tag: "html", html: "<p>fee table</p>", title: "Fees", height: null }],
     });
     assert.isFalse(posted.isError, posted.text);
-    assert.strictEqual(posted.structured.message.askId, "q1");
+    assert.strictEqual(posted.structured.message.askId, "q2");
     assert.deepStrictEqual(
       posted.structured.message.blocks.map((block: { _tag: string }) => block._tag),
       ["md", "html"],
     );
     const after = (yield* kanban.card(card.id)).card;
-    assert.isNull(after.asks[0]!.closedAt);
-    assert.strictEqual(kanbanAskWaitsOn(after.asks[0]!), "owner");
+    assert.deepStrictEqual(after.asks[0], answered);
+    assert.isNull(after.asks[1]!.closedAt);
+    assert.isUndefined(after.asks[1]!.answer);
+    assert.strictEqual(kanbanAskWaitsOn(after.asks[1]!), "owner");
     assert.strictEqual(after.stage, "needs_owner");
 
     // A reply on an ask is held to the ask's sizes: a page over 256 KB, or too many blocks.
     const page = yield* call(evaluator, "discussion_post", {
       card: card.id,
-      ask: "q1",
+      ask: "q2",
       blocks: [{ _tag: "html", html: "x".repeat(256 * 1024 + 1), title: "Big", height: null }],
     });
     assert.isTrue(page.isError);
     assert.include(page.text, "an html block on a reply on an ask is at most 256 KB");
     const many = yield* call(evaluator, "discussion_post", {
       card: card.id,
-      ask: "q1",
+      ask: "q2",
       blocks: Array.from({ length: 13 }, (_, index) => ({ _tag: "md", text: `Line ${index}` })),
     });
     assert.isTrue(many.isError);
     assert.include(many.text, "a reply on an ask takes at most 12 blocks (got 13)");
-    assert.strictEqual(kanbanAskWaitsOn((yield* kanban.card(card.id)).card.asks[0]!), "owner");
+    assert.strictEqual(kanbanAskWaitsOn((yield* kanban.card(card.id)).card.asks[1]!), "owner");
 
     const missing = yield* call(evaluator, "discussion_post", {
       card: card.id,
