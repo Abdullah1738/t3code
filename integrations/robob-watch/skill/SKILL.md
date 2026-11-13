@@ -150,6 +150,14 @@ Remove watchers once the thing is resolved, or when the owner says to stop. Done
 - Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the JSON key `expires_at` (an ISO time or a duration like "14d"). The `--expires` flag on the CLI is a separate option. If the JSON has no `expires_at`, the watcher gets the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.
 - Nightly 2026-10-15: an email watcher whose filter changes gets a new seen-file key (`sha256(acct|mbox|query)`). Copy `mail-<oldkey>.seen` and `.seen.init` to the new key before `--replace`, or the new query re-baselines and misses the mail that prompted the change.
 
+## Logs
+
+Structured logs are in `~/.robob/logs/tools/watchers/YYYY-MM-DD.ndjson` (UTC). Watcher/helper names are readable; other correlation IDs are hashed. Message text, prompts, secrets and health values are excluded.
+
+Events: `watch.run`, `watch.retry`, `watch.fire_cap`, `watch.recovered`, `watch.disabled`, `wake.sent`, `wake.reply_guard`, `triage.decision`, `tg.send`, `tg.dedupe`, `tg.reminder` and `helper.run`. Tagged errors and triage stage timings use the same files.
+
+Run `robob-watch log-rollup [--day YYYY-MM-DD]` (default yesterday). The runner also rolls up yesterday after 00:05 UTC. Read `rollup-YYYY-MM-DD.json` for counts, rates, timing percentiles and error tags.
+
 ## Troubleshooting
 
 - Runner: one LaunchAgent `com.ardud.robob-watch` (KeepAlive, ticks every 1s; each tick is a stat per trigger file plus a JSON read per watcher, about 0% CPU). `robob-watch runner` or `launchctl print gui/$(id -u)/com.ardud.robob-watch`. Log: `~/.local/share/robob-watch/runner.log`. You may restart it: `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
