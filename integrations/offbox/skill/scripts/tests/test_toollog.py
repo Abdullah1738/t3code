@@ -126,6 +126,9 @@ class Logs(unittest.TestCase):
 
 
 class Instrumentation(Isolated):
+    # Exercise the logging wrappers; the failover test stubs _probe and traps execve.
+    guard_home_failover = False
+
     def setUp(self):
         super().setUp()
         for name in ('SSH_DIR', 'CM_DIR', 'KEY_PATH'):
