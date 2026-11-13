@@ -1057,6 +1057,7 @@ const seedRestartCancelledChild = (input: {
   readonly continuationPending: boolean;
   readonly runStatus?: "cancelled" | "completed" | "interrupted";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
+  readonly partialResult?: string;
   readonly now: DateTime.Utc;
 }) =>
   Effect.gen(function* () {
@@ -1162,6 +1163,33 @@ const seedRestartCancelledChild = (input: {
           ]
         : [],
     });
+    if (input.partialResult !== undefined) {
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`event:${input.name}:partial-result`),
+            type: "message.updated",
+            threadId: childThreadId,
+            runId: childRunId,
+            occurredAt: input.now,
+            payload: {
+              id: MessageId.make(`message:${input.name}:partial-result`),
+              threadId: childThreadId,
+              runId: childRunId,
+              nodeId: null,
+              role: "assistant",
+              text: input.partialResult,
+              createdBy: "agent",
+              creationSource: "provider",
+              attachments: [],
+              streaming: false,
+              createdAt: input.now,
+              updatedAt: input.now,
+            },
+          },
+        ],
+      });
+    }
     return { taskId, childThreadId, childRunId };
   });
 
@@ -1743,6 +1771,27 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
               commandId: reconcileCommandId("followup-restart-cut"),
               events: [
                 {
+                  id: EventId.make("event:followup-partial"),
+                  type: "message.updated",
+                  threadId: child.childThreadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: {
+                    id: MessageId.make("message:followup-partial"),
+                    threadId: child.childThreadId,
+                    runId: run.id,
+                    nodeId: run.rootNodeId,
+                    role: "assistant",
+                    text: "Partial follow-up result",
+                    createdBy: "agent",
+                    creationSource: "provider",
+                    attachments: [],
+                    streaming: false,
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                },
+                {
                   id: EventId.make("event:followup-restart-cut"),
                   type: "run.updated",
                   threadId: child.childThreadId,
@@ -2065,6 +2114,84 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
       }),
   );
 
+  it.effect("holds a modern recut continuation for its earlier partial result", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:modern-recut-parent");
+      const projectId = ProjectId.make("project:modern-recut");
+      const runId = RunId.make("run:modern-recut-parent");
+      const rootNodeId = NodeId.make("node:modern-recut-parent");
+      yield* seedParentWithTerminalTask({
+        threadId,
+        projectId,
+        runId,
+        rootNodeId,
+        taskId: NodeId.make("node:modern-recut-seed"),
+        deliveryState: "delivered",
+        now,
+      });
+      const child = yield* seedRestartCancelledChild({
+        parentThreadId: threadId,
+        projectId,
+        parentRunId: runId,
+        rootNodeId,
+        name: "modern-recut-child",
+        completionWake: "always",
+        continuationPending: false,
+        partialResult: "Earlier partial result",
+        now,
+      });
+      const original = (yield* orchestrator.getThreadProjection(child.childThreadId)).runs[0]!;
+      const recutId = RunId.make("run:modern-recut-child:2");
+      const commandId = reconcileCommandId("modern-recut");
+      yield* sink.writeWithEffects({
+        commandId,
+        events: [
+          {
+            id: EventId.make("modern-recut:original"),
+            type: "run.updated",
+            threadId: child.childThreadId,
+            occurredAt: now,
+            payload: { ...original, delegatedTaskId: child.taskId },
+          },
+          {
+            id: EventId.make("modern-recut:continuation"),
+            type: "run.updated",
+            threadId: child.childThreadId,
+            occurredAt: now,
+            payload: {
+              ...original,
+              id: recutId,
+              ordinal: 2,
+              startedAt: null,
+              restartContinuationOfRunId: original.id,
+              delegatedTaskId: child.taskId,
+            },
+          },
+        ],
+        effects: [
+          {
+            id: `effect:restart-continuation:${recutId}`,
+            commandId,
+            threadId: child.childThreadId,
+            request: { type: "provider-runtime.continue", sourceRunId: recutId },
+          },
+        ],
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+      const task = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+        (row) => row.id === child.taskId,
+      )!;
+      assert.equal(task.status, "running");
+      assert.isNull(task.result);
+      assert.isTrue(
+        yield* orchestrator.delegatedTaskResultPending(child.childThreadId, child.taskId),
+      );
+    }),
+  );
+
   it.effect("holds a restart-cancelled child for its continuation's result", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -2096,6 +2223,7 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
           name,
           completionWake: "always",
           continuationPending,
+          partialResult: "Partial result before restart",
           ...(runStatus === undefined ? {} : { runStatus }),
           now,
         });
@@ -2251,6 +2379,7 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         parentRunId: runId,
         rootNodeId,
         name: "restart-declined-child",
+        partialResult: "Partial result before restart",
         completionWake: "always",
         continuationPending: true,
         now,

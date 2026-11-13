@@ -699,107 +699,153 @@ describe("OrchestratorMcpService", () => {
       }),
   );
 
-  it.effect("reports a restart-cut child as working until its continuation settles", () =>
-    Effect.gen(function* () {
-      const parentThreadId = ThreadId.make("thread:mcp-restart-parent");
-      const childThreadId = ThreadId.make("thread:mcp-restart-child");
-      const taskId = NodeId.make("node:mcp-restart-task");
-      const dispatched = yield* Ref.make(0);
-      let awaitsRestart = true;
-      let readFails = true;
-      const parentProjection = {
-        thread: { id: parentThreadId },
-        runs: [],
-        contextTransfers: [],
-        subagents: [
-          {
-            id: taskId,
+  it.effect.each(["active_continuation", "recut_nested", "recut_native"] as const)(
+    "preserves delegated work through restart for %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:mcp-restart-parent");
+        const childThreadId = ThreadId.make("thread:mcp-restart-child");
+        const taskId = NodeId.make("node:mcp-restart-task");
+        const dispatched = yield* Ref.make(0);
+        const now = yield* DateTime.now;
+        let awaitsRestart = true;
+        let readFails = true;
+        const parentProjection = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              driver: "codex",
+              model: "gpt-5.6-terra",
+              status: "running",
+              result: null,
+              completionDelivery: { state: "pending" },
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        let childProjection = {
+          thread: { id: childThreadId },
+          runs: [
+            {
+              id: RunId.make("run:mcp-restart-child"),
+              ordinal: 1,
+              status: "cancelled",
+              delegatedTaskId: taskId,
+            },
+            { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
+            { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
+          ],
+          contextTransfers: [],
+          messages: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        if (scenario !== "active_continuation") {
+          childProjection = {
+            ...childProjection,
+            runs: [
+              { ...childProjection.runs[0]!, status: "completed", startedAt: now },
+              {
+                ...childProjection.runs[0]!,
+                id: RunId.make("run:mcp-recut"),
+                ordinal: 2,
+                status: "cancelled",
+                startedAt: null,
+                restartContinuationOfRunId: childProjection.runs[0]!.id,
+              },
+            ],
+            subagents: scenario === "recut_nested" ? [{ status: "running" } as never] : [],
+            providerThreads:
+              scenario === "recut_native" ? [{ pendingBackgroundTasks: [{}] } as never] : [],
+          };
+        }
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (threadId) =>
+              Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
+            delegatedTaskResultPending: () =>
+              readFails
+                ? Effect.fail(new OrchestratorProjectionError({ threadId: childThreadId }))
+                : Effect.succeed(awaitsRestart),
+            dispatch: () =>
+              Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({} as never)),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:mcp-restart"),
+          requestNamespace: "provider-session:mcp-restart",
+          thread: {
             threadId: parentThreadId,
-            origin: "app_owned",
-            childThreadId,
-            driver: "codex",
-            model: "gpt-5.6-terra",
-            status: "running",
-            result: null,
-            completionDelivery: { state: "pending" },
+            providerSessionId: "provider-session:mcp-restart",
+            providerInstanceId: ProviderInstanceId.make("codex"),
           },
-        ],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const childProjection = {
-        thread: { id: childThreadId },
-        runs: [
-          {
-            id: RunId.make("run:mcp-restart-child"),
-            ordinal: 1,
-            status: "cancelled",
-            delegatedTaskId: taskId,
-          },
-          { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
-          { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
-        ],
-        contextTransfers: [],
-        messages: [],
-        subagents: [],
-        providerThreads: [],
-        runtimeRequests: [],
-        turnItems: [],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const layerDependencies = Layer.mergeAll(
-        NodeServices.layer,
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadRecords: (threadId) =>
-            Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
-          delegatedTaskResultPending: () =>
-            readFails
-              ? Effect.fail(new OrchestratorProjectionError({ threadId: childThreadId }))
-              : Effect.succeed(awaitsRestart),
-          dispatch: () => Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({} as never)),
-        }),
-        ServerSettings.layerTest(),
-        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-          list: () => Effect.succeed([]),
-        }),
-        Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(SecretRequests.SecretRequests)({}),
-        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
-      );
-      const scope: McpInvocationScope = {
-        environmentId: EnvironmentId.make("environment:mcp-restart"),
-        requestNamespace: "provider-session:mcp-restart",
-        thread: {
-          threadId: parentThreadId,
-          providerSessionId: "provider-session:mcp-restart",
-          providerInstanceId: ProviderInstanceId.make("codex"),
-        },
-        client: undefined,
-        capabilities: new Set(["orchestration"]),
-        issuedAt: 1,
-      };
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
 
-      yield* Effect.gen(function* () {
-        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const failed = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
-        assert.equal(failed.code, "orchestration_error");
-        assert.equal(yield* Ref.get(dispatched), 0);
-        readFails = false;
-        const held = yield* service.taskStatus(scope, taskId);
-        assert.equal(held.status, "running");
-        assert.equal(held.workState, "working");
-        assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
-        assert.equal(held.currentRunId, RunId.make("run:mcp-restart-later"));
-        assert.equal(held.currentRunStatus, "running");
-        assert.equal(held.latestTerminalStatus, "cancelled");
-        assert.equal(held.hasPendingChildRuns, true);
-        assert.isNull(held.summary);
-        assert.equal(yield* Ref.get(dispatched), 0);
-        awaitsRestart = false;
-        const settled = yield* service.taskStatus(scope, taskId);
-        assert.equal(settled.status, "cancelled");
-      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
-    }),
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          if (scenario === "active_continuation") {
+            const failed = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
+            assert.equal(failed.code, "orchestration_error");
+            assert.equal(yield* Ref.get(dispatched), 0);
+          }
+          readFails = false;
+          const held = yield* service.taskStatus(scope, taskId);
+          assert.equal(held.status, "running");
+          assert.equal(
+            held.workState,
+            scenario === "active_continuation" ? "working" : "waiting_for_children",
+          );
+          assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
+          assert.equal(
+            held.currentRunId,
+            scenario === "active_continuation" ? RunId.make("run:mcp-restart-later") : null,
+          );
+          assert.equal(
+            held.currentRunStatus,
+            scenario === "active_continuation" ? "running" : null,
+          );
+          assert.equal(
+            held.latestTerminalStatus,
+            scenario === "active_continuation" ? "cancelled" : "completed",
+          );
+          assert.equal(held.hasPendingChildRuns, scenario === "active_continuation");
+          assert.isNull(held.summary);
+          assert.equal(yield* Ref.get(dispatched), 0);
+          awaitsRestart = false;
+          const settled = yield* service.taskStatus(scope, taskId);
+          if (scenario === "active_continuation") {
+            assert.equal(settled.status, "cancelled");
+          } else {
+            assert.equal(settled.status, "running");
+            assert.equal(settled.workState, "waiting_for_children");
+            childProjection = { ...childProjection, subagents: [], providerThreads: [] };
+            const finished = yield* service.taskStatus(scope, taskId);
+            assert.equal(finished.status, "cancelled");
+            assert.equal(finished.workState, "result_available");
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }),
   );
 
   it.effect("does not dispose delivery when a nonterminal task has no active child run", () =>

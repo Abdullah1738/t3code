@@ -1976,10 +1976,22 @@ const make = Effect.gen(function* () {
             .filter((run) => run.delegatedTaskId === task.id)
             .toSorted((a, b) => b.ordinal - a.ordinal)[0]
         : progress.resultRun;
+    const resultRunAncestors = new Set<RunId>();
+    let resultSource = taskResultRun;
+    while (resultSource !== undefined && !resultRunAncestors.has(resultSource.id)) {
+      resultRunAncestors.add(resultSource.id);
+      const previous: RunId | undefined = resultSource.restartContinuationOfRunId;
+      resultSource =
+        previous === undefined ? undefined : childControls.runs.find((run) => run.id === previous);
+    }
     const taskWorkState =
       childRun?.delegatedTaskId === task.id
         ? isTerminalTaskStatus(taskStatusForRun(taskResultRun))
-          ? "result_available"
+          ? progress.state === "waiting_for_children" &&
+            progress.resultRun !== undefined &&
+            resultRunAncestors.has(progress.resultRun.id)
+            ? "waiting_for_children"
+            : "result_available"
           : "working"
         : progress.state;
     const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
@@ -3100,7 +3112,7 @@ const make = Effect.gen(function* () {
               );
       const stopChild = Effect.gen(function* () {
         const commandId = stableCommandId({ scope, requestKey: key, operation: "cancel-task" });
-        const reason = input.reason;
+        const reason = input.reason ?? "Cancellation requested by parent task";
         yield* threadManagement
           .dispatch({
             type: "thread.stop",
@@ -3150,6 +3162,33 @@ const make = Effect.gen(function* () {
             })
             .pipe(Effect.mapError(threadManagementFailure));
         }
+        const taskRunIds = new Set([current.childRunId]);
+        for (const run of stopped.runs.toSorted((a, b) => a.ordinal - b.ordinal)) {
+          if (
+            run.delegatedTaskId === input.taskId ||
+            (run.restartContinuationOfRunId !== undefined &&
+              taskRunIds.has(run.restartContinuationOfRunId))
+          ) {
+            taskRunIds.add(run.id);
+          }
+        }
+        const terminalRun = stopped.runs
+          .filter(
+            (run) =>
+              ThreadManagementService.isTerminalRunStatus(run.status) && taskRunIds.has(run.id),
+          )
+          .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+        if (
+          parentTask?.result === null &&
+          terminalRun !== undefined &&
+          !stopped.runs.some((run) =>
+            ["preparing", "starting", "running", "waiting"].includes(run.status),
+          )
+        ) {
+          // Stop can only mark an already-ended turn. No new run event will
+          // settle its task, including when a previous cancel disposed delivery.
+          yield* threadManagement.recoverDelegatedTask(current.childThreadId, terminalRun.id);
+        }
       });
       // Checked above; a user raising one of these threads meanwhile is
       // caught again under that thread's lock, which leaves it running.
@@ -3186,6 +3225,7 @@ const make = Effect.gen(function* () {
       const child = yield* loadProjection(current.childThreadId, ["runs"]);
       if (
         current.workState !== "waiting_for_children" &&
+        current.latestTerminalRunId === null &&
         ThreadManagementService.latestActiveRun(child) === undefined &&
         !child.runs.some(
           (run) =>
