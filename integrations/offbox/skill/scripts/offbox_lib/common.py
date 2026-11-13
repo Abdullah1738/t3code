@@ -236,9 +236,13 @@ def entry_backend(argv: list[str]) -> str:
                     and not any(r["name"] == full for r in base_catalog.rows("server"))):
                 _BACKEND_REASON = "boat-only-base"
                 return "boat"
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
-        if sub in ("logs", "wait", "kill"):
+        if sub == "exec":
+            from .cli import parse_args
+            a = parse_args(argv)
+            named = a.cmd[:1] if a.cmd and a.cmd[0].startswith("bx_") else []
+        elif sub in ("logs", "wait", "kill"):
             named = []
             args = iter(argv[argv.index(sub) + 1:])
             for arg in args:

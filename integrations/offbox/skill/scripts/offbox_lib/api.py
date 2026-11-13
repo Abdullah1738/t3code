@@ -436,6 +436,14 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
         return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
 
 
+def _log_request_error(method: str, path: str, detail: str) -> None:
+    # A command endpoint may echo its input in an error. Keep shell text and secrets out of offbox.log.
+    if method == "POST" and path.endswith("/commands"):
+        log(f"api {method} {path} -> command request failed (details omitted)")
+    else:
+        log(f"api {method} {path} -> {detail}")
+
+
 def _request(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
              retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable).
@@ -564,7 +572,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 uncertain_start = True
             if is_start and is_capacity_outage(e.code, code, msg):
                 # This is an explicit refusal, not an ambiguous create. Retry only after the outer wait.
-                log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+                _log_request_error(method, path, f"{e.code} {code} {msg[:200]}")
                 if uncertain_start:
                     raise OffboxError("a previous create/fork was unanswered; boat's later capacity refusal "
                                       "does not prove it failed. Nothing ran; check boat before retrying")
@@ -594,10 +602,10 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if _never_delivered(e.code, code, msg) and not start_not_delivered \
                     and attempt <= max(retries, max_connect) \
                     and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
-                log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
+                _log_request_error(method, path, f"{e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
                 time.sleep(min(2.0 * attempt, 8))
                 continue
-            log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+            _log_request_error(method, path, f"{e.code} {code} {msg[:200]}")
             if is_start and uncertain_start and "Idempotency-Key" in h:
                 raise OffboxError("create/fork was unanswered and may have been accepted; "
                                   "nothing ran. Check boat before retrying")
@@ -616,7 +624,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if deadline is not None and time.time() >= deadline:
                 # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
                 raise NetworkError(f"deadline passed during {method} {path}: {e}")
-            log(f"api {method} {path} -> network {e}")
+            _log_request_error(method, path, f"network {e}")
             raise NetworkError(f"{NAME} API unreachable ({method} {path}): {e}")
 
 

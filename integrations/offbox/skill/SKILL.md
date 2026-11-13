@@ -230,6 +230,17 @@ UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on 
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
 
+### Control a box without SSH
+
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>` runs through the authenticated
+offbox server API, owner-checked, on home or Boat. With no box ID it uses this caller's current lease.
+Use `offbox exec <box> -- <cmd>` when a guest has stopped, masked or replaced its own sshd (for example
+TorSSH testhost fixtures). Never bypass a host-key mismatch by editing known_hosts or disabling strict
+host-key checking. `boat exec` is Boat-only and returns 404 for home boxes.
+Timeout defaults to 60 seconds and is clamped to 1..600. Output goes to stdout/stderr, or `--json` prints
+the raw result dict; the CLI returns the remote exit code. API/transport failures exit 90. A box ID selects
+its recorded backend; a failed request never retries on the other backend. This command does not sync files.
+
 ## Repo toolchains
 
 The `usdtwallet-android` repo recipe installs JDK 17, Android command-line tools, SDK platforms 37.1 and 36,
