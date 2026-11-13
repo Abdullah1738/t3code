@@ -99,6 +99,7 @@ export interface EventSinkV2Shape {
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
+    readonly unlessClaudeRefused?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly threadId: ThreadId;
@@ -434,6 +435,15 @@ const layerBase: Layer.Layer<
       });
 
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+      const providerSessions = new Map<
+        ProviderThreadId,
+        {
+          native_id: string | null;
+          instance_id: string;
+          driver: string;
+          refused: number;
+        }
+      >();
       const runOrdinals = new Map(
         events.flatMap((event) =>
           event.type === "run.created" || event.type === "run.updated"
@@ -444,14 +454,64 @@ const layerBase: Layer.Layer<
       return Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
-          event.type === "turn-item.updated"
-            ? turnItemPositions
-                .normalize(
-                  event.payload,
-                  event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
-                )
-                .pipe(Effect.map((payload) => ({ ...event, payload })))
-            : Effect.succeed(event),
+          Effect.gen(function* () {
+            if (event.type === "provider-thread.updated") {
+              const incoming = event.payload;
+              if (incoming.driver !== "claudeAgent") {
+                providerSessions.set(incoming.id, {
+                  native_id: incoming.nativeThreadRef?.nativeId ?? null,
+                  instance_id: incoming.providerInstanceId,
+                  driver: incoming.driver,
+                  refused: 0,
+                });
+                return event;
+              }
+              const prior =
+                providerSessions.get(incoming.id) ??
+                (yield* sql<{
+                  native_id: string | null;
+                  instance_id: string;
+                  driver: string;
+                  refused: number;
+                }>`SELECT
+              json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+              provider_instance_id AS instance_id, driver,
+              COALESCE(json_extract(payload_json, '$.nativeMetadata.claudeRefusalObserved'), 0) AS refused
+              FROM orchestration_v2_projection_provider_threads
+              WHERE provider_thread_id = ${incoming.id} LIMIT 1`)[0];
+              const nativeId = incoming.nativeThreadRef?.nativeId ?? null;
+              // A queued pre-refusal snapshot must not erase durable history for
+              // the same native Claude session. A new native identity starts fresh.
+              const preserve =
+                incoming.driver === "claudeAgent" &&
+                nativeId !== null &&
+                prior?.driver === incoming.driver &&
+                prior.instance_id === incoming.providerInstanceId &&
+                prior.native_id === nativeId &&
+                prior.refused === 1;
+              const payload = preserve
+                ? {
+                    ...incoming,
+                    nativeMetadata: { ...incoming.nativeMetadata, claudeRefusalObserved: true },
+                  }
+                : incoming;
+              providerSessions.set(incoming.id, {
+                native_id: nativeId,
+                instance_id: incoming.providerInstanceId,
+                driver: incoming.driver,
+                refused: payload.nativeMetadata?.claudeRefusalObserved === true ? 1 : 0,
+              });
+              return { ...event, payload };
+            }
+            return event.type === "turn-item.updated"
+              ? yield* turnItemPositions
+                  .normalize(
+                    event.payload,
+                    event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
+                  )
+                  .pipe(Effect.map((payload) => ({ ...event, payload })))
+              : event;
+          }),
         { concurrency: 1 },
       );
     };
@@ -686,6 +746,16 @@ const layerBase: Layer.Layer<
                   committed: false as const,
                   storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
                 };
+              }
+
+              if (input.unlessClaudeRefused !== undefined) {
+                const refused = yield* sql`SELECT provider_thread_id
+                  FROM orchestration_v2_projection_provider_threads
+                  WHERE provider_thread_id = ${input.unlessClaudeRefused}
+                    AND driver = 'claudeAgent'
+                    AND json_extract(payload_json, '$.nativeMetadata.claudeRefusalObserved') = 1
+                  LIMIT 1`;
+                if (refused.length > 0) return { committed: false as const, storedEvents: [] };
               }
 
               const normalized = yield* timing.measure(

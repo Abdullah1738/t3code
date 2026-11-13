@@ -238,6 +238,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   latestTerminalResultContextTransferId: Schema.NullOr(ContextTransferId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.NullOr(Schema.String),
+  finishedOn: Schema.optional(Schema.String),
   selectionRouting: Schema.optional(Schema.NullOr(ModelSelectionRouting)),
   options: Schema.optional(
     Schema.Array(ProviderOptionSelection).annotate({

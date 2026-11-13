@@ -1,3 +1,4 @@
+import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
   CommandId,
@@ -1906,7 +1907,11 @@ const make = Effect.gen(function* () {
       : null;
     const resultContextTransferId = resultTransfer?.id ?? null;
     const latestTerminalResultContextTransferId = resultTransferForRun(terminalRun)?.id ?? null;
-    const modelSelection = childRun?.modelSelection ??
+    const resultModelRun = task.result !== null ? summaryRun : taskResultRun;
+    const recoveredRun =
+      resultModelRun?.launchRecovery?.kind === "model_access" ? resultModelRun : undefined;
+    const modelSelection = recoveredRun?.modelSelection ??
+      childRun?.modelSelection ??
       childControls.thread.modelSelection ?? {
         instanceId: task.providerInstanceId,
         model: task.model,
@@ -1944,6 +1949,7 @@ const make = Effect.gen(function* () {
               delayMs: activeRun.status === "starting" ? 1000 : 0,
               filesMayBePartlyWritten: true,
             };
+    const finishedOn = claudeRecoveryResult(recoveredRun, null).finishedOn;
     const response = {
       retry,
       partial: false,
@@ -1962,6 +1968,7 @@ const make = Effect.gen(function* () {
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,
+      ...(finishedOn === undefined ? {} : { finishedOn }),
       options: modelSelection.options ?? [],
       ...(task.selectionRouting === undefined ? {} : { selectionRouting: task.selectionRouting }),
       ...(Option.isSome(progressGuard)

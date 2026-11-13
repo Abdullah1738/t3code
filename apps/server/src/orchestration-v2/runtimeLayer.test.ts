@@ -1,3 +1,4 @@
+import { nextLaunchRecovery, claudeRecoveryResult } from "./launchRecovery.ts";
 import { bootId, continuationReport } from "../ardud/fast-install/report.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
@@ -4167,6 +4168,391 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
 
       assert.equal(first._tag, "OrchestratorProjectionError");
       assert.equal(retry._tag, "OrchestratorCommandPreviouslyRejectedError");
+    }),
+  );
+
+  it.effect.each([false, true])(
+    "atomically excludes durable Claude refusal from retry commit: %s",
+    (refused) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`refusal-commit-${refused}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId: ProjectId.make("restart-project"),
+          title: "Refusal guard",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: "/tmp/runtime-layer-refusal-guard",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:message`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message`),
+          text: "Read",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const source = projection.runs[0]!;
+        const providerThread = projection.providerThreads.find(
+          (row) => row.id === source.providerThreadId,
+        )!;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:running`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...source, status: "running" },
+            },
+            {
+              id: EventId.make(`${threadId}:refusal`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                driver: ProviderDriverKind.make("claudeAgent"),
+                nativeMetadata: { claudeRefusalObserved: refused },
+              },
+            },
+          ],
+        });
+        const commandId = CommandId.make(`${threadId}:retry`);
+        const result = yield* sink.writeIfRunCurrent({
+          threadId,
+          runId: source.id,
+          activeAttemptId: source.activeAttemptId!,
+          expectedStatus: "running",
+          unlessClaudeRefused: providerThread.id,
+          commandId,
+          events: [
+            {
+              id: EventId.make(`${threadId}:next`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...source, status: "starting" },
+            },
+          ],
+          effects: [
+            {
+              id: `${threadId}:start`,
+              commandId,
+              threadId,
+              request: { type: "provider-turn.start", runId: source.id, retryDelayMs: 30000 },
+            },
+          ],
+        });
+        assert.equal(result.committed, !refused);
+        assert.lengthOf(
+          yield* (yield* EffectOutbox.EffectOutboxV2).listByCommandId(commandId),
+          refused ? 0 : 1,
+        );
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status,
+          refused ? "running" : "starting",
+        );
+      }),
+  );
+
+  it.effect.each(
+    (
+      [
+        { model: "claude-haiku-5-5", kind: "model_access", retriesOnModel: 1, attempt: 1 },
+        { model: "claude-sonnet-5-5", kind: "model_access", retriesOnModel: 0, attempt: 2 },
+        { model: "claude-opus-5-5", kind: "model_access", retriesOnModel: 0, attempt: 4 },
+        { model: "claude-haiku-5-5", kind: "relay", retriesOnModel: 1, attempt: 1 },
+      ] as const
+    ).flatMap((row) => (["none", "before", "during"] as const).map((stop) => ({ ...row, stop }))),
+  )(
+    "recovers persisted launch backoff once: $kind/$model Stop=$stop",
+    ({ model, kind, retriesOnModel, attempt, stop }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const threadId = ThreadId.make(`launch-backoff-${kind}-${model}-${stop}`);
+        const selection = { ...modelSelection, model };
+        const initialSelection = { ...modelSelection, model: "claude-haiku-5-5" };
+        const text =
+          kind === "relay" ? "[Watcher event from build] Please relay: ready" : "Complete the task";
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId: ProjectId.make("restart-project"),
+          title: "Backoff",
+          modelSelection: initialSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: "/tmp/runtime-layer-backoff",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "agent",
+          creationSource: "server",
+          commandId: CommandId.make(`${threadId}:message`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message`),
+          text,
+          attachments: [],
+          modelSelection: initialSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const source = before.runs[0]!;
+        const now = yield* DateTime.now;
+        const marker = {
+          kind,
+          replayAllowed: true,
+          retriesOnModel,
+          attempt,
+          delayMs: 30_000,
+          since: DateTime.formatIso(now),
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:backoff`),
+              type: "run.updated",
+              threadId,
+              runId: source.id,
+              occurredAt: now,
+              payload: {
+                ...source,
+                modelSelection: selection,
+                startedAt: now,
+                launchRecovery: marker,
+              },
+            },
+          ],
+        });
+        const providerThread = before.providerThreads.find(
+          (thread) => thread.id === source.providerThreadId,
+        )!;
+        const resumedNativeId = model === "claude-haiku-5-5" ? "native-before-backoff" : null;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:native`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                status: "idle",
+                nativeThreadRef:
+                  resumedNativeId === null
+                    ? null
+                    : { driver, nativeId: resumedNativeId, strength: "strong" },
+                nativeMetadata: { ...providerThread.nativeMetadata, claudeRefusalObserved: false },
+              },
+            },
+          ],
+        });
+        yield* TestClock.adjust("10 seconds");
+        const interrupt = (runId: RunId) =>
+          orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make(`${threadId}:stop`),
+            threadId,
+            runId,
+            holdQueue: true,
+          });
+        if (stop === "before") yield* interrupt(source.id);
+        // This is the same isolated persisted-state reconciliation used on process startup.
+        yield* recovery.reconcile("startup");
+        const continuation = continueRestartedRun({ threadId, sourceRunId: source.id }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                dispatch: orchestrator.dispatch,
+                recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              }),
+            ),
+          ),
+        );
+        yield* continuation;
+        yield* continuation;
+        let after = yield* orchestrator.getThreadProjection(threadId);
+        if (stop === "before") {
+          assert.lengthOf(after.runs, 1);
+          return;
+        }
+        assert.lengthOf(after.runs, 2);
+        const resumed = after.runs[1]!;
+        assert.deepEqual(resumed.launchRecovery, marker);
+        assert.deepEqual(resumed.modelSelection, selection);
+        assert.equal(
+          after.providerThreads.find((thread) => thread.id === resumed.providerThreadId)
+            ?.nativeThreadRef?.nativeId ?? null,
+          resumedNativeId,
+        );
+        assert.equal(
+          after.messages.find((message) => message.id === resumed.userMessageId)?.text,
+          text,
+        );
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const pending = yield* outbox.listByCommandId(
+          CommandId.make(`command:restart-continuation:${source.id}`),
+        );
+        const starts = pending.filter((effect) => effect.request.type === "provider-turn.start");
+        assert.lengthOf(starts, 1);
+        if (starts[0]?.request.type === "provider-turn.start")
+          assert.equal(starts[0].request.retryDelayMs, 20_000);
+        if (stop === "during") {
+          yield* interrupt(resumed.id);
+          yield* recovery.reconcile("startup");
+          yield* continuation;
+          after = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(after.runs, 2);
+          assert.equal(after.runs[1]?.status, "interrupted");
+        }
+      }),
+  );
+
+  it.effect("closes replay permission after a recovered attempt reached its native turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("launch-output-restart");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make("restart-project"),
+        title: "Output",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-backoff",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "server",
+        commandId: CommandId.make(`${threadId}:message`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message`),
+        text: "Complete the task",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const source = projection.runs[0]!;
+      const now = yield* DateTime.now;
+      const selection = { ...modelSelection, model: "claude-sonnet-5-5" };
+      const marker = {
+        kind: "model_access" as const,
+        replayAllowed: true,
+        retriesOnModel: 1,
+        attempt: 3,
+        delayMs: 30_000,
+        since: DateTime.formatIso(now),
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:cut`),
+            type: "run.updated",
+            threadId,
+            runId: source.id,
+            occurredAt: now,
+            payload: {
+              ...source,
+              modelSelection: selection,
+              status: "cancelled",
+              startedAt: now,
+              completedAt: now,
+              launchRecovery: marker,
+              delegatedTaskId: NodeId.make("task-output"),
+            },
+          },
+          {
+            id: EventId.make(`${threadId}:turn`),
+            type: "provider-turn.updated",
+            threadId,
+            runId: source.id,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make(`${threadId}:native`),
+              providerThreadId: source.providerThreadId!,
+              nodeId: source.rootNodeId!,
+              runAttemptId: source.activeAttemptId,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "cancelled",
+              startedAt: now,
+              completedAt: now,
+            },
+          },
+        ],
+      });
+      yield* continueRestartedRun({ threadId, sourceRunId: source.id }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+              dispatch: orchestrator.dispatch,
+              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+            }),
+          ),
+        ),
+      );
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 2);
+      const resumed = after.runs[1]!;
+      assert.isFalse(resumed.launchRecovery?.replayAllowed);
+      assert.equal(
+        claudeRecoveryResult({ ...resumed, status: "completed" }, "Done").finishedOn,
+        "claude-sonnet-5-5",
+      );
+      assert.isUndefined(
+        nextLaunchRecovery({
+          thread: {
+            ...after.thread,
+            lineage: { ...after.thread.lineage, relationshipToParent: "subagent" },
+          },
+          run: resumed,
+          failure: {
+            class: "provider_error",
+            category: "auth_expired",
+            code: "api_error_401",
+            retryable: true,
+            message: "401",
+            claudeAccess: { status: 401, beforeResponse: true, refusalFree: true, refused: false },
+          },
+          driver: "claudeAgent",
+          automated: false,
+          text: "Continue",
+          jitter: 0.5,
+        }),
+      );
     }),
   );
 
