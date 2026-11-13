@@ -2308,6 +2308,7 @@ class ManifestLocationTests(FakeCliTestCase):
         installed = self.tmp / "installed"
         installed.mkdir()
         shutil.copy(PKG / "harness_cli.py", installed / "harness_cli.py")
+        shutil.copy(PKG / "toollog.py", installed / "toollog.py")
         shutil.copy(PKG / "model-manifest.json", installed / "model-manifest.json")
         env = {k: v for k, v in os.environ.items() if k != "HARNESS_CLI_MODEL_MANIFEST"}
         code = (

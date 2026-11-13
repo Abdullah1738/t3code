@@ -41,6 +41,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+import toollog
+
 from typing import Callable
 
 # Every location is read at call time, never at import: tests and throwaway runs
@@ -1849,6 +1852,22 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
 
 
 def canary(tool: str, version: str) -> dict:
+    started = time.perf_counter()
+    state = {'step': 'staging'}
+    ok = False
+    try:
+        result = _canary(tool, version, state)
+        ok = result['passed']
+        return result
+    finally:
+        toollog.emit('harness-cli', 'perf' if ok else 'error', 'canary.run',
+                     duration_ms=(time.perf_counter() - started) * 1000, ok=ok,
+                     props={'harness': tool if tool in TOOLS else 'unknown',
+                            'failingStep': 'none' if ok else state['step']},
+                     error_tag=None if ok else 'canary.' + state['step'])
+
+
+def _canary(tool: str, version: str, log_state: dict) -> dict:
     """Run the full canary and write one durable record for the outcome.
 
     Every outcome is recorded: a pass, a failed check, or an exception (generation, version,
@@ -1875,6 +1894,7 @@ def canary(tool: str, version: str) -> dict:
         if binary_version(binary, tool) != version:
             raise HarnessError(f"{binary} does not report {version}")
         key_present = bool(os.environ.get("NINEROUTER_KEY"))
+        log_state["step"] = "runtime"
         if tool == "claude":
             work = Path(tempfile.mkdtemp(prefix=f"harness-cli-canary-{tool}-"))
             try:

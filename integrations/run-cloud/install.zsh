@@ -27,7 +27,7 @@ done
 [[ -d "$src" ]] || { print -u2 "run-cloud: missing $src"; exit 1 }
 
 if [[ $mode == check ]]; then
-  out="$(rsync -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/")"
+  out="$(rsync --copy-unsafe-links -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/")"
   if [[ -n "$out" ]]; then
     print -u2 "run-cloud: live skill differs from $src:"
     print -u2 -r -- "$out"
@@ -39,7 +39,7 @@ fi
 
 # Back up each file that the install would replace or delete, so a bad install can be undone by hand.
 backup_dir="$live.bak-$stamp"
-changes="$(rsync -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/" 2>/dev/null || true)"
+changes="$(rsync --copy-unsafe-links -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/" 2>/dev/null || true)"
 if [[ -z "$changes" ]]; then
   print "run-cloud: nothing to install (live skill already matches)"
   exit 0
@@ -52,8 +52,8 @@ fi
 
 mkdir -p "$backup_dir"
 if [[ -d "$live" ]]; then
-  rsync -rlp "${excludes[@]}" "$live/" "$backup_dir/"
+  rsync --copy-unsafe-links -rlp "${excludes[@]}" "$live/" "$backup_dir/"
 fi
 mkdir -p "$live"
-rsync -rlp --checksum "${excludes[@]}" "$src/" "$live/"
+rsync --copy-unsafe-links -rlp --checksum "${excludes[@]}" "$src/" "$live/"
 print "run-cloud: installed. Previous copy kept at $backup_dir"

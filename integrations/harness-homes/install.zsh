@@ -9,7 +9,7 @@ set -eu
 
 pkg="${0:A:h}"
 dst="$HOME/.local/share/harness-homes"
-py=/opt/homebrew/bin/python3
+py="${HARNESS_HOMES_PYTHON:-/opt/homebrew/bin/python3}"
 label=com.ardud.harness-homes
 plist="$HOME/Library/LaunchAgents/$label.plist"
 
@@ -53,7 +53,7 @@ if (( with_agent )); then
   agents+=("$label")
 fi
 if [[ -d "$dst" ]]; then
-  rsync -a --exclude logs "$dst/" "$backup_dir/package/"
+  rsync --copy-unsafe-links -a --exclude logs "$dst/" "$backup_dir/package/"
 fi
 for agent in "${agents[@]}"; do
   [[ ! -f "$HOME/Library/LaunchAgents/$agent.plist" ]] || \
@@ -74,7 +74,7 @@ finish_install() {
       launchctl bootout "gui/$(id -u)/$agent" 2>/dev/null || true
     done
     if [[ -d "$backup_dir/package" ]]; then
-      rsync -ac "$backup_dir/package/" "$dst/" || recovery_failed=1
+      rsync --copy-unsafe-links -ac "$backup_dir/package/" "$dst/" || recovery_failed=1
     else
       rm -f "$dst/manifest.json" || recovery_failed=1
     fi
@@ -102,7 +102,7 @@ finish_install() {
 trap finish_install EXIT
 
 mkdir -p "$dst/logs" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
-rsync -ac --itemize-changes \
+rsync --copy-unsafe-links -ac --itemize-changes \
   --exclude node_modules --exclude data --exclude logs --exclude .venv --exclude venv \
   --exclude backups --exclude __pycache__ --exclude '*.bak*' --exclude '*.sqlite*' \
   --exclude '*.db' --exclude '*.db-*' --exclude '*.log' --exclude '*.pid' --exclude '*.lock' \

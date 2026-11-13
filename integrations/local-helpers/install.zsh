@@ -67,6 +67,7 @@ take_lock() {
 
 # repo dir -> live dir. Only files git knows about: keys, tokens, caches and state stay on the live side.
 typeset -A live=(
+  libexec/toollog "$HOME/.local/libexec/toollog"
   libexec/mail "$HOME/.local/libexec/mail"
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"

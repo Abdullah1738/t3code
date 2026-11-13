@@ -28,8 +28,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+import toollog
 
 HOME = Path.home()
 STATE_DIR = HOME / ".local/share/rcsim"
@@ -455,6 +459,40 @@ def print_created(sess: dict, platform: str, me: dict, notified: bool, as_json: 
     print(f"release when done: rcsim release {sess['id']}")
 
 
+def log_error_tag(code, data):
+    error = data.get('error') if isinstance(data, dict) else None
+    error = error if isinstance(error, dict) else {}
+    status = error.get('httpStatus')
+    tag = error.get('code') or error.get('tag')
+    # Provider fields and text are untrusted. Only known diagnostic tags survive.
+    known = {'api_origin_unavailable', 'not_found', 'unauthorized', 'quota_exceeded', 'capacity_exceeded'}
+    if code == 124:
+        return 'timeout'
+    return (str(status) + '.' if isinstance(status, int) else '') + (tag if tag in known else 'runcloud.failed')
+
+
+def logged_sim(name):
+    def decorate(fn):
+        @wraps(fn)
+        def run(a):
+            start = time.perf_counter()
+            ok = False
+            try:
+                result = fn(a)
+                ok = True
+                return result
+            finally:
+                if name != 'sim.heartbeat' or not ok:
+                    toollog.emit('rcsim', 'perf' if ok else 'error', name,
+                             duration_ms=(time.perf_counter() - start) * 1000, ok=ok,
+                             ids={'sessionId': getattr(a, '_log_session_id', None)},
+                             props={'platform': getattr(a, 'platform', 'unknown')},
+                             error_tag=None if ok else getattr(a, '_log_error_tag', name + '.failed'))
+        return run
+    return decorate
+
+
+@logged_sim('sim.create')
 def cmd_create(a) -> None:
     me = whoami(a.thread, a.manager)
     refuse_unresolved(me, "create")
@@ -471,14 +509,18 @@ def cmd_create(a) -> None:
     if a.install_asset:
         args += ["--install-asset", a.install_asset]
     code, data, out, err = rc(args)
+    a._log_session_id = data.get("id") if isinstance(data, dict) else None
     if code != 0 or not isinstance(data, dict) or not data.get("id"):
+        a._log_error_tag = log_error_tag(code, data)
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
         die("runcloud create failed", 1)
+    a._log_session_id = data["id"]
     register(con, data, a.platform, me, a.purpose, "rcsim")
     notified = False
     print_created(data, a.platform, me, notified, a.json)
 
 
+@logged_sim('sim.create')
 def cmd_launch(a) -> None:
     if bool(a.build) == bool(a.asset):
         die("pass exactly one of --build BUILD_ID or --asset ASSET_ID")
@@ -497,9 +539,12 @@ def cmd_launch(a) -> None:
         args += ["--region", a.region]
     code, data, out, err = rc(args, timeout=900)
     sess = (data or {}).get("session") if isinstance(data, dict) else None
+    a._log_session_id = sess.get("id") if isinstance(sess, dict) else None
     if code != 0 or not sess or not sess.get("id"):
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
+        a._log_error_tag = log_error_tag(code, data)
         die("runcloud mobile launch failed", 1)
+    a._log_session_id = sess["id"]
     register(con, sess, a.platform, me, a.purpose, "rcsim", launch_id=data.get("id"))
     notified = False
     print_created(sess, a.platform, me, notified, a.json)
@@ -522,6 +567,7 @@ def my_active(con, me: dict):
     return out
 
 
+@logged_sim('sim.heartbeat')
 def cmd_heartbeat(a) -> None:
     con = db()
     me = whoami(a.thread)
@@ -532,6 +578,7 @@ def cmd_heartbeat(a) -> None:
         die("no active simulators registered to this thread (pass ids explicitly)", 1)
     who = me.get("thread") or me.get("ses") or "cli"
     for sid in ids:
+        started = time.perf_counter()
         row = get_row(con, sid)
         if not row or row["state"] != "active":
             print(f"{sid}: not active ({row['release_reason'] if row else 'unregistered'}); nothing to heartbeat")
@@ -539,22 +586,39 @@ def cmd_heartbeat(a) -> None:
         con.execute("UPDATE sims SET last_hb=?, hb_by=?, warned_at=NULL WHERE id=?", (now(), who, sid))
         con.commit()
         event(con, sid, "heartbeat", who)
+        a._log_session_id = sid
+        a.platform = row['platform']
+        toollog.emit('rcsim', 'perf', 'sim.heartbeat', ok=True, duration_ms=(time.perf_counter() - started) * 1000,
+                     ids={'sessionId': sid}, props={'platform': row['platform'],
+                     'billedMinutes': max(0, min(now(), row['expires_at'] or now()) - row['created_at']) / 60, 'status': 'elapsed-estimate'})
         left = (row["expires_at"] or 0) - now()
         print(f"{sid}: heartbeat ok, next due by {hhmm(now() + HEARTBEAT_S)}; hard stop {hhmm(row['expires_at'])} ({mins(max(left, 0))} left)")
 
 
 def release(con, row, reason: str) -> tuple[bool, str]:
-    code, data, out, err = rc([row["platform"], "delete", row["id"], "--json"], timeout=120)
-    gone = code == 0 or (isinstance(data, dict) and (data.get("error") or {}).get("httpStatus") == 404) \
-        or "not found" in (out + err).lower()
-    status = (data or {}).get("status") if isinstance(data, dict) else None
-    if gone:
-        con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
-                    (now(), reason, row["id"]))
-        con.commit()
-        event(con, row["id"], "release", reason)
-        return True, status or "released"
-    return False, (json.dumps(redact(data)) if data else (out + err).strip())[:300]
+    started = time.perf_counter()
+    ok = False
+    tag = 'sim.release.failed'
+    try:
+        code, data, out, err = rc([row['platform'], 'delete', row['id'], '--json'], timeout=120)
+        error = data.get('error') if isinstance(data, dict) else None
+        gone = code == 0 or isinstance(error, dict) and error.get('httpStatus') == 404 or 'not found' in (out + err).lower()
+        tag = None if gone else log_error_tag(code, data)
+        status = data.get('status') if isinstance(data, dict) else None
+        if gone:
+            con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
+                        (now(), reason, row['id']))
+            con.commit()
+            event(con, row['id'], 'release', reason)
+            ok = True
+            return True, status or 'released'
+        return False, (json.dumps(redact(data)) if data else (out + err).strip())[:300]
+    finally:
+        toollog.emit('rcsim', 'perf' if ok else 'error', 'sim.release', ok=ok,
+                     duration_ms=(time.perf_counter() - started) * 1000,
+                     ids={'sessionId': row['id']}, props={'platform': row['platform'],
+                     'billedMinutes': max(0, min(now(), row['expires_at'] or now()) - row['created_at']) / 60, 'status': 'elapsed-estimate'},
+                     error_tag=None if ok else tag or 'sim.release.failed')
 
 
 def cmd_release(a) -> None:
@@ -579,7 +643,16 @@ def cmd_release(a) -> None:
             # unregistered id: try both platforms
             sid = a.ids[i]
             for plat in PLATFORMS:
-                code, *_ = rc([plat, "delete", sid, "--json"])
+                started = time.perf_counter()
+                code, data = 1, None
+                tag = 'sim.release.start_failed'
+                try:
+                    code, data, *_ = rc([plat, "delete", sid, "--json"])
+                    tag = None if code == 0 else log_error_tag(code, data)
+                finally:
+                    toollog.emit('rcsim', 'perf' if code == 0 else 'error', 'sim.release', ok=code == 0,
+                                 duration_ms=(time.perf_counter() - started) * 1000,
+                                 ids={'sessionId': sid}, props={'platform': plat}, error_tag=tag)
                 if code == 0:
                     print(f"{sid}: released (unregistered {plat})")
                     break

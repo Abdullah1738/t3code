@@ -7,6 +7,7 @@ then install.
 
 | Source | Installed as | Used by |
 | --- | --- | --- |
+| `libexec/toollog/` | `~/.local/libexec/toollog/` | `toollog`, native harness hooks, homes, canaries and rcsim |
 | `libexec/mail/` | `~/.local/libexec/mail/` | `himalaya-heal`, `mailsearch`, otp watchers, message-archive (`MAIL_LIBEXEC`) |
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
 | `libexec/qcard/` | `~/.local/libexec/qcard/` | `qcard` |
@@ -216,3 +217,10 @@ explicitly bypass shell setup; they need the helper sourced by their caller.
 
 Focused verification:
 `PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s integrations/local-helpers/tests -p test_repo_node_pin.py`.
+
+`toollog read --board agent-tools --kind error --limit 50` reads today's UTC
+NDJSON. Use `--day YYYY-MM-DD` for another day, `--name dotted.name` to filter,
+or another board slug for that board's logs. `toollog rollup --board agent-tools`
+writes `~/.robob/logs/tools/agent-tools/rollup-YYYY-MM-DD.json`.
+The Python logger has one source in `libexec/toollog/`; the other integrations'
+source symlinks are materialized beside their entry points by their installers.

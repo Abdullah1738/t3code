@@ -180,6 +180,7 @@ class SharedMcpTests(unittest.TestCase):
                 root = Path(tmp)
                 shared = root / "shared"
                 shared.mkdir()
+                (root / "toollog.py").write_text((PKG / "toollog.py").read_text())
                 (shared / "check.py").write_text((PKG / "shared/check.py").read_text())
                 (shared / "opencode.py").write_text("SHARED_IDS = ('flighty', 'inbody')\n")
                 (root / "generate_homes.py").write_text(

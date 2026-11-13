@@ -1,3 +1,4 @@
+import { hook as toolLogHook } from "../lib/toollog"
 // offbox gate (worker C, 2026-10-13). Heavy agent compute (test suites,
 // installs, local containers) runs on boat.dev boxes through `offbox run --`.
 // Every shell tool call is classified with remote-compute/heavy-rules.json.
@@ -129,13 +130,19 @@ export function denial(cmd: string, v: any): string {
 export default {
   id: "offbox-gate",
   setup: async (ctx: any) => {
-    try { ensureRules() } catch (e) { log({ event: "rules-load-error", error: String(e) }) }
+    try { ensureRules() } catch {
+      log({ event: "rules-load-error", error: "rules.load_failed" })
+      toolLogHook('offbox-gate', 'allowed', 'rules-load-error', performance.now(), undefined, 'rules.load_failed')
+    }
 
     await ctx.tool.hook("execute.before", async (e: any) => {
+      const started = performance.now()
+      let decision = 'allowed', rule = 'no-policy', command: unknown, errorTag: string | undefined
       try {
         if (!SHELL_TOOLS.has(e.tool)) return
         const input = e.input as any
         const cmd = input?.command
+        command = cmd
         if (typeof cmd !== "string" || !cmd) return
         const m = mode()
         if (m === "off") return
@@ -143,7 +150,8 @@ export default {
         ensureRules()
         const v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null)
         const ms = +(performance.now() - t0).toFixed(3)
-        if (v.error) log({ event: "classify-error", session: e.sessionID, error: v.error })
+        if (v.error) errorTag = "hook.classifier_failed"
+        rule = v.rule ?? "no-policy"
         if (!v.heavy) return
         const ids = [e.sessionID]
         let ex = exempt(ids)
@@ -153,14 +161,18 @@ export default {
         }
         const reason = ex ? "exempt" : !offboxAvailable() ? "no-offbox" : capped() ? "capped" : null
         const deny = m === "enforce" && !reason
+        decision = deny ? "denied" : "allowed"
         log({
           event: deny ? "deny" : "allow", mode: m, session: e.sessionID, rule: v.rule, class: v.class, size: v.size,
           would_deny: !ex, allow_reason: reason, cmd_hash: createHash("sha1").update(cmd).digest("hex").slice(0, 12),
-          cmd: cmd.slice(0, 300), cwd: input.workdir ?? null, ms,
+          ms,
         })
         if (deny) e.input = { ...input, command: denial(cmd, v), background: false }
       } catch (err) {
-        log({ event: "hook-error", session: e?.sessionID, error: String(err) })
+        errorTag = 'hook.error'
+        log({ event: "hook-error", error: 'hook.error' })
+      } finally {
+        if (typeof command === 'string') toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e.sessionID})
       }
     })
 
@@ -179,7 +191,8 @@ export default {
         if (!path.split(":").includes(BLOCKERS)) env.PATH = `${BLOCKERS}:${path}`
         env.OFFBOX_GATE = "1"
       } catch (err) {
-        log({ event: "shell-hook-error", error: String(err) })
+        log({ event: "shell-hook-error", error: 'shell.hook_failed' })
+        toolLogHook('shell', 'allowed', 'shell-hook-error', performance.now(), undefined, 'shell.hook_failed')
       }
     })
 

@@ -32,6 +32,9 @@ import statev2_guard
 import rootwide_search_guard
 
 
+
+import toollog
+
 HOME = Path.home()
 BETTERSTACK_REASON = "Better Stack is restricted to CRPKO work. Open the relevant CRPKO project before using this MCP."
 COORD_REASON = "coord Haiku lane: this changes dev or reads a secret; hand the exact command to your Opus lead, who runs it under a coord claim."
@@ -85,6 +88,21 @@ def _log_enum(value, allowed):
 
 def _log(**record):
     try:
+        rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
+        guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
+                 else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                     "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
+                     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
+                     "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
+                     "gradle", "cargo", "make-test", "forge-test", "anvil"}
+                 else "desktop-lease" if rule.startswith("desktop") else "coord" if rule.startswith("coord") else "shell")
+        harness = record.get("harness")
+        if harness == "codex" and Path(os.environ.get("CODEX_HOME", "")).name == "codex-cu":
+            harness = "codex-cu"
+        decision = "denied" if record.get("decision") == "deny" else "rewritten" if record.get("rewritten") else "allowed"
+        toollog.hook(harness, guard, decision, rule, record.get("ms", 0), record.get("command"),
+                     _log_enum(record.get("error"), _LOG_ERRORS),
+                     ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId")})
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -1244,7 +1262,8 @@ def decide(event, harness):
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
              identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
-             command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
+             sessionId=event.get("session_id") if isinstance(event, dict) else None,
+             command=command, rewritten="updatedInput" in result["context"] or "updatedToolOutput" in result["context"], ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 
 
