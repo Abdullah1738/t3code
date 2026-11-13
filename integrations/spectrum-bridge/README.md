@@ -335,6 +335,18 @@ The operational setup and private credential handling remain in the local
 `imessage-notifications` skill. Use `bun run check` and `bun test` from this
 directory when changing the bridge.
 
+Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Read today's saved rollup with:
+
+```sh
+jq . "$HOME/.robob/logs/tools/imessage/rollup-$(date -u +%F).json"
+```
+
+`total` includes calls represented by turn summaries; `recordedRows` counts disk
+records. Call percentiles merge millisecond histograms, including slow and failed
+calls that also retain individual rows. `byComponent` includes each call name.
+After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the day.
+
 ## Upstream
 
 The main OpenChamber repository remains the `upstream` Git remote. This fork is

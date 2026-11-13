@@ -57,7 +57,7 @@ test("cap suppresses event/perf, retains errors and emits one notice across writ
   log.write(entry); log.write(entry); log.write({ ...entry, kind: "event" });
   createToolLog({ root, now: () => at, capBytes: 1 }).write(entry);
   log.write({ ...entry, kind: "error", name: "reply.failed", ok: false, error: { tag: "stop_opt_out", message: "private" } });
-  expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.cap", "reply.failed"]);
+  expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.degraded", "reply.failed"]);
 });
 
 test("all logging failures, malformed input and optional attribution failures are swallowed", async () => {
@@ -177,6 +177,7 @@ test.each([
   // Older or externally supplied input must pass the same filter when aggregated.
   appendFileSync(join(root, `${day}.ndjson`), JSON.stringify({ ...row, ts: `${day}T12:00:00.000Z`, tool: "imessage" }) + "\n");
   const rollup = await log.rollup(day);
-  expect(rollup?.topErrorTags).toEqual([{ tag: expected, count: 2, sampleId: "msg-fixture" }]);
+  expect(rollup?.topErrorTags).toHaveLength(1);
+  expect(rollup?.topErrorTags[0]).toMatchObject({ tag: expected, count: 2, sampleId: "msg-fixture" });
   expect(JSON.stringify(rollup)).not.toContain("PRIVATE_MESSAGE");
 });

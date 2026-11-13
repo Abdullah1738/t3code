@@ -338,6 +338,73 @@ def _sample_rate(row):
     return rate if row.get('kind') != 'error' and type(rate) is int and 1 <= rate <= 2**53 - 1 else 1
 
 
+_IMESSAGE_CALLS = {
+    ('GET', '/health'): 'health', ('GET', '/projects'): 'projects', ('GET', '/threads'): 'threads',
+    ('POST', '/threads'): 'createThread', ('GET', '/threads/:id'): 'thread', ('PATCH', '/threads/:id'): 'settle',
+    ('GET', '/threads/by-native/:id'): 'byNative', ('GET', '/threads/:id/messages'): 'messages',
+    ('GET', '/threads/:id/runs/:id/evidence'): 'runEvidence', ('POST', '/threads/:id/requests/:id/respond'): 'respond',
+    ('POST', '/attachments'): 'attachment', ('PUT', '/threads/:id/origin'): 'origin',
+    ('POST', '/threads/:id/send'): 'send', ('POST', '/threads/:id/interrupt'): 'interrupt',
+}
+
+
+def _imessage_call_name(row):
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    method, route = props.get('method'), props.get('route')
+    return _IMESSAGE_CALLS.get((method, route)) if isinstance(method, str) and isinstance(route, str) else None
+
+
+def _imessage_call_stats(row):
+    # Same fixed operation names and millisecond histogram format as spectrum-bridge/src/log-calls.ts.
+    if row.get('component') != 'robob' or row.get('name') != 'turn.robob_calls' or row.get('kind') != 'perf':
+        return {}
+    calls = row.get('calls')
+    if not isinstance(calls, dict):
+        return {}
+    result = {}
+    for name, stats in calls.items():
+        if name not in _IMESSAGE_CALLS.values() or not isinstance(stats, dict):
+            continue
+        oks, failures, histogram = stats.get('ok'), stats.get('failed'), stats.get('histogram')
+        if (type(oks) is not int or type(failures) is not int or oks < 0 or failures < 0
+                or not 1 <= oks + failures <= 10_000_000 or not isinstance(histogram, list) or len(histogram) > 100_000):
+            continue
+        values = [(pair[0], pair[1]) for pair in histogram if isinstance(pair, list) and len(pair) == 2
+                  and type(pair[0]) is int and 0 <= pair[0] <= 86_400_000
+                  and type(pair[1]) is int and 1 <= pair[1] <= 10_000_000]
+        if sum(count for _, count in values) == oks + failures:
+            result[name] = (oks, failures, values)
+    return result
+
+
+def _imessage_rollup_records(board, day):
+    def batch(row):
+        identity = row.get('ids')
+        value = identity.get('callBatchId') if isinstance(identity, dict) else None
+        return value if isinstance(value, str) else None
+    represented = set()
+    pending = []
+    for line, raw in _read_records(board, day):
+        row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
+        calls = _imessage_call_stats(row)
+        if calls:
+            for name, (oks, failed, histogram) in calls.items():
+                if batch(row) is not None:
+                    represented.add((batch(row), name))
+                yield line, {'ts': row.get('ts'), 'ids': row.get('ids'), 'component': 'robob', 'kind': 'perf',
+                             'name': 'turn.robob_call', '_rollup_count': oks + failed,
+                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name}
+        elif row.get('name') == 'turn.robob_call' and row.get('kind') == 'perf':
+            pending.append((line, row))
+            yield line, {'_rollup_skip': True}
+        else:
+            yield line, row
+    # Count retained observations only after seeing the summaries in this same read.
+    for line, row in pending:
+        if (batch(row), _imessage_call_name(row)) not in represented:
+            yield line, {**row, '_rollup_deferred': True}
+
+
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
@@ -346,16 +413,24 @@ def rollup(board, day, top_n=20):
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     caps = []
     recorded = 0
+    last_record = None
+    component_stats = {}
     sampled = False
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
-    for line_number, row in _read_records(board, day):
-        recorded += 1
-        weight = _sample_rate(row)
-        sampled |= weight > 1
+    records = _imessage_rollup_records(board, day) if board == 'imessage' else _read_records(board, day)
+    for line_number, row in records:
+        if not (board == 'imessage' and row.get('_rollup_deferred')):
+            recorded += line_number != last_record
+            last_record = line_number
+        if board == 'imessage' and row.get('_rollup_skip'):
+            continue
+        aggregate = board == 'imessage' and '_rollup_count' in row
+        weight = row['_rollup_count'] if aggregate else _sample_rate(row)
+        sampled |= weight > 1 and not aggregate
         total += weight
-        if row.get('name') == 'log.cap':
+        if row.get('name') in {'log.cap', 'log.degraded'}:
             props = row.get('props') or {}
             caps.append({'component': props.get('component', 'all'),
                          'capBytes': props.get('capBytes'), 'ts': row.get('ts')})
@@ -368,14 +443,26 @@ def rollup(board, day, top_n=20):
             threads_by_rule[rule][thread] += weight
             if at is not None and start <= at < start + 86400:
                 attempts[(thread, rule)].append((at, _sample_rate(row)))
-        if type(row.get('ok')) is bool:
-            observed += weight
-            oks += weight * row['ok']
-            failed += weight * (not row['ok'])
+        row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
+        row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
+        observed += row_ok + row_failed
+        oks += row_ok
+        failed += row_failed
         errors += weight * (kind == 'error')
         duration = row.get('durationMs')
-        if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-            durations[name].append((duration, weight))
+        values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
+            if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
+        if values:
+            durations[name].extend(values)
+        if board == 'imessage':
+            component = row.get('component', 'unknown')
+            call = row.get('_rollup_call') if aggregate else _imessage_call_name(row)
+            for label in [name] + ([call] if name == 'turn.robob_call' and call else []):
+                stats = component_stats.setdefault((component, label), {'count': 0, 'ok': 0, 'failed': 0, 'histogram': []})
+                stats['count'] += weight
+                stats['ok'] += row_ok
+                stats['failed'] += row_failed
+                stats['histogram'].extend(values)
         if board == 'orders':
             merchant = (row.get('props') or {}).get('merchant')
             if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
@@ -452,6 +539,14 @@ def rollup(board, day, top_n=20):
                 for merchant, values in sorted(order_polls.items())}
         result['topErrors'] = sorted(order_errors.values(), key=lambda x: (
             -x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20]
+    if board == 'imessage':
+        result['byComponent'] = {}
+        result['durationMs'] = result['durationMsByName']
+        for (component, name), stats in component_stats.items():
+            result['byComponent'].setdefault(component, {})[name] = {
+                'count': stats['count'], 'ok': stats['ok'], 'failed': stats['failed'],
+                'errorRate': stats['failed'] / stats['count'] if stats['count'] else 0,
+                **({'durationMs': percentiles(stats['histogram'])} if stats['histogram'] else {})}
     return result
 
 

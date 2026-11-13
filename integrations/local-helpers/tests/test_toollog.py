@@ -16,6 +16,66 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        raw = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False, 'durationMs': 1001,
+               'ids': {'callBatchId': 'batch-fixture'}, 'props': {'method': 'GET', 'route': '/threads/:id'}}
+        summary = {**raw, 'name': 'turn.robob_calls', 'calls': {'thread': {
+            'ok': 2, 'failed': 1, 'histogram': [[10, 1], [20, 1], [1001, 1]]}}}
+        path.write_text(json.dumps(raw) + '\n')
+        original = toollog._read_records
+        reads = 0
+        def append_after_read(board, day):
+            nonlocal reads
+            yield from original(board, day)
+            if day == self.day:
+                reads += 1
+                if reads == 1:
+                    with path.open('a') as dest:
+                        dest.write(json.dumps(summary) + '\n')
+        with patch.object(toollog, '_read_records', append_after_read):
+            first = toollog.rollup('imessage', self.day)
+        self.assertEqual((first['total'], first['failedCount']), (1, 1))
+        second = toollog.rollup('imessage', self.day)
+        self.assertEqual((second['total'], second['failedCount']), (3, 1))
+
+    def test_imessage_aggregate_counts_and_percentiles_without_duplicate_slow_rows(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        stats = {'count': 3, 'ok': 2, 'failed': 1, 'p50': 10, 'p95': 1002, 'max': 1002,
+                 'histogram': [[10, 2], [1002, 1]]}
+        call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
+                'props': {'method': 'GET', 'route': '/threads/:id'}}
+        rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
+                {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
+                {'component': 'router', 'kind': 'perf', 'name': 'turn.end', 'ok': True}]
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
+        self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['byComponent']['robob']['thread'], {
+            'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})
+
+    def test_imessage_aggregate_rejects_private_names_and_invalid_histograms(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        for histogram, expected in [([[5, 1], [971501234567, 1]], 5), ([[5, 2]], None), ([[5, -1]], None)]:
+            stats = {'ok': 1, 'failed': 0, 'histogram': histogram, 'p50': 'PRIVATE_BODY'}
+            row = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                   'calls': {'PRIVATE_TOKEN': stats, 'thread': stats}}
+            (directory / (self.day + '.ndjson')).write_text(json.dumps(row) + '\n')
+            result = toollog.rollup('imessage', self.day)
+            self.assertNotIn('PRIVATE', json.dumps(result))
+            self.assertNotIn('971501234567', json.dumps(result))
+            if expected:
+                self.assertEqual(result['byComponent']['robob']['thread']['durationMs']['p95'], expected)
+            else:
+                self.assertNotIn('thread', result['byComponent']['robob'])
+
     def test_missing_override_uses_private_temp_root(self):
         with patch.dict(os.environ):
             os.environ.pop('TOOLLOG_ROOT', None)

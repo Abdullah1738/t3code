@@ -709,6 +709,11 @@ export class Router {
     const quiet = options.quietMs ?? (options.context ? SENDBLUE_QUIET_MS : 15_000);
     if (!Number.isSafeInteger(quiet) || quiet < 0) throw new Error("Invalid quiet period");
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
+    toolLog.capture(() => {
+      const restored = this.store.get<Turn | null>("activeTurn");
+      // A persisted running turn can poll without passing through setTurn again.
+      if (restored && restored.phase !== "failed" && this.current(restored)) this.logTurnStart(restored);
+    });
   }
 
   tick(): Promise<void> {
@@ -4516,6 +4521,7 @@ export class Router {
 
   private logTurnStart(turn: Turn): void {
     toolLog.capture(() => {
+      toolLog.beginRun(turn.id, turn.messageId);
       if (this.store.get(`log-turn-start:${turn.messageId}`)) return;
       this.store.set(`log-turn-start:${turn.messageId}`, true);
       const inbound = turn.inboundId ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(turn.inboundId) : undefined;
