@@ -74,6 +74,7 @@ export type ShellApplicationEvent =
   | {
       readonly sequence: number;
       readonly event: Pick<OrchestrationV2StoredEvent["event"], "threadId">;
+      readonly redactionSequence?: number;
     };
 
 /** Shell updates refetch an aggregate; drop transcript bodies before retaining an event. */
@@ -85,7 +86,13 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
         type: stored.type,
         sequence: stored.sequence,
       }
-    : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
+    : {
+        sequence: stored.sequence,
+        event: { threadId: stored.event.threadId },
+        ...(stored.event.type === "thread.item-redacted"
+          ? { redactionSequence: stored.sequence }
+          : {}),
+      };
 }
 
 /**
@@ -97,6 +104,7 @@ export function shellChangeEvents(changes: {
   readonly threads: ReadonlyArray<{
     readonly threadId: OrchestrationV2StoredEvent["event"]["threadId"];
     readonly sequence: number;
+    readonly redactionSequence?: number;
   }>;
   readonly projects: ReadonlyArray<{
     readonly projectId: Extract<
@@ -111,6 +119,9 @@ export function shellChangeEvents(changes: {
     ...changes.threads.map((thread) => ({
       sequence: thread.sequence,
       event: { threadId: thread.threadId },
+      ...(thread.redactionSequence === undefined
+        ? {}
+        : { redactionSequence: thread.redactionSequence }),
     })),
     ...changes.projects.map((project) => ({
       aggregateKind: "project" as const,
@@ -131,7 +142,19 @@ export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
       "aggregateKind" in stored
         ? `project:${stored.aggregateId}`
         : `thread:${stored.event.threadId}`;
-    latestByAggregate.set(key, stored);
+    const previous = latestByAggregate.get(key);
+    latestByAggregate.set(
+      key,
+      "event" in stored &&
+        previous &&
+        "event" in previous &&
+        previous.redactionSequence !== undefined
+        ? {
+            ...stored,
+            redactionSequence: Math.max(stored.redactionSequence ?? 0, previous.redactionSequence),
+          }
+        : stored,
+    );
   }
   return Array.from(latestByAggregate.values()).sort(
     (left, right) => left.sequence - right.sequence,
@@ -275,7 +298,7 @@ export function skipUnchangedThreadShells<A extends OrchestrationV2ShellStreamIt
             lastSent.delete(item.threadId);
             return true;
           }
-          if (item.kind !== "thread.updated") return true;
+          if (item.kind !== "thread.updated" || item.redactionSequence !== undefined) return true;
           const previous = lastSent.get(item.thread.id);
           if (
             previous !== undefined &&
@@ -316,6 +339,9 @@ export function shellStreamItemFromThreadShell(input: {
       return {
         kind: "thread.removed",
         sequence: input.stored.sequence,
+        ...(input.stored.redactionSequence === undefined
+          ? {}
+          : { redactionSequence: input.stored.redactionSequence }),
         location: "active",
         threadId: input.shell.id,
       };
@@ -323,6 +349,9 @@ export function shellStreamItemFromThreadShell(input: {
     return {
       kind: "thread.updated",
       sequence: input.stored.sequence,
+      ...(input.stored.redactionSequence === undefined
+        ? {}
+        : { redactionSequence: input.stored.redactionSequence }),
       location: "active",
       thread: compactShell(input.shell),
     };
@@ -331,6 +360,9 @@ export function shellStreamItemFromThreadShell(input: {
   return {
     kind: "thread.removed",
     sequence: input.stored.sequence,
+    ...(input.stored.redactionSequence === undefined
+      ? {}
+      : { redactionSequence: input.stored.redactionSequence }),
     location: "active",
     threadId: input.stored.event.threadId,
   };

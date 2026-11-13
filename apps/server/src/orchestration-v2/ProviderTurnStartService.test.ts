@@ -6,6 +6,8 @@ import {
   ContextHandoffId,
   CheckpointScopeId,
   EnvironmentId,
+  EventId,
+  type OrchestrationV2StoredEvent,
   ContextTransferId,
   MessageId,
   NodeId,
@@ -36,6 +38,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -324,6 +327,8 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
   readonly nativeDelivery?: boolean;
+  readonly providerDriver?: string;
+  readonly beforeHandoffWrite?: Effect.Effect<void>;
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -356,7 +361,7 @@ function makeLocalCommandHarness(input: {
   };
   const providerThread: OrchestrationV2ThreadProjection["providerThreads"][number] = {
     id: providerThreadId,
-    driver: ProviderDriverKind.make("codex"),
+    driver: ProviderDriverKind.make(input.providerDriver ?? "codex"),
     providerInstanceId: newInstanceId,
     providerSessionId,
     appThreadId: threadId,
@@ -596,6 +601,9 @@ function makeLocalCommandHarness(input: {
   const nativeStartTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(
     () => Effect.void,
   );
+  const nativeInterruptTurn = vi.fn<
+    ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]
+  >(() => Effect.void);
   const injectHistory = vi.fn<
     NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["injectHistory"]>
   >(() => Effect.succeed(true));
@@ -639,6 +647,7 @@ function makeLocalCommandHarness(input: {
                   resumeThread,
                   startTurn: nativeStartTurn,
                   compactThread: nativeStartTurn,
+                  interruptTurn: nativeInterruptTurn,
                   injectHistory,
                 } as never)
               : Effect.die("A local command must not open a native session."),
@@ -749,7 +758,7 @@ function makeLocalCommandHarness(input: {
                 events.push(event);
                 projection = ProjectionStore.applyToProjection(projection, event);
               }
-            }) as never,
+            }).pipe(Effect.andThen(input.beforeHandoffWrite ?? Effect.void)) as never,
         }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
@@ -820,6 +829,7 @@ function makeLocalCommandHarness(input: {
     writeIfProviderThreadUnchanged,
     retryableEnsureThread,
     nativeStartTurn,
+    nativeInterruptTurn,
     injectHistory,
     startRootRun,
     tryHandlePromptCommand,
@@ -863,20 +873,111 @@ const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2St
     runtimePolicy: controls.runtimePolicy,
   });
 
-effectIt.effect("attributes a recovered original queue run only at its actual provider request", () =>
+effectIt.effect.each([
+  "failed",
+  "cancelled",
+  "interrupted",
+  "completed",
+  "replaced_attempt",
+  "live",
+  "missing",
+  "no_identity",
+  "retry_refused",
+] as const)("recovers previous_turn_active only with stale ownership proof: %s", (state) =>
   Effect.gen(function* () {
-    const harness = makeLocalCommandHarness({ text: "Continue queued work", nativeDelivery: true });
-    const run = harness.projection().runs.at(-1)!;
-    expect(run.restartContinuationOfRunId).toBeUndefined();
-    const before = continuationReport().firstResumedProviderRequestAt;
-    markQueuedRunRecovered(run.id);
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
     yield* harness.start;
-    expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
-    expect(harness.nativeStartTurn).not.toHaveBeenCalled();
-    yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
-    expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
-    expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const oldRunId = RunId.make("stale-claude-run");
+    const oldAttempt = RunAttemptId.make("stale-claude-attempt");
+    const staleTurn = ProviderTurnId.make("stale-claude-turn");
+    if (state !== "missing") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...controls.run,
+            id: oldRunId,
+            ordinal: 1,
+            activeAttemptId:
+              state === "replaced_attempt" ? RunAttemptId.make("replacement-attempt") : oldAttempt,
+            status:
+              state === "live" ||
+              state === "replaced_attempt" ||
+              state === "no_identity" ||
+              state === "retry_refused"
+                ? "running"
+                : state,
+          },
+        ],
+      });
+    }
+    const refusal = new ProviderAdapter.ProviderAdapterTurnStartError({
+      driver: controls.session.driver,
+      threadId: controls.run.threadId,
+      providerThreadId: controls.providerThread.id,
+      runId: controls.run.id,
+      cause: new ProviderAdapter.ProviderAdapterProtocolError({
+        driver: controls.session.driver,
+        reason: "previous_turn_active",
+        detail: "still active",
+        ...(state === "no_identity"
+          ? {}
+          : {
+              activeTurn: {
+                runId: oldRunId,
+                attemptId: oldAttempt,
+                providerThreadId: controls.providerThread.id,
+                providerTurnId: staleTurn,
+              },
+            }),
+      }),
+    });
+    harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    if (state === "retry_refused") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: projection.runs.map((run) =>
+          run.id === oldRunId ? { ...run, status: "failed" } : run,
+        ),
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    }
+    const outcome = yield* startPreparedTurn(controls).pipe(Effect.result);
+    const healed = !["live", "missing", "no_identity"].includes(state);
+    expect(harness.nativeInterruptTurn).toHaveBeenCalledTimes(healed ? 1 : 0);
+    expect(harness.nativeStartTurn).toHaveBeenCalledTimes(healed ? 2 : 1);
+    expect(outcome._tag).toBe(healed && state !== "retry_refused" ? "Success" : "Failure");
+    if (healed)
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledWith({
+        providerThread: controls.providerThread,
+        providerTurnId: staleTurn,
+      });
   }),
+);
+
+effectIt.effect(
+  "attributes a recovered original queue run only at its actual provider request",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue queued work",
+        nativeDelivery: true,
+      });
+      const run = harness.projection().runs.at(-1)!;
+      expect(run.restartContinuationOfRunId).toBeUndefined();
+      const before = continuationReport().firstResumedProviderRequestAt;
+      markQueuedRunRecovered(run.id);
+      yield* harness.start;
+      expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
+      expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+      expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+    }),
 );
 
 effectIt.effect(
@@ -2278,4 +2379,426 @@ effectIt.effect("fails an automatic recovery instead of replacing its native ses
       "native thread is gone",
     );
   }),
+);
+
+effectIt.effect.each([
+  "allowed",
+  "refused",
+  "settled",
+  "replaced_attempt",
+  "replaced_native",
+  "replaced_instance",
+  "replaced_driver",
+  "missing_provider",
+  "missing_run",
+] as const)("validates recovery admission against a coherent %s snapshot", (state) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const expected = controls.providerThread;
+    const before = harness.projection();
+    harness.setProjection({
+      ...before,
+      runs:
+        state === "missing_run"
+          ? []
+          : before.runs.map((run) => ({
+              ...run,
+              ...(state === "settled" ? { status: "failed" as const } : {}),
+              ...(state === "replaced_attempt"
+                ? { activeAttemptId: RunAttemptId.make("other-attempt") }
+                : {}),
+            })),
+      providerThreads:
+        state === "missing_provider"
+          ? []
+          : before.providerThreads.map((row) => ({
+              ...row,
+              nativeMetadata: { ...row.nativeMetadata, claudeRefusalObserved: state === "refused" },
+              ...(state === "replaced_native"
+                ? {
+                    nativeThreadRef: {
+                      driver: row.driver,
+                      nativeId: "another-native-thread",
+                      strength: "strong" as const,
+                    },
+                  }
+                : {}),
+              ...(state === "replaced_instance"
+                ? { providerInstanceId: ProviderInstanceId.make("another-instance") }
+                : {}),
+              ...(state === "replaced_driver"
+                ? { driver: ProviderDriverKind.make("other-driver") }
+                : {}),
+            })),
+    });
+    const admission = yield* controls.loadRecoveryAdmission!(expected);
+    expect(admission).toEqual({
+      current: state === "allowed" || state === "refused",
+      refused: state === "refused",
+    });
+  }),
+);
+
+effectIt.effect("fails recovery admission when its projection snapshot cannot be read", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    harness.getThreadRecords.mockImplementation(() =>
+      Effect.fail(
+        new ProjectionStore.ProjectionStoreReadError({
+          threadId: controls.run.threadId,
+          cause: "unavailable",
+        }),
+      ),
+    );
+    const error = yield* Effect.flip(controls.loadRecoveryAdmission!(controls.providerThread));
+    expect(error._tag).toBe("ProjectionStoreReadError");
+  }),
+);
+
+effectIt.effect.each(
+  (["relay", "model_access", "transient", "restart"] as const).flatMap((kind) =>
+    [false, true].flatMap((refused) =>
+      ["handoff", "stale_stop"].flatMap((stage) =>
+        ["before", "during"].map((timing) => ({
+          kind,
+          refused,
+          stage,
+          timing,
+        })),
+      ),
+    ),
+  ),
+)(
+  "excludes refusal at the native offer after $stage: $kind/$refused/$timing",
+  ({ kind, refused, stage, timing }) =>
+    Effect.gen(function* () {
+      const handoffEntered = yield* Deferred.make<void>();
+      const handoffReleased = yield* Deferred.make<void>();
+      const harness = makeLocalCommandHarness({
+        text: "[Watcher event from review] Please relay: task is ready",
+        nativeDelivery: true,
+        resumeSuccess: true,
+        providerDriver: "claudeAgent",
+        ...(stage === "handoff"
+          ? {
+              beforeHandoffWrite: Deferred.succeed(handoffEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(handoffReleased)),
+              ),
+            }
+          : {}),
+      });
+      const before = harness.projection();
+      const sourceRun = before.runs.at(-1)!;
+      const target = before.providerThreads.at(-1)!;
+      const priorId = RunId.make("restart-source");
+      const priorAttempt = RunAttemptId.make("restart-source-attempt");
+      const alreadyRefused = timing === "before" && refused;
+      const recovery =
+        kind === "restart"
+          ? { restartContinuationOfRunId: priorId }
+          : kind === "transient"
+            ? {
+                transientRecovery: {
+                  firstError: {
+                    class: "provider_error" as const,
+                    category: "transient" as const,
+                    code: "api_error_502",
+                    retryable: true,
+                    message: "502",
+                  },
+                  since: "2026-11-13T00:00:00Z",
+                },
+              }
+            : {
+                launchRecovery: {
+                  kind,
+                  replayAllowed: true,
+                  retriesOnModel: 1,
+                  attempt: 1,
+                  delayMs: 30000,
+                  since: "2026-11-13T00:00:00Z",
+                },
+              };
+      harness.setProjection({
+        ...before,
+        ...(kind === "restart"
+          ? {
+              thread: {
+                ...before.thread,
+                lineage: {
+                  ...before.thread.lineage,
+                  parentThreadId: ThreadId.make("restart-parent"),
+                  rootThreadId: ThreadId.make("restart-parent"),
+                  relationshipToParent: "subagent" as const,
+                },
+              },
+              providerTurns: [
+                {
+                  id: ProviderTurnId.make("restart-source-native-turn"),
+                  providerThreadId: target.id,
+                  runAttemptId: priorAttempt,
+                  nodeId: sourceRun.rootNodeId!,
+                  nativeTurnRef: null,
+                  ordinal: 1,
+                  status: "cancelled" as const,
+                  startedAt: sourceRun.requestedAt,
+                  completedAt: sourceRun.requestedAt,
+                },
+              ],
+            }
+          : {}),
+        runs: [
+          ...(kind === "restart"
+            ? [
+                {
+                  ...sourceRun,
+                  id: priorId,
+                  ordinal: 1,
+                  activeAttemptId: priorAttempt,
+                  status: "cancelled" as const,
+                  completedAt: sourceRun.requestedAt,
+                },
+              ]
+            : []),
+          ...before.runs.map((run) => ({
+            ...run,
+            ...recovery,
+            ...(kind === "restart" ? { delegatedTaskId: NodeId.make("restart-task") } : {}),
+            modelSelection: { instanceId: run.providerInstanceId, model: "claude-haiku-5-5" },
+          })),
+        ],
+        attempts: before.attempts.map((attempt) => ({
+          ...attempt,
+          reason: "retry",
+          attemptOrdinal: 2,
+        })),
+        providerThreads: before.providerThreads.map((row) => ({
+          ...row,
+          nativeThreadRef: {
+            driver: row.driver,
+            nativeId: "review-r10-native",
+            strength: "strong",
+          },
+          nativeMetadata: { claudeRefusalObserved: alreadyRefused },
+        })),
+        contextHandoffs: [
+          {
+            id: ContextHandoffId.make(`handoff:review-r10-${kind}-${refused}`),
+            threadId: sourceRun.threadId,
+            targetRunId: sourceRun.id,
+            fromProviderThreadIds: [],
+            toProviderThreadId: target.id,
+            coveredRunOrdinals: { from: 1, to: 1 },
+            strategy: "full_thread_summary",
+            status: "ready",
+            summaryMessageId: null,
+            summaryText: "Earlier task context",
+            createdByProviderInstanceId: null,
+            createdAt: sourceRun.requestedAt,
+            updatedAt: sourceRun.requestedAt,
+          },
+        ],
+      });
+      const localMarkerIngested = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const source = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+      let nativeStarts = 0;
+      let markerIngestions = 0;
+      let closes = 0;
+      const openNative = harness.open.getMockImplementation()!;
+      harness.open.mockImplementation((...args) =>
+        openNative(...args).pipe(
+          Effect.map((runtime) => {
+            // Claude has no native history injection method; its handoff is delivered inline.
+            const { injectHistory: _injectHistory, ...inlineRuntime } = runtime;
+            return inlineRuntime;
+          }),
+        ),
+      );
+      harness.nativeStartTurn.mockImplementation((turnInput) =>
+        Effect.sync(() => {
+          nativeStarts++;
+        }).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: turnInput.providerThread.driver,
+                threadId: turnInput.threadId,
+                providerThreadId: turnInput.providerThread.id,
+                runId: turnInput.runId,
+                cause: "Native boundary reached; end isolated startup without running native work.",
+              }),
+            ),
+          ),
+        ),
+      );
+      yield* harness.start;
+      if (alreadyRefused) {
+        yield* Queue.end(source);
+        expect(harness.open).not.toHaveBeenCalled();
+        expect(harness.startRootRun).not.toHaveBeenCalled();
+        expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+        expect(harness.projection().runs.find((run) => run.id === sourceRun.id)?.status).toBe(
+          "failed",
+        );
+        return;
+      }
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      if (stage === "stale_stop") {
+        const staleRunId = RunId.make("recovery-stale-run");
+        const staleAttemptId = RunAttemptId.make("recovery-stale-attempt");
+        const current = harness.projection();
+        harness.setProjection({
+          ...current,
+          runs: [
+            ...current.runs,
+            {
+              ...controls.run,
+              id: staleRunId,
+              activeAttemptId: staleAttemptId,
+              status: "failed",
+              ordinal: 1,
+            },
+          ],
+        });
+        harness.nativeStartTurn.mockImplementationOnce((turnInput) =>
+          Effect.fail(
+            new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: turnInput.providerThread.driver,
+              threadId: turnInput.threadId,
+              providerThreadId: turnInput.providerThread.id,
+              runId: turnInput.runId,
+              cause: new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: turnInput.providerThread.driver,
+                reason: "previous_turn_active",
+                detail: "stale turn",
+                activeTurn: {
+                  runId: staleRunId,
+                  attemptId: staleAttemptId,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: ProviderTurnId.make("stale-turn"),
+                },
+              }),
+            }),
+          ),
+        );
+        harness.nativeInterruptTurn.mockImplementation(() =>
+          Deferred.succeed(handoffEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(handoffReleased)),
+            Effect.asVoid,
+          ),
+        );
+      }
+      const execution = Effect.gen(function* () {
+        const service = yield* RunExecutionService.RunExecutionServiceV2;
+        yield* service.startRootRun({
+          ...controls,
+          session: {
+            ...controls.session,
+            events: Stream.fromQueue(source),
+            subscribeEvents: Effect.succeed({
+              events: Stream.fromQueue(source),
+              close: Effect.sync(() => {
+                closes++;
+              }).pipe(Effect.andThen(Deferred.succeed(closed, undefined)), Effect.asVoid),
+            }),
+          },
+        });
+      }).pipe(
+        Effect.provide(
+          RunExecutionService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                McpAppModelContext.layerEmpty,
+                PreviewAgentActivity.layer,
+                IdAllocator.layer,
+                ServerSettings.layerTest(),
+                Layer.mock(CheckpointService.CheckpointServiceV2)({
+                  captureBaseline: () => Effect.void,
+                }),
+                Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                  allocate: () => Effect.succeed(1),
+                }),
+                Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+                  ingestNormalized: ({ event }) =>
+                    Effect.gen(function* () {
+                      if (event.type !== "provider_thread.updated") return [];
+                      markerIngestions++;
+                      if (markerIngestions === 2)
+                        yield* Deferred.succeed(localMarkerIngested, undefined);
+                      return [
+                        {
+                          sequence: markerIngestions,
+                          commandId: null,
+                          event: {
+                            id: EventId.make(`review-r10-marker-${markerIngestions}`),
+                            type: "provider-thread.updated",
+                            threadId: sourceRun.threadId,
+                            driver: event.providerThread.driver,
+                            providerInstanceId: event.providerThread.providerInstanceId,
+                            occurredAt: yield* DateTime.now,
+                            payload: event.providerThread,
+                          },
+                        },
+                      ] satisfies ReadonlyArray<OrchestrationV2StoredEvent>;
+                    }),
+                }),
+                Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent: harness.writeIfRunCurrent }),
+              ),
+            ),
+          ),
+        ),
+      );
+      if (alreadyRefused) yield* Deferred.succeed(handoffReleased, undefined);
+      const startup = yield* execution.pipe(Effect.forkScoped);
+      if (!alreadyRefused) {
+        yield* Deferred.await(handoffEntered);
+        const current = harness.projection();
+        const marked = {
+          ...current.providerThreads.at(-1)!,
+          nativeMetadata: { claudeRefusalObserved: refused },
+        };
+        harness.setProjection({
+          ...current,
+          providerThreads: current.providerThreads.map((row) =>
+            row.id === marked.id ? marked : row,
+          ),
+        });
+        yield* Queue.offer(source, {
+          type: "provider_thread.updated",
+          driver: marked.driver,
+          providerThread: marked,
+        });
+        yield* Queue.offer(source, {
+          type: "provider_thread.updated",
+          driver: marked.driver,
+          providerThread: marked,
+        });
+        yield* Deferred.await(localMarkerIngested);
+        yield* Deferred.succeed(handoffReleased, undefined);
+      }
+      yield* Fiber.join(startup);
+      yield* Queue.end(source);
+      yield* Deferred.await(closed);
+      expect(closes).toBe(1);
+      expect(
+        nativeStarts,
+        "a native refusal before the next offer must exclude automatic startup",
+      ).toBe(refused ? 0 : 1);
+      expect(harness.nativeStartTurn).toHaveBeenCalledTimes(
+        alreadyRefused ? 0 : stage === "stale_stop" ? (refused ? 1 : 2) : refused ? 0 : 1,
+      );
+      for (const [offered] of harness.nativeStartTurn.mock.calls) {
+        expect(offered.automaticRecovery).toBe(true);
+      }
+      expect(harness.projection().runs.find((run) => run.id === sourceRun.id)?.status).toBe(
+        "failed",
+      );
+      if (refused)
+        expect(harness.projection().contextHandoffs.at(-1)?.delivery?.status).not.toBe("pending");
+    }),
 );

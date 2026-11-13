@@ -53,6 +53,12 @@ npm config -g set update-notifier false fund false audit false
 GO=1.26.9
 curl -fsSL "https://go.dev/dl/go$GO.linux-amd64.tar.gz" | tar -xz -C /usr/local
 ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+# Stamp the tree the way the client's Go repair does (offbox_lib/runs.py GO_REPAIR, "_offbox_inventory").
+# Without the stamp every new box re-downloads the 75 MB archive before its first command (13 Nov 2026:
+# 29 boxes doing that at once filled the server's link and runs sat in setup for 15 minutes).
+(cd /usr/local/go && printf 'offbox-go-tree-v1 %s %s\n' "$(head -n 1 VERSION)" \
+  "$(LC_ALL=C find . ! -type d ! -path './.offbox-manifest' -printf '%P\t%y\t%s\t%l\0' | LC_ALL=C sort -z | sha256sum)" \
+  > .offbox-manifest)
 curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
 sudo -u user bash -c 'curl -fsSL https://bun.sh/install | bash' >/dev/null
 ln -sf /home/user/.bun/bin/bun /usr/local/bin/bun

@@ -24,6 +24,8 @@ def session_start():
 
 def response(event, result):
     kind = event.get("hook_event_name")
+    if kind == "PostToolUse" and "updatedToolOutput" in result["context"]:
+        return {"hookSpecificOutput": {"hookEventName": kind, "updatedToolOutput": result["context"]["updatedToolOutput"]}}
     if kind != "PreToolUse" or (result["decision"] != "deny" and "updatedInput" not in result["context"]):
         return None
     specific = {"hookEventName": kind}
@@ -51,6 +53,9 @@ def main():
             except OSError:
                 engine.log_event_error("claude", "SessionStart", "session-export-error", "session-export-error")
                 return
+        # The desktop-specific registration already masks and ends its lease.
+        if sys.argv[1:] == ["--card-mask"] and engine.desktop_lease.matches(event.get("tool_name")):
+            return
         result = engine.decide(event, "claude")
         output = response(event, result)
         if output is not None:

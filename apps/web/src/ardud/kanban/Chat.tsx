@@ -74,6 +74,7 @@ import {
   runAction,
   useFeed,
   useKanbanPermission,
+  useKanbanPermissionStatus,
   useMessages,
 } from "./kanbanStore";
 import { KanbanMarkdown } from "./links";
@@ -94,7 +95,7 @@ export function Chat(props: {
 }) {
   const { boardId, discussion, state } = props;
   const messages = useMessages(boardId, discussion.id);
-  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
+  const postPermission = useKanbanPermissionStatus(KANBAN_WS_METHODS.messagePost);
   const feed = useFeed(kanban.messages(boardId, discussion.id));
   const nowMs = useNowMs();
   const presence = discussionPresence(discussion, messages ?? [], nowMs);
@@ -163,7 +164,7 @@ export function Chat(props: {
       <Composer
         placeholder="Message"
         attachments
-        blockedReason={canPost ? null : "Your connection can't post here"}
+        blockedReason={postPermission === "denied" ? "Your connection can't post here" : null}
         onSend={(blocks) => kanban.post(boardId, discussion.id, blocks)}
       />
     </div>

@@ -903,5 +903,6 @@ export function createEnvironmentRpcCommand<
     ...command,
     requiredScopes: permissions.requiredScopes,
     permissionAtom: permissions.permissionAtom,
+    permissionStatusAtom: permissions.permissionStatusAtom,
   };
 }

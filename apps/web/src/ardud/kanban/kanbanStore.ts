@@ -1,6 +1,6 @@
 import { paintActionValue } from "@t3tools/client-runtime/ardud/kanban";
 import { useAtomValue } from "@effect/atom-react";
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -132,6 +132,11 @@ export function useBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow>
  */
 export function useKanbanPermission(tag: KanbanRequestTag): boolean {
   return useAtomValue(kanban.permission(tag));
+}
+
+export function useKanbanPermissionStatus(tag: KanbanRequestTag) {
+  const status = useMemo(() => kanban.permissionStatus(tag), [tag]);
+  return useAtomValue(status);
 }
 
 export function useScripts(boardId: string): ReadonlyArray<KanbanScript> | undefined {

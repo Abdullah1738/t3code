@@ -26,6 +26,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as RestartPacingTestkit from "../ardud/restart-pacing/RestartPacing.testkit.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -113,6 +114,7 @@ function layerExecutorFor(input: {
       ProviderSessionManager.ProviderSessionManagerV2,
       ProviderSessionManager.ProviderSessionManagerV2.of({
         shutdown: Effect.void,
+        sweepOrphanedThreads: () => Effect.void,
         observeThreadSessionUpdates: () => Effect.void,
         refreshThreadSessionUpdates: () => Effect.void,
         open: () => Effect.die("unused open"),
@@ -169,6 +171,7 @@ function layerExecutorFor(input: {
         layerDependencies,
         Layer.mock(EventSink.EventSinkV2)({}),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+        RestartPacingTestkit.layer,
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(

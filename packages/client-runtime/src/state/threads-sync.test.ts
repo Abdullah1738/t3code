@@ -7,6 +7,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  RunId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2ProviderSession,
@@ -2821,3 +2822,194 @@ describe("EnvironmentThreads", () => {
     }),
   );
 });
+
+it.effect("a redaction drops persisted and queued snapshots before loading clean data", () =>
+  Effect.gen(function* () {
+    const dirty = {
+      ...BASE_PROJECTION,
+      thread: { ...BASE_PROJECTION.thread, title: "eyJFAKE.cached-copy" },
+    };
+    const clean = { ...BASE_PROJECTION, thread: { ...BASE_PROJECTION.thread, title: "redacted" } };
+    const h = yield* makeHarness({
+      cached: dirty,
+      httpSnapshot: { _tag: "present", snapshot: { snapshotSequence: 10, projection: clean } },
+    });
+    yield* Queue.offer(h.inputs, {
+      kind: "event",
+      sequence: 8,
+      event: {
+        id: EventId.make("redaction-test"),
+        type: "thread.item-redacted",
+        threadId: THREAD_ID,
+        occurredAt: DateTime.makeUnsafe("2026-01-01T00:00:00Z"),
+        payload: { itemId: "fixture", reason: "fixture", at: "2026-01-01T00:00:00Z" },
+      },
+    });
+    yield* awaitThreadState(
+      h.observed,
+      (value) => Option.isSome(value.data) && value.data.value.thread.title === "redacted",
+    );
+    expect(yield* Ref.get(h.removedThreads)).toContain(THREAD_ID);
+    yield* TestClock.adjust("500 millis");
+    expect(JSON.stringify(yield* Ref.get(h.savedThreads)).includes("eyJFAKE.cached-copy")).toBe(
+      false,
+    );
+  }).pipe(Effect.scoped),
+);
+
+const redactionFixture = {
+  kind: "event",
+  sequence: 8,
+  event: {
+    id: EventId.make("redaction-recovery-test"),
+    type: "thread.item-redacted",
+    threadId: THREAD_ID,
+    occurredAt: DateTime.makeUnsafe("2026-01-01T00:00:00Z"),
+    payload: { itemId: "fixture", reason: "fixture", at: "2026-01-01T00:00:00Z" },
+  },
+} satisfies OrchestrationV2ThreadStreamItem;
+
+it.effect.each(["unavailable", "missing", "denied"] as const)(
+  "redaction recovery handles HTTP %s without reusing old data",
+  (outcome) =>
+    Effect.gen(function* () {
+      const dirty = {
+        ...BASE_PROJECTION,
+        thread: { ...BASE_PROJECTION.thread, title: "eyJFAKE.cached-copy" },
+      };
+      const clean = { ...BASE_PROJECTION, thread: { ...BASE_PROJECTION.thread, title: "clean" } };
+      const h = yield* makeHarness({
+        cached: dirty,
+        httpSnapshots: (call) =>
+          outcome === "missing" && call > 1
+            ? { _tag: "present", snapshot: { snapshotSequence: 10, projection: clean } }
+            : { _tag: outcome },
+      });
+      yield* Queue.take(h.subscriptions);
+      yield* Queue.offer(h.inputs, redactionFixture);
+      if (outcome === "denied") {
+        yield* awaitThreadState(h.observed, (value) => value.status === "no-access");
+        yield* awaitThreadState(h.observed, (value) => value.status === "no-access");
+        expect(yield* Ref.get(h.loaderCalls)).toBe(2);
+        expect(Option.isNone((yield* Ref.get(h.latest)).data)).toBe(true);
+      } else {
+        const resumed = yield* Queue.take(h.subscriptions);
+        if (outcome === "unavailable") {
+          expect(resumed.afterSequence).toBeUndefined();
+          yield* Queue.offer(h.inputs, snapshot(dirty, 7));
+          yield* Queue.offer(h.inputs, snapshot(clean, 10));
+        }
+        yield* awaitThreadState(
+          h.observed,
+          (value) => Option.isSome(value.data) && value.data.value.thread.title === "clean",
+        );
+        expect(yield* Ref.get(h.loaderCalls)).toBe(2);
+      }
+      expect(yield* Ref.get(h.removedThreads)).toContain(THREAD_ID);
+      yield* TestClock.adjust("500 millis");
+      expect(JSON.stringify(yield* Ref.get(h.savedThreads)).includes("eyJFAKE.cached-copy")).toBe(
+        false,
+      );
+    }).pipe(Effect.scoped),
+);
+
+it.effect("redaction refetch preserves bounded pagination in memory and disk", () =>
+  Effect.gen(function* () {
+    const clean = { ...BASE_PROJECTION, thread: { ...BASE_PROJECTION.thread, title: "clean" } };
+    const history = {
+      historyCursor: "fixture-cursor",
+      hasMoreHistory: true,
+      latestLocalTurnOrdinal: 14,
+    };
+    const h = yield* makeHarness({
+      cached: BASE_PROJECTION,
+      httpSnapshot: {
+        _tag: "present",
+        snapshot: { snapshotSequence: 10, projection: clean },
+        history,
+      },
+    });
+    yield* Queue.take(h.subscriptions);
+    yield* Queue.offer(h.inputs, redactionFixture);
+    const current = yield* awaitThreadState(
+      h.observed,
+      (value) => Option.isSome(value.data) && value.data.value.thread.title === "clean",
+    );
+    expect(current.history).toMatchObject(history);
+    yield* TestClock.adjust("500 millis");
+    const saved = yield* Ref.get(h.savedThreads);
+    expect(saved.at(-1)).toMatchObject(history);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("a fork audit purges persisted inherited source output", () =>
+  Effect.gen(function* () {
+    const source = ThreadId.make("fork-source-thread");
+    const now = DateTime.makeUnsafe("2026-01-01T00:00:00Z");
+    const item = {
+      id: TurnItemId.make("source-tool"),
+      threadId: source,
+      runId: RunId.make("source-run"),
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "completed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "command_execution",
+      input: "fixture",
+      output: "eyJFAKE.INHERITED-CACHE",
+      exitCode: 0,
+    } satisfies OrchestrationV2TurnItem;
+    const dirty: OrchestrationV2ThreadProjection = {
+      ...BASE_PROJECTION,
+      thread: {
+        ...BASE_PROJECTION.thread,
+        forkedFrom: { type: "run", threadId: source, runId: item.runId },
+      },
+      visibleTurnItems: [
+        {
+          position: 0,
+          visibility: "inherited",
+          sourceThreadId: source,
+          sourceItemId: item.id,
+          item,
+        },
+      ],
+    };
+    const clean: OrchestrationV2ThreadProjection = {
+      ...dirty,
+      visibleTurnItems: dirty.visibleTurnItems.map((row) => ({
+        ...row,
+        item: { ...item, output: "[redacted fixture]" },
+      })),
+    };
+    const h = yield* makeHarness({
+      cached: dirty,
+      httpSnapshot: { _tag: "present", snapshot: { snapshotSequence: 10, projection: clean } },
+    });
+    yield* Queue.offer(h.inputs, {
+      ...redactionFixture,
+      event: {
+        ...redactionFixture.event,
+        payload: { ...redactionFixture.event.payload, itemId: item.id },
+      },
+    });
+    yield* awaitThreadState(
+      h.observed,
+      (value) =>
+        Option.isSome(value.data) &&
+        JSON.stringify(value.data.value.visibleTurnItems).includes("[redacted fixture]"),
+    );
+    expect(yield* Ref.get(h.removedThreads)).toContain(THREAD_ID);
+    yield* TestClock.adjust("500 millis");
+    expect(JSON.stringify(yield* Ref.get(h.savedThreads)).includes("eyJFAKE.INHERITED-CACHE")).toBe(
+      false,
+    );
+  }).pipe(Effect.scoped),
+);

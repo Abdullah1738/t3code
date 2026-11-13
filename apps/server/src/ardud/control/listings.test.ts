@@ -1,3 +1,4 @@
+import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 /**
  * `/threads?active=true` and `/requests` start from the live and pending ids
  * in the projection tables instead of the whole shell snapshot, and still
@@ -293,6 +294,7 @@ const makeHarness = (
         ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
+    const diagnostics = yield* Effect.serviceOption(DatabaseDiagnostics.DatabaseDiagnostics);
     const web = yield* Effect.acquireRelease(
       Effect.sync(() =>
         HttpRouter.toWebHandler(
@@ -320,6 +322,9 @@ const makeHarness = (
                           ),
                     ),
                 }),
+                Option.isSome(diagnostics)
+                  ? Layer.succeed(DatabaseDiagnostics.DatabaseDiagnostics, diagnostics.value)
+                  : Layer.empty,
                 threads,
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                 Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -436,6 +441,41 @@ describe("control listings", () => {
       }),
     ),
   );
+  it.effect("health retains primary corruption after SQL requests work again", () =>
+    Effect.gen(function* () {
+      let now = 0;
+      const monitor = DatabaseDiagnostics.createDatabaseMonitor(
+        () => now,
+        () => {},
+      );
+      monitor.observe(
+        { errcode: 779 },
+        {
+          file: "/isolated/state.sqlite",
+          role: "primary",
+          connection: "reader",
+          operation: "execute",
+          span: "test",
+        },
+      );
+      yield* run(({ get }) =>
+        Effect.gen(function* () {
+          const first = yield* get("/health");
+          assert.equal(first.body.status, "degraded");
+          assert.equal(first.body.databaseErrors[0].errcode, 779);
+          now = 300_000;
+          const next = yield* get("/health");
+          assert.equal(next.body.status, "recovered-unverified");
+          assert.equal(next.body.databaseErrors[0].file, "/isolated/state.sqlite");
+        }),
+      ).pipe(
+        Effect.provideService(DatabaseDiagnostics.DatabaseDiagnostics, {
+          health: Effect.sync(monitor.health),
+        }),
+      );
+    }),
+  );
+
   it.effect("reports a validated build commit captured at startup", () =>
     Effect.gen(function* () {
       for (const [input, expected] of [

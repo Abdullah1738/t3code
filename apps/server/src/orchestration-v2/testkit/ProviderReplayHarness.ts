@@ -1,3 +1,4 @@
+import * as RestartPacingTestkit from "../../ardud/restart-pacing/RestartPacing.testkit.ts";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -498,6 +499,7 @@ export function layerWithRegistry<Error>(
         )
       : Layer.empty;
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
+    Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         layerStores,

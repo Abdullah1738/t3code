@@ -562,6 +562,8 @@ export const PullRequestDetail = Schema.Struct({
   headBranch: TrimmedNonEmptyString,
   headRepositoryNameWithOwner: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   headSha: Schema.optional(TrimmedNonEmptyString),
+  headBranchSha: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  checksHeadSha: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   /** Base commit reported by the host, which may lag the live branch tip. */
   baseSha: Schema.optional(TrimmedNonEmptyString),
   baseBranch: TrimmedNonEmptyString,

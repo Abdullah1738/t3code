@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -19,6 +20,35 @@ class ReadBudgetExceeded(RuntimeError):
     pass
 
 
+class ProgressWatchdog:
+    """A stuck filesystem call must not strand launchd on an unmounted SSD."""
+
+    def __init__(self, timeout=300):
+        self.timeout = timeout
+        self.last_progress = time.monotonic()
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def progress(self):
+        self.last_progress = time.monotonic()
+
+    def watch(self):
+        remaining = self.timeout
+        while not self.stopped.wait(remaining):
+            remaining = self.timeout - (time.monotonic() - self.last_progress)
+            if remaining <= 0:
+                # SQLite close and even stderr (on the SSD) can block too.
+                os._exit(1)
+
+    def __exit__(self, *_):
+        self.stopped.set()
+        self.thread.join()
+
+
 def quote(name):
     return '"' + name.replace('"', '""') + '"'
 
@@ -27,6 +57,8 @@ class Exporter:
     def __init__(self, source, destination, *, page_size=32, chunk_size=65536, read_ms=25):
         self.source_path = Path(source).expanduser().resolve()
         self.path = safe_path(destination)
+        self.volume_path = Path(*self.path.parts[:3]) if self.path.parts[1:2] == ('Volumes',) else None
+        self.check_volume()
         if self.path == self.source_path or self.path.name in ('opencode.db', 'statev2.sqlite'):
             raise ValueError('export destination must be separate from live state')
         if self.path.exists() and os.path.samefile(self.source_path, self.path):
@@ -53,6 +85,9 @@ class Exporter:
             if self.src.execute('PRAGMA journal_mode').fetchone()[0].lower() != 'wal':
                 raise RuntimeError('native source must use WAL')
             self.out = sqlite3.connect(self.path, timeout=0, isolation_level=None)
+            self.destination_identity = self.file_identity(self.path)
+            self.last_progress_stamp = 0
+            self.last_file_check = 0
             os.chmod(self.path, 0o600)
             self.out.executescript('''
                 PRAGMA journal_mode=WAL;
@@ -154,6 +189,30 @@ class Exporter:
         row = self.out.execute('SELECT value FROM ardud_readonly_meta WHERE key=?', (key,)).fetchone()
         return row[0] if row else None
 
+    @staticmethod
+    def file_identity(path):
+        info = path.stat()
+        return info.st_dev, info.st_ino
+
+    def check_destination(self):
+        now = time.monotonic()
+        if now - self.last_file_check >= 5:
+            self.check_volume()
+            if self.file_identity(self.path) != self.destination_identity:
+                raise RuntimeError('native export volume or destination replaced; reopen exporter')
+            self.last_file_check = now
+
+    def check_volume(self):
+        if self.volume_path is not None and not self.volume_path.is_mount():
+            raise RuntimeError('native export volume is not mounted')
+
+    def progress(self):
+        self.check_destination()
+        now = time.monotonic()
+        if now - self.last_progress_stamp >= 30:
+            self.setmeta('progress_at', time.time())
+            self.last_progress_stamp = now
+
     def setmeta(self, key, value):
         self.out.execute('INSERT INTO ardud_readonly_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          (key, str(value)))
@@ -186,6 +245,7 @@ class Exporter:
         return rows[0][0] if rows else -1
 
     def begin_cycle(self):
+        self.check_destination()
         identity = f'{self.source_path}:{self.source_path.stat().st_dev}:{self.source_path.stat().st_ino}'
         if identity != self.identity:
             raise RuntimeError('native source replaced; reopen exporter')
@@ -398,6 +458,7 @@ class Exporter:
             self.phase = 'session_pending' if table == 'session_inbox' else 'pins'
 
     def step(self):
+        self.check_destination()
         if self.clear_staging:
             self.out.execute('DELETE FROM session_inbox WHERE id IN (SELECT id FROM session_inbox LIMIT ?)', (self.page_size,))
             self.out.execute('DELETE FROM session_pending WHERE id IN (SELECT id FROM session_pending LIMIT ?)', (self.page_size,))
@@ -456,6 +517,7 @@ class Exporter:
 
     def collect_retired(self):
         """Drain after publication, before producing more replacement payloads."""
+        self.check_destination()
         row = self.out.execute('SELECT payload_id FROM ardud_native_retired ORDER BY payload_id LIMIT 1').fetchone()
         if row is None:
             return False
@@ -491,6 +553,15 @@ def main():
                         str(Path.home() / '.robob/userdata/readonly/opencode.sqlite'))
     parser.add_argument('--once', action='store_true')
     args = parser.parse_args()
+    with ProgressWatchdog() as watchdog:
+        try:
+            run(args, watchdog)
+        except Exception as exc:
+            print(f'native export unavailable: {type(exc).__name__}', file=sys.stderr, flush=True)
+            sys.exit(1)
+
+
+def run(args, watchdog):
     exporter = Exporter(args.source, args.destination)
     try:
         while True:
@@ -499,10 +570,14 @@ def main():
             except ReadBudgetExceeded:
                 time.sleep(1)
                 continue
+            exporter.progress()
+            watchdog.progress()
             if not more:
                 # Reclamation keeps up with replacement volume without pinning
                 # the source, delaying publication or imposing a large DELETE.
                 while exporter.collect_retired():
+                    exporter.progress()
+                    watchdog.progress()
                     time.sleep(0.005)
                 if args.once:
                     return
@@ -515,8 +590,4 @@ def main():
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as exc:
-        print(f'native export unavailable: {type(exc).__name__}', file=sys.stderr)
-        sys.exit(1)
+    main()

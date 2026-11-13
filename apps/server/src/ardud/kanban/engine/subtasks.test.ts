@@ -9,6 +9,7 @@ import {
   PACKET_SUBTASK,
   passReview,
   planSubtasks,
+  pendingWakeNote,
   subtaskLines,
   withPacketStep,
 } from "./subtasks.ts";
@@ -339,4 +340,79 @@ describe("board script subtasks", () => {
     const lines = subtaskLines(scriptCard());
     expect(lines).toContain('- s1 step 1, script "land" (now): Merge the PR');
   });
+});
+
+it.each([
+  ["Owner says keep 2%", "Owner says keep 2%"],
+  ["Review findings (round 1): fix rate", "Review findings (round 1): fix rate"],
+  ["Do s1 again", null],
+  ["s1: build it", null],
+  ["Do S13 again", null],
+  [
+    "Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review.",
+    null,
+  ],
+])("pending wake cleanup: %s", (wakeNote, expected) => {
+  const subtasks = markSubtask(planned(), "s1", "done", null, owner, at);
+  expect(pendingWakeNote({ subtasks, wakeNote })).toBe(expected);
+});
+
+describe.each(["done", "skipped", "removed", "evaluator"] as const)(
+  "pending wake preserves bundled context when its requested task is %s",
+  (obsolete) => {
+    it.each([
+      ["Do s1 again.\n\nFor s3, use 2%.", "For s3, use 2%."],
+      ["s1: build again\nFor s3, use 2%.", "For s3, use 2%."],
+      ["Do S1 again.\r\n\r\nOwner says use 2%.", "Owner says use 2%."],
+      ["Do s1 again. For s3, use 2%.", "For s3, use 2%."],
+      ["For s3, use 2%. Do s1 again.", "For s3, use 2%."],
+      ["Do s1 again; For s3, use 2%.", "For s3, use 2%."],
+      ["- Do s1 again.\n- Do s3 with 2%.", "- Do s3 with 2%."],
+      ["1. Do s1 again.\n2. Do s3 with 2%.", "2. Do s3 with 2%."],
+      [
+        "Review findings (round 1):\nDo s1 again.\nKeep 2.5% for s3.",
+        "Review findings (round 1):\nDo s1 again.\nKeep 2.5% for s3.",
+      ],
+    ])("%s", (wakeNote, expected) => {
+      const subtasks = planned().flatMap((s) =>
+        s.id === "s1"
+          ? obsolete === "removed"
+            ? []
+            : [
+                {
+                  ...s,
+                  state: obsolete === "evaluator" ? ("open" as const) : obsolete,
+                  owner: obsolete === "evaluator" ? ("evaluator" as const) : s.owner,
+                },
+              ]
+          : [{ ...s, ...(s.id === "s3" ? { owner: "work" as const } : {}) }],
+      );
+      expect(pendingWakeNote({ subtasks, wakeNote })).toBe(expected);
+    });
+  },
+);
+
+it.each([
+  ["LF", "\n"],
+  ["CRLF", "\r\n"],
+  ["CR", "\r"],
+  ["LINE SEPARATOR", "\u2028"],
+  ["PARAGRAPH SEPARATOR", "\u2029"],
+])("pending wake line separators: %s", (_name, separator) => {
+  const subtasks = markSubtask(planned(), "s1", "done", null, owner, at);
+  const wakeNote = ["Owner says keep 2.5%.", "Do s1 again.", "Use 2% for the next task."].join(
+    separator,
+  );
+  expect(pendingWakeNote({ subtasks, wakeNote })).toBe(
+    "Owner says keep 2.5%.\n\nUse 2% for the next task.",
+  );
+});
+
+it.each([
+  "s1 established the rate as 2.5%; use that same rate for s3.",
+  "s1 is complete. Use the same rate for s3.",
+  "S1 established 2.5%.\nUse it for s3.",
+])("pending wake preserves descriptive context: %s", (wakeNote) => {
+  const subtasks = markSubtask(planned(), "s1", "done", null, owner, at);
+  expect(pendingWakeNote({ subtasks, wakeNote })).toBe(wakeNote);
 });

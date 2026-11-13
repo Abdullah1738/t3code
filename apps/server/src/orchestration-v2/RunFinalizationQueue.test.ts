@@ -1,3 +1,4 @@
+import * as RestartPacingTestkit from "../ardud/restart-pacing/RestartPacing.testkit.ts";
 import { assert, it } from "@effect/vitest";
 import { CheckpointScopeId, CommandId, GitCommandError, RunId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -83,6 +84,7 @@ it.effect.each([
     ),
   );
   const executor = EffectWorker.layerExecutor.pipe(
+    Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         finalization,

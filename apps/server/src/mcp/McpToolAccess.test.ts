@@ -409,9 +409,29 @@ it.effect.each(["caller", "target"] as const)(
           clientRequestId: "bounded-access",
         }).pipe(Effect.provide(NodeCrypto.layer), Effect.forkChild);
         yield* Deferred.await(entered);
-        yield* TestClock.adjust("15 seconds");
-        expect(yield* Fiber.join(request)).toBe("send_timeout");
+        // The caller guard's 10-second refusal precedes the overall send deadline.
+        yield* TestClock.adjust(blocked === "caller" ? "10 seconds" : "15 seconds");
+        expect(yield* Fiber.join(request)).toBe(
+          blocked === "caller" ? "caller_unresolved" : "send_timeout",
+        );
         expect(ran).toBe(false);
       }).pipe(Effect.provide(server));
     }),
+);
+
+it.effect("actsAsCaller returns caller_unresolved when the caller shell read stalls", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadShell: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    });
+    const result = yield* call("acts_as_caller", fullAccess).pipe(
+      Effect.provide(probeServer(threads)),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust("10 seconds");
+    expect(result.pollUnsafe()).toBeDefined();
+    expect(yield* Fiber.join(result)).toBe("caller_unresolved");
+  }),
 );

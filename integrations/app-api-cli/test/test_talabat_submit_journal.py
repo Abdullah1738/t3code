@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import hashlib
 import multiprocessing as mp
@@ -34,6 +35,7 @@ def child_crash_after_consume(root, value):
 
 class JournalTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp=tempfile.TemporaryDirectory()
         self.root=Path(self.temp.name)/'journal'
         self.patch=patch.object(j,'ROOT',self.root); self.patch.start()

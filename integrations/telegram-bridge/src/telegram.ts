@@ -1,3 +1,4 @@
+import { redact } from "./redact.ts";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Chat } from "grammy/types";
 import type { KeyboardSpec } from "./store.ts";
@@ -56,7 +57,7 @@ function replyMarkup(keyboard?: KeyboardSpec) {
   if (keyboard === undefined) return undefined;
   if ("remove" in keyboard) return { inline_keyboard: [] };
   return {
-    inline_keyboard: keyboard.rows.map(row => row.map(button => ({ text: button.text, callback_data: button.data }))),
+    inline_keyboard: keyboard.rows.map(row => row.map(button => ({ text: redact(button.text), callback_data: button.data }))),
   };
 }
 
@@ -103,7 +104,7 @@ export class Telegram {
     if (typeof input.text !== "string" || !input.text.trim() || input.text.length > MAX_TEXT) {
       throw new TransportError("invalidText");
     }
-    const message = await this.#client().api.sendMessage(input.chatId, input.text, {
+    const message = await this.#client().api.sendMessage(input.chatId, redact(input.text), {
       link_preview_options: { is_disabled: true },
       ...(input.replyTo === undefined ? {} : { reply_parameters: { message_id: input.replyTo } }),
       ...(replyMarkup(input.keyboard) === undefined ? {} : { reply_markup: replyMarkup(input.keyboard)! }),
@@ -128,7 +129,7 @@ export class Telegram {
     }
     const document = new InputFile(input.data, input.name);
     const message = await this.#client().api.sendDocument(input.chatId, document, {
-      ...(input.caption?.trim() ? { caption: input.caption.slice(0, 1_024) } : {}),
+      ...(input.caption?.trim() ? { caption: redact(input.caption).slice(0, 1_024) } : {}),
       ...(input.replyTo === undefined ? {} : { reply_parameters: { message_id: input.replyTo } }),
     });
     if (typeof message.message_id !== "number" || !Number.isSafeInteger(message.message_id)) {
@@ -141,7 +142,7 @@ export class Telegram {
     if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(messageId)) throw new TransportError("invalidChat");
     if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) throw new TransportError("invalidText");
     const markup = replyMarkup(keyboard);
-    await this.#client().api.editMessageText(chatId, messageId, text, {
+    await this.#client().api.editMessageText(chatId, messageId, redact(text), {
       ...(markup === undefined ? {} : { reply_markup: markup! }),
     });
   }
@@ -149,7 +150,7 @@ export class Telegram {
   async answerCallback(callbackId: string, text?: string): Promise<void> {
     if (!callbackId.trim()) throw new TransportError("invalidCallback");
     await this.#client().api.answerCallbackQuery(callbackId, {
-      ...(text === undefined ? {} : { text: text.slice(0, 200) }),
+      ...(text === undefined ? {} : { text: redact(text).slice(0, 200) }),
     });
   }
 

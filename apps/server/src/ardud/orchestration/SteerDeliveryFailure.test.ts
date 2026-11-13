@@ -41,6 +41,7 @@ import * as ThreadTitles from "../../orchestration-v2/ThreadTitleRegenerationSer
 import * as McpSessionRegistryTestkit from "../../mcp/McpSessionRegistry.testkit.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SteerDeliveryFailure from "./SteerDeliveryFailure.ts";
+import * as RestartPacingTestkit from "../restart-pacing/RestartPacing.testkit.ts";
 
 const threadId = ThreadId.make("thread:steer-delivery-failure");
 const messageId = MessageId.make("message:saved-steer");
@@ -222,6 +223,7 @@ const executorLayer = (
   threads: Partial<ThreadManagement.ThreadManagementService["Service"]> = {},
 ) =>
   EffectWorker.layerExecutor.pipe(
+    Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProviderControl.ProviderTurnControlServiceV2)({ steer }),
@@ -572,5 +574,88 @@ it.effect.each([
       assert.equal(providerCalls, 1);
       assert.equal(bookkeepingCalls, executions);
       assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 0);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("preserves accepted input while refunding an outbox retry attempt", () =>
+  Effect.gen(function* () {
+    yield* seed();
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    yield* outbox.enqueue([
+      { id: effect.id, commandId: effect.commandId, threadId, request: effect.request },
+    ]);
+    for (const markAccepted of [true, false]) {
+      const claimed = yield* outbox.claimNext({ workerId: "both-flags", leaseDurationMs: 30_000 });
+      assert.isTrue(Option.isSome(claimed));
+      if (Option.isNone(claimed)) return;
+      assert.equal(claimed.value.attemptCount, 1);
+      assert.isTrue(
+        yield* outbox.retry({
+          effectId: effect.id,
+          workerId: "both-flags",
+          error: "Retry bookkeeping",
+          delayMs: 0,
+          refundAttempt: true,
+          ...(markAccepted ? { steerAccepted: true } : {}),
+        }),
+      );
+      const saved = yield* outbox.get(effect.id);
+      assert.isTrue(Option.isSome(saved));
+      if (Option.isNone(saved)) return;
+      assert.equal(saved.value.attemptCount, 0);
+      assert.equal(saved.value.request.type, "provider-turn.steer");
+      if (saved.value.request.type === "provider-turn.steer")
+        assert.isTrue(saved.value.request.providerAccepted);
+    }
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect.each([false, true])(
+  "preserves acceptance and the attempt refund through deferral (write fails=%s)",
+  (failFirstWrite) =>
+    Effect.gen(function* () {
+      yield* seed();
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      yield* outbox.enqueue([
+        { id: effect.id, commandId: effect.commandId, threadId, request: effect.request },
+      ]);
+      let failed = false;
+      const outcome = yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        return yield* worker.runOnce;
+      }).pipe(
+        Effect.provide(EffectWorker.layerWithOptions({ workerId: "both-flags" })),
+        Effect.provideService(EffectWorker.OrchestrationEffectExecutorV2, {
+          execute: () =>
+            Effect.fail(
+              new EffectWorker.OrchestrationEffectExecutionError({
+                effectId: effect.id,
+                effectType: effect.request.type,
+                providerAccepted: true,
+                deferMs: 100,
+              }),
+            ),
+        }),
+        Effect.provideService(EffectOutbox.EffectOutboxV2, {
+          ...outbox,
+          retry: (input) =>
+            Effect.suspend(() => {
+              if (failFirstWrite && !failed) {
+                failed = true;
+                return Effect.fail(new EffectOutbox.EffectOutboxError({ operation: "retry" }));
+              }
+              return outbox.retry(input);
+            }),
+        }),
+        Effect.result,
+      );
+      assert.equal(Result.isFailure(outcome), failFirstWrite);
+      const saved = yield* outbox.get(effect.id);
+      assert.isTrue(Option.isSome(saved));
+      if (Option.isNone(saved)) return;
+      assert.equal(saved.value.status, "pending");
+      assert.equal(saved.value.attemptCount, 0);
+      if (saved.value.request.type === "provider-turn.steer")
+        assert.isTrue(saved.value.request.providerAccepted);
     }).pipe(Effect.provide(testLayer)),
 );

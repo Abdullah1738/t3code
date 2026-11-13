@@ -18,6 +18,57 @@ _SEND_NAMES = {'discussion_post', 'card_ask', 't3_thread_send', 'send', 'send_sm
                'send_message', 'send_email', 'send_text', 'notify', 'reply', 't3_thread_send_attachments'}
 
 
+def imessage_arguments(tool, arguments, cwd):
+    if re.split(r'__|[./:]', tool.lower())[-1] != 'imessage_send' or arguments.get('to'):
+        return arguments
+    # The bridge uses <chatRoot>/chats/<slug> for non-owner chat threads.
+    root = os.environ.get('ROBOB_IMESSAGE_CHAT_ROOT', '')
+    if not root:
+        try:
+            config = json.loads((Path.home()/'.config/spectrum-bridge/config.json').read_text())
+            root = config.get('robobChatRoot', '')
+        except (OSError, ValueError, AttributeError):
+            pass
+    root = Path(root if isinstance(root, str) and root else Path.home()/'.robob/imessage').expanduser().absolute()
+    try:
+        parts = Path(cwd).absolute().relative_to(root).parts
+    except ValueError:
+        return arguments
+    recipient = parts[1] if len(parts) >= 2 and parts[0] == 'chats' else 'owner'
+    return {**arguments, 'to': recipient}
+
+
+def wrapped_calls(tool, arguments):
+    name = re.split(r'__|[./:]', tool.lower())[-1]
+    code = arguments.get('code', arguments.get('input', arguments.get('command', '')))
+    if name not in {'exec', 'execute'} or not isinstance(code, str):
+        return []
+    # Consume strings/comments as whole tokens so their contents cannot supply
+    # a recipient, an object boundary, or a second apparent tool call.
+    tokens = re.findall(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`|[\w$]+|[^\s]', code)
+    tokens = [t for t in tokens if not t.startswith(('//', '/*'))]
+    allowed = {'cmd', 'command', 'to', 'recipient', 'contact', 'chat', 'chat_name', 'session', *_FIELDS}
+    calls = []
+    for i in range(len(tokens) - 4):
+        if tokens[i:i+2] != ['tools', '.'] or tokens[i+3:i+5] != ['(', '{']:
+            continue
+        depth, j = 1, i + 5
+        fields = {}
+        while j < len(tokens) and depth:
+            token = tokens[j]
+            if token == '{': depth += 1
+            elif token == '}': depth -= 1
+            elif depth == 1 and tokens[j-1] in {'{', ','} and tokens[j+1:j+2] == [':'] and j+2 < len(tokens):
+                try:
+                    key = ast.literal_eval(token) if token.startswith(('"', "'")) else token
+                    value = ast.literal_eval(tokens[j+2])
+                    if key in allowed and isinstance(value, str): fields[key] = value
+                except (ValueError, SyntaxError): pass
+            j += 1
+        if depth == 0: calls.append((tokens[i+2], fields))
+    return calls
+
+
 def _file(value, cwd):
     path = Path(value).expanduser()
     if not path.is_absolute(): path = Path(cwd) / path
@@ -29,7 +80,7 @@ def _file(value, cwd):
     return ''
 
 
-def outgoing(tool, arguments, cwd='', depth=0):
+def outgoing(tool, arguments, cwd='', depth=0, *, calls=False):
     """Return outgoing bodies only; quoted command examples are never sends."""
     if depth > 4: return []
     if isinstance(arguments, str):
@@ -42,21 +93,11 @@ def outgoing(tool, arguments, cwd='', depth=0):
         for block in arguments.get('blocks') or []:
             if isinstance(block, dict):
                 values += [v for k in ('text','question','html','title') if isinstance((v := block.get(k)), str)]
-        return values
+        return ([(tool, arguments)] if values else []) if calls else values
     # Codex code mode wraps actual shell/MCP calls in functions.exec source.
-    code = arguments.get('code', arguments.get('input', arguments.get('command', '')))
-    if name in {'exec', 'execute'} and isinstance(code, str) and 'tools.' in code:
-        wrapped = []
-        literal = r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
-        for call in re.finditer(r'tools\.([\w]+)\s*\(\s*\{(.*?)\}\s*\)', code, re.S):
-            fields = {}
-            for field in ('cmd','command') + _FIELDS:
-                match = re.search(r'(?:["\']?'+field+r'["\']?)\s*:\s*'+literal, call[2], re.S)
-                if match:
-                    try: fields[field] = ast.literal_eval(match[1])
-                    except (ValueError, SyntaxError): pass
-            wrapped += outgoing(call[1], fields, cwd, depth+1)
-        if wrapped: return wrapped
+    wrapped = [body for tool, fields in wrapped_calls(tool, arguments)
+               for body in outgoing(tool, fields, cwd, depth+1, calls=calls)]
+    if wrapped: return wrapped
     command = arguments.get('command', arguments.get('cmd'))
     if not isinstance(command, str): return []
     if not re.search(r'\b(?:telegram-bridge|spectrum-bridge|imsg|wa|wacli|cliq|himalaya|himalaya-heal|mailsend|sms|sendblue|approved_message\.py)\b', command): return []
@@ -81,17 +122,18 @@ def outgoing(tool, arguments, cwd='', depth=0):
         if exe in {'sh','bash','zsh'}:
             for i, t in enumerate(tokens):
                 if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', t) and i+1 < len(tokens):
-                    result += outgoing('shell', {'command': tokens[i+1]}, cwd, depth+1)
+                    result += outgoing('shell', {'command': tokens[i+1]}, cwd, depth+1, calls=calls)
             continue
         # bun/node bridge cli.ts is the actual executable, not arbitrary script data.
         if exe in {'bun','node'} and len(tokens)>1:
             script = tokens[1]
             if any('/'+b+'/' in script for b in ('telegram-bridge','spectrum-bridge','sendblue')):
                 exe, tokens = 'bridge', tokens[1:]
+        send_tool = 'imessage_send' if exe == 'bridge' and '/spectrum-bridge/' in tokens[0] else 'send_message'
         if exe in {'python','python3'} and len(tokens)>3 and tokens[1].endswith('/approved_message.py') and tokens[2]=='execute':
             try:
                 packet = json.loads(_file(tokens[3], cwd))
-                result.extend(packet[k] for k in _FIELDS if isinstance(packet.get(k), str))
+                result.extend(outgoing('send_message', packet, cwd, depth+1, calls=calls))
             except (ValueError, TypeError): pass
             continue
         if exe not in {'bridge','imsg','wa','wacli','cliq','himalaya','himalaya-heal','mailsend','sms','sendblue'}: continue
@@ -139,7 +181,15 @@ def outgoing(tool, arguments, cwd='', depth=0):
         if not bodies and positional:
             if exe in {'wa','cliq','sms','sendblue'} and len(positional)>=2: bodies.append(positional[-1])
             elif exe in {'himalaya','himalaya-heal'} and len(positional)>=3: bodies.append(positional[-1])
-        result.extend(b for b in bodies if b and b != '-')
+        for body in bodies:
+            if not body or body == '-': continue
+            if calls:
+                fields = {'text': body}
+                for key in ('to', 'recipient', 'contact', 'chat', 'chat_name', 'session'):
+                    if '--'+key in opts: fields[key] = opts['--'+key]
+                result.append((send_tool, fields))
+            else:
+                result.append(body)
     return result
 
 
@@ -179,11 +229,13 @@ def contradiction(messages, facts, timeout=1.3):
     return scores, float(data.get('usage',{}).get('cost') or 0)
 
 
-def check(messages, facts):
+def check(messages, facts, *, timeout=1.3):
     started = time.monotonic()
     base = dict(decision='allow', note=None, sources=[], classifier='message-facts', recall_ran=bool(facts), p=0, cost=0, routed=False)
     if not facts: return base
     try:
+        if timeout <= 0:
+            raise TimeoutError('outgoing check budget exhausted')
         # Socket timeouts alone do not bound DNS or a trickling HTTP response.
         # A daemon prevents a stalled optional decision from holding hook exit.
         result = queue.Queue(maxsize=1)
@@ -191,7 +243,7 @@ def check(messages, facts):
             try: result.put((contradiction(messages, facts), None))
             except Exception as exc: result.put((None, exc))
         threading.Thread(target=decide, daemon=True).start()
-        answer, error = result.get(timeout=1.4)
+        answer, error = result.get(timeout=timeout)
         if error: raise error
         scores, cost = answer
         base.update(p=max(scores.values()), cost=cost, routed=True)

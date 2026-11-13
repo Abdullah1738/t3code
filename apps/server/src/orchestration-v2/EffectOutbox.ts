@@ -235,6 +235,14 @@ export interface EffectOutboxV2Shape {
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly hasPendingRunStart: (input: {
+    readonly threadId: ThreadId;
+    readonly runIds: ReadonlyArray<RunId>;
+  }) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly listRestartContinuations: Effect.Effect<
+    ReadonlyArray<OrchestrationEffectV2>,
+    EffectOutboxError
+  >;
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
@@ -271,6 +279,7 @@ export interface EffectOutboxV2Shape {
     readonly error: string;
     readonly delayMs: number;
     readonly steerAccepted?: boolean;
+    readonly refundAttempt?: boolean;
   }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly fail: (input: {
     readonly effectId: string;
@@ -358,10 +367,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     };
     // An earlier effect waiting out a retry backoff still blocks later ones, so
     // a turn cannot start while a failed rollback is about to restore files.
-    const claimableCandidatePredicate = (
-      availableBefore?: string,
-      excludeRestartContinuations = false,
-    ) =>
+    // A pending restart wake holds no provider or filesystem resources. Fresh
+    // user turns must pass it while restart admission is paced.
+    const claimableCandidatePredicate = (availableBefore?: string) =>
       sql`
         ${
           availableBefore === undefined
@@ -378,11 +386,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               OR (
                 active.status = 'pending'
                 AND active.rowid < candidate.rowid
-                AND ${
-                  excludeRestartContinuations
-                    ? sql`active.effect_type != 'provider-runtime.continue'`
-                    : sql`1 = 1`
-                }
+                AND active.effect_type != 'provider-runtime.continue'
+                AND NOT (active.effect_type = 'provider-turn.start' AND COALESCE(active.last_error, '') = 'Resuming after restart')
               )
             )
             AND (
@@ -479,6 +484,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
           LIMIT 1
         `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
+      hasPendingRunStart: Effect.fn("EffectOutbox.hasPendingRunStart")(
+        function* ({ threadId, runIds }) {
+          if (runIds.length === 0) return false;
+          const rows = yield* sql`
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+              AND effect_type = 'provider-turn.start'
+              AND json_extract(payload_json, '$.runId') IN ${sql.in(runIds)}
+            LIMIT 1
+          `;
           return rows.length > 0;
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
@@ -617,7 +636,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations)}
+              WHERE ${claimableCandidatePredicate(nowIso)}
                 AND ${threadId === undefined ? sql`1 = 1` : sql`candidate.thread_id = ${threadId}`}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
                 AND ${onlyEffectTypes === undefined ? sql`1 = 1` : sql`candidate.effect_type IN ${sql.in(onlyEffectTypes)}`}
@@ -633,6 +652,15 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           return Option.some(yield* rowToEffect(row));
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
+      ),
+      listRestartContinuations: Effect.gen(function* () {
+        const rows =
+          yield* sql<EffectRow>`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type = 'provider-runtime.continue' AND status IN ('pending', 'running') ORDER BY created_at, effect_id`;
+        return yield* Effect.forEach(rows, rowToEffect);
+      }).pipe(
+        Effect.mapError(
+          (cause) => new EffectOutboxError({ operation: "list-restart-continuations", cause }),
+        ),
       ),
       nextClaimableAt: Effect.gen(function* () {
         const rows = yield* sql<{ readonly available_at: string | null }>`
@@ -713,7 +741,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           ),
       ),
       retry: Effect.fn("EffectOutbox.retry")(
-        function* ({ effectId, workerId, error, delayMs, steerAccepted }) {
+        function* ({ effectId, workerId, error, delayMs, steerAccepted, refundAttempt }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           const availableAt = DateTime.formatIso(
@@ -723,6 +751,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             UPDATE orchestration_v2_effect_outbox
             SET
               status = 'pending',
+              attempt_count = MAX(0, attempt_count - ${refundAttempt === true ? 1 : 0}),
               available_at = ${availableAt},
               lease_owner = NULL,
               lease_expires_at = NULL,

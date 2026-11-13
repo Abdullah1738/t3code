@@ -1,3 +1,8 @@
+import {
+  reportSqliteError,
+  sqliteErrorDetails,
+  sqliteFailureContext,
+} from "@t3tools/shared/nodeSqliteErrors";
 import { PROVIDER_DISPLAY_NAMES, type ProviderDriverKind } from "@t3tools/contracts";
 import * as Predicate from "effect/Predicate";
 import * as SqlError from "effect/sql/SqlError";
@@ -13,25 +18,30 @@ const SQLITE_RECOVERY_MESSAGES: Readonly<Record<number, string>> = {
   6: "The T3 Code server database is locked (SQLITE_LOCKED). Wait a moment, then retry. If this keeps happening, check the server logs for the process holding the database lock.",
   8: "The T3 Code server database is read-only (SQLITE_READONLY). On the machine running the server, check that its data directory is writable and its disk is mounted read-write, then retry.",
   10: "The T3 Code server could not read or write its database (SQLITE_IOERR). On the machine running the server, check free disk space and disk health, then retry. If it still fails, check the server logs.",
-  11: "The T3 Code server database appears damaged (SQLITE_CORRUPT). Preserve the server data directory and check the server logs before restoring a database backup.",
+  11: "The T3 Code server database appears damaged (SQLITE_CORRUPT). Preserve the server data directory and run an integrity check before deciding on recovery.",
   13: "The T3 Code server could not save this change because its database or disk is full (SQLITE_FULL). Free space on the machine running the server, then retry. If space is available, check the server logs for a database size limit.",
   14: "The T3 Code server could not open a database file (SQLITE_CANTOPEN). On the machine running the server, check free disk space and that its data and temporary directories exist and are writable, then retry. If it still fails, check the server logs.",
-  26: "The T3 Code server could not read its database file (SQLITE_NOTADB). Preserve the server data directory and check the configured database path and server logs before restoring a database backup.",
+  26: "The T3 Code server could not read its database file (SQLITE_NOTADB). Preserve the server data directory, verify the configured database path, and run an integrity check before deciding on recovery.",
 };
 
 function databaseErrorMessage(value: unknown): string | undefined {
   if (!SqlError.isSqlError(value)) return undefined;
 
-  let cause: unknown = value.cause;
-  const seen = new Set<unknown>();
-  while (Predicate.isObject(cause) && !seen.has(cause)) {
-    seen.add(cause);
-    // node:sqlite uses extended result codes; their low byte is the primary code.
-    if (typeof cause.errcode === "number" && Number.isInteger(cause.errcode) && cause.errcode > 0) {
-      const message = SQLITE_RECOVERY_MESSAGES[cause.errcode & 0xff];
-      if (message !== undefined) return message;
-    }
-    cause = cause.cause;
+  reportSqliteError(value, "UserFacingErrors.databaseErrorMessage");
+  const details = sqliteErrorDetails(value);
+  const context = details?.context ?? sqliteFailureContext(value);
+  const primary = details === undefined ? undefined : details.errcode & 0xff;
+  if (
+    context?.role === "replica" ||
+    context?.volumeUnavailable ||
+    (primary !== undefined && [11, 26].includes(primary) && context?.role !== "primary")
+  ) {
+    const name = primary === 11 ? "SQLITE_CORRUPT" : primary === 26 ? "SQLITE_NOTADB" : "SQLite";
+    return `The T3 Code server storage is temporarily unavailable (${name}). Wait a moment, then retry. Check the server logs if it continues.`;
+  }
+  if (primary !== undefined) {
+    const message = SQLITE_RECOVERY_MESSAGES[primary];
+    if (message !== undefined) return message;
   }
 
   return "The T3 Code server could not complete this database request. Retry once; if it still fails, check the server logs for the database error.";

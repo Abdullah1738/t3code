@@ -1,0 +1,39 @@
+{
+  "case_number": 6,
+  "reporter_id": "crpko3887",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:d1d002c3-4942-41c6-8d30-9971acd8b3e7",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T21-24-12-01a1cba3-8141-71c2-acfe-046e1560ab23.jsonl",
+    "source_call_line_0": 212,
+    "timestamp": "2026-11-11T17:32:10.846Z",
+    "call_id": "call_c1adcad8618e436880dc51685455c465",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 110,
+    "setup_files_provenance": {
+      "kind": "synthetic_representative_only",
+      "original_invocation_source_recovered": false,
+      "detail": "Minimal harmless source supplied for an existing invoked script. These bytes are authored for guard scanning, not recovered original contents. Never execute reporter commands."
+    }
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "rg -n 'useQueryClient:|getQueryCache:' src/components/features/trading/shared/ChartSection --glob '*test*'; python3 - <<'PY'\nfor p in ['src/components/features/trading/shared/ChartSection/views/TradingViewAdvancedChart.test.tsx','src/components/features/trading/shared/ChartSection/views/TradingViewAdvancedChart.data-error.test.tsx']:\n s=open(p).read();a=s.index(\"vi.mock('@tanstack/react-query'\");b=s.index('\\nvi.mock(',a+1)\n block=s[a:b];block=block.replace(\"async (importOriginal) => ({\\n  ...(await importOriginal<typeof import('@tanstack/react-query')>()),\\n  useQueryClient: () => ({\", \"async (importOriginal) => {\\n  const client = {\")\n block=block.replace(\"getQueryCache: () => ({ subscribe: () => () => {} })\", \"getQueryCache: () => ({ find: () => undefined, subscribe: () => () => {} })\")\n block=block.replace(\"  }),\\n}));\", \"  };\\n  return {\\n    ...(await importOriginal<typeof import('@tanstack/react-query')>()),\\n    useQueryClient: () => client,\\n  };\\n});\")\n s=s[:a]+block+s[b:];open(p,'w').write(s)\nPY\n/Users/ardud/.nvm/versions/node/v22.23.2/bin/node node_modules/prettier/bin/prettier.cjs --write src/components/features/trading/shared/ChartSection/views/TradingViewAdvancedChart.test.tsx src/components/features/trading/shared/ChartSection/views/TradingViewAdvancedChart.data-error.test.tsx\n/Users/ardud/.nvm/versions/node/v22.23.2/bin/node node_modules/vitest/vitest.mjs run --config vitest.config.mjs src/components/features/trading/shared/ChartSection/views/TradingViewAdvancedChart.test.tsx --maxWorkers=1 > tmp/quint/3887/lifecycle.log 2>&1",
+      "workdir": "/Users/ardud/checkouts/card-3887-legend",
+      "sha256": "40d7144b591fd52ac5ea91947107781bbac47435aee8c679ec6a01e8d6a9c0e4"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.",
+  "setup_files": {
+    "/Users/ardud/checkouts/card-3887-legend/node_modules/prettier/bin/prettier.cjs": "module.exports = {};\n",
+    "/Users/ardud/checkouts/card-3887-legend/node_modules/vitest/vitest.mjs": "export {};\n"
+  }
+}
