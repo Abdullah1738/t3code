@@ -122,7 +122,7 @@ class BigRootTests(unittest.TestCase):
                     def __exit__(inner, *args):
                         return False
                     def __iter__(inner):
-                        yield SimpleNamespace(path=str(self.big/'fast'))
+                        yield SimpleNamespace(path=str(self.big/'fast'), is_dir=lambda **kwargs: True)
                         raise failure
                 def run(cmd, **kw):
                     return SimpleNamespace(returncode=0, stdout='42\t'+cmd[-1], stderr='')

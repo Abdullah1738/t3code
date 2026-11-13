@@ -23,12 +23,19 @@ def state_path(name):
     return root / (name + '.json')
 
 
-def read_state(name):
+def read_state(name, with_reason=False):
+    reason = None
     try:
         value = json.loads(state_path(name).read_text())
-        return value if isinstance(value, dict) else {}
+        if not isinstance(value, dict):
+            value, reason = {}, 'corrupt_state'
+    except FileNotFoundError:
+        value, reason = {}, 'missing_state'
+    except (ValueError, UnicodeError):
+        value, reason = {}, 'corrupt_state'
     except Exception:
-        return {}
+        value, reason = {}, 'unreadable_state'
+    return (value, reason) if with_reason else value
 
 
 def save_state(name, value):
@@ -187,10 +194,11 @@ def big_root_inventory(path, run, deadline, cache=None):
         timeout = min(15, deadline-started)
         try:
             size, unreadable, code = du_total(child, run, timeout)
+            is_directory = entry.is_dir(follow_symlinks=False)
             completed += 1
             denied += unreadable
             cache[str(child)] = dict(bytes=size, at=now, attemptedAt=now,
-                                     partial=bool(unreadable))
+                                     partial=bool(unreadable), isDirectory=is_directory)
             children[str(child)] = size
             emit('disk', 'event', 'disk.inventory.source', ok=True,
                  props=dict(source=str(child), bytes=size, partial=bool(unreadable),
@@ -406,21 +414,133 @@ def storage_probes(volumes, sample_started, popen=subprocess.Popen):
     return props
 
 
+def sample_time(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+    except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+        return None
+
+
+def legacy_free_baseline(sampled_at):
+    # The pre-delta schema saved only sizes. Bound this one-time migration to
+    # two log tails; never replay the full log or recover corrupt state silently.
+    free, stamps = {}, {}
+    for day in (sampled_at.date(), sampled_at.date()-dt.timedelta(days=1)):
+        try:
+            with (directory()/(day.isoformat()+'.ndjson')).open('rb') as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell()-1024*1024))
+                lines = stream.read(1024*1024).splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+                at = sample_time(row.get('ts'))
+                if row.get('name') != 'disk.sample' or at is None or at > sampled_at.timestamp():
+                    continue
+                values = row.get('props', {})
+                for key in ('internalFreeGb', 'externalFreeGb'):
+                    if key not in free and number(values.get(key)):
+                        free[key], stamps[key] = values[key], row['ts']
+            except (ValueError, TypeError, AttributeError, UnicodeError):
+                continue
+    return free, stamps
+
+
+def drop_inventory(inventory, volume, now):
+    at = inventory.get('at')
+    fresh = number(at) and 0 <= now-at <= 7200
+    sizes = inventory.get('sizes', {})
+    sizes = sizes if isinstance(sizes, dict) else {}
+    partials = inventory.get('partials', {})
+    partials = partials if isinstance(partials, dict) else {}
+    children = inventory.get('children', {})
+    children = children if isinstance(children, dict) else {}
+    child_state = inventory.get('childState', {})
+    child_state = child_state if isinstance(child_state, dict) else {}
+    candidates = {}
+    roots = [p for p in DIRECTORY_ROOTS
+             if p.is_relative_to('/Volumes/ExternalSSD') == (volume == 'external')]
+    complete = bool(fresh and roots and inventory.get('sourceErrors') == 0 and not partials)
+    for root in roots:
+        key = str(root)
+        if not number(sizes.get(key)) or key in partials:
+            complete = False
+        if root not in BIG_ROOTS:
+            if fresh and key not in partials and number(sizes.get(key)):
+                candidates[key] = sizes[key]
+            continue
+        measured, states = children.get(key, {}), child_state.get(key, {})
+        if (key not in children or key not in child_state
+                or not isinstance(measured, dict) or not isinstance(states, dict)):
+            complete = False
+            continue
+        for path, size in measured.items():
+            state = states.get(path, {})
+            valid = (fresh and isinstance(path, str) and Path(path).parent == root and number(size)
+                     and isinstance(state, dict) and type(state.get('isDirectory')) is bool
+                     and state.get('partial') is False and number(state.get('at'))
+                     and 0 <= now-state['at'] <= 7200)
+            if not valid:
+                complete = False
+            elif state['isDirectory']:
+                candidates[path] = size
+    return dict(at=at if fresh else None, sizes=candidates, complete=complete)
+
+
 def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/ExternalSSD'), paths=None):
     started = time.monotonic()
     sampled_at = dt.datetime.now(dt.timezone.utc)
     stamp = sampled_at.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-    previous = read_state('disk')
+    previous, state_reason = read_state('disk', with_reason=True)
+    if previous and (not any(key in previous for key in ('sizes', 'free'))
+                     or any(key in previous and not isinstance(previous[key], dict)
+                            for key in ('sizes', 'free', 'freeTs', 'freeInventory'))):
+        previous, state_reason = {}, 'corrupt_state'
+    old_free = previous.get('free', {})
+    old_free = dict(old_free) if isinstance(old_free, dict) else {}
+    free_ts = previous.get('freeTs', {})
+    free_ts = dict(free_ts) if isinstance(free_ts, dict) else {}
+    if isinstance(previous.get('sizes'), dict) and ('free' not in previous or 'freeTs' not in previous):
+        if any(key not in old_free for key in ('internalFreeGb', 'externalFreeGb')):
+            recovered, stamps = legacy_free_baseline(sampled_at)
+            for key, value in recovered.items():
+                if key not in old_free:
+                    old_free[key], free_ts[key] = value, stamps[key]
+    free_inventory = previous.get('freeInventory', {})
+    free_inventory = dict(free_inventory) if isinstance(free_inventory, dict) else {}
     props, errors = {}, 0
-    for key, volume in zip(('internalFreeGb', 'externalFreeGb'), volumes):
+    for prefix, volume in zip(('internal', 'external'), volumes):
+        key = prefix+'FreeGb'
         try:
             st = os.statvfs(volume)
             props[key] = round(st.f_bavail * st.f_frsize / 1024**3, 3)
         except OSError:
             errors += 1
-        old_free = previous.get('free', {})
-        old_value = old_free.get(key) if isinstance(old_free, dict) else None
-        props[key+'Delta'] = round(props[key]-old_value, 3) if key in props and number(old_value) else None
+        old_value = old_free.get(key)
+        from_ts = free_ts.get(key, previous.get('ts'))
+        if number(old_value) and key not in free_ts:
+            free_ts[key] = from_ts
+        at = sample_time(from_ts)
+        if at is not None:
+            try:
+                from_ts = dt.datetime.fromtimestamp(at, dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            except (ValueError, OverflowError, OSError):
+                at = None
+        reason = state_reason or ('no_previous_numeric' if not number(old_value) else
+                                 'invalid_timestamp' if at is None or at > sampled_at.timestamp() else
+                                 'current_unavailable' if key not in props else None)
+        props[key+'Delta'] = round(props[key]-old_value, 3) if reason is None else None
+        props[prefix+'DeltaFromTs'] = from_ts if reason is None else None
+        props[prefix+'DeltaWindowS'] = round(sampled_at.timestamp()-at, 3) if reason is None else None
+        if reason:
+            props[prefix+'DeltaUnavailable'] = reason
+            props.setdefault('deltaUnavailable', reason)
+        if prefix == 'internal' or props['deltaFromTs'] is None:
+            props['deltaFromTs'] = props[prefix+'DeltaFromTs']
+            props['deltaWindowS'] = props[prefix+'DeltaWindowS']
     home = Path.home()
     # stat only: never open live databases, traverse private content or run du in the guard.
     paths = paths if paths is not None else [
@@ -478,15 +598,45 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     props.update(storage_probes(volumes, started))
     emit('disk', 'error' if errors else 'perf', 'disk.sample', duration_ms=(time.monotonic()-started)*1000,
          ok=not errors, props=props, error_tag='disk.source_unavailable' if errors else None, now=sampled_at)
+    for prefix in ('internal', 'external'):
+        key = prefix+'FreeGb'
+        current_inventory = drop_inventory(inventory, prefix, sampled_at.timestamp())
+        if (props.get(key+'Delta') or 0) < -10:
+            before = free_inventory.get(key, {})
+            before = before if isinstance(before, dict) else {}
+            before_at, after_at = before.get('at'), current_inventory['at']
+            comparable = (number(before_at) and number(after_at)
+                          and 0 <= sampled_at.timestamp()-before_at <= 7200 and before_at < after_at)
+            before_sizes = before.get('sizes', {})
+            before_sizes = before_sizes if isinstance(before_sizes, dict) else {}
+            growth = sorted(((path, size-before_sizes[path]) for path, size in current_inventory['sizes'].items()
+                             if comparable and number(before_sizes.get(path)) and size > before_sizes[path]),
+                            key=lambda item: (-item[1], item[0]))[:5]
+            drop = dict(volume=prefix, deltaGb=props[key+'Delta'], windowS=props[prefix+'DeltaWindowS'],
+                        deltaFromTs=props[prefix+'DeltaFromTs'],
+                        purgeableGb=props.get(prefix+'PurgeableGb'),
+                        localSnapshotCount=props.get(prefix+'LocalSnapshotCount'),
+                        inventoryComplete=bool(comparable and before.get('complete') is True
+                                               and current_inventory['complete']))
+            for i, (path, size) in enumerate(growth, 1):
+                drop['grower%dName' % i] = path
+                drop['grower%dBytes' % i] = size
+            emit('disk', 'event', 'disk.drop', props=drop, now=sampled_at)
+        if key in props:
+            old_free[key], free_ts[key] = props[key], stamp
+            free_inventory[key] = current_inventory
     if any(abs(props[key+'Delta'] or 0) >= 20 for key in ('internalFreeGb', 'externalFreeGb')):
         swing = {key: props[key] for key in ('internalFreeGbDelta', 'externalFreeGbDelta')}
-        swing.update(previousTs=previous.get('ts'), sampleTs=stamp)
+        swing.update(previousTs=props['deltaFromTs'], sampleTs=stamp)
+        for prefix in ('internal', 'external'):
+            for field in ('DeltaFromTs', 'DeltaWindowS'):
+                swing[prefix+field] = props[prefix+field]
         for i, (path, delta) in enumerate(movers, 1):
             swing['topMover%dPath' % i] = path
             swing['topMover%dGbDelta' % i] = round(delta/1024**3, 6)
         emit('disk', 'event', 'disk.swing', props=swing, now=sampled_at)
     save_state('disk', dict(sizes=sizes, ts=stamp,
-                           free={key: props[key] for key in ('internalFreeGb', 'externalFreeGb') if key in props},
+                           free=old_free, freeTs=free_ts, freeInventory=free_inventory,
                            partials=inventory.get('partials', {}),
                            inventoryAt=inventory.get('at') if not props['inventoryStale'] else None))
 
