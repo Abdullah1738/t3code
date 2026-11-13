@@ -715,17 +715,24 @@ export const layer: Layer.Layer<
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const analyticsContext = yield* Effect.context<never>();
 
-    const usageByRun = new Map<string, ReturnType<typeof makeRunUsageState>>();
-    const pendingRetryUsage = new Map<
+    const usageByRun = new Map<
       string,
-      (status: "interrupted" | "cancelled") => Effect.Effect<void>
+      {
+        readonly measurements: ReturnType<typeof makeRunUsageState>;
+        activeAttemptId: RunAttemptId;
+        ended: "interrupted" | "cancelled" | undefined;
+      }
+    >();
+    const usageFallbacks = new Map<
+      string,
+      (status: ProviderTerminalEvent["status"]) => Effect.Effect<void>
     >();
     const localAnalytics = yield* Effect.serviceOption(Analytics.Analytics);
     const usageStreamStart = Option.isSome(localAnalytics)
       ? yield* eventSink.latestSequence().pipe(Effect.option)
       : Option.none();
     if (Option.isSome(usageStreamStart)) {
-      // Stop can settle a run during retry backoff, when there is no provider consumer left.
+      // Committed Stop also covers preparation and gaps between provider attempts.
       yield* eventSink
         .stream({ eventType: "run.updated", afterSequence: usageStreamStart.value })
         .pipe(
@@ -735,10 +742,10 @@ export const layer: Layer.Layer<
               (event.payload.status !== "interrupted" && event.payload.status !== "cancelled")
             )
               return Effect.void;
-            const finish = pendingRetryUsage.get(event.payload.id);
-            if (!finish) return Effect.void;
-            pendingRetryUsage.delete(event.payload.id);
-            return finish(event.payload.status);
+            const entry = usageByRun.get(event.payload.id);
+            if (!entry) return Effect.void;
+            entry.ended = event.payload.status;
+            return usageFallbacks.get(event.payload.id)?.(event.payload.status) ?? Effect.void;
           }),
           Effect.ignore,
           Effect.forkScoped,
@@ -748,6 +755,7 @@ export const layer: Layer.Layer<
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
         readonly recordUsage: (terminal: ProviderTerminalEvent) => Effect.Effect<void>;
+        readonly deferUsage: Effect.Effect<void>;
         readonly run: OrchestrationV2Run;
         readonly rootNode: OrchestrationV2ExecutionNode;
         readonly checkpointScope: OrchestrationV2CheckpointScope;
@@ -764,7 +772,6 @@ export const layer: Layer.Layer<
           readonly expectedStatus: OrchestrationV2Run["status"];
         };
       }) {
-        yield* input.recordUsage(input.terminal);
         const completedAt = yield* DateTime.now;
         const finalizedAttempt: OrchestrationV2RunAttempt | null = {
           ...input.attempt,
@@ -817,6 +824,7 @@ export const layer: Layer.Layer<
               yield* input.refreshAfterTurn;
             }
           }
+          yield* input.deferUsage;
           return;
         }
         const allocateEventId = () => idAllocator.allocate.event({ threadId: input.run.threadId });
@@ -978,20 +986,27 @@ export const layer: Layer.Layer<
             },
           ],
         } satisfies Parameters<typeof eventSink.writeWithEffects>[0];
-        if (input.writeIfRunCurrent !== undefined) {
-          const result = yield* eventSink.writeIfRunCurrent({
-            threadId: input.run.threadId,
-            runId: input.run.id,
-            activeAttemptId: input.writeIfRunCurrent.activeAttemptId,
-            expectedStatus: input.writeIfRunCurrent.expectedStatus,
-            events: finalization.events,
-            effects: finalization.effects,
-          });
-          if (!result.committed) {
-            return;
+        // Cleanup must not interrupt an irreversible terminal commit before its usage enqueue.
+        const committed = yield* Effect.gen(function* () {
+          if (input.writeIfRunCurrent !== undefined) {
+            const result = yield* eventSink.writeIfRunCurrent({
+              threadId: input.run.threadId,
+              runId: input.run.id,
+              activeAttemptId: input.writeIfRunCurrent.activeAttemptId,
+              expectedStatus: input.writeIfRunCurrent.expectedStatus,
+              events: finalization.events,
+              effects: finalization.effects,
+            });
+            if (!result.committed) return false;
+          } else {
+            yield* eventSink.writeWithEffects(finalization);
           }
-        } else {
-          yield* eventSink.writeWithEffects(finalization);
+          yield* input.recordUsage(input.terminal);
+          return true;
+        }).pipe(Effect.uninterruptible);
+        if (!committed) {
+          yield* input.deferUsage;
+          return;
         }
         yield* input.refreshAfterTurn;
       },
@@ -1000,11 +1015,17 @@ export const layer: Layer.Layer<
     const observeUsage = Effect.fn("RunExecutionService.observeUsage")(function* (
       input: RunUsageInput,
     ) {
-      const state = usageByRun.get(input.run.id) ?? makeRunUsageState();
-      usageByRun.set(input.run.id, state);
-      return yield* makeRunUsageObserver(input, state).pipe(
+      const entry = usageByRun.get(input.run.id) ?? {
+        measurements: makeRunUsageState(),
+        activeAttemptId: input.attempt.id,
+        ended: undefined,
+      };
+      entry.activeAttemptId = input.attempt.id;
+      usageByRun.set(input.run.id, entry);
+      const observer = yield* makeRunUsageObserver(input, entry.measurements).pipe(
         Effect.provideContext(analyticsContext),
       );
+      return { ...observer, entry };
     });
     return RunExecutionServiceV2.of({
       finishUsageBeforeStart: Effect.fn("RunExecutionService.finishUsageBeforeStart")(
@@ -1014,7 +1035,7 @@ export const layer: Layer.Layer<
             Effect.ensuring(
               Effect.sync(() => {
                 usageByRun.delete(input.run.id);
-                pendingRetryUsage.delete(input.run.id);
+                usageFallbacks.delete(input.run.id);
               }),
             ),
           );
@@ -1030,11 +1051,25 @@ export const layer: Layer.Layer<
             Effect.ensuring(
               Effect.sync(() => {
                 usageByRun.delete(input.run.id);
-                pendingRetryUsage.delete(input.run.id);
+                usageFallbacks.delete(input.run.id);
               }),
             ),
           );
         const recordUsage = (terminal: ProviderTerminalEvent) => finishUsage(terminal.status);
+        // Superseding an attempt preserves the logical run's measurements and start time.
+        const deferUsage = Effect.fn("RunExecutionService.deferUsage")(function* () {
+          if (Option.isNone(localAnalytics)) {
+            usageByRun.delete(input.run.id);
+            usageFallbacks.delete(input.run.id);
+            return;
+          }
+          if (usage.entry.measurements.finished || usage.entry.activeAttemptId !== input.attempt.id)
+            return;
+          usageFallbacks.set(input.run.id, finishUsage);
+          if (usage.entry.ended !== undefined) yield* finishUsage(usage.entry.ended);
+        });
+        yield* deferUsage();
+
         // Startup failure and stream shutdown can report the same attempt.
         const refreshAfterTurn = yield* Effect.cached(
           finalizationObserver.refreshAfterTurn(input.appThread.projectId).pipe(
@@ -1107,6 +1142,7 @@ export const layer: Layer.Layer<
                 cause,
               });
               yield* writeFinalRunEvents({
+                deferUsage: deferUsage(),
                 recordUsage,
                 run: input.run,
                 rootNode: input.rootNode,
@@ -1305,7 +1341,7 @@ export const layer: Layer.Layer<
                 },
               },
             ];
-            pendingRetryUsage.set(input.run.id, finishUsage);
+            yield* deferUsage();
             const retryWrite = yield* eventSink.writeIfRunCurrent({
               ...(input.providerThread.driver === "claudeAgent"
                 ? { unlessClaudeRefused: input.providerThread.id }
@@ -1351,6 +1387,7 @@ export const layer: Layer.Layer<
           const providerThread = yield* Ref.get(latestProviderThread);
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
           yield* writeFinalRunEvents({
+            deferUsage: deferUsage(),
             recordUsage,
             run: input.run,
             rootNode: input.rootNode,
@@ -1920,6 +1957,7 @@ export const layer: Layer.Layer<
                 else if (!(yield* nativeEndConfirmed))
                   yield* stopOrphanedProviderTurn(providerThread);
                 yield* writeFinalRunEvents({
+                  deferUsage: deferUsage(),
                   recordUsage,
                   run: input.run,
                   rootNode: input.rootNode,
@@ -2045,7 +2083,6 @@ export const layer: Layer.Layer<
         ).pipe(Effect.onInterrupt(() => stopProviderEventIngestion));
         const shouldStart = Exit.map(admission, (state) => state.current);
         if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
-          if (!pendingRetryUsage.has(input.run.id)) usageByRun.delete(input.run.id);
           yield* stopProviderEventIngestion;
           return;
         }
@@ -2057,6 +2094,7 @@ export const layer: Layer.Layer<
         if (refused) {
           yield* stopProviderEventIngestion;
           yield* writeFinalRunEvents({
+            deferUsage: deferUsage(),
             recordUsage,
             run: input.run,
             rootNode: input.rootNode,
@@ -2130,7 +2168,7 @@ export const layer: Layer.Layer<
         yield* Effect.andThen(
           shouldStart,
           Effect.sync(() => {
-            pendingRetryUsage.delete(input.run.id);
+            usageFallbacks.delete(input.run.id);
           }).pipe(Effect.andThen(startTurn)),
         ).pipe(
           // The event fiber is detached; an interrupted start must not leak it.
@@ -2138,7 +2176,7 @@ export const layer: Layer.Layer<
             stopStartingRun.pipe(
               Effect.ensuring(stopProviderEventIngestion),
               // A wrapper can still be awaiting admission without a native turn to terminalize.
-              Effect.andThen(finishUsage("interrupted")),
+              Effect.andThen(deferUsage()),
             ),
           ),
           // Wait for acceptance so abandoned startup cannot leave a refresher
@@ -2172,6 +2210,7 @@ export const layer: Layer.Layer<
                         Ref.get(openRunOwnedSubagents).pipe(
                           Effect.flatMap((openSubagents) =>
                             writeFinalRunEvents({
+                              deferUsage: deferUsage(),
                               recordUsage,
                               run: input.run,
                               rootNode: input.rootNode,
