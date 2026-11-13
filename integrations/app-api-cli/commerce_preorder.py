@@ -78,6 +78,8 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20, challenge=None):
     # needed; the durable journal+vault supply that local ownership binding.
     result=client._call('payment_status',{'clientSecret':saved['secret']},timeout,
         project=lambda data:Snapshot(data,project_payment(data,None),time.time()))
+    from commerce_pending import record_approval
+    record_approval(flow_id,result.wire)
     op=next(x['name'] for x in state['operations'] if x['kind']=='prepay')
     journal.observe(flow_id,op,outcome=payment_outcome(result.projection),evidence_hash=journal.digest(result.projection))
     observe_zero_amounts(flow_id, op, result.wire)

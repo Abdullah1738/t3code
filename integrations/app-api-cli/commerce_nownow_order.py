@@ -282,6 +282,8 @@ class NowNowOrderFlow:
             if self.review is None or time.time() - self.review['observed_at'] > 60:
                 _fail('NOWNOW_FRESH_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register
+            register(self.flow_id, 'nownow', self.account_hash, self.items)
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='nownow',
                               account_hash=self.account_hash, scope_hash=self.scope_hash)
             self.receipt_store = receipts.create(flow_id=self.flow_id, app='noon', vertical='nownow',
@@ -645,6 +647,8 @@ class NowNowOrderFlow:
         self._expect('payment_complete', body)
         result = self.client.complete_payment(order=None, session_code=self.session_code,
             client_secret=secret, card=self.card, cvv_encryption=encrypted, before_send=self._before, timeout=25)
+        from commerce_pending import record_approval
+        record_approval(self.flow_id,result.wire)
         outcome = payment_outcome(result.projection)
         journal.observe(self.flow_id, 'payment_complete', outcome=outcome, evidence_hash=journal.digest(result.projection))
         observe_zero_amounts(self.flow_id, 'payment_complete', result.wire)
@@ -764,6 +768,8 @@ class NowNowOrderFlow:
         self.current = native.Snapshot({'data': row}, readback.projection, time.time())
         self.card = saved_card(self.client, timeout=25)
         corroborate_token(self.client, self.card, timeout=25)
+        from commerce_pending import register
+        register(self.flow_id, 'nownow', self.account_hash, self.items)
         return self
 
     def prepare_only(self, *, timeout=25, record=True):
@@ -834,6 +840,7 @@ class NowNowOrderFlow:
         if not getattr(self, 'owned_session_code', None) or self.session_code != self.owned_session_code:
             return {'cart_checked': False, 'reason': 'NOWNOW_STOP_OWNERSHIP_UNPROVEN'}
         journal.require_nownow_session(self.flow_id, journal.digest({'session': self.session_code}))
+        journal.require_nownow_cleanup_available(self.account_hash, flow_id=self.flow_id)
         deleted = 'cart_delete' in self.consumed()
         body = {'storeCode': self.store_code}
         self._expect('cart_get', body)

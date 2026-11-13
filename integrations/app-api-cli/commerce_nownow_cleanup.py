@@ -127,7 +127,7 @@ def source(flow_id, cleanup_id=None):
 def clear_cart(flow_id, *, auth=None, request=native.native_request, vault=None):
     proof = source(flow_id)
     auth = auth or NoonAuthLifecycle()
-    j.require_account_available('noon', proof['account_hash'])
+    j.require_nownow_cleanup_available(proof['account_hash'])
     try:
         state = load(flow_id)
     except j.JournalError as exc:

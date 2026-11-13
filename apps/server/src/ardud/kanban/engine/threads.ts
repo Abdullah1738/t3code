@@ -7,6 +7,8 @@ import {
   DEFAULT_RUNTIME_MODE,
   MessageId,
   RunId,
+  type OrchestrationV2UserInputQuestion,
+  type RuntimeRequestId,
   type ModelSelection,
   type ProjectId,
   type ThreadId,
@@ -90,6 +92,8 @@ export interface KanbanSendInput {
   readonly text: string;
   /** Stable per logical send when a retry must not deliver a second message. */
   readonly key?: string;
+  /** One logical delivery across replacement recipients; only rejected attempts may send again. */
+  readonly keyAcrossThreads?: boolean;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
   /** Steer only an existing turn; never start an idle thread. */
@@ -105,6 +109,13 @@ type KanbanInterruptResult =
  * steer when a run is live, otherwise it starts a turn; nothing is queued.
  */
 export interface KanbanThreadsShape {
+  readonly pendingUserInputs: (threadId: ThreadId) => Effect.Effect<
+    ReadonlyArray<{
+      readonly requestId: RuntimeRequestId;
+      readonly questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+    }>,
+    KanbanThreadError
+  >;
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
   /** Like view, but a failed read fails: null means the thread is gone. */
   readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
@@ -486,7 +497,7 @@ const make = Effect.gen(function* () {
   );
 
   const sendId = Effect.fn("KanbanThreads.sendId")(function* (
-    input: Pick<KanbanSendInput, "threadId" | "key">,
+    input: Pick<KanbanSendInput, "threadId" | "key" | "keyAcrossThreads">,
   ) {
     let id: string = input.key ?? NodeCrypto.randomUUID();
     if (input.key !== undefined) {
@@ -500,15 +511,18 @@ const make = Effect.gen(function* () {
         if (Option.isNone(receipt)) break;
         if (
           receipt.value.aggregateKind !== "thread" ||
-          receipt.value.aggregateId !== input.threadId ||
-          receipt.value.commandType !== "message.dispatch"
+          receipt.value.commandType !== "message.dispatch" ||
+          (receipt.value.aggregateId !== input.threadId && !input.keyAcrossThreads)
         ) {
           return yield* new KanbanThreadError({
             operation: "send",
             detail: "keyed send receipt belongs to another command",
           });
         }
-        if (receipt.value.status !== "rejected") break;
+        if (receipt.value.status !== "rejected") {
+          if (input.keyAcrossThreads) return;
+          break;
+        }
       }
     }
     return id;
@@ -521,6 +535,7 @@ const make = Effect.gen(function* () {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
       const id = yield* sendId(input);
+      if (id === undefined) return;
       const deliver = Effect.gen(function* () {
         const sent = yield* threads.sendToThread({
           projectId: shell.projectId,
@@ -568,6 +583,7 @@ const make = Effect.gen(function* () {
       const shell = yield* threads.getThreadShell(input.threadId);
       if (!shell || shell.deletedAt !== null) return;
       const id = yield* sendId(input);
+      if (id === undefined) return;
       const receipt = yield* receipts.getByCommandId({
         commandId: CommandId.make(`kanban:send:${id}`),
       });
@@ -667,7 +683,30 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const pendingUserInputs: KanbanThreadsShape["pendingUserInputs"] = Effect.fn(
+    "KanbanThreads.pendingUserInputs",
+  )(
+    function* (threadId) {
+      const records = yield* threads.getThreadRecords(threadId, ["runtimeRequests", "turnItems"], {
+        turnItemTypes: ["user_input_request"],
+      });
+      return records.runtimeRequests.flatMap((request) => {
+        if (request.kind !== "user_input" || request.status !== "pending") return [];
+        const item = records.turnItems.find(
+          (item) => item.type === "user_input_request" && item.requestId === request.id,
+        );
+        return item?.type === "user_input_request"
+          ? [{ requestId: request.id, questions: item.questions }]
+          : [];
+      });
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "pendingUserInputs", detail: detailOf(error) }),
+    ),
+  );
+
   return KanbanThreads.of({
+    pendingUserInputs,
     view,
     find,
     model,

@@ -20,12 +20,14 @@ class NowNowFlowTests(unittest.TestCase):
         self.auth.revalidate.side_effect=lambda *a,**k:AuthSnapshot('nownow','1'*64,fingerprint('HOME','KEY'),
             time.time(),{'cookie':'synthetic=secret','x-addresscode':'HOME','x-addresskey':'KEY'},time.monotonic()+30)
 
-    def test_existing_account_fence_prevents_new_flow_before_wire(self):
+    def test_existing_noon_flow_allows_new_flow_before_wire(self):
         flow='10000000-0000-4000-8000-000000000001'
         c.journal.open_flow(flow_id=flow,app='noon',vertical='minutes',account_hash='1'*64,scope_hash='2'*64)
         wire=Mock()
-        with self.assertRaisesRegex(c.journal.JournalError,'RECONCILIATION_REQUIRED'):
-            c.NowNowFlow(store_code='STORE',products=(('PRODUCT',1),),auth=self.auth,request=wire)
+        fresh=c.NowNowFlow(store_code='STORE',products=(('PRODUCT',1),),auth=self.auth,request=wire)
+        self.assertNotEqual(fresh.flow_id,flow)
+        self.assertFalse(fresh.opened)
+        self.assertEqual(c.journal.inspect(flow)['state'],'ACTIVE')
         wire.assert_not_called()
 
     def test_existing_store_cart_never_adopted_or_changed(self):

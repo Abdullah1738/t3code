@@ -165,8 +165,9 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(unknown['charge'],'unknown')
         self.assertEqual(j.inspect(self.flow)['reserved_minor'],4585)
         self.assertEqual(self.registrations,[])
-        with self.assertRaises(j.JournalError):
-            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        new=str(uuid.uuid4())
+        j.open_flow(flow_id=new,app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        self.assertEqual(j.inspect(new)['state'],'ACTIVE')
 
     def test_automatic_processing_does_not_claim_capture_or_release(self):
         self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
@@ -188,8 +189,9 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(state['reserved_minor'],4585)
         self.assertEqual(state['order_id'],ORDER)
         with self.assertRaises(j.JournalError):self.co.place()
-        with self.assertRaises(j.JournalError):
-            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        new=str(uuid.uuid4())
+        j.open_flow(flow_id=new,app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        self.assertEqual(j.inspect(new)['state'],'ACTIVE')
 
     def test_ambiguous_complete_recovery_and_repeat_are_read_only(self):
         self.co.place();self.fail_send='complete'

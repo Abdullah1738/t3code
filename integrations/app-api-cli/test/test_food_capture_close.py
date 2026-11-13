@@ -103,8 +103,8 @@ class CaptureCloseTests(unittest.TestCase):
 
     def test_close_lifts_prepare_fence_preserves_consumed_sends_and_audit(self):
         before = j.inspect(self.flow)
-        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', self.account)
+        self.assertTrue(j.require_account_available('noon', self.account))
+        self.assertEqual(before['state'],'FENCED')
         with patch.object(j, 'consume', side_effect=AssertionError('no sends')):
             result = self.close()
         self.assertEqual(result['state'], 'COMPLETE')

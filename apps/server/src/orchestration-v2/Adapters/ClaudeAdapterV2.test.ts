@@ -8189,6 +8189,332 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  describe("compaction progress guard", () => {
+    const start = Effect.fnUntraced(function* (
+      options?: Parameters<typeof makeWakeHarnessWithOptions>[0],
+    ) {
+      const harness = yield* makeWakeHarnessWithOptions(options);
+      const input = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("compaction-guard-attempt"),
+        text: "Continue working.",
+        attachments: [],
+      });
+      yield* harness.runtime.startTurn(input);
+      return { ...harness, input };
+    });
+    const compacting = claudeSdkFrame({
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid: "compaction-guard-start",
+      session_id: WAKE_NATIVE_SESSION,
+    });
+    const compactions = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+      events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+          ? [event.turnItem]
+          : [],
+      );
+    const layers = Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer);
+
+    it.effect.each([false, true])(
+      "keeps queued steers in order with compaction=%s",
+      (withCompaction) =>
+        Effect.gen(function* () {
+          const h = yield* start();
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          if (withCompaction) yield* h.offerAndWait(compacting);
+          for (const text of ["first correction", "second correction"]) {
+            yield* h.runtime.steerTurn({
+              threadId: h.threadId,
+              runId: h.input.runId,
+              providerThread: h.providerThread,
+              providerTurnId: idAllocator.derive.providerTurn({
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeTurnId: `turn:${h.input.attemptId}`,
+              }),
+              message: {
+                createdBy: "agent",
+                creationSource: "mcp",
+                messageId: MessageId.make(text),
+                text,
+                attachments: [],
+              },
+            });
+          }
+          assert.lengthOf(h.offeredMessages, 1);
+          if (withCompaction) {
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "status",
+                status: null,
+                compact_result: "success",
+                uuid: "compaction-guard-success",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "informational",
+                content: "Compaction observed",
+                level: "warning",
+                uuid: "compaction-success-observed",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* Queue.take(h.systemNoticeReceipts);
+            assert.equal(compactions(h.events).at(-1)?.status, "completed");
+            assert.lengthOf(h.offeredMessages, 1);
+          }
+          for (const [index, text] of ["first correction", "second correction"].entries()) {
+            yield* h.offerAndWait(
+              makeResultFrame({ uuid: `segment-${index}`, result: "Segment complete." }),
+            );
+            assert.lengthOf(h.offeredMessages, index + 2);
+            assert.equal(h.offeredMessages[index + 1]?.priority, "later");
+            assert.include(JSON.stringify(h.offeredMessages[index + 1]?.message.content), text);
+            assert.isEmpty(h.terminalEvents());
+          }
+          yield* TestClock.adjust("10 minutes");
+          yield* h.offerAndWait(makeResultFrame({ uuid: "steered-final", result: "Done." }));
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "completed");
+          assert.lengthOf(h.offeredMessages, 3);
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect.each(["upstream stream stopped", "", undefined])(
+      "shows failed compaction reason %s",
+      (reason) =>
+        Effect.gen(function* () {
+          const h = yield* start();
+          yield* h.offerAndWait(compacting);
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: null,
+              compact_result: "failed",
+              ...(reason === undefined ? {} : { compact_error: reason }),
+              uuid: "compaction-guard-failure",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "failed-compaction-final", result: "Done." }),
+          );
+          yield* Queue.take(h.terminalReceipts);
+          assert.equal(
+            compactions(h.events).at(-1)?.summary,
+            reason || "Claude compaction failed without a reason.",
+          );
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect.each(["query exit", "watchdog", "watchdog with unresponsive close"] as const)(
+      "%s settles an earlier run's native subagent and open call",
+      (mode) =>
+        Effect.gen(function* () {
+          const closed = yield* Deferred.make<void>();
+          const h = yield* start({
+            close: (q) =>
+              Deferred.succeed(closed, undefined).pipe(
+                Effect.andThen(
+                  mode === "watchdog with unresponsive close" ? Effect.never : Queue.shutdown(q),
+                ),
+              ),
+          });
+          const taskId = "old-run-task";
+          const toolUseId = "toolu-old-run-agent";
+          const bashToolUseId = "toolu-old-run-bash";
+          const bashStatuses = () =>
+            h.events.flatMap((event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.nativeItemRef?.nativeId === bashToolUseId
+                ? [event.turnItem.status]
+                : [],
+            );
+          yield* h.offerAndWait(
+            makeSubagentTaskStartedFrame({
+              taskId,
+              toolUseId,
+              uuid: "old-run-task-start",
+            }),
+          );
+          const started = yield* Queue.take(h.subagentReceipts);
+          assert.equal(started.subagent.status, "running");
+          for (const frame of makeSubagentAssistantFrames({
+            parentToolUseId: toolUseId,
+            uuid: "old-run-assistant",
+            bashToolUseId,
+          }))
+            yield* h.offerAndWait(frame);
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "old-run-complete", result: "Working in background." }),
+          );
+          const firstTerminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(firstTerminal.status, "completed");
+          assert.isTrue(yield* h.hasPendingBackgroundWork);
+          assert.deepEqual(bashStatuses(), ["running"]);
+
+          const next = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("next-run"),
+            providerTurnOrdinal: 2,
+            text: "Continue.",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(next);
+          yield* h.offerAndWait(compacting);
+          if (mode === "query exit") yield* Queue.shutdown(h.sdkMessages);
+          else yield* TestClock.adjust("5 minutes");
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (mode !== "query exit") yield* Deferred.await(closed);
+          else {
+            let ended = yield* Queue.take(h.subagentReceipts);
+            while (ended.subagent.status === "running")
+              ended = yield* Queue.take(h.subagentReceipts);
+          }
+          const latest = h.events.findLast((event) => event.type === "subagent.updated");
+          assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "failed");
+          assert.equal(
+            latest?.type === "subagent.updated" && latest.subagent.runId,
+            started.subagent.runId,
+          );
+          assert.deepEqual(bashStatuses(), ["running", "failed"]);
+          assert.isFalse(yield* h.hasPendingBackgroundWork);
+          assert.lengthOf(h.terminalEvents(), 2);
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect("keeps a replacement turn and native task live after watchdog disposal", () =>
+      Effect.gen(function* () {
+        const closed = yield* Deferred.make<void>();
+        const h = yield* start({
+          freshQueueOnReopen: true,
+          close: () => Deferred.succeed(closed, undefined),
+        });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("5 minutes");
+        const timedOut = yield* Queue.take(h.terminalReceipts);
+        assert.equal(timedOut.failure?.code, "compaction_no_progress");
+        yield* Deferred.await(closed);
+        const next = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("after-compaction-timeout"),
+          providerTurnOrdinal: 2,
+          text: "Recover.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(next);
+        const replacementQueue = h.processQueues[1]!;
+        yield* Queue.offer(
+          replacementQueue,
+          makeSubagentTaskStartedFrame({
+            taskId: "replacement-task",
+            toolUseId: "replacement-agent",
+            uuid: "replacement-started",
+          }),
+        );
+        const task = yield* Queue.take(h.subagentReceipts);
+        assert.equal(task.subagent.status, "running");
+        assert.equal(task.subagent.runId, next.runId);
+        // Both a late result and stream exit belong to the fenced process.
+        yield* h.offerAndWait(makeResultFrame({ uuid: "discarded-result", result: "Too late." }));
+        yield* Queue.shutdown(h.sdkMessages);
+        yield* h.awaitQueryCleanup;
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.isTrue(yield* h.hasPendingBackgroundWork);
+        const latest = h.events.findLast((event) => event.type === "subagent.updated");
+        assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "running");
+        const conflict = yield* h.runtime.startTurn(h.input).pipe(Effect.flip);
+        assert.isTrue(isProtocolError(conflict.cause));
+        if (isProtocolError(conflict.cause))
+          assert.equal(conflict.cause.activeTurn?.runId, next.runId);
+        yield* Queue.offer(
+          replacementQueue,
+          makeResultFrame({ uuid: "replacement-result", result: "Recovered." }),
+        );
+        const completed = yield* Queue.take(h.terminalReceipts);
+        assert.equal(completed.status, "completed");
+        assert.notEqual(completed.providerTurnId, timedOut.providerTurnId);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect("lets an admitted Stop own compaction shutdown without a watchdog terminal", () =>
+      Effect.gen(function* () {
+        const interrupted = yield* Deferred.make<void>();
+        const h = yield* start({
+          interrupt: Deferred.succeed(interrupted, undefined).pipe(Effect.andThen(Effect.never)),
+          close: Queue.shutdown,
+        });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("4 minutes");
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const stop = yield* h.runtime
+          .interruptTurn({
+            providerThread: h.providerThread,
+            providerTurnId: idAllocator.derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${h.input.attemptId}`,
+            }),
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(interrupted);
+        yield* TestClock.adjust("1 minute");
+        yield* Fiber.join(stop);
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "interrupted");
+        assert.equal(compactions(h.events).at(-1)?.status, "interrupted");
+        yield* TestClock.adjust("5 minutes");
+        assert.lengthOf(h.terminalEvents(), 1);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect("fails stalled compaction after five minutes without SDK progress", () =>
+      Effect.gen(function* () {
+        const closed = yield* Deferred.make<void>();
+        const h = yield* start({ close: () => Deferred.succeed(closed, undefined) });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("4 minutes");
+        yield* h.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "informational",
+            content: "Still working",
+            level: "info",
+            uuid: "compaction-progress",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* TestClock.adjust("4 minutes");
+        assert.isEmpty(h.terminalEvents());
+        yield* TestClock.adjust("1 minute");
+        yield* Effect.yieldNow;
+        assert.lengthOf(h.terminalEvents(), 1);
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        assert.equal(terminal.failure?.code, "compaction_no_progress");
+        assert.equal(terminal.failure?.message, "Claude compaction made no progress for 5 min.");
+        assert.equal(compactions(h.events).at(-1)?.status, "failed");
+        assert.equal(compactions(h.events).at(-1)?.summary, terminal.failure?.message);
+        yield* Deferred.await(closed);
+        yield* h.offerAndWait(makeResultFrame({ uuid: "late-result", result: "Too late." }));
+        assert.lengthOf(h.terminalEvents(), 1);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+  });
+
   it.effect.each([
     { outcome: "result", turnStatus: "completed", itemStatus: "failed" },
     { outcome: "interrupt", turnStatus: "interrupted", itemStatus: "interrupted" },
@@ -17897,6 +18223,128 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           "between-turn workflow snapshot",
         );
         assert.equal(coordinatorCount(), betweenTurnCount + 1);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    "query exit",
+    "watchdog",
+    "watchdog close stalls",
+    "watchdog current workflow",
+  ] as const)("%s releases recovery while workflow transcript cleanup stalls", (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const digestStarted = yield* Deferred.make<void>();
+        const digestStopped = yield* Deferred.make<void>();
+        const releaseDigest = yield* Deferred.make<void>();
+        const closeStarted = yield* Deferred.make<void>();
+        const watchdog = mode !== "query exit";
+        const earlierRun = mode !== "watchdog current workflow";
+        let pauseDigest = false;
+        yield* Effect.gen(function* () {
+          const h = yield* makeWorkflowHarnessWithOptions({
+            close: (q) =>
+              Deferred.succeed(closeStarted, undefined).pipe(
+                Effect.andThen(mode === "watchdog close stalls" ? Effect.never : Queue.shutdown(q)),
+              ),
+            freshQueueOnReopen: true,
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("workflow-old"),
+            text: "Launch workflow",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(first);
+          yield* launchWorkflow({ harness: h, snapshotUuid: "workflow-snapshot" });
+          if (earlierRun) {
+            yield* h.offerAndWait(
+              makeResultFrame({ uuid: "workflow-launched", result: "Running in background" }),
+            );
+            yield* Queue.take(h.terminalReceipts);
+            yield* h.runtime.startTurn({
+              ...first,
+              runId: RunId.make("compaction"),
+              attemptId: RunAttemptId.make("compaction"),
+              providerTurnOrdinal: 2,
+            });
+          }
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: "compacting",
+              uuid: "compaction",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          pauseDigest = true;
+          if (watchdog) yield* TestClock.adjust("5 minutes");
+          else yield* Queue.shutdown(h.sdkMessages);
+          yield* Deferred.await(digestStarted);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          const next = {
+            ...first,
+            runId: RunId.make("recovery"),
+            attemptId: RunAttemptId.make("recovery"),
+            providerTurnOrdinal: 3,
+          };
+          const recovering = yield* h.runtime
+            .startTurn(next)
+            .pipe(Effect.timeoutOption("30 seconds"), Effect.forkScoped);
+          if (watchdog) yield* TestClock.adjust("30 seconds");
+          assert.isTrue(
+            Option.isSome(yield* Fiber.join(recovering)),
+            "recovery admission stayed blocked behind transcript cleanup",
+          );
+          if (watchdog) {
+            assert.isTrue(
+              Option.isSome(yield* Deferred.poll(closeStarted)),
+              "native close never started",
+            );
+            assert.isTrue(
+              Option.isSome(yield* Deferred.poll(digestStopped)),
+              "transcript enrichment was not bounded",
+            );
+            assert.equal(workflowCoordinatorEvents(h.events).at(-1)?.subagent.status, "failed");
+            for (const index of [1, 2])
+              assert.equal(workflowMemberEvents(h.events, index).at(-1)?.subagent.status, "failed");
+            assert.isFalse(yield* h.hasPendingBackgroundWork);
+          }
+          yield* Queue.offer(
+            h.processQueues[1]!,
+            makeResultFrame({ uuid: "recovery-result", result: "Recovered" }),
+          );
+          assert.equal((yield* Queue.take(h.terminalReceipts)).status, "completed");
+          assert.lengthOf(h.terminalEvents(), earlierRun ? 3 : 2);
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseDigest, undefined)),
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fileSystem,
+            readDirectory: () => Effect.succeed([]),
+            readFileString: () => Effect.succeed(""),
+            exists: () => Effect.succeed(false),
+          }),
+          Effect.provideService(WorkflowAgentTranscriptReadObserver, () =>
+            Effect.gen(function* () {
+              if (!pauseDigest) return;
+              pauseDigest = false;
+              yield* Deferred.succeed(digestStarted, undefined);
+              yield* Deferred.await(releaseDigest).pipe(
+                Effect.ensuring(Deferred.succeed(digestStopped, undefined)),
+              );
+            }),
+          ),
+        );
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),

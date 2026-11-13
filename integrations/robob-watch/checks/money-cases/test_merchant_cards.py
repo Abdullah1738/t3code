@@ -37,6 +37,69 @@ class MerchantCases(unittest.TestCase):
         cs.record_cancelled('5542', reason='cancelled 29 Oct')
         cm.seed()
 
+    def test_saved_card_name_does_not_abort_mixed_book_alerts(self):
+        now = self.now + dt.timedelta(hours=1)
+        wd = self.root / 'watch'
+        wd.mkdir()
+        mc.add(self.data, 'refund', 'Shop', '42', 'AED', 'refund pending', 'check receipt',
+               '2026-11-13', 'Abdullah', at=self.now)
+        mc.add(self.data, 'bill', 'Wio statement', '120', 'AED', 'repayment due', 'confirm paid',
+               '2026-11-13', 'Abdullah', at=self.now)
+        rows = [{'key': 'youtube premium', 'merchant': 'YouTube Premium', 'next_charge': '2026-11-13',
+                 'dead_cards': [{'last4': '1111', 'state': 'cancelled'}]}]
+        with patch.object(mc, 'merchant_dead', return_value=rows):
+            event = mc.run_check(wd, 'mixed', self.data, now=now)
+            # With no runner acknowledgement, none of these lines may emit again.
+            repeat = mc.run_check(wd, 'mixed-again', self.data, now=now + dt.timedelta(minutes=15))
+        saved = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'merchant_card')
+        self.assertIn(saved['state'], event)
+        self.assertIn('saved card', event)
+        self.assertIn('refund: Shop AED 42', event)
+        self.assertIn('bill: Wio statement AED 120', event)
+        self.assertIn('balance after credits: AED 120.00', event)
+        self.assertEqual(event.count('balance after credits:'), 1)
+        self.assertNotIn('balance after credits:', next(line for line in event.splitlines() if saved['id'] in line))
+        self.assertEqual(repeat, '')
+        self.assertTrue((wd / 'pings.json').exists())
+
+    def test_saved_card_keyword_class_is_never_a_monetary_bill(self):
+        for merchant in ('YouTube Premium', 'Premium', 'Bill', 'Statement', 'Autopay', 'Repayment'):
+            for amount, currency in ((None, None), ('120', 'AED')):
+                with self.subTest(merchant=merchant, amount=amount, currency=currency):
+                    saved = {'kind': 'merchant_card', 'merchant': merchant, 'amount': amount, 'currency': currency}
+                    self.assertFalse(mc.is_bill(saved))
+                    self.assertEqual(mc.balance_after_credits(saved, [saved], self.now), 'saved card')
+
+    def test_unknown_amount_class_keeps_due_reminders_without_balance_arithmetic(self):
+        for field in ('amount', 'currency'):
+            for shape in ('missing', None, ''):
+                with self.subTest(field=field, shape=shape):
+                    data = self.root / (field + str(shape))
+                    bill = mc.add(data, 'bill', 'Premium bill', '120', 'AED', 'repayment due', 'check statement',
+                                  '2026-11-13', 'Abdullah', at=self.now)
+                    if shape == 'missing':
+                        bill.pop(field)
+                    else:
+                        bill[field] = shape
+                    self.assertFalse(mc.is_bill(bill))
+                    self.assertEqual(mc.balance_after_credits(bill, [bill], self.now), 'amount unknown')
+                    entries = mc.attention([bill], self.now, {})
+                    self.assertEqual(len(entries), 1)
+                    self.assertIn('amount unknown', entries[0][0])
+                    self.assertFalse(any('balance after credits' in text for _, text in entries[0][1]))
+                    # Payment deadlines have their own alert path and must also handle an unknown amount.
+                    bill['kind'] = 'payment_deadline'
+                    entries = mc.payment_entries([bill], self.now, {})
+                    self.assertEqual(len(entries), 1)
+                    self.assertIn('amount unknown', entries[0][0])
+                    self.assertIn('balance after credits: amount unknown', entries[0][1][0][1])
+
+    def test_zero_amount_is_a_known_balance(self):
+        bill = mc.add(self.data, 'zero', 'Premium bill', '0', 'AED', 'repayment due', 'check statement',
+                      '2026-11-13', 'Abdullah', at=self.now)
+        self.assertTrue(mc.is_bill(bill))
+        self.assertEqual(mc.balance_after_credits(bill, [bill], self.now), 'AED 0.00')
+
     def test_open_dedupe_close_reopen_and_brief(self):
         mc.reconcile_merchants(self.data, self.now)
         original = mc.load(self.data)['cases']

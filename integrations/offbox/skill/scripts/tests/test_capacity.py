@@ -37,7 +37,7 @@ class Isolated(unittest.TestCase):
         self.stack.enter_context(patch.object(common, 'LOG_PATH', root/'log'))
         self.stack.enter_context(patch.object(spend, 'CAP_PATH', root/'cap.json'))
         self.stack.enter_context(patch.object(lease, 'CAP_PATH', root/'cap.json'))
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS':'0', 'OFFBOX_POOL_SIZE':'2'}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':'boat', 'OFFBOX_POOL_WAIT_SECONDS':'0', 'OFFBOX_POOL_SIZE':'2'}))
         for name in ('OFFBOX_STARTS_PER_MINUTE','OFFBOX_STARTS_PER_HOUR','OFFBOX_STARTS_PER_DAY'):
             self.stack.enter_context(patch.dict(os.environ, {name: str(dict(MINUTE=25,HOUR=180,DAY=760)[name.rsplit('_',1)[-1]])}))
         self.con = common.db()

@@ -44,6 +44,85 @@ class StateFixtures(unittest.TestCase):
             return original(operation, *args, **kwargs)
         return request
 
+    def test_other_open_flow_blocks_stopped_cart_cleanup(self):
+        for when in ('before_read', 'before_delete'):
+            with self.subTest(when=when), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                    patch.object(lane.receipts, 'ROOT', Path(temp).resolve() / 'commerce'):
+                flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+                before = len(harness.calls)
+                other = '10000000-0000-4000-8000-000000000099'
+                def opened():
+                    j.open_flow(flow_id=other, app='noon', vertical='food',
+                                account_hash=flow.account_hash, scope_hash='a'*64)
+                original = j.consume
+                def consume(flow_id, operation, **kw):
+                    if operation == 'cart_delete':
+                        opened()
+                    return original(flow_id, operation, **kw)
+                if when == 'before_read':
+                    opened()
+                with patch.object(j, 'consume', side_effect=consume), self.assertRaises(Exception):
+                    flow.stop_unsent()
+                if when == 'before_read':
+                    self.assertEqual(len(harness.calls), before)
+                self.assertNotIn('cart_delete', [op for op, _ in harness.calls])
+                self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
+                self.assertEqual(j.inspect(other)['state'], 'ACTIVE')
+                self.assertTrue(j.require_account_available('noon', flow.account_hash))
+
+    def test_pending_review_failure_before_cart_never_deletes(self):
+        import commerce_pending as pending
+        original = pending.cli_review
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                flow, harness = f.make_flow(f.happy_responses())
+                def denied(current, args):
+                    if registered:
+                        original(current, args)
+                    j.fail('PENDING_BASKET_CHANGED')
+                with patch.object(cli, 'CommerceAuth', return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                        patch.object(lane, 'NowNowOrderFlow', return_value=flow), \
+                        patch.object(pending, 'cli_review', side_effect=denied), \
+                        patch.object(flow, 'stop_unsent', wraps=flow.stop_unsent) as stopped, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(['order', 'nownow', '--store-code', f.STORE,
+                        '--product-code', f.PRODUCT, '--quantity', '1', '--prepare-only'])
+                result = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(code, 1)
+                self.assertEqual(result['error'], 'PENDING_BASKET_CHANGED')
+                self.assertEqual(result['cleanup']['reason'], 'NOWNOW_NO_OWNED_CART')
+                stopped.assert_called_once()
+                self.assertFalse(flow.opened)
+                self.assertEqual(harness.calls, [])
+
+    def test_pending_ack_denial_reaches_cli_without_financial_send(self):
+        import commerce_pending as pending
+        flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+        old = '10000000-0000-4000-8000-000000000001'
+        j.open_flow(flow_id=old, app='noon', vertical='nownow', account_hash=flow.account_hash, scope_hash='a'*64)
+        pending.register(old, 'nownow', flow.account_hash, flow.items)
+        j.record_nownow_prepared(old, '5'*64)
+        j.consume(old, 'subscription', kind='preauthorize', request_hash='3'*64,
+                  cart_hash=j.digest(old), review_hash='5'*64, payable_minor=3145)
+        j.observe(old, 'subscription', outcome='CHALLENGE_REQUIRED', evidence_hash='6'*64)
+        original_resume = lane.NowNowOrderFlow.resume_active
+        with patch.object(cli, 'CommerceAuth', return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                patch.object(lane.NowNowOrderFlow, 'resume_active', side_effect=lambda fid, **kw:
+                    original_resume(fid, request=harness.request, **kw)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = cli.main(['order', 'nownow', '--store-code', f.STORE,
+                '--product-code', f.PRODUCT, '--quantity', '1', '--resume-flow', flow.flow_id])
+        result = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['error'], 'SAME_BASKET_PENDING_ACK_REQUIRED')
+        self.assertEqual(result['warnings'][0]['flow_id'], old)
+        self.assertFalse(result['financial_send'])
+        self.assertEqual(result['cleanup']['reason'], 'NOWNOW_CLEAR_OPEN_FLOW')
+        self.assertEqual(j.inspect(flow.flow_id)['reserved_minor'], 0)
+        self.assertFalse(any(op in ('place', 'payment_subscription', 'payment_complete', 'cart_delete') for op, _ in harness.calls))
+        self.assertTrue(j.require_account_available('noon', flow.account_hash))
+
     def test_notice_and_stale_cart_fixtures(self):
         for case in CASES:
             if 'patch' not in case and case['state'] != 'stale_store_cart': continue
@@ -242,8 +321,9 @@ class StateFixtures(unittest.TestCase):
         self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
         with self.assertRaisesRegex(j.JournalError, 'JOURNAL_CLEAR_EMPTY_READBACK_REQUIRED'):
             j.abandon(flow.flow_id)
-        with self.assertRaises(j.JournalError):
-            j.require_account_available('noon', flow.account_hash)
+        self.assertTrue(j.require_account_available('noon', flow.account_hash))
+        with self.assertRaisesRegex(j.JournalError, 'NOWNOW_CLEAR_OPEN_FLOW'):
+            j.require_nownow_cleanup_available(flow.account_hash)
         fail_recent = False
         for store, session in ((f.STORE, 'OTHER-SESSION'), ('OTHER-STORE', flow.session_code)):
             with self.subTest(store=store, session=session):
@@ -325,8 +405,11 @@ class StateFixtures(unittest.TestCase):
                 else:
                     self.assertFalse(result['cleanup'].get('cart_empty'))
                     self.assertEqual(j.inspect(flow.flow_id)['state'],'FENCED' if remaining == 'unknown' else 'ACTIVE')
+                    self.assertTrue(j.require_account_available('noon',flow.account_hash))
+                    with self.assertRaisesRegex(j.JournalError, 'NOWNOW_CLEAR_OPEN_FLOW'):
+                        j.require_nownow_cleanup_available(flow.account_hash)
                     with self.assertRaises(j.JournalError):
-                        j.require_account_available('noon',flow.account_hash)
+                        j.abandon(flow.flow_id)
                 self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls),1)
                 self.assertFalse(any(op in ('place','payment_subscription','payment_complete') for op, _ in harness.calls))
 

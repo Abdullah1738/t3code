@@ -258,6 +258,8 @@ class MinutesFlow:
         if financial and self.review is None:
             j.fail('MINUTES_EXACT_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register, legacy_scopes
+            register(self.flow_id, 'minutes', self.snapshot.account_ref, self.skus, legacy=legacy_scopes('minutes', self.skus, self.snapshot.address_ref, extra=self.driver_note_extra, use_current_cart=self.use_current_cart))
             j.open_flow(flow_id=self.flow_id,app='noon',vertical='minutes',
                 account_hash=self.snapshot.account_ref,scope_hash=self.scope_hash)
             self.opened=True
@@ -414,6 +416,8 @@ class MinutesFlow:
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
             header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
             home_provider=self._fresh_home)
+        from commerce_pending import register, legacy_scopes
+        register(self.flow_id, 'minutes', self.snapshot.account_ref, self.skus, legacy=legacy_scopes('minutes', self.skus, self.snapshot.address_ref, extra=self.driver_note_extra, use_current_cart=self.use_current_cart))
         return self
 
     def select_quiet(self):

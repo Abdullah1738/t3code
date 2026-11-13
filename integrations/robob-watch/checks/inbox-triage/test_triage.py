@@ -1,5 +1,6 @@
 """Narrow offline checks for filtering and no-loss cursor/outbox behavior."""
 import copy
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -654,6 +655,15 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual((qs['20.00']['status'], qs['30.00']['wait_until'] is not None, qs['50.00']['passed'],
                           qs['40.00']['passed']), ('closed', True, True, False))
         self.assertEqual(self.mc.load_questions()['questions'], [])
+
+    def test_delegated_purchase_is_explained_before_the_classifier(self):
+        self.mc.note_purchase(self.mc.DATA, 'CHATGPT', '1920', 'EUR', '1111', 'owner', 'thread:purchase',
+                              'invoice-4', now=dt.datetime.fromtimestamp(self.now - 660, self.mc.TZ))
+        item = self.alert(77, '1920.00', 'CHATGPT', 600)
+        model, state, runs = self.run_triage([item])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['charge_explained'], 1)
 
     def test_an_unexplained_charge_goes_on_even_when_the_classifier_skips_it(self):
         model, state, runs = self.run_triage([self.alert(4, '50.00', 'UMBRELLA', 600)])

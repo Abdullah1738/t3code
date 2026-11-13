@@ -14,6 +14,9 @@ import {
   ProviderInstanceId,
   RunId,
   RuntimeRequestId,
+  NodeId,
+  type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2TurnItem,
   ThreadId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
@@ -22,6 +25,7 @@ import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
@@ -323,6 +327,161 @@ it.effect("interrupt fails on a failed shell read and treats a missing thread as
       ),
     );
   }),
+);
+
+it.effect(
+  "pendingUserInputs returns readable pending questions only, preserving every option",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-questions");
+      const requests = [
+        ["pending", "user_input", "pending"],
+        ["resolved", "user_input", "resolved"],
+        ["cancelled", "user_input", "cancelled"],
+        ["expired", "user_input", "expired"],
+        ["approval", "command", "pending"],
+        ["missing-item", "user_input", "pending"],
+      ] as const;
+      const runtimeRequests: OrchestrationV2RuntimeRequest[] = requests.map(
+        ([id, kind, status]) => ({
+          id: RuntimeRequestId.make(id),
+          nodeId: NodeId.make(id),
+          kind,
+          status,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          responseCapability: { type: "message" },
+          createdAt: at(QUESTION_AT),
+          resolvedAt: status === "pending" ? null : at(FINISHED_AT),
+        }),
+      );
+      const questions = [
+        {
+          id: "strategy",
+          header: "Git",
+          question: "Rebase or merge?",
+          options: [
+            { label: "Rebase", description: "Force-push", value: "rebase" },
+            { label: "Merge", description: "Normal push" },
+          ],
+        },
+      ];
+      const turnItems: OrchestrationV2TurnItem[] = requests
+        .filter(([id]) => id !== "missing-item")
+        .map(([id], ordinal) => ({
+          id: TurnItemId.make(id),
+          threadId,
+          runId: null,
+          nodeId: NodeId.make(id),
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "waiting",
+          title: null,
+          startedAt: at(QUESTION_AT),
+          completedAt: null,
+          updatedAt: at(QUESTION_AT),
+          type: "user_input_request",
+          requestId: RuntimeRequestId.make(id),
+          questions,
+        }));
+      let fail = false;
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadRecords: () =>
+          fail
+            ? Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({ threadId, cause: "read failed" }),
+              )
+            : Effect.succeed({ runtimeRequests, turnItems } as never),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        expect(yield* threads.pendingUserInputs(threadId)).toEqual([
+          { requestId: RuntimeRequestId.make("pending"), questions },
+        ]);
+        fail = true;
+        const result = yield* Effect.result(threads.pendingUserInputs(threadId));
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) expect(result.failure.operation).toBe("pendingUserInputs");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  { status: "rejected", cross: true, acceptedRetry: false, sends: 1 },
+  { status: "accepted", cross: true, acceptedRetry: false, sends: 0 },
+  { status: "rejected", cross: true, acceptedRetry: true, sends: 0 },
+  { status: "rejected", cross: false, acceptedRetry: false, sends: 0 },
+  { status: "accepted", cross: false, acceptedRetry: false, sends: 0 },
+] as const)(
+  "delivery replacement: prior=$status cross=$cross acceptedRetry=$acceptedRetry",
+  (row) =>
+    Effect.gen(function* () {
+      const old = ThreadId.make("old-evaluator");
+      const replacement = ThreadId.make("replacement-evaluator");
+      const sent: string[] = [];
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+        sendToThread: (input) =>
+          Effect.sync(() => {
+            sent.push(input.commandId);
+            return { run: { id: "delivered" } } as never;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+        const receipt = {
+          commandId: CommandId.make("kanban:send:question-key"),
+          aggregateKind: "thread" as const,
+          aggregateId: old,
+          commandType: "message.dispatch",
+          acceptedAt: QUESTION_AT,
+          resultSequence: 1,
+          status: row.status,
+          error: row.status === "rejected" ? "unavailable" : null,
+        };
+        yield* receipts.insertIfAbsent(receipt);
+        if (row.acceptedRetry)
+          yield* receipts.insertIfAbsent({
+            ...receipt,
+            commandId: CommandId.make("kanban:send:question-key:retry:1"),
+            status: "accepted",
+            error: null,
+          });
+        const threads = yield* KanbanThreads;
+        const result = yield* Effect.result(
+          threads.send({
+            threadId: replacement,
+            text: "Same question",
+            key: "question-key",
+            keyAcrossThreads: row.cross,
+          }),
+        );
+        expect(Result.isSuccess(result)).toBe(row.cross);
+        expect(sent).toHaveLength(row.sends);
+        if (row.sends) expect(sent[0]).toBe("kanban:send:question-key:retry:1");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provideMerge(CommandReceipts.layer),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect("a keyed send passes stable command and message ids to thread management", () =>

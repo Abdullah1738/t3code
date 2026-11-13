@@ -1450,6 +1450,60 @@ it.effect("preserves failed legacy materialization when reading checkpoint conte
   }).pipe(Effect.provide(layerTest));
 });
 
+it.effect("waitForThread counts initial projection loading against its budget", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:wait-budget");
+    const threadId = ThreadId.make("thread:wait-budget");
+    const runId = RunId.make("run:wait-budget");
+    const loading = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const subscribed = yield* Deferred.make<void>();
+    let reads = 0;
+    const projection = {
+      thread: { id: threadId, projectId, deletedAt: null },
+      runs: [{ id: runId, status: "running" }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadEventSequence: () => Effect.succeed(0),
+          restartContinuationPending: () => Effect.succeed(false),
+          getThreadRecords: () => {
+            reads++;
+            return reads === 1
+              ? Deferred.succeed(loading, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(projection),
+                )
+              : Effect.succeed(projection);
+          },
+          streamStoredEventsFrom: () =>
+            Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.never),
+            ),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
+    const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layerTest),
+    );
+    const call = yield* service
+      .waitForThread({ projectId, threadId, runId, timeoutMs: 1000 })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(loading);
+    yield* TestClock.adjust(600);
+    yield* Deferred.succeed(release, undefined);
+    yield* Deferred.await(subscribed);
+    yield* TestClock.adjust(400);
+    expect(call.pollUnsafe()).toBeDefined();
+    expect((yield* Fiber.join(call)).timedOut).toBe(true);
+  }),
+);
+
 it.effect.each([
   { finalStatus: "completed" as const, timedOut: false },
   { finalStatus: "failed" as const, timedOut: false },

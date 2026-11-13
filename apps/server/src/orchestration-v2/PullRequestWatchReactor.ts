@@ -176,6 +176,7 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
     left.failedChecks.join("\n") === right.failedChecks.join("\n") &&
     left.passed === right.passed &&
     left.passedChecks.join("\n") === right.passedChecks.join("\n") &&
+    left.passedPending.join("\n") === right.passedPending.join("\n") &&
     left.remarksThrough === right.remarksThrough &&
     left.remarkIds.join("\n") === right.remarkIds.join("\n") &&
     left.conflicting === right.conflicting &&
@@ -297,9 +298,10 @@ export const make = Effect.gen(function* () {
     target: WatchTarget,
     failures: number,
     error: Option.Option<PullRequestService.PullRequestError>,
+    reason?: string,
   ) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive read ${failures === 1 ? "failure" : "failures"}.${Option.match(
+      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}${Option.match(
         error,
         {
           onNone: () => "",
@@ -451,6 +453,29 @@ export const make = Effect.gen(function* () {
     return { projectId: first.thread.projectId, ...identityOf(first.link) };
   };
 
+  const unsuccessfulRead = Effect.fn("PullRequestWatchReactor.unsuccessfulRead")(function* (
+    group: WatchGroup,
+    error: Option.Option<PullRequestService.PullRequestError>,
+    reason?: string,
+  ) {
+    const failures = (readFailures.get(group.key) ?? 0) + 1;
+    readFailures.set(group.key, failures);
+    if (reason !== undefined) {
+      yield* Effect.logInfo("pull request watch evaluation delayed", {
+        pullRequest: group.key,
+        threads: group.targets.map((target) => target.thread.id),
+        reason,
+        failures,
+      });
+    }
+    const unavailable = Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
+    if (!unavailable && failures < READ_FAILURE_LIMIT) return false;
+    if (yield* eachTarget(group, (target) => giveUp(target, failures, error, reason))) {
+      readFailures.delete(group.key);
+    }
+    return true;
+  });
+
   const fingerprintOf = (group: WatchGroup) =>
     pullRequests.watchFingerprint(referenceOf(group)).pipe(
       Effect.catchCause(
@@ -500,22 +525,10 @@ export const make = Effect.gen(function* () {
     if (Exit.isFailure(read)) {
       if (Cause.hasInterruptsOnly(read.cause)) return yield* Effect.failCause(read.cause);
       lastReads.delete(group.key);
-      if (isRateLimited(read.cause)) return;
-      const failures = (readFailures.get(group.key) ?? 0) + 1;
-      readFailures.set(group.key, failures);
       const error = Cause.findErrorOption(read.cause);
-      // Unavailable reasons require a tool, credential or host configuration change.
-      const unavailable =
-        Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
-      if (
-        (unavailable || failures >= READ_FAILURE_LIMIT) &&
-        (yield* eachTarget(group, (target) => giveUp(target, failures, error)))
-      ) {
-        readFailures.delete(group.key);
-      }
+      yield* unsuccessfulRead(group, error);
       return yield* Effect.failCause(read.cause);
     }
-    readFailures.delete(group.key);
     const [detail, activity] = read.value;
     const headSha = detail.headSha ?? null;
     for (const target of group.targets) {
@@ -531,12 +544,26 @@ export const make = Effect.gen(function* () {
       });
     }
     if (detail.state !== "open") {
+      readFailures.delete(group.key);
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
         detail.state === "closed"
           ? closed(target)
           : record(target, null).pipe(Effect.tap(() => ended(target, "merged"))),
       );
+    }
+
+    if (pullRequestChecksSettling(detail)) {
+      if (
+        yield* unsuccessfulRead(
+          group,
+          Option.none(),
+          "The PR head, source branch, and check rollup still disagree.",
+        )
+      )
+        return;
+    } else {
+      readFailures.delete(group.key);
     }
 
     // Never advance the remark watermark past comments an incomplete read could have missed.
@@ -560,7 +587,11 @@ export const make = Effect.gen(function* () {
         detail.mergeability === "unknown" ||
         group.targets.some(({ watch }) => {
           const next = evaluatePullRequestWatch(watch, detail, null).next;
-          return next.conflictHead !== null && !next.conflicting;
+          return (
+            (next.conflictHead !== null && !next.conflicting) ||
+            // The first optional green read still needs a confirmation on the next sweep.
+            (next.passedPending.length > 0 && !next.passed)
+          );
         }) ||
         detail.checks.some((check) => check.status === "pending"),
       remarksComplete: plan.activity ? remarks !== null : (last?.remarksComplete ?? false),
@@ -666,13 +697,20 @@ export const make = Effect.gen(function* () {
       groups,
       (group, index) => {
         const fingerprint = fingerprints[index]!;
-        return fingerprint === "paused"
-          ? Effect.void
-          : readGroup(group, fingerprint).pipe(
-              Effect.catchCause(
-                logFailure("pull request watch check failed", { pullRequest: group.key }),
-              ),
-            );
+        if (fingerprint === "paused") {
+          // Recovery must read detail before its cached plan can skip clearing the failure streak.
+          lastReads.delete(group.key);
+          return unsuccessfulRead(
+            group,
+            Option.none(),
+            "A host rate limit prevented reading checks.",
+          );
+        }
+        return readGroup(group, fingerprint).pipe(
+          Effect.catchCause(
+            logFailure("pull request watch check failed", { pullRequest: group.key }),
+          ),
+        );
       },
       { concurrency: 4, discard: true },
     );

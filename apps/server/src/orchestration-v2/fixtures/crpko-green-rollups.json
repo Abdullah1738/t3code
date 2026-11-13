@@ -1,0 +1,62 @@
+[
+  {
+    "number": 1261,
+    "headSha": "4e843f698314c27bd62f28c3cfef14cd3e4bae99",
+    "checks": [
+      ["Authorize manual run", "skipped"],
+      ["broker-rights", "success"],
+      ["Static Terraform checks (infra)", "success"],
+      ["Static Terraform checks (unit 1/9)", "success"],
+      ["Static Terraform checks (unit 2/9)", "success"],
+      ["Static Terraform checks (unit 3/9)", "success"],
+      ["Static Terraform checks (unit 4/9)", "success"],
+      ["Static Terraform checks (unit 5/9)", "success"],
+      ["Static Terraform checks (unit 6/9)", "success"],
+      ["Static Terraform checks (unit 7/9)", "success"],
+      ["Static Terraform checks (unit 8/9)", "success"],
+      ["Static Terraform checks (unit 9/9)", "success"],
+      ["Static Terraform checks (log coverage)", "success"],
+      [
+        "Static Terraform checks (clickhouse scripts/test-clickhouse-retention-refresh.mjs)",
+        "success"
+      ],
+      ["Redis plan guard (dev)", "success"],
+      ["bootstrap-unsaved-apply", "skipped"],
+      ["Bootstrap root plan (dev)", "skipped"],
+      ["Infra-only IAM plan-role prerequisite", "skipped"],
+      ["terraform", "skipped"],
+      ["terraform-saved-plan-apply", "skipped"],
+      ["bootstrap-saved-plan-apply", "skipped"],
+      ["Static Terraform checks", "success"]
+    ]
+  },
+  {
+    "number": 1250,
+    "headSha": "380e5af4e5ea359b4254d5d447b94647483d4a34",
+    "checks": [
+      ["Authorize manual run", "skipped"],
+      ["broker-rights", "success"],
+      ["Static Terraform checks (infra)", "success"],
+      ["Static Terraform checks (unit 1/9)", "success"],
+      ["Static Terraform checks (unit 2/9)", "success"],
+      ["Static Terraform checks (unit 3/9)", "success"],
+      ["Static Terraform checks (unit 4/9)", "success"],
+      ["Static Terraform checks (unit 5/9)", "success"],
+      ["Static Terraform checks (unit 6/9)", "success"],
+      ["Static Terraform checks (unit 7/9)", "success"],
+      ["Static Terraform checks (unit 8/9)", "success"],
+      ["Static Terraform checks (unit 9/9)", "success"],
+      ["Static Terraform checks (log coverage)", "success"],
+      [
+        "Static Terraform checks (clickhouse scripts/test-clickhouse-retention-refresh.mjs)",
+        "success"
+      ],
+      ["Redis plan guard (dev)", "success"],
+      ["Bootstrap root plan (dev)", "skipped"],
+      ["Infra-only IAM plan-role prerequisite", "skipped"],
+      ["terraform", "skipped"],
+      ["terraform-saved-plan-apply", "skipped"],
+      ["Static Terraform checks", "success"]
+    ]
+  }
+]
