@@ -1,3 +1,4 @@
+import { emit, observed, recoveryIo } from './logging.mjs';
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
@@ -46,9 +47,14 @@ async function mapLimit(items, limit, fn) {
 
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
-export async function stallScan({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
+export async function stallScan(options, io = realIo) {
+  return observed('stream-recovery', 'stall.scan', () => stallScanImpl(options, io));
+}
+
+async function stallScanImpl({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
   assertRecoveryActive(io);
-  io = guardRecoveryIo(io);
+  io = recoveryIo(guardRecoveryIo(io));
+  const scanStart = performance.now();
   const iso = new Date(now).toISOString();
   const cutover = await io.harnessCutoverStatus();
   const active = new Set([...(await io.activeSessions())].filter(isOpenCodeSessionId));
@@ -102,6 +108,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     assertRecoveryActive(io);
     // A dry run may report what would happen but must not finish a stored stall.
     const completed = dryRun ? { ...stall } : stall;
+    emit('stream-recovery', 'stall.result', { kind: outcome === 'failed' ? 'error' : 'perf', ok: outcome !== 'failed', durationMs: performance.now() - scanStart, ids: { incident: id, session: stall.ses }, props: { tag: outcome, dryRun }, ...(outcome === 'failed' ? { error: { tag: 'stall_failed' } } : {}) });
     Object.assign(completed, { outcome, detail: detail ?? null, done: true, doneAt: iso });
     completed.summary = buildStallSummary(completed).text.split("\n")[0];
     if (!dryRun) completed.alertPending = true;
@@ -217,6 +224,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       ses, kind: activity.kind, limitMs: activity.limitMs, quietMs, waiting, childActive,
       parentID: info?.parentID, thread, recent,
     });
+    emit('stream-recovery', 'stall.decision', { ok: true, durationMs: performance.now() - scanStart, ids: { session: ses }, props: { action: plan.action, tag: plan.action, dryRun } });
     const title = thread?.title || info?.title || ses;
     if (plan.action === "skip") {
       if (verbose) log(`stall: skip ${ses} | ${truncate(title, 60)} | ${plan.reason}`);
@@ -321,6 +329,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         (s) => s.ses === g.ses && (s.action === "robob" || s.action === "opencode") && now - Date.parse(s.at) < DAY_MS,
       ).length;
       const plan = planGhost({ thread: t, recent });
+      emit('stream-recovery', 'ghost.decision', { ok: true, durationMs: performance.now() - scanStart, ids: { thread: t.threadId }, props: { action: plan.action, tag: plan.action, dryRun } });
       const stall = {
         at: iso, ses: g.ses, threadId: t.threadId, runId: t.activeRunId, title: t.title || g.ses,
         origin: t.origin ?? null, parentTitle: null, kind: "ghost", label: GHOST_LABEL,

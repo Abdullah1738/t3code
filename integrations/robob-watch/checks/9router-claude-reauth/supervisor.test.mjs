@@ -4,11 +4,19 @@ import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { acquireLease, leaseOwner, releaseLease } from './lease.mjs';
 import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, runBoundedCommand, runObserved, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
+
+const testLogDir = mkdtempSync(join(tmpdir(), 'reauth-logs-'));
+const previousLogDir = process.env.ROUTER_LOG_DIR;
+process.env.ROUTER_LOG_DIR = testLogDir;
+after(() => {
+  if (previousLogDir === undefined) delete process.env.ROUTER_LOG_DIR; else process.env.ROUTER_LOG_DIR = previousLogDir;
+  rmSync(testLogDir, { recursive: true, force: true });
+});
 
 const MODEL = { instanceId: 'opencode', model: 'opus/cx/gpt-6.1-terra', variant: 'max' };
 const good = (id = 'alpha') => ({ id, provider: 'claude', authType: 'oauth', isActive: true });
@@ -769,4 +777,22 @@ test('four failures followed by recovery remains successful and retains the stal
   assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
   const next = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
   assert.equal(next.code, 0); assert.equal(next.stderr, '');
+});
+
+test('logging covers relogin needed, start, ok and fail while preserving the safety fence', async t => {
+  const { fixture } = await import('../../../router-logging/test/support.mjs');
+  const { rows } = fixture(t);
+  const h = harness(t);
+  await h.tick();
+  h.complete(); h.sim.rows = [good()]; await h.tick();
+  h.sim.rows = [bad('another')]; h.sim.createError = true;
+  await assert.rejects(h.tick, /launch outcome unknown/);
+  for (const name of ['relogin.needed','relogin.start','relogin.ok','relogin.fail']) assert.ok(rows().some(r => r.name === name), name);
+  const safe = harness(t); safe.ctx.enforceSafetyFence = true; await safe.tick();
+  assert.equal(safe.sim.creates.length, 0);
+  safe.sim.rows = [{ ...bad(), isActive: false }]; await safe.tick();
+  assert.ok(!rows().some(r => r.props?.tag === 'marker_cleared_observed'));
+  safe.sim.rows = [good()]; await safe.tick();
+  assert.ok(rows().some(r => r.props?.tag === 'marker_cleared_observed'));
+  assert.ok(!JSON.stringify(rows()).includes('REAUTH_RESULT'));
 });
