@@ -363,6 +363,17 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
   ) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly applyApprovedInstructions: (
+    boardId: KanbanBoardId,
+    field: keyof KanbanBoard["instructions"],
+    text: string,
+    cardId: KanbanCard["id"],
+    askId: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<
+    { readonly board: KanbanBoard; readonly applied: boolean; readonly reason?: string },
+    KanbanError
+  >;
   readonly setNightlyReview: (
     boardId: KanbanBoard["id"],
     input: {
@@ -10777,6 +10788,95 @@ const make = Effect.gen(function* () {
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
     guard("board.update", updateBoardUnlocked(boardId, patch));
 
+  const applyApprovedInstructions: KanbanServiceShape["applyApprovedInstructions"] = Effect.fn(
+    "KanbanService.applyApprovedInstructions",
+  )(function* (boardId, field, text, cardId, askId, actor) {
+    if (actor._tag !== "evaluator") {
+      return yield* failWith("denied", "Only evaluators use this tool.");
+    }
+    return yield* guard(
+      "board.applyApprovedInstructions",
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask.closedAt) return yield* failWith("denied", `ask ${askId} is still open`);
+        if (ask.answer?.verdict === "dropped") {
+          return yield* failWith("denied", `ask ${askId} was dropped`);
+        }
+        if (ask.answer?.verdict === "rejected") {
+          return yield* failWith("denied", `ask ${askId} was rejected`);
+        }
+        if (ask.answer?.by._tag !== "owner") {
+          return yield* failWith("denied", `ask ${askId} was not answered by the owner`);
+        }
+        if (ask.answer.verdict !== "approved") {
+          return yield* failWith("denied", `ask ${askId} does not have the owner's approval`);
+        }
+        const board = yield* boardOf(boardId);
+        const namesField = {
+          escalation: ["escalation", "when to ask"],
+          modelRouting: ["model routing", "modelRouting"],
+          reviewerRouting: ["reviewer routing", "reviewerRouting"],
+        }[field];
+        const names = (label: string, name: string) => {
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}($|[^\\p{L}\\p{N}_])`, "iu").test(label);
+        };
+        const changes = [ask.change, ...(ask.changes ?? [])]
+          .filter((entry) => entry !== undefined)
+          .filter(
+            (entry) =>
+              (names(entry.label, board.slug) || names(entry.label, board.name)) &&
+              namesField.some((name) => names(entry.label, name)),
+          );
+        if (changes.length === 0) {
+          return yield* failWith(
+            "denied",
+            `ask ${askId} has no change entry labelled for board ${board.slug} and field ${field}`,
+          );
+        }
+        const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
+        const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
+        if (approved.length === 0) {
+          return yield* failWith("denied", `text differs from the approved after in ask ${askId}`);
+        }
+        if (normalized(board.instructions[field]) === normalized(text)) {
+          return { board, applied: false, reason: "already set" };
+        }
+        if (
+          !approved.some(
+            (entry) => normalized(entry.before) === normalized(board.instructions[field]),
+          )
+        ) {
+          return yield* failWith(
+            "denied",
+            "the board's text changed since he approved it; ask again",
+          );
+        }
+        const next = yield* updateBoardUnlocked(board.id, {
+          instructions: { ...board.instructions, [field]: text },
+        });
+        yield* editCard(
+          card.id,
+          {
+            comment: `Applied ${field} on board ${board.slug} from ${askId} (by ${actor.threadId})`,
+          },
+          actor,
+        );
+        yield* Effect.logInfo("kanban board instructions applied", {
+          boardId: board.id,
+          board: board.slug,
+          field,
+          cardId,
+          askId,
+          threadId: actor.threadId,
+        });
+        return { board: next, applied: true };
+      }),
+    );
+  });
+
   const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
       "board.open",
@@ -14274,6 +14374,7 @@ const make = Effect.gen(function* () {
     openBoard,
     createBoard,
     updateBoard,
+    applyApprovedInstructions,
     setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {
       return yield* guard(
         "board.setNightlyReview",
