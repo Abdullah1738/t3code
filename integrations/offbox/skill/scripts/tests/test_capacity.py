@@ -14,7 +14,7 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests._env import isolate_home
+from tests._env import isolate_boat, isolate_home
 from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
 
 
@@ -32,6 +32,7 @@ class Isolated(unittest.TestCase):
         self.addCleanup(key_lookup.assert_not_called)
         root = Path(self.tmp.name)
         isolate_home(self.stack, root, guard_failover=self.guard_home_failover)
+        isolate_boat(self.stack)
         for name in ('STATE','LOGS_DIR','LOCKS_DIR','SSH_DIR','CM_DIR'):
             self.stack.enter_context(patch.object(common, name, root/name))
         # Modules that import these by name keep the real paths; point them at the fixture and the repo's templates.

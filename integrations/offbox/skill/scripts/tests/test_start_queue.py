@@ -204,7 +204,7 @@ class ResumeQueueTests(Isolated):
                 with patch.object(self.clock.time, 'sleep', sleep), \
                         patch.object(lease, '_bring_up'), \
                         patch.object(lease, 'acquire_private') as create, patch.object(runs.Runner, 'start', start), \
-                        patch.object(runs, 'follow', return_value=0), patch.object(runs, 'finish'), \
+                        patch.object(runs, 'follow', return_value=0), patch.object(runs, 'finish', return_value=0), \
                         patch.object(api, 'get', side_effect=lambda *a,**k: {'state':'stopping' if phase[0]=='stopping' else 'running', 'type':'xlarge'}), \
                         patch.object(lease, 'ensure_ttl'), \
                         patch.object(fallback, 'run_local') as local, contextlib.redirect_stdout(io.StringIO()):

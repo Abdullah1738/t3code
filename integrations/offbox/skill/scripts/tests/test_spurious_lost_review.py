@@ -180,7 +180,9 @@ class FollowSettlementTests(LostReviewFixture):
                         patch.object(runs,'follow',side_effect=follow),contextlib.redirect_stdout(io.StringIO()), \
                         contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(misc.wait('run-t',5),90)
-                    self.assertEqual(read.call_count,1)
+                    read.assert_not_called()
+                self.assertEqual(self.con.execute("SELECT v FROM kv WHERE k='lost_confirmed:run-t'").fetchone()[0],
+                                 'box')
                 self.assertEqual(self.row()['status'],'lost')
 
     def test_unavailable_ssh_on_live_or_unknown_box_does_not_settle(self):

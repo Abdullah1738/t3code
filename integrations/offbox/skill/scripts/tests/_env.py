@@ -16,6 +16,17 @@ def clean_env(**overrides):
     return env
 
 
+def isolate_boat(stack):
+    from offbox_lib import api, capacity
+
+    # These values are cached at import, before a fixture can pin OFFBOX_BACKEND.
+    for name, value in (("BACKEND", "boat"), ("NAME", "boat"), ("API", "https://boat.dev/api/v1"),
+                        ("KEY_SERVICE", "boat-api"), ("KEY_ACCOUNT", "ardud"), ("_KEY", None)):
+        stack.enter_context(patch.object(api, name, value))
+    stack.enter_context(patch.object(capacity, "WINDOWS",
+                                    ((60, "MINUTE", 25), (3600, "HOUR", 180), (86400, "DAY", 760))))
+
+
 def isolate_home(stack, root, *, guard_failover=True):
     from offbox_lib import common, home
 

@@ -11,8 +11,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests._env import clean_env
-from offbox_lib import api, cli, common, lease, pool, prune, runs, ssh_sync
+from offbox_lib import allocation, api, cli, common, lease, pool, prune, runs, ssh_sync
 from test_capacity import Isolated
 
 
@@ -321,7 +322,8 @@ class ColdHomeTests(Isolated):
     def test_pool_acquisition_honors_same_run_cold_exclusions(self):
         self.box('b', member=True)
         with patch('offbox_lib.identity.require_proven'), \
-                patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)):
+                patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
+                allocation.queue():
             row = pool._acquire(self.con, self.me, 'large', None, None, False, None, exclude={'a'})
         try:
             self.assertEqual(row['box_id'], 'b')
@@ -457,6 +459,7 @@ class ResumeTests(Isolated):
         self.box('a', state='stopped', member=True)
         common.event(self.con, 'a', 'lease_resume_from', 'archived')
         self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:a','large',?)", (common.now(),))
+        self.con.execute("INSERT INTO kv VALUES ('resume_sender:a','',?)", (common.now(),))
         self.con.commit()
         row = self.con.execute("SELECT * FROM leases WHERE box_id='a'").fetchone()
         with patch.object(lease, '_resume_confirmed', return_value=(None, False)), \

@@ -8,6 +8,7 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests._env import clean_env
 from offbox_lib import api, cli, common, lease, misc, pool, reap, runs, ssh_sync, start_check
 from test_capacity import Isolated

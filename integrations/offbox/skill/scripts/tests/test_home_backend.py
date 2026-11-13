@@ -19,6 +19,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
+from tests._env import isolate_boat
 from offbox_lib import api, capacity, cli, common, home, lease, pool, prepare, runs, spend  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 from test_wait_lock import Clock  # noqa: E402
@@ -75,6 +76,10 @@ class HomeFiles(unittest.TestCase):
 
 class Unconfigured(HomeFiles):
     """No server.json (or a disabled one): everything is Boat, as before the home server existed."""
+
+    def setUp(self):
+        super().setUp()
+        isolate_boat(self.stack)
 
     def test_a_fresh_process_with_no_server_json_is_the_boat_client(self):
         self.assertEqual(fresh_process(self.dir), BOAT)

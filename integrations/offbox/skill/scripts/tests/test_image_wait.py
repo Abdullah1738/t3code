@@ -114,13 +114,16 @@ class ImageWaitTests(unittest.TestCase):
     def test_restore_loading_past_deadline_and_unresponsive_docker_never_runs_command(self):
         with tempfile.TemporaryDirectory() as d:
             fx = ImageWaitFixture(d, 'load')
+            # Reach load before timing out, including the fake timeout interpreter's startup.
+            fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '5'
             fx.env['SEEN_INFO'] = str(fx.root / 'seen-info')
             # Docker answers before loading starts, then stalls when checked after the restore deadline.
             fx.tool('docker', DOCKER.replace("'info ')", "'info ') if [ -e \"$SEEN_INFO\" ]; then exec sleep 30; fi; "
                                             'touch "$SEEN_INFO";'))
             start = time.monotonic()
-            result = fx.run(timeout=18)
-            self.assertLess(time.monotonic() - start, 16)
+            result = fx.run(timeout=23)
+            # Restore 5s + Docker probe 11s + ps/lslocks 2s each + 1.5s startup margin.
+            self.assertLess(time.monotonic() - start, 5 + 11 + 2 + 2 + 1.5)
             self.assertEqual(result.returncode, 97, result.stderr)
             self.assertNotIn('USER_COMMAND', result.stdout)
             self.assertIn('docker load', fx.invoked())
