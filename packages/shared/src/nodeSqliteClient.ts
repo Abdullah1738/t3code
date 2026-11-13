@@ -1665,7 +1665,11 @@ const make = Effect.fn("makeWithDatabase")(function* (
       observeStatement(
         Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
           const classification = checkpointClassifications.get(statement);
+          const control = /^\s*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i
+            .exec(statement.sourceSQL)?.[1]
+            ?.toLowerCase();
           const execute = () => {
+            const controlStart = control === undefined ? undefined : performance.now();
             let arrays = false;
             let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
             try {
@@ -1722,6 +1726,26 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 }),
               );
             } finally {
+              if (controlStart !== undefined)
+                try {
+                  const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                  if (span?._tag === "Span") {
+                    const operation = control === "end" ? "commit" : control;
+                    const prefix = `db.transaction.control.${operation}`;
+                    span.attribute(
+                      `${prefix}_ms`,
+                      Number(span.attributes.get(`${prefix}_ms`) ?? 0) +
+                        performance.now() -
+                        controlStart,
+                    );
+                    span.attribute(
+                      `${prefix}_count`,
+                      Number(span.attributes.get(`${prefix}_count`) ?? 0) + 1,
+                    );
+                  }
+                } catch {
+                  /* Timing must not change a transaction's outcome. */
+                }
               // OR FAIL may have committed earlier rows even when execution throws.
               if (classification?.check) checkpoint?.check();
             }

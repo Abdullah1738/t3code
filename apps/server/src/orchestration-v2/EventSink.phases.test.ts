@@ -35,6 +35,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 
 const threadId = ThreadId.make("thread:phases");
@@ -766,4 +767,184 @@ it.effect.each([
         );
       assert.equal(accepted, acknowledgements);
     }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "100 concurrent writes share one transaction, retain caller results and publish in order",
+  () => {
+    const trace = capture();
+    return Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* EventStore.EventStoreV2;
+      yield* sink.write({ events: [created] });
+      const published = yield* sink
+        .stream()
+        .pipe(Stream.take(101), Stream.runCollect, Effect.forkChild);
+      const results = yield* Effect.forEach(
+        Array.from({ length: 100 }, (_, i) => i + 1),
+        (i) => sink.write({ commandId: CommandId.make(`batch:${i}`), events: [item(i)] }),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.withTracer(trace.tracer));
+      assert.lengthOf(
+        trace.spans.filter((span) => span.name === "sql.transaction"),
+        1,
+      );
+      for (const [i, result] of results.entries()) {
+        assert.lengthOf(result, 1);
+        assert.equal(result[0]!.event.id, item(i + 1).id);
+        assert.equal(result[0]!.sequence, results[0]![0]!.sequence + i);
+      }
+      const committed = yield* store.read().pipe(Stream.runCollect);
+      assert.lengthOf(committed, 101);
+      assert.deepEqual(
+        Array.from(yield* Fiber.join(published), (stored) => stored.sequence),
+        Array.from(committed, (stored) => stored.sequence),
+      );
+      const transaction = trace.spans.find((span) => span.name === "sql.transaction")!;
+      assert.equal(transaction.attributes.get("db.transaction.control.begin_count"), 1);
+      assert.equal(transaction.attributes.get("db.transaction.control.commit_count"), 1);
+    }).pipe(Effect.provide(testLayer()));
+  },
+);
+
+it.effect("a failed batch rolls back before retrying each caller and preserves later writes", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const store = yield* EventStore.EventStoreV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    yield* sink.write({ events: [created] });
+    const results = yield* Effect.forEach(
+      [[item(1)], [item(3), item(1)], [item(2)]],
+      (events, i) =>
+        sink
+          .writeWithEffects({
+            commandId: CommandId.make(`failure:${i}`),
+            events,
+            effects: [
+              {
+                id: `failure-effect:${i}`,
+                commandId: CommandId.make(`failure:${i}`),
+                threadId,
+                request: { type: "terminal.cleanup" },
+              },
+            ],
+          })
+          .pipe(Effect.exit),
+      { concurrency: "unbounded" },
+    );
+    assert.isTrue(Exit.isSuccess(results[0]!));
+    assert.isTrue(Exit.isFailure(results[1]!));
+    assert.isTrue(Exit.isSuccess(results[2]!));
+    assert.equal((yield* outbox.get("failure-effect:0"))._tag, "Some");
+    assert.equal((yield* outbox.get("failure-effect:1"))._tag, "None");
+    assert.equal((yield* outbox.get("failure-effect:2"))._tag, "Some");
+    const events = Array.from(yield* store.read().pipe(Stream.runCollect));
+    assert.deepEqual(
+      events.map((stored) => stored.event.id),
+      [created.id, item(1).id, item(2).id],
+    );
+    assert.equal(
+      (yield* projections.getTurnItem({ threadId, itemId: item(2).payload.id }))?.id,
+      item(2).payload.id,
+    );
+    assert.lengthOf(
+      yield* store
+        .readByCommandId({ commandId: CommandId.make("failure:1") })
+        .pipe(Stream.runCollect),
+      0,
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "caller transaction pinning bypasses batching and rolls its events back with the owner",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* EventStore.EventStoreV2;
+      yield* sink.write({ events: [created] });
+      const result = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sink.write({ events: [item(1)] });
+            return yield* Effect.fail("rollback-owner");
+          }),
+        )
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      assert.lengthOf(yield* store.read().pipe(Stream.runCollect), 1);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("batched writes retain each caller's reference context on the shared writer", () => {
+  const traces = [capture(), capture()];
+  return Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    yield* sink.write({ events: [created] });
+    yield* Effect.all(
+      traces.map((trace, i) =>
+        sink
+          .write({ events: [item(i + 1)] })
+          .pipe(NodeSqliteClient.readOnly, Effect.withTracer(trace.tracer)),
+      ),
+      { concurrency: "unbounded" },
+    );
+    for (const trace of traces) assert.lengthOf(writeSpans(trace.spans), 1);
+  }).pipe(Effect.provide(testLayer()));
+});
+
+it.effect("a later batch waits for publication and cannot overtake earlier sequences", () =>
+  Effect.gen(function* () {
+    const publishing = yield* Deferred.make<void>();
+    const enteredNextBatch = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let enqueues = 0;
+    const publications: number[] = [];
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      yield* sink.write({ events: [created] });
+      const first = yield* Effect.all(
+        [1, 2].map((i) => sink.write({ events: [item(i)] })),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(publishing);
+      const second = yield* Effect.all(
+        [3, 4].map((i) => sink.write({ events: [item(i)] })),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(enteredNextBatch);
+      assert.isUndefined(first.pollUnsafe());
+      assert.isUndefined(second.pollUnsafe());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      assert.deepEqual(publications, [0, 1, 2, 3, 4]);
+    }).pipe(
+      Effect.provide(
+        testLayer({
+          outbox: Effect.suspend(() =>
+            ++enqueues === 4
+              ? Deferred.succeed(enteredNextBatch, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+          publish: (events) =>
+            Effect.gen(function* () {
+              const stored = events[0];
+              if (stored === undefined || !("event" in stored)) return;
+              if (stored.event.id === item(1).id) {
+                yield* Deferred.succeed(publishing, undefined);
+                yield* Deferred.await(release);
+              }
+              publications.push(
+                stored.event.type === "thread.created"
+                  ? 0
+                  : Number(stored.event.id.split(":").at(-1)),
+              );
+            }),
+        }),
+      ),
+    );
+  }),
 );
