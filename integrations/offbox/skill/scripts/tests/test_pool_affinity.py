@@ -483,7 +483,7 @@ class HintAndPullTests(Isolated):
 
     def test_new_checkout_hint_precedes_any_remote_exit(self):
         root = Path(self.tmp.name)
-        (root/'package.json').write_text('{}')
+        (root/'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
         row = {'box_id': 'B', '_new_checkout': True}
         for lock, install in (('pnpm-lock.yaml','corepack pnpm@10 install --frozen-lockfile'),
                               ('yarn.lock','corepack yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
@@ -491,29 +491,29 @@ class HintAndPullTests(Isolated):
                 (root/lock).write_text("lockfileVersion: '9.0'\n" if lock == 'pnpm-lock.yaml' else '')
                 err=io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint(row, root)
+                    runs.new_checkout_hint(row, root, runs.command_usage.inspect(root, '.', ['vp test run x']))
                 self.assertIn(f'node_modules missing on new box B; prefix your command with {install} &&',err.getvalue())
                 (root/lock).unlink()
         (root / 'package.json').write_text('{"packageManager":"pnpm@11.10.0","devDependencies":{"vite-plus":"1.0.0"}}')
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            runs.new_checkout_hint(row, root)
+            runs.new_checkout_hint(row, root, runs.command_usage.inspect(root, '.', ['vp test run x']))
         self.assertIn('with corepack pnpm@11.10.0 install --frozen-lockfile &&', err.getvalue())
         self.assertNotIn('vp i &&', err.getvalue())
-        (root / 'package.json').write_text('{}')
+        (root / 'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
         (root / 'vite.config.ts').touch()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            runs.new_checkout_hint(row, root)
+            runs.new_checkout_hint(row, root, runs.command_usage.inspect(root, '.', ['vp test run x']))
         self.assertIn('with npm install &&', err.getvalue())
         err=io.StringIO()
         with contextlib.redirect_stderr(err):
-            runs.new_checkout_hint(dict(row, _new_checkout=False), root)
+            runs.new_checkout_hint(dict(row, _new_checkout=False), root, runs.command_usage.inspect(root, '.', ['vp test run x']))
         self.assertEqual(err.getvalue(), '')
 
     def test_switched_pnpm_run_hints_before_command_even_when_exit_is_one(self):
         root = Path(self.tmp.name)
-        (root/'package.json').write_text('{}')
+        (root/'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
         (root/'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
         me = dict(self.me, repo_root=str(root))
         self.box('A', state='deleted', member=True)

@@ -81,6 +81,24 @@ class LogCatchupTests(Isolated):
         self.assertIn('failed exit=7', out)
         self.assertEqual(err, '')
 
+    def test_detached_recovery_places_setup_before_command_output(self):
+        preamble = b'offbox: node v24.22.1\noffbox: pnpm v11.10.0\noffbox-command-started: run-x\n'
+        stdout = b'pytest failure details\n20 failed, 3 passed\n'
+        stderr = preamble + b'command error\n'
+        self.path.write_bytes(b'')
+        common.offsets_path(self.path).unlink(missing_ok=True)
+        self.streams(stdout, stderr, page=7)
+        self.state('failed', 1)
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 1)
+        expected = preamble + stdout + b'command error\n'
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=len(stdout), stderrOffset=len(stderr),
+                                                           logBytes=len(expected)))
+        self.assertIn(expected.decode(), output)
+        self.assertEqual(errors, '')
+        self.assertNotIn('pytest failure details', self.invoke(wait=True)[1])
+
     def test_uncommitted_suffix_is_removed_before_appending(self):
         with self.path.open('ab') as f:
             f.write(b'rest\nuncommitted')
@@ -143,6 +161,35 @@ class LogCatchupTests(Isolated):
                 report = out.getvalue() + err.getvalue() + str(raised.exception)
                 self.assertNotIn('done exit=0', report)
                 self.assertNotIn('remote exit 0', report)
+
+    def test_wait_replays_failure_recovered_from_a_recorded_zero(self):
+        self.con.execute("UPDATE runs SET step_count=1 WHERE run_id='run-x'")
+        self.con.commit()
+        failure = b'actual failed assertion\noffbox step 1 rc=7: check\n'
+        self.prefix(failure)
+        self.streams(failure, b'')
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 7)
+        self.assertIn(failure.decode(), output)
+        self.assertIn('failed exit=7', output)
+        self.assertNotIn('actual failed assertion', self.invoke(wait=True)[1])
+
+    def test_failure_tail_stops_at_sampled_size_when_history_grows(self):
+        self.path.write_bytes(b'x' * 20000)
+        tail = misc._tail
+        def grow(*args, **kwargs):
+            with self.path.open('ab') as log:
+                log.write(b'late failure\n' * 2000)
+            return tail(*args, **kwargs)
+        output = io.StringIO()
+        with patch.object(misc, '_tail', side_effect=grow), contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertEqual(output.getvalue(), 'x' * 16384)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertIn('late failure', output.getvalue())
+        self.assertLessEqual(len(output.getvalue()), 16384)
 
     def test_no_checkpoint_does_not_guess_stream_offsets(self):
         common.offsets_path(self.path).unlink()

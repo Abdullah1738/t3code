@@ -338,9 +338,18 @@ def log(msg: str) -> None:
         f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
+def is_silenced(stream) -> bool:
+    return bool(getattr(stream, '_offbox_silenced', False))
+
+
 def silence(stream) -> None:
     """Point a dead output descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
     again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
+    # A successful write after dup2 reaches /dev/null, not the caller.
+    try:
+        stream._offbox_silenced = True
+    except (AttributeError, TypeError):
+        pass
     try:
         fd = os.open(os.devnull, os.O_WRONLY)
         try:
@@ -692,6 +701,36 @@ def file_lock(name: str, timeout: float = 600):
 
 def offsets_path(log_path: Path) -> Path:
     return Path(str(log_path) + ".offsets")
+
+
+def delivered_bytes(log_path: Path) -> int:
+    try:
+        with open(str(log_path) + '.delivered') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            return max(0, int(f.read()))
+    except (OSError, ValueError):
+        return 0
+
+
+def record_delivery(log_path: Path, position: int) -> None:
+    # Keep this separate from stream checkpoints: fetching output is not delivering it to a caller.
+    if position <= 0:
+        return
+    try:
+        with open(str(log_path) + '.delivered', 'a+') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                previous = int(f.read() or 0)
+            except ValueError:
+                previous = 0
+            if position > previous or previous > Path(log_path).stat().st_size:
+                f.seek(0)
+                f.truncate()
+                f.write(str(position))
+                f.flush()
+    except OSError:
+        pass
 
 
 def checkpoint(log_path: Path | None) -> dict | None:

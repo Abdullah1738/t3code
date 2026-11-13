@@ -6,6 +6,7 @@ import codecs
 import contextlib
 import json
 import os
+import shutil
 import sqlite3
 import re
 import signal
@@ -20,8 +21,8 @@ from time import monotonic, sleep
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
-                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, log, month_key, now,
-                     offsets_path, out, read_json, require_mine, say, silence)
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, log, month_key, now,
+                     delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
 
@@ -646,6 +647,35 @@ def _empty_log_fallback(r, path, deadline, result) -> str:
     return result
 
 
+def _preamble_first(dst, stdout_bytes, run_id):
+    # History has separate streams, so its stdout-first merge otherwise puts setup after the command's output.
+    # Only a fresh settled recovery can reorder bytes: existing checkpoints and delivery cursors must stay valid.
+    marker = f'offbox-command-started: {run_id}\n'.encode()
+    end = dst.tell()
+    dst.seek(stdout_bytes)
+    with tempfile.TemporaryFile() as prefix:
+        while line := dst.readline(64 * 1024):
+            prefix.write(line)
+            if line == marker:
+                break
+        else:
+            dst.seek(end)
+            return
+        size = prefix.tell()
+        left = stdout_bytes
+        while left:
+            count = min(left, 64 * 1024)
+            left -= count
+            dst.seek(left)
+            chunk = dst.read(count)
+            dst.seek(left + size)
+            dst.write(chunk)
+        dst.seek(0)
+        prefix.seek(0)
+        shutil.copyfileobj(prefix, dst, 64 * 1024)
+    dst.seek(end)
+
+
 def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
     started = time.time()
     deadline = started + (30 if budget is None else budget)
@@ -663,7 +693,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
             return 'incomplete:invalid checkpoint'
         offsets = [ck['stdoutOffset'], ck['stderrOffset']]
         sizes = [0, 0]
-        with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix=path.name + '.catchup.',
+        with tempfile.NamedTemporaryFile(mode='w+b', dir=path.parent, prefix=path.name + '.catchup.',
                                          delete=False) as dst:
             tmp = dst.name
             with open(path, 'rb') as src:
@@ -718,6 +748,8 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                         if page.get('size') is not None and nxt < int(page['size']):
                             return 'incomplete:history ended early'
                         break
+            if not keep and not live:
+                _preamble_first(dst, offsets[0], r['run_id'])
             log_bytes = dst.tell()
         if time.time() >= deadline:
             return 'incomplete:timeout'
@@ -857,11 +889,11 @@ def wait(run_id: str, timeout: float | None) -> int:
     from . import start_check
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
-        return _settled(r, until=None if timeout is None else now() + timeout)
+        return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
     return _wait_locked(r, echo=False, timeout=timeout)
 
 
-def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
+def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
@@ -872,6 +904,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
         raise _wait_timeout(checked)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
+    elif show_failure and r['mode'] == 'bg' and code not in (0, None):
+        _failure_tail(LOGS_DIR / f"{r['run_id']}.log")
     if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
         say(f"{r['run_id']} settled with no output on record")
     else:
@@ -899,10 +933,23 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
     return code if code is not None else 90
 
 
+def _failure_tail(path) -> None:
+    # Repeated waits and waits after a follower must not replay output already delivered by another invocation.
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    delivered = delivered_bytes(path)
+    pos = max(0, size - 16384, delivered if delivered <= size else 0)
+    _tail(path, pos, True, limit=size)
+
+
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
     """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
     are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    echo = echo and not is_silenced(sys.stdout)
+    delivered = 0
     try:
         with open(path, 'rb') as f:
             f.seek(pos)
@@ -919,8 +966,10 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
                         else:
                             sys.stdout.write(decoder.decode(data))
                             sys.stdout.flush()
+                        delivered = pos + len(data)
                     except (OSError, ValueError):
                         silence(sys.stdout)
+                        echo = False
                 pos += len(data)
             if echo and getattr(sys.stdout, 'buffer', None) is None:
                 try:
@@ -930,6 +979,8 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
                     silence(sys.stdout)
     except OSError:
         pass
+    if delivered:
+        record_delivery(path, delivered)
     return pos
 
 
@@ -1311,8 +1362,10 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message, settled_steps_code)
+    delivered = delivered_bytes(log_path)
     try:
-        delivered = os.path.getsize(log_path)
+        if delivered > os.path.getsize(log_path):
+            delivered = 0
     except OSError:
         delivered = 0
     if repo_setup_failed(code, log_path):
@@ -1351,7 +1404,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
                 _incomplete_log(settled, result)
         if until is not None and now() >= until:
             raise _wait_timeout(_run_row(r['run_id']))
-        # finish can fill a detached run's log after its stream ended. Only these new bytes remain undelivered.
+        # Catch-up must also drain bytes whose stream echo failed before recording later bytes as delivered.
         if echo:
             _tail(log_path, delivered, True)
         go_std_glitch(r["box_id"], r["run_id"], log_path, code)
