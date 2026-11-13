@@ -246,6 +246,10 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(self.classify(prefix + writer + invoke), UNRESOLVED)
         self.assertIsNone(self.classify(prefix + invoke))
         self.assertIsNone(self.classify(prefix + 'python3 -I -c "print(1)"' + invoke))
+        self.assertIsNone(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke))
+        self.assertEqual(self.classify(prefix + 'bash -nc "echo hi"' + invoke), UNRESOLVED)
+        with patch.dict(os.environ, {'BASH_ENV': '/tmp/guard841-shell-env.sh'}):
+            self.assertEqual(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke), UNRESOLVED)
         other_edit = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/report.txt')\np.write_text('report')\nPY"
         self.assertIsNone(self.classify(prefix + other_edit + invoke))
         other_edit_live_read = other_edit.replace("'report'", 'open(' + repr(LIVE) + ').read()')

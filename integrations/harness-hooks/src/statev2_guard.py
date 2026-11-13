@@ -1472,6 +1472,11 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             return False
         binary = os.path.basename(words[0])
         if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
+            if (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(words) == 3 and words[1] == '-n' and
+                    not words[2].startswith('-') and not unsafe_bindings and
+                    not any(os.environ.get(name) or name in shell_values for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'}) and
+                    not any(name.startswith('BASH_FUNC_') for name in os.environ)):
+                return False
             if re.fullmatch(r'python[\d.]*', binary):
                 args = _interpreter_args(binary, words[1:])
                 while args and args[0] in {'-I', '-E', '-s', '-S', '-B', '-u', '-b', '-bb', '-q'}:
