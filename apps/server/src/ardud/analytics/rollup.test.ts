@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 
 import { accumulate, boundedLines, finishRollup, makeAccumulator } from "./rollup.ts";
 
@@ -13,6 +13,69 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("merges long-task histograms by route and surface without counting individual samples twice", () => {
+    const accumulator = makeAccumulator();
+    const bucket = (ms: number) => Math.ceil(Math.log(ms) / Math.log(LONG_TASK_HISTOGRAM_RATIO));
+    const summary = (
+      props: NonNullable<AnalyticsEvent["props"]>,
+      surface: AnalyticsEvent["surface"] = "desktop",
+    ) => event({ kind: "performance.long-task-summary", route: "board", surface, props });
+    accumulate(
+      accumulator,
+      summary({
+        count: 99,
+        totalMs: 9900,
+        maxMs: 100,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(100), 99]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(500), 1]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({ count: 0, totalMs: 0, maxMs: 0, wallTimeMs: 60_000, histogram: [] }),
+    );
+    accumulate(
+      accumulator,
+      event({ kind: "performance.long-task", surface: "desktop", route: "board", durationMs: 500 }),
+    );
+    accumulate(
+      accumulator,
+      summary(
+        { count: 1, totalMs: 800, maxMs: 800, wallTimeMs: 10_000, histogram: [[bucket(800), 1]] },
+        "web",
+      ),
+    );
+    // An inconsistent distribution must not create a misleading percentile.
+    accumulate(
+      accumulator,
+      summary({ count: 1000, totalMs: 10, maxMs: 10, wallTimeMs: 60_000, histogram: [[0, 1]] }),
+    );
+    const rows = finishRollup(accumulator, "2026-11-13", ts).longTasksByRoute;
+    assert.lengthOf(rows, 2);
+    assert.deepInclude(rows[0], {
+      route: "board",
+      surface: "desktop",
+      count: 100,
+      totalMs: 10_400,
+      maxMs: 500,
+      wallTimeMs: 180_000,
+      wallTimeShare: 10_400 / 180_000,
+      approximate: true,
+    });
+    assert.isAtLeast(rows[0]!.p95Ms!, 100);
+    assert.isBelow(rows[0]!.p95Ms!, 102);
+    assert.equal(rows[1]!.p95Ms, 800);
+  });
   it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
     const accumulator = makeAccumulator();
     const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>
