@@ -3599,6 +3599,53 @@ it.effect.each(
   ),
 );
 
+it.effect.each(["truncated gzip", "invalid UTF-8", "incomplete log frame"])(
+  "refuses a later archive with %s before rewriting any file or database row",
+  (invalid) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const config = yield* Config.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const first = NodePath.join(config.logsDir, "00-first.trace.ndjson.1.gz");
+        const last = NodePath.join(config.logsDir, "zz-last.trace.ndjson.2.gz");
+        const source = NodeZlib.gzipSync(JSON.stringify({ output: fake }) + "\n");
+        const corrupt =
+          invalid === "truncated gzip"
+            ? source.subarray(0, source.length - 6)
+            : NodeZlib.gzipSync(
+                invalid === "invalid UTF-8"
+                  ? Buffer.from([0xff])
+                  : String.raw`NTIVE: "unrelated\u0061`,
+              );
+        yield* Effect.promise(async () => {
+          await NodeFSP.writeFile(first, source);
+          await NodeFSP.writeFile(last, corrupt);
+        });
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({
+            threadId,
+            itemId: "item-fixture",
+            reason: "fixture",
+            compact: true,
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(yield* Effect.promise(() => NodeFSP.readFile(first))).toEqual(source);
+        expect(yield* Effect.promise(() => NodeFSP.readFile(last))).toEqual(corrupt);
+        const rows = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        expect(rows[0]!.payload_json).toBe(JSON.stringify(fixture));
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+      }),
+    ),
+);
+
 it.effect("scrubs compressed trace backups without changing other spans or summaries", () =>
   run(
     Effect.gen(function* () {
