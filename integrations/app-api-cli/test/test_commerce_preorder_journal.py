@@ -17,6 +17,7 @@ class PreorderTests(unittest.TestCase):
         self.binding=dict(request_hash='3'*64,cart_hash='4'*64,review_hash='5'*64,payable_minor=2500)
 
     def intent(self):
+        j.record_nownow_prepared(FLOW, self.binding['review_hash'])
         j.consume(FLOW,'subscription',kind='preauthorize',**self.binding)
         j.observe(FLOW,'subscription',outcome='PREORDER_INTENT_RECEIVED',evidence_hash='6'*64)
 

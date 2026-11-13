@@ -30,6 +30,7 @@ class BasketCLITests(unittest.TestCase):
         self.path = Path(self.temp.name) / 'basket.json'
         self.flow = Mock()
         self.flow.flow_id = '10000000-0000-4000-8000-000000000041'
+        self.flow.stop_unsent.return_value = {'cart_checked': False, 'reason': 'NOWNOW_NO_OWNED_CART'}
         self.flow.prepare_only.return_value = {
             'flow_id': self.flow.flow_id,
             'prepared_only': True,
@@ -74,7 +75,7 @@ class BasketCLITests(unittest.TestCase):
                 self.assertEqual(result['state'], 'PREPARED_NOT_ORDERED')
                 self.assertFalse(result['financial_send'])
                 self.assertTrue(result['cart_readback_verified'])
-                self.flow.prepare_only.assert_called_once_with()
+                self.flow.prepare_only.assert_called_once_with(**({'record': True} if name == 'nownow' else {}))
                 for method in ('place', 'complete', 'await_payment', 'await_success',
                                'poll_tracking', 'confirm_paid', 'register_tracker'):
                     getattr(self.flow, method).assert_not_called()
@@ -99,6 +100,11 @@ class BasketCLITests(unittest.TestCase):
     def test_incomplete_prepare_evidence_blocks_even_financial_invocation(self):
         for name in ('minutes', 'nownow', 'main', 'supermall'):
             target, row, extra = self.lane(name)
+            if name == 'nownow':
+                cli.journal.open_flow(flow_id=self.flow.flow_id, app='noon', vertical='nownow',
+                    account_hash='a'*64, scope_hash='b'*64)
+                cli.journal.record_nownow_prepared(self.flow.flow_id, 'c'*64)
+                extra = [*extra, '--resume-flow', self.flow.flow_id]
             for change in ({'readback': None}, {'readback': {}}, {'readback': False},
                            {'prepared_only': False}, {'flow_id': 'different'}):
                 with self.subTest(name=name, change=change):
@@ -107,10 +113,11 @@ class BasketCLITests(unittest.TestCase):
                         'flow_id': self.flow.flow_id, 'prepared_only': True,
                         'review': {'payable_minor': 123}, 'readback': {'exact': True}, **change}
                     self.path.write_text(json.dumps([row]))
-                    with patch(target, return_value=self.flow), patch.object(cli, 'CommerceAuth'), \
+                    with patch(target, return_value=self.flow) as cls, patch.object(cli, 'CommerceAuth'), \
                          patch('commerce_minutes.readback_active_orders', return_value=SimpleNamespace(
                              projection={'count': 0, 'active': []})), \
                          patch.object(cli, 'cvv_from_keychain', side_effect=AssertionError('CVV forbidden')):
+                        cls.resume_active.return_value = self.flow
                         code, result = self.run_cli(['order', name, '--items-file', str(self.path), *extra])
                     self.assertEqual(code, 1)
                     self.assertEqual(result['error'], 'PREPARE_ONLY_READBACK_UNCONFIRMED')
@@ -124,7 +131,7 @@ class BasketCLITests(unittest.TestCase):
             with self.subTest(name=name), patch.object(cli, 'CommerceAuth',
                     side_effect=AssertionError('auth forbidden')):
                 code, result = self.run_cli(['order', name, '--items-file', str(self.path),
-                                             '--quantity', '2', *extra])
+                                             '--quantity', '2', '--prepare-only', *extra])
             self.assertEqual(code, 1)
             self.assertEqual(result['error'], 'BASKET_FILE_AND_SINGLE_ITEM_FLAGS_CONFLICT')
 

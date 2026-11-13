@@ -62,6 +62,7 @@ class PreorderFlowTests(unittest.TestCase):
             flow.client._request=wire
             vault=p.IntentVault(Store())
             flow.validate_reviewed()
+            c.journal.record_nownow_prepared(flow.flow_id, flow.review.digest)
             with patch('noon_cvv.encrypt',return_value={'encCvv':'synthetic-encrypted','publicKeyName':'test'}):
                 result=flow.authorize_preorder(cvv=b'007',vault=vault)
             self.assertEqual(result['payment_status'],'payment_pending')
@@ -100,6 +101,7 @@ class PreorderFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp,patch.object(c.journal,'ROOT',Path(temp).resolve()/'commerce'):
             c.journal.open_flow(flow_id=flow,app='noon',vertical='nownow',account_hash='1'*64,scope_hash='2'*64)
             args=dict(request_hash='3'*64,cart_hash='4'*64,review_hash='5'*64,payable_minor=2500)
+            c.journal.record_nownow_prepared(flow, args['review_hash'])
             c.journal.consume(flow,'subscription',kind='preauthorize',**args)
             vault=p.IntentVault(Store());intent=vault.retain(flow,secret='synthetic',review_hash='5'*64,
                 cart_hash='4'*64,card_hash='6'*64,payable_minor=2500)

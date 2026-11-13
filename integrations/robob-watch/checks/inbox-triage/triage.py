@@ -904,8 +904,13 @@ def live_work(now):
             {'ref': f'p{n}', 'app': f.get('app'), 'vertical': f.get('vertical'), 'state': f.get('state'),
              'amount_aed': f['amount_minor'] / 100 if isinstance(f.get('amount_minor'), int) else None,
              'minutes_ago': round(f.get('sent_seconds_ago', 0) / 60),
-             'sent_at': round(checked - f.get('sent_seconds_ago', 0) + 1, 1)}
-            for n, f in enumerate(data.get('open', []), 1)]
+             'sent_at': max(round(checked - f.get('sent_seconds_ago', 0) + 1, 1), f.get('settlement_epoch') or 0)}
+            | {k: f[k] for k in ('flow_id', 'order_id', 'card_last4', 'settlement_epoch') if k in f}
+            for n, f in enumerate(data.get('open', []), 1)
+            if f.get('financial_send') is not False and f.get('in_flight') is not False
+            and isinstance(f.get('sent_seconds_ago'), (int, float))
+            and f.get('state') not in ('COMPLETE', 'RELEASED', 'OWNER_ATTESTED_UNCHARGED', 'REJECTED_DUPLICATE')
+            and not (f.get('state') == 'FENCED' and f.get('amount_minor') == 0)]
     except Exception as e:
         work['open_payments'] = f'unavailable: {type(e).__name__}: {str(e)[:120]}'
     # The owner's phone tasks hold this file while they drive the phone (android-phone skill).
@@ -916,6 +921,51 @@ def live_work(now):
     except OSError as e:
         work['phone_task'] = f'unavailable: {type(e).__name__}'
     return work
+
+
+def settle_work(work, items, state):
+    """Exact receipts/charges settle context only; they never release a payment fence."""
+    settled = state.setdefault('settled_payments', {})
+    payments = work.get('open_payments')
+    if not isinstance(payments, list):
+        return
+    try:
+        parse_charge = load_module('triage_money_cases', MONEY_CASES).charges.parse
+    except Exception:
+        parse_charge = lambda *_: None
+    for payment in payments:
+        flow = payment.get('flow_id')
+        if not flow:
+            continue
+        if flow in settled:
+            if settled[flow].get('epoch', 0) == payment.get('settlement_epoch', 0):
+                continue
+            del settled[flow]
+        for item in items:
+            if not isinstance(item.get('ts'), (int, float)) or item['ts'] <= payment['sent_at']:
+                continue
+            text = ' '.join(str(item.get(k, '')) for k in ('subject', 'preview'))
+            order = payment.get('order_id')
+            exact_order = bool(order and re.search(r'(?<![A-Za-z0-9])' + re.escape(order) + r'(?![A-Za-z0-9])', text, re.I))
+            card, amount = payment.get('card_last4'), payment.get('amount_aed')
+            sender = str(item.get('sender', '')).strip()
+            bank_source = (item.get('source') == 'imessage' or (item.get('source') == 'email'
+                and re.fullmatch(r'(?:.*<)?MashreqAlerts@mashreq\.com>?', sender, re.I)))
+            charge = parse_charge(text, sender) if bank_source else None
+            purchase = bool(charge and charge['kind'] == 'charge' and not charge['pending']
+                and card and isinstance(amount, (int, float))
+                and charge['card'] == card and charge['currency'] == 'AED' and charge['amount'] == f'{amount:.2f}'
+                and re.fullmatch(r'noon(?:\.com)?(?:\s+80038888)?(?:\s+(?:ae|uae|dubai))?', charge['merchant'], re.I)
+                and not OTP.search(text) and not re.search(r'\b(declined|failed|refund|reversed|approve|pending)\b', text, re.I)
+                and sum(p.get('card_last4') == card and p.get('amount_aed') == amount for p in payments) == 1)
+            receipt = (exact_order and item.get('source') == 'email'
+                and re.search(r'@(?:[^@\s]+\.)?noon\.com>?$', str(item.get('sender', '')), re.I)
+                and re.search(r'\b(receipt|paid|payment received|order confirmed)\b', text, re.I)
+                and not re.search(r'\b(failed|declined|cancelled|canceled|pending|refund|refunded|reversed|unpaid|not paid)\b', text, re.I))
+            if purchase or receipt:
+                settled[flow] = {'source_id': item['id'], 'at': item['ts'], 'epoch': payment.get('settlement_epoch', 0)}
+                break
+    work['open_payments'] = [p for p in payments if p.get('flow_id') not in settled]
 
 
 def open_money_questions():
@@ -1482,6 +1532,9 @@ def replay_outbox(state, wd, run):
             atomic(wd / 'cursor.json', state)
             return None
         now = time.time()
+        if 'live_work' in report:
+            report['live_work'] = live_work(now)
+            settle_work(report['live_work'], report['hits'] + state.get('queue', []), state)
         withdrawal_statuses(report['hits'], report['hits'] + state.get('queue', []), now, deadline=started + 50)
         urgent = urgent_alerts(state, report, wd, now, deadline=started + 57)
         atomic(Path(out['batch']), report)
@@ -1653,6 +1706,7 @@ def run(args):
             return 0
     watchers, rules = active_watchers(now), noise_rules()
     results, errors = collect(state, now, watchers, rules, now - args.dry_run_hours * 3600 if dry else None, new)
+    settlement_items = [*state['queue'], *(i for r in results.values() for i in r['items'])]
     stats, drops, dropped = {}, collections.Counter(), []
     fast_definition = read_json(LIVE.parent / 'inbox-triage-fastpath/watcher.json', {})
     fast_enabled = bool(fast_definition) and not fast_definition.get('paused')
@@ -1725,7 +1779,9 @@ def run(args):
     ready = sorted([i for i in state['queue'] if i['id'] not in held], key=lambda i: bool(i.get('chat_deferred')))
     items = ready if dry else ready[:MAX_BATCH]
     meta = {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0}
-    context = build_context(items, watchers, now) if items else {}
+    context = build_context(items, watchers, now) if items or settlement_items else {}
+    if isinstance(context.get('live_work'), dict):
+        settle_work(context['live_work'], settlement_items, state)
     classify_items = [i for i in items if not i.get('chat_deferred')]
     hits = [{'id': i['id'], 'reason': i['reason'], 'urgency': i['urgency']} for i in items if i.get('chat_deferred')]
     for n in range(0, len(classify_items), MAX_BATCH):

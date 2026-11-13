@@ -391,15 +391,50 @@ def order_minutes(args):
 def order_nownow(args):
     if not args.prepare_only and order_card.LAST4 == '9546':
         journal.fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
-    """Paid NowNow E2E replay of the captured contract (NNGAANNWEFJMZW8A).
+    flows = []
+    try:
+        return _order_nownow(args, flows)
+    except BaseException as exc:
+        from noon_nownow_checkout import NowNowError
+        if (isinstance(exc, NowNowError) and exc.code == 'SEND_RESERVATION_FAILED'
+                and not exc.may_have_sent and isinstance(exc.__cause__, journal.JournalError)
+                and str(exc.__cause__) in ('NOWNOW_FRESH_PREPARE_REQUIRED', 'ORDERING_PAUSED',
+                    'NOWNOW_9546_PAID_CONTRACT_UNPROVEN', 'NOON_FALLBACK_REQUIRES_RECORDED_9546_DECLINE',
+                    'SAME_BASKET_PENDING_ACK_REQUIRED')):
+            cause = exc.__cause__
+            exc = cause if isinstance(cause, journal.PaymentError) else journal.PaymentError(str(cause), {
+                'financial_send': False, 'financial_retry': False})
+        try:
+            if flows:
+                cleanup = flows[-1].stop_unsent()
+            elif args.resume_flow:
+                from commerce_nownow_cleanup import stop_retained_preparation
+                cleanup = stop_retained_preparation(args.resume_flow)
+            else:
+                cleanup = {'cart_checked': False, 'reason': 'NOWNOW_NO_OWNED_CART'}
+        except Exception as stopped:
+            cleanup = {'cart_checked': False, 'reason': getattr(stopped, 'code', None) or
+                       (str(stopped) if re.fullmatch(r'[A-Z][A-Z0-9_]+', str(stopped)) else 'NOWNOW_STOP_CLEAR_UNVERIFIED')}
+        if isinstance(exc, journal.PaymentError):
+            exc.details['cleanup'] = cleanup
+            raise exc
+        if isinstance(exc, Exception):
+            code = getattr(exc, 'code', None) or str(exc)
+            if not re.fullmatch(r'[A-Z][A-Z0-9_]+', code):
+                code = 'NOWNOW_ORDER_STOPPED'
+            raise journal.PaymentError(code, {'cleanup': cleanup}) from exc
+        raise
 
-    session/create -> edit-product -> validate guard -> edit-payment (saved
-    card) -> set-delivery-preference (BOTH flags one call) -> place-order ->
-    tracking poll. Payment rides the session token; place is the only
-    financial send. On 401: stop, no re-login attempt.
-    """
+
+def _order_nownow(args, flows):
+    """Explicit preparation, then same-basket verification and one placement."""
     import noon_nownow_checkout as nownow_transport
     from commerce_nownow_order import NowNowOrderFlow
+    if not args.prepare_only:
+        if not args.resume_flow:
+            raise journal.PaymentError('NOWNOW_FRESH_PREPARE_REQUIRED', {
+                'next_action': 're-run --prepare-only, then use --resume-flow with that flow', 'financial_send': False})
+        journal.require_nownow_prepared(args.resume_flow)
     items=input_items(args,id_argument='product_code',id_key='product_code')
     auth=CommerceAuth().noon
     if args.resume_flow:
@@ -412,9 +447,10 @@ def order_nownow(args):
     else:
         flow=NowNowOrderFlow(store_code=args.store_code,items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
+    flows.append(flow)
     from commerce_pending import cli_review
     cli_review(flow,args)
-    prepared=flow.prepare_only()
+    prepared=flow.prepare_only(record=args.prepare_only)
     verified=prepared_result(flow,prepared)
     review=prepared['review']
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
@@ -433,7 +469,8 @@ def order_nownow(args):
         # before the one placement; no CVV/verification operation is replayed.
         flow = NowNowOrderFlow.resume_active(flow.flow_id, store_code=args.store_code,
             items=items, auth=auth)
-        flow.prepare_only()
+        flows.append(flow)
+        flow.prepare_only(record=False)
     try:
         placed=flow.place()
     except nownow_transport.NowNowError as exc:
@@ -1330,10 +1367,11 @@ def main(argv=None):
             print(json.dumps({'ok':False,'error':'PREPARATION_FAILED','phase':preparation[1],
                               'cause':preparation[2],'financial_send':False,'financial_retry':False}))
             return 1
-        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):code='COMMERCE_OPERATION_FAILED'
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):
+            code = 'NOWNOW_CLEAR_FAILED' if args.command == 'clear-cart' and args.vertical == 'nownow' else 'COMMERCE_OPERATION_FAILED'
         # A sent payment that didn't confirm: say whether a no-charge is proven, never assume it.
         details=exc.details if isinstance(exc,journal.PaymentError) else {}
-        if code == 'COMMERCE_OPERATION_FAILED':
+        if code in ('COMMERCE_OPERATION_FAILED', 'NOWNOW_CLEAR_FAILED'):
             # Exception messages may contain credentials or raw provider responses.
             cause = exc.__cause__ or exc
             tb = cause.__traceback__
