@@ -51,6 +51,19 @@ class VerticalReadsTest(unittest.TestCase):
         data['data']['status'] = 'future_status'
         self.assertEqual(v.food_projection(data, 'FTEST')['status'], 'unknown')
 
+    def test_food_cancellation_only_maps_verified_raw_status(self):
+        for raw, expected in [('canceled', 'cancelled'), ('cancelled', 'unknown'),
+                              ('future_status', 'unknown')]:
+            with self.subTest(raw=raw):
+                data = {'status': 'success', 'data': {'orderNr': 'FTEST',
+                        'status': raw, 'statusLabel': 'UNDElIVERED'}}
+                result = v.food_projection(data, 'FTEST')
+                self.assertEqual(result['status'], expected)
+                self.assertEqual(result['raw_status'], raw)
+                self.assertEqual(result['status_text'], 'UNDElIVERED')
+                self.assertEqual(result['coverage'],
+                                 'exact_native_food_order; delivered_delivering_picked_up_canceled_verified')
+
     order = 'NAEIA0002358740'
 
     def manifest(self):
