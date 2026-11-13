@@ -17,3 +17,5 @@ Delivered checks match AED totals to money-cases bank alerts within 2% of the or
 Matches retain `bank_amount`, `bank_card_last4`, `bank_msg_id` and `bank_charged_at`;
 wakes include those fields in `bank_charge`, or null when no charge is matched.
 `bank_amount_gap` reports a gap over AED 1 once; it does not establish an overcharge or refund.
+Eligible delivered orders retain bank-only retries, at most once per 10 minutes, until matched or
+48 hours after placement; normal and pending checks both preserve that retry window.

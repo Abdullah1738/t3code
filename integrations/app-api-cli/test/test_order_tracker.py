@@ -25,7 +25,7 @@ class BankChargeTest(unittest.TestCase):
         self.root.mkdir()
         self.now = float(int(time.time()))
         self.cfg = {'app': 'noon', 'order': 'FGB8NN4KUNY0L2A', 'watcher': 'order-noon-bank',
-                    'for': 'owner', 'chat': 'owner', 'total': 'AED 3,010.30',
+                    'for': 'owner', 'chat': 'owner', 'total': 'AED 3,010.30', 'active': True,
                     'placed_at': t.stamp(self.now - 3600), 'registered_at': t.stamp(self.now - 3600)}
         self.folder = self.watchers / self.cfg['watcher']
         self.folder.mkdir(parents=True)
@@ -44,19 +44,25 @@ class BankChargeTest(unittest.TestCase):
                                       search=mock.Mock(return_value=[self.row]), show=mock.Mock(return_value=self.BODY))
         self.result = {'status': 'delivered', 'whole_order_complete': True, 'errors': []}
         self.loader = t.order_bank_charge.load_charges
+        self.run = mock.Mock(return_value='')
         for patch in (mock.patch.object(t, 'ROOT', self.root), mock.patch.object(t, 'WATCHERS', self.watchers),
                       mock.patch.object(t, 'fetch', return_value=self.result),
-                      mock.patch.object(t.store, 'reconcile'), mock.patch.object(t, 'retire_terminal'),
+                      mock.patch.object(t.store, 'reconcile'), mock.patch.object(t, 'run', self.run),
                       mock.patch.object(t.delivery_cards, 'safe_sync', return_value={'status': 'ready', 'link_health': 'ok'}),
                       mock.patch.object(t.order_bank_charge, 'load_charges', return_value=self.charges)):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def tick(self, cfg=None, folder=None, now=None):
+    def tick(self, cfg=None, folder=None, now=None, pending=False, main_checked=False,
+             run_id='scheduled-bank-fixture'):
         output = io.StringIO()
-        with mock.patch.dict(os.environ, WATCH_DIR=str(folder or self.folder)), \
+        with mock.patch.dict(os.environ, WATCH_DIR=str(folder or self.folder), WATCH_RUN=run_id,
+                             WATCH_MAIN_CHECKED='1' if main_checked else '0'), \
              mock.patch.object(t.time, 'time', return_value=now or self.now), redirect_stdout(output):
-            t.check(cfg or self.cfg)
+            if pending:
+                t._check(cfg or self.cfg, pending_only=True)
+            else:
+                t.check(cfg or self.cfg)
         return json.loads(output.getvalue()) if output.getvalue() else None
 
     def test_exact_match_stored_without_gap(self):
@@ -86,17 +92,56 @@ class BankChargeTest(unittest.TestCase):
         self.charges.search.assert_called_once()
         self.assertTrue(t.read(self.state_path)['bank_gap_sent'])
 
-    def test_no_bank_message_and_throttled_retry(self):
-        self.charges.search.return_value = []
+    def assert_late_bank_alert_recovers(self, lookup_error=False):
+        if lookup_error:
+            self.charges.search.side_effect = self.charges.Lookup('search unavailable')
+        else:
+            self.charges.search.return_value = []
         wake = self.tick()
         self.assertIsNone(wake['bank_charge'])
         self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+        # Exercise real retirement through both callers while bank lookup is throttled.
+        for seconds, pending, main_checked in [(60, False, False), (120, True, False), (180, True, True)]:
+            with self.subTest(seconds=seconds, pending=pending, main_checked=main_checked):
+                self.assertIsNone(self.tick(now=self.now + seconds, pending=pending, main_checked=main_checked))
+                self.run.assert_not_called()
+                self.assertTrue(t.read(self.record)['active'])
         self.assertIsNone(self.tick(now=self.now + 599))
         self.charges.search.assert_called_once()
-        # Terminal orders get a bank-only retry; provider delivery reads stop.
+        self.run.assert_not_called()
+        self.charges.search.side_effect = None
         self.charges.search.return_value = [self.row]
         wake = self.tick(now=self.now + 600)
         self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+        self.assertEqual(t.read(self.record)['bank_msg_id'], '515561')
+        self.assertNotIn('bank_lookup_error', t.read(self.state_path))
+        self.assertEqual(self.charges.search.call_count, 2)
+        self.run.assert_not_called()
+        t.fetch.assert_called_once()
+        # Once matched, pending-check can retire without consuming another bank event.
+        self.assertIsNone(self.tick(now=self.now + 601, pending=True))
+        self.run.assert_called_once_with(['robob-watch', 'remove', self.cfg['watcher']])
+        self.assertFalse(t.read(self.record)['active'])
+
+    def test_empty_search_keeps_bank_only_retries_scheduled(self):
+        self.assert_late_bank_alert_recovers()
+
+    def test_lookup_error_keeps_bank_only_retries_scheduled(self):
+        self.assert_late_bank_alert_recovers(lookup_error=True)
+
+    def test_unmatched_bank_retry_retires_at_48_hour_cutoff(self):
+        self.charges.search.return_value = []
+        self.cfg['placed_at'] = t.stamp(self.now - 48 * 3600 + 600)
+        t.write(self.record, self.cfg)
+        self.tick()
+        for seconds, pending in [(60, False), (120, True), (599, False)]:
+            self.assertIsNone(self.tick(now=self.now + seconds, pending=pending))
+            self.run.assert_not_called()
+            self.assertTrue(t.read(self.record)['active'])
+        self.assertIsNone(self.tick(now=self.now + 600, pending=True))
+        self.run.assert_called_once_with(['robob-watch', 'remove', self.cfg['watcher']])
+        self.assertFalse(t.read(self.record)['active'])
+        self.charges.search.assert_called_once()
         t.fetch.assert_called_once()
 
     def test_unacceptable_bank_alerts(self):
@@ -231,8 +276,7 @@ class BankChargeTest(unittest.TestCase):
         self.assertEqual(self.charges.search.call_args.kwargs['deadline'], self.now + 50)
 
     def test_registration_prime_defers_bank_claim_until_scheduled_check(self):
-        with mock.patch.dict(os.environ, WATCH_RUN='prime-fixture'):
-            wake = self.tick()
+        wake = self.tick(run_id='prime-fixture')
         self.assertIsNone(wake['bank_charge'])
         self.charges.search.assert_not_called()
         self.assertNotIn('bank_msg_id', t.read(self.record))

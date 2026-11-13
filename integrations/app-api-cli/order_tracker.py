@@ -1118,6 +1118,16 @@ def bank_claimed_ids(record):
     return claimed
 
 
+def bank_match_pending(cfg, result, state, now):
+    if (state.get('status') != 'delivered' or cfg.get('bank_msg_id') or state.get('bank_msg_id')
+            or order_total_aed(cfg, result, state) <= 0):
+        return False
+    try:
+        return 0 <= now - epoch(cfg['placed_at']) < 48 * 3600
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def bank_charge_events(cfg, result, state, folder, now, deadline):
     if os.environ.get('WATCH_RUN', '').startswith('prime-'):
         return []
@@ -1128,11 +1138,7 @@ def bank_charge_events(cfg, result, state, folder, now, deadline):
         return []
     if state.get('bank_msg_id'):
         return bank_gap_events(total, state)
-    try:
-        age = now - epoch(cfg['placed_at'])
-    except (KeyError, ValueError, TypeError, AttributeError):
-        return []
-    if not 0 <= age < 48 * 3600 or now - state.get('bank_checked', 0) < 600:
+    if not bank_match_pending(cfg, result, state, now) or now - state.get('bank_checked', 0) < 600:
         return []
     live = folder.resolve() == (WATCHERS / cfg['watcher']).resolve()
     record = ROOT / 'orders' / (cfg['watcher'] + '.json')
@@ -1288,6 +1294,10 @@ def _check(cfg, pending_only=False):
 
 def retire_terminal(cfg, folder, path, state):
     if folder.resolve() != (WATCHERS / cfg['watcher']).resolve():
+        return
+    # Both normal and pending checks retire here. A throttled or failed bank
+    # lookup must leave the watcher scheduled for its next bank-only attempt.
+    if bank_match_pending(cfg, state.get('last_result', {}), state, time.time()):
         return
     # Direct checks can race the runner before it stores or delivers an event.
     # Primes must finish registration before the watcher can be archived.
@@ -1513,7 +1523,7 @@ def main(argv=None, _locked=False):
                        'careem_single_active = Careem live notification tied to this order because it is the only active Careem order and matches its merchant; it updates status and the card. '
                        'eta_elapsed means delivery is unconfirmed past ETA, not proof it is late. Never infer delivered from missing notifications. '
                        'bank_amount_gap: mention the order total, the bank-charged amount and the gap once in the delivered update. '
-                       'No cancelling, reordering, contacting restaurants or changing orders. After exact whole-order delivered/cancelled confirmation, the tracker stops provider reads and archives itself on the next check, so send the update and do not poll for it. '
+                       'No cancelling, reordering, contacting restaurants or changing orders. After exact whole-order delivered/cancelled confirmation, the tracker stops provider reads and archives itself when no eligible bank match is pending (at most 48 hours after placement), so send the update and do not poll for it. '
                        f'Run order-watch remove --app {app} --order {args.order} only to stop tracking early. Item/shipment-scoped evidence (Amazon or noon marketplace) proves only that part: say package/item, and verify all shipments before closing. whole_order_complete=false is never a whole-order completion. '
                        'Amazon aftercare is scoped return/refund/cancellation evidence, not a fresh arrival or whole-order cancellation: do not remove tracking or initiate any return/refund/cancellation from it. Historical package evidence is not a new arrival. '
                        'On candidate delivered, verify or ask Abdullah before removing. '
