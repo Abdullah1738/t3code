@@ -11,6 +11,7 @@ from pathlib import Path
 import commerce_journal as journal
 import native
 import order_card
+import owner_go
 import noon_http_orders as core
 import noon_vertical_reads as vertical
 from noon_checkout import project_home, QUIET_NOTE
@@ -232,6 +233,7 @@ class FoodFlow:
         review['display_items']=[{'name':names[r['itemCode']],'qty':r['qty']} for r in self.rows]
         self.state['review_hash']=journal.digest(review); self.state['review']=review; self.save()
         return {'ok':True,'state':'PREPARED_NOT_ORDERED','flow_id':self.flow_id,'review':review,
+                'owner_go_item':owner_go.commerce_item(journal.binding(self.flow_id)),
                 'financial_send':False,'purchase_enabled':True,'cleanup':'Leave this isolated session; no owner basket was reset or cleared.'}
 
 

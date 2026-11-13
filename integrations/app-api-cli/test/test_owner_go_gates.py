@@ -1,5 +1,6 @@
 import datetime as dt
 import contextlib
+import copy
 import io
 import json
 import importlib.machinery
@@ -7,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 import uuid
@@ -93,6 +95,70 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(journal.JournalError, 'OWNER_GO_REQUIRED'):
             journal.consume(flow, 'place', kind='place', payable_minor=201, **args)
         self.assertTrue(journal.consume(flow, 'place', kind='place', payable_minor=200, **args))
+
+    def test_food_preparation_returns_the_item_accepted_by_the_financial_gate(self):
+        import commerce_cli as cli
+        import commerce_food as food
+        import noon_nownow_checkout as cards
+        from noon_checkout import AccountHome
+
+        rows=[{'item_code':'I1','qty':1}]
+        (self.home/'commerce').mkdir(mode=0o700)
+        items_file=self.home/'food-items.json'
+        items_file.write_text(json.dumps(rows))
+        session={'checkoutSessionCode':'SESSION1','outletCode':'OUTLET','addressCode':'ADDR',
+                 'addressVersion':1,'items':food.manifest(rows),'orderTotal':10,
+                 'orderPaymentAmount':10,'orderWalletAmount':0,
+                 'deliveryPreferenceInfo':[{'code':k,'value':False} for k in food.QUIET]}
+        operations=[]
+        def request(operation, headers, body):
+            operations.append(operation)
+            if operation=='create':return {'checkoutSessionCode':'SESSION1'}
+            if operation=='details':return copy.deepcopy(session)
+            if operation=='set-delivery-preference':
+                session['deliveryPreferenceInfo']=[{'code':k,'value':v} for k,v in body['deliveryPreference'].items()]
+            elif operation=='add-notes':session['driverNotes']=body['driverNotes']
+            elif operation=='set-payment-method':
+                session.update(creditCardMask=body['creditCardMask'],paymentMethodCode=body['paymentMethod'],
+                               prepaidPaymentMethodCode=body['prepaidPaymentMethod'])
+            else:self.fail('unexpected Food request: '+operation)
+            return {}
+
+        menu=({'status':'open','serviceable':True,'menu_code':'MENU1','menu_version':1,'name':'Store'},
+              [{'id':'I1','name':'Item','available':True,'max_quantity':3,'choice_groups':[]}])
+        home=AccountHome('main','a'*64,'b'*64,time.time())
+        with patch.object(food,'ROOT',self.home/'commerce/food'), \
+                patch.object(food.order_card,'LAST4','2342'), patch.object(cli,'PAUSE_FILE',self.home/'paused'), \
+                patch.object(food.vertical,'_headers',return_value={'x-addresscode':'ADDR','x-addresskey':'ADDR-1'}), \
+                patch.object(food.core,'request',return_value={}), patch.object(food,'project_home',return_value=home), \
+                patch.object(food.native,'food_menu_raw',return_value=menu), \
+                patch.object(food.vertical,'food_orders',return_value={'orders':[]}), \
+                patch.object(cards,'native_request',return_value={'data':[{
+                    'ccMasked':'****2342','id':161,'isDeleted':False}]}), \
+                patch.object(food,'request',side_effect=request):
+            args=['order','food','--outlet-code','OUTLET','--items-file',str(items_file),'--prepare-only']
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main(args),0,output.getvalue())
+            prepared=json.loads(output.getvalue().splitlines()[-1])
+            flow=prepared['flow_id']
+            item=prepared['owner_go_item']
+            amount=prepared['review']['payable_minor']
+            self.assertFalse(prepared['financial_send'])
+            self.assertFalse(any(o['kind'] in ('place','payment') for o in journal.inspect(flow)['operations']))
+            sends=list(operations)
+            items_file.write_text(json.dumps({'items':rows}))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main(args+['--resume-flow',flow]),0,output.getvalue())
+            resumed=json.loads(output.getvalue().splitlines()[-1])
+            self.assertEqual(resumed['owner_go_item'],item)
+            self.assertEqual([op for op in operations[len(sends):] if op!='details'],[])
+
+            financial=dict(request_hash='c'*64,cart_hash='d'*64,review_hash='e'*64,payable_minor=amount)
+            with self.assertRaisesRegex(journal.JournalError,'^OWNER_GO_REQUIRED$'):
+                journal.consume(flow,'place',kind='place',**financial)
+            self.approve(vendor='noon',item=item,amount=amount,currency=prepared['review']['currency'])
+            self.assertTrue(journal.consume(flow,'place',kind='place',**financial))
+            self.assertEqual(journal.inspect(flow)['reserved_minor'],amount)
 
     def test_hcloud_write_forms_and_missing_tool_refuse_without_execution(self):
         writes = [['server','create','--type','ccx33'], ['server','change-type','123','ccx33'],
