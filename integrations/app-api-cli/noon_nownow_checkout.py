@@ -339,7 +339,9 @@ class NowNowCheckout:
         if mutation:
             try:
                 reserved = before_send(operation, digest)
-            except Exception:
+            except Exception as exc:
+                if str(exc) == 'OWNER_GO_REQUIRED':
+                    raise NowNowError('OWNER_GO_REQUIRED') from None
                 raise NowNowError('SEND_RESERVATION_FAILED') from None
             require(reserved is True, 'SEND_RESERVATION_DENIED')
             sent = self._mutation_fenced = True

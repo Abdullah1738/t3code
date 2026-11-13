@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
 _os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -19,12 +20,13 @@ import commerce_minutes as c
 from commerce_auth_status import CommerceAuth
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint
-from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
-from test.test_noon_minutes_checkout import Harness, HEADERS, fixture
+from test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
+from test_noon_minutes_checkout import Harness, HEADERS, fixture
 
 
 class MinutesIntegrationTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -150,7 +152,7 @@ class MinutesIntegrationTests(unittest.TestCase):
 def _session_wire(cvv_required):
     """A fixture-based cart session that satisfies approve()'s fee and arithmetic gates."""
     import copy
-    from test.test_noon_minutes_checkout import fixture as _fixture
+    from test_noon_minutes_checkout import fixture as _fixture
     session=copy.deepcopy(_fixture())
     session['isCvvRequired']=cvv_required
     for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
@@ -284,6 +286,9 @@ PREPARE_SENDS=7
 
 
 class OrderMinutesEndToEndTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     """`commerce order minutes --cvv-from-keychain` through the real CLI, MinutesFlow
     constructor and client. Only the outside world is faked: noon's HTTP (urllib
     opener), the noon auth lifecycle, the Keychain CVV read and the Telegram /
@@ -418,6 +423,9 @@ def paid_projection(status='payment_confirmed',txn='CAPTURED',authorized=1725,ca
 
 
 class PaymentAwaitTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def flow(self):
         from unittest.mock import Mock
         flow=object.__new__(c.MinutesFlow)
@@ -606,6 +614,7 @@ class PaymentAwaitTests(unittest.TestCase):
 
 class ResumeActiveTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -759,6 +768,9 @@ class ResumeActiveTests(unittest.TestCase):
 
 
 class ResumeAndCloseTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_failed_evidence_accepts_rejected_dead_intent_only(self):
         from unittest.mock import Mock
         auth=Mock()
