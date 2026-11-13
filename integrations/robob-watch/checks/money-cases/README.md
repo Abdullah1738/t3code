@@ -35,6 +35,8 @@ money-cases brief      # one line for the morning brief, nothing when no case is
 
 A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open case needs one. Setting a new deadline re-arms the ping. Every change is kept in the case's `history`.
 
+Use `add --due DATE` to record the real due date separately from the follow-up deadline. `update --due DATE` needs `--because TEXT` or `--reply ID`. The brief sorts and judges overdue cases by due when set and shows the follow-up date too; cases without due use deadline. Pings still follow deadline.
+
 Rules added 2026-10-30 (money-cases fixes, card #10):
 - **No self-moved deadlines.** A deadline change needs `--source mail:<id>`, `sms:<id>`, `imessage:<id>`, `statement:<path>#<line>`, or `--reply` (his reply id). `--because` is an optional reason and cannot move a deadline alone. The source is kept in the history text and its `source` field; it can also be recorded without a deadline change. Only his reply counts as an owner answer.
 - **One reminder a case a day.** A second reminder the same day is held until the next day.

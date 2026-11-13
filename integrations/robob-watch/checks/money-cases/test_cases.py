@@ -731,6 +731,113 @@ class Rules(Base):
         self.assertEqual(len(mc.load(self.data)['cases']), 2)
 
 
+class DueDates(Base):
+    def test_add_accepts_deadline_formats_for_due_and_rejects_bad_dates(self):
+        for n, value in enumerate(('2026-11-01', '2026-11-01T05:00:00Z',
+                                   '2026-11-01T09:00:00+04:00', '2026-11-01T09:00:00')):
+            with self.subTest(value=value):
+                c = self.case(f'case-{n}', merchant=f'Merchant {n}', due=value)
+                self.assertEqual(c['due'], value)
+                self.assertIn('due Sun 1 Nov', mc.brief([c], at('2026-10-31T10:00')))
+        for value in ('tomorrow', '2026-02-30', ''):
+            with self.subTest(value=value), self.assertRaises(mc.CaseError):
+                self.case('invalid', merchant='Invalid', due=value)
+        self.assertEqual(len(mc.load(self.data)['cases']), 4)
+
+    def test_brief_keeps_real_due_date_after_follow_up_moves(self):
+        c = self.case(due='2026-11-01', deadline='2026-11-02', when=at('2026-10-20T09:00'))
+        line = mc.brief([c], at('2026-10-31T10:00'))
+        self.assertEqual(line, 'Money: 1 open. due: Acme AED 120.50 due Sun 1 Nov (follow-up Mon 2 Nov).')
+        # The true due date is overdue even before the follow-up time on 2 Nov.
+        self.assertIn('overdue since Sun 1 Nov (follow-up Mon 2 Nov)', mc.brief([c], at('2026-11-02T08:00')))
+        self.assertIn('due Sun 1 Nov, follow-up Mon 2 Nov', mc.table([c]))
+        c = mc.update(self.data, 'acme', {'deadline': '2026-11-03'}, source='mail:follow-up')
+        self.assertEqual(c['due'], '2026-11-01')
+        mc.close(self.data, 'acme', 'done')
+        c = mc.reopen(self.data, 'acme', '2026-11-04', 'still unpaid')
+        self.assertEqual(c['due'], '2026-11-01')
+
+    def test_brief_sorts_and_buckets_by_due_instead_of_follow_up(self):
+        early = self.case('early', merchant='Early', due='2026-11-01', deadline='2026-11-10',
+                          when=at('2026-10-20T09:00'))
+        later = self.case('later', merchant='Later', due='2026-11-02', deadline='2026-10-30',
+                          when=at('2026-10-20T09:00'))
+        future = self.case('future', merchant='Future', due='2026-11-10', deadline='2026-10-30',
+                           when=at('2026-10-31T09:00'))
+        line = mc.brief([later, future, early], at('2026-10-31T10:00'))
+        self.assertLess(line.index('Early'), line.index('Later'))
+        self.assertIn('changed: Future AED 120.50 due Tue 10 Nov (follow-up Fri 30 Oct)', line)
+        self.assertNotIn('overdue', line)
+        self.assertIn('nothing due in 48h', mc.brief([future], at('2026-11-02T10:00')))
+
+    def test_same_instant_does_not_repeat_follow_up_in_brief(self):
+        c = self.case(due='2026-11-01', deadline='2026-11-01T05:00:00Z')
+        line = mc.brief([c], at('2026-10-31T10:00'))
+        self.assertIn('due Sun 1 Nov', line)
+        self.assertNotIn('follow-up', line)
+
+    def test_missing_or_null_due_keeps_legacy_display(self):
+        c = self.case(deadline='2026-11-01', when=at('2026-10-20T09:00'))
+        self.assertNotIn('due', c)
+        for row in (c, dict(c, due=None)):
+            with self.subTest(due=row.get('due')):
+                self.assertEqual(mc.brief([row], at('2026-10-31T10:00')),
+                                 'Money: 1 open. due: Acme AED 120.50 (Sun 1 Nov).')
+                self.assertEqual(mc.brief([row], at('2026-11-02T08:00')),
+                                 'Money: 1 open. due: Acme AED 120.50 (overdue since Sun 1 Nov).')
+                self.assertIn('Acme AED 120.50, by Sun 1 Nov (Abdullah)', mc.table([row]))
+
+    def test_awaiting_answer_and_urgency_stay_visible_with_due(self):
+        c = self.case(due='2026-11-01', deadline='2026-11-02')
+        for status in ('open', 'awaiting_answer'):
+            with self.subTest(status=status):
+                row = dict(c, status=status, urgency='overdue', state='OVERDUE bank bill')
+                line = mc.brief([row], at('2026-11-02T08:00'))
+                self.assertIn('OVERDUE bank bill', line)
+                self.assertIn('overdue since Sun 1 Nov (follow-up Mon 2 Nov)', line)
+                if status == 'awaiting_answer':
+                    self.assertIn('awaiting answer', line)
+
+    def test_due_edits_require_reason_and_failure_changes_nothing(self):
+        self.case(due='2026-11-01')
+        path = self.data / 'cases.json'
+        before, stat = path.read_bytes(), path.stat()
+        for proof in ({}, {'because': ' '}, {'source': 'mail:fixture'}):
+            with self.subTest(proof=proof), self.assertRaisesRegex(mc.CaseError, '--because or --reply'):
+                mc.update(self.data, 'acme', {'due': '2026-11-03', 'state': 'changed'}, **proof)
+            self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns),
+                             (before, stat.st_ino, stat.st_mtime_ns))
+        for value in ('tomorrow', '2026-02-30', ''):
+            with self.subTest(value=value), self.assertRaises(mc.CaseError):
+                mc.update(self.data, 'acme', {'due': value}, because='corrected date')
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_due_edits_record_reason_or_reply_without_revising_ping_deadline(self):
+        self.case()
+        for value, proof in (('2026-11-01', {'because': 'merchant confirmed the due date'}),
+                             ('2026-11-02T09:00:00+04:00', {'reply': 'msg-4471'})):
+            with self.subTest(value=value):
+                c = mc.update(self.data, 'acme', {'due': value}, **proof)
+                self.assertEqual((c['due'], c['deadline'], c['rev']), (value, '2026-10-25', 0))
+                self.assertIn('due: ' + value, c['history'][-1]['text'])
+                self.assertEqual(c['history'][-1].get('owner', False), 'reply' in proof)
+        self.assertIn('owner reply msg-4471', c['history'][-1]['text'])
+        self.assertIn('because: merchant confirmed the due date', c['history'][-2]['text'])
+
+    def test_due_does_not_reschedule_or_rearm_pings(self):
+        self.case(due='2026-11-01', deadline='2026-11-02', kind='hold')
+        self.assertEqual(self.check('2026-10-31T10:00'), '')
+        self.assertIn('due Mon 2 Nov', self.check('2026-11-01T10:00', 'r2'))
+        mc.update(self.data, 'acme', {'due': '2026-10-30'}, because='corrected due date', at=at('2026-11-01T10:30'))
+        self.assertEqual(self.check('2026-11-01T11:00', 'r3'), '')
+        self.assertIn('OVERDUE since Mon 2 Nov', self.check('2026-11-02T10:00', 'r4'))
+
+    def test_due_does_not_hide_unasked_charges_from_daily_list(self):
+        self.case(due='2026-11-01', deadline='2026-11-10')
+        self.assertIn('1 unasked charges older than 24 h', self.check('2026-10-31T10:00'))
+        self.assertEqual([c['id'] for c in mc.unasked_candidates(self.data, at('2026-10-31T10:00'))], ['acme'])
+
+
 class Brief(Base):
     def test_lists_due_and_changed_only(self):
         self.assertEqual(mc.brief([], at('2026-10-24T08:00')), '')
@@ -2129,6 +2236,24 @@ class Cli(Base):
         self.assertEqual((self.data / 'cases.json').read_bytes(), before)
         self.assertEqual(self.run_cli('update', 'acme', '--deadline', '2026-10-28', '--source', 'mail:abc')[0], 0)
         self.assertEqual(mc.find(mc.load(self.data), 'acme')['history'][-1]['source'], 'mail:abc')
+
+    def test_add_and_update_due_cli(self):
+        code, out, err = self.run_cli('add', 'acme', '--merchant', 'Acme', '--amount', '120.50', '--currency', 'AED',
+                                    '--state', 'refund asked', '--next', 'follow up', '--deadline', '2026-11-02',
+                                    '--who', 'Abdullah', '--due', '2026-11-01')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('due Sun 1 Nov, follow-up Mon 2 Nov', out)
+        path = self.data / 'cases.json'
+        before = path.read_bytes()
+        code, out, err = self.run_cli('update', 'acme', '--due', '2026-11-03', '--state', 'changed')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('--because or --reply', err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.run_cli('update', 'acme', '--due', '2026-11-03', '--because', 'merchant corrected it')[0], 0)
+        self.assertIn('due Tue 3 Nov, follow-up Mon 2 Nov', self.run_cli('list')[1])
+        self.assertEqual(json.loads(self.run_cli('show', 'acme')[1])['due'], '2026-11-03')
+        self.assertEqual(self.run_cli('update', 'acme', '--due', '2026-11-04', '--reply', 'msg-1')[0], 0)
+        self.assertEqual(json.loads(self.run_cli('list', '--json')[1])[0]['due'], '2026-11-04')
 
     def test_card_dead_cards_and_swap_cli(self):
         code, _, _ = self.run_cli('card-dead', '5542', '--note', 'cancelled 30 Oct, replaced by 2342')
