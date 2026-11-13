@@ -234,11 +234,11 @@ export class ControlClient {
   }
 
   /** Uploads one file through a signed URL and returns the attachment reference for send. */
-  async upload(file: { name: string; mimeType: string; bytes: Uint8Array }) {
+  async upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal?: AbortSignal) {
     const type = file.mimeType.startsWith("image/") ? "image" as const : "file" as const;
     const issued = await this.request<{ attachmentId: string; relativeUrl: string }>("POST", "/attachments", {
       type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength,
-    });
+    }, { signal });
     if (typeof issued.relativeUrl !== "string" || !issued.relativeUrl.startsWith("/") || issued.relativeUrl.startsWith("//")) {
       throw new ControlError(0, "upload_url");
     }
@@ -248,7 +248,7 @@ export class ControlClient {
         method: "POST",
         headers: { "content-length": String(file.bytes.byteLength) },
         body: new Blob([file.bytes as Uint8Array<ArrayBuffer>]),
-        signal: AbortSignal.timeout(120_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
         redirect: "manual",
         proxy: "",
         verbose: false,
