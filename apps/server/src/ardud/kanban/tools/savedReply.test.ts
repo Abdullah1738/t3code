@@ -76,7 +76,7 @@ it.effect.each([...SavedReply.TOOLS])("%s interrupted before commit is not saved
   }),
 );
 
-it.effect.each(["card_update", "evaluator_start", "discussion_post"])(
+it.effect.each([...SavedReply.TOOLS])(
   "%s after an external boundary is ambiguous and an error",
   (tool) =>
     Effect.gen(function* () {

@@ -23119,3 +23119,376 @@ it.effect("an already-terminal silence interrupt records no stop or stale promot
     }).pipe(Effect.provide(testLayer(layer)));
   }),
 );
+
+it.effect("reportBug appends a hinted sighting as the reporter without an evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Known tool failure", prompt: "Fix tool" },
+        owner,
+      );
+      const threadId = ThreadId.make("reporter");
+      const result = yield* kanban.reportBug({
+        boardId: board.slug,
+        threadId,
+        title: "Different wording",
+        evidence: "run-1 failed",
+        cardHint: `#${card.number}`,
+      });
+      assert.deepStrictEqual(result, { appendedTo: `#${card.number}` });
+      const events = (yield* kanban.card(card.id)).events.filter(
+        (event) => event.kind === "comment",
+      );
+      assert.strictEqual(events.length, 1);
+      assert.deepStrictEqual(events[0]?.actor, { _tag: "thread", threadId });
+      assert.strictEqual(events[0]?.body, "sighting\n\nrun-1 failed");
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("reportBug strong title matches append and return the next two candidates", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker certificate expiry", prompt: "Fix cert" },
+        owner,
+      );
+      yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker latency", prompt: "Fix latency" },
+        owner,
+      );
+      yield* kanban.createCard(
+        board.id,
+        { title: "Certificate rotation", prompt: "Rotate" },
+        owner,
+      );
+      yield* kanban.createCard(board.id, { title: "Kafka metrics", prompt: "Metrics" }, owner);
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: "The KAFKA broker certificate expiry fails",
+        evidence: "run-2",
+      });
+      assert.strictEqual(result.appendedTo, `#${card.number}`);
+      assert.strictEqual(result.candidates?.length, 3);
+      assert.strictEqual(result.candidates?.[0]?.number, card.number);
+      assert.strictEqual(result.candidates?.[0]?.score, 0.8);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  ["below threshold", "Kafka broker lag timeout"],
+  ["description only", "Novel parser crashes"],
+  ["single token", "Kafka"],
+  ["stop words only", "The bug is a report"],
+  ["token substring", "Kafka brokers certificates"],
+  ["unknown reference", "Kafka broker certificate expiry #999"],
+  ["ambiguous references", "Kafka broker certificate expiry #1 #2"],
+  ["hash headings", "Kafka broker expiry ##12 ##34"],
+  ["attached hash reference", "Kafka broker expiry error#123"],
+  ["single digit headings", "Kafka broker expiry ##1 ##2"],
+  ["decimal references", "Kafka broker expiry #1.5 #2.6"],
+  ["leading zero references", "Kafka broker expiry #01 #02"],
+  ["letter suffix references", "Kafka broker expiry #1a #2b"],
+  ["unicode suffix references", "Kafka broker expiry #1é #2é"],
+  ["single malformed reference with matching title", "Kafka broker certificate expiry #1foo"],
+  ["Unicode compound with matching title", "Kafka broker certificate expiry #1.٥"],
+  [
+    "valid and malformed references with matching title",
+    "Kafka broker certificate expiry #1 #2foo",
+  ],
+] as const)("reportBug weak match (%s) starts exactly one request evaluator", ([_label, title]) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Kafka broker certificate expiry",
+          description: "Novel parser crashes",
+          prompt: "Fix cert",
+        },
+        owner,
+      );
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title,
+        evidence: "new evidence",
+      });
+      assert.isString(result.threadId);
+      assert.isUndefined(result.appendedTo);
+      const launched = yield* Ref.get(fake.threads);
+      assert.strictEqual(launched.size, 1);
+      assert.include([...launched.values()][0]!.messages[0]!, title);
+      assert.include([...launched.values()][0]!.messages[0]!, "new evidence");
+      assert.strictEqual(
+        (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment").length,
+        0,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("reportBug exact card references never match number prefixes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Known tool", prompt: "Fix" },
+        owner,
+      );
+      for (const title of [
+        `Same problem #${card.number}`,
+        `Same problem (#${card.number})`,
+        `Same problem [#${card.number}]`,
+        `Same problem **#${card.number}**`,
+        `Same problem #${card.number}: failure`,
+        `Same problem #${card.number}.`,
+      ]) {
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId: ThreadId.make("reporter"),
+          title,
+          evidence: title,
+        });
+        assert.strictEqual(result.appendedTo, `#${card.number}`);
+      }
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: `Same problem #${card.number}0`,
+        evidence: "other",
+      });
+      assert.isString(result.threadId);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "reportBug dedupes concurrent identical evidence per thread and card for 30 minutes",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Known tool", prompt: "Fix" },
+          owner,
+        );
+        const other = yield* kanban.createCard(
+          board.id,
+          { title: "Other tool", prompt: "Fix other" },
+          owner,
+        );
+        const input = {
+          boardId: board.id,
+          threadId: ThreadId.make("reporter"),
+          title: "Known tool",
+          evidence: "same evidence",
+          cardHint: `#${card.number}`,
+        };
+        const results = yield* Effect.all([kanban.reportBug(input), kanban.reportBug(input)], {
+          concurrency: "unbounded",
+        });
+        assert.strictEqual(results.filter((result) => result.deduped).length, 1);
+        // An intervening comment must not defeat sighting dedupe.
+        yield* kanban.editCard(card.id, { comment: "unrelated" }, owner);
+        yield* TestClock.adjust("29 minutes");
+        assert.isTrue((yield* kanban.reportBug(input)).deduped);
+        yield* kanban.reportBug({ ...input, threadId: ThreadId.make("other-reporter") });
+        yield* kanban.reportBug({ ...input, cardHint: `#${other.number}` });
+        yield* kanban.reportBug({ ...input, evidence: "new evidence" });
+        yield* TestClock.adjust("1 minute");
+        assert.isUndefined((yield* kanban.reportBug(input)).deduped);
+        const sightings = (yield* kanban.card(card.id)).events.filter((event) =>
+          event.body?.startsWith("sighting\n\n"),
+        );
+        assert.strictEqual(sightings.length, 4);
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("reportBug ignores closed hints, settled cards and cards on another board", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const closed = yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker certificate expiry", prompt: "Fix" },
+        owner,
+      );
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putCard({ ...closed, stage: "completed" });
+      const settled = yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker certificate expiry", prompt: "Fix again" },
+        owner,
+      );
+      yield* store.putCard({ ...settled, settledAt: "2026-11-01T00:00:00.000Z" });
+      const elsewhere = yield* kanban.ensureBoard({
+        slug: "elsewhere",
+        name: "Elsewhere",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.createCard(
+        elsewhere.id,
+        { title: "Kafka broker certificate expiry", prompt: "Other board" },
+        owner,
+      );
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: "Kafka broker certificate expiry",
+        evidence: "new failure",
+        cardHint: `#${closed.number}`,
+      });
+      assert.isString(result.threadId);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("reportBug tied strong candidates fall through to an evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker certificate expiry", prompt: "Fix first" },
+        owner,
+      );
+      yield* kanban.createCard(
+        board.id,
+        { title: "Kafka broker certificate expiry regression", prompt: "Fix second" },
+        owner,
+      );
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: "Kafka broker certificate expiry",
+        evidence: "failure",
+      });
+      assert.isString(result.threadId);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  "#10",
+  "#1abc",
+  "##1",
+  "#1.5",
+  "abc#1",
+  "#1é",
+  "#1-2",
+  "#1/2",
+  "#1:2",
+  "#1,2",
+  "#1–2",
+  "#1−2",
+  "#1+2",
+  "#1-2-2026",
+  "#1#2",
+  "#1##2",
+  "#1*2",
+  "#1×2",
+  "#1÷2",
+  "#1%2",
+  "#1=2",
+  "#1^2",
+  "#1&2",
+  "#1|2",
+  "#1.٥",
+  "#1/٥",
+  "#1-٥",
+  "#1:٥",
+  "#1,٥",
+  "#1*٥",
+  "#1.Ⅴ",
+  "#1 #2foo",
+  "#1 (#2*3)",
+  "#1* 2",
+  "#1| 2",
+  "#1** 2",
+  "#1*#2",
+  "#1* #2",
+  "**#1*",
+  "*#1**",
+  "#1* ",
+  "https://example.com/#1",
+  "/#1",
+  "$#1",
+  "error(#1)",
+])("reportBug does not interpret malformed or different references as #1: %s", (ref) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Known tool", prompt: "Fix" },
+        owner,
+      );
+      assert.strictEqual(card.number, 1);
+      const second = yield* kanban.createCard(
+        board.id,
+        { title: "Other tool", prompt: "Fix other" },
+        owner,
+      );
+      assert.strictEqual(second.number, 2);
+      const result = yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: `Same issue ${ref}`,
+        evidence: "failure",
+      });
+      assert.isString(result.threadId);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("reportBug invalid input never appends or starts an evaluator", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const input = {
+        boardId: board.id,
+        threadId: ThreadId.make("reporter"),
+        title: "Some bug",
+        evidence: "failure",
+      };
+      for (const patch of [
+        { boardId: "missing" },
+        { title: "  " },
+        { evidence: " " },
+        { evidence: "bad\u0000decode" },
+      ]) {
+        const error = yield* kanban.reportBug({ ...input, ...patch }).pipe(Effect.flip);
+        assert.strictEqual(error.code, "invalid");
+      }
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
