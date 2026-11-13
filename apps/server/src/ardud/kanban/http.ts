@@ -236,6 +236,7 @@ const ScriptPatchBody = Schema.Struct({ enabled: Schema.Boolean });
 const RunBody = Schema.Struct({ trigger: Schema.optional(Schema.Literals(["manual", "webhook"])) });
 
 const EvaluatorBody = Schema.Struct({
+  forceNew: Schema.optional(Schema.Boolean),
   kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
   text: Text,
 });
@@ -921,8 +922,10 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         // setup/request already carry their text in purpose; only sweeps pass it separately.
         const sweepText =
           input.kind === "setup" || input.kind === "request" ? undefined : input.text;
-        const threadId = yield* service.startEvaluator(board.id, purpose, sweepText);
-        return { threadId };
+        return yield* service.submitEvaluator(board.id, purpose, {
+          ...(sweepText ? { text: sweepText } : {}),
+          ...(input.forceNew === undefined ? {} : { forceNew: input.forceNew }),
+        });
       }),
     );
 

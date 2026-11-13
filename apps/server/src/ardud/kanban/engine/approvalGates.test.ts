@@ -7,6 +7,148 @@ import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
 
+const consentReplies = [
+  { task: "Purchase the license", label: "Yes, buy it", reply: "yes", approved: true },
+  { task: "Purchase the license", label: "Yes, buy this", reply: "yes", approved: true },
+  { task: "Purchase the license", label: "Yes, buy that now", reply: "yes", approved: true },
+  { task: "Purchase the licenses", label: "Yes, buy these", reply: "yes", approved: true },
+  { task: "Purchase the licenses", label: "Yes, buy those now", reply: "yes", approved: true },
+  { task: "Purchase the license", label: "Yes, purchase it", reply: "yes", approved: true },
+  { task: "Purchase the license", label: "Yes, please buy it", reply: "yes", approved: true },
+  { task: "Purchase the license", label: "Yes, go ahead and buy it", reply: "yes", approved: true },
+  { task: "Restart the bridge LaunchAgent", label: "Yes, go ahead", reply: "yes", approved: true },
+  { task: "Restart the bridge LaunchAgent", label: "Yes, go for it", reply: "yes", approved: true },
+  { task: "Restart the bridge LaunchAgent", label: "Yes, do it", reply: "yes", approved: true },
+  { task: "Share the token", label: "Yes, share it", reply: "yes", approved: true },
+  ...[
+    " and read back its version",
+    ", then read back its version",
+    "; read back its version",
+    " — read back its version",
+    " (read back its version)",
+    ". Read back its version",
+  ].map((followup) => ({
+    task: `Deploy Robob build 41${followup}`,
+    label: "Deploy Robob build 41",
+    reply: "go",
+    approved: true,
+  })),
+  {
+    task: "Purchase the license and record the receipt",
+    label: "Buy the license",
+    reply: "Buy the license",
+    approved: true,
+  },
+  {
+    task: "Share the API key and confirm the connection",
+    label: "Share the API key",
+    reply: "Share the API key",
+    approved: true,
+  },
+  { task: "Purchase the license", label: "Yes, show the price", reply: "yes", approved: false },
+  {
+    task: "Purchase the license",
+    label: "Yes, please show the price",
+    reply: "yes",
+    approved: false,
+  },
+  {
+    task: "Purchase the license",
+    label: "Yes, go ahead and show the price",
+    reply: "yes",
+    approved: false,
+  },
+  {
+    task: "Purchase the license",
+    label: "Yes, compare purchase options",
+    reply: "yes",
+    approved: false,
+  },
+  { task: "Share the token", label: "Yes, show token permissions", reply: "yes", approved: false },
+  { task: "Deploy the release", label: "Yes, review release notes", reply: "yes", approved: false },
+  { task: "Purchase the license", label: "Yes, buy it if needed", reply: "yes", approved: false },
+  { task: "Restart LaunchAgent", label: "Yes, go ahead later", reply: "yes", approved: false },
+  {
+    task: "Deploy Robob build 41 and read back its version",
+    label: "Deploy Robob build 42",
+    reply: "go",
+    approved: false,
+  },
+  { task: "Deploy Robob build 410", label: "Deploy Robob build 41", reply: "go", approved: false },
+  { task: "Deploy Robob build 41.1", label: "Deploy Robob build 41", reply: "go", approved: false },
+  {
+    task: "Deploy Robob build 41-beta",
+    label: "Deploy Robob build 41",
+    reply: "go",
+    approved: false,
+  },
+];
+
+it.effect.each(
+  consentReplies.flatMap((fixture) =>
+    (["done", "skipped"] as const).map((state) => ({ ...fixture, state })),
+  ),
+)(
+  "$reply selects $label; $state requires consent ($approved)",
+  ({ task, label, reply, approved, state }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Consent wording",
+            prompt: "Work",
+            subtasks: [{ text: task, owner: "evaluator" }],
+          },
+          owner,
+        );
+        yield* kanban.askOwner(
+          card.id,
+          { question: `${task}?`, blocking: false },
+          evaluator,
+          "evaluator",
+        );
+        yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+        yield* kanban.askOwner(
+          card.id,
+          { question: `${task}?`, blocking: false, options: [label, "No"] },
+          evaluator,
+          "evaluator",
+        );
+        yield* kanban.replyOnAsk(card.id, "q2", owner, [{ _tag: "md", text: reply }], "owner");
+        const answered = (yield* kanban.card(card.id)).card.asks.at(-1)!;
+        assert.isNotNull(answered.closedAt);
+        assert.strictEqual(answered.answer?.verdict, "picked");
+        assert.deepStrictEqual(answered.answer?.optionIds, ["o1"]);
+        const complete = kanban.markSubtask(
+          card.id,
+          "s1",
+          state,
+          "Owner replied",
+          evaluator,
+          "evaluator",
+        );
+        if (approved) {
+          assert.strictEqual((yield* complete).subtasks[0]?.state, state);
+          assert.strictEqual(
+            (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
+            "verified",
+          );
+        } else {
+          assert.include((yield* complete.pipe(Effect.flip)).detail, "approval");
+          assert.include(
+            (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator).pipe(Effect.flip))
+              .detail,
+            "approval",
+          );
+          assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]?.state, "open");
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect.each([
   { task: "Purchase the license", neutral: "Show the price", approve: "Purchase now" },
   { task: "Purchase the license", neutral: "Compare purchase options", approve: "Buy the license" },

@@ -53,12 +53,16 @@ const approvesGate = (
     /\b(?:if|unless|after|before|once|when|pending|first|then)\b/i.test(words)
   )
     return false;
-  const command = words.replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "");
-  if (/^(?:yes|approve|approved|go|ok|okay|do it|proceed)$/i.test(command)) return true;
+  const command = words
+    .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
+    .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
+  if (/^(?:yes|approve|approved|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(command))
+    return true;
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
   const normalized = approvalAction(action);
-  if (normalized.replace(/\s+now$/, "") === approvalAction(task).replace(/\s+now$/, ""))
-    return true;
+  const target = normalized.replace(/\s+now$/, "");
+  const taskAction = approvalAction(task).replace(/\s+now$/, "");
+  if (target === taskAction) return true;
   let verb: RegExp;
   switch (gate) {
     case "deploy":
@@ -74,8 +78,11 @@ const approvesGate = (
   const operation = action !== command ? normalized : action;
   const matched = verb.exec(operation)?.[0];
   if (!matched) return false;
-  // Prefixes such as "Release notes" or "Show token permissions" are information, not consent.
-  return /^(?:\s+now)?$/i.test(operation.slice(matched.length));
+  // A targeted action need not repeat follow-up work, but must end at a word or clause boundary.
+  return (
+    /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
+    (taskAction.startsWith(target) && /^(?:\s|[,;:(]|\.\s)/.test(taskAction.slice(target.length)))
+  );
 };
 
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */

@@ -4,5 +4,6 @@
   "group_mention_names": [],
   "excluded_imessage_chat_ids": [],
   "excluded_imessage_identifiers": [],
-  "robob_lines": []
+  "robob_lines": [],
+  "fastpath_aed_rates": {}
 }

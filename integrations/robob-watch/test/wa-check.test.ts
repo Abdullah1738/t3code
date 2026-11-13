@@ -53,6 +53,7 @@ writeFileSync(waBin, readFileSync(join(import.meta.dir, "../helpers/wa")));
 chmodSync(waBin, 0o755);
 writeFileSync(join(helpersDir, "wa-db"), readFileSync(join(import.meta.dir, "../helpers/wa-db")));
 chmodSync(join(helpersDir, "wa-db"), 0o755);
+writeFileSync(join(helpersDir, "redact.py"), readFileSync(join(import.meta.dir, "../helpers/redact.py")));
 
 const uid = Bun.spawnSync(["/usr/bin/id", "-u"]).stdout.toString().trim();
 const SVC = `gui/${uid}/com.ardud.wacli-sync`;

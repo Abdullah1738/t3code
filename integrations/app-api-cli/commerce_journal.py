@@ -5,6 +5,7 @@ An unknown send remains consumed on its flow; new noon flows remain independent.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import inbox_auth
 import owner_go
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -471,6 +472,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                 fail('JOURNAL_PAYMENT_ALREADY_REPORTED')
         db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                    (flow_id, operation, kind, request_hash, 'MAY_HAVE_SENT', time.time()))
+        if financial and flow['app'] == 'noon':
+            inbox_auth.expect_payment(order_card.LAST4)
     return True
 
 

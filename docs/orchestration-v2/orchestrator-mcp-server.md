@@ -258,8 +258,14 @@ provider session. The request becomes the V2 command
 
 `mode: "async"` returns the current durable state immediately.
 `mode: "wait"` waits for the task result, including nested work and completion follow-ups, or until
-the timeout expires. A wait timeout does not cancel the child; the result sets
-`waitTimedOut: true`, and the caller can continue with `task_status`. A pending blocking
+the timeout expires. The total budget starts at call entry, includes setup, and defaults to and is
+capped at 4 minutes 30 seconds. A wait timeout does not cancel the child; the result sets
+`waitTimedOut: true`, and the caller can continue with `task_status`. If the transport loses the
+response, retry `delegate_task` with the same `clientRequestId` from the same parent thread to
+recover the same task without starting another child, even after a reconnect, a 5xx, a tool-catalog refresh, or a restart.
+Once accepted, preparation continues independently of the response deadline. If preparation or a
+status read cannot finish within the budget, the response carries the accepted identity and the
+last observed state; `startPending: true` means the child has not started yet. A pending blocking
 question also ends the wait with `hasPendingQuestion: true` and `waitTimedOut: false`.
 If `hasPendingQuestion`, pass `threadId=childThreadId` to `t3_pending_request_list`,
 `t3_pending_request_read` (with `requestId`) and `t3_pending_request_respond`, or ask
@@ -499,8 +505,10 @@ results use the latest assistant content from the final work turn.
   backed by a V2 adapter.
 - A requested model must be advertised by the selected provider when the
   provider publishes a model list.
-- `clientRequestId` derives stable command, thread, and message IDs within the
-  provider session. Retrying the same call returns the same durable work.
+- Delegation keys `clientRequestId` by environment and parent thread, so renewed
+  MCP credentials still recover the same task. The other keyed orchestration tools
+  also use the caller thread for command, thread, and message IDs; standalone
+  client credentials retain their client-session namespace.
 - Calls without `clientRequestId` receive a generated request key and create
   new work.
 
