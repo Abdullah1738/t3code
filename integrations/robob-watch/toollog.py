@@ -5,6 +5,7 @@ import fcntl
 import json
 import math
 import os
+import re
 from pathlib import Path
 import time
 import uuid
@@ -14,9 +15,9 @@ CAP_BYTES = 50 * 1024 * 1024
 COMPONENTS = {'food', 'hlog', 'validate', 'whoop', 'cards', 'took', 'whoop-sync',
               'meds-nag', 'nutrition-checkin', 'nutrition-nudge', 'forge-workouts', 'gym-nudge', 'rollup'}
 COMMANDS = {
-    'food': 'search log quick meal-log del flag add-food show-food recipe-new recipe-add recipe-show meal-save pantry today week phase checkin meals-count',
+    'food': 'search log quick meal-log log-order del flag add-food show-food recipe-new recipe-add recipe-show meal-save pantry today week phase checkin meals-count',
     'hlog': 'import summary weekly monthly labs site feel conflicts',
-    'whoop': 'status sync authurl serve', 'cards': 'morning nutrition', 'took': 'confirm skip',
+    'whoop': 'status sync authurl serve', 'cards': 'morning nutrition mark-sent', 'took': 'confirm skip',
     'validate': 'validate', 'rollup': 'rollup',
 }
 CONFLICTS = {'status', 'amount', 'time', 'missing_in_new_export', 'backdated_in_new_export',
@@ -25,15 +26,23 @@ CONFLICTS = {'status', 'amount', 'time', 'missing_in_new_export', 'backdated_in_
 TAGS = {'exit_nonzero', 'invalid_arguments', 'not_authorized', 'reauth_needed', 'timeout',
         'subprocess_failed', 'renderer_failed', 'headless_chrome', 'database_error',
         'io_error', 'interrupted', 'internal_error', 'cap_reached'}
+ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
+                   'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
+                   'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
 SCHEMAS = {
-    'food.warning': {'warning': {'no_time', 'macro_drift'}, 'count': int},
-    'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'help'}},
+    'food.order_log': {'vertical': {'food', 'nownow', 'minutes', 'main', 'supermall'},
+        'outcome': {'logged', 'partial', 'fetch_failed', 'no_items', 'unmatched', 'bad_exclude', 'bad_portion', 'duplicate'},
+        'lines': int, 'unmatched': int, 'options_not_counted': int, 'fetch_ms': int},
+    'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed', 'option_not_counted', 'partial'}, 'count': int},
+    'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'}},
     'watcher.run': {}, 'sync.run': {'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
-        'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool},
-    'sync.gap': {'count': int}, 'card.render': {'kind': {'morning', 'nutrition'}},
+        'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool,
+        **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
+    'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
+    'card.render': {'kind': {'morning', 'nutrition'}, 'runIdRef': 'run'},
+    'delivery.result': {'kind': {'card', 'nag', 'warning'}, 'ok': bool, 'errorTag': TAGS | {'none'}, 'runIdRef': 'run'},
     'brief.fresh': {'fresh': bool}, 'nag.sent': {'count': int}, 'nag.snoozed': {'count': int},
-    'nag.stopped': {'count': int}, 'nag.folded': {'count': int},
-    'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
+    'nag.stopped': {'count': int}, 'nag.folded': {'count': int}, 'validate.conflicts': {'conflictKind': CONFLICTS, 'count': int},
     'log.cap': {}, 'rollup.run': {},
 }
 
@@ -66,11 +75,38 @@ def error_tag(exc, renderer=False):
                 name, 'io_error' if isinstance(exc, OSError) else 'internal_error')
 
 
+def valid_run(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) is not None
+
+
+def iso_stamp(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|[+-]\d\d:\d\d)', value):
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+    except ValueError:
+        return None
+
+
 def _props(name, props):
+    return _fields(SCHEMAS[name], props)
+
+
+def _fields(schema, props):
     out = {}
-    for key, spec in SCHEMAS[name].items():
+    for key, spec in schema.items():
         value = props.get(key)
-        if spec is bool and type(value) is bool:
+        if isinstance(spec, dict) and isinstance(value, dict):
+            out[key] = _fields(spec, value)
+        elif spec == 'run' and valid_run(value):
+            out[key] = value
+        elif spec == 'iso':
+            out[key] = iso_stamp(value)
+        elif spec == 'status' and (value is None or type(value) is int and 100 <= value <= 599):
+            out[key] = value
+        elif spec == 'seconds' and (value is None or type(value) in (int, float) and math.isfinite(value) and -10**9 <= value <= 10**9):
+            out[key] = value
+        elif spec is bool and type(value) is bool:
             out[key] = value
         elif spec is int and type(value) is int and 0 <= value <= 10**9:
             out[key] = value
@@ -79,7 +115,7 @@ def _props(name, props):
     return out
 
 
-def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now):
+def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected=None):
     row = {'ts': now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
            'tool': 'health', 'component': component, 'kind': kind, 'name': name}
     if type(duration_ms) in (int, float) and math.isfinite(duration_ms) and duration_ms >= 0:
@@ -94,6 +130,8 @@ def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now):
     if tag in TAGS:
         # Exception text can contain foods, doses, API bodies or credentials.
         row['error'] = {'tag': tag, 'message': tag.replace('_', ' ')}
+        if tag == 'invalid_arguments' and isinstance(rejected, (list, tuple)):
+            row['error']['rejected'] = sorted({v for v in rejected if isinstance(v, str) and re.fullmatch(r'--?[A-Za-z][A-Za-z0-9-]{0,63}', v)})[:32]
     return (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode()
 
 
@@ -109,7 +147,7 @@ def _retention(root, today):
             pass
 
 
-def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None):
+def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None, rejected=None):
     try:
         if component not in COMPONENTS or name not in SCHEMAS or kind not in ('event', 'perf', 'error'):
             return
@@ -136,7 +174,7 @@ def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, t
                     os.write(fd, _line(component, 'log.cap', 'error', None, False, {}, 'cap_reached', None, now))
                 if kind != 'error':
                     return
-            os.write(fd, _line(component, name, kind, duration_ms, ok, props, tag, run_id, now))
+            os.write(fd, _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected))
         finally:
             os.close(fd)
     except BaseException:
@@ -148,11 +186,14 @@ class Span:
         self.component, self.name = component, name
         self.props = props if props is not None else {}
         self.ok, self.tag, self.run_id, self.start = True, None, None, None
+        self.rejected = []
 
     def __enter__(self):
         try:
             self.start = time.monotonic()
-            self.run_id = uuid.uuid4().hex
+            self.run_id = os.environ.get('HEALTH_TOOLLOG_RUN') if self.name == 'watcher.run' else None
+            if not valid_run(self.run_id):
+                self.run_id = uuid.uuid4().hex
         except BaseException:
             pass
         return self
@@ -163,7 +204,7 @@ class Span:
                 self.ok = False
                 self.tag = error_tag(exc, self.name == 'card.render')
             emit(self.component, self.name, 'perf' if self.ok else 'error',
-                 (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id)
+                 (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id, rejected=self.rejected)
         except BaseException:
             pass
         return False
@@ -197,11 +238,23 @@ def conflicts(rows):
         pass
 
 
-def sync_gap(latest):
+_MISSING = object()
+
+def sync_gap(latest, recovery=_MISSING):
     try:
-        stamp = dt.datetime.fromisoformat(latest.replace('Z', '+00:00')) if latest else None
-        if stamp is None or utcnow() - stamp > dt.timedelta(hours=36):
-            emit('whoop-sync', 'sync.gap', props={'count': 1})
+        ends = [iso_stamp(latest), iso_stamp(recovery)]
+        gaps = [(utcnow() - dt.datetime.fromisoformat(v.replace('Z', '+00:00'))).total_seconds() / 3600 for v in ends if v]
+        if ends[0] is None or (recovery is not _MISSING and ends[1] is None) or any(g > 36 for g in gaps):
+            emit('whoop-sync', 'sync.gap', props={'count': 1, 'lastSleepEnd': ends[0],
+                 'lastRecoveryEnd': ends[1], 'gapHours': max(gaps) if gaps else None})
+    except BaseException:
+        pass
+
+
+def delivery(kind, run_id, ok=True, tag=None, component='cards'):
+    try:
+        emit(component, 'delivery.result', ok=ok, props={'kind': kind, 'ok': ok,
+             'errorTag': 'none' if ok else (tag if tag in TAGS else 'internal_error'), 'runIdRef': run_id})
     except BaseException:
         pass
 
@@ -218,6 +271,8 @@ def rollup(day=None):
         names, kinds, outcomes, tags = Counter(), Counter(), Counter(), Counter()
         durations, samples = defaultdict(list), {}
         malformed = 0
+        zero_sleep, last_scored = 0, None
+        food_errors, delivered, expected = Counter(), {}, set()
         with source.open() as fh:
             for line in fh:
                 try:
@@ -228,6 +283,29 @@ def rollup(day=None):
                     kinds[r['kind']] += 1
                     if type(r.get('ok')) is bool:
                         outcomes['ok' if r['ok'] else 'error'] += 1
+                    props = _props(r['name'], r.get('props') or {})
+                    origin = r.get('ids', {}).get('run')
+                    if r['name'] == 'sync.run':
+                        saved = props.get('lastScoredSleep')
+                        if saved:
+                            last_scored = max(last_scored or saved, saved)
+                        endpoint = props.get('sleep', {})
+                        if (endpoint.get('fetchComplete') is True and endpoint.get('httpStatus') == 200
+                                and endpoint.get('rawCount') == 0):
+                            zero_sleep += 1
+                        elif 'sleep' not in props and r.get('ok') is True and props.get('sleepCount') == 0:
+                            zero_sleep += 1
+                        stamp = endpoint.get('newestScoredRecordEnd')
+                        if endpoint.get('scoreStates', {}).get('SCORED', 0) and stamp:
+                            last_scored = max(last_scored or stamp, stamp)
+                    if r.get('component') == 'food' and r['name'] == 'cli.run' and r.get('ok') is False:
+                        food_errors[props.get('subcommand', 'none')] += 1
+                    obligation = ('card' if r['name'] == 'card.render' else
+                                  'nag' if r['name'] == 'nag.sent' else 'warning' if r['name'] == 'food.warning' else None)
+                    if obligation:
+                        expected.add((origin if valid_run(origin) else 'legacy-%d' % sum(names.values()), obligation))
+                    if r['name'] == 'delivery.result' and valid_run(props.get('runIdRef')) and type(props.get('ok')) is bool:
+                        delivered[(props['runIdRef'], props.get('kind'))] = props['ok']
                     value = r.get('durationMs')
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         durations[r['name']].append(value)
@@ -246,7 +324,12 @@ def rollup(day=None):
                   'errorCount': outcomes['error'], 'okRate': outcomes['ok'] / rated if rated else None,
                   'errorRate': outcomes['error'] / rated if rated else None,
                   'errorKindRate': kinds['error'] / total if total else None,
-                  'durationMs': {}, 'topErrors': []}
+                  'durationMs': {}, 'topErrors': [],
+                  'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep},
+                  'food': {'errorsBySubcommand': dict(food_errors)},
+                  'delivery': {'sent': sum(v is True for v in delivered.values()),
+                               'failed': sum(v is False for v in delivered.values()),
+                               'unmarked': len(expected - set(delivered))}}
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}

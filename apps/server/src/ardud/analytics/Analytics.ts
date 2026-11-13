@@ -22,6 +22,9 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { askLatencyRollup, type AskTimingRow } from "./askLatency.ts";
 import {
   accumulate,
   boundedLines,
@@ -95,6 +98,7 @@ export class Analytics extends Context.Service<
   Analytics,
   {
     readonly record: (event: AnalyticsEvent) => Effect.Effect<void>;
+    readonly flush: Effect.Effect<void, AnalyticsError>;
     readonly ingest: (input: {
       readonly events: readonly AnalyticsEvent[];
     }) => Effect.Effect<void, AnalyticsError>;
@@ -131,6 +135,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
+  const boards = yield* Effect.serviceOption(BoardsDatabase.BoardsDatabase);
   const options = boundedOptions(input);
   const directory = path.join(config.logsDir, "analytics");
   const disk = yield* Semaphore.make(1);
@@ -174,7 +179,12 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   ) {
     const full = makeAccumulator();
     const filtered =
-      filter?.kind !== undefined || filter?.boardId !== undefined ? makeAccumulator() : full;
+      filter?.kind !== undefined ||
+      filter?.boardId !== undefined ||
+      filter?.tool !== undefined ||
+      filter?.outcome !== undefined
+        ? makeAccumulator()
+        : full;
     const samples: AnalyticsEvent[] = [];
     const limit = filter?.limit ?? 100;
     let cursor = 0;
@@ -200,7 +210,9 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       accumulate(full, event);
       if (
         (filter?.kind !== undefined && filter.kind !== event.kind) ||
-        (filter?.boardId !== undefined && filter.boardId !== event.boardId)
+        (filter?.boardId !== undefined && filter.boardId !== event.boardId) ||
+        (filter?.tool !== undefined && filter.tool !== event.tool) ||
+        (filter?.outcome !== undefined && filter.outcome !== event.outcome)
       )
         return;
       if (filtered !== full) accumulate(filtered, event);
@@ -435,6 +447,13 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     const batch: PendingEvent[] = [];
     let bytes = 0;
     for (const event of input.events) {
+      // Older clients still emit this after a send. The stored server answer is authoritative.
+      if (
+        event.kind === "ask.answered" ||
+        event.kind === "ask.seen" ||
+        event.kind === "ask.notified"
+      )
+        continue;
       const entry = yield* prepare(event).pipe(
         Effect.mapError((cause) => new AnalyticsError({ operation: "ingest", cause })),
       );
@@ -460,6 +479,29 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       });
   });
 
+  const readAskRows = Effect.fn("Analytics.readAskRows")(function* (day: string) {
+    if (Option.isNone(boards)) return undefined;
+    yield* boards.value.ready;
+    const sql = boards.value.sql;
+    const rows = yield* sql<AskTimingRow>`
+      SELECT c.board_id AS boardId, c.id AS cardId,
+        json_extract(a.value, '$.id') AS askId,
+        json_extract(a.value, '$.at') AS createdAt,
+        json_extract(a.value, '$.closedAt') AS closedAt,
+        CASE WHEN json_extract(a.value, '$.answer.by._tag') = 'owner'
+          AND json_extract(a.value, '$.answer.verdict') != 'dropped'
+          THEN json_extract(a.value, '$.answer.at') END AS answeredAt,
+        json_extract(a.value, '$.blocking') AS blocking,
+        COALESCE(json_extract(a.value, '$.timing.kind'), 'unknown') AS kind,
+        (SELECT MIN(value) FROM json_each(a.value, '$.timing.notified')) AS notifiedAt,
+        (SELECT MIN(value) FROM json_each(a.value, '$.timing.firstSeen')) AS firstSeenAt
+      FROM ardud_kanban_cards c, json_each(c.json, '$.asks') a
+      WHERE json_extract(a.value, '$.at') <= ${`${day}T23:59:59.999Z`}
+        AND COALESCE(json_extract(a.value, '$.to'), 'owner') != 'evaluator'
+    `.pipe(NodeSqliteClient.readOnly);
+    return rows.map((row) => ({ ...row, blocking: Boolean(row.blocking) }));
+  });
+
   const read: Analytics["Service"]["read"] = Effect.fn("Analytics.read")(function* (raw) {
     const input = yield* decodeRead(raw).pipe(
       Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })),
@@ -471,14 +513,39 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         cause: new AnalyticsValidationError({ reason: "invalid-day" }),
       });
     }
+    const storedRows = yield* readAskRows(input.day).pipe(
+      Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })),
+    );
     return yield* disk
       .withPermit(
         Effect.gen(function* () {
           yield* drain(true);
           yield* maintain();
           const scan = yield* scanDay(input.day, yield* listFiles(), input);
-          if (scan.hasFiles) yield* persistRollup(scan.full);
-          return scan.result;
+          let result = scan.result;
+          let fullRollup = scan.full;
+          if (storedRows !== undefined) {
+            const normalized = storedRows;
+            fullRollup = {
+              ...scan.full,
+              askLatency: askLatencyRollup(normalized, input.day, scan.full.generatedAt),
+            };
+            result = {
+              ...result,
+              rollup: {
+                ...result.rollup,
+                askLatency: askLatencyRollup(
+                  input.boardId === undefined
+                    ? normalized
+                    : normalized.filter((row) => row.boardId === input.boardId),
+                  input.day,
+                  result.rollup.generatedAt,
+                ),
+              },
+            };
+          }
+          if (scan.hasFiles) yield* persistRollup(fullRollup);
+          return result;
         }),
       )
       .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })));
@@ -540,7 +607,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }),
   );
 
-  return Analytics.of({ record, ingest, read });
+  const flush = disk
+    .withPermit(drain(true))
+    .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "write", cause })));
+  return Analytics.of({ record, flush, ingest, read });
 });
 
 export const layerWith = (options: Partial<AnalyticsOptions>) =>

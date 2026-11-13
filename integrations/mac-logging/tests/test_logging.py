@@ -39,6 +39,9 @@ class LoggingTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        probes = patch.object(jobs, 'storage_probes', return_value={})
+        probes.start()
+        self.addCleanup(probes.stop)
 
     def rows(self):
         return [json.loads(line) for p in sorted(self.logs.glob('*.ndjson')) for line in p.read_text().splitlines()]
@@ -129,9 +132,11 @@ class LoggingTests(unittest.TestCase):
         a,b=self.rows()
         self.assertEqual(a['props']['bytes'],123)
         self.assertEqual(a['props']['files'],4)
-        self.assertEqual(b['props']['snapshotAgeS'],11)
+        self.assertEqual(a['props']['snapshotAgeS'],1)
+        self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
-        self.assertNotIn('password',str(self.rows()))
+        self.assertNotIn('banned',str(self.rows()))
+        self.assertNotIn('failed with password',str(self.rows()))
 
     def test_cve_entrypoint_and_fix_success_failure_no_commands(self):
         cve=load('cve_test',REPO/'integrations/cve-sweep/cve-sweep')
@@ -182,11 +187,18 @@ class LoggingTests(unittest.TestCase):
         for name in ['kernel.panic','Finder_2026-11-13.ips','app.spin']:
             p=reports/name;p.write_text('{"app_name":"Finder","bug_type":"309"}\nprivate stack')
             os.utime(p,(now-100,now-100))
-        reader=lambda a,b: {} if a==now else {('restart','kernel'):1}
+        reader=lambda a,b: {('restart','kernel'):1} if a==now-3600 else {}
+        toollog.emit('backup', 'perf', 'backup.run', ok=True,
+                     now=dt.datetime.fromtimestamp(now-86400, dt.timezone.utc),
+                     props={'target':'memory', 'skipped':1})
         self.assertTrue(collector.collect(now, [reports], reader))
         observed=[r for r in self.rows() if r['name']=='crash.observed']
         self.assertEqual(sum(r['props']['count'] for r in observed),4)
         self.assertTrue((self.logs/'rollup-2026-11-12.json').exists())
+        rollup_props = next(r['props'] for r in self.rows() if r['name']=='log.rollup')
+        self.assertEqual(rollup_props['backup.skipped_runs.memory'], 1)
+        self.assertEqual(rollup_props['backup.ok_runs.memory'], 0)
+        self.assertEqual(rollup_props['backup.skipped_runs.health'], 0)
         collector.collect(now+1,[reports],lambda a,b:{})
         self.assertEqual(len([r for r in self.rows() if r['name']=='crash.observed']),4)
         collector.collect(now+2,[reports],lambda a,b: (_ for _ in ()).throw(RuntimeError('secret')))
@@ -314,7 +326,9 @@ class LoggingTests(unittest.TestCase):
         calls=[]
         def run(cmd,**kwargs):
             calls.append(cmd)
-            return SimpleNamespace(returncode=0,stdout=json.dumps([{'eventMessage':'=== system boot'},{'eventMessage':'PMU wdog'}]))
+            return SimpleNamespace(returncode=0,stdout=json.dumps([
+                {'timestamp':'1970-01-01T00:02:30Z','eventMessage':'=== system boot'},
+                {'timestamp':'1970-01-01T00:02:30Z','eventMessage':'PMU wdog'}]))
         self.assertEqual(sum(collector.unified(100,200,run).values()),2)
         self.assertEqual(calls[0][:3],['/usr/bin/log','show','--style'])
         self.assertNotIn('private',str(self.rows()))

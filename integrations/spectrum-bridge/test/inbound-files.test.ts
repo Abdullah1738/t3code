@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { imageSize, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_INCOMING_BYTES, prepareIncoming } from "../src/inbound-files.ts";
+import { imageSize, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_INCOMING_BYTES, prepareIncoming, savePreview } from "../src/inbound-files.ts";
 
 const directories: string[] = [];
 const restores: Array<() => void> = [];
@@ -131,6 +131,49 @@ test.each(["directory-link", "file-link", "hard-link", "nonregular", "collision"
   expect(readFileSync(target, "utf8")).toBe("unchanged");
   expect(statSync(target).mode & 0o777).toBe(0o644);
   expect(readdirSync(outside)).toEqual(["target"]);
+});
+
+test("saves an omitted JPEG preview privately and reuses only identical bytes", async () => {
+  const chat = directory();
+  const file = { type: "file" as const, mime: "image/jpeg", filename: '../../bad"\nname.jpg', url: `data:image/jpeg;base64,${jpeg.toString("base64")}` };
+  const path = savePreview(file, chat);
+  expect(path).toBe(join(chat, "attachments", `${createHash("sha256").update(jpeg).digest("hex").slice(0, 16)}-bad__name.preview.jpg`));
+  expect(readFileSync(path)).toEqual(jpeg);
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+  chmodSync(path, 0o644);
+  expect(savePreview(file, chat)).toBe(path);
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
+test.each(["directory-link", "file-link", "hard-link", "collision"])("rejects an unsafe preview %s without modifying the target", async kind => {
+  const chat = directory();
+  const outside = directory();
+  const target = join(outside, "target");
+  writeFileSync(target, "unchanged", { mode: 0o644 });
+  const path = join(chat, "attachments", `${createHash("sha256").update(jpeg).digest("hex").slice(0, 16)}-photo.preview.jpg`);
+  if (kind === "directory-link") symlinkSync(outside, join(chat, "attachments"));
+  else {
+    mkdirSync(join(chat, "attachments"));
+    if (kind === "file-link") symlinkSync(target, path);
+    if (kind === "hard-link") linkSync(target, path);
+    if (kind === "collision") writeFileSync(path, "different");
+  }
+  expect(() => savePreview({ type: "file", mime: "image/jpeg", filename: "photo.jpg", url: `data:image/jpeg;base64,${jpeg.toString("base64")}` }, chat)).toThrow();
+  expect(readFileSync(target, "utf8")).toBe("unchanged");
+  expect(statSync(target).mode & 0o777).toBe(0o644);
+  expect(readdirSync(outside)).toEqual(["target"]);
+});
+
+test("saves an omitted native PNG preview without losing or converting the original", async () => {
+  const chat = directory();
+  const prepared = await prepareIncoming({ data: png, name: "photo.bin", mimeType: "image/png" }, chat);
+  const spawn = mockSips(() => ({ code: 1 }));
+  const preview = savePreview(prepared.file!, chat);
+  expect(spawn).not.toHaveBeenCalled();
+  expect(preview).toEndWith("-photo.preview.png");
+  expect(readFileSync(preview)).toEqual(png);
+  expect(readFileSync(metadata(prepared.note).path)).toEqual(png);
+  expect(statSync(preview).mode & 0o777).toBe(0o600);
 });
 
 test("requires an existing absolute managed chat and rejects oversized input before creating attachments", async () => {

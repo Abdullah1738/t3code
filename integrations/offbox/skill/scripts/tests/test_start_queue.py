@@ -148,6 +148,11 @@ with allocation.scope('repo'), allocation.guard():
 class ResumeQueueTests(Isolated):
     def setUp(self):
         super().setUp()
+        # Pool interleavings need the mocked clock/API in this process; real detachment has separate coverage.
+        def inline_background(a, me):
+            with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}):
+                return runs.background_client(a, me)
+        self.stack.enter_context(patch.object(runs, '_background', side_effect=inline_background))
         self.clock = FakeClock()
         self.stack.enter_context(patch.object(pool, 'time', self.clock.time))
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':'server','OFFBOX_POOL_WAIT_SECONDS':'12'}))

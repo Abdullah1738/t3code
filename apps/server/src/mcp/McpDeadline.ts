@@ -3,6 +3,9 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Schema from "effect/Schema";
+import { failedPhase } from "../ardud/analytics/McpCall.ts";
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",
@@ -49,11 +52,13 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
   const pending =
     outer._tag === "Some" ? outer.value : { wait: input.wait ?? input.stage, since: startedAt };
   return yield* effect.pipe(
+    Effect.onError(() => failedPhase(input.stage)),
     Effect.provideService(PendingWait, pending),
     awaitInterruptibly,
     Effect.timeoutOrElse({
       duration: "10 seconds",
       orElse: Effect.fn("McpDeadline.expired")(function* () {
+        yield* failedPhase(input.stage);
         const now = yield* Clock.monotonicTimeNanos;
         yield* Effect.logWarning("MCP operation timed out", {
           code: input.code,
@@ -75,7 +80,8 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
             code: input.code,
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
-              (input.code === "caller_unresolved" && input.stage === "caller"
+              ((input.code === "caller_unresolved" && input.stage === "caller") ||
+              input.stage === "parent_records"
                 ? " Nothing was saved; retry the same call."
                 : "") +
               (input.stage === "dispatch"
@@ -91,6 +97,16 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
           }),
         );
       }),
+    }),
+    Effect.mapError((error) => {
+      // Admission can fail before the timer; keyed callers still need the same retry identity.
+      const retry = `Retry only with the same clientRequestId: ${input.requestKey}.`;
+      return isOrchestratorMcpFailure(error) &&
+        error.code === "caller_unresolved" &&
+        input.requestKey !== undefined &&
+        !error.message.includes(retry)
+        ? new OrchestratorMcpFailure({ code: error.code, message: `${error.message} ${retry}` })
+        : error;
     }),
   );
 });

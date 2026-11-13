@@ -84,6 +84,8 @@ export type ThreadPullRequestKey = typeof ThreadPullRequestKey.Type;
 export const ThreadPullRequestWatch = Schema.Struct({
   startedAt: IsoDateTime,
   headSha: Schema.NullOr(TrimmedNonEmptyString),
+  /** Latest branch head observed, even while checks still belong to headSha. */
+  observedHeadSha: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   failedChecks: Schema.Array(TrimmedNonEmptyString),
   passed: Schema.Boolean,
   passedChecks: Schema.Array(TrimmedNonEmptyString).pipe(

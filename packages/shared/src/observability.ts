@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -99,6 +100,40 @@ export interface OtlpTraceRecord extends BaseTraceRecord {
 
 export type TraceRecord = EffectTraceRecord | OtlpTraceRecord;
 
+// Summaries count only omitted successful children. Times are Unix milliseconds; durations are milliseconds.
+export const SpanSummaryRecord = Schema.Struct({
+  type: Schema.Literal("span-summary"),
+  windowStart: Schema.Finite,
+  windowEnd: Schema.Finite,
+  spans: Schema.Record(
+    Schema.String,
+    Schema.Struct({ count: Schema.Int, totalMs: Schema.Finite, maxMs: Schema.Finite }),
+  ),
+});
+export type SpanSummaryRecord = typeof SpanSummaryRecord.Type;
+export const isSpanSummaryRecord = Schema.is(SpanSummaryRecord);
+
+function keepFileSpan(record: TraceRecord, minDurationMs: number) {
+  return (
+    !Number.isFinite(record.durationMs) ||
+    record.durationMs < 0 ||
+    record.durationMs >= minDurationMs ||
+    !record.parentSpanId ||
+    (record.type === "effect-span"
+      ? record.exit._tag !== "Success"
+      : record.status?.code === "2" ||
+        record.status?.message === "Interrupted" ||
+        record.attributes["effect.fiber.interrupted"] === true) ||
+    record.events.some((event) => {
+      const level = event.attributes["effect.logLevel"];
+      return (
+        typeof level === "string" &&
+        ["WARN", "WARNING", "ERROR", "FATAL"].includes(level.toUpperCase())
+      );
+    })
+  );
+}
+
 function isStructuralTag(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -135,6 +170,9 @@ export interface TraceSinkOptions {
   readonly maxBytes: number;
   readonly maxFiles: number;
   readonly batchWindowMs: number;
+  readonly compressBackups?: boolean;
+  readonly maxTotalBytes?: number;
+  readonly fileFilter?: { readonly minDurationMs: number };
   readonly onFlush?: (stats: TraceSinkFlushStats) => Effect.Effect<void>;
 }
 
@@ -379,11 +417,15 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
 export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: TraceSinkOptions) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  let sink = yield* makeAsyncRotatingFileSink({
+  const clock = yield* Clock.Clock;
+  const rotationOptions = {
     filePath: options.filePath,
     maxBytes: options.maxBytes,
     maxFiles: options.maxFiles,
-  }).pipe(Effect.orDie);
+    ...(options.compressBackups ? { compressBackups: true } : {}),
+    ...(options.maxTotalBytes !== undefined ? { maxTotalBytes: options.maxTotalBytes } : {}),
+  };
+  let sink = yield* makeAsyncRotatingFileSink(rotationOptions).pipe(Effect.orDie);
 
   let paused = false;
   let epoch = 0;
@@ -401,6 +443,38 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
     durationMs: 0,
   };
 
+  let windowStart = clock.currentTimeMillisUnsafe();
+  const summaries = new Map<string, { count: number; totalMs: number; maxMs: number }>();
+  const enqueue = (record: TraceRecord | SpanSummaryRecord) => {
+    try {
+      const text = `${JSON.stringify(record)}\n`;
+      const bytes = Buffer.byteLength(text);
+      if (bytes > options.maxBytes) return;
+      if (bufferBytes + bytes > maxBufferBytes) {
+        droppedCount++;
+        return;
+      }
+      buffer.push({ text, bytes });
+      bufferBytes += bytes;
+      if (buffer.length >= FLUSH_BUFFER_THRESHOLD) Queue.offerUnsafe(flushRequests, undefined);
+    } catch {
+      return;
+    }
+  };
+  const flushSummary = (force = false) => {
+    const now = clock.currentTimeMillisUnsafe();
+    if (!force && now - windowStart < 60_000) return;
+    if (summaries.size > 0) {
+      enqueue({
+        type: "span-summary",
+        windowStart,
+        windowEnd: now,
+        spans: Object.fromEntries(summaries),
+      });
+      summaries.clear();
+    }
+    windowStart = now;
+  };
   const flushBuffered = Effect.gen(function* () {
     if (buffer.length === 0) {
       return;
@@ -447,6 +521,7 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
   });
 
   const drain = Effect.gen(function* () {
+    flushSummary();
     const droppedAtStart = droppedCount;
     yield* flushBuffered;
     const stats = pendingFlushStats;
@@ -487,10 +562,16 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
       Effect.updateContext(Context.omit(Tracer.ParentSpan)<never>),
     );
 
-  yield* Effect.addFinalizer(() => flush.pipe(Effect.ignore));
+  const close = () =>
+    Effect.sync(() => flushSummary(true)).pipe(
+      Effect.andThen(flush),
+      Effect.andThen(sink.flush),
+      Effect.ignore,
+    );
+  yield* Effect.addFinalizer(close);
   yield* Effect.forkScoped(
     Queue.take(flushRequests).pipe(
-      Effect.timeoutOption(`${options.batchWindowMs} millis`),
+      Effect.timeoutOption(`${Math.min(options.batchWindowMs, 60_000)} millis`),
       Effect.andThen(flush),
       Effect.forever,
     ),
@@ -498,22 +579,16 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
 
   const push = (record: TraceRecord) => {
     if (paused) return;
-    try {
-      const text = `${JSON.stringify(record)}\n`;
-      const bytes = Buffer.byteLength(text);
-      if (bytes > options.maxBytes) return;
-      if (bufferBytes + bytes > maxBufferBytes) {
-        droppedCount++;
-        return;
-      }
-      buffer.push({ text, bytes });
-      bufferBytes += bytes;
-      if (buffer.length >= FLUSH_BUFFER_THRESHOLD) {
-        Queue.offerUnsafe(flushRequests, undefined);
-      }
-    } catch {
-      return;
-    }
+    flushSummary();
+    const minimum = options.fileFilter?.minDurationMs ?? 0;
+    // Slow ancestors normally survive too; detached/forked children can outlive a fast parent.
+    if (minimum > 0 && !keepFileSpan(record, minimum)) {
+      const stats = summaries.get(record.name) ?? { count: 0, totalMs: 0, maxMs: 0 };
+      stats.count++;
+      stats.totalMs += record.durationMs;
+      stats.maxMs = Math.max(stats.maxMs, record.durationMs);
+      summaries.set(record.name, stats);
+    } else enqueue(record);
   };
   const withMaintenance: TraceMaintenance = (effect) =>
     flushSemaphore
@@ -522,18 +597,15 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
           Effect.gen(function* () {
             paused = true;
             epoch++;
-            const drained = yield* drain.pipe(Effect.exit);
+            flushSummary(true);
+            const drained = yield* drain.pipe(Effect.andThen(sink.flush), Effect.exit);
             if (ExitRuntime.isFailure(drained) || writeFailing) {
               epoch++;
               paused = false;
               return yield* new TraceMaintenanceError({});
             }
             const result = yield* restore(effect).pipe(Effect.exit);
-            const reopened = yield* makeAsyncRotatingFileSink({
-              filePath: options.filePath,
-              maxBytes: options.maxBytes,
-              maxFiles: options.maxFiles,
-            }).pipe(
+            const reopened = yield* makeAsyncRotatingFileSink(rotationOptions).pipe(
               Effect.provideService(FileSystem.FileSystem, fs),
               Effect.provideService(Path.Path, path),
               Effect.result,
@@ -559,7 +631,7 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
     },
     withMaintenance,
     flush,
-    close: () => flush,
+    close,
   } satisfies TraceSink;
 });
 
@@ -647,6 +719,9 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
       maxFiles: options.maxFiles,
       batchWindowMs: options.batchWindowMs,
       ...(options.onFlush ? { onFlush: options.onFlush } : {}),
+      ...(options.fileFilter ? { fileFilter: options.fileFilter } : {}),
+      ...(options.compressBackups ? { compressBackups: true } : {}),
+      ...(options.maxTotalBytes !== undefined ? { maxTotalBytes: options.maxTotalBytes } : {}),
     }));
 
   const delegate =

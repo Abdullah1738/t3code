@@ -6,6 +6,7 @@ import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Atomic fsync/rename and byte-preserving fixture verification require native file handles.
 import { createReadonlyReplica } from "../persistence/readonlyExport.ts";
+import * as NodeZlib from "node:zlib";
 import * as NodeFS from "node:fs";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Fiber from "effect/Fiber";
@@ -34,6 +35,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Executor from "../../orchestration-v2/ThreadCommandExecutor.ts";
+import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
 
 const filesystemFault = vi.hoisted(() => ({
@@ -156,6 +158,55 @@ it.effect(
         expect(other[0]!.text).toBe("untouched");
       }),
     ),
+);
+
+it.effect("scrubs retained V1 transcript rows and their imported V2 copies", () =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${threadId}, 'fixture', 'Legacy thread',
+          '{"instanceId":"codex","model":"gpt-6.1-sol"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter.pipe(
+        Effect.provide(LegacyV1ThreadImporter.layer),
+      );
+      yield* importer.reconcileShells;
+      yield* importer.ensureTranscript(threadId);
+      const copies = () =>
+        Effect.all([
+          sql`SELECT text FROM projection_thread_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'migration:v1:turn-item:quote'`,
+          sql`SELECT payload_json FROM orchestration_events WHERE event_id = 'migration:v1:message:quote'`,
+        ]);
+      const before = yield* copies();
+      for (const rows of before) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).toContain(fake);
+      }
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "call-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.stores.every((store) => store.remainingAfter === 0)).toBe(true);
+      for (const rows of yield* copies()) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).not.toContain(fake);
+        expect(JSON.stringify(rows)).toContain("[redacted ");
+      }
+    }),
+  ),
 );
 
 it.effect.each(["missing", "ambiguous", "running"])("refuses %s before any rewrite", (kind) =>
@@ -3594,6 +3645,98 @@ it.effect.each(
       const audit =
         yield* sql`SELECT event_id FROM orchestration_events WHERE event_type='thread.item-redacted'`;
       expect(audit.length).toBe(0);
+    }),
+  ),
+);
+
+it.effect.each(["truncated gzip", "invalid UTF-8", "incomplete log frame"])(
+  "refuses a later archive with %s before rewriting any file or database row",
+  (invalid) =>
+    run(
+      Effect.gen(function* () {
+        yield* extendedStores(false);
+        const config = yield* Config.ServerConfig;
+        const sql = yield* SqlClient.SqlClient;
+        const first = NodePath.join(config.logsDir, "00-first.trace.ndjson.1.gz");
+        const last = NodePath.join(config.logsDir, "zz-last.trace.ndjson.2.gz");
+        const source = NodeZlib.gzipSync(JSON.stringify({ output: fake }) + "\n");
+        const corrupt =
+          invalid === "truncated gzip"
+            ? source.subarray(0, source.length - 6)
+            : NodeZlib.gzipSync(
+                invalid === "invalid UTF-8"
+                  ? Buffer.from([0xff])
+                  : String.raw`NTIVE: "unrelated\u0061`,
+              );
+        yield* Effect.promise(async () => {
+          await NodeFSP.writeFile(first, source);
+          await NodeFSP.writeFile(last, corrupt);
+        });
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({
+            threadId,
+            itemId: "item-fixture",
+            reason: "fixture",
+            compact: true,
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(yield* Effect.promise(() => NodeFSP.readFile(first))).toEqual(source);
+        expect(yield* Effect.promise(() => NodeFSP.readFile(last))).toEqual(corrupt);
+        const rows = yield* sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+        expect(rows[0]!.payload_json).toBe(JSON.stringify(fixture));
+        const pending = yield* sql<{
+          pending: number;
+        }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
+        expect(pending[0]?.pending).toBe(0);
+      }),
+    ),
+);
+
+it.effect("scrubs compressed trace backups without changing other spans or summaries", () =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const config = yield* Config.ServerConfig;
+      const file = NodePath.join(config.logsDir, "server.trace.ndjson.1.gz");
+      const unrelated = JSON.stringify({
+        type: "span-summary",
+        windowStart: 0,
+        windowEnd: 60000,
+        spans: { sqlite: { count: 2, totalMs: 1, maxMs: 0.5 } },
+      });
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          file,
+          NodeZlib.gzipSync(
+            JSON.stringify({ type: "effect-span", attributes: { output: fake } }) +
+              "\n" +
+              unrelated +
+              "\n",
+          ),
+          { mode: 0o640 },
+        ),
+      );
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      expect(
+        result.stores.some((s) => s.store === file && s.replaced > 0 && s.remainingAfter === 0),
+      ).toBe(true);
+      const text = NodeZlib.gunzipSync(
+        yield* Effect.promise(() => NodeFSP.readFile(file)),
+      ).toString("utf8");
+      expect(text.includes(fake)).toBe(false);
+      expect(text.split("\n")[1]).toBe(unrelated);
+      expect((yield* Effect.promise(() => NodeFSP.stat(file))).mode & 0o777).toBe(0o640);
     }),
   ),
 );

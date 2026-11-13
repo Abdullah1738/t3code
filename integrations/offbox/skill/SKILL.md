@@ -194,7 +194,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
-| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`) |
+| `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then `offbox logs <id> --follow` / `offbox wait <id> [--timeout S]` (exits with its code, does `--pull`). Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
 | `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
@@ -211,7 +211,7 @@ its end and returns its code. If the box says the process ended but that `offbox
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
 `--timeout S` stops waiting after S seconds with exit 124; the run keeps going.
 On a run still queued for a pool box they say "waiting for a box" and keep polling until it gets one or settles.
-If that run's own `offbox run` has died (a tool-call timeout), wait marks it lost ("never started, nothing ran", 90).
+A queued `--bg` run survives its caller ending. If the offbox client itself dies before getting a box, wait marks the run lost and wait/logs return 100 ("never started; nothing ran, safe to rerun").
 
 `--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
 reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
@@ -281,6 +281,8 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 ## Home server, Boat standby
 
+On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace it); offbox manages the box through its own `offbox-mgmt-ssh` service on port 2222, which you must leave alone.
+
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
 `offbox run` picks its backend once, when it starts:
@@ -296,8 +298,10 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
   ends with **94**.
-- Each backend has its own boxes, saved states and templates (`offbox list`, `bases` show the backend in use;
-  `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the run or box id). A saved state or template
+- Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
+  are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
+  `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
+  run or box id. A saved state or template
   that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
   first standby run of a repo is a cold one.
 - Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
@@ -363,6 +367,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
+- **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands
@@ -393,6 +398,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Logs
+
+Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UTC). Run events are `run.request`, `run.queue`, `run.lease`, `run.sync`, `run.command`, `run.pull`, `run.end`, `run.invocation` and `run.error`. Other events include `backend.failover`, `home.probe`, `pool.snapshot`, `gate.decision`, `local.override`, `ssh.setup`, `ssh.readiness`, `ssh.drop`, `ssh.put_file`, `mullvad.check`, `reaper.action`, `reaper.pass` and `cli.<command>`. Logs contain ids, counts, sizes, durations and stable error tags; command output stays in the existing per-run logs.
+
+`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Monitor/reaper ticks roll up yesterday after 00:05 UTC. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
 

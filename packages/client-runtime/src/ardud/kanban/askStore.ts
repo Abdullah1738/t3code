@@ -409,7 +409,7 @@ export function createAskStore(host: AskStoreHost) {
       if (!ref.analytics) continue;
       const { createdAt, ...ids } = ref.analytics;
       const durationMs = Date.now() - Date.parse(createdAt);
-      collector?.record("ask.answered", {
+      collector?.record("ask.answer_sent", {
         ...ids,
         ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
         props: { createdAt, phase: "ask", key: ref.askId, count: 1 },
@@ -456,6 +456,7 @@ export function createAskStore(host: AskStoreHost) {
   };
 
   let inFlight: Promise<void> | null = null;
+  let lastRefreshAt: number | null = null;
   let again = false;
   /** History asked for its asks and has none yet: the next good read of the feed asks again. */
   let closedOwed = false;
@@ -653,6 +654,7 @@ export function createAskStore(host: AskStoreHost) {
       again = true;
       return inFlight;
     }
+    lastRefreshAt = Date.now();
     if (get().feed === null) set({ status: "loading" });
     inFlight = askApi
       .feed()
@@ -709,59 +711,62 @@ export function createAskStore(host: AskStoreHost) {
   }
 
   let watchers = 0;
+  let fastWatchers = 0;
   let stopWatching: (() => void) | null = null;
-  let pollMs = 60_000;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  const pollMs = () => (fastWatchers > 0 ? 30_000 : 60_000);
 
-  const restartPoll = () => {
-    if (pollTimer !== null) clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-      if (host.watch.isForeground()) void refreshAsks();
-    }, pollMs);
+  const poll = () => {
+    pollTimer = null;
+    if (disposed || watchers === 0) return;
+    if (
+      host.watch.isForeground() &&
+      inFlight === null &&
+      (lastRefreshAt === null || Date.now() - lastRefreshAt >= pollMs())
+    )
+      void refreshAsks();
+    pollTimer = setTimeout(poll, pollMs());
+  };
+
+  const schedulePoll = () => {
+    if (pollTimer !== null) clearTimeout(pollTimer);
+    const elapsed = lastRefreshAt === null ? pollMs() : Date.now() - lastRefreshAt;
+    pollTimer = setTimeout(poll, Math.max(0, pollMs() - elapsed));
   };
 
   /**
-   * Keeps the feed current while anything shows it: it is read again when a
-   * board's counts change (the board list feed), when the window comes back,
-   * and on a slow timer for edits that change no count. `fast` is the page
-   * itself; the sidebar count alone polls slowly.
+   * One poll for the page and sidebar together. Board pushes and foreground
+   * signals share its cadence; explicit refreshes after owner actions stay immediate.
    */
   function watchAsks(fast: boolean): () => void {
     if (disposed) return () => undefined;
     watchers += 1;
-    if (fast) {
-      pollMs = 15_000;
-      if (stopWatching !== null) restartPoll();
-    }
+    if (fast) fastWatchers += 1;
     if (stopWatching === null) {
-      let debounce: ReturnType<typeof setTimeout> | null = null;
       const soon = () => {
-        if (debounce !== null) clearTimeout(debounce);
-        debounce = setTimeout(() => void refreshAsks(), 400);
+        if (host.watch.isForeground()) schedulePoll();
       };
       const offBoards = host.watch.onBoardsChange(soon);
       const offForeground = host.watch.onForeground(soon);
-      restartPoll();
-      void refreshAsks();
       stopWatching = () => {
         offBoards();
         offForeground();
-        if (debounce !== null) clearTimeout(debounce);
-        if (pollTimer !== null) clearInterval(pollTimer);
+        if (pollTimer !== null) clearTimeout(pollTimer);
         pollTimer = null;
       };
     }
+    if (host.watch.isForeground() && lastRefreshAt === null) void refreshAsks();
+    schedulePoll();
+    let stopped = false;
     return () => {
-      if (disposed) return;
+      if (disposed || stopped) return;
+      stopped = true;
       watchers -= 1;
-      if (fast) {
-        pollMs = 60_000;
-        if (watchers > 0) restartPoll();
-      }
+      if (fast) fastWatchers -= 1;
       if (watchers === 0) {
         stopWatching?.();
         stopWatching = null;
-      }
+      } else schedulePoll();
     };
   }
 
@@ -1500,6 +1505,7 @@ export function createAskStore(host: AskStoreHost) {
     stopWatching?.();
     stopWatching = null;
     watchers = 0;
+    fastWatchers = 0;
     again = false;
     closedOwed = false;
     focusedKey = null;

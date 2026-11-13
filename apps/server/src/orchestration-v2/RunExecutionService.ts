@@ -601,6 +601,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+  readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
@@ -716,6 +717,7 @@ export const layer: Layer.Layer<
         readonly attempt: OrchestrationV2RunAttempt;
         readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
         readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+        readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
         readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
         readonly terminal: ProviderTerminalEvent;
         readonly failureItemPersisted: boolean;
@@ -726,6 +728,10 @@ export const layer: Layer.Layer<
         };
       }) {
         const completedAt = yield* DateTime.now;
+        const interruptReason =
+          input.terminal.status === "interrupted"
+            ? yield* input.loadRunInterruptReason?.() ?? Effect.succeed(undefined)
+            : undefined;
         const finalizedAttempt: OrchestrationV2RunAttempt | null = {
           ...input.attempt,
           status: input.terminal.status,
@@ -770,6 +776,7 @@ export const layer: Layer.Layer<
                       rootNode: input.rootNode,
                       providerThread: input.providerThread,
                       completedAt,
+                      reason: interruptReason,
                     }),
                   },
                 ],
@@ -880,6 +887,7 @@ export const layer: Layer.Layer<
                       rootNode: input.rootNode,
                       providerThread: input.providerThread,
                       completedAt,
+                      reason: interruptReason,
                     }),
                   },
                 ]
@@ -1297,6 +1305,9 @@ export const layer: Layer.Layer<
               : {
                   hasUnpairedRunInterruptRequest: input.hasUnpairedRunInterruptRequest,
                 }),
+            ...(input.loadRunInterruptReason === undefined
+              ? {}
+              : { loadRunInterruptReason: input.loadRunInterruptReason }),
             openRunOwnedSubagents: openSubagents,
             terminal,
             failureItemPersisted:
@@ -1508,6 +1519,15 @@ export const layer: Layer.Layer<
           // thread-scoped probe: session-wide pending work (siblings, wake
           // buffers, session subagents) must not pin this root subscription.
           const latestProviderThreadSnapshot = yield* Ref.get(latestProviderThread);
+          // The live adapter can already be idle while its output is still queued.
+          // Failed ingestion uses native termination evidence: the clearing snapshot may not persist.
+          if (
+            latestProviderThreadSnapshot.pendingBackgroundWork === true &&
+            (yield* Ref.get(ingestionFailure)) === null &&
+            !(yield* Ref.get(startupFailurePending))
+          ) {
+            return false;
+          }
           if (input.session.hasPendingBackgroundWorkForThread !== undefined) {
             const hasPendingWork = yield* input.session
               .hasPendingBackgroundWorkForThread(latestProviderThreadSnapshot)
@@ -1792,12 +1812,13 @@ export const layer: Layer.Layer<
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
-          Stream.interruptWhen(
+          Stream.runDrain,
+          // Interrupt a blocked write as well as a blocked event pull when cleanup expires.
+          Effect.raceFirst(
             Deferred.await(shutdownCleanupDeadline).pipe(
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
             ),
           ),
-          Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
@@ -1852,6 +1873,9 @@ export const layer: Layer.Layer<
                     activeAttemptId: input.attempt.id,
                     expectedStatus: "running",
                   },
+                  ...(input.loadRunInterruptReason === undefined
+                    ? {}
+                    : { loadRunInterruptReason: input.loadRunInterruptReason }),
                   openRunOwnedSubagents: openSubagents,
                   terminal: makeFailedTerminalEvent(
                     makeProviderFailure({
@@ -2091,6 +2115,9 @@ export const layer: Layer.Layer<
                                 activeAttemptId: input.attempt.id,
                                 expectedStatus: "running",
                               },
+                              ...(input.loadRunInterruptReason === undefined
+                                ? {}
+                                : { loadRunInterruptReason: input.loadRunInterruptReason }),
                               openRunOwnedSubagents: openSubagents,
                               terminal: makeFailedTerminalEvent(
                                 makeProviderFailure({
@@ -2129,6 +2156,7 @@ export function makeInterruptResultTurnItem(input: {
   readonly rootNode: OrchestrationV2ExecutionNode;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly completedAt: DateTime.Utc;
+  readonly reason?: string | undefined;
 }): OrchestrationV2TurnItem {
   return {
     id: input.idAllocator.derive.runSignalTurnItem({
@@ -2152,6 +2180,6 @@ export function makeInterruptResultTurnItem(input: {
     completedAt: input.completedAt,
     updatedAt: input.completedAt,
     type: "run_interrupt_result",
-    message: "Run interrupted by user",
+    message: input.reason === undefined ? "Run interrupted" : `Run interrupted: ${input.reason}`,
   };
 }

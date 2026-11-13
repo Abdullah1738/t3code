@@ -114,7 +114,8 @@ on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
 
 Verify without `--server-endpoint` gets a free local port. Explicit endpoints
 must name a free `localhost:<port>` or `127.0.0.1:<port>`; the wrapper starts its
-own server there and never attaches to an existing server. Other commands pass
+own server on IPv4 loopback there, normalizes the client endpoint to
+`127.0.0.1:<port>`, and never attaches to an existing server. Other commands pass
 through. `QUINT_APALACHE_ARCHIVE` selects the reviewed archive (default
 `~/.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz`); a missing or
 mismatched archive/JAR fails before starting Java. Each verify uses a private
@@ -122,18 +123,19 @@ temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
 the pinned JAR available to TLC. Quint-side launch/download attempts fail even
 if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
 completion or signals. Port ownership is checked with `lsof` before Quint runs.
+Pass each backend option once; repeated endpoint/version options, including aliases, are refused.
 
 CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
-The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
-Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet peers can reach it for the run's duration. The Mac firewall was disabled (block-all disabled, stealth off) on 12 Nov; a loopback source patch is a separate follow-up.
+The guard pins archive SHA256 `51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174` and JAR `a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
+The source patch binds Apalache to `127.0.0.1` only. Quint 0.33.1 requires v1alpha reflection (`dist/src/apalache.js:212,242`), so it remains registered.
+The pre-22 v1alpha gencode warning reported by Crpko #2329 can still appear outside the guarded wrapper; #54 closes that bypass. No reflection classes are regenerated here.
 `QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
 Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
 
-Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
-nvm before `~/.local/bin`. Until approved PATH changes and installation, call
-the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
-`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
-archive from this change; shipping both and fixing PATH is a separate task.
+Agent PATHs put `~/.local/share/quint-guard/bin` immediately after the blocker dirs, before nvm; its only tool is a symlink to `~/.local/bin/quint`.
+The shared shell fence refuses direct npm/Node/package-runner `quint verify`; use `/Users/ardud/.local/bin/quint` or explicitly set `QUINT_ALLOW_VULNERABLE_APALACHE=1`.
+Bare `quint` relies on the managed PATH when the hook cannot see the executing shell's PATH. Other subcommands pass through; the shared `~/.quint` cache is untouched.
+Offbox has no installed wrapper or pinned archive from this change; shipping both remains a separate task.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads
@@ -189,9 +191,9 @@ seconds or a command returning epoch seconds for an advancing test clock.
 
 `apalache/build-patched.sh` builds Apalache 0.62.4 (`7954daf7563a69cce9d0b89c8542e40bf46f7c6e`) with all gRPC modules at 1.75.0 and protobuf/protoc 3.25.8; ScalaPB stays at 0.11.20.
 Rebuild on Linux/JDK 21: `offbox run --remote -- 'JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 integrations/local-helpers/apalache/build-patched.sh'` (requires git, curl, Python 3 and sha256sum).
-Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f`.
+Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174`.
 The recipe checks resolved dependencies and reflection bytecode, records the JAR hash, and retains v1alpha reflection for quint 0.33.1; installation and wrapper selection are separate.
-Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; this version binds `*:<n>` and has no checker `--hostname` option.
+Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; the patched server binds `127.0.0.1:<n>` and keeps v1alpha reflection for Quint.
 As of 9 Nov 2026, upstream main has no dependency fix after 0.62.4; the upstream issue draft is on Robob card #787 and has not been filed.
 
 ## Repo Node and pnpm selection
@@ -222,6 +224,15 @@ Focused verification:
 NDJSON. Use `--day YYYY-MM-DD` for another day, `--name dotted.name` to filter,
 or another board slug for that board's logs. `toollog rollup --board agent-tools`
 writes `~/.robob/logs/tools/agent-tools/rollup-YYYY-MM-DD.json`.
+Non-error hook rows stop when the day file reaches 35 MiB; other components
+continue to 50 MiB. Errors always continue. `logCaps` identifies any reached
+budget, including older markers as `component: all`.
+Allowed/rewritten non-error decisions are sampled 1-in-128 and omit default
+optional props. Missing `repeatCount` means 1, `cwdClass` means `other`, and
+`matchedRoot`/`argv0Class` mean `none`. Rollup weights counts, rates, duration
+percentiles and loop windows by `sampleRate`; `sampled: true` marks estimates,
+while `recordedRows` reports the stored count. Denials and other hook errors
+keep every row and all their context.
 Hook rollups include `topThreadsByRule` (`--top N`, default 20) and `repeatLoops`
 for a thread/rule appearing more than 20 times in a sliding hour. Loop windows
 can include the previous UTC day's last hour; daily totals stay local.

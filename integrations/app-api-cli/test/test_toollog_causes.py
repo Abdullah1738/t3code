@@ -188,6 +188,56 @@ class CauseLogs(unittest.TestCase):
                     self.assertEqual(row['error']['message'], 'HTTP 200: ACCOUNT_TIMEOUT')
         self.assertNotIn('private-token', self.lines())
 
+    def test_careem_live_and_fallback_polls_keep_merchant_and_fetch_phases(self):
+        import native_orders
+        import order_tracker as tracker
+        now = tracker.time.time()
+        folder = self.folder.parent / 'watcher'
+        folder.mkdir(parents=True)
+        cfg = {'app': 'careem', 'order': '123456', 'watcher': 'fixture', 'for': 'owner',
+               'placed_at': tracker.stamp(now - 600), 'registered_at': tracker.stamp(now),
+               'eta': None, 'label': 'Fixture Cafe: Private item', 'vertical': 'food'}
+        forms = [('food', True, [], 'out for delivery'),
+                 ('food', True, ['notification_collector_stale'], 'out for delivery'),
+                 ('quik', True, [], 'out for delivery'),
+                 ('box', True, [], 'unknown'), ('food', False, [], 'unknown')]
+        for vertical, single, errors, expected in forms:
+            with self.subTest(vertical=vertical, single=single, errors=errors):
+                tracker.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'unknown'})
+                text = 'Careem Quik 5 minutes' if vertical == 'quik' else 'Fixture Cafe 5 minutes'
+                ticks = [0]
+                def clock():
+                    ticks[0] += .5
+                    return ticks[0]
+                start = len(self.rows())
+                with patch.dict(os.environ, {'WATCH_DIR': str(folder)}), \
+                        patch.object(tracker, 'ROOT', folder / 'orders-root'), \
+                        patch.object(tracker, 'single_allowed', return_value=single), \
+                        patch('native_orders.track', side_effect=native_orders.OrderError('AUTH_EXPIRED')), \
+                        patch.object(tracker, 'mail_evidence', return_value=([], [])), \
+                        patch.object(tracker.store, 'rows', return_value=([
+                            {'posted': now - 1, 'detected': now, 'text': text}], errors)) as live, \
+                        patch.object(tracker.store, 'evidence', return_value=([], [])) as fallback, \
+                        patch.object(log, 'perf_counter', side_effect=clock), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    tracker.check({**cfg, 'vertical': vertical})
+                state = tracker.read(folder / 'order-tracker-state.json')
+                self.assertEqual(state['status'], expected)
+                live_path = vertical != 'box' and single
+                self.assertEqual(live.call_count, int(live_path))
+                self.assertEqual(fallback.call_count, int(not live_path))
+                self.assertEqual(bool(state['last_result'].get('live_source_ok')), live_path and not errors)
+                rows = self.rows()[start:]
+                self.assertTrue({'track.error', 'track.poll'} <= {r['name'] for r in rows})
+                for row in rows:
+                    self.assertEqual(row['props']['merchant'], 'careem')
+                    self.assertEqual(row['props']['lane'], vertical)
+                poll = next(r for r in rows if r['name'] == 'track.poll')
+                self.assertGreater(poll['props']['phases']['fetchMs'], 0)
+                self.assertAlmostEqual(sum(poll['props']['phases'].values()), poll['durationMs'])
+        self.assertNotIn('Private item', self.lines())
+        self.assertNotIn('Fixture Cafe', self.lines())
+
     def test_timeout_forms_are_retryable_and_have_a_safe_message(self):
         import noon_http_orders
         import noon_minutes_checkout

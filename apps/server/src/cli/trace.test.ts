@@ -101,3 +101,30 @@ it("reads failures and interrupts of browser spans from their OTLP status", () =
   const [render] = summarizer.finish().spans;
   assert.deepStrictEqual([render?.count, render?.interrupted, render?.failures], [4, 2, 1]);
 });
+
+it("uses minute summaries for counts and maxima without inventing percentiles", () => {
+  const summarizer = makeTraceSpanSummary();
+  summarizer.addLine(
+    JSON.stringify({
+      type: "span-summary",
+      windowStart: 0,
+      windowEnd: MINUTE_MS,
+      spans: { sqlite: { count: 100, totalMs: 25, maxMs: 0.9 } },
+    }),
+  );
+  summarizer.addLine(span("sqlite", 10, MINUTE_MS));
+  const summary = summarizer.finish();
+  assert.equal(summary.spanCount, 101);
+  assert.equal(summary.summarisedSpanCount, 100);
+  assert.equal(summary.skippedLineCount, 0);
+  assert.deepEqual(summary.spans[0], {
+    name: "sqlite",
+    count: 101,
+    perMinute: 101,
+    p50Ms: 10,
+    p90Ms: 10,
+    maxMs: 10,
+    interrupted: 0,
+    failures: 0,
+  });
+});

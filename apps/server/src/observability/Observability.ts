@@ -45,6 +45,8 @@ export const layer = Layer.unwrap(
         const sink = yield* makeTraceSink({
           filePath: config.serverTracePath,
           ...retention,
+          compressBackups: true,
+          fileFilter: { minDurationMs: config.traceFileMinDurationMs },
           batchWindowMs: config.traceBatchWindowMs,
           onFlush: (stats) =>
             attribution.record({

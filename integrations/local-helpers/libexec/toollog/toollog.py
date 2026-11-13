@@ -10,9 +10,14 @@ import re
 import hashlib
 import time
 import struct
+import random
+import sys
+import tempfile
 from functools import lru_cache
 
 CAP_BYTES = 50 * 1024 * 1024
+HOOKS_CAP_BYTES = 35 * 1024 * 1024
+HOOK_SAMPLE_RATE = 128
 _SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 _ID_VALUE = re.compile(r"[A-Za-z0-9_.:%/-]{1,300}\Z")
@@ -21,7 +26,8 @@ _ID_VALUE = re.compile(r"[A-Za-z0-9_.:%/-]{1,300}\Z")
 _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'filesChanged', 'driftFound', 'differingCount', 'platform', 'billedMinutes',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
-           'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource'}
+           'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
+           'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -38,6 +44,21 @@ def command_props(command):
                   'build' if first in {'go', 'cargo', 'rustc', 'make'} else first if first in {
                       'git', 'docker', 'offbox', 'sqlite3'} else 'other')
     return {'firstWord': first, 'argv0Class': argv_class, 'commandLength': len(command)}
+
+
+def hook_props(props, *, error=False):
+    """Absent optional fields retain their defaults; errors retain all context."""
+    result = dict(props)
+    if error or props.get('decision') not in {'allowed', 'rewritten'}:
+        return result
+    for key, defaults in {'argv0Class': ('none', ''), 'matchedRoot': ('none', ''),
+                          'repeatCount': (0, 1), 'firstWord': ('',),
+                          'commandLength': (0,), 'cwdClass': ('other', '')}.items():
+        if key in result and (result[key] is None or result[key] in defaults):
+            del result[key]
+    # Independent sampling also works for one-shot native hook processes.
+    result['sampleRate'] = HOOK_SAMPLE_RATE
+    return result
 
 
 def cwd_class(cwd):
@@ -135,8 +156,21 @@ def _repeat_count(harness, ids, guard, rule, first_word):
         return 1
 
 
+_test_root = None
+
+
 def root():
-    return Path(os.environ.get('TOOLLOG_ROOT', str(Path.home() / '.robob/logs/tools')))
+    global _test_root
+    override = os.environ.get('TOOLLOG_ROOT')
+    if override:
+        return Path(override)
+    if ('unittest' in sys.modules or 'pytest' in sys.modules or
+            os.environ.get('NODE_ENV') == 'test' or os.environ.get('ROBOB_TEST')):
+        if _test_root is None:
+            _test_root = tempfile.TemporaryDirectory(prefix='helpers-test-logs-')
+        os.environ['TOOLLOG_ROOT'] = _test_root.name
+        return Path(_test_root.name)
+    return Path.home() / '.robob/logs/tools'
 
 
 def board_dir(board):
@@ -179,7 +213,8 @@ def _metadata(values, keys):
             continue
         if type(value) is bool or type(value) in (int, float) and math.isfinite(value):
             result[key] = value
-        elif isinstance(value, str) and (_ID_VALUE if keys is _IDS else _LABEL).fullmatch(value):
+        elif isinstance(value, str) and (re.fullmatch(r"[A-Za-z/]{1,80}", value) if key == 'method'
+                                       else (_ID_VALUE if keys is _IDS else _LABEL).fullmatch(value)):
             result[key] = value
     return result
 
@@ -197,7 +232,7 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         if _claim(directory / ('.retained-' + day)):
             cutoff = (now.date() - timedelta(days=30)).isoformat()
             for path in directory.iterdir():
-                date = re.fullmatch(r'(?:rollup-|\.retained-|\.cap-|\.repeat-)?(\d{4}-\d{2}-\d{2})(?:-[a-f0-9]{32})?(?:\.ndjson|\.json|\.bin)?', path.name)
+                date = re.fullmatch(r'(?:rollup-|\.retained-|\.cap-(?:hooks-)?|\.repeat-)?(\d{4}-\d{2}-\d{2})(?:-[a-f0-9]{32})?(?:\.ndjson|\.json|\.bin)?', path.name)
                 if date and date[1] < cutoff:
                     try:
                         path.unlink()
@@ -220,13 +255,21 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
             size = path.stat().st_size
         except FileNotFoundError:
             size = 0
-        if size >= CAP_BYTES:
-            if _claim(directory / ('.cap-' + day)):
-                _append(path, {**{k: row[k] for k in ('ts', 'tool', 'component')},
-                               'kind': 'error', 'name': 'log.cap', 'ok': False,
-                               'error': {'tag': 'log.cap', 'message': 'Daily log cap reached'}})
-            if kind != 'error':
-                return
+        caps = [('all', CAP_BYTES, '.cap-')]
+        if component == 'hooks':
+            caps.append(('hooks', HOOKS_CAP_BYTES, '.cap-hooks-'))
+        for scope, cap, claim_prefix in caps:
+            if size >= cap:
+                if _claim(directory / (claim_prefix + day)):
+                    _append(path, {**{k: row[k] for k in ('ts', 'tool', 'component')},
+                                   'kind': 'error', 'name': 'log.cap', 'ok': False,
+                                   'props': {'component': scope, 'capBytes': cap},
+                                   'error': {'tag': 'log.cap', 'message': 'Daily log cap reached'}})
+        if kind != 'error' and (size >= CAP_BYTES or component == 'hooks' and size >= HOOKS_CAP_BYTES):
+            return
+        rate = _sample_rate(row)
+        if rate > 1 and random.random() >= 1 / rate:
+            return
         _append(path, row)
     except Exception:
         pass
@@ -238,10 +281,10 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
         command_fields = command_props(command)
         emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
              duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
-             props={'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
+             props=hook_props({'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
                     'threadIdSource': source, 'cwdClass': cwd_class(cwd), 'matchedRoot': matched_root(matched),
                     'repeatCount': _repeat_count(harness, identity, guard, rule, command_fields.get('firstWord', 'none')),
-                    'argv0Class': 'none', **command_fields},
+                    'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag)),
              error_tag=error_tag or (rule if decision == 'denied' else None))
     except Exception:
         pass
@@ -288,40 +331,57 @@ def _hook_attempt(row):
     return thread, rule, at
 
 
+def _sample_rate(row):
+    props = row.get('props')
+    rate = props.get('sampleRate') if isinstance(props, dict) else None
+    # Errors are never sampled, including records from older or external writers.
+    return rate if row.get('kind') != 'error' and type(rate) is int and 1 <= rate <= 2**53 - 1 else 1
+
+
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
+    caps = []
+    recorded = 0
+    sampled = False
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
     for line_number, row in _read_records(board, day):
-        total += 1
+        recorded += 1
+        weight = _sample_rate(row)
+        sampled |= weight > 1
+        total += weight
+        if row.get('name') == 'log.cap':
+            props = row.get('props') or {}
+            caps.append({'component': props.get('component', 'all'),
+                         'capBytes': props.get('capBytes'), 'ts': row.get('ts')})
         name, kind = row.get('name', 'unknown'), row.get('kind', 'unknown')
-        counts_name[name] += 1
-        counts_kind[kind] += 1
+        counts_name[name] += weight
+        counts_kind[kind] += weight
         attempt = _hook_attempt(row)
         if attempt:
             thread, rule, at = attempt
-            threads_by_rule[rule][thread] += 1
+            threads_by_rule[rule][thread] += weight
             if at is not None and start <= at < start + 86400:
-                attempts[(thread, rule)].append(at)
+                attempts[(thread, rule)].append((at, _sample_rate(row)))
         if type(row.get('ok')) is bool:
-            observed += 1
-            oks += row['ok']
-            failed += not row['ok']
-        errors += kind == 'error'
+            observed += weight
+            oks += weight * row['ok']
+            failed += weight * (not row['ok'])
+        errors += weight * (kind == 'error')
         duration = row.get('durationMs')
         if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-            durations[name].append(duration)
+            durations[name].append((duration, weight))
         if board == 'orders':
             merchant = (row.get('props') or {}).get('merchant')
             if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
                 merchant = 'unknown'
             if name == 'track.poll' and type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-                order_polls[merchant].append(duration)
+                order_polls[merchant].append((duration, weight))
             if kind == 'error':
                 error = row.get('error') or {}
                 status = (error.get('cause') or {}).get('httpStatus')
@@ -330,18 +390,25 @@ def rollup(board, day, top_n=20):
                 item = order_errors.setdefault((code, status, merchant), {
                     'tag': code, 'httpStatus': status, 'merchant': merchant, 'count': 0,
                     'sampleId': {'file': day + '.ndjson', 'line': line_number}})
-                item['count'] += 1
+                item['count'] += weight
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
-            tags[tag] += 1
+            tags[tag] += weight
             references.setdefault(tag, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
             identity = row.get('ids')
             if isinstance(identity, dict) and identity:
                 samples.setdefault(tag, identity)
     def percentiles(values):
         values.sort()
-        return {'p50': values[max(0, math.ceil(len(values) * .5) - 1)],
-                'p95': values[max(0, math.ceil(len(values) * .95) - 1)], 'max': values[-1]}
+        count = sum(weight for _, weight in values)
+        def percentile(fraction):
+            threshold = math.ceil(count * fraction)
+            seen = 0
+            for value, weight in values:
+                seen += weight
+                if seen >= threshold:
+                    return value
+        return {'p50': percentile(.5), 'p95': percentile(.95), 'max': values[-1][0]}
     loops = []
     # A UTC file boundary must not hide a retry loop. Previous-day records
     # supply only the rolling window; daily totals and top threads stay local.
@@ -350,18 +417,23 @@ def rollup(board, day, top_n=20):
         if attempt:
             thread, rule, at = attempt
             if (thread, rule) in attempts and at is not None and start - 3600 <= at < start:
-                attempts[(thread, rule)].append(at)
+                weight = _sample_rate(row)
+                sampled |= weight > 1
+                attempts[(thread, rule)].append((at, weight))
     for (thread, rule), timestamps in sorted(attempts.items()):
         timestamps.sort()
-        left = peak = 0
-        for right, at in enumerate(timestamps):
-            while at - timestamps[left] > 3600:
+        left = peak = window_count = 0
+        for at, weight in timestamps:
+            window_count += weight
+            while at - timestamps[left][0] > 3600:
+                window_count -= timestamps[left][1]
                 left += 1
             if at >= start:
-                peak = max(peak, right - left + 1)
+                peak = max(peak, window_count)
         if peak > 20:
             loops.append({'threadId': thread, 'rule': rule, 'maxCountInHour': peak, 'repeatLoop': True})
     result = {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
+            'recordedRows': recorded, 'sampled': sampled, 'logCaps': caps,
             'countsByName': dict(counts_name), 'countsByKind': dict(counts_kind),
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
             'errorRate': errors / total if total else 0,
@@ -376,7 +448,7 @@ def rollup(board, day, top_n=20):
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:
             result['durationsMs']['track.poll']['byMerchant'] = {
-                merchant: {**percentiles(values), 'count': len(values)}
+                merchant: {**percentiles(values), 'count': sum(weight for _, weight in values)}
                 for merchant, values in sorted(order_polls.items())}
         result['topErrors'] = sorted(order_errors.values(), key=lambda x: (
             -x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20]

@@ -8,6 +8,7 @@ import {
   MessageId,
   RunId,
   type OrchestrationV2UserInputQuestion,
+  type OrchestrationV2Run,
   type RuntimeRequestId,
   type ModelSelection,
   type ProjectId,
@@ -49,8 +50,10 @@ export interface KanbanThreadPr {
   readonly url: string;
   readonly title: string | null;
   readonly state: "open" | "draft" | "merged" | "closed";
-  /** Its head commit while the thread watches the PR (the watch keeps it current); null otherwise. */
+  /** The watch's CI checkpoint, which may lag the observed branch head. */
   readonly head?: string | null;
+  /** Latest branch head observed by a live watch; null when unknown. */
+  readonly observedHead?: string | null;
   /** Checks on the head as last synced; null when none were reported. */
   readonly checks?: "passing" | "failing" | "pending" | null;
   /** When its state and checks were last synced from the host; null when never. */
@@ -94,6 +97,8 @@ export interface KanbanSendInput {
   readonly key?: string;
   /** One logical delivery across replacement recipients; only rejected attempts may send again. */
   readonly keyAcrossThreads?: boolean;
+  /** Replace the oldest queued board wake in this thread with the same scope. */
+  readonly coalesce?: string;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
   /** Steer only an existing turn; never start an idle thread. */
@@ -106,7 +111,7 @@ type KanbanInterruptResult =
 
 /**
  * The few thread operations the board needs. Every message is delivered as a
- * steer when a run is live, otherwise it starts a turn; nothing is queued.
+ * steer when supported by a live turn, otherwise it starts or queues a turn.
  */
 export interface KanbanThreadsShape {
   readonly pendingUserInputs: (threadId: ThreadId) => Effect.Effect<
@@ -187,6 +192,25 @@ export interface KanbanThreadsShape {
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
   "t3/ardud/kanban/engine/threads/KanbanThreads",
 ) {}
+
+export const coalesceTarget = <
+  R extends Pick<OrchestrationV2Run, "ordinal" | "status" | "userMessageId">,
+>(
+  runs: ReadonlyArray<R>,
+  scope: string,
+): R | undefined => {
+  const prefix = `kanban:wake:${scope}:`;
+  let oldest: R | undefined;
+  for (const run of runs) {
+    if (
+      run.status === "queued" &&
+      run.userMessageId.startsWith(prefix) &&
+      (oldest === undefined || run.ordinal < oldest.ordinal)
+    )
+      oldest = run;
+  }
+  return oldest;
+};
 
 const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCrypto.randomUUID()}`);
 
@@ -277,6 +301,7 @@ const make = Effect.gen(function* () {
                 : pr.snapshot.state,
           // Only a live watch: an ended one's head may be commits behind.
           head: pr.watch?.headSha ?? null,
+          observedHead: pr.watch?.observedHeadSha ?? null,
           checks: pr.snapshot?.checksState ?? null,
           at: pr.snapshot?.syncedAt ?? null,
         })),
@@ -497,7 +522,7 @@ const make = Effect.gen(function* () {
   );
 
   const sendId = Effect.fn("KanbanThreads.sendId")(function* (
-    input: Pick<KanbanSendInput, "threadId" | "key" | "keyAcrossThreads">,
+    input: Pick<KanbanSendInput, "threadId" | "key" | "keyAcrossThreads" | "coalesce">,
   ) {
     let id: string = input.key ?? NodeCrypto.randomUUID();
     if (input.key !== undefined) {
@@ -511,7 +536,10 @@ const make = Effect.gen(function* () {
         if (Option.isNone(receipt)) break;
         if (
           receipt.value.aggregateKind !== "thread" ||
-          receipt.value.commandType !== "message.dispatch" ||
+          (receipt.value.commandType !== "message.dispatch" &&
+            receipt.value.commandType !== "queued-run.edit") ||
+          (receipt.value.commandType === "queued-run.edit" &&
+            receipt.value.aggregateId !== input.threadId) ||
           (receipt.value.aggregateId !== input.threadId && !input.keyAcrossThreads)
         ) {
           return yield* new KanbanThreadError({
@@ -519,8 +547,24 @@ const make = Effect.gen(function* () {
             detail: "keyed send receipt belongs to another command",
           });
         }
+        if (
+          receipt.value.status === "rejected" &&
+          receipt.value.commandType === "queued-run.edit" &&
+          !/^Run [^\r\n]+ is not queued\.$/.test(receipt.value.error ?? "")
+        ) {
+          return yield* new KanbanThreadError({
+            operation: "send",
+            detail: receipt.value.error ?? "queued wake edit was rejected",
+            rejected: true,
+          });
+        }
         if (receipt.value.status !== "rejected") {
-          if (input.keyAcrossThreads) return;
+          if (
+            input.keyAcrossThreads ||
+            input.coalesce !== undefined ||
+            receipt.value.commandType === "queued-run.edit"
+          )
+            return;
           break;
         }
       }
@@ -534,13 +578,46 @@ const make = Effect.gen(function* () {
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
-      const id = yield* sendId(input);
+      let id = yield* sendId(input);
       if (id === undefined) return;
+      // Queue edits cannot change a run's model selection or steer a live turn.
+      const scope =
+        input.mode === "steer" || input.model !== undefined ? undefined : input.coalesce;
+      if (scope !== undefined) {
+        const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
+        const target = coalesceTarget(records.runs, scope);
+        if (target !== undefined) {
+          const message = records.messages.find((row) => row.id === target.userMessageId);
+          // A keyed no-op still needs an edit receipt so its retry cannot restore stale text.
+          if (message?.text === input.text && input.key === undefined) return target.id;
+          const edited = yield* Effect.result(
+            threads.dispatch({
+              type: "queued-run.edit",
+              commandId: CommandId.make(`kanban:send:${id}`),
+              threadId: input.threadId,
+              runId: target.id,
+              text: input.text,
+            }),
+          );
+          if (Result.isSuccess(edited)) return target.id;
+          if (
+            !Schema.is(Orchestrator.OrchestratorCommandRejectedError)(edited.failure) ||
+            edited.failure.cause !== `Run ${target.id} is not queued.`
+          ) {
+            return yield* edited.failure;
+          }
+          // The rejected edit owns its command id. Walk its receipt before sending once.
+          id = yield* sendId({ ...input, key: input.key ?? id });
+          if (id === undefined) return;
+        }
+      }
       const deliver = Effect.gen(function* () {
         const sent = yield* threads.sendToThread({
           projectId: shell.projectId,
           commandId: CommandId.make(`kanban:send:${id}`),
-          messageId: MessageId.make(`kanban:${id}`),
+          messageId: MessageId.make(
+            scope === undefined ? `kanban:${id}` : `kanban:wake:${scope}:${id}`,
+          ),
           threadId: input.threadId,
           text: input.text,
           attachments: [],

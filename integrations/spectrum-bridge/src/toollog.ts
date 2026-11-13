@@ -3,7 +3,7 @@ import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync,
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { writeFile, readFile, rename, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -18,8 +18,9 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "threadId", "operationId", "formId", "runId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels"]);
 const ENUMS: Record<string, readonly string[]> = {
+  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook"],
   source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -56,7 +57,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
 }
 
 export function createToolLog(options: { root?: string; now?: () => number; capBytes?: number; defer?: boolean } = {}) {
-  const root = () => options.root ?? process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/imessage");
+  const root = () => options.root ?? logDirectory("imessage");
   const now = options.now ?? Date.now;
   let maintainedDay = "";
   let maintainedRoot = "";

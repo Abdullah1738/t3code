@@ -155,6 +155,7 @@ function baseThread(input: {
       relationshipToParent: null,
       rootThreadId: input.threadId,
     },
+    forkedFrom: null,
     archivedAt: null,
     deletedAt: null,
     providerInstanceId: input.instanceId,

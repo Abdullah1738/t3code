@@ -109,10 +109,10 @@ const shellCreated = (id: string, sessionID: string) =>
       },
     },
   });
-const shellExited = (id: string) =>
+const shellExited = (id: string, status: "exited" | "timeout" | "killed" = "exited") =>
   rawEvent("shell.exited", {
     location: { directory: WORK },
-    data: { id, exit: 0, status: "exited" },
+    data: { id, ...(status === "exited" ? { exit: 0 } : {}), status },
   });
 
 const mcpRules = [
@@ -2493,7 +2493,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         delivery: "steer",
       },
     });
-  const nestedLaunch: ReadonlyArray<ProviderReplayEntry> = [
+  const middleLaunch: ReadonlyArray<ProviderReplayEntry> = [
     out("session.prompt", { sessionID: SESSION, text: "<any>" }),
     promptAccepted,
     event("session.execution.started", { sessionID: SESSION }),
@@ -2510,6 +2510,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       metadata: { sessionID: MIDDLE, status: "running" },
     }),
     event("session.execution.started", { sessionID: MIDDLE }),
+  ];
+  const nestedLaunch: ReadonlyArray<ProviderReplayEntry> = [
+    ...middleLaunch,
     event("session.tool.input.started", { ...toolOf(MIDDLE, "call-deep"), name: "subagent" }),
     event("session.tool.called", {
       ...toolOf(MIDDLE, "call-deep"),
@@ -2538,6 +2541,89 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }),
     event("session.execution.succeeded", { sessionID: SESSION }),
   ];
+
+  it.effect.each(
+    (["root", "child"] as const).flatMap((owner) =>
+      (["completed", "interrupted", "failed"] as const).flatMap((status) =>
+        (["exited", "timeout", "killed", "deleted"] as const).map((ending) => ({
+          owner,
+          status,
+          ending,
+          label: ending === "exited" ? "foreground shell" : `${ending} shell`,
+        })),
+      ),
+    ),
+  )("clears a $status $label on the $owner session", ({ owner, status, ending }) =>
+    Effect.gen(function* () {
+      const sessionID = owner === "root" ? SESSION : MIDDLE;
+      const { runtime, thread } = yield* resumed([
+        ...(owner === "child"
+          ? middleLaunch
+          : [
+              out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+              promptAccepted,
+              event("session.execution.started", { sessionID: SESSION }),
+            ]),
+        shellCreated("sh_foreground", sessionID),
+        ending === "deleted"
+          ? rawEvent("shell.deleted", {
+              location: { directory: WORK },
+              data: { id: "sh_foreground" },
+            })
+          : shellExited("sh_foreground", ending),
+        event("session.text.ended", {
+          sessionID,
+          assistantMessageID: "msg_foreground_shell_answer",
+          ordinal: 0,
+          text: "FOREGROUND_OK",
+        }),
+        status === "failed"
+          ? event("session.execution.failed", {
+              sessionID,
+              error: { type: "unknown", message: "Foreground execution failed" },
+            })
+          : event(
+              status === "completed"
+                ? "session.execution.succeeded"
+                : "session.execution.interrupted",
+              { sessionID },
+            ),
+        ...(owner === "child"
+          ? [event("session.execution.succeeded", { sessionID: SESSION })]
+          : []),
+        event("session.model.selected", {
+          sessionID: SESSION,
+          model: { providerID: "opencode", id: "big-pickle", variant: "foreground-shell-finished" },
+        }),
+      ]);
+      const delivered = yield* runtime.events.pipe(
+        Stream.tap(() => Effect.yieldNow),
+        Stream.takeUntil(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.nativeMetadata?.modelSelection?.options?.[0]?.value ===
+              "foreground-shell-finished",
+        ),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      const events = [...(yield* Fiber.join(delivered))];
+      const updates = events.flatMap((event) =>
+        event.type === "provider_thread.updated" && event.providerThread.id === thread.id
+          ? [event.providerThread]
+          : [],
+      );
+      assert.isTrue(updates.some((thread) => thread.pendingBackgroundWork === true));
+      assert.equal(updates.at(-1)?.pendingBackgroundWork, false);
+      assert.isTrue(
+        events.some(
+          (event) => event.type === "message.updated" && event.message.text === "FOREGROUND_OK",
+        ),
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
   const watchNested = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime) =>
     Effect.gen(function* () {
       const deep: Array<string> = [];
@@ -2575,6 +2661,122 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         });
       return { deep, middleTurns, terminals, until };
     });
+
+  it.effect.each([
+    { source: "subagent", status: "completed", exitBeforeRootEnd: false },
+    { source: "subagent", status: "interrupted", exitBeforeRootEnd: false },
+    { source: "subagent", status: "failed", exitBeforeRootEnd: false },
+    { source: "shell", status: "completed", exitBeforeRootEnd: false },
+    { source: "shell", status: "interrupted", exitBeforeRootEnd: false },
+    { source: "shell", status: "failed", exitBeforeRootEnd: false },
+    { source: "shell", status: "completed", exitBeforeRootEnd: true },
+    { source: "shell", status: "interrupted", exitBeforeRootEnd: true },
+    { source: "shell", status: "failed", exitBeforeRootEnd: true },
+  ] as const)(
+    "publishes idle after a nested $source's $status follow-up output (root still running: $exitBeforeRootEnd)",
+    ({ source, status, exitBeforeRootEnd }) =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed([
+          ...(source === "subagent"
+            ? [
+                ...nestedLaunch,
+                event("session.execution.succeeded", { sessionID: DEEP }),
+                deepReport(status === "interrupted" ? "cancelled" : "completed"),
+              ]
+            : [
+                ...middleLaunch,
+                shellCreated("sh_nested", MIDDLE),
+                event("session.execution.succeeded", { sessionID: MIDDLE }),
+                event("session.tool.success", {
+                  ...toolOf(SESSION, "call-middle"),
+                  content: [{ type: "text", text: "MIDDLE_OK" }],
+                  metadata: { sessionID: MIDDLE, status: "completed", truncated: false },
+                  executed: false,
+                }),
+                ...(exitBeforeRootEnd
+                  ? [
+                      shellExited("sh_nested"),
+                      event("session.execution.succeeded", { sessionID: SESSION }),
+                    ]
+                  : [
+                      event("session.execution.succeeded", { sessionID: SESSION }),
+                      shellExited("sh_nested"),
+                    ]),
+              ]),
+          event("session.execution.started", { sessionID: MIDDLE }),
+          event("session.text.ended", {
+            sessionID: MIDDLE,
+            assistantMessageID: "msg_middle_follow_up",
+            ordinal: 0,
+            text: "GRANDCHILD_OK",
+          }),
+          status === "failed"
+            ? event("session.execution.failed", {
+                sessionID: MIDDLE,
+                error: { type: "unknown", message: "Follow-up failed after output" },
+              })
+            : event(
+                status === "completed"
+                  ? "session.execution.succeeded"
+                  : "session.execution.interrupted",
+                { sessionID: MIDDLE },
+              ),
+        ]);
+        const delivered = yield* runtime.events.pipe(
+          Stream.tap(() => Effect.yieldNow),
+          Stream.takeUntil(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.id === thread.id &&
+              event.providerThread.pendingBackgroundWork === false,
+          ),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(withLineage(thread));
+        const events = [...(yield* Fiber.join(delivered))];
+        const states = events.flatMap((event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.id === thread.id &&
+          event.providerThread.pendingBackgroundWork !== undefined
+            ? [event.providerThread.pendingBackgroundWork]
+            : [],
+        );
+        assert.equal(states[0], true);
+        assert.equal(states.at(-1), false);
+        assert.isTrue(states.slice(0, -1).every(Boolean));
+        assert.isTrue(
+          events.some(
+            (event) => event.type === "message.updated" && event.message.text === "GRANDCHILD_OK",
+          ),
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("publishes idle when a pending nested report is cancelled without a wake", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...nestedLaunch,
+        event("session.execution.succeeded", { sessionID: DEEP }),
+        deepReport("completed"),
+        event("session.inbox.cancelled", { sessionID: MIDDLE, inboxID: "msg_deep_report" }),
+      ]);
+      const idle = yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.id === thread.id &&
+            event.providerThread.pendingBackgroundWork === false,
+        ),
+        Stream.runHead,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      assert.isTrue(Option.isSome(yield* Fiber.join(idle)));
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
 
   it.effect("stops a foreground subagent's background subagent after the turn ended", () =>
     Effect.gen(function* () {
@@ -3516,6 +3718,42 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(turnInput(thread));
       assert.equal((yield* Fiber.join(terminal))?.status, "completed");
     }).pipe(Effect.scoped),
+  );
+
+  it.effect.each(["permission", "form"] as const)(
+    "publishes the %s row before making its request answerable",
+    (kind) =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed(
+          [
+            out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+            promptAccepted,
+            kind === "permission" ? shellAskEvent : event("form.created", { form: colorForm }),
+          ],
+          { supervised: true },
+        );
+        const published = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "runtime_request.updated"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread, bigPickle, "approval-required"));
+        const events = [...(yield* Fiber.join(published))];
+        const request = events.find((event) => event.type === "runtime_request.updated");
+        assert.isDefined(request);
+        if (request?.type !== "runtime_request.updated") return;
+        const item = events.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            (event.turnItem.type === "approval_request" ||
+              event.turnItem.type === "user_input_request") &&
+            event.turnItem.requestId === request.runtimeRequest.id,
+        );
+        assert.isDefined(item, "an immediate answer must find the row it completes");
+        if (item?.type !== "turn_item.updated") return;
+        assert.equal(item.turnItem.nodeId, request.runtimeRequest.nodeId);
+        assert.equal(item.turnItem.status, "waiting");
+      }).pipe(Effect.scoped),
   );
 
   it.effect("ends the turn when an answer to its request cannot be delivered", () =>

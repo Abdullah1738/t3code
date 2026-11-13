@@ -162,15 +162,23 @@ def trace_run(name):
     return decorate
 
 
-def run_helper(name, command, **kwargs):
+def run_helper(name, command, failure_state=None, **kwargs):
     started = time.perf_counter()
     ids = {**log_ids(), 'helper': name}
+
+    def failed(tag, cause):
+        status = {'tag': tag, **cause}
+        if failure_state is None or failure_state.get(name) != status:
+            tool_error('triage', tag, ids, cause)
+        if failure_state is not None:
+            failure_state[name] = status
+
     try:
         result = subprocess.run(command, **kwargs)
     except Exception as error:
         timeout = isinstance(error, subprocess.TimeoutExpired)
         cause = stderr_cause(error.stderr if timeout else str(error), timeout)
-        tool_error('triage', 'helper.timeout' if timeout else 'helper.launch_failed', ids, cause)
+        failed('helper.timeout' if timeout else 'helper.launch_failed', cause)
         tool_log({'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ids': ids, 'ok': False,
                   'durationMs': (time.perf_counter() - started) * 1000,
                   'props': {'outcome': 'timeout' if timeout else 'fail', **cause}})
@@ -179,7 +187,9 @@ def run_helper(name, command, **kwargs):
               'durationMs': (time.perf_counter() - started) * 1000, 'ok': result.returncode == 0,
               'props': {'exitCode': result.returncode, **(stderr_cause(result.stderr) if result.returncode else {})}})
     if result.returncode:
-        tool_error('triage', 'helper.exit_failed', ids, stderr_cause(result.stderr))
+        failed('helper.exit_failed', stderr_cause(result.stderr))
+    elif failure_state is not None and failure_state.pop(name, None) is not None:
+        tool_log({'component': 'triage', 'kind': 'event', 'name': 'helper.recovered', 'ids': ids, 'ok': True})
     return result
 
 
@@ -1813,15 +1823,20 @@ def send_health(state, due, wd, now):
     stub = os.environ.get('ROBOB_WATCH_TELEGRAM_CLI')
     if (os.environ.get('ROBOB_TEST') or os.environ.get('NODE_ENV') == 'test' or os.environ.get('PYTEST_CURRENT_TEST')) and not stub:
         return {'health_alert_error': 'refused: test run; telegram notify would reach a real app'}
+    failures = state.setdefault('health_delivery_failures', {})
+    previous = failures.get('telegram-bridge')
     try:
         out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
-                          '--text', pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
+                          '--text=' + pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
+                         failure_state=failures,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
         if out.returncode:
-            raise RuntimeError((out.stderr or out.stdout).strip()[:160] or f'exit {out.returncode}')
-    except Exception as e:
-        log_failure('health.delivery_failed')
-        return {'health_alert_error': f'{type(e).__name__}: {str(e)[:160]}'}
+            raise RuntimeError('telegram-bridge notify failed: ' + stderr_cause(out.stderr)['stderrClass'])
+    except Exception:
+        cause = {k: v for k, v in failures.get('telegram-bridge', {}).items() if k != 'tag'}
+        if previous != failures.get('telegram-bridge'):
+            tool_error('triage', 'health.delivery_failed', {**log_ids(), 'helper': 'telegram-bridge'}, cause)
+        return {'health_alert_error': 'telegram-bridge notify failed: ' + cause.get('stderrClass', 'unknown')}
     health = state.setdefault('source_health', {})
     for s in pending['sources']:
         if s in health:
@@ -1892,17 +1907,21 @@ def collect(state, now, watchers, rules, since=None, baseline=False, fast=None):
             if fast is None:
                 tasks[pool.submit(replay_pages, lambda cursor: collect_whatsapp(cursor, now, jids, cutoff, since))] = 'whatsapp'
             tasks[pool.submit(replay_pages, lambda cursor: collect_imessage(cursor, now, cutoff, since, fast=fast))] = 'imessage'
-        results, errors = {}, {}
+        results, errors, causes = {}, {}, {}
         for f in concurrent.futures.as_completed(tasks):
             source = tasks[f]
             try:
                 results[source] = f.result()
                 if results[source].get('partial'):
-                    log_failure('collection.partial')
                     errors[source] = results[source]['partial']
+                    causes[source] = ('collection.partial', stderr_cause(errors[source]))
             except Exception as e:
-                log_failure('collection.failed')
                 errors[source] = f'{type(e).__name__}: {str(e)[:160]}'
+                causes[source] = ('collection.failed', stderr_cause(f'{type(e).__name__}: {e}'))
+        for source, (tag, cause) in causes.items():
+            helper = 'mail-worker' if source in ACCOUNTS else source
+            tool_error('triage', tag, {**log_ids(), 'helper': helper},
+                       {**cause, 'failedSources': len(errors), 'totalSources': len(tasks)})
     return results, errors
 
 

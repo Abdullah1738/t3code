@@ -34,6 +34,25 @@ const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEG
 const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
 export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
 
+/** Native payloads are unescaped, so only the leading report's header is authoritative. */
+export function subagentNoticeState(text: string): string | undefined {
+  const source = text.trim();
+  if (!source.endsWith("</subagent>")) return;
+  // The native notifier drops running reports before onWake joins reports.
+  // Real joined notices are terminal; scanning their payload can only invent
+  // boundaries from quoted or incomplete report examples.
+  const native = /^<subagent\s+sessionID="[^"]+"\s+state="([^"]*)"\s+description="/.exec(source);
+  if (native) return native[1];
+  const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>/.exec(source)?.[1];
+  if (!header) return;
+  const attributes = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
+  return attributes.length === 1 ? attributes[0]![2] : undefined;
+}
+
+export const isCompletionNoticeText = (text: string): boolean => isDelegatedCompletionText(text)
+  // OpenCode calls a failed native report "error" (reportOutcome in its provider adapter).
+  || ["completed", "failed", "error", "cancelled"].includes(subagentNoticeState(text) ?? "");
+
 export type MessageRecord =
   | { id: string; type: "user"; text: string; time: { created: number }; createdBy?: string; [key: string]: unknown }
   | {
@@ -277,6 +296,7 @@ export type OwnerWords = { inboundId: string; text: string };
  * became (or waits for) a run of its own; `refused` means nothing was sent.
  */
 export type SteerDelivery = "steered" | "started" | "queued" | "refused";
+export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean> };
 
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
@@ -298,7 +318,7 @@ export interface ChatBackend {
    */
   runToolEvidence?(id: string, directory: string, sinceMs: number): Promise<"ran" | "none" | "unknown">;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
-  children(id: string, directory: string): Promise<SessionRecord[]>;
+  children(id: string, directory: string, complete?: boolean): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
   promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
   /**
@@ -309,12 +329,12 @@ export interface ChatBackend {
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
     model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords): Promise<void>;
   /**
-   * Adds text to the session's running turn, never queueing behind it. Backends
+   * Adds a message to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
    */
-  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
+  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
-  statuses(): Promise<Record<string, SessionStatus>>;
+  statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;
    * backends whose full list is slow (Robob) implement this cheap single lookup.

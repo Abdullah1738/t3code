@@ -17,6 +17,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
+import * as McpCallLedger from "./McpCallLedger.ts";
 
 const day = "2026-11-13";
 const ts = `${day}T12:00:00.000Z`;
@@ -445,3 +446,41 @@ describe("Analytics storage failures", () => {
     },
   );
 });
+
+it.effect("scope shutdown persists the in-flight MCP ledger before returning", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    yield* Effect.gen(function* () {
+      const ledger = yield* McpCallLedger.McpCallLedger;
+      yield* ledger.begin(() =>
+        Effect.succeed({
+          ts,
+          startedAt: ts,
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          bootId: "boot-storage",
+          tool: "delegate_task",
+          outcome: "interrupted_by_shutdown",
+          clientRequestId: "c".repeat(64),
+          committed: true,
+          taskId: "node:delegated-task:review(1338)",
+        }),
+      );
+    }).pipe(
+      Effect.provide(McpCallLedger.layer),
+      Effect.provideService(Analytics.Analytics, analytics),
+    );
+    const rows = (yield* setup.fs.readFileString(setup.active))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.lengthOf(rows, 1);
+    assert.include(rows[0], {
+      outcome: "interrupted_by_shutdown",
+      committed: true,
+      taskId: "node:delegated-task:review(1338)",
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

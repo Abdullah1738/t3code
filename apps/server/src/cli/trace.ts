@@ -1,3 +1,4 @@
+import { isSpanSummaryRecord } from "@t3tools/shared/observability";
 import { PositiveInt } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
@@ -39,7 +40,17 @@ const decodeTraceSpanLine = Schema.decodeUnknownOption(
 );
 
 export function makeTraceSpanSummary(sinceMs = -Infinity) {
-  const byName = new Map<string, { durations: number[]; interrupted: number; failures: number }>();
+  const byName = new Map<
+    string,
+    {
+      durations: number[];
+      interrupted: number;
+      failures: number;
+      omitted: number;
+      maxOmittedMs: number;
+    }
+  >();
+  let summarisedSpanCount = 0;
   let spanCount = 0;
   let skippedLineCount = 0;
   let firstEndMs = Infinity;
@@ -47,6 +58,34 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
 
   const addLine = (line: string) => {
     if (line.trim().length === 0) return;
+    if (line.includes('"span-summary"')) {
+      try {
+        const summary: unknown = JSON.parse(line);
+        if (isSpanSummaryRecord(summary)) {
+          if (summary.windowEnd < sinceMs) return;
+          for (const [name, stats] of Object.entries(summary.spans)) {
+            if (stats.count < 1 || stats.maxMs < 0 || stats.totalMs < 0) continue;
+            const current = byName.get(name) ?? {
+              durations: [],
+              interrupted: 0,
+              failures: 0,
+              omitted: 0,
+              maxOmittedMs: 0,
+            };
+            current.omitted += stats.count;
+            current.maxOmittedMs = Math.max(current.maxOmittedMs, stats.maxMs);
+            byName.set(name, current);
+            spanCount += stats.count;
+            summarisedSpanCount += stats.count;
+          }
+          firstEndMs = Math.min(firstEndMs, summary.windowStart);
+          lastEndMs = Math.max(lastEndMs, summary.windowEnd);
+          return;
+        }
+      } catch {
+        /* Malformed records are counted below. */
+      }
+    }
     const span = Option.getOrUndefined(decodeTraceSpanLine(line));
     if (span === undefined) {
       skippedLineCount += 1;
@@ -63,7 +102,13 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     spanCount += 1;
     firstEndMs = Math.min(firstEndMs, endMs);
     lastEndMs = Math.max(lastEndMs, endMs);
-    const stats = byName.get(span.name) ?? { durations: [], interrupted: 0, failures: 0 };
+    const stats = byName.get(span.name) ?? {
+      durations: [],
+      interrupted: 0,
+      failures: 0,
+      omitted: 0,
+      maxOmittedMs: 0,
+    };
     stats.durations.push(span.durationMs);
     if (
       span.exit?._tag === "Interrupted" ||
@@ -79,30 +124,39 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
   const finish = () => {
     const minutes = (lastEndMs - firstEndMs) / 60_000;
     const spans = [...byName]
-      .map(([name, { durations, interrupted, failures }]) => {
+      .map(([name, { durations, interrupted, failures, omitted, maxOmittedMs }]) => {
         const sorted = durations.toSorted((left, right) => left - right);
-        const percentile = (p: number) => sorted[Math.ceil(p * sorted.length) - 1]!;
+        const percentile = (p: number) =>
+          sorted.length > 0 ? sorted[Math.ceil(p * sorted.length) - 1]! : NaN;
         return {
           name,
-          count: sorted.length,
-          perMinute: minutes > 0 ? sorted.length / minutes : undefined,
+          count: sorted.length + omitted,
+          perMinute: minutes > 0 ? (sorted.length + omitted) / minutes : undefined,
           p50Ms: percentile(0.5),
           p90Ms: percentile(0.9),
-          maxMs: sorted[sorted.length - 1]!,
+          maxMs: Math.max(sorted[sorted.length - 1] ?? 0, maxOmittedMs),
           interrupted,
           failures,
         };
       })
       .toSorted((left, right) => right.count - left.count || left.name.localeCompare(right.name));
 
-    return { spanCount, skippedLineCount, firstEndMs, lastEndMs, minutes, spans };
+    return {
+      spanCount,
+      summarisedSpanCount,
+      skippedLineCount,
+      firstEndMs,
+      lastEndMs,
+      minutes,
+      spans,
+    };
   };
 
   return { addLine, finish };
 }
 
 const formatMs = (ms: number) =>
-  ms < 1_000 ? `${Math.round(ms)}ms` : `${(ms / 1_000).toFixed(1)}s`;
+  !Number.isFinite(ms) ? "-" : ms < 1_000 ? `${Math.round(ms)}ms` : `${(ms / 1_000).toFixed(1)}s`;
 
 function formatTraceSummary(
   summary: ReturnType<ReturnType<typeof makeTraceSpanSummary>["finish"]>,
@@ -132,6 +186,11 @@ function formatTraceSummary(
     `${summary.spanCount} spans ended from ${formatIso(summary.firstEndMs)} to ${formatIso(summary.lastEndMs)} (${summary.minutes.toFixed(1)} min).`,
     ...(summary.skippedLineCount > 0
       ? [`Skipped ${summary.skippedLineCount} lines that are not spans.`]
+      : []),
+    ...(summary.summarisedSpanCount > 0
+      ? [
+          `${summary.summarisedSpanCount} fast successful spans counted from minute summaries; p50/p90 cover full records only. Summary time filtering has one-minute precision.`,
+        ]
       : []),
     "",
     ...table.map((row) =>

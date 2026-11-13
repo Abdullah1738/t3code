@@ -10,6 +10,7 @@ import * as Schema from "effect/Schema";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
 
@@ -173,5 +174,10 @@ export const desktopLeaseRoutes = HttpRouter.addAll(
 );
 
 export const desktopLeaseRouteLayer = desktopLeaseRoutes.pipe(
-  Layer.provide(DesktopLeaseService.layer.pipe(Layer.provide(ExecutionIdentity.layer))),
+  Layer.provide(
+    DesktopLeaseService.layer.pipe(
+      Layer.provide(ExecutionIdentity.layer),
+      Layer.provide(ProjectionStore.layer),
+    ),
+  ),
 );
