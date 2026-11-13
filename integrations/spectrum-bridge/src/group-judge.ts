@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Group chats: is an unnamed message meant for Robob? Messages that name him or
  * swipe-reply to him never get here; for the rest Jev (TypeSafe's decision
@@ -221,7 +222,7 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
     if (!states.length) return [];
     const keyFile = deps.keyFile ?? join(homedir(), ".config/opencode/openrouter-key");
     let key: string;
-    try { key = (await readFile(keyFile, "utf8")).trim(); } catch { throw new JudgeError("keyUnavailable"); }
+    try { key = (await readFile(keyFile, "utf8")).trim(); } catch { toolError("group-judge", "group-judge.catch1"); throw new JudgeError("keyUnavailable"); }
     if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new JudgeError("keyUnavailable");
     const keys = states.map((_, index) => `m${index}`);
     const body = JSON.stringify({
@@ -239,19 +240,19 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
             method: "POST", body, redirect: "error", signal,
             headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "X-OpenRouter-Title": "spectrum-bridge group gate" },
           });
-        } catch { throw new JudgeError(signal.aborted ? "timeout" : "network"); }
+        } catch { toolError("group-judge", "group-judge.catch2"); throw new JudgeError(signal.aborted ? "timeout" : "network"); }
         if (!response.ok) {
-          await response.body?.cancel().catch(() => {});
+          await response.body?.cancel().catch(() => { toolError("group-judge", "group-judge.catch3");});
           throw new JudgeError(`http${response.status}`);
         }
         let result: { answers?: Record<string, { noul?: unknown }> };
-        try { result = await response.json() as typeof result; } catch { throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
+        try { result = await response.json() as typeof result; } catch { toolError("group-judge", "group-judge.catch4"); throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
         return keys.map(k => {
           const p = result.answers?.[k]?.noul;
           if (typeof p !== "number" || !(p >= 0 && p <= 1)) throw new JudgeError("invalidResponse");
           return p;
         });
-      } catch (error) {
+      } catch (error) { toolError("group-judge", "group-judge.catch5");
         failure = error instanceof JudgeError ? error : new JudgeError("jevFailed");
       }
     }

@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { extname, join } from "node:path";
@@ -52,11 +53,11 @@ async function settings(path: string): Promise<{ server: string; model: string }
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>;
-  } catch {}
+  } catch { toolError("stt", "stt.catch1");}
   let server = DEFAULT_SERVER;
   if (typeof raw.sttServerUrl === "string" && raw.sttServerUrl.trim()) {
     let url: URL;
-    try { url = new URL(raw.sttServerUrl.trim()); } catch { throw new SttError("invalidServerUrl"); }
+    try { url = new URL(raw.sttServerUrl.trim()); } catch { toolError("stt", "stt.catch2"); throw new SttError("invalidServerUrl"); }
     if (url.protocol !== "https:" && url.protocol !== "http:") throw new SttError("invalidServerUrl");
     server = url.href.endsWith("/") ? url.href : `${url.href}/`;
   }
@@ -132,7 +133,7 @@ export async function transcribe(input: SttInput, deps: SttDeps = {}): Promise<s
   const { server, model } = await settings(deps.settingsPath ?? join(homedir(), ".config/spectrum-bridge/config.json"));
   const keyFile = deps.keyFile ?? process.env.SPECTRUM_STT_KEY_FILE ?? join(homedir(), ".config/opencode/openrouter-key");
   let key: string;
-  try { key = (await readFile(keyFile, "utf8")).trim(); } catch { throw new SttError("keyUnavailable"); }
+  try { key = (await readFile(keyFile, "utf8")).trim(); } catch { toolError("stt", "stt.catch3"); throw new SttError("keyUnavailable"); }
   if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new SttError("keyUnavailable");
 
   const signal = AbortSignal.timeout(deps.timeoutMs ?? 60_000);
@@ -149,12 +150,12 @@ export async function transcribe(input: SttInput, deps: SttDeps = {}): Promise<s
       try {
         exitCode = await (deps.spawn ?? defaultSpawn)(
           ["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", source, target], signal);
-      } catch {
+      } catch { toolError("stt", "stt.catch4");
         throw new SttError(signal.aborted ? "timeout" : "conversionFailed");
       }
       if (signal.aborted) throw new SttError("timeout");
       if (exitCode !== 0) throw new SttError("conversionFailed");
-      try { wav = new Uint8Array(await readFile(target)); } catch { throw new SttError("conversionFailed"); }
+      try { wav = new Uint8Array(await readFile(target)); } catch { toolError("stt", "stt.catch5"); throw new SttError("conversionFailed"); }
       if (wav.byteLength === 0) throw new SttError("conversionFailed");
     }
     const pieces = splitWav(wav, deps.maxUploadBytes ?? MAX_UPLOAD_BYTES);
@@ -169,15 +170,15 @@ export async function transcribe(input: SttInput, deps: SttDeps = {}): Promise<s
         response = await (deps.fetch ?? fetch)(`${server}audio/transcriptions`, {
           method: "POST", headers: { Authorization: `Bearer ${key}` }, body: form, redirect: "error", signal,
         });
-      } catch {
+      } catch { toolError("stt", "stt.catch6");
         throw new SttError(signal.aborted ? "timeout" : "network");
       }
       if (!response.ok) {
-        await response.body?.cancel().catch(() => {});
+        await response.body?.cancel().catch(() => { toolError("stt", "stt.catch7");});
         throw new SttError(`http${response.status}`);
       }
       let result: unknown;
-      try { result = await response.json(); } catch { throw new SttError(signal.aborted ? "timeout" : "invalidResponse"); }
+      try { result = await response.json(); } catch { toolError("stt", "stt.catch8"); throw new SttError(signal.aborted ? "timeout" : "invalidResponse"); }
       const text = result && typeof result === "object" ? (result as { text?: unknown }).text : undefined;
       if (typeof text !== "string") throw new SttError("invalidResponse");
       texts[index] = text.trim();
@@ -188,6 +189,6 @@ export async function transcribe(input: SttInput, deps: SttDeps = {}): Promise<s
     }
     return texts.filter(Boolean).join(" ");
   } finally {
-    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    await rm(directory, { recursive: true, force: true }).catch(() => { toolError("stt", "stt.catch9");});
   }
 }

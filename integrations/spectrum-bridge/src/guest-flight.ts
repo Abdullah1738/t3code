@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * One of the owner's flights, read-only from the Flighty DB, cut down to what someone meeting him
  * needs: number, airports, times, delay, terminal/gate/belt and status. Seats, PNRs, other
@@ -63,7 +64,7 @@ export function flightyDb(path = FLIGHTY_DB, user = FLIGHTY_OWNER): FlightSource
       db = new Database(path, { readonly: true });
       db.exec("PRAGMA busy_timeout = 3000");
       return work(db);
-    } catch { return "unavailable"; } finally { db?.close(); }
+    } catch { toolError("guest-flight", "guest-flight.catch1"); return "unavailable"; } finally { db?.close(); }
   };
   return {
     flights: since => read(db => db.query<FlightRow, [string, number]>(SQL).all(user, since)),

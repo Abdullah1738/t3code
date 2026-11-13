@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import assert from "node:assert/strict";
 
 // JSON.parse establishes this representation; notification consumers decode its
@@ -344,12 +345,12 @@ export class OpenChamber implements ChatBackend {
         throw new Error();
       }
       this.baseUrl = new URL(baseUrl).origin;
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch1");
       throw new Error("OpenChamber URL must be an HTTP origin on 127.0.0.1 or localhost");
     }
     try {
       this.headers = new Headers(headers);
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch2");
       throw new Error("Invalid OpenChamber headers");
     }
   }
@@ -383,12 +384,12 @@ export class OpenChamber implements ChatBackend {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch3");
       throw requestError(0, signal);
     }
     if (!response.ok) {
       await inspectFailure?.(response);
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("openchamber", "openchamber.catch4");});
       throw requestError(response.status, signal);
     }
     return response;
@@ -401,7 +402,7 @@ export class OpenChamber implements ChatBackend {
     if (response.status === 204) return undefined;
     try {
       return (await response.json()) as T;
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch5");
       throw requestError(response.status, signal);
     }
   }
@@ -461,7 +462,7 @@ export class OpenChamber implements ChatBackend {
         assert.match(session.parentID, ID);
         id = session.parentID;
       }
-    } catch { /* Keep pending permissions visible when the policy owner is unavailable. */ }
+    } catch { toolError("openchamber", "openchamber.catch6"); /* Keep pending permissions visible when the policy owner is unavailable. */ }
   }
 
   async createChat(title?: string): Promise<{ id: string; directory: string }> {
@@ -504,7 +505,7 @@ export class OpenChamber implements ChatBackend {
     try {
       // An id-only read: OpenCode resolves the session's own location.
       session = sessionRecord(await this.readOrNotFound(`/api/session/${encodeURIComponent(id)}`, id, directory));
-    } catch (error) {
+    } catch (error) { toolError("openchamber", "openchamber.catch7");
       if (error === SESSION_NOT_FOUND) return "missing";
       throw error;
     }
@@ -530,12 +531,12 @@ export class OpenChamber implements ChatBackend {
     const response = await this.response(path, { signal, ...(directory === undefined ? {} : { directory }) }, "application/json",
       async failed => {
         if (failed.status !== 404) return;
-        const body = await failed.json().catch(() => undefined) as { _tag?: unknown; sessionID?: unknown } | undefined;
+        const body = await failed.json().catch(() => { toolError("openchamber", "openchamber.catch8"); return undefined; }) as { _tag?: unknown; sessionID?: unknown } | undefined;
         if (body?._tag === "SessionNotFoundError" && body.sessionID === id) throw SESSION_NOT_FOUND;
       });
     try {
       return await response.json();
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch9");
       throw requestError(response.status, signal);
     }
   }
@@ -596,7 +597,7 @@ export class OpenChamber implements ChatBackend {
       const message = unwrap<{ id?: unknown; type?: unknown } | undefined>(await this.request<unknown>(
         `/api/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageId)}`, { directory }));
       if (message?.id === messageId && message.type === "user") return true;
-    } catch (error) {
+    } catch (error) { toolError("openchamber", "openchamber.catch10");
       // 404 is OpenCode's MessageNotFoundError: not promoted yet, or never admitted.
       if ((error as { status?: unknown }).status !== 404) throw error;
     }
@@ -721,7 +722,7 @@ export class OpenChamber implements ChatBackend {
     const response = await this.response(path, { signal }, "text/event-stream");
     if (response.status === 204) return;
     if (!response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("openchamber", "openchamber.catch11");});
       throw requestError(response.status, signal);
     }
     const reader = response.body.getReader();
@@ -763,10 +764,10 @@ export class OpenChamber implements ChatBackend {
         // SSE dispatch requires a blank line; discard incomplete frames at EOF.
         if (done) return;
       }
-    } catch {
+    } catch { toolError("openchamber", "openchamber.catch12");
       throw requestError(response.status, signal);
     } finally {
-      await reader.cancel().catch(() => {});
+      await reader.cancel().catch(() => { toolError("openchamber", "openchamber.catch13");});
       reader.releaseLock();
     }
   }

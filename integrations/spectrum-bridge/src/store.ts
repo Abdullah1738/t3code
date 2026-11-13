@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 
@@ -96,7 +97,7 @@ export class Store {
       this.db.exec("CREATE INDEX IF NOT EXISTS inbound_failed ON inbound(state) WHERE state = 'failed'");
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
-    } catch (error) {
+    } catch (error) { toolError("store", "store.catch1");
       this.db.close();
       throw error;
     }
@@ -173,7 +174,17 @@ export class Store {
     return this.db.transaction(() => {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
-      if (result.changes) return true;
+      if (result.changes) {
+        toolLog.capture(() => {
+          this.set(`log-queued:${op.id}`, Date.now());
+          const turn = this.get<{ id: string; inboundId?: string } | null>("activeTurn");
+          const inboundId = op.replyTo ?? (turn?.id === op.sessionId ? turn?.inboundId : undefined);
+          const row = inboundId ? this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId) : undefined;
+          const receivedAt = row ? (JSON.parse(row.payload) as { receivedAt?: number }).receivedAt : undefined;
+          if (typeof receivedAt === "number" && Number.isFinite(receivedAt)) this.set(`log-inbound-at:${op.id}`, receivedAt);
+        });
+        return true;
+      }
       const existing = this.db.query<{ payload: string }, [string]>(
         "SELECT payload FROM outbox WHERE id = ?",
       ).get(op.id)!;

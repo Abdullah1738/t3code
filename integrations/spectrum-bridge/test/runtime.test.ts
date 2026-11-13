@@ -508,3 +508,39 @@ describe("Sendblue socket API", () => {
     expect((await post("/chats", { sessionId: "ses_owner" })).status).toBe(200);
   });
 });
+
+test("accepted live and backfill ingress logs canonical chat ids and failure tags", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const deps: IngressDeps = { line: h.line, owner, ownerStore: h.ownerStore, access: async () => access,
+      sink: h.registry().sink(async () => {}, () => true) };
+    const message: LineInbound = { handle: "log-live", chat: chatKey.dm(owner), from: owner, text: "PRIVATE_INBOUND", kind: "message", service: "iMessage", participants: [], sentAt: Date.now() - 100 };
+    await handleInbound(deps, message);
+    await handleInbound(deps, { ...message, handle: "log-backfill" }, "backfill");
+    expect(await handleInbound(deps, message)).toBe(false);
+    const { backfill } = await import("../src/sb-ingress.ts");
+    await backfill({ ...deps, line: { ...h.line, backfill: async () => [{ ...message, handle: "failed-inbound" }] },
+      sink: { ...deps.sink, acceptInto: () => { throw new Error("PRIVATE_ERROR"); } } }, Date.now);
+
+  });
+  expect(logs.filter(l => l.name === "msg.received").map(l => [l.ids?.chat, l.props?.source])).toEqual([["owner", "live"], ["owner", "backfill"]]);
+  expect(logs.some(l => l.name === "bridge.catch" && l.component === "sb-ingress")).toBe(true);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test("late Sendblue failures retain the status code but never the provider's error text", async () => {
+  const { observedLine } = await import("../src/sb-main.ts");
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const line = fakeLine();
+    line.events = async function* () {
+      yield { type: "status", id: "status-failed", handle: "sent-fixture", status: "failed", errorCode: "STOP", errorMessage: "PRIVATE_PROVIDER_MESSAGE", at: Date.now() };
+      yield { type: "status", id: "status-delivered", handle: "sent-ok", status: "delivered", at: Date.now() };
+    };
+    for await (const _event of observedLine(line, { synchronized: true, lastEventAt: 0 }).events(new AbortController().signal)) { /* drain fixture */ }
+  });
+  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe("sendblue.stop_opt_out");
+  expect(logs.filter(l => l.name === "reply.failed")).toHaveLength(1);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_MESSAGE");
+});

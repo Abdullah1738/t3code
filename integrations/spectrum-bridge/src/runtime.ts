@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 /**
  * Sendblue mode: one shared line, one Store + Router + Delivery per chat. The owner's chat keeps
  * the original state.sqlite so a rollback to Photon finds its history; every other chat lives
@@ -122,7 +123,13 @@ export class ChatRegistry<P> {
             if (typeof id !== "string") return false;
             // Same as Photon ingest: the router's quiet window counts from arrival, not from the sender's clock.
             const created = chat.store.acceptInbound(id, { ...(input as object), receivedAt: this.now() });
-            if (created) { this.touch(chat); received?.(chat, input); }
+            if (created) {
+              const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
+              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
+                props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
+                  receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live" } }));
+              this.touch(chat); received?.(chat, input);
+            }
             return created;
           },
         };
@@ -229,7 +236,7 @@ function parseBody(raw: Uint8Array): Record<string, unknown> | undefined {
   try {
     const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  } catch { return undefined; }
+  } catch { toolError("runtime", "runtime.catch1"); return undefined; }
 }
 
 const askText = (from: ChatInfo, question: string) =>
@@ -327,7 +334,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           let created: boolean;
           // Like send --to, this is an owner-authorized relay, not a reply in the recipient's session.
           try { created = target.store.enqueue({ id, kind: "conversation", text: "", app }); }
-          catch { throw new HttpError(409, "Operation could not be completed"); }
+          catch { toolError("runtime", "runtime.catch2"); throw new HttpError(409, "Operation could not be completed"); }
           return reply(created ? 202 : 200, { id, created });
         }
         case "/send": {
@@ -341,7 +348,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const id = `send:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
           try { created = target.store.enqueue({ id, kind: "conversation", text: body.text }); }
-          catch { throw new HttpError(409, "Operation could not be completed"); }
+          catch { toolError("runtime", "runtime.catch3"); throw new HttpError(409, "Operation could not be completed"); }
           return reply(created ? 202 : 200, { id, created });
         }
         case "/wake": {
@@ -473,7 +480,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         default:
           return reply(404, { error: "Not found" });
       }
-    } catch (error) {
+    } catch (error) { toolError("runtime", "runtime.catch4");
       if (error instanceof HttpError) return reply(error.status, { error: error.message });
       if (error instanceof LineError) return reply(502, { error: "Sendblue request failed" });
       return reply(500, { error: "Internal error" });

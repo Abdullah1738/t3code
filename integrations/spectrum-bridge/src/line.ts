@@ -75,8 +75,27 @@ export type LineOutbound = {
   sentAt: number; status: string;
 };
 
-/** Failure codes a Line raises once sb-transport has cut any free text off an HTTP error key. Safe to log. */
-export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|card_preview_unavailable|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(:[a-z0-9_]{1,40})?)$/;
+// Provider strings can be message text, even when they look like machine keys.
+const SENDBLUE_ERROR_KEYS = new Set(["invalid_number", "worker_unavailable", "stop_opt_out", "5504", "provider_error"]);
+export function sendblueErrorKey(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 40) return;
+  const key = value.toLowerCase();
+  if (key === "stop") return "stop_opt_out";
+  return SENDBLUE_ERROR_KEYS.has(key) ? key : undefined;
+}
+
+export function sendblueFailureCode(status: number, key?: string): string {
+  return `http_${status}${key ? `:${sendblueErrorKey(key) ?? "provider_error"}` : ""}`;
+}
+
+/** Keep HTTP status and known provider codes; never promote arbitrary response fields into tags. */
+export function safeLineFailureCode(code: string): string {
+  const http = /^http_([1-5]\d{2})([\s\S]*)$/.exec(code);
+  if (http) return sendblueFailureCode(Number(http[1]), http[2]!.replace(/^:/, ""));
+  return LINE_FAILURE_CODE.test(code) ? code : "lineFailure";
+}
+
+export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|card_preview_unavailable|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(?::(?:invalid_number|worker_unavailable|stop_opt_out|5504|provider_error))?)$/;
 
 export type SendOptions = { replyTo?: string; sendStyle?: string; /** From upload(). */ mediaUrl?: string };
 

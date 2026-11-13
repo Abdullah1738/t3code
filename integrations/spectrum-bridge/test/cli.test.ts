@@ -369,3 +369,35 @@ describe("guest-allow", () => {
     expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--session", "ses_1"])).toThrow();
   });
 });
+
+test("log-rollup is local, validates UTC dates and rolls up fixture input", async () => {
+  const { parseLocalCommand, runLocalCommand, isLocalCommand } = await import("../src/cli.ts");
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  expect(isLocalCommand(["log-rollup"])).toBe(true);
+  for (const day of ["../x", "2026-02-30", "2026-11-13T12:00Z", "13-11-2026", ""]) expect(() => parseLocalCommand(["log-rollup", "--day", day])).toThrow();
+  await captureLogs(async () => {
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await runLocalCommand(parseLocalCommand(["log-rollup", "--day", day]))).toMatchObject({ total: 1, day });
+    for (const kind of ["quick", "delivery", "ride", "nutrition"]) {
+      await runLocalCommand(parseLocalCommand(["log-card-render", "--kind", kind, "--ms", "1.5", "--ok", "true"]));
+    }
+  });
+  for (const ms of ["-1", "NaN", "Infinity", ""]) expect(() => parseLocalCommand(["log-card-render", "--kind", "quick", "--ms", ms, "--ok", "true"])).toThrow();
+});
+
+test("nutrition's live-only renderer is observed at file preparation, on success and failure", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const root = await fs.mkdtemp(join(os.tmpdir(), "nutrition-log-fixture-"));
+  try {
+    const path = join(root, "nutrition.png");
+    await fs.writeFile(path, "PRIVATE_HEALTH_IMAGE");
+    const logs = await captureLogs(async () => {
+      await loadCommandPayload(parseCommand(["send-file", "--file", path, "--session", "fixture-session", "--key", "nutrition-fixture"]));
+      await expect(loadCommandPayload(parseCommand(["send-file", "--file", join(root, "nutrition-missing.png"), "--session", "fixture-session", "--key", "missing-fixture"]))).rejects.toThrow();
+    });
+    expect(logs.filter(l => l.name === "card.render").map(l => [l.component, l.ok, l.props?.cardKind])).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
+    expect(JSON.stringify(logs)).not.toContain("PRIVATE_HEALTH_IMAGE");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});

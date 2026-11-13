@@ -1573,3 +1573,16 @@ test.each([false, true])("an older busy run finishing without a later wake frees
   expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Did it go through?", "Next question"]);
   expect(inbounds(store)).toContainEqual({ id: "next", state: "done" });
 });
+
+test("control calls log method/duration on success and failure, with no bodies or query data", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { ControlClient } = await import("../src/control.ts");
+  const logs = await captureLogs(async () => {
+    const control = fakeControl();
+    const client = new ControlClient({ url: control.url, token: "test-token" });
+    await client.request("GET", "/health?private=PRIVATE_QUERY");
+    await expect(client.request("POST", "/missing", { text: "PRIVATE_BODY", token: "PRIVATE_TOKEN" })).rejects.toThrow();
+  });
+  expect(logs.filter(l => l.name === "turn.robob_call").map(l => [l.ok, l.props?.method])).toEqual([[true, "GET"], [false, "POST"]]);
+  for (const value of ["PRIVATE_", "test-token"]) expect(JSON.stringify(logs)).not.toContain(value);
+});

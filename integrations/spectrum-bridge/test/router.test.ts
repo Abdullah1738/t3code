@@ -1,7 +1,7 @@
 import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
@@ -3386,6 +3386,7 @@ test("previews share a 10-MiB budget, PDFs stay path-only, and omitted previews 
 });
 
 test("storage errors do not create an active turn or send an unpersisted attachment", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
   const h = filesSetup();
   h.input("start", "Start");
   await h.router.tick();
@@ -3393,9 +3394,10 @@ test("storage errors do not create an active turn or send an unpersisted attachm
   await h.router.tick();
   symlinkSync(h.root, join(h.root, "ses_1", "attachments"));
   h.input("file", "Read", { attachments: [attachment()] });
-  await h.router.tick();
+  const logs = await captureLogs(() => h.router.tick());
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.store.get("activeTurn")).toBeNull();
+  expect(logs.filter(line => line.name === "turn.start" || line.name === "turn.end")).toEqual([]);
   expect(h.controls().at(-1)!.text).toBe("I couldn't save those files. Mind sending them again?");
   expect(readdirSync(h.root)).toEqual(["ses_1"]);
 });
@@ -7375,6 +7377,149 @@ test.each(["permission", "question"] as const)("an incomplete child scan cannot 
   expect(h.backend.prompts).toHaveLength(1);
 });
 
+test("background follow-up turns have paired start/end records", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const captured = await captureLogs(async () => {
+    const h = setup(":memory:", { watchMs: 0 });
+    h.input("log-first", "PRIVATE_PROMPT");
+    await h.router.tick();
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+    h.backend.step("PRIVATE_BACKGROUND\nNO_REPLY");
+    h.backend.settle();
+    await h.router.tick();
+    await h.router.tick();
+  });
+  const starts = captured.filter(l => l.name === "turn.start");
+  expect(starts).toHaveLength(2);
+  for (const start of starts) expect(captured.some(l => l.name === "turn.end" && l.ids?.messageId === start.ids?.messageId)).toBe(true);
+  expect(captured.filter(l => l.name === "turn.end").map(l => l.props?.outcome)).toEqual(["replied", "no_reply"]);
+  expect(JSON.stringify(captured)).not.toContain("PRIVATE_");
+});
+
+test("replay expiry ends the tracked turn as failed before it is cleared", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("expiring-log", "PRIVATE_PROMPT", { source: "typed" });
+    await h.router.tick();
+    h.store.set("failed-replay-until:expiring-log", start + 1000);
+    setSystemTime(start + 2000);
+    await h.router.tick();
+    expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "expiring-log", phase: "failed" });
+  });
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  const later = await captureLogs(async () => {
+    h.backend.promptBehavior = undefined;
+    h.input("fresh-log", "New instruction", { source: "typed" });
+    await h.router.tick();
+  });
+  expect(later.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log"))).toEqual([]);
+});
+
+test("a held-turn rebuild logs no terminal outcome until the rebuilt turn replies", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const rebuilding = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("rebuild-log", "PRIVATE_HELD_PROMPT");
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    h.backend.promptBehavior = undefined;
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    expect(h.backend.prompts.at(-1)).toMatchObject({ messageId: messageId("rebuild-log"), text: "PRIVATE_HELD_PROMPT" });
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "running" });
+  });
+  expect(rebuilding.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("rebuild-log"))).toEqual([]);
+  const completed = await captureLogs(async () => {
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+  });
+  expect(completed.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("rebuild-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["replied", true]]);
+});
+
+test.each(["storage-file", "storage-symlink", "download"])("held-turn rebuild preparation failure %s closes the original logged turn", async failure => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = filesSetup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const id = "failed-preparation-log";
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input(id, "PRIVATE_HELD_PROMPT", { attachments: [attachment()] });
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    if (failure === "download") {
+      h.store.set(`incoming-file:${createHash("sha256").update("att_1").digest("hex")}`, null);
+      h.transport.downloadAttachment = async () => { throw new TransportError("invalidAttachment"); };
+    } else {
+      const managed = join(h.root, "ses_1", "attachments");
+      renameSync(managed, managed + ".offline");
+      if (failure === "storage-file") writeFileSync(managed, "PRIVATE_STORAGE_FIXTURE");
+      else symlinkSync(h.root, managed);
+    }
+    h.backend.promptBehavior = undefined;
+    const attempts = h.backend.prompts.length;
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("failed");
+    expect(h.store.get("activeTurn")).toBeNull();
+    expect(h.store.get("preparingDelivery")).toBeNull();
+    expect(h.backend.prompts).toHaveLength(attempts);
+    expect(h.controls().at(-1)?.text).toBe(failure === "download"
+      ? "That attachment came through broken. Mind resending it?"
+      : "I couldn't save those files. Mind sending them again?");
+    await h.router.tick();
+    h.input("after-preparation-failure", "/new");
+    await h.router.tick();
+  });
+  expect(logs.filter(l => l.name === "turn.start" && l.ids?.messageId === messageId(id))).toHaveLength(1);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId(id)).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test("reset during held-turn preparation closes the original logged turn", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  let resetDuringPreparation = false;
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input("cancel-rebuild-log", "PRIVATE_HELD_PROMPT");
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    h.backend.onStatuses = () => {
+      if (!resetDuringPreparation && h.store.get("preparingDelivery") && !h.store.get("activeTurn")) {
+        resetDuringPreparation = true;
+        h.input("cancel-preparation", "/new");
+      }
+    };
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    await h.router.tick();
+    expect(resetDuringPreparation).toBe(true);
+    expect(inbounds(h.store).find(row => row.id === "cancel-rebuild-log")?.state).toBe("cancelled");
+  });
+  expect(logs.filter(l => l.name === "turn.start" && l.ids?.messageId === messageId("cancel-rebuild-log"))).toHaveLength(1);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("cancel-rebuild-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["no_reply", true]]);
+});
+
 test("watcher reply guard logs accepted silence and visible replies without text", async () => {
   const previous = process.env.TOOLLOG_DIR;
   const logs = mkdtempSync(join(tmpdir(), "wake-guard-log-")); directories.push(logs);
@@ -7388,9 +7533,10 @@ test("watcher reply guard logs accepted silence and visible replies without text
       await h.router.tick();
       const raw = readFileSync(join(logs, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8");
       const rows = raw.trim().split("\n").map(line => JSON.parse(line));
-      expect(rows.at(-1)).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
-      expect(rows.at(-1).ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
-      if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(rows.at(-1)));
+      const entry = rows.filter(row => row.tool === "watchers" && row.name === "wake.reply_guard").at(-1);
+      expect(entry).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
+      expect(entry.ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
+      if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(entry));
       expect(raw).not.toContain("private fixture");
       expect(raw).not.toContain("NO_REPLY");
     }

@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -107,7 +108,7 @@ export async function prepareIncoming(
   try {
     if (fstatSync(chat).uid !== process.getuid!()) throw new Error("Chat directory is not owned by this user");
     attachments = join(realpathSync(directory), "attachments");
-    try { mkdirSync(attachments, { mode: 0o700 }); } catch (error) {
+    try { mkdirSync(attachments, { mode: 0o700 }); } catch (error) { toolError("inbound-files", "inbound-files.catch1");
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     const folder = openSync(attachments, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -120,7 +121,7 @@ export async function prepareIncoming(
       try {
         fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
         created = true;
-      } catch (error) {
+      } catch (error) { toolError("inbound-files", "inbound-files.catch2");
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       }
@@ -186,7 +187,7 @@ export async function prepareIncoming(
         ? `${note} A JPEG preview was prepared locally (maximum dimension ${MAX_IMAGE_SIDE} pixels); the original HEIC/HEIF remains at the quoted path.`
         : `${note} The image was over model image limits, so a smaller JPEG preview (maximum dimension ${MAX_IMAGE_SIDE} pixels) is attached; the original remains at the quoted path.`,
     };
-  } catch {
+  } catch { toolError("inbound-files", "inbound-files.catch3");
     return { note: `${note} ${heif ? "HEIC/HEIF" : "Image"} JPEG conversion failed or the preview exceeded model image limits (10 seconds, 3.5 MiB, ${MAX_IMAGE_SIDE} pixels), so no preview is attached. Use the original path; no image interpretation is claimed.` };
   } finally {
     if (temporary) rmSync(temporary, { recursive: true, force: true });

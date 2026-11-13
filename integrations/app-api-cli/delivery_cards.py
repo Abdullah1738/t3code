@@ -3,6 +3,7 @@
 Watcher checks supply already-read evidence. No polling process or merchant
 request is started here. Only the allowlisted view is written to the web root.
 """
+import threading
 import argparse
 from collections import Counter
 import datetime as dt
@@ -539,7 +540,30 @@ def preview_chrome(path):
     return False
 
 
+def log_render(started, ok):
+    try:
+        env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
+        child = subprocess.Popen([BUN, BRIDGE, 'log-card-render', '--kind', 'delivery',
+                                  '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--ok', str(ok).lower()],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        # Reap without holding the renderer or its per-order lock for logging.
+        threading.Thread(target=child.wait, daemon=True).start()
+    except Exception:
+        pass
+
+
 def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
+    started = time.monotonic()
+    ok = False
+    try:
+        result = _build(cfg, data, meta, outdir, url, public=public)
+        ok = bool(result.get('has_preview'))
+        return result
+    finally:
+        log_render(started, ok)
+
+
+def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
