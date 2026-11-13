@@ -34,6 +34,9 @@ class CommerceJournalTest(unittest.TestCase):
         self.patcher.start()
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(self.patcher.stop)
+        auth = patch.object(j.inbox_auth, 'expect_payment', return_value=None)
+        auth.start()
+        self.addCleanup(auth.stop)
         self.flow = str(uuid.uuid4())
 
     def open(self, flow=None, account='a'*64, app='noon', vertical='nownow'):
