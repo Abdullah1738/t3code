@@ -16,6 +16,7 @@ NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshot
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount'))
+NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
@@ -23,6 +24,7 @@ NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS
                 'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other'))
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
+    NUMBERS.add(prefix+'DeltaWindowS')
 SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -30,16 +32,21 @@ BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'red
                'run_limited.py', 'install.zsh', 'install-jobs.zsh', 'deploy.zsh',
                'backup', 'snapshots', 'forget', 'prune',
                '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
-BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
+BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale', 'inventoryComplete'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
 NULLABLE.update(('internalFreeGbDelta', 'externalFreeGbDelta'))
 NULLABLE.update(('lastGoodSnapshotAgeS', 'lockHolderCmd', 'lockHolderPpid', 'lockHolderStartedAgoS'))
+NULLABLE.update(('deltaFromTs', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
+for prefix in ('internal', 'external'):
+    NULLABLE.update((prefix+'DeltaFromTs', prefix+'DeltaWindowS'))
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
+    TEXT.add('grower%dName' % i)
+    NUMBERS.add('grower%dBytes' % i)
 for i in range(1, 4):
     TEXT.add('topMover%dPath' % i)
     NUMBERS.add('topMover%dGbDelta' % i)
@@ -101,7 +108,13 @@ def safe_fields(values, event=None):
             result[key] = value
         elif key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
             result[key] = value
-        elif key in ('previousTs', 'sampleTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
+        elif key in ('deltaUnavailable', 'internalDeltaUnavailable', 'externalDeltaUnavailable') and value in (
+                'corrupt_state', 'missing_state', 'unreadable_state', 'no_previous_numeric',
+                'invalid_timestamp', 'current_unavailable'):
+            result[key] = value
+        elif key == 'volume' and value in ('internal', 'external'):
+            result[key] = value
+        elif key in ('previousTs', 'sampleTs', 'deltaFromTs', 'internalDeltaFromTs', 'externalDeltaFromTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value
         elif key == 'skipReason' and isinstance(value, str) and value in SKIP_REASONS:
             result[key] = value
