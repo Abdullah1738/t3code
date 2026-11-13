@@ -2077,6 +2077,48 @@ export const KanbanScriptTrigger = Schema.Union([
 ]);
 export type KanbanScriptTrigger = typeof KanbanScriptTrigger.Type;
 
+export const KanbanScriptCardCommand = Schema.Struct({
+  kanban: Schema.Literal("card"),
+  prompt: Schema.String,
+  title: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.String),
+  priority: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 4 }))),
+  projects: Schema.optional(Schema.Array(Schema.String)),
+  links: Schema.optional(
+    Schema.Array(Schema.Struct({ url: Schema.String, label: Schema.optional(Schema.String) })),
+  ),
+});
+
+export const KanbanScriptPostCommand = Schema.Struct({
+  kanban: Schema.Literal("post"),
+  text: Schema.String,
+  discussion: Schema.optional(Schema.String),
+  card: Schema.optional(Schema.Int),
+});
+
+export const KanbanScriptDeliveryRef = Schema.Struct({
+  command: Schema.Union([KanbanScriptCardCommand, KanbanScriptPostCommand]),
+  firstFailedAt: IsoDateTime,
+  /** Total delivery attempts, including retries within a run. */
+  attempts: NonNegativeInt,
+});
+export type KanbanScriptDeliveryRef = typeof KanbanScriptDeliveryRef.Type;
+
+/** Acknowledgement clears checked outcomes; it never sends the commands again. */
+export const KanbanScriptAcknowledgeInput = Schema.Struct({
+  scriptId: KanbanScriptId,
+  deliveries: Schema.Array(KanbanScriptDeliveryRef).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(100),
+  ),
+});
+export type KanbanScriptAcknowledgeInput = typeof KanbanScriptAcknowledgeInput.Type;
+
+const KanbanScriptHeldCommand = Schema.Struct({
+  ...KanbanScriptDeliveryRef.fields,
+  lastError: Schema.String,
+});
+
 export const KanbanScript = Schema.Struct({
   id: KanbanScriptId,
   boardId: KanbanBoardId,
@@ -2087,6 +2129,16 @@ export const KanbanScript = Schema.Struct({
   enabled: Schema.Boolean,
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
+  held: Schema.optional(Schema.Array(KanbanScriptHeldCommand)),
+  /** A write started but has no confirmed outcome. These records must never replay automatically. */
+  unresolved: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        ...KanbanScriptHeldCommand.fields,
+        reported: Schema.optional(Schema.Boolean),
+      }),
+    ),
+  ),
   lastRun: Schema.NullOr(
     Schema.Struct({
       startedAt: IsoDateTime,
@@ -2156,6 +2208,8 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
    * (`invalid`) or an older one (`conflict`). The detail says it in words too.
    */
   revision: Schema.optionalKey(NonNegativeInt),
+  /** The savedReply signal: false means definitely not written, null means possibly saved. */
+  saved: Schema.optional(Schema.NullOr(Schema.Boolean)),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

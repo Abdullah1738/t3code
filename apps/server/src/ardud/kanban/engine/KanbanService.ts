@@ -8830,11 +8830,14 @@ const make = Effect.gen(function* () {
     locks.run(boardId === undefined ? effect : locks.access(boardId, effect), cardId).pipe(
       Effect.catchDefect((defect) =>
         defect instanceof BoardLocks.BoardStateChanged
-          ? failWith(
-              "conflict",
-              defect.committed
-                ? BoardLocks.MAY_HAVE_APPLIED
-                : "Board changed during this operation. Re-read its state before retrying.",
+          ? Effect.fail(
+              new KanbanError({
+                code: "conflict",
+                saved: defect.committed ? null : false,
+                detail: defect.committed
+                  ? BoardLocks.MAY_HAVE_APPLIED
+                  : "Board changed during this operation. Re-read its state before retrying.",
+              }),
             )
           : isKanbanError(defect)
             ? Effect.fail(defect)

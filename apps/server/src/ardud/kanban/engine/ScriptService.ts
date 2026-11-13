@@ -24,6 +24,7 @@ import {
   KanbanError,
   KanbanScriptId,
   kanbanWaiting,
+  KanbanScriptDeliveryRef,
   type KanbanActor,
   type KanbanBoard,
   type KanbanCard,
@@ -31,6 +32,7 @@ import {
   type KanbanDiscussion,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanScriptAcknowledgeInput,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -53,6 +55,7 @@ import { KanbanStore } from "../store/KanbanStore.ts";
 import { KanbanService, type WaitAnswerFor } from "./KanbanService.ts";
 import { modelSelectionResult } from "./defaults.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
+import * as SavedWrite from "./savedWrite.ts";
 import * as Rules from "./rules.ts";
 import * as Scripts from "./scripts.ts";
 import * as Text from "./text.ts";
@@ -65,6 +68,8 @@ const RUN_TIMEOUT_MS = 10 * 60_000;
 const STDOUT_LIMIT = 4 * 1024 * 1024;
 /** The shortest schedule a script can have. */
 const MIN_EVERY_MS = 60_000;
+const sameCommand = Schema.toEquivalence(Scripts.ScriptCommand);
+const sameDelivery = Schema.toEquivalence(KanbanScriptDeliveryRef);
 
 export interface NewScript {
   readonly boardId: KanbanBoard["id"];
@@ -98,6 +103,10 @@ export interface KanbanScriptsShape {
   readonly setEnabled: (
     scriptId: KanbanScript["id"],
     enabled: boolean,
+  ) => Effect.Effect<KanbanScript, KanbanError>;
+  /** Clears operator-checked unresolved outcomes without requeueing or sending them. */
+  readonly acknowledge: (
+    input: KanbanScriptAcknowledgeInput,
   ) => Effect.Effect<KanbanScript, KanbanError>;
   /** Starts a run now and returns it open; it finishes in the background. */
   readonly run: (
@@ -138,7 +147,7 @@ const asKanbanError = (error: unknown): KanbanError =>
       });
 
 const fail = (code: KanbanError["code"], detail: string) =>
-  Effect.fail(new KanbanError({ code, detail }));
+  Effect.fail(new KanbanError({ code, detail, saved: false }));
 
 const isFile = (path: string) =>
   Effect.promise(() =>
@@ -347,122 +356,344 @@ const make = Effect.gen(function* () {
       : `Couldn't resize the ${command.model} pool: ${resized.failure.detail}`;
   });
 
-  // Applies what the script printed, as the script. One bad command doesn't stop the rest.
+  // A malformed command cannot become valid by replaying it after board configuration changes.
+  class InvalidScriptCommand extends Schema.TaggedError<InvalidScriptCommand>()(
+    "InvalidScriptCommand",
+    {
+      detail: Schema.String,
+    },
+  ) {}
+  const invalidCommand = (detail: string) => Effect.fail(new InvalidScriptCommand({ detail }));
+
+  // Share the same commit-start and receipt evidence as savedReply. A known or possible
+  // save wins over an error's earlier admission result, including a later follow-up failure.
+  const observeWrite = Effect.fn("KanbanScripts.observeWrite")(function* <A, R>(
+    effect: Effect.Effect<A, KanbanError | InvalidScriptCommand, R>,
+  ) {
+    const parent = yield* SavedWrite.observer;
+    const parentCommitting = yield* SavedWrite.commitObserver;
+    let receipt = false;
+    let commitStarted = false;
+    return yield* effect.pipe(
+      Effect.provideService(SavedWrite.observer, (saved) => {
+        receipt = true;
+        parent(saved);
+      }),
+      Effect.provideService(SavedWrite.commitObserver, () => {
+        commitStarted = true;
+        parentCommitting();
+      }),
+      Effect.mapError((error) =>
+        error._tag === "InvalidScriptCommand"
+          ? error
+          : new KanbanError({
+              ...error,
+              saved:
+                receipt || error.saved === true
+                  ? true
+                  : commitStarted || error.saved === null
+                    ? null
+                    : false,
+            }),
+      ),
+    );
+  });
+
+  const retryWrite = Effect.fn("KanbanScripts.retryWrite")(function* <A, R>(
+    effect: Effect.Effect<A, KanbanError | InvalidScriptCommand, R>,
+    budget = 4,
+  ) {
+    const delays = [3_000, 10_000, 30_000];
+    let attempts = 0;
+    while (true) {
+      const result = yield* Effect.result(effect);
+      attempts += 1;
+      if (
+        Result.isSuccess(result) ||
+        result.failure._tag !== "KanbanError" ||
+        result.failure.code !== "conflict" ||
+        result.failure.saved !== false ||
+        attempts >= Math.min(budget, 4)
+      )
+        return { result, attempts };
+      yield* Effect.sleep(delays[attempts - 1]!);
+    }
+  });
+
+  // Even rejected input must be safe to include in the delivery notice.
+  // eslint-disable-next-line no-control-regex -- Rejected command text must be printable in a board message.
+  const labelText = (text: string) => text.slice(0, 80).replace(/[\u0000-\u001f\u007f]/g, " ");
+  const commandLabel = (command: Scripts.ScriptCommand) => {
+    switch (command.kanban) {
+      case "card":
+        return `card: ${labelText(command.title || command.prompt)}`;
+      case "post":
+        return `post: ${labelText(command.text)}`;
+      case "pool":
+        return `pool: ${command.model}`;
+      default:
+        return `${command.kanban}: card #${command.card}`;
+    }
+  };
+
+  const writeCommand = Effect.fn("KanbanScripts.writeCommand")(function* (
+    script: KanbanScript,
+    command: Exclude<Scripts.ScriptCommand, Scripts.PoolCommand>,
+  ) {
+    const actor: KanbanActor = { _tag: "script", scriptId: script.id };
+    // Re-read on every attempt: another writer may have delivered the card during backoff.
+    const cards =
+      command.kanban === "post" && command.card === undefined
+        ? []
+        : yield* observeWrite(io(store.cards(script.boardId)));
+    if (command.kanban === "card") {
+      const problem = Text.textProblem([
+        ["title", command.title],
+        ["description", command.description],
+        ["prompt", command.prompt],
+      ]);
+      if (problem) return yield* invalidCommand(problem);
+      if (!command.prompt.trim() && !command.title?.trim()) {
+        return yield* invalidCommand("a card needs a prompt or a title");
+      }
+      const existing = Scripts.duplicateOf(cards, command);
+      if (existing) return `Card #${existing.number} is already on the board.`;
+      const created = yield* observeWrite(
+        service.createCard(
+          script.boardId,
+          {
+            prompt: command.prompt,
+            title: command.title,
+            description: command.description,
+            priority: command.priority,
+            projects: command.projects,
+            links: command.links,
+          },
+          actor,
+        ),
+      );
+      return `Added card #${created.number}.`;
+    }
+    if (command.kanban === "post") {
+      const problem = Text.textProblem([["message", command.text]]);
+      if (problem) return yield* invalidCommand(problem);
+      const discussion = yield* observeWrite(targetOf(script, command, cards)).pipe(
+        Effect.catchIf(
+          (error) => error._tag === "KanbanError" && error.code === "invalid",
+          (error) => invalidCommand(error.detail),
+        ),
+      );
+      yield* observeWrite(service.post(discussion.id, actor, [{ _tag: "md", text: command.text }]));
+      return `Posted in "${discussion.title}".`;
+    }
+    const card = cards.find((entry) => entry.number === command.card);
+    if (!card) return yield* fail("not-found", `No card #${command.card} on this board.`);
+    if (command.kanban === "subtask") {
+      yield* observeWrite(
+        service.markSubtask(
+          card.id,
+          command.subtask,
+          command.state,
+          command.note ?? null,
+          actor,
+          "script",
+        ),
+      );
+      return `Marked ${command.subtask} ${command.state} on card #${command.card}.`;
+    }
+    if (command.kanban === "handback") {
+      yield* observeWrite(service.handBack(card.id, command.subtask, command.note, actor));
+      return `Handed ${command.subtask} on card #${command.card} back to the evaluator.`;
+    }
+    yield* observeWrite(
+      service.moveCard(card.id, command.to, "script", actor, { note: command.note ?? null }),
+    );
+    return `Moved card #${command.card} to ${command.to}.`;
+  });
+
+  // Applies held work first, then what the child printed. A bad command never stops its siblings.
   const apply = Effect.fn("KanbanScripts.apply")(function* (
     script: KanbanScript,
     commands: ReadonlyArray<Scripts.ScriptCommand>,
   ) {
-    const actor: KanbanActor = { _tag: "script", scriptId: script.id };
+    type Held = NonNullable<KanbanScript["held"]>[number];
     const notes: Array<string> = [];
-    const cards = [...(yield* io(store.cards(script.boardId)))];
-    for (const command of commands) {
-      if (command.kanban === "card") {
-        const problem = Text.textProblem([
-          ["title", command.title],
-          ["description", command.description],
-          ["prompt", command.prompt],
-        ]);
-        if (problem) {
-          notes.push(`Couldn't add a card: ${problem}`);
-          continue;
-        }
-        const existing = Scripts.duplicateOf(cards, command);
-        if (existing) {
-          notes.push(`Card #${existing.number} is already on the board.`);
-          continue;
-        }
-        const created = yield* Effect.result(
-          service.createCard(
-            script.boardId,
-            {
-              prompt: command.prompt,
-              title: command.title,
-              description: command.description,
-              priority: command.priority,
-              projects: command.projects,
-              links: command.links,
-            },
-            actor,
-          ),
+    const notices: Array<string> = [];
+    type Unresolved = NonNullable<KanbanScript["unresolved"]>[number];
+    const latest = yield* scriptOf(script.id);
+    let held = [...(latest.held ?? [])];
+    let unresolved = [...(latest.unresolved ?? [])];
+    const saveDelivery = () =>
+      update(script.id, (record) => ({
+        ...record,
+        held: [...held],
+        unresolved: [...unresolved],
+      }));
+    const limitHeld = () => {
+      held.sort((a, b) => a.firstFailedAt.localeCompare(b.firstFailedAt));
+      while (held.length > 100) {
+        const dropped = held.shift()!;
+        const note = `Dropped ${commandLabel(dropped.command)}: ${dropped.lastError} (100 command limit; will not retry).`;
+        notes.push(note);
+        notices.push(note);
+      }
+    };
+    for (const entry of unresolved) {
+      if (!entry.reported) {
+        notices.push(
+          `Unresolved ${commandLabel(entry.command)}: ${entry.lastError} Will not retry; check the board.`,
         );
-        if (Result.isSuccess(created)) {
-          cards.push(created.success);
-          notes.push(`Added card #${created.success.number}.`);
-        } else {
-          notes.push(`Couldn't add a card: ${created.failure.detail}`);
+      }
+    }
+    const pending = [
+      ...held.map((entry) => ({ command: entry.command, previous: entry as Held | null })),
+      ...commands.map((command) => ({ command, previous: null as Held | null })),
+    ];
+    for (const { command, previous } of pending) {
+      const label = commandLabel(command);
+      if (unresolved.some((entry) => sameCommand(entry.command, command))) {
+        if (previous !== null) {
+          held = held.filter((entry) => entry !== previous);
+          yield* saveDelivery();
         }
+        notes.push(`Skipped unresolved ${label}: check the board before retrying.`);
         continue;
+      }
+      if (previous !== null) {
+        if (!held.includes(previous)) continue;
+        const age =
+          DateTime.toEpochMillis(yield* DateTime.now) - Date.parse(previous.firstFailedAt);
+        if (age >= 24 * 60 * 60_000 || previous.attempts >= 10) {
+          held = held.filter((entry) => entry !== previous);
+          yield* saveDelivery();
+          const note = `Dropped ${label}: ${previous.lastError} (${age >= 24 * 60 * 60_000 ? "24 hours old" : "10 attempts"}; will not retry).`;
+          notes.push(note);
+          notices.push(note);
+          continue;
+        }
       }
       if (command.kanban === "pool") {
         notes.push(yield* resizePool(script, command));
         continue;
       }
-      if (
-        command.kanban === "subtask" ||
-        command.kanban === "handback" ||
-        command.kanban === "move"
-      ) {
-        const card = cards.find((entry) => entry.number === command.card);
-        if (!card) {
-          notes.push(
-            `Couldn't ${command.kanban === "move" ? "move" : "mark"} card #${command.card}: No card #${command.card} on this board.`,
-          );
-          continue;
-        }
-        if (command.kanban === "subtask") {
-          const marked = yield* Effect.result(
-            service.markSubtask(
-              card.id,
-              command.subtask,
-              command.state,
-              command.note ?? null,
-              actor,
-              "script",
-            ),
-          );
-          notes.push(
-            Result.isSuccess(marked)
-              ? `Marked ${command.subtask} ${command.state} on card #${command.card}.`
-              : `Couldn't mark ${command.subtask} on card #${command.card}: ${marked.failure.detail}`,
-          );
-        } else if (command.kanban === "handback") {
-          const handed = yield* Effect.result(
-            service.handBack(card.id, command.subtask, command.note, actor),
-          );
-          notes.push(
-            Result.isSuccess(handed)
-              ? `Handed ${command.subtask} on card #${command.card} back to the evaluator.`
-              : `Couldn't hand ${command.subtask} on card #${command.card} back: ${handed.failure.detail}`,
-          );
-        } else {
-          const moved = yield* Effect.result(
-            service.moveCard(card.id, command.to, "script", actor, { note: command.note ?? null }),
-          );
-          notes.push(
-            Result.isSuccess(moved)
-              ? `Moved card #${command.card} to ${command.to}.`
-              : `Couldn't move card #${command.card}: ${moved.failure.detail}`,
-          );
-        }
+      const firstFailedAt = previous?.firstFailedAt ?? (yield* nowIso);
+      if ((command.kanban === "card" || command.kanban === "post") && unresolved.length >= 100) {
+        const error = "100 unresolved deliveries need reconciliation before sending more commands.";
+        if (previous === null) held.push({ command, firstFailedAt, lastError: error, attempts: 0 });
+        limitHeld();
+        yield* saveDelivery();
+        notes.push(`Held ${label}: ${error}`);
+        notices.push(`Held ${label}: ${error} Will retry next run.`);
         continue;
       }
-      const problem = Text.textProblem([["message", command.text]]);
-      const posted = yield* Effect.result(
-        (problem ? fail("invalid", problem) : targetOf(script, command, cards)).pipe(
+      let current = previous;
+      let attempted = 0;
+      const write = writeCommand(script, command);
+      const trackedWrite =
+        command.kanban === "card" || command.kanban === "post"
+          ? Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                attempted += 1;
+                held = held.filter((entry) => entry !== current);
+                const active: Unresolved = {
+                  command,
+                  firstFailedAt,
+                  lastError: "Delivery started; its outcome is unknown.",
+                  attempts: (previous?.attempts ?? 0) + attempted,
+                };
+                unresolved.push(active);
+                // Persist before sending; an interrupted call stays visible but cannot be replayed.
+                yield* saveDelivery();
+                const result = yield* Effect.result(restore(write));
+                if (
+                  Result.isFailure(result) &&
+                  result.failure._tag === "KanbanError" &&
+                  result.failure.saved === null
+                ) {
+                  const error = result.failure;
+                  unresolved = unresolved.map((entry) =>
+                    entry === active ? { ...active, lastError: error.detail } : entry,
+                  );
+                } else {
+                  unresolved = unresolved.filter((entry) => entry !== active);
+                  if (
+                    Result.isFailure(result) &&
+                    result.failure._tag !== "InvalidScriptCommand" &&
+                    result.failure.saved === false
+                  ) {
+                    current = { ...active, lastError: result.failure.detail };
+                    held.push(current);
+                    limitHeld();
+                  } else current = null;
+                }
+                // Mask settlement only: a known not-written result is durable before any sleep/interrupt.
+                yield* saveDelivery();
+                if (Result.isFailure(result)) return yield* Effect.fail(result.failure);
+                return result.success;
+              }),
+            )
+          : write;
+      const { result, attempts } = yield* retryWrite(trackedWrite, 10 - (previous?.attempts ?? 0));
+      if (Result.isSuccess(result)) {
+        notes.push(
+          attempts > 1
+            ? `${result.success.replace(/\.$/, "")} after ${attempts - 1} ${attempts === 2 ? "retry" : "retries"}.`
+            : result.success,
+        );
+        if (previous !== null) notices.push(`Delivered held ${label}.`);
+        continue;
+      }
+      const error = result.failure;
+      if (error._tag === "KanbanError" && error.saved === true) {
+        notes.push(`Saved ${label}; follow-up failed: ${error.detail} Will not retry.`);
+        if (previous !== null) notices.push(`Delivered held ${label}.`);
+        continue;
+      }
+      const prefix =
+        command.kanban === "card"
+          ? "add a card"
+          : command.kanban === "post"
+            ? "post"
+            : command.kanban === "move"
+              ? `move card #${command.card}`
+              : command.kanban === "handback"
+                ? `hand ${command.subtask} on card #${command.card} back`
+                : `mark ${command.subtask} on card #${command.card}`;
+      notes.push(`Couldn't ${prefix}: ${error.detail}`);
+      if (command.kanban !== "card" && command.kanban !== "post") continue;
+      if (error._tag === "KanbanError" && error.saved !== false) {
+        notices.push(`${label}: ${error.detail} Will not retry; check the board.`);
+        continue;
+      }
+      const total = (previous?.attempts ?? 0) + attempts;
+      if (error._tag === "InvalidScriptCommand" || total >= 10) {
+        held = held.filter((entry) => entry !== current);
+        yield* saveDelivery();
+        const note = `Dropped ${label}: ${error.detail} (${total >= 10 ? "10 attempts" : "invalid command"}; will not retry).`;
+        notes.push(note);
+        notices.push(note);
+        continue;
+      }
+      notices.push(`Held ${label}: ${error.detail} Will retry next run.`);
+    }
+    if (notices.length > 0) {
+      const notice = yield* retryWrite(
+        ownDiscussion(script).pipe(
           Effect.flatMap((discussion) =>
-            service
-              .post(discussion.id, actor, [{ _tag: "md", text: command.text }])
-              .pipe(Effect.as(discussion)),
+            service.post(discussion.id, { _tag: "script", scriptId: script.id }, [
+              { _tag: "md", text: notices.join("\n") },
+            ]),
           ),
         ),
       );
-      notes.push(
-        Result.isSuccess(posted)
-          ? `Posted in "${posted.success.title}".`
-          : `Couldn't post: ${posted.failure.detail}`,
-      );
+      if (Result.isFailure(notice.result)) {
+        notes.push(`Couldn't post delivery notice: ${notice.result.failure.detail}`);
+      } else if (unresolved.length > 0) {
+        unresolved = unresolved.map((entry) => ({ ...entry, reported: true }));
+        yield* saveDelivery();
+      }
     }
-    return notes;
+    return { notes, heldCount: held.length };
   });
 
   // Applies what the script printed about waits. A check run also answers for
@@ -661,9 +892,17 @@ const make = Effect.gen(function* () {
     run: KanbanScriptRun,
     exitCode: number | null,
     output: string,
+    heldCount = 0,
   ) {
     const endedAt = yield* nowIso;
-    yield* saveRun(script.boardId, { ...run, endedAt, exitCode, output: Scripts.tail(output) });
+    const summary = heldCount > 0 ? `Held ${heldCount} command(s) for retry\n` : "";
+    yield* saveRun(script.boardId, {
+      ...run,
+      endedAt,
+      exitCode,
+      output:
+        summary + Scripts.tail(output, Scripts.OUTPUT_TAIL_BYTES - Buffer.byteLength(summary)),
+    });
     yield* update(script.id, (latest) => ({
       ...latest,
       lastRun: { startedAt: run.startedAt, endedAt, exitCode },
@@ -700,10 +939,8 @@ const make = Effect.gen(function* () {
     });
     const parsed = Scripts.parseOutput(result.stdout);
     const broke = Scripts.checkRunProblem(script.name, result, RUN_TIMEOUT_MS);
-    const notes = [
-      ...(yield* apply(script, parsed.commands)),
-      ...(yield* applyWaits(script, parsed.waits, check, broke)),
-    ];
+    const { notes, heldCount } = yield* apply(script, parsed.commands);
+    notes.push(...(yield* applyWaits(script, parsed.waits, check, broke)));
     const problems = [
       result.spawnError === null ? null : `It didn't start: ${result.spawnError}`,
       result.timedOut ? `Stopped after ${RUN_TIMEOUT_MS / 60_000} minutes.` : null,
@@ -713,7 +950,7 @@ const make = Effect.gen(function* () {
     const output = [notes.join("\n"), parsed.text, result.stderr.trim(), problems.join("\n")]
       .filter((part) => part.length > 0)
       .join("\n\n");
-    yield* close(script, run, result.exitCode, output);
+    yield* close(script, run, result.exitCode, output, heldCount);
   });
 
   const claim = (scriptId: KanbanScript["id"], done: Deferred.Deferred<void>) =>
@@ -897,6 +1134,45 @@ const make = Effect.gen(function* () {
       }
       return yield* update(scriptId, (latest) =>
         latest.enabled === enabled ? latest : { ...latest, enabled },
+      );
+    },
+  );
+
+  const acknowledge: KanbanScriptsShape["acknowledge"] = Effect.fn("KanbanScripts.acknowledge")(
+    function* ({ scriptId, deliveries }) {
+      if (deliveries.length === 0 || deliveries.length > 100) {
+        return yield* fail("invalid", "Acknowledge between 1 and 100 checked deliveries.");
+      }
+      const done = yield* Deferred.make<void>();
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          // Own the script's slot so apply cannot overwrite the acknowledged set from its snapshot.
+          if (!(yield* claim(scriptId, done))) {
+            return yield* fail(
+              "conflict",
+              "The script is running. Wait for it to finish before acknowledging deliveries.",
+            );
+          }
+          return yield* Effect.gen(function* () {
+            const script = yield* scriptOf(scriptId);
+            if (
+              deliveries.some(
+                (ref) => !script.unresolved?.some((entry) => sameDelivery(entry, ref)),
+              )
+            ) {
+              return yield* fail(
+                "conflict",
+                "Unresolved deliveries changed. Read the script again before acknowledging them.",
+              );
+            }
+            return yield* update(scriptId, (latest) => ({
+              ...latest,
+              unresolved: (latest.unresolved ?? []).filter(
+                (entry) => !deliveries.some((ref) => sameDelivery(entry, ref)),
+              ),
+            }));
+          }).pipe(Effect.ensuring(handOff(scriptId, done)));
+        }),
       );
     },
   );
@@ -1098,7 +1374,17 @@ const make = Effect.gen(function* () {
         yield* saveRun(script.boardId, {
           ...open,
           endedAt: at,
-          output: [open.output, "Robob stopped during this run."].filter(Boolean).join("\n\n"),
+          output: [
+            script.held?.length ? `Held ${script.held.length} command(s) for retry` : null,
+            open.output,
+            "Robob stopped during this run.",
+            ...(script.unresolved ?? []).map(
+              (entry) =>
+                `Unresolved ${commandLabel(entry.command)}: ${entry.lastError} Will not retry; check the board.`,
+            ),
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
         });
       }
       if (script.lastRun !== null && leftOpen(script.lastRun.startedAt, script.lastRun.endedAt)) {
@@ -1124,6 +1410,7 @@ const make = Effect.gen(function* () {
     runs,
     register,
     setEnabled,
+    acknowledge,
     run,
     tick,
     checkWaits,
