@@ -3373,7 +3373,7 @@ it.effect("a worker keeps a pre-save conflict and does not change its card", () 
   }).pipe(Effect.provide(fake.layer));
 });
 
-it.effect("card_move no-op replies name the current stage before and after dispatch", () => {
+it.effect("card_move annotates queued review and refuses to interrupt a live reviewer", () => {
   const fake = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -3395,20 +3395,25 @@ it.effect("card_move no-op replies name the current stage before and after dispa
       note: "Other note",
     });
     assert.isFalse(retry.isError);
-    assert.include(retry.text, "already in needs_review; nothing changed");
-    assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    assert.include(retry.text, "already queued for review; note added");
+    const annotated = yield* kanban.card(card.id);
+    assert.deepStrictEqual(annotated.card, before.card);
+    assert.deepStrictEqual(annotated.events.slice(0, -1), before.events);
+    assert.strictEqual(annotated.events.at(-1)?.body, "Other note");
+    const comment = yield* call(worker, "card_update", { card: card.id, comment: "New head 14a4c162" });
+    assert.isFalse(comment.isError, comment.text);
     yield* kanban.dispatchNow;
     const after = yield* kanban.card(card.id);
     assert.strictEqual(after.card.stage, "in_review");
     const dispatched = yield* call(worker, "card_move", { card: card.id, to: "needs_review" });
-    assert.isFalse(dispatched.isError);
-    assert.include(dispatched.text, "now in_review, nothing changed");
+    assert.isTrue(dispatched.isError);
+    assert.include(dispatched.text, "is being reviewed by another thread");
     assert.deepStrictEqual((yield* kanban.card(card.id)).events, after.events);
   }).pipe(Effect.provide(fake.layer));
 });
 
 it.effect(
-  "subtask advancement counts as the worker's move when dispatch wins the finish-flow race",
+  "subtask advancement does not let the worker interrupt review after dispatch",
   () => {
     const fake = fakeThreads();
     return Effect.gen(function* () {
@@ -3468,9 +3473,8 @@ it.effect(
       assert.isNotNull(reviewer);
       assert.notStrictEqual(reviewer, worker);
       const moved = yield* call(worker, "card_move", { card: card.id, to: "needs_review" });
-      assert.isFalse(moved.isError, moved.text);
-      assert.include(moved.text, "already moved to needs_review; now in_review, nothing changed");
-      assert.deepStrictEqual(moved.structured.card, reviewing.card);
+      assert.isTrue(moved.isError, moved.text);
+      assert.include(moved.text, "is being reviewed by another thread");
       const unrelated: KanbanActor = {
         _tag: "thread",
         threadId: ThreadId.make("unrelated-worker"),
