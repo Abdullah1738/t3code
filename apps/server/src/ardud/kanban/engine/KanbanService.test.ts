@@ -15746,23 +15746,11 @@ it.effect.each([
           owner,
         );
         assert.deepStrictEqual(editable.model, pool);
-        if (legacy) {
-          for (const patch of [
-            { model: requested },
-            { models: [{ model: requested, weight: 1 }] },
-          ]) {
-            const error = yield* kanban.editCard(editable.id, patch, owner).pipe(Effect.flip);
-            assert.include(error.detail, `Asked for opencode/${source}#xhigh`);
-            assert.include(error.detail, `selection routing rewrites it to ${Rules.poolKey(pool)}`);
-            assert.include(error.detail, `Card keeps ${Rules.poolKey(pool)}`);
-            assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, pool);
-          }
-        }
-        yield* kanban.editCard(editable.id, { model: expected }, owner);
+        yield* kanban.editCard(editable.id, { model: requested }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
         yield* kanban.editCard(editable.id, { model: pool }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, pool);
-        yield* kanban.editCard(editable.id, { models: [{ model: expected, weight: 1 }] }, owner);
+        yield* kanban.editCard(editable.id, { models: [{ model: requested, weight: 1 }] }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
         yield* kanban.dispatchNow;
         assert.deepStrictEqual(
@@ -16435,7 +16423,7 @@ it.effect.each(
     ),
   ),
 )(
-  "card_edit preserves the final pool harness ($poolInstance / $requestedInstance / $form)",
+  "card_edit applies the final pool harness ($poolInstance / $requestedInstance / $form)",
   ({ poolInstance, requestedInstance, form }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -16465,7 +16453,7 @@ it.effect.each(
         })),
       ];
       yield* Effect.gen(function* () {
-        const { kanban, board, card } = yield* parkedWork;
+        const { kanban, board, card, threadId } = yield* parkedWork;
         const model = {
           instanceId: ProviderInstanceId.make(poolInstance),
           model: "gpt-6.1-sol",
@@ -16473,25 +16461,15 @@ it.effect.each(
         };
         yield* kanban.setPool(board.id, model, 1);
         const requested = { ...model, instanceId: ProviderInstanceId.make(requestedInstance) };
-        const result = yield* kanban
-          .editCard(
-            card.id,
-            form === "model" ? { model: requested } : { models: [{ model: requested, weight: 1 }] },
-            owner,
-          )
-          .pipe(Effect.result);
-        if (poolInstance === requestedInstance) {
-          assert.strictEqual(result._tag, "Success");
-          assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, requested);
-        } else {
-          assert.strictEqual(result._tag, "Failure");
-          if (result._tag === "Failure") {
-            assert.include(result.failure.detail, Rules.poolKey(requested));
-            assert.include(result.failure.detail, Rules.poolKey(model));
-            assert.include(result.failure.detail, `Card keeps ${Rules.poolKey(card.model)}`);
-          }
-          assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, card.model);
-        }
+        const saved = yield* kanban.editCard(
+          card.id,
+          form === "model" ? { model: requested } : { models: [{ model: requested, weight: 1 }] },
+          owner,
+        );
+        assert.deepStrictEqual(saved.model, model);
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, model);
+        assert.deepStrictEqual(fake.modelSwitches, [{ threadId, model }]);
+        assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, model);
       }).pipe(Effect.provide(testLayer(fake.layer, KanbanModels.layerTest(null), providers)));
     }),
 );
@@ -16519,23 +16497,33 @@ it.effect.each(["model", "models"] as const)(
     }),
 );
 
-it.effect("card_edit refuses a routing rewrite and names the requested and retained models", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    yield* Effect.gen(function* () {
-      const { kanban, card } = yield* parkedWork;
-      const settings = yield* ServerSettings.ServerSettingsService;
-      yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
-      const legacy = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
-      for (const patch of [{ model: legacy }, { models: [{ model: legacy, weight: 1 }] }]) {
-        const error = yield* kanban.editCard(card.id, patch, owner).pipe(Effect.flip);
-        assert.include(error.detail, "opencode/opus/cx/gpt-6.1-sol");
-        assert.include(error.detail, "codex/gpt-6.1-sol");
-        assert.include(error.detail, `Card keeps ${Rules.poolKey(card.model)}`);
-        assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, card.model);
-      }
-    }).pipe(Effect.provide(testLayer(fake.layer)));
-  }),
+it.effect.each(["model", "models"] as const)(
+  "card_edit applies a routed selection to a parked work thread (%s)",
+  (form) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId } = yield* parkedWork;
+        const settings = yield* ServerSettings.ServerSettingsService;
+        yield* settings.updateSettings({ ardudHarnessMigration: { selections: "apply" } });
+        const legacy = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+        const routed = modelSelectionOf({
+          instanceId: "codex",
+          model: "gpt-6.1-sol",
+          variant: "xhigh",
+        });
+        yield* kanban.setPool(board.id, routed, 1);
+        const saved = yield* kanban.editCard(
+          card.id,
+          form === "model" ? { model: legacy } : { models: [{ model: legacy, weight: 1 }] },
+          owner,
+        );
+        assert.deepStrictEqual(saved.model, routed);
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, routed);
+        assert.deepStrictEqual(fake.modelSwitches, [{ threadId, model: routed }]);
+        assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, routed);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("steer carries the card's model to its thread", () =>
