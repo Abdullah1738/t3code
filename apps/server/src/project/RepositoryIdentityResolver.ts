@@ -21,7 +21,7 @@ const DEFAULT_REPOSITORY_IDENTITY_CACHE_CAPACITY = 512;
 // from spawning git each time. Clone, publish, and PR discovery (after a turn
 // and before it saves links) resolve with `refresh: true`.
 const DEFAULT_POSITIVE_CACHE_TTL = Duration.minutes(15);
-const DEFAULT_NEGATIVE_CACHE_TTL = Duration.minutes(1);
+const DEFAULT_NEGATIVE_CACHE_TTL = Duration.minutes(15);
 
 export interface RepositoryIdentityResolverOptions {
   readonly cacheCapacity?: number;

@@ -35,6 +35,7 @@ import { TestClock } from "effect/testing";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as GitManager from "../git/GitManager.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import { makeSweepFixture } from "../pullRequest/testkit/sweepFixture.ts";
 import * as ServerActivation from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -163,6 +164,7 @@ function makeSummary(
 }
 
 interface HarnessOptions {
+  readonly pullRequests?: PullRequestService.PullRequestService["Service"];
   readonly invalidate?: PullRequestService.PullRequestService["Service"]["invalidate"];
   readonly snapshot: TestShellSnapshot;
   readonly summary?: (
@@ -217,12 +219,14 @@ const makeHarness = Effect.fn("makePullRequestSyncHarness")(function* (options: 
   };
 
   const layerDependencies = Layer.mergeAll(
-    Layer.mock(PullRequestService.PullRequestService)({
-      summary,
-      stack,
-      invalidate: options.invalidate ?? (() => Effect.void),
-      subscribeStateChanges: Effect.succeed(Stream.fromQueue(stateChanges)),
-    }),
+    options.pullRequests !== undefined
+      ? Layer.succeed(PullRequestService.PullRequestService, options.pullRequests)
+      : Layer.mock(PullRequestService.PullRequestService)({
+          summary,
+          stack,
+          invalidate: options.invalidate ?? (() => Effect.void),
+          subscribeStateChanges: Effect.succeed(Stream.fromQueue(stateChanges)),
+        }),
     Layer.mock(GitManager.GitManager)({
       subscribePullRequestStateChanges: Effect.succeed(Stream.empty),
     }),
@@ -1397,3 +1401,37 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 });
+
+it.effect("measures project listing and identity spawns across sync sweeps", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const workspace = yield* makeSweepFixture();
+      const thread = makeThread("fork", {
+        projectId: workspace.projects[0]!.id,
+        pullRequests: Array.from({ length: 20 }, (_, index) =>
+          makeLink(index + 1, null, {
+            repository: index < 18 ? "Abdullah1738/robob-mission-control" : "pingdotgg/t3code",
+          }),
+        ),
+      });
+      const fixture = yield* makeHarness({
+        snapshot: makeSnapshot([thread]),
+        pullRequests: workspace.service,
+      });
+      yield* Effect.gen(function* () {
+        const reactor = yield* startAndSweep(fixture);
+        const first = workspace.counts();
+        assert.strictEqual((yield* Ref.get(fixture.syncCommands)).length, 20);
+        workspace.reset();
+        yield* sweepAgain(fixture, reactor);
+        const second = workspace.counts();
+        assert.deepStrictEqual({ first, second }, {
+          first: { listShells: 1, gitSpawns: 180 },
+          second: { listShells: 1, gitSpawns: 0 },
+        });
+        assert.strictEqual((yield* Ref.get(fixture.syncCommands)).length, 40);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+  ),
+);

@@ -641,7 +641,15 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const sweep = Effect.gen(function* () {
+  const sweep = Effect.suspend(() =>
+    sweepOnce.pipe(
+      Effect.provideService(
+        PullRequestService.SweepProjectShells,
+        PullRequestService.makeSweepProjectMemo(),
+      ),
+    ),
+  );
+  const sweepOnce = Effect.gen(function* () {
     const threads = yield* projections.getThreadsWithPullRequests();
     const targets = threads.flatMap((thread) =>
       visibleThreadPullRequests(thread.pullRequests ?? []).flatMap((link) =>
