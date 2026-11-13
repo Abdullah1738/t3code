@@ -119,14 +119,12 @@ def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> No
         lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
 
 
-def _mark_lost(con, run_id, error=None, *, no_box=False, expected_client=None):
+def _mark_lost(con, run_id, error=None, *, no_box=False):
     from .runs import claim_terminal_log, emit_terminal
     with write(con):
         changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=COALESCE(?,error) "
                               "WHERE run_id=? AND status IN ('starting','running')" +
-                              (" AND box_id IS NULL" if no_box else "") +
-                              (" AND client_pid IS ? AND start_at IS ?" if expected_client is not None else ""),
-                              (now(), error, run_id, *(expected_client or ())))
+                              (" AND box_id IS NULL" if no_box else ""), (now(), error, run_id))
         row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone() if changed.rowcount else None
         log_row = claim_terminal_log(con, row)
     if log_row is not None:
@@ -169,15 +167,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry:
             _mark_lost(con, rid)
     # Foreground/--bg runs that never got a box (client died while waiting in the pool): nothing remote to check.
-    # Old clients without a PID retain the legacy age limit; a live queued client can wait longer at home.
-    nobox = con.execute("SELECT run_id,start_at FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
-                        "AND client_pid IS NULL AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
-    for rid, start_at in nobox:
+    # Two hours is past any pool wait, so live waiters are never touched.
+    nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
+                        "AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
+    for (rid,) in nobox:
         if rid in recovered or rid in unowned:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
         if not dry:
-            _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(None, start_at))
+            _mark_lost(con, rid, "client ended before it got a box")
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
     from .misc import _client_alive
     orphan = [tuple(r) for r in con.execute(
@@ -190,7 +188,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:
-            _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(pid, start_at))
+            _mark_lost(con, rid, "client ended before it got a box", no_box=True)
     start_budget = {'checks': START_CHECKS_PER_PASS}
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)

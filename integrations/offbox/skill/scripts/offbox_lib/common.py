@@ -282,8 +282,7 @@ def _known(name: str, ident: str, *, suffix: bool) -> bool:
                     return False  # Box IDs only support exact lookup.
                 return con.execute("SELECT 1 FROM leases WHERE box_id=?", (ident,)).fetchone() is not None
             op, value = ("LIKE", f"%{ident}") if suffix else ("=", ident)
-            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ? AND COALESCE(status,'')!='forwarded'",
-                               (value,)).fetchone() is not None
+            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ?", (value,)).fetchone() is not None
         finally:
             con.close()
     except sqlite3.Error:
@@ -305,7 +304,6 @@ EXIT_INTERRUPTED = 94          # the home server restarted under the run and the
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
 EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
-EXIT_NOT_STARTED = 100         # queued client died before acquiring a box; nothing ran, safe to rerun
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)

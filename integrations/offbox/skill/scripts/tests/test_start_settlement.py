@@ -53,34 +53,6 @@ class ShellChecks(Isolated):
         self.assertEqual(start_check.check('bx', 'run-test').code, 1)
         self.assertGreater(int((self.home / '.offbox/claim/run-test/pid').read_text()), 1)
 
-    def test_background_fenced_retry_rotates_claim_without_reopening_old_fence(self):
-        rid = 'run-fenced-bg'
-        self.con.execute("INSERT INTO runs(run_id,mode,status,client_pid,box_id) VALUES (?,'bg','starting',?,'bx')",
-                         (rid, os.getpid()))
-        self.con.execute("INSERT INTO kv(k,v) VALUES (?, '1')", ('start_claim:' + rid,))
-        with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: rid}):
-            result = start_check.check('bx', rid)
-            start_check.settle(self.con, self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone(),
-                               result, 'start response lost')
-            self.assertEqual(self.con.execute('SELECT status FROM runs WHERE run_id=?', (rid,)).fetchone()[0], 'starting')
-            runs.retry_background(common.OffboxError('retry fenced start'))
-        key = start_check.claim_id(self.con, rid)
-        self.assertNotEqual(key, rid)
-        env_dir = self.home / '.offbox/env'
-        env_dir.mkdir(parents=True, exist_ok=True)
-        (env_dir / (rid + '.env')).write_text('export OFFBOX_TEST_VALUE=old\n')
-        retry_env = env_dir / (key + '.env')
-        retry_env.write_text('export OFFBOX_TEST_VALUE=kept\n')
-        self.assertEqual(self.wrapper(rid, 'touch "$HOME/late"').returncode, 98)
-        self.assertFalse((self.home / 'late').exists())
-        self.assertTrue(retry_env.exists(), 'late fenced delivery removed the new attempt environment')
-        command = runs.exit_recording_command(f'. "$HOME/.offbox/env/{key}.env"; '
-                                             'echo "$OFFBOX_TEST_VALUE" >> "$HOME/count"; exit 7', rid, claim_id=key)
-        self.assertEqual(self.ssh('bx', command).returncode, 7)
-        self.assertEqual(self.ssh('bx', command).returncode, 98)
-        self.assertEqual((self.home / 'count').read_text(), 'kept\n')
-        self.assertEqual(start_check.check('bx', rid).code, 7)
-
     def test_aged_claim_never_expires(self):
         c = self.claim('run-aged')
         os.utime(c, (time.time()-5*86400,)*2)
@@ -117,11 +89,6 @@ class ShellChecks(Isolated):
 class StartPaths(Isolated):
     def setUp(self):
         super().setUp()
-        # These tests inspect the worker's final state. Process detachment itself is covered in test_bg_queue_detach.
-        def inline_background(a, me):
-            with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}):
-                return runs.background_client(a, me)
-        self.stack.enter_context(patch.object(runs, '_background', side_effect=inline_background))
         self.box('bx', member=True)
         self.stack.enter_context(patch.object(api, '_key', return_value='fake'))
         self.stack.enter_context(patch('urllib.request.urlopen', side_effect=AssertionError('unexpected boat call')))
@@ -176,16 +143,6 @@ class StartPaths(Isolated):
             self.assertEqual(cli.cmd_run(a, self.me), 0)
         row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
         self.assertEqual((row['process_id'], row['command_id'], row['wrapper_pid']), (1001, 'cmd-own', None))
-
-    def test_row_settled_during_pool_acquisition_never_starts_command(self):
-        a = cli.build_parser().parse_args(['run', '--remote', '--', 'proof'])
-        def acquire(*args, **kwargs):
-            self.con.execute("UPDATE runs SET status='lost' WHERE run_id=?", (kwargs['run_id'],))
-            return dict(box_id='bx', remote_dir='w/r', size='large')
-        with patch.object(pool, 'acquire', side_effect=acquire), patch.object(api, 'cmd_start') as send, \
-                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cli.cmd_run(a, self.me), 130)
-        send.assert_not_called()
 
     def test_step_receipt_does_not_save_unvalidated_exit_before_pull_lock(self):
         for bg in (False, True):

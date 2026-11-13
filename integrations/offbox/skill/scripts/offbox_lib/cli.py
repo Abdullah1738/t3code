@@ -31,7 +31,7 @@ Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "of
 failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally after 90/91/92.
 With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
 94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once).
-96 local state failure (no local fallback); 100 queued client ended before getting a box (nothing ran, safe to rerun).
+96 local state failure (no local fallback).
 95 Robob restarted: the remote run detached and keeps going (offbox wait <run-id>)."""
 
 
@@ -194,13 +194,6 @@ def _cmd_run(a, me) -> int:
     if not a.cmd:
         say("usage: offbox run [opts] -- <cmd...>  or  offbox run --step CMD [--step CMD ...]")
         return 2
-    if os.environ.get(runs.BACKGROUND_RUN_ENV):
-        return runs.background_client(a, me)
-    return _run_with_retries(a, me)
-
-
-def _run_with_retries(a, me) -> int:
-    from . import capacity, fallback, runs
     # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
@@ -239,7 +232,6 @@ def _run_with_retries(a, me) -> int:
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
             except OffboxError as e:
-                runs.retry_background(e)
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
                         time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
                     raise last_outage
