@@ -123,6 +123,7 @@ import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
 import * as BoardLocks from "./boardLocks.ts";
 import * as LockedStore from "./lockedStore.ts";
+import * as TickTimings from "./tickTimings.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import {
@@ -1458,7 +1459,7 @@ const make = Effect.gen(function* () {
       ? yield* failWith("invalid", result.reason)
       : result.selection;
   });
-  const rawStore = yield* KanbanStore;
+  const rawStore = TickTimings.store(yield* KanbanStore);
   const boardSql = yield* BoardsDatabase.client;
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
@@ -1709,9 +1710,12 @@ const make = Effect.gen(function* () {
           ),
     );
   const threadRead = <A, E, R>(read: string, threadId: string, effect: Effect.Effect<A, E, R>) =>
-    replayReads
-      ? locks.outsideRead(`${read}:${threadId}`, () => threadFences.get(threadId) ?? 0, effect)
-      : locks.outside(effect, undefined, true);
+    TickTimings.measure(
+      "thread_status",
+      replayReads
+        ? locks.outsideRead(`${read}:${threadId}`, () => threadFences.get(threadId) ?? 0, effect)
+        : locks.outside(effect, undefined, true),
+    );
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
     function* (input: Parameters<typeof threadIo.launch>[0], id: ThreadId) {
       // The ended link comes first: a keyed owner-route replay must see this
@@ -1792,7 +1796,11 @@ const make = Effect.gen(function* () {
     { defaultValue: () => undefined },
   );
   const threads: typeof threadIo = {
-    pendingUserInputs: (id) => locks.outside(threadIo.pendingUserInputs(id), undefined, true),
+    pendingUserInputs: (id) =>
+      TickTimings.measure(
+        "thread_status",
+        locks.outside(threadIo.pendingUserInputs(id), undefined, true),
+      ),
     view: (id) => threadRead("view", id, threadIo.view(id)),
     find: (id) => threadRead("find", id, threadIo.find(id)),
     model: (id, activeRun = false) =>
@@ -1801,7 +1809,11 @@ const make = Effect.gen(function* () {
     findLastFailure: (id) => threadRead("findLastFailure", id, threadIo.findLastFailure(id)),
     latestRun: (id) => threadRead("latestRun", id, threadIo.latestRun(id)),
     compactRun: (id, run) => locks.outside(touching(id, threadIo.compactRun(id, run))),
-    runSettled: (id, run) => locks.outside(threadIo.runSettled(id, run), undefined, true),
+    runSettled: (id, run) =>
+      TickTimings.measure(
+        "thread_status",
+        locks.outside(threadIo.runSettled(id, run), undefined, true),
+      ),
     launch: (input) =>
       Effect.flatMap(launchReconcile, (reconcile) => {
         let launched: ThreadId | undefined;
@@ -1955,6 +1967,7 @@ const make = Effect.gen(function* () {
         Effect.logWarning("kanban saved write post-commit work failed", { cause }),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2031,7 +2044,8 @@ const make = Effect.gen(function* () {
         all.set(key, mutex);
       }
       return locks.outside(
-        mutex.withPermits(1)(
+        TickTimings.admission(
+          mutex.withPermits(1),
           Effect.gen(function* () {
             // The permit wait was invisible in traces: it dominated slow owner answers.
             yield* Effect.annotateCurrentSpan("serial.wait_ms", performance.now() - started);
@@ -3025,6 +3039,7 @@ const make = Effect.gen(function* () {
                       }),
                     ),
                     Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+                    Effect.provideService(TickTimings.current, undefined),
                     Effect.forkIn(scope),
                   )
                 : Effect.void,
@@ -3084,6 +3099,7 @@ const make = Effect.gen(function* () {
         Ref.update(groupsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3170,6 +3186,7 @@ const make = Effect.gen(function* () {
         Ref.update(goalsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3239,6 +3256,7 @@ const make = Effect.gen(function* () {
         Ref.update(proposalsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -3375,6 +3393,7 @@ const make = Effect.gen(function* () {
         Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -5275,6 +5294,7 @@ const make = Effect.gen(function* () {
               ),
               Effect.retry(Schedule.spaced("5 seconds")),
               Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+              Effect.provideService(TickTimings.current, undefined),
               Effect.forkIn(scope),
             );
           }),
@@ -6059,6 +6079,7 @@ const make = Effect.gen(function* () {
       yield* runOwnerDrain(discussionId, state).pipe(
         NodeSqliteClient.backgroundReads,
         Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+        Effect.provideService(TickTimings.current, undefined),
         Effect.forkIn(scope),
       );
     return waiter;
@@ -7109,58 +7130,64 @@ const make = Effect.gen(function* () {
               const attempted = new Set(stoppedCards);
               while (true) {
                 // Replan after each attempt so a failed head leaves room for lower cards.
-                const planned = yield* locks.run(
-                  Effect.gen(function* () {
-                    const board = yield* boardOf(candidate.id);
-                    if (board.archivedAt !== null || settingUp.has(board.id)) return null;
-                    const cards = yield* upgradeFindings(yield* pass.read);
-                    const depths = yield* tickQueueDepths;
-                    if (depths !== undefined) {
-                      depths.todo = cards.filter(
-                        (card) => card.stage === "todo" && card.settledAt === null,
-                      ).length;
-                      depths.needs_review = cards.filter(
-                        (card) => card.stage === "needs_review" && card.settledAt === null,
-                      ).length;
-                    }
-                    // Old releases could leave a worker instruction after its last
-                    // work subtask closed. Repair that persisted note without sending it.
-                    for (let i = 0; i < cards.length; i++) {
-                      const card = cards[i]!;
-                      if (
-                        card.stage !== "todo" ||
-                        card.wakeNote === null ||
-                        card.subtasks.length === 0
-                      )
-                        continue;
-                      const note = Subtasks.pendingWakeNote(card);
-                      if (note === card.wakeNote) continue;
-                      const repaired = { ...card, wakeNote: note };
-                      yield* saveCard(repaired);
-                      cards[i] = repaired;
-                    }
-                    const pools = Rules.maskDownPools(
-                      yield* store.pools(board.id),
-                      new Set((yield* Ref.get(down)).keys()),
-                    );
-                    const held = yield* boardHolds(board.id);
-                    const now = yield* nowMillis;
-                    const dispatch = Rules.planDispatch(
-                      board,
-                      cards,
-                      pools,
-                      held,
-                      pick,
-                      now,
-                      attempted,
-                    )[0];
-                    if (!dispatch) {
-                      yield* recordPoolWaits(board, cards, pools, held, attempted, now);
-                      return null;
-                    }
-                    const card = cards.find((card) => card.id === dispatch.cardId);
-                    return card ? { boardId: board.id, dispatch, card } : null;
-                  }),
+                const planned = yield* TickTimings.measure(
+                  "dependency_checks",
+                  locks.run(
+                    Effect.gen(function* () {
+                      const board = yield* boardOf(candidate.id);
+                      if (board.archivedAt !== null || settingUp.has(board.id)) return null;
+                      const cards = yield* upgradeFindings(yield* pass.read);
+                      const depths = yield* tickQueueDepths;
+                      if (depths !== undefined) {
+                        depths.todo = cards.filter(
+                          (card) => card.stage === "todo" && card.settledAt === null,
+                        ).length;
+                        depths.needs_review = cards.filter(
+                          (card) => card.stage === "needs_review" && card.settledAt === null,
+                        ).length;
+                      }
+                      // Old releases could leave a worker instruction after its last
+                      // work subtask closed. Repair that persisted note without sending it.
+                      for (let i = 0; i < cards.length; i++) {
+                        const card = cards[i]!;
+                        if (
+                          card.stage !== "todo" ||
+                          card.wakeNote === null ||
+                          card.subtasks.length === 0
+                        )
+                          continue;
+                        const note = Subtasks.pendingWakeNote(card);
+                        if (note === card.wakeNote) continue;
+                        const repaired = { ...card, wakeNote: note };
+                        yield* saveCard(repaired);
+                        cards[i] = repaired;
+                      }
+                      const pools = Rules.maskDownPools(
+                        yield* store.pools(board.id),
+                        new Set((yield* Ref.get(down)).keys()),
+                      );
+                      const held = yield* boardHolds(board.id);
+                      const now = yield* nowMillis;
+                      const dispatch = Rules.planDispatch(
+                        board,
+                        cards,
+                        pools,
+                        held,
+                        pick,
+                        now,
+                        attempted,
+                      )[0];
+                      if (!dispatch) {
+                        yield* TickTimings.measure(
+                          "pool_accounting",
+                          recordPoolWaits(board, cards, pools, held, attempted, now),
+                        );
+                        return null;
+                      }
+                      const card = cards.find((card) => card.id === dispatch.cardId);
+                      return card ? { boardId: board.id, dispatch, card } : null;
+                    }),
+                  ),
                 );
                 if (!planned) break;
                 const { boardId, dispatch, card } = planned;
@@ -7304,7 +7331,10 @@ const make = Effect.gen(function* () {
                           );
                         }).pipe(Effect.orDie),
                       );
-                      yield* startCard(boardId, dispatch, card, destination, pass);
+                      yield* TickTimings.measure(
+                        "start_card",
+                        startCard(boardId, dispatch, card, destination, pass),
+                      );
                     }),
                     card.id,
                   )
@@ -8644,26 +8674,35 @@ const make = Effect.gen(function* () {
     turnEnd?: KanbanThreadLink,
   ) {
     yield* Effect.annotateCurrentSpan({ "kanban.board_id": boardId, "kanban.tick_step": step });
-    return yield* locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
-      Effect.map(Option.some),
-      Effect.catchDefect((defect) =>
-        Effect.gen(function* () {
-          if (!(defect instanceof BoardLocks.BoardStateChanged)) return yield* Effect.die(defect);
-          if (turnEnd) {
-            const previous = (yield* Ref.get(turnEndConflicts)).get(turnEnd.threadId);
-            if (previous?.committed === defect.committed) return Option.none<A>();
-            yield* Ref.update(turnEndConflicts, (all) =>
-              new Map(all).set(turnEnd.threadId, { committed: defect.committed, link: turnEnd }),
-            );
-          }
-          yield* Effect.logWarning("kanban tick step skipped", {
-            boardId,
-            step,
-            cardId: cardId ?? turnEnd?.cardId ?? null,
-            ...(turnEnd ? { threadId: turnEnd.threadId, committed: defect.committed } : {}),
-          });
-          return Option.none<A>();
-        }),
+    return yield* TickTimings.measure(
+      /discussion|nudge/i.test(step)
+        ? "discussion_updates"
+        : /pool/i.test(step)
+          ? "pool_accounting"
+          : /wait|block|depend/i.test(step)
+            ? "dependency_checks"
+            : "card_evaluation",
+      locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
+        Effect.map(Option.some),
+        Effect.catchDefect((defect) =>
+          Effect.gen(function* () {
+            if (!(defect instanceof BoardLocks.BoardStateChanged)) return yield* Effect.die(defect);
+            if (turnEnd) {
+              const previous = (yield* Ref.get(turnEndConflicts)).get(turnEnd.threadId);
+              if (previous?.committed === defect.committed) return Option.none<A>();
+              yield* Ref.update(turnEndConflicts, (all) =>
+                new Map(all).set(turnEnd.threadId, { committed: defect.committed, link: turnEnd }),
+              );
+            }
+            yield* Effect.logWarning("kanban tick step skipped", {
+              boardId,
+              step,
+              cardId: cardId ?? turnEnd?.cardId ?? null,
+              ...(turnEnd ? { threadId: turnEnd.threadId, committed: defect.committed } : {}),
+            });
+            return Option.none<A>();
+          }),
+        ),
       ),
     );
   });
@@ -10374,22 +10413,41 @@ const make = Effect.gen(function* () {
     yield* Ref.update(missing, (all) => new Map(all).set(boardId, missed));
   });
 
-  const runningTicks = new Set<string>();
+  const runningTicks = new Map<
+    string,
+    { tickId: string; timing: ReturnType<typeof TickTimings.make> }
+  >();
   const tickBoard = Effect.fn("KanbanService.tickBoard")(function* (
     board: KanbanBoard,
     turnEndLinks: ReadonlyMap<string, KanbanThreadLink>,
   ) {
     const boardId = board.id;
     yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
-    const busy = runningTicks.has(boardId);
-    if (!busy) runningTicks.add(boardId);
-    const clock = yield* Clock.Clock;
-    const started = clock.monotonicTimeNanosUnsafe();
+    const previous = runningTicks.get(boardId);
+    const busy = previous !== undefined;
+    const tickId = NodeCrypto.randomUUID();
+    const timing = yield* TickTimings.create;
+    if (!busy) runningTicks.set(boardId, { tickId, timing });
+    else {
+      previous.timing.overlappingTicks++;
+      yield* recordAnalytics({
+        kind: "kanban.tick_overlap",
+        boardId,
+        props: { tickId, activeTickId: previous.tickId, reason: "local_waits_only" },
+      }).pipe(Effect.catchCause(() => Effect.void));
+    }
     const depths: { todo?: number; needs_review?: number; evaluator?: number } = {};
     const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
     yield* tickLocalWaits(board).pipe(
       Effect.andThen(
-        busy ? Effect.void : serialEach(ticking, boardId, tickSteps(boardId, turnEndLinks), false),
+        busy
+          ? Effect.void
+          : serialEach(
+              ticking,
+              boardId,
+              TickTimings.measure("card_evaluation", tickSteps(boardId, turnEndLinks)),
+              false,
+            ),
       ),
       Effect.provideService(tickKicks, kicks),
       Effect.ensuring(
@@ -10409,13 +10467,27 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           // A busy tick only runs local waits; timing it would skew tick durations.
           if (Option.isNone(analytics) || busy) return;
-          const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
+          const summary = timing.finish();
+          for (const phase of summary.phases)
+            yield* recordAnalytics({
+              kind: "kanban.tick_phase",
+              boardId,
+              durationMs: phase.durationMs,
+              props: { tickId, phase: phase.phase, count: phase.count },
+            });
           yield* recordAnalytics({
             kind: "kanban.tick",
             boardId,
-            durationMs,
+            durationMs: summary.durationMs,
             props: {
               span: "KanbanService.tickBoard",
+              tickId,
+              cardsScanned: summary.cardsScanned,
+              cardsChanged: summary.cardsChanged,
+              dbMs: summary.dbMs,
+              queueWaitMs: summary.queueWaitMs,
+              heapMB: process.memoryUsage().heapUsed / 1024 / 1024,
+              overlappingTicks: timing.overlappingTicks,
               ...(Exit.isFailure(exit) ? { errorTag: analyticsErrorTag(exit.cause) } : {}),
             },
           });
@@ -10436,6 +10508,10 @@ const make = Effect.gen(function* () {
         }),
       ),
       Effect.provideService(tickQueueDepths, Option.isSome(analytics) ? depths : undefined),
+      Effect.provideService(
+        TickTimings.current,
+        !busy && Option.isSome(analytics) ? timing : undefined,
+      ),
     );
   });
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
@@ -14189,6 +14265,7 @@ const make = Effect.gen(function* () {
         Effect.logWarning("kanban mark read failed", { discussionId, cause }),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -14406,6 +14483,7 @@ const make = Effect.gen(function* () {
         }),
       ),
       Effect.provideService(BoardLocks.writeWaitMs, BoardLocks.WRITE_WAIT_MS),
+      Effect.provideService(TickTimings.current, undefined),
       Effect.forkIn(scope),
     );
   }
