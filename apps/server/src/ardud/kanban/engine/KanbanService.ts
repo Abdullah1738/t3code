@@ -3988,10 +3988,13 @@ const make = Effect.gen(function* () {
       const specific = card?.asks.find((ask) => ask.id === askId);
       const recorded = row?.askers ?? null;
       const nowMs = yield* nowMillis;
+      // Freeze open-ask eligibility before routing closes it; late picks retain no asker.
       const asks = recorded
         ? (card?.asks ?? []).filter((ask) => recorded.ids.includes(ask.id))
         : specific
-          ? [specific]
+          ? specific.closedAt === null
+            ? [specific]
+            : []
           : card
             ? // A reply in words answers only the asks that take words alone.
               kanbanOpenAsks(card).filter((ask) => Asks.takesReply(ask, nowMs))
@@ -4079,7 +4082,7 @@ const make = Effect.gen(function* () {
   const ownerPostKey = (message: Pick<KanbanMessage, "discussionId" | "seq" | "createdAt">) =>
     `owner-post:${message.discussionId}:${message.seq}:${message.createdAt}`;
 
-  /** A pick or written answer on a choice block reaches whoever asked it. */
+  /** Choice answers follow the current evaluator or active worker, except open asks. */
   const ownerAnswerRoute = (
     discussionId: KanbanDiscussion["id"],
     seq: number,
@@ -4104,11 +4107,15 @@ const make = Effect.gen(function* () {
           return;
         }
         if (card !== null && ask !== undefined) {
-          // Already answered or dropped: its asker hears the late pick, and nothing else closes.
+          // A late pick follows current ownership and closes nothing else.
           const by = ask.by;
           if (by._tag === "thread" && by.threadId === card.activeThreadId) {
             yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, note);
-          } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
+          } else if (
+            by._tag === "evaluator" &&
+            by.threadId === discussion.evaluatorThreadId &&
+            (yield* liveEvaluator(by.threadId))
+          ) {
             yield* deliver(discussion, by, "Evaluator", by.threadId, note);
           } else {
             yield* toEvaluator(
@@ -4121,11 +4128,15 @@ const make = Effect.gen(function* () {
         // A pick on a card waiting on the owner answers it like a reply does.
         const waiting = card !== null && card.stage === "needs_owner";
         const author = message.author;
-        if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
-          if (yield* liveEvaluator(author.threadId)) {
-            yield* deliver(discussion, author, message.authorName, author.threadId, note);
-            return;
-          }
+        if (
+          !waiting &&
+          ((author._tag === "evaluator" &&
+            author.threadId === discussion.evaluatorThreadId &&
+            (yield* liveEvaluator(author.threadId))) ||
+            (author._tag === "thread" && author.threadId === card?.activeThreadId))
+        ) {
+          yield* deliver(discussion, author, message.authorName, author.threadId, note);
+          return;
         }
         yield* routeToOwnerAgent(discussion, note);
       }),
@@ -11167,7 +11178,7 @@ const make = Effect.gen(function* () {
           previous.choice.length === choiceIds.length &&
           previous.choice.every((id, index) => id === choiceIds[index]);
         const at = same ? previous.at : yield* nowIso;
-        const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")}`;
+        const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}, block ${blockId}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")} [options: ${choiceIds.join(", ")}]`;
         const answerText = words === "" ? null : words;
         // The content is part of the key: a different answer in the same millisecond
         // is a different delivery, never deduplicated as the earlier one.
