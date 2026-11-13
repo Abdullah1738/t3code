@@ -320,8 +320,50 @@ def main(argv=None):
     check_cmd.add_argument('--json', action='store_true')
     list_cmd = commands.add_parser('list')
     list_cmd.add_argument('--json', action='store_true')
+    merchant = commands.add_parser('merchant', help='record saved cards per merchant (last four only)')
+    actions = merchant.add_subparsers(dest='action', required=True)
+    set_cmd = actions.add_parser('set')
+    set_cmd.add_argument('merchant')
+    set_cmd.add_argument('last4', help='exactly four digits, or none to clear saved cards')
+    set_cmd.add_argument('--role', choices=('primary', 'backup'), default='primary')
+    set_cmd.add_argument('--source')
+    set_cmd.add_argument('--seen')
+    set_cmd.add_argument('--next-charge', help='known next charge date, YYYY-MM-DD')
+    remove = actions.add_parser('remove', help='remove one saved card')
+    remove.add_argument('merchant')
+    remove.add_argument('last4')
+    for action in ('list', 'dead', 'seed'):
+        actions.add_parser(action).add_argument('--json', action='store_true')
+    final = commands.add_parser('assert-final', help='verify the card read on the final payment screen')
+    final.add_argument('merchant')
+    final.add_argument('last4')
+    final.add_argument('--fallback', action='store_true', help='explicit fallback after failure/decline and reconciliation')
     args = parser.parse_args(argv)
     try:
+        if args.command in ('merchant', 'assert-final'):
+            # The CLI runs this file as __main__; share its status and lock helpers.
+            sys.modules.setdefault('card_status', sys.modules[__name__])
+            import card_merchants as merchants
+            if args.command == 'assert-final':
+                try:
+                    ok, message = merchants.assert_final(args.merchant, args.last4, fallback=args.fallback)
+                except CardStatusError as exc:
+                    ok, message = False, str(exc)
+                print(message)
+                return 0 if ok else EXIT_BLOCKED
+            if args.action == 'set':
+                rows = merchants.set_card(args.merchant, args.last4, role=args.role, source=args.source,
+                                          seen=args.seen, next_charge=args.next_charge)
+            elif args.action == 'remove':
+                rows = merchants.remove_card(args.merchant, args.last4)
+            elif args.action == 'seed':
+                rows = merchants.seed()
+            else:
+                rows = merchants.list_merchants(dead=args.action == 'dead')
+            print(json.dumps(rows, ensure_ascii=False))
+            if args.action == 'set':
+                print(merchants.REMINDER, file=sys.stderr)
+            return 0
         if args.command == 'check':
             result = check(args.last4)
             print(json.dumps(result) if args.json else result['message'])
