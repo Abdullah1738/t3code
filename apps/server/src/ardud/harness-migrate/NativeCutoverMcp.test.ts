@@ -161,6 +161,7 @@ it.effect.each(["claudeAgent", "codex", "codex-cu"])(
           Layer.provide(NodeCrypto.layer),
           Layer.provide(
             Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: () => Effect.succeed(shell),
               getThreadShell: () => Effect.succeed(shell),
               getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
               getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
