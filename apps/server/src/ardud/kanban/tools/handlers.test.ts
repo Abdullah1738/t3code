@@ -5417,7 +5417,7 @@ it.effect.each(defaultDiscussionCases)(
               discussion.id,
             );
             assert.deepInclude(
-              (yield* kanban.messages(discussion.id)).map((message) => message.blocks).flat(),
+              (yield* kanban.messages(discussion.id)).flatMap((message) => message.blocks),
               { _tag: "md", text: "private-post" },
             );
           }
