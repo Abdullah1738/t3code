@@ -54,6 +54,13 @@ export const kanbanDDL = [
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, evaluator_thread_id TEXT, json TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_board ON ardud_kanban_discussions (board_id)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_open ON ardud_kanban_discussions (board_id)
+    WHERE json_extract(json, '$.settledAt') IS NULL
+      AND json_extract(json, '$.archivedAt') IS NULL`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_system_channel
+    ON ardud_kanban_discussions (board_id, json_extract(json, '$.createdBy.component'))
+    WHERE card_id IS NULL AND json_extract(json, '$.archivedAt') IS NULL
+      AND json_extract(json, '$.createdBy._tag') = 'system'`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_messages (
     discussion_id TEXT NOT NULL, seq INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (discussion_id, seq)
   )`,

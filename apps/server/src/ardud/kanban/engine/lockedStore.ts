@@ -71,7 +71,10 @@ export const wrap = (
     groups: (id) => locks.access(id, store.groups(id)),
     putGroups: (id, rows) => locks.access(id, store.putGroups(id, rows), true),
     discussions: (id) => locks.access(id, store.discussions(id)),
+    openDiscussions: (id) => locks.access(id, store.openDiscussions(id)),
     discussion: (id) => discussion(id, store.discussion(id)),
+    latestSystemDiscussion: (id, component) =>
+      locks.access(id, store.latestSystemDiscussion(id, component)),
     discussionByEvaluator: (id) => thread(id, store.discussionByEvaluator(id)),
     discussionBoardIdsByEvaluator: (id) => thread(id, store.discussionBoardIdsByEvaluator(id)),
     putDiscussion: (row) =>
