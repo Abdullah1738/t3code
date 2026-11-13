@@ -6,7 +6,7 @@ import { toolError } from "./toollog.ts";
  */
 import type { ChatKey, Line, LineFile, LineAppCard, LineOutbound } from "./line.ts";
 import { LineError, chatKey, safeLineFailureCode } from "./line.ts";
-import { TransportError, type NormalizedInbound } from "./photon.ts";
+import { TransportError, type NormalizedInbound, type SendResult } from "./photon.ts";
 import type { Store } from "./store.ts";
 import { createHash } from "node:crypto";
 import { CARD_TEXT_FIELDS, cardLayout, type CardText } from "./card-text.ts";
@@ -49,9 +49,13 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
   const wrap = async <T>(work: () => Promise<T>): Promise<T> => {
     try { return await work(); } catch (error) { toolError("sb-transport", "sb-transport.catch1", error); throw classifyLineFailure(error); }
   };
-  const sendAtLine = async <T>(send: () => Promise<T>): Promise<T> => {
+  const sendAtLine = async (send: () => Promise<{ handle: string }>) => {
     const revision = store.get<number>("optInRevision") ?? 0;
-    try { return await send(); } catch (error) {
+    const optOutAtDispatch = {
+      since: store.get<{ since: number }>("optedOut")?.since,
+      awaiting: (store.get<{ since: number }[]>("optOutAwaitingSend") ?? []).map(episode => episode.since),
+    };
+    try { return { ...await send(), optOutAtDispatch }; } catch (error) {
       const failure = classifyLineFailure(error);
       failure.optInRevision = revision;
       throw failure;
@@ -69,7 +73,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
    * messages no other row has claimed. Until SETTLE_MS have passed since the latest attempt a miss
    * only fails again as `sendUnconfirmed`; after that the send goes out again.
    */
-  type Receipt = { providerId?: string; duplicate?: boolean; original?: boolean };
+  type Receipt = SendResult;
   const recover = (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean): Receipt | Promise<Receipt | undefined> | undefined => {
     const saved = store.get<{ handle: string; original?: boolean }>(sentKey(id));
     if (saved) return { providerId: saved.handle, duplicate: true, ...(saved.original ? { original: true } : {}) };
@@ -92,11 +96,11 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       if (now() < last + SETTLE_MS) throw new TransportError("sendUnconfirmed", true, true);
     })();
   };
-  const dispatch = async (id: string, send: () => Promise<{ handle: string }>): Promise<Receipt> => {
+  const dispatch = async (id: string, send: () => ReturnType<typeof sendAtLine>): Promise<Receipt> => {
     const own = attempts(id);
     const start = now();
     store.set(attemptKey(id), { first: own?.first ?? start, last: start } satisfies Attempts);
-    let sent: { handle: string };
+    let sent: Awaited<ReturnType<typeof sendAtLine>>;
     try {
       sent = await send();
     } catch (error) { toolError("sb-transport", "sb-transport.catch2", error);
@@ -110,10 +114,10 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     }
     store.set(sentKey(id), { handle: sent.handle });
     rearm();
-    return { providerId: sent.handle };
+    return { providerId: sent.handle, optOutAtDispatch: sent.optOutAtDispatch };
   };
   const once = async (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean,
-    send: () => Promise<{ handle: string }>): Promise<Receipt> => {
+    send: () => ReturnType<typeof sendAtLine>): Promise<Receipt> => {
     const recovery = recover(id, retryOf, landed);
     const receipt = recovery instanceof Promise ? await recovery : recovery;
     if (receipt) return receipt;
@@ -158,7 +162,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       return { chatGuids: [chat], content: { text: message.text }, isFromMe: outbound };
     },
     async sendText(input: { id: string; chatGuid: string; text: string; replyTo?: string; effect?: string; subject?: string; retryOf?: string }):
-      Promise<{ providerId?: string; duplicate?: boolean; original?: boolean }> {
+      Promise<Receipt> {
       const text = sameText(input.text);
       return once(input.id, input.retryOf, message => !message.mediaUrl && !message.card && sameText(message.text) === text,
         () => sendAtLine(() => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined)));
@@ -166,7 +170,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     async uploadAttachment(input: { id: string; data: Uint8Array; name: string; mimeType: string }): Promise<{ guid: string }> {
       return { guid: await wrap(() => line.upload({ data: input.data, name: input.name, mimeType: input.mimeType })) };
     },
-    async sendAttachment(input: { id: string; chatGuid: string; attachmentGuid: string; replyTo?: string }): Promise<{ providerId?: string; duplicate?: boolean }> {
+    async sendAttachment(input: { id: string; chatGuid: string; attachmentGuid: string; replyTo?: string }): Promise<Receipt> {
       // Sendblue keeps the uploaded file's URL as the message's media_url.
       return once(input.id, undefined, message => message.mediaUrl === input.attachmentGuid,
         () => sendAtLine(() => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) })));
@@ -214,7 +218,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       return (await this.prepareApp(input))();
     },
     /** Polls are unsupported on Sendblue; the title and numbered options go out as plain text. */
-    async sendPoll(input: { id: string; chatGuid: string; title: string; options: readonly string[] }): Promise<{ providerId?: string; duplicate?: boolean }> {
+    async sendPoll(input: { id: string; chatGuid: string; title: string; options: readonly string[] }): Promise<Receipt> {
       const body = [input.title, ...input.options.map((option, index) => `${index + 1}. ${option}`)].join("\n");
       return this.sendText({ id: input.id, chatGuid: input.chatGuid, text: body });
     },

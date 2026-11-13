@@ -5,12 +5,12 @@ import { join } from "node:path";
 import { createApi } from "../src/api.ts";
 import { Delivery } from "../src/delivery.ts";
 import type { Access } from "../src/chats.ts";
-import { chatKey, GROUP_APP_REFUSAL, LineError, type Line, type LineInbound } from "../src/line.ts";
+import { chatKey, GROUP_APP_REFUSAL, LineError, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
 import { TransportError } from "../src/photon.ts";
 import { ChatRegistry, createSbApi, optOutHealth, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
-import { Store } from "../src/store.ts";
+import { Store, type OutboxOperation } from "../src/store.ts";
 
 const owner = "+15555550123";
 const moni = "+15555550199";
@@ -84,6 +84,82 @@ function setup(realApi = false) {
 const message = (overrides: Partial<LineInbound>): LineInbound => ({
   handle: "h-1", chat: chatKey.dm(owner), from: owner, text: "hi", kind: "message", service: "iMessage",
   participants: [], sentAt: 1_000, ...overrides,
+});
+
+const recoveryRaces = (["text", "file", "poll", "app"] as const).flatMap(kind =>
+  (["fresh", "duplicate", "in-flight"] as const).map(outcome => ({ kind, outcome })));
+
+test.each(recoveryRaces)("opt-in during retry: $kind $outcome uses actual line-dispatch recovery state", async ({ kind, outcome }) => {
+  const { setSystemTime } = await import("bun:test");
+  const { sbTransport } = await import("../src/sb-transport.ts");
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  setSystemTime(start);
+  try {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    const alerts: string[] = [];
+    let calls = 0;
+    let releaseSend!: () => void;
+    let sendStarted!: () => void;
+    const sending = new Promise<void>(resolve => { sendStarted = resolve; });
+    const send = async () => {
+      if (++calls === 1) throw new LineError("network", "network", true, true);
+      sendStarted();
+      if (outcome === "in-flight") await new Promise<void>(resolve => { releaseSend = resolve; });
+      return { handle: "fresh-after-history" };
+    };
+    env.line.sendText = send;
+    env.line.sendApp = send;
+    const operation: OutboxOperation = { id: "retry", kind: "conversation", text: kind === "text" ? "test" : "" };
+    if (kind === "file") {
+      const bytes = new Uint8Array([1, 2, 3]);
+      operation.attachment = { sha256: dm.store.putBlob(bytes), name: "test.png", mimeType: "image/png", size: bytes.length };
+    }
+    if (kind === "poll") operation.poll = { title: "Lunch?", options: ["Pizza", "Sushi"] };
+    if (kind === "app") operation.app = { url: "https://example.test/card", caption: "Card" };
+    const oldCopy: LineOutbound = { handle: "old-copy", chat: dm.info.key, status: "sent", sentAt: start + 1_000,
+      text: kind === "poll" ? "Lunch?\n1. Pizza\n2. Sushi" : operation.text,
+      ...(kind === "file" ? { mediaUrl: "https://cdn.example/file.jpg" } : {}),
+      ...(kind === "app" ? { card: { url: operation.app!.url, layout: { caption: "Card" } } } : {}),
+    };
+    let releaseHistory!: () => void;
+    let historyStarted!: () => void;
+    const entered = new Promise<void>(resolve => { historyStarted = resolve; });
+    env.line.outbound = async () => {
+      historyStarted();
+      await new Promise<void>(resolve => { releaseHistory = resolve; });
+      return outcome === "duplicate" ? [oldCopy] : [];
+    };
+    const delivery = new Delivery(dm.store, sbTransport(env.line, dm.info.key, dm.store), {
+      projectScope: "review", chatGuid: () => dm.info.key, enabled: () => true, sleep: async () => {},
+      optOut: { title: "Moni", slug: "moni", notify: async severity => { alerts.push(severity); return true; } },
+    });
+    dm.store.enqueue(operation);
+    await delivery.tick();
+    const episode = { since: start, failures: 1, alerted: true };
+    dm.store.set("optedOut", episode);
+    setSystemTime(start + 180_000);
+    const tick = delivery.tick();
+    await entered;
+    if (outcome === "in-flight") {
+      releaseHistory();
+      await sending;
+    }
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => true, health: () => ({}) });
+    const response = await handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify({ chat: "moni" }) }));
+    expect(response.status).toBe(200);
+    expect(dm.store.get<unknown>("optOutAwaitingSend")).toEqual([episode]);
+    if (outcome === "in-flight") releaseSend();
+    else releaseHistory();
+    await tick;
+    expect(dm.store.getOperation("retry")?.state).toBe("sent");
+    expect(calls).toBe(outcome === "duplicate" ? 1 : 2);
+    expect(dm.store.get("optedOut")).toBeUndefined();
+    expect({ alerts, parked: dm.store.get("optOutAwaitingSend") }).toEqual(outcome === "fresh"
+      ? { alerts: ["info"], parked: undefined } : { alerts: [], parked: [episode] });
+  } finally { setSystemTime(); }
 });
 
 describe("opt-in and health", () => {

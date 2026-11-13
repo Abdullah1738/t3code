@@ -609,9 +609,9 @@ export class Delivery {
           this.error("retryWindowExpired", item);
           continue operations;
         }
-        const optOutAtDispatch = this.store.get<OptedOut>("optedOut")?.since;
+        const optOutBeforeSend = this.store.get<OptedOut>("optedOut")?.since;
         let optInRevision = this.store.get<number>("optInRevision") ?? 0;
-        const awaitingAtDispatch = new Set((this.store.get<OptedOut[]>("optOutAwaitingSend") ?? []).map(episode => episode.since));
+        const awaitingBeforeSend = (this.store.get<OptedOut[]>("optOutAwaitingSend") ?? []).map(episode => episode.since);
         this.store.db.transaction(() => {
           if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
           this.store.set(destinationKey, chatGuid);
@@ -690,9 +690,11 @@ export class Delivery {
         // Provider acceptance is durable even if cancellation raced with this RPC.
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
         // A reconciled old copy is not evidence that a later STOP was reversed.
+        const optOutAtDispatch = result.optOutAtDispatch ?? { since: optOutBeforeSend, awaiting: awaitingBeforeSend };
+        const awaitingAtDispatch = new Set(optOutAtDispatch.awaiting);
         const currentOptOut = this.store.get<OptedOut>("optedOut");
         const awaiting = this.store.get<OptedOut[]>("optOutAwaitingSend") ?? [];
-        const confirmsOptOutRecovery = !result.duplicate && (currentOptOut === undefined || currentOptOut.since === optOutAtDispatch)
+        const confirmsOptOutRecovery = !result.duplicate && (currentOptOut === undefined || currentOptOut.since === optOutAtDispatch.since)
           && (currentOptOut !== undefined || awaiting.some(episode => awaitingAtDispatch.has(episode.since)));
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);

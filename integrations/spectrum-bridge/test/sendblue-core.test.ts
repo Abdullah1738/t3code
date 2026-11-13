@@ -205,7 +205,7 @@ describe("transport shim", () => {
       clock += 119_000;
       await expect(transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).rejects.toMatchObject({ code: "sendUnconfirmed" });
       clock += 1_000;
-      expect(await transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).toEqual({ providerId: "second" });
+      expect(await transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).toMatchObject({ providerId: "second" });
       expect(s.get<unknown>("sent-attempt:late")).toEqual({ first: 30_000, last: 150_000 });
     });
 
@@ -282,7 +282,7 @@ describe("transport shim", () => {
       clock = 30_000;
       await expect(transport.sendApp(arrived)).rejects.toMatchObject({ ambiguous: true });
       clock = 200_000;
-      expect(await transport.sendApp(approaching)).toEqual({ providerId: "h3" });
+      expect(await transport.sendApp(approaching)).toMatchObject({ providerId: "h3" });
       expect(await transport.sendApp(arrived)).toEqual({ providerId: "h2", duplicate: true });
       expect(sends).toEqual(["Driver approaching", "Driver 3 min away", "Driver approaching"]);
     });
@@ -317,7 +317,7 @@ describe("transport shim", () => {
       await expect(transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).rejects.toMatchObject({ code: "http_429", ambiguous: false });
       expect(s.get("sent-attempt:op")).toBeUndefined();
       clock = 5_000;
-      expect(await transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).toEqual({ providerId: "ok" });
+      expect(await transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).toMatchObject({ providerId: "ok" });
       expect(looked).toEqual([]);
     });
 
@@ -336,7 +336,7 @@ describe("transport shim", () => {
       clock = 110_000;
       await expect(transport.sendApp(card)).rejects.toMatchObject({ code: "sendUnconfirmed" });
       clock = 220_000;
-      expect(await transport.sendApp(card)).toEqual({ providerId: "new-card" });
+      expect(await transport.sendApp(card)).toMatchObject({ providerId: "new-card" });
       expect(looked).toEqual([40_000, 40_000]);
     });
 
@@ -452,7 +452,7 @@ describe("transport shim", () => {
     const s = store();
     const line = fakeLine();
     const transport = sbTransport(line, chatKey.dm(owner), s);
-    expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toEqual({ providerId: "out-1" });
+    expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toMatchObject({ providerId: "out-1" });
     expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toEqual({ providerId: "out-1", duplicate: true });
     expect(line.sent).toHaveLength(1);
   });

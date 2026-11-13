@@ -84,6 +84,8 @@ export type SendResult = {
   duplicate?: boolean;
   /** A recovered copy that is the one a retryOf id named (e.g. the threaded original), not this id's own variant. */
   original?: boolean;
+  /** Sendblue recovery eligibility captured after history lookup, immediately before a fresh line request. */
+  optOutAtDispatch?: { since?: number; awaiting: number[] };
 };
 export type PollOptionInfo = { optionIdentifier: string; text: string };
 export type PollResult = SendResult & { options?: PollOptionInfo[] };
