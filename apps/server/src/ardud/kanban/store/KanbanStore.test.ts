@@ -1036,6 +1036,7 @@ it.live(
       for (const id of [smallBoard, boardId]) {
         assert.strictEqual((yield* store.cards(id)).length, id === boardId ? 5000 : 1000);
         yield* store.summaryCards(id);
+        yield* store.feedCards(id);
         yield* store.threadLinks({ boardId: id, open: false });
       }
       gc();
@@ -1044,6 +1045,7 @@ it.live(
       for (const id of [boardId, smallBoard]) {
         yield* store.cards(id);
         yield* store.summaryCards(id);
+        yield* store.feedCards(id);
         yield* store.threadLinks({ boardId: id, open: false });
       }
       const warm = yield* store.decodeCacheStats;
@@ -1059,7 +1061,7 @@ it.live(
       const summaryRead = spans.find((span) => span.name === "KanbanStore.read");
       assert.strictEqual(summaryRead?.attributes.get("kanban.decode.summary.hits"), 5000);
       assert.strictEqual(summaryRead?.attributes.get("kanban.decode.summary.misses"), 0);
-      for (const name of ["card", "summary", "thread"]) {
+      for (const name of ["card", "feed", "summary", "thread"]) {
         assert.strictEqual(cold[name]!.entries, 6000);
         assert.strictEqual(warm[name]!.misses, 6000);
         assert.strictEqual(warm[name]!.hits - cold[name]!.hits, 6000);
@@ -1073,7 +1075,7 @@ it.live(
         bigBoard: 5000,
         smallBoard: 1000,
         retainedBytes,
-        bytesPerCardIncludingSummaryAndThread: Math.round(retainedBytes / 6000),
+        bytesPerCardAllDecoders: Math.round(retainedBytes / 6000),
         cold,
         warm,
       });

@@ -1503,7 +1503,25 @@ it.effect.each(["missing-join", "missing-blocker", "failed-compact"] as const)(
           yield* store.putCard({
             ...sibling,
             workThreadId: work,
-            ...(exit === "missing-blocker" ? { settledAt: before.movedAt } : {}),
+            // A completed merge still blocks a fresh thread, but not its own reused thread.
+            ...(exit === "missing-blocker"
+              ? {
+                  stage: "completed" as const,
+                  subtasks: [
+                    {
+                      id: "s1",
+                      step: 1,
+                      text: "Merge the PR",
+                      owner: "evaluator" as const,
+                      state: "open" as const,
+                      createdAt: before.movedAt,
+                      note: null,
+                      doneBy: null,
+                      doneAt: null,
+                    },
+                  ],
+                }
+              : {}),
             ...(exit === "missing-join"
               ? {
                   stage: "working" as const,
@@ -1550,6 +1568,55 @@ it.effect.each(["missing-join", "missing-blocker", "failed-compact"] as const)(
         assert.deepStrictEqual(after.links, newer);
       }).pipe(Effect.provide(testLayer(delayed)));
     }),
+);
+
+it.effect.each([
+  { state: "missing", starts: true },
+  { state: "open", starts: false },
+  { state: "merge-pending", starts: false },
+  { state: "completed", starts: true },
+  { state: "verified", starts: true },
+  { state: "settled-merge", starts: true },
+] as const)("dispatch treats $state blockers correctly with open-card reads", ({ state, starts }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const blocker = yield* kanban.createCard(
+        board.id,
+        { prompt: "Dependency", priority: 2 },
+        owner,
+      );
+      const target = yield* kanban.createCard(board.id, { prompt: "Target", priority: 1 }, owner);
+      const pending = state === "merge-pending" || state === "settled-merge";
+      yield* store.putCard({
+        ...blocker,
+        stage: state === "open" ? "todo" : state === "verified" ? "verified" : "completed",
+        settledAt: state === "settled-merge" ? blocker.createdAt : null,
+        subtasks: pending
+          ? [
+              {
+                id: "s1",
+                step: 1,
+                text: "Merge the PR",
+                owner: "evaluator",
+                state: "open",
+                note: null,
+                doneBy: null,
+                doneAt: null,
+              },
+            ]
+          : [],
+      });
+      yield* store.putCard({
+        ...target,
+        blockedBy: [state === "missing" ? KanbanCardId.make("absent") : blocker.id],
+      });
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(target.id)).card.activeThreadId !== null, starts);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect.each(["card", "slot"] as const)(

@@ -415,6 +415,7 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<KanbanCard | null, KanbanError>;
   readonly cards: (
     boardId: KanbanBoard["id"],
+    options?: { readonly includeSettled: boolean },
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanError>;
   readonly createCard: (
     boardId: KanbanBoard["id"],
@@ -14293,7 +14294,8 @@ const make = Effect.gen(function* () {
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
-    cards: (boardId) => readDb(store.cards(boardId)),
+    cards: (boardId, options) =>
+      readDb(options?.includeSettled === false ? store.openCards(boardId) : store.cards(boardId)),
     createCard,
     editCard,
     moveCard,
