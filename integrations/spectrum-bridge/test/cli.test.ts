@@ -54,7 +54,7 @@ describe("parseCommand", () => {
 
   test("one-time notification sends moved to the telegram bridge; send-file requires --session", () => {
     for (const command of ["notify", "remind", "reminders", "notifications", "cancel", "snooze"]) {
-      expect(() => parseCommand([command])).toThrow("Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish");
+      expect(() => parseCommand([command])).toThrow("Expected health, send, send-file");
       expect(() => parseCommand([command])).toThrow("telegram bridge CLI");
     }
     expect(() => parseCommand(["send-file", "--file", "/nonexistent/report.pdf", "--key", "file-1"]))
@@ -368,4 +368,18 @@ describe("guest-allow", () => {
     expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--fact", "nokey", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
     expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--session", "ses_1"])).toThrow();
   });
+});
+
+test("message length errors name actual length, limit and a recovery", () => {
+  const cases: [string[], number][] = [
+    [["send", "--session", "s", "--key", "k"], 12_000],
+    [["send", "--to", "moni", "--session", "s", "--key", "k"], 12_000],
+    [["wake", "--source", "watch", "--key", "k"], 12_000],
+    [["guest-send", "--address", "+15555550199", "--session", "s", "--key", "k"], 2_000],
+  ];
+  for (const [args, limit] of cases) {
+    const actual = limit + 412;
+    expect(() => parseCommand([...args, "--text", "x".repeat(actual)])).toThrow(
+      `message too long: ${actual.toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card`);
+  }
 });

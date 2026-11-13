@@ -125,7 +125,8 @@ def check(watch_dir, report, run_id):
     if pending:
         ack = watch_dir / ".run-ok"
         acknowledged = ack.exists() and ack.read_text().strip() == pending["run"]
-        owned = (runner.get("pending") or {}).get("event") == pending["event"]
+        owned = ((runner.get("pending") or {}).get("event") == pending["event"]
+                 or pending["event"] in (runner.get("batch") or {}).get("events", []))
         # The runner can crash after persisting pending but before writing .run-ok,
         # then deliver before it calls this check again. This watcher's fires counter
         # only advances on delivery; retain its original value across outbox replays.

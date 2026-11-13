@@ -508,3 +508,23 @@ describe("Sendblue socket API", () => {
     expect((await post("/chats", { sessionId: "ses_owner" })).status).toBe(200);
   });
 });
+
+test("recipient sends, wakes and guest sends report their own message length limit", async () => {
+  const env = setup(true);
+  const registry = env.registry();
+  registry.open(chatKey.dm(moni));
+  env.ownerStore.set("route", { id: "ses_owner", generation: 1 });
+  const guests = { send: async () => { throw new Error("must not send"); } } as unknown as NonNullable<Parameters<typeof createSbApi>[0]["guests"]>;
+  const handler = createSbApi({ registry, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+    enabled: () => true, health: () => ({}), guests });
+  for (const [path, limit, extra] of [
+    ["/send", 12_000, { to: "moni" }],
+    ["/wake", 12_000, { chat: "moni", source: "watch" }],
+    ["/guest-send", 2_000, { address: "+15555550198" }],
+  ] as const) {
+    const response = await handler(new Request(`http://bridge${path}`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "x".repeat(limit + 412), dedupeKey: "long", sessionId: "ses_owner", ...extra }) }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: `message too long: ${(limit + 412).toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card` });
+  }
+});

@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -244,7 +245,7 @@ export function parseCommand(args: string[]): Command {
       const session = required(values.session, "--session");
       if (session.length > 200 || /\s|[\x00-\x1f\x7f-\x9f]/.test(session)) throw new CliError("Invalid --session");
       const text = values.text ?? "";
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       const body: Record<string, string> = { file, dedupeKey, text, sessionId: session };
       if (values.mime !== undefined) {
         if (!validMimeType(values.mime)) throw new CliError("Invalid --mime");
@@ -263,7 +264,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "send": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.to !== undefined) {
         if (values.effect !== undefined || values.subject !== undefined) throw new CliError("--to does not take --effect or --subject");
         return { method: "POST", path: "/send", body: { text, to: chatSlug(values.to), ...session() } };
@@ -281,7 +282,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "wake": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.chat !== undefined) {
         const source = label(values.source, "--source", 100);
         return { method: "POST", path: "/wake",
@@ -301,7 +302,7 @@ export function parseCommand(args: string[]): Command {
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
     case "ask-owner": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       return { method: "POST", path: "/ask-owner", body: { text, ...session() } };
     }
     case "chats": {
@@ -355,7 +356,7 @@ export function parseCommand(args: string[]): Command {
     case "guest-send": {
       const address = label(required(values.address, "--address"), "--address", 200)!;
       const text = required(values.text, "--text");
-      if (text.length > 2_000) throw new CliError("--text must be at most 2000 characters");
+      if (text.length > 2_000) throw new CliError(messageLengthError(text, 2_000));
       return { method: "POST", path: "/guest-send", body: { address, text, ...session() } };
     }
     case "share-contact": {

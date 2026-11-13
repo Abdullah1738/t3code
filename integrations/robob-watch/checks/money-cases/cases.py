@@ -1173,17 +1173,20 @@ def runner_fires(wd):
 
 
 def runner_owns(wd, out):
-    """Whether the runner has accepted this check's output: it is saved as the runner's pending event.
+    """Whether the runner saved this output in its pending delivery or person-chat batch.
 
-    The runner saves `pending` (with the event text) before it acks the run, so a match means it will retry
+    The runner saves the event text before it acks the run, so a match means it will retry
     the event itself. No match and no delivery means the output was lost before acknowledgement."""
     try:
-        pending = json.loads((wd / 'state.json').read_text()).get('pending') or {}
+        runner = json.loads((wd / 'state.json').read_text())
+        pending = runner.get('pending') or {}
     except (OSError, ValueError, AttributeError):
         return False
     # An outbox from before this field (or an empty one) has no event to match, so it is never owned.
     event = (out.get('event') or '').strip()
-    return bool(event) and (pending.get('event') or '').strip() == event
+    queued = (runner.get('batch') or {}).get('events') or []
+    return bool(event) and ((pending.get('event') or '').strip() == event
+                            or any(isinstance(item, str) and item.strip() == event for item in queued))
 
 
 def delivery_time(out, wd):

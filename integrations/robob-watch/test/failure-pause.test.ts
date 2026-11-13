@@ -16,7 +16,7 @@ if (!ok) process.exit(1);
 console.log('{"created":true}');`);
   const db = join(sandbox, "bridge.sqlite");
   Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_test","generation":1}');`]);
-  const env = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_ROOT: root,
+  const env = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_SPECTRUM_CLI: stub, ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_BRIDGE_DB: db,
     ROBOB_WATCH_CHECK_TIMEOUT_MS: "500", ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_SSD_PATH: "/dev", WACLI_STORE_DIR: join(sandbox, "wacli"), ...options };
   const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], { env });

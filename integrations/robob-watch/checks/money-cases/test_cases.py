@@ -593,6 +593,23 @@ class Rules(Base):
         self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
         self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
 
+    def test_a_batched_event_keeps_its_outbox_until_delivery(self):
+        self.case(deadline='2026-10-25')
+        event = self.check('2026-10-24T10:00', 'r1', ack=False)
+        self.assertTrue(event)
+        for queued, owned in [([event], True), (['unrelated event'], False), ([event, 'another event'], True)]:
+            with self.subTest(queued=queued):
+                (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'batch': {'events': queued}}))
+                self.assertEqual(mc.runner_owns(self.wd, {'event': event}), owned)
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'batch': {'events': [event]}}))
+        self.assertEqual(self.check('2026-10-24T10:01', 'r2', ack=False), '')
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+        self.deliver('2026-10-24T10:03')
+        self.assertEqual(self.check('2026-10-24T10:04', 'r3', ack=False), '')
+        pings = json.loads((self.wd / 'pings.json').read_text())
+        self.assertNotIn('outbox', pings)
+        self.assertIn('acme|r0|soon', pings['sent'])
+
     def test_a_reminder_delivered_two_days_late_counts_from_delivery(self):
         # Built 24 Oct 10:00, but the runner only delivers it on 26 Oct at 10:00 (a retry after an outage).
         self.case(deadline='2026-10-25', when=at('2026-10-24T09:00'))

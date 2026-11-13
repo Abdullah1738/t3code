@@ -112,7 +112,12 @@ export type Watcher = {
   created_by_session: string | null;
 };
 export type State = {
-  status: "active" | "done" | "expired";
+  status: "active" | "closing" | "done" | "expired";
+  closing_until?: number;
+  closing_from?: "active" | "done" | "expired";
+  closing_final_started?: boolean;
+  closing_final_check?: boolean;
+  batch?: { at: number; events: string[]; watcher?: Watcher };
   fires: number;
   last_run_at?: string;
   last_fire_at?: string;
@@ -130,7 +135,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string };
+  pending?: { key: string; event: string; at: string; count?: number; watcher?: Watcher; context_file?: string };
   last_delivery?: string;
   /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
   wakes?: TrackedWake[];
@@ -138,6 +143,149 @@ export type State = {
   trigger_sig?: string;
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
+
+export const PERSON_BATCH_MS = 150_000;
+export const REMOVAL_GRACE_MS = 15 * 60_000;
+// The bridge is the only wake destination on this version; notify keeps its direct-send timing.
+export const personChat = (watcher: Watcher) => watcher.mode === "wake";
+export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
+export const checking = (state: State) => state.status === "active" || state.status === "closing";
+
+export function archiveWatcher(id: string): string {
+  const target = join(ARCHIVE, `${id}-${now()}`);
+  log(id, "removed");
+  const state = loadState(id);
+  if (state.status === "closing" && state.closing_from) {
+    state.status = state.closing_from;
+    delete state.closing_from;
+    delete state.closing_until;
+    delete state.closing_final_started;
+    delete state.closing_final_check;
+    saveState(id, state);
+  }
+  renameSync(watcherDir(id), target);
+  return target;
+}
+
+export function finalizeClosing(id: string): boolean {
+  return withRelayLock(() => {
+    const state = loadState(id);
+    if (!loadWatcher(id) || state.status !== "closing" || now() < state.closing_until!
+      || !state.closing_final_check || state.pending || state.batch) return false;
+    archiveWatcher(id);
+    return true;
+  });
+}
+
+export function removeWatcher(id: string, immediately = false): { archived?: string; closing_until?: number } {
+  return withRelayLock(() => {
+    if (immediately) return { archived: archiveWatcher(id) };
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    if (watcher.paused) writeJson(join(watcherDir(id), "watcher.json"), { ...watcher, paused: false });
+    const state = loadState(id);
+    if (state.status !== "closing") {
+      state.closing_from = state.status;
+      state.closing_until = now() + REMOVAL_GRACE_MS;
+      delete state.closing_final_started;
+      delete state.closing_final_check;
+    }
+    state.status = "closing";
+    state.next_at = 0;
+    delete state.failure_paused_at;
+    saveState(id, state);
+    log(id, `closing until ${iso(state.closing_until!)}`);
+    return { closing_until: state.closing_until };
+  });
+}
+
+export function editWatcher(id: string, change: (watcher: Watcher) => Watcher): Watcher {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    const next = normalize(change(watcher));
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next;
+  });
+}
+
+export function checkEvent(output: string): { event: string; urgent: boolean } {
+  const event = output.trim();
+  try {
+    const value = JSON.parse(event);
+    return { event, urgent: value?.urgent === true };
+  } catch { return { event, urgent: false }; }
+}
+
+function contextSnapshot(context: string): string {
+  const dir = join(ARCHIVE, "contexts");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, `${hash(context)}.json`);
+  if (!existsSync(file)) writeJson(file, { context });
+  return file;
+}
+
+export function queueEvent(watcher: Watcher, state: State, event: string, urgent: boolean): void {
+  if (personChat(watcher) && !urgent) {
+    state.batch ??= { at: now(), events: [], watcher };
+    state.batch.events.push(event);
+  } else {
+    state.pending = { key: `robob-watch:${watcher.id}:${state.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), watcher, context_file: watcher.mode === "wake" ? contextSnapshot(watcher.context) : undefined };
+  }
+}
+
+export function sealBatch(watcher: Watcher, state: State): void {
+  const batch = state.batch!;
+  const accepted = batch.watcher ?? watcher;
+  const destination = sameDestination(accepted, watcher) ? { ...accepted, context: watcher.context } : accepted;
+  const key = `robob-watch:${watcher.id}:batch:${hash(JSON.stringify(batch)).slice(0, 32)}`;
+  const events = batch.events.length === 1 ? batch.events[0]! : batch.events.map((event, i) => `${i + 1}. ${event}`).join("\n\n");
+  // A large burst must survive the bridge's text cap. Keep the complete batch for the woken agent to read.
+  const file = join(ARCHIVE, "batches", `${watcher.id}-${hash(key).slice(0, 32)}.json`);
+  if (events.length > MAX_EVENT) {
+    mkdirSync(join(ARCHIVE, "batches"), { recursive: true, mode: 0o700 });
+    writeJson(file, { ...batch, context: destination.context });
+  }
+  const event = events.length <= MAX_EVENT ? events : `${batch.events.length} events, oldest first. Read the complete batch before replying: ${file}`;
+  state.pending = { key, event, count: batch.events.length, at: iso(batch.at), watcher: destination, context_file: contextSnapshot(destination.context) };
+  delete state.batch;
+}
+
+function jsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeContext(previous: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...previous };
+  for (const [key, value] of Object.entries(patch)) {
+    const old = previous[key];
+    Object.defineProperty(result, key, { enumerable: true, configurable: true, writable: true,
+      value: Array.isArray(old) && Array.isArray(value) ? [...old, ...value]
+        : jsonObject(old) && jsonObject(value) ? mergeContext(old, value) : value });
+  }
+  return result;
+}
+
+export function editContext(id: string, patch: string, replace = false): string {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    let context = patch;
+    if (!replace) {
+      let before: unknown, after: unknown;
+      try { before = JSON.parse(watcher.context); } catch { /* legacy prose */ }
+      try { after = JSON.parse(patch); } catch { /* prose append */ }
+      if (jsonObject(after)) {
+        context = JSON.stringify(mergeContext(jsonObject(before) ? before : { instructions: watcher.context }, after));
+      } else if (jsonObject(before)) {
+        context = JSON.stringify({ ...before, notes: [...(Array.isArray(before.notes) ? before.notes : before.notes === undefined ? [] : [before.notes]), patch] });
+      } else context = [watcher.context, patch].filter(Boolean).join("\n");
+    }
+    const next = normalize({ ...watcher, context });
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next.context;
+  });
+}
 
 export const HEADSUP_MS = Number(process.env.ROBOB_WATCH_HEADSUP_MS ?? 120_000);
 /** Tracking is dropped after this long even if the row state could never be read. */
@@ -345,7 +493,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, WATCH_CLOSING: loadState(watcher.id).status === "closing" ? "1" : "0", ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
@@ -585,13 +733,14 @@ function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at:
 /** Wakes repeat the saved context on every fire; this is the start that carries the action, the rest is a pointer. */
 export const CONTEXT_PREVIEW = 280;
 
-export function contextPreview(w: Watcher): string {
+export function contextPreview(w: Watcher, snapshot?: string): string {
   const context = w.context || "";
   if (!context) return "(none)";
   if (context.length <= CONTEXT_PREVIEW) return context;
   const head = context.slice(0, CONTEXT_PREVIEW);
   const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("\n"));
-  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: \`robob-watch context ${w.id}\` (read them before acting on anything beyond the lines above).`;
+  const pointer = snapshot ? `read saved context at \`${snapshot}\`` : `\`robob-watch context ${w.id}\``;
+  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: ${pointer} (read them before acting on anything beyond the lines above).`;
 }
 
 /** The first fire of each Dubai day (or of the watcher's quiet-hours zone) carries the whole context; decided from state so a retried key keeps its text. */
@@ -603,8 +752,10 @@ function firstFireToday(watcher: Watcher, state: State): boolean {
 }
 
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
-  const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
-  const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
+  const count = state.pending?.count ?? 1;
+  const label = count === 1 ? `fire ${state.fires + 1}` : `fires ${state.fires + 1}–${state.fires + count}`;
+  const fires = watcher.max_fires === 0 ? `${label}, unlimited` : `${label} of ${watcher.max_fires}`;
+  const after = watcher.max_fires !== 0 && state.fires + count >= watcher.max_fires
     ? "This watcher is now finished and disabled. If the owner still wants it watched, add a fresh one."
     : "The watcher keeps running; manage it with robob-watch show/pause/remove " + watcher.id + ".";
   return [
@@ -616,8 +767,8 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     "Event:",
     clip(event.trim(), MAX_EVENT),
     "",
-    "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
-    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher),
+    `Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event)${firstFireToday(watcher, state) && state.pending?.context_file ? `; full snapshot: ${state.pending.context_file}` : ""}:`,
+    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher, state.pending?.context_file),
     "",
     `Watcher ${watcher.id} (${fires}). ${after}`,
   ].join("\n");
