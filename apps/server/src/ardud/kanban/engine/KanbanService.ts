@@ -7737,7 +7737,7 @@ const make = Effect.gen(function* () {
     yield* nudgeThread(threadId, nudge, Briefs.nudgeWorkText(nudge));
   });
 
-  /** A reviewer whose turn ended with no verdict: nudged once, then flagged and its slot freed. */
+  /** Refused verdicts flag immediately; a missing verdict gets a nudge and one restart first. */
   const reviewerStopped = Effect.fn("KanbanService.reviewerStopped")(function* (
     planned: KanbanCard,
     threadId: ThreadId,
@@ -7768,21 +7768,26 @@ const make = Effect.gen(function* () {
     });
     const at = yield* nowIso;
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
-    if (card.nudgedAt === null) {
+    const refused = Retries.refusedVerdict(card, yield* store.cardEvents(card.id), threadId);
+    if (refused === null && card.nudgedAt === null) {
       yield* nudgeThread(threadId, [card], Briefs.nudgeReviewText(card));
       return;
     }
     // A reviewer that still has no verdict after the nudge frees its slot. The first
     // time the review is started again once (see Retries); the second time it is flagged.
-    const reason = Retries.NO_VERDICT_REASON;
-    const retry = Retries.decideRetry({
-      kind: "no_verdict",
-      role: "review",
-      retries: card.retries,
-      paused: Retries.heldByPause(board, card),
-      nowMs: Date.parse(at),
-      at,
-    });
+    const reason =
+      refused === null ? Retries.NO_VERDICT_REASON : `${Retries.REFUSED_VERDICT_PREFIX}${refused}`;
+    const retry =
+      refused !== null
+        ? { _tag: "flag" as const }
+        : Retries.decideRetry({
+            kind: "no_verdict",
+            role: "review",
+            retries: card.retries,
+            paused: Retries.heldByPause(board, card),
+            nowMs: Date.parse(at),
+            at,
+          });
     if (retry._tag === "hold" || retry._tag === "wait") return;
     yield* endReviewLink(card.reviewThreadId, at);
     if (retry._tag === "restart") {
@@ -13134,159 +13139,220 @@ const make = Effect.gen(function* () {
 
   const REVIEW_REPLAY_WINDOW_MS = 10 * 60_000;
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
-    SavedWrite.recover(
-      guardDeferred(
-        "card.reviewResult",
-        Effect.gen(function* () {
-          yield* checkText(findings.map((finding) => ["finding", finding] as const));
-          const link = yield* store.threadLink(threadId);
-          if (!link || link.role !== "review" || link.cardId === null) {
-            return yield* failWith("denied", "only a card's review thread records a review result");
-          }
-          const card = yield* cardOf(link.cardId);
-          const live = card.activeThreadId === threadId && card.stage === "in_review";
-          const late = !live && (yield* lateReviewer(card, threadId));
-          const sha = head?.trim().toLowerCase() || null;
-          const body =
-            verdict === "findings"
-              ? findings.map((line) => `- ${line.trim()}`).join("\n")
-              : "clear";
-          if (!live && !late) {
-            if (sha !== null && /^[0-9a-f]{7,40}$/.test(sha)) {
-              const events = yield* store.cardEvents(card.id);
-              const lastReview = events.findLast((event) => event.kind === "review");
-              const at = yield* nowIso;
-              const ageMs =
-                lastReview === undefined ? Number.NaN : Date.parse(at) - Date.parse(lastReview.at);
-              const dispatchedSince =
-                lastReview !== undefined &&
-                events.some(
-                  (event) =>
-                    event.id > lastReview.id &&
-                    event.kind === "moved" &&
-                    event.toStage === "in_review",
-                );
-              if (
-                lastReview?.actor._tag === "thread" &&
-                lastReview.actor.threadId === threadId &&
-                lastReview.head === sha &&
-                lastReview.body === body &&
-                ageMs >= 0 &&
-                ageMs <= REVIEW_REPLAY_WINDOW_MS &&
-                card.movedAt === lastReview.at &&
-                lastReview.toStage === card.stage &&
-                !dispatchedSince
-              ) {
-                yield* Effect.logInfo("kanban review result replay ignored", {
-                  cardId: card.id,
-                  threadId,
-                  head: sha,
-                });
-                return {
-                  card,
-                  recorded: false,
-                  note: `Already recorded as review event ${lastReview.id} at ${lastReview.at}; not saved again.`,
-                };
+    Effect.suspend(() => {
+      let attempted: KanbanCard | undefined;
+      return SavedWrite.recover(
+        guardDeferred(
+          "card.reviewResult",
+          Effect.gen(function* () {
+            yield* checkText(findings.map((finding) => ["finding", finding] as const));
+            const link = yield* store.threadLink(threadId);
+            if (!link || link.role !== "review" || link.cardId === null) {
+              return yield* failWith(
+                "denied",
+                "only a card's review thread records a review result",
+              );
+            }
+            const card = yield* cardOf(link.cardId);
+            attempted = card;
+            const live = card.activeThreadId === threadId && card.stage === "in_review";
+            const late = !live && (yield* lateReviewer(card, threadId));
+            const sha = head?.trim().toLowerCase() || null;
+            const body =
+              verdict === "findings"
+                ? findings.map((line) => `- ${line.trim()}`).join("\n")
+                : "clear";
+            if (!live && !late) {
+              if (sha !== null && /^[0-9a-f]{7,40}$/.test(sha)) {
+                const events = yield* store.cardEvents(card.id);
+                const lastReview = events.findLast((event) => event.kind === "review");
+                const at = yield* nowIso;
+                const ageMs =
+                  lastReview === undefined
+                    ? Number.NaN
+                    : Date.parse(at) - Date.parse(lastReview.at);
+                const dispatchedSince =
+                  lastReview !== undefined &&
+                  events.some(
+                    (event) =>
+                      event.id > lastReview.id &&
+                      event.kind === "moved" &&
+                      event.toStage === "in_review",
+                  );
+                if (
+                  lastReview?.actor._tag === "thread" &&
+                  lastReview.actor.threadId === threadId &&
+                  lastReview.head === sha &&
+                  lastReview.body === body &&
+                  ageMs >= 0 &&
+                  ageMs <= REVIEW_REPLAY_WINDOW_MS &&
+                  card.movedAt === lastReview.at &&
+                  lastReview.toStage === card.stage &&
+                  !dispatchedSince
+                ) {
+                  yield* Effect.logInfo("kanban review result replay ignored", {
+                    cardId: card.id,
+                    threadId,
+                    head: sha,
+                  });
+                  return {
+                    card,
+                    recorded: false,
+                    note: `Already recorded as review event ${lastReview.id} at ${lastReview.at}; not saved again.`,
+                  };
+                }
               }
+              const board = yield* boardOf(card.boardId);
+              const steps = Rules.chainFor(board, card)?.steps.length ?? 1;
+              const step = Math.min(card.reviewStep + 1, steps);
+              return yield* failWith(
+                "conflict",
+                `card #${card.number} is not in review with this thread (stage ${card.stage}, review step ${step} of ${steps}${card.stage === "needs_review" ? " waits for the dispatcher" : ""}). Your verdict was not recorded. Check card_get for the current assignment.`,
+              );
+            }
+            if (verdict === "findings" && findings.length === 0) {
+              return yield* failWith("invalid", "findings need at least one line");
+            }
+            if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
+              return yield* failWith(
+                "invalid",
+                "head is the commit you reviewed: 7 to 40 hex characters",
+              );
             }
             const board = yield* boardOf(card.boardId);
-            const steps = Rules.chainFor(board, card)?.steps.length ?? 1;
-            const step = Math.min(card.reviewStep + 1, steps);
-            return yield* failWith(
-              "conflict",
-              `card #${card.number} is not in review with this thread (stage ${card.stage}, review step ${step} of ${steps}${card.stage === "needs_review" ? " waits for the dispatcher" : ""}). Your verdict was not recorded. Check card_get for the current assignment.`,
-            );
-          }
-          if (verdict === "findings" && findings.length === 0) {
-            return yield* failWith("invalid", "findings need at least one line");
-          }
-          if (sha !== null && !/^[0-9a-f]{7,40}$/.test(sha)) {
-            return yield* failWith(
-              "invalid",
-              "head is the commit you reviewed: 7 to 40 hex characters",
-            );
-          }
-          const board = yield* boardOf(card.boardId);
-          const chain = Rules.chainFor(board, card);
-          const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
-          const at = yield* nowIso;
-          // The last review step passing ticks off the step's review subtasks. If
-          // the plan then has more work, the card goes back to its worker.
-          const passed = verdict === "clear" && !outcome.continueReview;
-          if (passed) {
-            for (const subtask of kanbanStepSubtasks(card, "review")) {
-              const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
-              if (missing) return yield* failWith("denied", missing);
+            const chain = Rules.chainFor(board, card);
+            const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
+            const at = yield* nowIso;
+            // The last review step passing ticks off the step's review subtasks. If
+            // the plan then has more work, the card goes back to its worker.
+            const passed = verdict === "clear" && !outcome.continueReview;
+            if (passed) {
+              for (const subtask of kanbanStepSubtasks(card, "review")) {
+                const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
+                if (missing) return yield* failWith("denied", missing);
+              }
             }
-          }
-          const subtasks = passed
-            ? Subtasks.passReview(card, { _tag: "thread", threadId }, at)
-            : card.subtasks;
-          const moreWork = passed && Subtasks.workAfterReview({ subtasks });
-          const next: KanbanCard = {
-            // A verdict is a review that ended normally: its retry record goes.
-            ...Retries.withoutRetries(
-              release(
-                yield* moveWait(
-                  card,
-                  moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
-                  at,
-                  { _tag: "thread", threadId },
+            const subtasks = passed
+              ? Subtasks.passReview(card, { _tag: "thread", threadId }, at)
+              : card.subtasks;
+            const moreWork = passed && Subtasks.workAfterReview({ subtasks });
+            const next: KanbanCard = {
+              // A verdict is a review that ended normally: its retry record goes.
+              ...Retries.withoutRetries(
+                release(
+                  yield* moveWait(
+                    card,
+                    moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
+                    at,
+                    { _tag: "thread", threadId },
+                  ),
                 ),
               ),
+              // The dispatcher's no-verdict flag is answered by the verdict; a
+              // reviewer's own flag stays for the evaluator.
+              stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
+              subtasks,
+              stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
+              reviewStep: moreWork ? 0 : outcome.reviewStep,
+              reviewRound: outcome.reviewRound,
+              reviewFindingsPending: verdict === "findings",
+              wakeNote:
+                verdict === "findings"
+                  ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
+                  : moreWork
+                    ? Subtasks.nextStepNote("The review passed. ")
+                    : // A review start keeps the card's wake note so the reviewer reads it
+                      // (startCard). The verdict is where it has been read: without this it
+                      // came back in every later review brief.
+                      null,
+              nudgedAt: null,
+              movedAt: at,
+              updatedAt: at,
+            };
+            yield* logEvent(next, { _tag: "thread", threadId }, "review", {
+              at,
+              fromStage: card.stage,
+              toStage: next.stage,
+              body,
+              head: sha,
+            });
+            yield* saveCard(next);
+            yield* kick;
+            const actor: KanbanActor = { _tag: "thread", threadId };
+            if (evaluatorTurnDue(card, next))
+              yield* later(
+                next.boardId,
+                cardLane(next),
+                { kind: "evaluatorTurn", before: card, after: next, actor },
+                forkPostCommit(evaluatorTurn(card, next, actor)),
+              );
+            if (verdict === "findings" && next.reviewRound === 3) {
+              const text = `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`;
+              yield* later(
+                next.boardId,
+                cardLane(next),
+                { kind: "noteDiscussion", cardId: next.id, text },
+                forkPostCommit(noteDiscussion(next, text)),
+              );
+            }
+            return { card: next, recorded: true };
+          }),
+        ),
+        (saved) => (saved.kind === "card" ? { card: saved.card, recorded: true } : undefined),
+      ).pipe(
+        Effect.tapError((error) => {
+          const initial = attempted;
+          if (
+            initial !== undefined &&
+            (initial.activeRole !== "review" || initial.activeThreadId !== threadId)
+          )
+            return Effect.void;
+          return guardDeferred(
+            "card.reviewResult.refused",
+            Effect.gen(function* () {
+              const cardId = initial?.id ?? (yield* store.threadLink(threadId))?.cardId;
+              if (cardId == null) return;
+              const card = yield* cardOf(cardId);
+              if (
+                card.activeRole !== "review" ||
+                card.activeThreadId !== threadId ||
+                (initial !== undefined && card.movedAt !== initial.movedAt)
+              )
+                return;
+              const sha = head?.trim().toLowerCase() || null;
+              // Invalid heads may contain the delimiter used to read back the refusal reason.
+              const shortHead =
+                sha === null
+                  ? "unknown head"
+                  : /^[0-9a-f]{7,40}$/.test(sha)
+                    ? sha.slice(0, 8)
+                    : "invalid head";
+              const body = `${Retries.REFUSED_VERDICT_PREFIX}${verdict} at ${shortHead}: ${error.detail}`;
+              const events = yield* store.cardEvents(card.id);
+              if (
+                events.some(
+                  (event) =>
+                    event.kind === "comment" &&
+                    event.actor._tag === "thread" &&
+                    event.actor.threadId === threadId &&
+                    event.at >= card.movedAt &&
+                    event.head === sha &&
+                    event.body === body,
+                )
+              )
+                return;
+              yield* logEvent(card, { _tag: "thread", threadId }, "comment", { body, head: sha });
+              yield* publish(card.boardId, { _tag: "card", card });
+            }),
+            initial?.id,
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban review refusal could not be recorded", { cause }),
             ),
-            // The dispatcher's no-verdict flag is answered by the verdict; a
-            // reviewer's own flag stays for the evaluator.
-            stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
-            subtasks,
-            stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
-            reviewStep: moreWork ? 0 : outcome.reviewStep,
-            reviewRound: outcome.reviewRound,
-            reviewFindingsPending: verdict === "findings",
-            wakeNote:
-              verdict === "findings"
-                ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
-                : moreWork
-                  ? Subtasks.nextStepNote("The review passed. ")
-                  : // A review start keeps the card's wake note so the reviewer reads it
-                    // (startCard). The verdict is where it has been read: without this it
-                    // came back in every later review brief.
-                    null,
-            nudgedAt: null,
-            movedAt: at,
-            updatedAt: at,
-          };
-          yield* logEvent(next, { _tag: "thread", threadId }, "review", {
-            at,
-            fromStage: card.stage,
-            toStage: next.stage,
-            body,
-            head: sha,
-          });
-          yield* saveCard(next);
-          yield* kick;
-          const actor: KanbanActor = { _tag: "thread", threadId };
-          if (evaluatorTurnDue(card, next))
-            yield* later(
-              next.boardId,
-              cardLane(next),
-              { kind: "evaluatorTurn", before: card, after: next, actor },
-              forkPostCommit(evaluatorTurn(card, next, actor)),
-            );
-          if (verdict === "findings" && next.reviewRound === 3) {
-            const text = `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`;
-            yield* later(
-              next.boardId,
-              cardLane(next),
-              { kind: "noteDiscussion", cardId: next.id, text },
-              forkPostCommit(noteDiscussion(next, text)),
-            );
-          }
-          return { card: next, recorded: true };
+          );
         }),
-      ),
-      (saved) => (saved.kind === "card" ? { card: saved.card, recorded: true } : undefined),
-    );
+      );
+    });
 
   const cardThread: KanbanServiceShape["cardThread"] = (cardId, action, text, actor) =>
     savedCardGuard(
