@@ -18,14 +18,24 @@ NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
+NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
+                'backup.skipped_runs.memory', 'backup.skipped_runs.health', 'backup.skipped_runs.other',
+                'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other'))
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
-SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
+SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
+BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
+                   'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
+BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'redact_lock.py',
+               'run_limited.py', 'install.zsh', 'install-jobs.zsh', 'deploy.zsh',
+               'backup', 'snapshots', 'forget', 'prune',
+               '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
 NULLABLE.update(('internalFreeGbDelta', 'externalFreeGbDelta'))
+NULLABLE.update(('lastGoodSnapshotAgeS', 'lockHolderCmd', 'lockHolderPpid', 'lockHolderStartedAgoS'))
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
@@ -41,6 +51,15 @@ ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
 
+def backup_command(value):
+    # Closed vocabulary: even an innocuous-looking argv token can be a secret.
+    if not isinstance(value, str):
+        return False
+    parts = value.split(' ')
+    return (1 <= len(parts) <= 2 and parts[0] in BACKUP_PROGRAMS and
+            (len(parts) == 1 or parts[1] in BACKUP_ARGS))
+
+
 def directory():
     return Path(os.environ.get('TOOLLOG_DIR', str(Path.home() / '.robob/logs/tools/mac')))
 
@@ -48,7 +67,14 @@ def directory():
 def safe_fields(values):
     result = {}
     for key, value in (values or {}).items():
-        if key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
+        if key == 'lockHolderCmd' and backup_command(value):
+            result[key] = value
+        elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
+            if key != 'trigger' or value != 'agent':
+                result[key] = value
+        elif key == 'lastGoodSnapshotError' and value in ('password_unavailable', 'timeout', 'exit', 'parse', 'unavailable', 'no_snapshots'):
+            result[key] = value
+        elif key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
             result[key] = value
         elif key in ('previousTs', 'sampleTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value
