@@ -45,6 +45,7 @@ Rules added 2026-10-30 (money-cases fixes, card #10):
 - **Build once, acknowledge delivery separately.** Event keys and the case’s daily cap are recorded in `built` before the check prints an event; they suppress another build even if the runner never accepts or acknowledges it. Existing outbox keys migrate on the first check. Delivery still controls the reminder clock: The runner acks a run before it delivers the event and may retry it later or the next day. A reminder is recorded as sent, and it counts toward the one-a-day cap and starts the two-day clock, only when the runner's `state.json` confirms delivery (`fires` rose and `last_fire_at` is the delivery time). An event the runner owns stays pending; a lost event releases the outbox, while its keys remain consumed.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
 - A merchant mail after the case's last edit saying a refund was processed holds the dispute deadline until mail time + 7 days (or the existing later deadline) and tells him once; any negation in the merchant's own text blocks the hold.
+- Questions and requests to confirm processing do not authorize a hold. A trailing receipt or help question can be ignored after an affirmative statement.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 
 ## Saved merchant cards

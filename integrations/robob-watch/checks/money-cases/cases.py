@@ -111,6 +111,11 @@ REFUND_DONE = re.compile(
     r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
     r'|\b(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
 REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
+REFUND_QUERY = re.compile(
+    r'(?:^|[\n.!?;:,])\s*(?:am|is|are|was|were|do|does|did|has|have|had|can|could|may|might|will|would|shall|should|who|what|when|where|why|how|which)\b'
+    r'|\bwhether\b|\b(?:please\s+(?:confirm|check)|(?:confirm|check|know|advise|ask(?:s|ing)?|wonder(?:s|ing)?)\s+if)\b', re.I)
+REFUND_FOLLOWUP = re.compile(
+    r'(?<=[.!])\s+(?:have you received (?:it|the refund|the credit)|is there anything else we can help with)\?\s*$', re.I)
 QUOTED_REPLY = re.compile(r'^\s*>|^.*Original Message.*$|^.*\bOn\b.+\bwrote:.*$', re.I | re.M)
 CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){12,18}(?!\d)')
 # A secret is a labelled value: a code of 3-12 digits (grouped or not) a few words after the label, a token
@@ -2865,8 +2870,10 @@ def refund_mails(data, now, deadline, find=None, read=None):
                     # A wrong hold postpones a dispute, so any authored negation blocks it.
                     if REFUND_NEGATION.search(text):
                         continue
-                    if not any(not sentence.rstrip().endswith('?') and REFUND_DONE.search(sentence)
-                               for sentence in re.split(r'(?<=[.!?;])\s+', text)):
+                    # Abbreviations can look like sentence endings inside a question. Only
+                    # a neutral trailing follow-up may be ignored; other questions block a hold.
+                    confirmation = REFUND_FOLLOWUP.sub('', text)
+                    if '?' in confirmation or REFUND_QUERY.search(confirmation) or not REFUND_DONE.search(confirmation):
                         continue
                     changes = {'state': f'refund promised: {merchant} mail {mailed:%a %d %b %H:%M} says it was processed'}
                     due = mailed + dt.timedelta(days=7)

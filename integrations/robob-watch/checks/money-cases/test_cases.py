@@ -1325,7 +1325,10 @@ class Questions(Base):
                  'refund refunded', 'refund sent', 'processed the refund', 'issued your refund',
                  'initiated refund', 'credited back to your card', 'credited back to your account',
                  'We processed the refund. Have you received it?',
-                 'Your refund was processed by Example Inc. Have you received it?')
+                 'Your refund was processed by Example Inc. Have you received it?',
+                 'We have initiated refund. Have you received it?',
+                 'We confirm that your refund was processed.',
+                 'Your refund was processed by Mr. Smith. Is there anything else we can help with?')
         for i, body in enumerate(forms):
             with self.subTest(body=body):
                 self.data = self.tmp / str(i)
@@ -1373,6 +1376,40 @@ class Questions(Base):
                     self.assertEqual(case['refund_mail']['id'], REFUND['id'])
                 else:
                     self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_questions_with_abbreviations_leave_case_and_notice_unchanged(self):
+        bodies = (
+            'Was your refund processed by Mr. Smith?',
+            'Is your refund processed by Dr. Smith?',
+            'Was your refund processed by Mr. I. Smith of Example Inc.?',
+            'Did Mr. Smith confirm that your refund was processed?',
+            'Could you confirm that Mr. Smith processed the refund?',
+            'What shows that your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Will Smith?',
+            'Refund processed by Mr. Smith?',
+            'Hello, was your refund processed by Mr. Smith?',
+            'Hello,\nWas your refund processed by Mr. Smith?',
+            'Please confirm whether your refund was processed by Mr. Smith.',
+            'Let us know if your refund was processed by Mr. Smith.',
+            'Our agent asks if your refund was processed by Mr. Smith.',
+            'We are wondering if your refund was processed by Mr. Smith.',
+            'Please advise if your refund was processed by Mr. Smith.',
+            'Was your refund processed by Mr. Smith? Have you received it?',
+            'Was your refund processed by Mr. Smith. Have you received it?',
+            'Have you received it?',
+            'Your request is pending. Have you received it?',
+        )
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'question-{i}'
+                self.wd = self.tmp / f'question-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
 
     def test_refund_negation_blocks_a_later_affirmation_across_punctuation(self):
         # Deliberate: any negation in the merchant's own text blocks the hold.
