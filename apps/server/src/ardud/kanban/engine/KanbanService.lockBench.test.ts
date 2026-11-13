@@ -92,6 +92,7 @@ const makeThreads = Effect.gen(function* () {
         updatedAt: at,
         quietSince: at,
         runStartedAt: thread.running ? at : null,
+        lastActivityAt: thread.running ? at : null,
         backgroundWork: 0,
         prWatches: 0,
         prs: [],
@@ -113,6 +114,7 @@ const makeThreads = Effect.gen(function* () {
       lastFailure: () => quick(null),
       findLastFailure: () => quick(null),
       latestRun: () => quick(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => quick(null),
       // A launch reads and writes thread state several times (receipts, projection, transcript).
       launch: (input) =>
@@ -134,6 +136,7 @@ const makeThreads = Effect.gen(function* () {
             thread.running = true;
           }
         }),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>

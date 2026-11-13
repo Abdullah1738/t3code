@@ -1,0 +1,49 @@
+{
+  "case_number": 24,
+  "reporter_id": "robob982",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:477d36b9-924b-41e6-a62f-15e26f1a0199",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 134224,
+    "sources": [
+      {
+        "denial_index": 278,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T10-06-41-01a1ce5d-93a1-73e0-8fc9-e81f84b15762.jsonl",
+        "timestamp": "2026-11-12T06:12:47.340Z",
+        "call_id": "call_329be51b415649f98292f6aa5ae94835",
+        "command_index": 0
+      },
+      {
+        "denial_index": 279,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T10-06-41-01a1ce5d-93a1-73e0-8fc9-e81f84b15762.jsonl",
+        "timestamp": "2026-11-12T06:14:15.014Z",
+        "call_id": "call_6fbe8fca98b2482d89e1afa01dd8ab60",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "node --check /Users/ardud/checkouts/install-prequit-982/apps/desktop/scripts/install-robob-fast.mjs; git diff --stat -- apps/desktop/scripts packages/shared/src/ownedProcessTree.ts",
+      "workdir": "/Users/ardud/checkouts/install-prequit-982",
+      "sha256": "2e725bffe0596f43acc986e4093616de85810c2aa5b31669ed4cebaeec515b8b",
+      "label": "node --check"
+    },
+    {
+      "cmd": "node --test /Users/ardud/checkouts/install-prequit-982/apps/desktop/scripts/install-robob-fast.test.mjs",
+      "workdir": "/Users/ardud/checkouts/install-prequit-982",
+      "sha256": "4c9cd986c68a0e7da4230ef8569bf01f95450114f8adca1940e1c298e0fa97ba",
+      "expected": "live-database-script",
+      "label": "node --test"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/t3code-fork",
+  "original_refusal": "statev2 guard: this command was NOT run (owner incident 2026-11-05).\nShell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\nUse Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, or server traces instead. Work on an existing isolated copy. Creating a copy or VACUUM INTO also reads the live file and needs Abdullah's approval first.\nIf only the database can answer, report the exact queries and stop..",
+  "source_files": {
+    "/Users/ardud/checkouts/install-prequit-982/apps/desktop/scripts/install-robob-fast.mjs": "apps/desktop/scripts/install-robob-fast.mjs",
+    "/Users/ardud/checkouts/install-prequit-982/apps/desktop/scripts/install-robob-fast.test.mjs": "apps/desktop/scripts/install-robob-fast.test.mjs"
+  }
+}

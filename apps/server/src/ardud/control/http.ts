@@ -1,3 +1,4 @@
+import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 import { continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
@@ -1701,14 +1702,29 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, ...issued });
   });
 
+  const diagnostics = yield* Effect.serviceOption(DatabaseDiagnostics.DatabaseDiagnostics);
   const health = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const sequence = yield* eventStore
       .latestAgentSequence()
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      .pipe(
+        Effect.catch((cause) =>
+          Option.isSome(diagnostics)
+            ? diagnostics.value.health.pipe(
+                Effect.flatMap((health) =>
+                  health.status === "healthy"
+                    ? Effect.fail(fail("internal", errorDetail(cause)))
+                    : Effect.succeed(null),
+                ),
+              )
+            : Effect.fail(fail("internal", errorDetail(cause))),
+        ),
+      );
     return json({
       ok: true,
-      status: "healthy",
+      ...(Option.isSome(diagnostics)
+        ? yield* diagnostics.value.health
+        : { status: "healthy", databaseErrors: [] }),
       sequence,
       time: DateTime.formatIso(yield* DateTime.now),
       buildCommit,

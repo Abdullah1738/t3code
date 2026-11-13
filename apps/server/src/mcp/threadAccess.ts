@@ -15,6 +15,7 @@ import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationMcp from "./OrchestratorMcpService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpDeadline from "./McpDeadline.ts";
 
 export const unavailable = () =>
   new OrchestratorMcpFailure({
@@ -74,9 +75,16 @@ export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
       },
     } satisfies Caller;
   }
+  const threadId = scope.thread.threadId;
   const caller = yield* threads
-    .getThreadShell(scope.thread.threadId)
-    .pipe(Effect.mapError(unavailable));
+    .getThreadShell(threadId)
+    .pipe(Effect.mapError(unavailable), (effect) =>
+      McpDeadline.withDeadline(effect, {
+        code: "caller_unresolved",
+        threadId,
+        stage: "caller",
+      }),
+    );
   if (caller === null || caller.deletedAt !== null) {
     return yield* new OrchestratorMcpFailure({
       code: "thread_not_found",

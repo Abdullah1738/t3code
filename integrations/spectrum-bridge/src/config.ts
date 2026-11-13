@@ -34,7 +34,7 @@ export interface Config {
   guestEffort?: "minimal" | "low" | "medium" | "high";
   /** iMessage app that renders Sendblue app cards; loadConfig fills in the Spectrum identity. */
   cardApp?: CardApp;
-  /** Chat slugs whose cards render live in the bubble; every other chat gets static cards. Default ["owner"]. */
+  /** Chat slugs opting into live extension bubbles; static image cards are the default for every chat. */
   liveCardChats?: string[];
   /** Stable public origin for shares (a named Cloudflare tunnel to 127.0.0.1:port); unset = quick tunnels. */
   shareOrigin?: { url: string; port: number };
@@ -69,7 +69,7 @@ export function shareOriginConfig(raw: unknown): { url: string; port: number } |
 }
 
 export function liveCardChatsConfig(raw: unknown): string[] {
-  if (raw === undefined) return ["owner"];
+  if (raw === undefined) return [];
   if (!Array.isArray(raw) || raw.length > 50 || !raw.every(slug => typeof slug === "string" && /^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug))) {
     throw new Error("Invalid bridge configuration");
   }

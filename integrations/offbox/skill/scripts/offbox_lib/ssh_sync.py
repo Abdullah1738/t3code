@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 import os
+import signal
+from functools import lru_cache
 import re
 import secrets
 import shlex
@@ -16,10 +18,11 @@ import time
 import unicodedata
 from pathlib import Path
 
-from . import api, git_snapshot
+from . import api, capacity, common, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
+STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
 SYNC_PROGRESS_S = 60
 RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
@@ -74,7 +77,9 @@ def setup(box_id: str) -> Path:
             log(f"ssh_setup_retry {box_id} attempt={attempt + 1} {str(last)[:200]}")
             time.sleep(1 + attempt if left is None else min(1 + attempt, left))
     else:
-        raise OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
+        error = OffboxError(f"ssh key setup failed for {box_id}: {last}", outage=bool(last and last.outage))
+        error.status = getattr(last, 'status', None)
+        raise error
     ep = r.get("sshEndpoint")
     if ep:
         host, port = ep.rsplit(":", 1)
@@ -139,13 +144,36 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
 
 
 def close_master(box_id: str) -> None:
+    path = None
+    try:
+        if not cfg_path(box_id).exists():
+            return
+        left = api.left()
+        timeout = 2 if left is None else min(2, max(0, left))
+        if timeout > 0:
+            # Resolve %C before exit can exhaust the budget, without connecting to the remote machine.
+            config = subprocess.run(ssh_base(box_id) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
+            if config.returncode == 0:
+                for line in config.stdout.splitlines():
+                    if line.startswith("controlpath "):
+                        candidate = Path(line.split(" ", 1)[1])
+                        if candidate.parent.resolve() == CM_DIR.resolve():
+                            path = candidate
+                        break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     try:
         left = api.left()
         timeout = 10 if left is None else min(10, max(0, left))
-        if timeout > 0 and cfg_path(box_id).exists():
+        if timeout > 0:
             subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         pass  # closing a cached connection must not undo a confirmed box stop
+    try:
+        if path is not None and path.is_socket():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)
@@ -549,15 +577,16 @@ def _stats(out: str) -> dict:
 
 
 def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeout: float = 3600,
-         includes: list[str] | None = None, seed_candidates: list[str] | None = None) -> dict:
+         includes: list[str] | None = None, seed_candidates: list[str] | None = None,
+         run_id: str | None = None) -> dict:
     """Mirror root/ to ~/<remote_dir>/ on the box. Deletes remote files removed locally (inside remote_dir only)."""
     if str(root) in ("/", str(Path.home())):
         raise OffboxError(f"refusing to sync {root} (not a repo). cd into a repo first.", code=2)
     t = time.time()
     with git_snapshot.snapshot(root) if with_git else nullcontext(None) as gitdir:
-        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates)
+        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
         if gitdir is not None:
-            extra = _push_git(box_id, gitdir, remote_dir, timeout)
+            extra = _push_git(box_id, gitdir, remote_dir, timeout, run_id=run_id)
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
@@ -580,25 +609,294 @@ def _endpoint(box_id: str) -> str | None:
     return f"{host[1]}:{port[1]}" if host and port else None
 
 
-def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = None):
-    for attempt in range(len(RETRY_PAUSES) + 1):
-        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
-                           timeout=timeout, input=input)
+@lru_cache(maxsize=8)
+def _progress_args(binary: str) -> tuple[str, ...]:
+    try:
+        p = subprocess.run([binary, "--version"], capture_output=True, timeout=5)
+        if re.search(rb"^rsync\s+version 3\.", p.stdout):
+            return ("--info=progress2", "--outbuf=N")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ()
+
+
+PROGRESS = re.compile(r"(?m)(?:^|(?<=\r))[ \t]*[\d,]+[ \t]+\d+%[ \t]+[^\r\n]*(?:\r\n|[\r\n]|$)")
+
+
+def _without_progress(output: str) -> str:
+    return PROGRESS.sub("", output).replace("\r\n", "\n").replace("\r", "\n")
+
+
+class SyncStalled(Exception):
+    pass
+
+
+def _kill_rsync(proc) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # An outer prepare deadline can interrupt the grace wait. It must still kill every group member.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
+    """One attempt with independent pipe draining and a wall/idle bound, reusable by artifact pulls."""
+    started = last = time.monotonic()
+    chunks = [[], []]
+    count, sent, source_sent = 0, 0, False
+    lock = threading.Lock()
+    changed = threading.Event()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+
+    def read(stream, index):
+        nonlocal last, count, sent, source_sent
+        pending = b""
+        try:
+            while data := os.read(stream.fileno(), 65536):
+                with lock:
+                    chunks[index].append(data)
+                    count += len(data)
+                    last = time.monotonic()
+                    if index == 0:
+                        pending += data
+                        parts = re.split(rb"[\r\n]", pending)
+                        pending = parts.pop()[-4096:]
+                        # Progress frames can end at the next CR rather than at this read's boundary.
+                        for line in [*parts, pending]:
+                            m = re.match(rb"\s*([\d,]+)\s+(\d+)%\s+", line)
+                            if m:
+                                sent = int(m[1].replace(b",", b""))
+                                # 100% during an incremental scan can still discover more files.
+                                source_sent = m[2] == b"100" and b"to-chk=0/" in line
+                changed.set()
+        finally:
+            stream.close()
+            changed.set()
+
+    def write():
+        try:
+            data = memoryview(input.encode("utf-8", "surrogateescape"))
+            while data:
+                data = data[os.write(proc.stdin.fileno(), data):]
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            proc.stdin.close()
+
+    readers = [threading.Thread(target=read, args=(stream, i), daemon=True)
+               for i, stream in enumerate((proc.stdout, proc.stderr))]
+    for thread in readers:
+        thread.start()
+    writer = threading.Thread(target=write, daemon=True) if input is not None else None
+    if writer:
+        writer.start()
+    report_at = started + SYNC_PROGRESS_S
+    try:
+        while proc.poll() is None or any(t.is_alive() for t in readers):
+            now = time.monotonic()
+            with lock:
+                idle, seen, transferred, complete = now - last, count, sent, source_sent
+            if now - started >= timeout:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if idle >= STALL_S:
+                if on_stall:
+                    on_stall(proc, seen, complete)
+                if time.monotonic() - started >= timeout:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                raise SyncStalled()
+            if on_progress and now >= report_at:
+                on_progress(seen, transferred, complete)
+                report_at = now + SYNC_PROGRESS_S
+            changed.wait(min(.05, max(0, timeout - (now - started)), max(0, STALL_S - idle)))
+            changed.clear()
+        proc.wait()
+    except BaseException:
+        _kill_rsync(proc)
+        raise
+    finally:
+        for thread in [*readers, *([writer] if writer else [])]:
+            thread.join(timeout=.2)
+    out, err = (b"".join(c).decode("utf-8", "surrogateescape") for c in chunks)
+    return subprocess.CompletedProcess(cmd, proc.returncode, _without_progress(out), err)
+
+
+def _bounded_command(cmd, timeout, *, stdout=None):
+    # A pipe's communicate()/wait() cleanup can itself hang after SIGKILL on an uninterruptible filesystem call.
+    # A temporary file lets us abandon an unreaped helper without waiting for EOF or blocking a reader thread.
+    with tempfile.TemporaryFile() if stdout is None else nullcontext(stdout) as output:
+        proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return None
+            if stdout is None:
+                output.seek(0)
+                data = output.read()
+            else:
+                data = b""
+            return subprocess.CompletedProcess(cmd, proc.returncode, data, b"")
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=.1)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+def _source_fs(root: Path | None) -> str:
+    # A subprocess keeps statfs of a wedged mount outside the watchdog's own thread.
+    if root is None or sys.platform != "darwin":
+        return "unknown"
+    try:
+        script = ("import ctypes,os,sys; b=ctypes.create_string_buffer(4096); "
+                  "rc=ctypes.CDLL(None).statfs(os.fsencode(sys.argv[1]),b); "
+                  "print(b.raw[72:88].split(bytes([0]))[0].decode() if rc==0 else 'unknown')")
+        p = _bounded_command([sys.executable, "-c", script, str(root)], 2)
+        return p.stdout.decode(errors="replace").strip().lower() if p is not None and p.returncode == 0 else "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
+    try:
+        # A separate connection must not wait behind the stalled multiplexed session.
+        cmd = ssh_base(box_id) + ["-o", "ControlMaster=no", "-o", "ControlPath=none", box_id,
+                                  "ps -eo pid,ppid,stat,wchan:32,etime,comm,args"]
+        p = _bounded_command(cmd, timeout)
+        if p is None:
+            return "remote_probe=unavailable", None
+        if p.returncode:
+            return "remote_probe=failed", None
+    except (OffboxError, OSError, subprocess.TimeoutExpired):
+        return "remote_probe=unavailable", None
+    states, prune, blocked = [], [], None
+    for line in p.stdout.decode(errors="replace").splitlines():
+        cols = line.split(None, 6)
+        if len(cols) < 6:
+            continue
+        _, _, state, wchan, _, comm = cols[:6]
+        if comm == "rsync":
+            states.append(f"remote_rsync_stat={state} wchan={wchan}")
+            if wchan == "request_wait_answer" or wchan.startswith("fuse_"):
+                blocked = "box workspace filesystem (FUSE) blocked"
+            elif state.startswith("D") and blocked is None:
+                blocked = "box disk I/O blocked (remote rsync in D state)"
+        if len(cols) > 6 and (".offbox/trash" in cols[6] or "prune-v2-" in cols[6]):
+            prune.append(line.strip())
+    return f"{' '.join(states) or 'remote_rsync_stat=none'} prune_workers={prune!r}", blocked
+
+
+def _sync_wait(source_sent: bool, blocked: str | None = None, sample: str = "") -> str:
+    if blocked:
+        return f"remote receiver blocked: {blocked}"
+    if source_sent:
+        return "source sent; waiting on box"
+    if re.search(r"\b(?:read_ndx\w*|read_a_msg|write_buf)\b", sample):
+        return "waiting on remote receiver"
+    if "map_ptr" in sample and re.search(r"\b(?:read|pread|stalled_read)\b", sample):
+        return "local source read stalled"
+    return "waiting for transfer progress"
+
+
+def _stall_diagnosis(box_id, pid, source, run_id, phase, count, timeout, source_sent=False):
+    deadline = time.monotonic() + timeout
+    fs = _source_fs(source) if timeout >= 2 else "unknown"
+    sample = ""
+    if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id) and sys.platform == "darwin" and Path("/usr/bin/sample").exists():
+        try:
+            path = common.LOGS_DIR / f"{run_id}.stall.sample"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a+b") as out:
+                start = out.tell()
+                _bounded_command(["/usr/bin/sample", str(pid), "2"],
+                                 min(5, max(.001, deadline - time.monotonic())), stdout=out)
+                out.seek(start)
+                sample = out.read(65536).decode(errors="replace")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    remote, blocked = _remote_stall(box_id, min(10, max(.001, deadline - time.monotonic())))
+    wait = _sync_wait(source_sent, blocked, sample)
+    log(f"push_stall {box_id} idle={STALL_S:g}s pass={phase} src_fs={fs} bytes_seen={count} {remote} wait={wait!r}")
+    return {"src_fs": fs, "blocked": blocked, "wait": wait}
+
+
+def _refresh_master(box_id, *, close=True, refresh=True):
+    for action in ([close_master] if close else []) + ([setup] if refresh else []):
+        try:
+            action(box_id)
+        except (OffboxError, OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = None, *,
+               source: Path | None = None, phase: str = "files1", run_id: str | None = None):
+    deadline = time.monotonic() + timeout
+    attempt, stalls = 0, 0
+    cmd = [cmd[0], *_progress_args(cmd[0]), *cmd[1:]]
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        diagnosis = {}
+
+        def stalled(proc, count, source_sent):
+            diagnosis.update(_stall_diagnosis(box_id, proc.pid, source, run_id, phase, count,
+                                             min(15, max(0, deadline - time.monotonic())), source_sent))
+
+        def progress(count, sent, source_sent):
+            common.say(f"still syncing -> {box_id} pass={phase} bytes_sent={sent} bytes_seen={count}; "
+                       f"{_sync_wait(source_sent)}")
+
+        try:
+            p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress)
+        except SyncStalled:
+            with api.budget(max(0, deadline - time.monotonic())):
+                _refresh_master(box_id, refresh=False)
+            source_note = "; source is on nfs (ovnfs checkout)" if diagnosis.get("src_fs") == "nfs" else ""
+            reason = diagnosis.get("blocked")
+            wait = diagnosis.get("wait", "waiting for transfer progress")
+            if reason or stalls:
+                from . import lease
+                why = reason or f"push stalled twice (pass={phase})"
+                lease.quarantine(box_id, why)
+                detail = wait if reason else f"no data for {STALL_S:g}s, twice; {wait}"
+                raise OffboxError(f"rsync to {box_id} stalled: {detail}{source_note}; box {box_id} quarantined; "
+                                  "the next run picks another box. Nothing ran.") from None
+            common.say(f"rsync to {box_id} stalled (no data for {STALL_S:g}s; {wait}{source_note}), "
+                       "retrying once with a fresh ssh connection")
+            with api.budget(max(0, deadline - time.monotonic())):
+                _refresh_master(box_id, close=False)
+            stalls += 1
+            continue
         if p.returncode not in (255, 12):
             return p
         old = _endpoint(box_id)
         if attempt < len(RETRY_PAUSES):
-            try:
-                close_master(box_id)
-            except (OffboxError, OSError, subprocess.TimeoutExpired):
-                pass
-            try:
-                setup(box_id)
-            except (OffboxError, OSError, subprocess.TimeoutExpired):
-                pass
+            with api.budget(max(0, deadline - time.monotonic())):
+                _refresh_master(box_id)
         # sshkey only returns connection details. Read state even when refreshing those details failed.
         try:
-            state = (api.get(box_id) or {}).get("state")
+            with api.budget(max(0, deadline - time.monotonic())):
+                state = (api.get(box_id) or {}).get("state")
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             state = None
         if state and state not in api.LIVE_STATES:
@@ -609,13 +907,13 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         new = _endpoint(box_id)
         endpoint = f" endpoint={old} -> {new}" if old and new and old != new else ""
         pause = RETRY_PAUSES[attempt]
-        print(f"offbox: rsync exit {p.returncode} to {box_id}, retry {attempt + 1}/3 in {pause}s",
-              file=sys.stderr, flush=True)
+        common.say(f"rsync exit {p.returncode} to {box_id}, retry {attempt + 1}/3 in {pause}s")
         log(f"push_retry {box_id} exit={p.returncode} try={attempt + 1}{endpoint}")
-        time.sleep(pause)
+        time.sleep(min(pause, max(0, deadline - time.monotonic())))
+        attempt += 1
 
 
-def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dict:
+def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float, *, run_id: str | None = None) -> dict:
     # Stage independently of a previous .git file/symlink/directory. A partial
     # metadata transfer must fail the run rather than leave usable stale history.
     staging = f"{remote_dir}/.offbox-git-{secrets.token_hex(8)}"
@@ -625,7 +923,7 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
         cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "--timeout=120",
                "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
                f"{gitdir}/", f"{box_id}:{staging}/"]
-        p = _run_rsync(box_id, cmd, timeout)
+        p = _run_rsync(box_id, cmd, timeout, source=gitdir, phase="git", run_id=run_id)
         if p.returncode != 0:
             # Keep rsync's stderr: a dead mount reported here must still classify as dead-mount.
             raise OffboxError(f"Git history sync to {box_id} failed ({p.returncode}): {p.stderr.strip()[-600:]}")
@@ -633,7 +931,7 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float) -> dic
         return _stats(p.stdout)
     finally:
         try:
-            ssh(box_id, f"rm -rf -- {qstage}", check=True)
+            ssh(box_id, f"rm -rf -- {qstage}", check=True, timeout=5)
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             log(f"push_git cleanup failed {box_id} {staging}")
 
@@ -658,42 +956,16 @@ def _seed(box_id: str, remote_dir: str, candidates: list[str]) -> tuple[bool, st
     return True, sibling
 
 
-@contextmanager
-def _sync_progress(root: Path, box_id: str, first: bool, sibling: str | None):
-    stop = threading.Event()
-    started = time.monotonic()
-
-    def report():
-        while not stop.wait(SYNC_PROGRESS_S):
-            detail = ", first sync of this checkout" if first else ""
-            if sibling:
-                detail += f", seeded from {sibling}"
-            try:
-                print(f"offbox: still syncing {root.name} -> {box_id} ({int(time.monotonic() - started)} s{detail})",
-                      file=sys.stderr, flush=True)
-            except (OSError, ValueError):
-                return
-
-    thread = threading.Thread(target=report, daemon=True)
-    thread.start()
-    try:
-        yield
-    finally:
-        stop.set()
-        thread.join()
-
-
 def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                includes: list[str] | None, seed_candidates: list[str] | None = None) -> dict:
+                includes: list[str] | None, seed_candidates: list[str] | None = None, run_id: str | None = None) -> dict:
     first, sibling = _seed(box_id, remote_dir, seed_candidates) if seed_candidates is not None else (False, None)
     if sibling:
         log(f"push_seed {box_id} {remote_dir} from={sibling}")
-    with _sync_progress(root, box_id, first, sibling):
-        return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling)
+    return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling, run_id)
 
 
 def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                      includes: list[str] | None, sibling: str | None) -> dict:
+                      includes: list[str] | None, sibling: str | None, run_id: str | None = None) -> dict:
     ssh_cmd = " ".join(shlex.quote(x) for x in ssh_base(box_id))
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
@@ -701,7 +973,7 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
         cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
-    out = _rsync(box_id, remote_dir, cmd, timeout)
+    out = _rsync(box_id, remote_dir, cmd, timeout, source=root, phase="files1", run_id=run_id)
     st = _stats(out)
     # A file git tracks is part of the checkout the command expects, whatever .gitignore says. Pass 2 sends the
     # ones pass 1 skipped, by name and without --delete; pass 1 excludes them, which also keeps them from --delete.
@@ -714,7 +986,8 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
             # Files go by name here, so a dir rule needs its /** form too (`- .aws/` alone lets .aws/creds through).
             cmd2 += [f"--filter=- {x.rstrip('/')}", f"--filter=- {x.rstrip('/')}/**"]
         cmd2 += [f"{root}/", f"{box_id}:{remote_dir}/"]
-        st2 = _stats(_rsync(box_id, remote_dir, cmd2, timeout, files="\0".join(extra)))
+        st2 = _stats(_rsync(box_id, remote_dir, cmd2, timeout, files="\0".join(extra),
+                            source=root, phase="files2", run_id=run_id))
         for k in ("sent", "received", "files", "xfer"):
             if k in st2:
                 st[k] = st.get(k, 0) + st2[k]
@@ -725,10 +998,11 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
     return st
 
 
-def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: str | None = None) -> str:
+def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: str | None = None, *,
+           source: Path | None = None, phase: str = "files1", run_id: str | None = None) -> str:
     """One push rsync: reclaim box-owned files once, skip unreadable local files, else raise. Returns stdout."""
     def run():
-        return _run_rsync(box_id, cmd, timeout, input=files)
+        return _run_rsync(box_id, cmd, timeout, input=files, source=source, phase=phase, run_id=run_id)
     p = run()
     if p.returncode == 23 and (denied := _receiver_denied(p.stderr)):
         import sys

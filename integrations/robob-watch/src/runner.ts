@@ -3,7 +3,7 @@ import { join } from "node:path";
 import {
   alert, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -225,6 +225,7 @@ async function tickOne(id: string): Promise<void> {
       }
     }
     fresh.consecutive_failures += 1;
+    fresh.failure_alerted = false;
     if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
     fresh.last_error = timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
     fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
@@ -238,10 +239,10 @@ async function tickOne(id: string): Promise<void> {
       return;
     }
     saveState(id, fresh);
-    if (watcher.max_consecutive_failures === 0 && shouldAlert(fresh, timedOut)) {
+    {
       const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
-      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} times in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
-        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}`, "error");
+      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
+        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
       const current = loadState(id);
       if (!loadWatcher(id) || current.failing_since !== fresh.failing_since) {
         log(id, "failure notice completed after resume/remove; state kept");

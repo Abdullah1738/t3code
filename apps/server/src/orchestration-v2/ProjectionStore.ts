@@ -354,14 +354,16 @@ const UNFINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
   "waiting",
 ]);
 /** In-memory twin of the SQL `recentRunLimit` filter. */
-const recentRuns = <T extends ReadonlyArray<ProjectionRun>>(runs: T, limit: number | undefined): T => {
+const recentRuns = <T extends ReadonlyArray<ProjectionRun>>(
+  runs: T,
+  limit: number | undefined,
+): T => {
   if (limit === undefined) return runs;
-  const floor = runs
-    .map((run) => run.ordinal)
-    .toSorted((left, right) => right - left)[Math.max(0, Math.floor(limit) - 1)];
+  const floor = runs.map((run) => run.ordinal).toSorted((left, right) => right - left)[
+    Math.max(0, Math.floor(limit) - 1)
+  ];
   return runs.filter(
-    (run) =>
-      UNFINISHED_RUN_STATUSES.has(run.status) || floor === undefined || run.ordinal >= floor,
+    (run) => UNFINISHED_RUN_STATUSES.has(run.status) || floor === undefined || run.ordinal >= floor,
   ) as unknown as T;
 };
 const settledLeafNodeKinds: ReadonlySet<ProjectionNode["kind"]> = new Set([
@@ -815,6 +817,11 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...(current.lastActivityAt !== undefined &&
+    (next.lastActivityAt === undefined ||
+      DateTime.toEpochMillis(current.lastActivityAt) > DateTime.toEpochMillis(next.lastActivityAt))
+      ? { lastActivityAt: current.lastActivityAt }
+      : {}),
     ...(next.delegatedTaskStall === undefined && current.delegatedTaskStall !== undefined
       ? { delegatedTaskStall: current.delegatedTaskStall }
       : {}),
@@ -901,6 +908,9 @@ export function applyToProjection(
   };
 
   switch (event.type) {
+    case "thread.item-redacted":
+      // Source events are scrubbed before replay reaches this audit record.
+      return base;
     case "thread.pull-request-link-updated":
       return {
         ...projection,
@@ -1036,6 +1046,14 @@ export function applyToProjection(
     case "turn-item.updated":
       return withLocalVisibleTurnItems({
         ...base,
+        runs: base.runs.map((run) =>
+          run.id === event.payload.runId &&
+          (run.lastActivityAt === undefined ||
+            DateTime.toEpochMillis(run.lastActivityAt) <
+              DateTime.toEpochMillis(event.payload.updatedAt))
+            ? { ...run, lastActivityAt: event.payload.updatedAt }
+            : run,
+        ),
         turnItems: upsertById(base.turnItems, event.payload),
       });
     case "plan.updated":
@@ -2086,8 +2104,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     // For run upserts: a snapshot without `path` keeps the value another event recorded there.
     const keepRecordedRunField = (payload: Statement.Fragment, path: string) => sql`
       CASE
-        WHEN json_type(excluded.payload_json, ${path}) IS NULL
-          AND json_type(orchestration_v2_projection_runs.payload_json, ${path}) IS NOT NULL
+        WHEN (json_type(excluded.payload_json, ${path}) IS NULL
+          AND json_type(orchestration_v2_projection_runs.payload_json, ${path}) IS NOT NULL)
+          OR (${path === "$.lastActivityAt" ? 1 : 0} = 1 AND
+            json_extract(orchestration_v2_projection_runs.payload_json, ${path}) > COALESCE(json_extract(excluded.payload_json, ${path}), ''))
         THEN json_set(
           ${payload},
           ${path},
@@ -2223,10 +2243,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 completed_at = excluded.completed_at,
                 payload_json = ${keepRecordedRunField(
                   keepRecordedRunField(
-                    keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
-                    "$.delegatedTaskStall",
+                    keepRecordedRunField(
+                      keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                      "$.delegatedTaskStall",
+                    ),
+                    "$.restartCancelledBackgroundWork",
                   ),
-                  "$.restartCancelledBackgroundWork",
+                  "$.lastActivityAt",
                 )}
             `;
               break;
@@ -2787,6 +2810,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
             `;
+              // One run-row update keeps the board sweep independent of transcript size.
+              if (event.payload.runId !== null) {
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_set(payload_json, '$.lastActivityAt', ${stringField(payload, "updatedAt")})
+                  WHERE run_id = ${event.payload.runId}
+                    AND COALESCE(json_extract(payload_json, '$.lastActivityAt'), '') < ${stringField(payload, "updatedAt")}`;
+              }
               break;
             }
             case "checkpoint-scope.created": {

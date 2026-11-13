@@ -29,6 +29,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
+import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -55,6 +57,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { mapCodexModelCapabilities } from "../provider/CodexProvider.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -1368,6 +1371,190 @@ describe("OrchestratorMcpService provider resolution", () => {
     runtimeRequests: [],
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
+
+  it.effect.each(["caller", "catalog", "receipt", "selection", "dispatch"] as const)(
+    "delegateTask bounds a stalled %s phase and never dispatches after a preflight timeout",
+    (stage) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let dispatches = 0;
+        const stall = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.uninterruptible,
+        );
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () =>
+              stage === "caller"
+                ? stall.pipe(Effect.as(parentProjection([])))
+                : Effect.succeed(parentProjection([])),
+            hasReceipt: () =>
+              stage === "receipt" ? stall.pipe(Effect.as(false)) : Effect.succeed(false),
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatches++;
+              }).pipe(Effect.andThen(stall), Effect.as({ sequence: 1, storedEvents: [] } as never)),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: (stage === "catalog" ? stall : Effect.void).pipe(
+              Effect.as([
+                providerSnapshot({
+                  instanceId: codexInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  model: "gpt-5.4",
+                }),
+              ]),
+            ),
+          }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () =>
+              (stage === "selection" ? stall : Effect.void).pipe(Effect.as([codexInstanceId])),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const call = yield* service
+            .delegateTask(scope, {
+              task: "Check the diff",
+              mode: "async",
+              clientRequestId: "cancelled-first-run",
+            })
+            .pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust("30 seconds");
+          const completed = call.pollUnsafe();
+          yield* Deferred.succeed(release, undefined);
+          assert.isDefined(completed);
+          const error = yield* Fiber.join(call);
+          assert.equal(error.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
+          assert.include(error.message, parentThreadId);
+          if (stage !== "caller") assert.include(error.message, stage);
+          if (stage === "dispatch") assert.include(error.message, "cancelled-first-run");
+          assert.equal(dispatches, stage === "dispatch" ? 1 : 0);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
+  it.effect.each(["result", "wait", "wake_policy"] as const)(
+    "delegateTask recovers an accepted task when %s I/O stalls",
+    (stage) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const finished = yield* Deferred.make<void>();
+        const stall = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.uninterruptible,
+          Effect.ensuring(Deferred.succeed(finished, undefined)),
+        );
+        let accepted = false;
+        let slow = true;
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: codexInstanceId,
+          model: "gpt-5.4",
+          status: "running",
+          result: null,
+        };
+        const commandIds: string[] = [];
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (id) => {
+              const projection =
+                id === parentThreadId ? parentProjection(accepted ? [task] : []) : childProjection;
+              return accepted && slow && stage === "result"
+                ? stall.pipe(Effect.as(projection))
+                : Effect.succeed(projection);
+            },
+            hasReceipt: () => Effect.succeed(accepted),
+            getThreadEventSequence: () =>
+              stage === "wait" || stage === "wake_policy"
+                ? stall.pipe(Effect.as(0))
+                : Effect.succeed(0),
+            dispatch: (command) => {
+              if (command.type === "delegated_task.request") {
+                accepted = true;
+                commandIds.push(command.commandId);
+                return Effect.succeed({
+                  sequence: 1,
+                  storedEvents: [
+                    {
+                      sequence: 1,
+                      commandId: command.commandId,
+                      event: { type: "subagent.updated", payload: task },
+                    },
+                  ],
+                } as never);
+              }
+              return stage === "wake_policy" && slow
+                ? stall.pipe(Effect.as({ sequence: 1, storedEvents: [] } as never))
+                : Effect.succeed({ sequence: 1, storedEvents: [] } as never);
+            },
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const input = {
+            task: "Check diff",
+            mode: stage === "result" ? ("async" as const) : ("wait" as const),
+            timeoutMs: 1000,
+            clientRequestId: "recover-accepted",
+          };
+          const pending = yield* service
+            .delegateTask(scope, input)
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust("20 seconds");
+          const completed = pending.pollUnsafe();
+          slow = false;
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(finished);
+          assert.isDefined(completed);
+          const outcome = yield* Fiber.join(pending);
+          if (stage === "result") {
+            assert.isTrue(Exit.isFailure(outcome));
+            if (Exit.isFailure(outcome)) {
+              const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
+              assert.equal(error.code, "delegation_timeout");
+              assert.include(error.message, taskId);
+            }
+          } else {
+            assert.isTrue(Exit.isSuccess(outcome));
+            if (Exit.isSuccess(outcome)) {
+              assert.equal(outcome.value.taskId, taskId);
+              assert.isTrue(outcome.value.waitTimedOut);
+            }
+          }
+          // Replay uses the same command, even after an accepted call lost its response.
+          const retry = yield* service.delegateTask(scope, { ...input, mode: "async" });
+          assert.equal(retry.taskId, taskId);
+          assert.equal(commandIds.length, 2);
+          assert.equal(commandIds[0], commandIds[1]);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
 
   it.effect(
     "advertises orchestration capability from registered adapters rather than a driver allowlist",
@@ -3351,7 +3538,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         id,
         label: id,
         type: "select" as const,
-        options: ["high", "max"].map((value) => ({ id: value, label: value })),
+        options: ["high", "max", "xhigh"].map((value) => ({ id: value, label: value })),
       });
       const haiku = "claude-haiku-5-5";
       const legacyHaiku = `opus/cc/${haiku}`;
@@ -3384,6 +3571,21 @@ describe("OrchestratorMcpService provider resolution", () => {
           },
         ],
       );
+      const codexDescriptors = mapCodexModelCapabilities({
+        id: "gpt-6.1-sol",
+        model: "gpt-6.1-sol",
+        displayName: "Sol",
+        description: "",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "high",
+        additionalSpeedTiers: [],
+        supportedReasoningEfforts: ["high", "max", "xhigh"].map((reasoningEffort) => ({
+          reasoningEffort,
+          description: "",
+        })),
+        serviceTiers: [{ id: "priority", name: "Fast", description: "" }],
+      }).optionDescriptors!;
       const providers = [
         snapshot(
           claude,
@@ -3399,16 +3601,58 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           ],
         ),
-        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", [
-          select("reasoningEffort"),
-          select("serviceTier"),
+        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", codexDescriptors, [
+          {
+            slug: "gpt-6-astra",
+            name: "Astra",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: codexDescriptors,
+            },
+          },
         ]),
+        snapshot(ProviderInstanceId.make("codex-cu"), "codex", "gpt-6.1-terra", codexDescriptors),
       ];
       const maxVariant = [{ id: "variant", value: "max" }] as const;
       const maxEffort = [{ id: "effort", value: "max" }] as const;
       const nativeParent = { instanceId: claude, model: "claude-opus-5-5" };
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        ...(
+          [
+            ["opus/cx/gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+            ["opus/cx/gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+            ["opus/gpt-6-astra", "gpt-6-astra", "codex"],
+            ["layso/gpt-6-astra", "gpt-6-astra", "codex"],
+          ] as const
+        ).flatMap(([source, model, instanceId]) =>
+          (["variant", "reasoningEffort"] as const).flatMap((effortId) =>
+            (["array", "record"] as const).map((shape) => ({
+              name: `preserves serviceTier on ${source} remap with ${effortId} ${shape}`,
+              mode: "apply" as const,
+              parent: nativeParent,
+              target: {
+                providerInstanceId: opencode,
+                model: source,
+                options:
+                  shape === "record"
+                    ? { [effortId]: "xhigh", serviceTier: "default" }
+                    : [
+                        { id: effortId, value: "xhigh" },
+                        { id: "serviceTier", value: "default" },
+                      ],
+              },
+              expected: {
+                instanceId: ProviderInstanceId.make(instanceId),
+                model,
+                options: [
+                  { id: "reasoningEffort", value: "xhigh" },
+                  { id: "serviceTier", value: "default" },
+                ],
+              },
+            })),
+          ),
+        ),
         {
           name: "reports an explicit legacy Haiku request",
           mode: "apply",
@@ -3632,7 +3876,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "variant", value: "high" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
           target: { options: { reasoningEffort: "max" } },
@@ -3641,7 +3885,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "reasoningEffort", value: "max" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
         },
@@ -3800,7 +4044,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                 : providers
               : [legacyProvider, ...providers],
           ),
-          adapterRegistryLayer([opencode, claude, codexInstanceId]),
+          adapterRegistryLayer([
+            opencode,
+            claude,
+            codexInstanceId,
+            ProviderInstanceId.make("codex-cu"),
+          ]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
@@ -3824,6 +4073,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.deepEqual(commands[0]?.modelSelection, testCase.expected, testCase.name);
             assert.equal(result.providerInstanceId, testCase.expected.instanceId, testCase.name);
             assert.equal(result.model, testCase.expected.model, testCase.name);
+            assert.deepEqual(
+              result.options,
+              commands[0]?.modelSelection.options ?? [],
+              testCase.name,
+            );
             if ("routingRequested" in testCase) {
               if (testCase.routingRequested === null) {
                 assert.isUndefined(result.selectionRouting, testCase.name);

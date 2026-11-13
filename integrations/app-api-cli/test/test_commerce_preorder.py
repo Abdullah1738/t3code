@@ -102,8 +102,11 @@ class PreorderFlowTests(unittest.TestCase):
             c.journal.observe(flow,'subscription',outcome='PREORDER_INTENT_RECEIVED',evidence_hash=intent)
             c.journal.consume(flow,'prepay',kind='prepay',payment_intent_hash=intent,**args)
             client=Mock();client._call.return_value=Snapshot({}, {'payment_status':'payment_confirmed','redirect_required':False},time.time())
-            with patch('commerce_nownow.reader',return_value=client):result=p.recover(flow,auth=Mock(),vault=vault)
-            self.assertEqual(result['journal_state'],'FENCED')
+            with patch('commerce_nownow.reader',return_value=client):
+                with self.assertRaisesRegex(c.journal.JournalError, 'NOWNOW_PREORDER_RECONCILIATION_UNPROVEN'):
+                    p.recover(flow,auth=Mock(),vault=vault)
+            self.assertEqual(c.journal.inspect(flow)['state'],'FENCED')
+            self.assertEqual(client._call.call_count, 1)
             with self.assertRaises(c.journal.JournalError):c.journal.consume(flow,'place',kind='place',**args)
             self.assertEqual(c.journal.inspect(flow)['reserved_minor'],2500)
 

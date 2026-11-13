@@ -12,7 +12,11 @@ import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
+// Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
+export const READ_CHECK_FAILED = 75;
 const exec = promisify(execFile);
+export const INSTALL_DATABASE_FILE = /^(statev2|boards)\.sqlite(?:-wal)?$/;
+
 export const INSTALL_PLAN = [
   "pre-stage",
   "signature",
@@ -24,7 +28,9 @@ export const INSTALL_PLAN = [
   "swap",
   "launch",
   "read-ready",
+  "read-check (5 healthy minutes, up to 30 minutes)",
   "continuation-report",
+  "prune-old-backups",
 ];
 
 // Robob builds are Developer ID signed but not notarized, so `spctl --assess`
@@ -81,6 +87,83 @@ export async function install(ops, { rollback = false } = {}) {
   await ops.readReady();
   await ops.phase("ready");
   await ops.report();
+  if (ops.prune)
+    await ops.prune().catch((error) => ops.phase("prune_failed", { error: String(error) }));
+}
+
+export function installCommandTimeout(timeout, quitAt, startupComplete, now = Date.now()) {
+  const remaining =
+    quitAt === undefined || startupComplete ? timeout : Math.min(timeout, 180_000 - (now - quitAt));
+  if (remaining <= 0) throw new Error("Install exceeded the 3 minute limit");
+  return remaining;
+}
+
+export async function checkSustainedReads({
+  env = process.env,
+  run = exec,
+  output = (text) => process.stdout.write(text),
+  now = () => new Date(),
+} = {}) {
+  const started = now();
+  try {
+    const result = await run(
+      env.ROBOB_READ_CHECK || path.join(os.homedir(), ".local/bin/robob-read-watchdog"),
+      ["--sustain", "300", "--every", "30", "--give-up", "1800"],
+      // Allow the final in-flight probe to finish after the watchdog's 30 minute bound.
+      { timeout: 1_840_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20, env },
+    );
+    if (result.stdout) output(result.stdout);
+    if (result.stderr) output(result.stderr);
+  } catch (cause) {
+    const diagnostic = `${cause.stdout ?? ""}${cause.stderr ?? ""}`;
+    if (diagnostic) output(diagnostic);
+    const match = diagnostic.match(
+      /^installed but reads still failing since ((?:[01]\d|2[0-3]):[0-5]\d) .+$/m,
+    );
+    const since = match?.[1] ?? started.toTimeString().slice(0, 5);
+    const line = match?.[0] ?? `installed but reads still failing since ${since} (read check could not complete)`;
+    if (!match) output(`${line}\n${cause.message}\n`);
+    throw Object.assign(new Error(line, { cause }), { exitCode: READ_CHECK_FAILED, since });
+  }
+}
+
+export async function reportInstall({
+  report,
+  phase,
+  readCheck = checkSustainedReads,
+  notify,
+  stamp,
+  log = process.env.ROBOB_INSTALL_LOG || "installer stdout",
+  elapsedSeconds,
+}) {
+  await phase("listening", { at: report.listeningAt });
+  await phase("command_ready", { at: report.commandReadyAt });
+  await phase("continuations_queued", { at: report.completedAt, report });
+  if (report.firstResumedProviderRequestAt)
+    await phase("first_resumed_provider_request", { at: report.firstResumedProviderRequestAt });
+  await phase("read-check");
+  try {
+    await readCheck();
+  } catch (error) {
+    if (error.exitCode !== READ_CHECK_FAILED) throw error;
+    await phase("reads_failed", { since: error.since, error: error.message });
+    await notify({
+      severity: "error",
+      key: `robob-install:${stamp}:reads`,
+      text: `Robob installed, but reads are still failing since ${error.since}. Not saying it's back up. Log: ${log}`,
+    }).catch((notifyError) => phase("reads_notify_failed", { error: String(notifyError) }));
+    throw error;
+  }
+  await phase("reads_healthy");
+  const skipped = report.threads
+    .filter((t) => !t.continued)
+    .map((t) => `${t.threadId}:${t.reason}`)
+    .join(", ");
+  await notify({
+    severity: "attention",
+    key: `robob-install:${stamp}:report`,
+    text: `Robob installed: ${report.continued} continuations queued, ${report.skipped} skipped${skipped ? ` (${skipped})` : ""}. Reads healthy for 5 min. ${elapsedSeconds()}s to report.`,
+  });
 }
 
 /** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
@@ -428,8 +511,18 @@ export async function clearStaleStaging({
 async function main(args) {
   const rollback = args.includes("--rollback");
   const dmgIndex = args.indexOf("--dmg");
+  const skipIndex = args.indexOf("--skip-migration-check");
+  // The pre-quit check clones the live database, and that clone stalls the running server's
+  // writes for as long as it takes (5.3 min on 11 Nov 2026). Skip it, with a stated reason,
+  // when the release changes no migration or schema files.
+  const skipMigrationCheck = skipIndex < 0 ? undefined : args[skipIndex + 1]?.trim();
+  if (skipIndex >= 0 && (!skipMigrationCheck || skipMigrationCheck.startsWith("--")))
+    throw new Error("--skip-migration-check requires a reason");
+  // A rollback must always prove the previous binary still opens the migrated database.
+  if (rollback && skipMigrationCheck !== undefined)
+    throw new Error("--skip-migration-check cannot be used with --rollback");
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--dmg" && args[i + 1]) {
+    if ((args[i] === "--dmg" || args[i] === "--skip-migration-check") && args[i + 1]) {
       i++;
       continue;
     }
@@ -437,7 +530,13 @@ async function main(args) {
       throw new Error(`Unknown argument: ${args[i]}`);
   }
   if (args.includes("--dry-run")) {
-    console.log(JSON.stringify({ rollback, steps: INSTALL_PLAN }));
+    console.log(
+      JSON.stringify({
+        rollback,
+        skipMigrationCheck: skipMigrationCheck ?? null,
+        steps: INSTALL_PLAN,
+      }),
+    );
     return;
   }
   if (!process.env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
@@ -450,10 +549,9 @@ async function main(args) {
   const phase = async (phase, extra = {}) =>
     console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra }));
   let quitAt;
+  let startupComplete = false;
   const run = (cmd, args, timeout = 20_000, env = process.env) => {
-    const remaining =
-      quitAt === undefined ? timeout : Math.min(timeout, 180_000 - (Date.now() - quitAt));
-    if (remaining <= 0) throw new Error("Install exceeded the 3 minute limit");
+    const remaining = installCommandTimeout(timeout, quitAt, startupComplete);
     return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env });
   };
   const exists = async (p) =>
@@ -463,13 +561,19 @@ async function main(args) {
     );
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const inputs = async () =>
-    (await fs.readdir(data)).filter((name) => /^(statev2|boards).*\.sqlite(?:-wal)?$/.test(name));
-  const clone = async (destination) => {
+    // Exact names only: the 226 GB statev2.pre-shrink-*.sqlite copy matched the old prefix pattern
+    // and was cloned on every install (11 Nov 2026).
+    (await fs.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
+  const clone = async (destination, timeoutMs) => {
     await fs.mkdir(destination, { recursive: true, mode: 0o700 });
     const names = await inputs();
     if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
     for (const name of names)
-      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], 3000);
+      await run(
+        "/bin/cp",
+        ["-c", path.join(data, name), path.join(destination, name)],
+        timeoutMs(),
+      );
   };
   const cfg = JSON.parse(
     await fs.readFile(
@@ -551,6 +655,10 @@ async function main(args) {
     },
     verify: () => verifyBundle(next),
     migrations: async () => {
+      if (skipMigrationCheck !== undefined) {
+        await phase("migration_check_skipped", { reason: skipMigrationCheck });
+        return;
+      }
       const sandbox = await fs.mkdtemp(path.join(path.dirname(data), ".install-clone-"));
       try {
         const fingerprint = async () =>
@@ -563,7 +671,7 @@ async function main(args) {
             ),
           );
         const before = await fingerprint();
-        await clone(sandbox);
+        await clone(sandbox, () => 3000);
         if (before !== (await fingerprint()))
           throw new Error("Database changed during preflight clone; retry before quitting");
         await fs.writeFile(path.join(sandbox, ".install-clone"), "", { mode: 0o600 });
@@ -624,13 +732,37 @@ async function main(args) {
     },
     backup: async () => {
       await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
-      await clone(path.join(backupRoot, stamp));
+      // No writer is left after the quit, so the clone only waits on APFS, not on the server.
+      // Leave at least 60 s of the 3 minute window for swap, launch and readiness: a backup that
+      // ate the window would fail the launch after the swap, where nothing relaunches either app.
+      const budget = () => {
+        const ms = Math.min(120_000, 180_000 - (Date.now() - quitAt) - 60_000);
+        if (ms <= 0) throw new Error("No time left for the backup before the swap");
+        return ms;
+      };
+      const destination = path.join(backupRoot, stamp);
+      try {
+        await clone(destination, budget);
+      } catch (error) {
+        // A partial folder would count as one of the two kept backups on the next prune. Rename it
+        // (instant) rather than delete it (tens of seconds) so the old app relaunches sooner;
+        // the next successful install's prune removes it.
+        await fs.rename(destination, path.join(backupRoot, `partial-${stamp}`)).catch(() => {});
+        throw error;
+      }
+    },
+    // Deleting old clones of a fragmented 160 GB file takes tens of seconds; it runs after
+    // the new server is ready instead of inside the outage window.
+    prune: async () => {
       const old = (await fs.readdir(backupRoot))
         .filter((n) => /^\d{4}-/.test(n))
         .sort()
         .reverse()
         .slice(2);
-      for (const name of old) await fs.rm(path.join(backupRoot, name), { recursive: true });
+      const partial = (await fs.readdir(backupRoot)).filter((n) => n.startsWith("partial-"));
+      for (const name of [...old, ...partial])
+        await fs.rm(path.join(backupRoot, name), { recursive: true });
+      await phase("backups_pruned", { removed: [...old, ...partial] });
     },
     swap: async (rollback) => {
       if (rollback) {
@@ -674,32 +806,32 @@ async function main(args) {
           (report.continued === 0 || report.firstResumedProviderRequestAt)
         );
       });
-      await phase("listening", { at: report.listeningAt });
-      await phase("command_ready", { at: report.commandReadyAt });
-      await phase("continuations_queued", { at: report.completedAt, report });
-      if (report.firstResumedProviderRequestAt)
-        await phase("first_resumed_provider_request", { at: report.firstResumedProviderRequestAt });
-      const skipped = report.threads
-        .filter((t) => !t.continued)
-        .map((t) => `${t.threadId}:${t.reason}`)
-        .join(", ");
-      const text = `Robob installed: ${report.continued} continuations queued, ${report.skipped} skipped${skipped ? ` (${skipped})` : ""}. ${Math.round((Date.now() - quitAt) / 1000)}s to report.`;
-      await run(
-        "/Users/ardud/.bun/bin/bun",
-        [
-          "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
-          "notify",
-          "--source",
-          "Robob install",
-          "--severity",
-          "attention",
-          "--key",
-          `robob-install:${stamp}:report`,
-          "--text",
-          text,
-        ],
-        5000,
-      );
+      // Continuations still start inside the startup bound. Healthy-read observation,
+      // its notification and final DMG detach must be allowed to outlast that bound.
+      startupComplete = true;
+      await reportInstall({
+        report,
+        phase,
+        stamp,
+        elapsedSeconds: () => Math.round((Date.now() - quitAt) / 1000),
+        notify: ({ severity, key, text }) =>
+          run(
+            "/Users/ardud/.bun/bin/bun",
+            [
+              "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
+              "notify",
+              "--source",
+              "Robob install",
+              "--severity",
+              severity,
+              "--key",
+              key,
+              "--text",
+              text,
+            ],
+            5000,
+          ),
+      });
     },
   };
   try {
@@ -765,9 +897,14 @@ async function main(args) {
     }
   }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main(process.argv.slice(2)).catch((error) => {
+export async function runInstaller(args, run = main) {
+  try {
+    await run(args);
+  } catch (error) {
     console.error(error.message);
-    process.exitCode = 1;
-  });
+    process.exitCode = error.exitCode === READ_CHECK_FAILED ? READ_CHECK_FAILED : 1;
+  }
+}
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await runInstaller(process.argv.slice(2));
 }

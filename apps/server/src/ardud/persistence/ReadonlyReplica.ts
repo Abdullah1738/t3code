@@ -1,3 +1,4 @@
+import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -6,14 +7,29 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as Fiber from "effect/Fiber";
 
 import * as ServerConfig from "../../config.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { createReadonlyReplica, type ReadonlyReplicaOptions } from "./readonlyExport.ts";
 
-class ReadonlyReplica extends Context.Service<
+export class ReadonlyReplicaMaintenanceError extends Schema.TaggedError<ReadonlyReplicaMaintenanceError>()(
+  "ReadonlyReplicaMaintenanceError",
+  {},
+) {
+  override get message() {
+    return "Readonly export could not be stopped for maintenance.";
+  }
+}
+
+export type ReplicaMaintenance = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E | ReadonlyReplicaMaintenanceError, R>;
+
+export class ReadonlyReplica extends Context.Service<
   ReadonlyReplica,
-  { readonly run: Effect.Effect<void> }
+  { readonly run: Effect.Effect<void>; readonly withMaintenance: ReplicaMaintenance }
 >()("t3/ardud/persistence/ReadonlyReplica") {}
 
 export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExportUnavailable>()(
@@ -34,6 +50,14 @@ type WorkerMessage =
       readonly type: "failed";
       readonly stage: string;
       readonly error: string;
+      readonly native?: {
+        readonly errcode?: unknown;
+        readonly errstr?: unknown;
+        readonly code?: unknown;
+        readonly sqliteFile?: unknown;
+        readonly sqliteRole?: unknown;
+        readonly sqliteOperation?: unknown;
+      };
       readonly quiet?: boolean;
     };
 
@@ -95,12 +119,14 @@ const beat = (type) => {
 };
 const fail = (stage, error) => {
   try { replica?.close(); } catch {}
+  const pendingRedaction = error && error.code === 'REDACTION_PENDING';
   const held = error && error.code === 'READONLY_REBUILD_HELD';
   parentPort.postMessage({
     type: 'failed',
-    stage: held ? 'rebuild-held' : stage,
+    stage: pendingRedaction ? 'redaction-pending' : held ? 'rebuild-held' : stage,
     error: describe(error),
-    quiet: held && error.notify === false,
+    native: { errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code, sqliteFile: error && error.sqliteFile, sqliteRole: error && error.sqliteRole, sqliteOperation: error && error.sqliteOperation },
+    quiet: pendingRedaction || (held && error.notify === false),
   });
 };
 try {
@@ -130,6 +156,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   spawn: () => ExportWorker,
   options: SupervisorOptions = defaultSupervisorOptions,
 ): Effect.fn.Return<never, ReadonlyExportUnavailable> {
+  const observer = yield* ErrorObserver;
   const clock = yield* Clock.Clock;
   const stallMs = Duration.toMillis(Duration.fromInputUnsafe(options.stallTimeout));
   let lastBeat = clock.currentTimeMillisUnsafe();
@@ -142,6 +169,27 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     Effect.callback<never, ReadonlyExportUnavailable>((resume) => {
       const onMessage = (message: WorkerMessage) => {
         if (message?.type === "failed") {
+          if (message.native)
+            annotateSqliteError(
+              message.native,
+              {
+                file:
+                  typeof message.native.sqliteFile === "string"
+                    ? message.native.sqliteFile
+                    : "readonly-export:unknown",
+                role:
+                  message.native.sqliteRole === "primary" || message.native.sqliteRole === "replica"
+                    ? message.native.sqliteRole
+                    : "unknown",
+                connection: "export-worker",
+                operation:
+                  typeof message.native.sqliteOperation === "string"
+                    ? message.native.sqliteOperation
+                    : message.stage,
+                span: "ReadonlyReplica.superviseExportWorker",
+              },
+              observer,
+            );
           resume(
             Effect.fail(
               new ReadonlyExportUnavailable({
@@ -230,7 +278,7 @@ export const superviseReadonlyExport = (
     superviseExportWorker(spawn, options).pipe(
       Effect.catch((error) => {
         const message = `Readonly export unavailable (${error.stage}): ${error.reason}; restarting the export worker`;
-        const held = error.stage === "rebuild-held";
+        const held = error.stage === "rebuild-held" || error.stage === "redaction-pending";
         return (error.quiet ? Effect.logDebug(message) : Effect.logWarning(message)).pipe(
           Effect.annotateLogs({ stage: error.stage, reason: error.reason }),
           Effect.as(
@@ -247,6 +295,52 @@ export const superviseReadonlyExport = (
     ),
   );
 
+export const makeCoordinatedReplica = Effect.fn("ReadonlyReplica.makeCoordinated")(function* (
+  spawn: () => ExportWorker,
+  options: SupervisorOptions = defaultSupervisorOptions,
+) {
+  const gate = yield* Semaphore.make(1);
+  const workers = new Set<ExportWorker>();
+  let active: Fiber.Fiber<never, never> | undefined;
+  const trackedSpawn = () => {
+    const worker = spawn();
+    workers.add(worker);
+    worker.on("exit", () => workers.delete(worker));
+    return worker;
+  };
+  const run = Effect.forever(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fiber = yield* gate.withPermit(
+          Effect.gen(function* () {
+            const next = yield* Effect.forkScoped(superviseReadonlyExport(trackedSpawn, options), {
+              startImmediately: true,
+            });
+            active = next;
+            return next;
+          }),
+        );
+        yield* Fiber.await(fiber);
+      }),
+    ),
+  );
+  const withMaintenance: ReplicaMaintenance = (effect) =>
+    gate.withPermit(
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          if (active) {
+            yield* Fiber.interrupt(active);
+            active = undefined;
+          }
+          // A timed-out termination is not permission to mutate beneath that worker.
+          if (workers.size) return yield* new ReadonlyReplicaMaintenanceError({});
+          return yield* restore(effect);
+        }),
+      ),
+    );
+  return ReadonlyReplica.of({ run, withMaintenance });
+});
+
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const path = yield* Path.Path;
@@ -259,7 +353,7 @@ const make = Effect.gen(function* () {
     archivePath: path.join(path.dirname(config.dbPath), "archive.sqlite"),
   };
   const source = exportWorkerSource(createReadonlyReplica.toString());
-  const run = superviseReadonlyExport(
+  return yield* makeCoordinatedReplica(
     () =>
       new NodeWorkerThreads.Worker(source, {
         eval: true,
@@ -267,12 +361,13 @@ const make = Effect.gen(function* () {
         workerData: options,
       }) as unknown as ExportWorker,
   );
-  return ReadonlyReplica.of({ run });
 });
+
+export const serviceLayer = Layer.effect(ReadonlyReplica, make);
 
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const replica = yield* ReadonlyReplica;
     yield* forkParked(replica.run);
   }),
-).pipe(Layer.provide(Layer.effect(ReadonlyReplica, make)));
+).pipe(Layer.provideMerge(serviceLayer));

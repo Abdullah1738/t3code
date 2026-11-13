@@ -61,6 +61,7 @@ import {
   useCardDetail,
   useFeed,
   useKanbanPermission,
+  useKanbanPermissionStatus,
 } from "./kanbanStore";
 import { CopyLinkButton, KanbanMarkdown } from "./links";
 import { Chip, Glyph, LinkChip, Pri, priorityLabel, stageGlyph, Tabs } from "./parts";
@@ -374,7 +375,7 @@ function CardDiscussion(props: {
 }) {
   const { boardId, card, state } = props;
   const discussion = card.discussionId ? state.discussions.get(card.discussionId) : undefined;
-  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
+  const postPermission = useKanbanPermissionStatus(KANBAN_WS_METHODS.messagePost);
 
   useEffect(() => {
     // The id is known but the list hasn't loaded it yet; the call returns the existing room.
@@ -404,7 +405,7 @@ function CardDiscussion(props: {
       <Composer
         placeholder="Message"
         attachments
-        blockedReason={canPost ? null : "Your connection can't post here"}
+        blockedReason={postPermission === "denied" ? "Your connection can't post here" : null}
         onSend={async (blocks) => {
           setFirstPosting(true);
           const room = await kanban.cardDiscussion(boardId, card.id);

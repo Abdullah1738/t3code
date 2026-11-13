@@ -15,13 +15,15 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_tools, node_version, pool, ssh_sync
-from . import prune, prepare
-from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
+from . import containers, prune, prepare
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
+RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
+RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",
@@ -100,6 +102,7 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     body = recipe.read_bytes()
     if repo_key == "crpko-devops":
         body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
+    body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
     check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '
@@ -254,6 +257,18 @@ def image_wait_seconds() -> int:
     """The client sets the remote bound; it is not implicitly forwarded as command environment."""
     value = os.environ.get("OFFBOX_IMAGE_WAIT_SECONDS") or "180"
     return int(value) if re.fullmatch(r"[1-9][0-9]{0,3}", value) else 180
+
+
+def clickhouse_suite_warning(repo_key: str, size: str, cmd: str) -> str | None:
+    if repo_key != 'crpko-devops' or size not in ('large', 'xlarge'):
+        return None
+    words = [word.rsplit('/', 1)[-1] for word in re.findall(r'[A-Za-z0-9_./:+-]+', cmd)]
+    runner = any(re.fullmatch(r'python(?:[23](?:\.\d+)?)?|pytest|npm|pnpm|npx|node', word) for word in words)
+    suite = any(re.fullmatch(r'unittest|pytest|test(?:[-_:].*|\.py)?|run-static-test-shard\.mjs', word) for word in words)
+    if runner and suite:
+        return ('ClickHouse 24.8 alert fixtures can exhaust threads on large/xlarge boxes; '
+                'use fixture max_threads=8 (raising PID limits alone does not fix it; #915)')
+    return None
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -667,10 +682,13 @@ def setup_failed(log_path: Path | None) -> bool:
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 
 
-def missing_deps_hint(root_files: set[str], package_manager: str | None) -> str:
-    install = node_tools.install_command(root_files, package_manager)
+def missing_deps_hint(root: Path) -> str:
+    install = package_manager.install_command(root)
+    node = node_version.want(root, root)
+    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(root)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
-            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them.")
+            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them."
+            + requirement + " Check the repo's CI install flags and manager version before running.")
 
 
 def box_deps_hint(root: Path, log_path: Path | None) -> str:
@@ -681,13 +699,7 @@ def box_deps_hint(root: Path, log_path: Path | None) -> str:
         marked = False
     if not marked:
         return ""
-    try:
-        root_files = {p.name for p in root.iterdir()}
-    except OSError:
-        root_files = set()
-    manifest = read_json(root / "package.json", {})
-    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
-    return missing_deps_hint(root_files, manager if isinstance(manager, str) else None)
+    return missing_deps_hint(root)
 
 
 def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
@@ -773,7 +785,8 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist = '\n'.join([
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
-        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" \\) -mtime +2 -delete',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
+        '-o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -1018,6 +1031,10 @@ def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
 def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    started = time.monotonic()
+    if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
+        containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
+    timeout = max(0, timeout - (time.monotonic() - started))
     if timeout > 0 and run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(
             run["box_id"], run["run_id"], timeout=min(10, timeout)):
         con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
@@ -1096,7 +1113,8 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
-                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None) -> str:
+                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
+                  preserve_containers: str = 'private lease') -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -1112,6 +1130,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               WATCH_REPAIR,
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
+              containers.script(run_id, BOUNDED_PROCESS, preserve=preserve_containers),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
               GO_REPAIR,
@@ -1246,9 +1265,15 @@ class Runner:
         except Exception:
             node_block = ""
         new_checkout_hint(row, self.root)
+        warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
+        if warning:
+            say(warning)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"], repo_root=self.root)
+                               repo_key=me["repo_key"], repo_root=self.root,
+                               preserve_containers=containers.preserve_reason(con, row))
+        con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
+        con.commit()
         from . import start_check
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
@@ -1384,10 +1409,10 @@ class Runner:
         push_exc = None
         try:
             if not a.no_sync:
-                with prepare.phase("push (source read stalled if no transfer progress)", self.box):
+                with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
-                                       seed_candidates=candidates)
+                                       seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1551,6 +1576,10 @@ def _close(frames) -> None:
 
 # Upper bound for joining the TTL keeper when a follower ends: its ensure_ttl call can be inside a 60 s request.
 _KEEPER_JOIN_S = 65
+
+
+class _ClientSignal(KeyboardInterrupt):
+    """Unwind to stop/detach without waiting on a network-bound TTL keeper."""
 
 
 def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
@@ -1910,7 +1939,9 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         stop_evt.set()
         _close(frames)  # closes the HTTP response (api.stream reads it inside `with`)
         # The keeper's ensure_ttl can sit in a 60 s request; a waiter past its deadline must not wait on it.
-        keeper.join(_KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        join_s = 0 if isinstance(sys.exc_info()[1], _ClientSignal) else (
+            _KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        keeper.join(join_s)
         if lf:
             lf.close()
         if mf:
@@ -1920,8 +1951,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
 def new_checkout_hint(row: dict, root: Path) -> None:
     if not row.get("_new_checkout") or not (root / "package.json").exists():
         return
-    install = node_tools.repo_install(root)
-    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
+    install = package_manager.install_command(root)
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(root))
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
@@ -2038,13 +2069,51 @@ def _run_attempt(a, me: dict) -> int:
         pool.release_guard(rn.lease_row)
 
 
+def _host_restarting(signum) -> bool:
+    if signum not in (signal.SIGTERM, signal.SIGHUP):
+        return False
+    try:
+        marker = json.loads(RESTART_MARKER.read_text())
+        return (isinstance(marker, dict) and type(marker.get('pid')) is int and marker['pid'] > 0
+                and type(marker.get('at')) in (int, float) and 0 <= now() - marker['at'] < RESTART_MARKER_MAX_S)
+    except (OSError, ValueError):
+        return False
+
+
+def _detach(rn, signum) -> int:
+    # Keep start_at: detaching must not restart #866's orphan age allowance.
+    rn.record(mode='bg')
+    message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "
+               f"Re-attach: offbox wait {rn.run_id}")
+    rn.log_path.parent.mkdir(parents=True, exist_ok=True)
+    ck = read_json(offsets_path(rn.log_path), {})
+    with open(rn.log_path, 'ab') as f:
+        # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
+        if ck:
+            f.truncate(ck['logBytes'])
+            f.seek(0, os.SEEK_END)
+        f.write(f"\noffbox: {message}\n".encode())
+        length = f.tell()
+    _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
+    say(message)
+    log(message)
+    try:
+        row = db().execute('SELECT start_at FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        remaining = max(0, int(ORPHAN_RUN_MAX_S - (now() - (row['start_at'] or 0)))) if row else 0
+        if remaining:
+            lease.ensure_ttl(rn.box, min(BG_TTL_S, remaining), api.get(rn.box))
+    except OffboxError as e:
+        say(f"could not extend {rn.box}'s deadline: {e}; the reaper will retry")
+    return EXIT_DETACHED
+
+
 def _run_remote(a, rn) -> int:
     interrupted = {"sig": None}
 
     def on_sig(signum, _frame):
-        interrupted["sig"] = signum
-        rn.kill()
-        raise KeyboardInterrupt
+        if interrupted['sig'] is None:
+            interrupted["sig"] = signum
+            raise _ClientSignal
 
     # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
     # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
@@ -2080,10 +2149,15 @@ def _run_remote(a, rn) -> int:
         except Interrupted:
             finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             raise
-        except KeyboardInterrupt:
-            # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
-            rn.record(error='interrupted; awaiting confirmed remote termination')
-            return 130
+    except KeyboardInterrupt:
+        if rn.started and rn.box and _host_restarting(interrupted['sig']):
+            return _detach(rn, interrupted['sig'])
+        rn.kill()
+        if not rn.started:
+            raise
+        # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
+        rn.record(error='interrupted; awaiting confirmed remote termination')
+        return 130
     finally:
         for s, h in old.items():
             signal.signal(s, h)

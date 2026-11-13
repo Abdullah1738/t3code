@@ -4,6 +4,7 @@
 Checks that the whole pipeline is flowing, not just that processes exist:
   sync      raw capture stage (com.abdullah.memory-sync) succeeded recently
   lag       native OpenCode sessions older than 30 min are in memory.db
+  opencode_export  native export is loaded and publishes fresh generations
   muse_lag  Muse capture ran cleanly; logs quiet for 10 min are fully captured
   recall    recall server answers on :18765 and its session catalog keeps up
   backup    memory backup job loaded and last success within 9 h (includes deferrals)
@@ -54,6 +55,8 @@ TG_CLI = os.path.join(HOME, ".local/share/telegram-bridge/src/cli.ts")
 SYNC_MAX_AGE = 15 * 60          # tick every 120 s
 LAG_GRACE_MS = 30 * 60 * 1000   # settle window is 10 min
 LAG_MAX = 3
+EXPORT_MAX_AGE = 30 * 60
+EXPORT_PROGRESS_MAX_AGE = 5 * 60
 MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
@@ -110,6 +113,37 @@ def check_sync():
             else f"; last run {st.get('state')} rc={st.get('rc')}"
         return False, f"last successful capture {int(age/60)} min ago{cur}"
     return True, f"last capture ok {int(age)} s ago"
+
+
+def check_opencode_export():
+    _, _, loaded = launchd_exit("com.abdullah.opencode-readonly")
+    if not loaded:
+        return False, "opencode-readonly launch agent not loaded"
+    # Read readiness itself: native_ro correctly refuses unready bootstraps.
+    with closing(robob_readonly.connect_ro(OC_DB, timeout=0.1)) as con:
+        meta = dict(con.execute("SELECT key,value FROM ardud_readonly_meta WHERE key IN "
+                                "('ready','history_ready','updated_at','progress_at','generation')"))
+    now = time.time()
+    generation = meta.get("generation", "unknown")
+    if meta.get("ready") == "0":
+        try:
+            age = now - float(meta.get("progress_at", "nan"))
+        except ValueError:
+            age = float("nan")
+        if meta.get("history_ready") in (None, "0") and -30 <= age <= EXPORT_PROGRESS_MAX_AGE:
+            return True, f"bootstrap progressing (generation {generation}, heartbeat {int(age)} s ago)"
+    try:
+        at = datetime.fromisoformat(meta["updated_at"].replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            raise ValueError("timestamp has no timezone")
+        age = now - at.timestamp()
+        if meta.get("ready") not in ("0", "1") or not -30 <= age <= EXPORT_MAX_AGE:
+            raise ValueError("not ready or stale")
+    except (KeyError, ValueError):
+        return False, f"OpenCode export ready={meta.get('ready', 'missing')}, missing timestamp or stale (>30 min; generation {generation})"
+    if meta["ready"] == "0":
+        return True, f"OpenCode export in progress; last publication {int(age)} s ago (generation {generation})"
+    return True, f"OpenCode export generation {generation}, published {int(age)} s ago"
 
 
 def check_lag():
@@ -579,6 +613,8 @@ def check_backup():
     now = time.time()
     last_ok = _native_epoch(st.get("last_success_ts"), now) or 0
     age = now - last_ok
+    if not st.get("ok"):
+        problems.append(f"last backup failed at {st.get('stage')}: {str(st.get('message', ''))[:200]}")
     if not last_ok or age > BACKUP_MAX_AGE:
         problems.append(f"last successful memory backup {int(age/3600)} h ago" if last_ok
                         else "no successful memory backup recorded")
@@ -588,7 +624,6 @@ def check_backup():
             problems.append(f"deferred {st.get('deferred_count', '?')} time(s): {str(reason)[:200]}")
         elif st.get("message"):
             problems.append(f"last: {st.get('stage')}: {str(st['message'])[:200]}")
-    # Individual failed runs are alerted inside the backup job (#552).
     if problems:
         return False, "; ".join(problems)
     return True, f"snapshot {st.get('last_snapshot')} {int(age/60)} min ago"
@@ -930,7 +965,8 @@ def check_msgs():
     return False, msg
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
+CHECKS = [("opencode_export", check_opencode_export), ("sync", check_sync), ("lag", check_lag),
+          ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
           ("claude_retention", check_claude_retention), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),

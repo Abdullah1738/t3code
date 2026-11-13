@@ -77,6 +77,7 @@ function harness(ids = ["a"]) {
         label: "test:rates",
         requiredScopes: () => [],
         permissionAtom: () => Atom.make(true),
+        permissionStatusAtom: () => Atom.make("granted" as const),
         run: (
           _registry: AtomRegistry.AtomRegistry,
           { environmentId }: { environmentId: EnvironmentId },

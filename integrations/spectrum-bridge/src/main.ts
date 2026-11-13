@@ -1,3 +1,4 @@
+import { acknowledgePhoton, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { connect } from "node:net";
@@ -11,7 +12,7 @@ import { acquireLock } from "./lock.ts";
 import { backendKind, createBackend } from "./backend.ts";
 import { RobobBackend, retireUnresolvedRoute } from "./robob.ts";
 import { backfillOrigins, OriginBackfill } from "./origin-backfill.ts";
-import { canonicalOwnerChat, Photon } from "./photon.ts";
+import { canonicalOwnerChat, normalizeInbound, Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { Router } from "./router.ts";
 import { checkReply, readReplyRules } from "./replyCheck.ts";
@@ -143,7 +144,7 @@ async function main(): Promise<void> {
   });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-    transcribe: input => transcribe(input), log, recoverAttachment,
+    transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, recoverAttachment,
   }) : undefined;
   router = makeRouter();
   const health = { photonLastOk: 0, backendLastOk: 0, lastError: "", startedAt: Date.now() };
@@ -223,6 +224,10 @@ async function main(): Promise<void> {
             chatGuid = store.get<string>("chatGuid");
             paired = true;
             router ??= makeRouter();
+            if (event.type !== "catchup.complete") {
+              const input = normalizeInbound(event, config.owner, chatGuid!);
+              if (input) void acknowledgePhoton(store, photon, chatGuid!, input).catch(() => log("receipt-ack-failed"));
+            }
           }
           if (event.type === "catchup.complete") { complete = true; break; }
         }
@@ -283,6 +288,7 @@ async function main(): Promise<void> {
   }
   const timer = setInterval(() => {
     void delivery.tick().catch(() => log("sender-failed"));
+    if (ready()) void router?.checkFailedInbound().catch(() => log("failed-inbound-check-failed"));
   }, 1_000);
   const stop = async () => {
     if (stopping) return;

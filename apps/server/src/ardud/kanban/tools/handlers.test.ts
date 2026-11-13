@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -121,6 +122,7 @@ const fakeThreads = (
             updatedAt: "2026-10-26T08:00:00.000Z",
             quietSince: "2026-10-26T08:00:00.000Z",
             runStartedAt: null,
+            lastActivityAt: null,
             backgroundWork: 0,
             prWatches: 0,
             prs: [],
@@ -137,6 +139,7 @@ const fakeThreads = (
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) => {
         const launch = Effect.sync(() => {
@@ -158,6 +161,7 @@ const fakeThreads = (
             : Effect.void),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -457,7 +461,7 @@ it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("#566 review replies distinguish a recorded verdict from an exact replay", () => {
+it.effect("#769 review replies name exact replays and refuse expired verdicts", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -488,12 +492,29 @@ it.effect("#566 review replies distinguish a recorded verdict from an exact repl
     });
     assert.isFalse(replay.isError, replay.text);
     assert.strictEqual(replay.structured.recorded, false);
-    assert.include(String(replay.structured.note), "nothing new written");
+    const review = (yield* kanban.card(card.id)).events.findLast(
+      (event) => event.kind === "review",
+    )!;
+    assert.strictEqual(
+      replay.structured.note,
+      `Already recorded as review event ${review.id} at ${review.at}; not saved again.`,
+    );
     assert.deepStrictEqual(replay.structured.card, first.structured.card);
     assert.lengthOf(
       (yield* kanban.card(card.id)).events.filter((event) => event.kind === "review"),
       1,
     );
+    const before = yield* kanban.card(card.id);
+    yield* TestClock.adjust("11 minutes");
+    const expired = yield* call(reviewer, "card_review_result", {
+      verdict: "clear",
+      head: "abc1234",
+    });
+    assert.isTrue(expired.isError, expired.text);
+    assert.include(expired.text, "stage completed");
+    assert.include(expired.text, "review step 1 of 1");
+    assert.include(expired.text, "Your verdict was not recorded.");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
   }).pipe(Effect.provide(layer));
 });
 
@@ -1401,7 +1422,6 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
           text: "First message",
         }),
       );
-      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       const created = yield* Fiber.join(create);
       assert.isFalse(created.isError, created.text);
       const discussion = created.structured.discussion as {
@@ -1414,7 +1434,6 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
       const open = yield* Effect.forkChild(
         call(evaluator, "board_open", { slug: "opened", name: "Opened", icon: "rocket" }),
       );
-      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       const opened = yield* Fiber.join(open);
       assert.isFalse(opened.isError, opened.text);
       assert.strictEqual((opened.structured.board as { icon: string }).icon, "rocket");
@@ -1457,6 +1476,21 @@ it.effect(
     Effect.gen(function* () {
       const held = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      const clock = yield* Clock.Clock;
+      let admissions = 0;
+      const admissionClock: Clock.Clock = {
+        ...clock,
+        sleep: (duration) =>
+          Effect.gen(function* () {
+            if (
+              Duration.toMillis(duration) === KanbanService.BOARD_WRITE_START_DEADLINE_MS &&
+              ++admissions === 2
+            )
+              yield* Deferred.succeed(waiting, undefined);
+            return yield* clock.sleep(duration);
+          }),
+      };
       const { layer, launches } = fakeThreads();
       yield* Effect.gen(function* () {
         const kanban = yield* KanbanService.KanbanService;
@@ -1476,11 +1510,15 @@ it.effect(
           call(evaluator, "discussion_create", {
             title: "Queued discussion",
             text: "First message",
-          }),
+          }).pipe(Effect.provideService(Clock.Clock, admissionClock)),
         );
         const open = yield* Effect.forkChild(
-          call(evaluator, "board_open", { slug: "queued", name: "Queued", icon: "rocket" }),
+          call(evaluator, "board_open", { slug: "queued", name: "Queued", icon: "rocket" }).pipe(
+            Effect.provideService(Clock.Clock, admissionClock),
+          ),
         );
+        // Caller resolution does async SQL; advance only once both calls await admission.
+        yield* Deferred.await(waiting);
         yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
         for (const result of [yield* Fiber.join(create), yield* Fiber.join(open)]) {
           assert.isTrue(result.isError, result.text);
@@ -1515,7 +1553,11 @@ it.effect(
         assert.strictEqual((opened.structured.board as { icon: string }).icon, "rocket");
         assert.lengthOf(yield* kanban.boards, 2);
         assert.lengthOf(launches, 0);
-      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(layer));
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(layer),
+        Effect.provideService(Clock.Clock, admissionClock),
+      );
     }),
 );
 
@@ -2678,7 +2720,34 @@ it.effect(
         note: "later",
       });
       assert.isTrue(own.isError);
-      assert.include(own.text, "has a running thread");
+      assert.include(
+        own.text,
+        "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+      );
+      yield* store.putCard({ ...running, links: card.links });
+      const ci = yield* call(running.activeThreadId!, "card_wait", {
+        on: "ci",
+        pr: card.links[0]!.url,
+        note: "checks finish",
+      });
+      assert.isTrue(ci.isError);
+      assert.include(
+        ci.text,
+        "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
+      );
+      const evaluator = yield* call(evaluatorThread, "card_wait", {
+        card: `#${running.number}`,
+        on: "ci",
+        note: "checks finish",
+      });
+      assert.isTrue(evaluator.isError);
+      assert.include(
+        evaluator.text,
+        `card #${running.number} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+      );
+      const after = (yield* kanban.card(running.id)).card;
+      assert.isUndefined(after.wait);
+      assert.strictEqual(after.activeThreadId, running.activeThreadId);
       // And it can't touch another thread's card.
       const foreign = yield* call(running.activeThreadId!, "card_wait", {
         card: `#${card.number}`,
@@ -3193,7 +3262,7 @@ it.effect.each(
         const board = yield* kanban.ensureBoard({
           slug: "post-reply",
           name: "Reply",
-          defaultProjectId: null,
+          defaultProjectId: ProjectId.make("project-1"),
         });
         const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
         const discussion = yield* kanban.cardDiscussion(card.id);
@@ -3221,7 +3290,20 @@ it.effect.each(
         assert.isFalse(result.isError, result.text);
         assert.strictEqual(result.structured.saved, true);
         assert.deepStrictEqual(result.structured.message, { discussionId: discussion.id, seq: 1 });
-        assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+        assert.deepStrictEqual(
+          (yield* kanban.messages(discussion.id)).map(({ seq, author, blocks }) => ({
+            seq,
+            author,
+            blocks,
+          })),
+          [
+            {
+              seq: 1,
+              author: { _tag: "evaluator", threadId: thread },
+              blocks: [{ _tag: "md", text: "Saved exactly once" }],
+            },
+          ],
+        );
       }).pipe(Effect.provide(fake.layer));
     }),
 );
@@ -3280,8 +3362,8 @@ it.effect.each(["card", "discussion"] as const)(
         yield* TestClock.adjust("25 seconds");
         const result = yield* Fiber.join(request);
         assert.isTrue(result.isError, result.text);
-        assert.isNull(result.structured.saved);
-        assert.include(result.text, "discussion_read");
+        assert.strictEqual(result.structured.saved, false);
+        assert.include(result.text, "Not saved (board busy). Safe to retry.");
         assert.lengthOf(yield* kanban.messages(discussion.id), 0);
       }).pipe(Effect.provide(fake.layer));
     }),
@@ -3628,7 +3710,7 @@ it.effect.each([
   }),
 );
 
-it.effect("report_bug gives reconciliation guidance if its reply times out before a receipt", () =>
+it.effect("report_bug is safe to retry if its reply times out before any write", () =>
   Effect.gen(function* () {
     const saved = yield* Deferred.make<void>();
     const fake = fakeThreads(undefined, undefined, undefined, undefined, {
@@ -3650,9 +3732,40 @@ it.effect("report_bug gives reconciliation guidance if its reply times out befor
       yield* Deferred.await(saved);
       yield* TestClock.adjust("25 seconds");
       const result = yield* Fiber.join(request);
+      assert.isTrue(result.isError, result.text);
+      assert.strictEqual(result.structured.saved, false);
+      assert.include(result.text, "Not saved (board busy). Safe to retry.");
+      assert.lengthOf(fake.launches, 0);
+    }).pipe(Effect.provide(fake.layer));
+  }),
+);
+
+it.effect("report_bug reconciles a request evaluator after launch starts without a receipt", () =>
+  Effect.gen(function* () {
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const fake = fakeThreads(undefined, undefined, undefined, { held, release });
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "bug-launch-timeout",
+        name: "Bug launch timeout",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const request = yield* call(ThreadId.make("outside"), "report_bug", {
+        boardId: board.slug,
+        title: "Novel parser crash",
+        evidence: "failure",
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      yield* TestClock.adjust("25 seconds");
+      const result = yield* Fiber.join(request);
+      assert.isTrue(result.isError, result.text);
       assert.isNull(result.structured.saved);
       assert.include(result.text, "card_get and board threads before retrying");
       assert.lengthOf(fake.launches, 0);
-    }).pipe(Effect.provide(fake.layer));
+      yield* Deferred.succeed(release, undefined);
+      assert.lengthOf(fake.launches, 0);
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(fake.layer));
   }),
 );
