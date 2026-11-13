@@ -1,4 +1,5 @@
 import * as Mime from "effect/http/Mime";
+import { interruptionProps } from "./observability/analyticsInterruption.ts";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -275,6 +276,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
         const clock = yield* Clock.Clock;
         const started = clock.monotonicTimeNanosUnsafe();
         const originKind = yield* AnalyticsOriginKind;
+        let interruption: ReturnType<typeof interruptionProps> = {};
         let errorTag: string | undefined;
         let recorded = false;
         yield* HttpEffect.appendPreResponseHandler((_request, response) =>
@@ -301,6 +303,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                       Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6,
                     ),
                     props: {
+                      ...interruption,
                       method: request.method,
                       status: response.status,
                       originKind,
@@ -327,12 +330,13 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                         bytes += chunk.byteLength;
                       }),
                     ),
-                    Stream.onExit((exit) =>
-                      record(
+                    Stream.onExit((exit) => {
+                      if (Exit.isFailure(exit)) interruption = interruptionProps(exit.cause);
+                      return record(
                         bytes,
                         Exit.isFailure(exit) ? analyticsErrorTag(exit.cause) : undefined,
-                      ),
-                    ),
+                      );
+                    }),
                   ),
                   body.contentType,
                   body.contentLength,
@@ -348,7 +352,10 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
         return yield* app.pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => {
-              if (Exit.isFailure(exit)) errorTag = analyticsErrorTag(exit.cause);
+              if (Exit.isFailure(exit)) {
+                errorTag = analyticsErrorTag(exit.cause);
+                interruption = interruptionProps(exit.cause);
+              }
             }),
           ),
         );

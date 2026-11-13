@@ -1086,6 +1086,8 @@ const withToolAnalytics =
                   tool: options.tool.name,
                   build,
                   ...identifiers,
+                  ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                  ...(callState.cardId ? { cardId: callState.cardId } : {}),
                   ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
                   callerResolved: callState.callerResolved,
                   callerResolveMs:
@@ -1096,6 +1098,14 @@ const withToolAnalytics =
                   readerLane: callState.readerLane,
                   durationMs: Math.max(0, Number(ended - started) / 1e6),
                   ...outcome,
+                  props: {
+                    ...outcome.props,
+                    ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                    ...(callState.cardNumber === undefined
+                      ? {}
+                      : { cardNumber: callState.cardNumber }),
+                    saved: outcome.saved ?? "unknown",
+                  },
                   ...(committed === undefined
                     ? {}
                     : {
@@ -1109,6 +1119,7 @@ const withToolAnalytics =
               const complete = yield* ledger.begin(() =>
                 row({
                   outcome: "interrupted_by_shutdown",
+                  props: { code: "unknown", cause: "shutdown" },
                   saved: callState.saved,
                   errorPhase: callState.phase,
                 }),
@@ -1185,6 +1196,11 @@ const withToolAnalytics =
                 Effect.provideService(McpCallAnalytics.McpCall, callState),
                 Effect.provideService(SavedWrite.observer, (receipt) => {
                   callState.saved = true;
+                  if (receipt.kind === "card" && callState.cardId === undefined) {
+                    callState.boardId = receipt.card.boardId;
+                    callState.cardId = receipt.card.id;
+                    callState.cardNumber = receipt.card.number;
+                  }
                   parentSaved(receipt);
                 }),
                 Effect.provideService(SavedWrite.commitObserver, () => {
@@ -1196,6 +1212,11 @@ const withToolAnalytics =
                   // Handoff tools look up threads to record; the response must not wait on them.
                   return Effect.gen(function* () {
                     const endedAt = yield* Clock.currentTimeMillis;
+                    const resolved = {
+                      ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
+                      ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                      ...(callState.cardId ? { cardId: callState.cardId } : {}),
+                    };
                     const outcome = McpCallAnalytics.callOutcome(exit, callState);
                     yield* complete
                       .value(row(outcome))
@@ -1212,11 +1233,22 @@ const withToolAnalytics =
                           kind: failed ? "server.mcp.error" : "server.mcp",
                           surface: "server",
                           route: "mcp",
+                          ...resolved,
                           ...(invocation?.thread === undefined
                             ? {}
                             : { threadId: invocation.thread.threadId }),
                           durationMs: Math.max(0, endedAt - startedAt),
                           props: {
+                            ...outcome.props,
+                            saved: outcome.saved ?? "unknown",
+                            ...(callState.boardId
+                              ? { boardId: callState.boardId }
+                              : identifiers.boardId
+                                ? { boardId: identifiers.boardId }
+                                : {}),
+                            ...(callState.cardNumber === undefined
+                              ? {}
+                              : { cardNumber: callState.cardNumber }),
                             method: options.tool.name,
                             span: "mcp.tools.call",
                             originKind: invocation?.thread === undefined ? "mcp-client" : "agent",

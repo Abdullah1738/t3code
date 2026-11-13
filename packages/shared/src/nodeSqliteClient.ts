@@ -225,6 +225,7 @@ export interface SqliteStatementObservation {
   readonly durationMs: number;
   readonly outcome: "success" | "failure" | "interrupt";
   readonly span?: string;
+  readonly waitMs?: number;
 }
 
 export interface SqliteStatementObserver {
@@ -263,9 +264,23 @@ const observeStatement = <A, E, R>(
           const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
           if (durationMs < observer.slowThresholdMs) return Effect.void;
           const parent = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-          const span =
-            parent?._tag === "Span" && /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(parent.name)
-              ? parent.name
+          let current = parent;
+          let span: string | undefined;
+          for (let depth = 0; current?._tag === "Span" && depth < 32; depth++) {
+            if (
+              current.name !== "sqlite" &&
+              current.name !== "sql.transaction" &&
+              /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(current.name)
+            ) {
+              span = current.name;
+              break;
+            }
+            current = Option.getOrUndefined(current.parent);
+          }
+          // Only the statement's acquisition belongs to it; a transaction parent's wait must not repeat.
+          const wait =
+            parent?._tag === "Span" && parent.name === "sqlite"
+              ? parent.attributes.get("db.lock_wait_ms")
               : undefined;
           return observer.record({
             operation: operation(),
@@ -273,6 +288,9 @@ const observeStatement = <A, E, R>(
             durationMs,
             ...(lane === undefined ? {} : { lane }),
             ...(span === undefined ? {} : { span }),
+            ...(typeof wait === "number" && Number.isFinite(wait) && wait >= 0
+              ? { waitMs: wait }
+              : {}),
             outcome: Exit.isSuccess(exit)
               ? "success"
               : Exit.hasInterrupts(exit)

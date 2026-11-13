@@ -44,6 +44,70 @@ interface RetryAttempt {
   ok: boolean;
 }
 
+interface Breakdown {
+  labels: Record<string, string | number | null>;
+  durations: Durations;
+  count: number;
+  totalWaitMs: number;
+}
+
+// Fixed cardinality, including overflow. Keep all overflowing measurements, not just their count.
+function breakdown(
+  groups: Map<string, Breakdown>,
+  labels: Breakdown["labels"],
+  event: AnalyticsEvent,
+) {
+  const identity = JSON.stringify(labels);
+  let key = identity;
+  if (!groups.has(identity) && groups.size >= 25) {
+    if (!groups.has(OTHER)) {
+      const last = [...groups.keys()].at(-1)!;
+      const overflow = groups.get(last)!;
+      groups.delete(last);
+      overflow.labels = Object.fromEntries(
+        Object.entries(overflow.labels).map(([k, v]) => [
+          k,
+          typeof v === "number" || v === null ? null : "other",
+        ]),
+      );
+      groups.set(OTHER, overflow);
+    }
+    key = OTHER;
+  }
+  let group = groups.get(key);
+  if (!group) {
+    group = {
+      labels:
+        key === OTHER
+          ? Object.fromEntries(
+              Object.entries(labels).map(([k, v]) => [
+                k,
+                typeof v === "number" || v === null ? null : "other",
+              ]),
+            )
+          : labels,
+      durations: durations(),
+      count: 0,
+      totalWaitMs: 0,
+    };
+    groups.set(key, group);
+  }
+  group.count++;
+  if (event.durationMs !== undefined) addDuration(group.durations, event.durationMs);
+  group.totalWaitMs += event.props?.waitMs ?? 0;
+}
+
+function finishBreakdown(groups: Map<string, Breakdown>) {
+  return [...groups.values()]
+    .map((group) => ({
+      labels: group.labels,
+      ...summarize(group.durations),
+      count: group.count,
+      totalWaitMs: group.totalWaitMs,
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
 export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
@@ -51,6 +115,9 @@ export const makeAccumulator = () => ({
   invalidLines: 0,
   kinds: new Map<string, number>(),
   errors: new Map<string, number>(),
+  routes: new Map<string, Breakdown>(),
+  mcpCodes: new Map<string, Breakdown>(),
+  dbSpans: new Map<string, Breakdown>(),
   rpcs: new Map<string, Durations>(),
   longTasks: new Map<
     string,
@@ -117,6 +184,43 @@ export function accumulate(
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
   else if ((event.props?.status ?? 0) >= 400)
     increment(target.errors, `status.${event.props!.status}`);
+
+  const tag = event.props?.errorTag ?? event.errorTag;
+  if (
+    event.surface === "server" &&
+    event.kind !== "mcp.call" &&
+    (tag || (event.props?.status ?? 0) >= 400 || /error|fail/i.test(event.kind))
+  ) {
+    breakdown(
+      target.routes,
+      {
+        route: event.route,
+        method: event.props?.method ?? "unknown",
+        status: event.props?.status ?? null,
+        tag: tag ?? "unknown",
+      },
+      event,
+    );
+  }
+  // The ledger is canonical: server.mcp.error is a compatibility event for the same call.
+  if (event.kind === "mcp.call" && event.outcome !== undefined && event.outcome !== "ok") {
+    breakdown(
+      target.mcpCodes,
+      { tool: event.tool ?? "unknown", code: event.props?.code ?? event.errorTag ?? "unknown" },
+      event,
+    );
+  }
+  if (event.kind === "db.slow") {
+    breakdown(
+      target.dbSpans,
+      {
+        span: event.props?.span ?? "unknown",
+        key: event.props?.key ?? "unknown",
+        phase: event.props?.phase ?? "unknown",
+      },
+      event,
+    );
+  }
 
   if (event.kind === "performance.long-task-summary") {
     const props = event.props;
@@ -313,6 +417,37 @@ export function finishRollup(
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
     errorCounts: Object.fromEntries(target.errors),
+    errorsByRoute: finishBreakdown(target.routes).map((row) => ({
+      route: String(row.labels.route),
+      method: String(row.labels.method),
+      status: typeof row.labels.status === "number" ? row.labels.status : null,
+      tag: String(row.labels.tag),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+    })),
+    mcpErrorsByCode: finishBreakdown(target.mcpCodes).map((row) => ({
+      tool: String(row.labels.tool),
+      code: String(row.labels.code),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+    })),
+    dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
+      span: String(row.labels.span),
+      key: String(row.labels.key),
+      phase: String(row.labels.phase),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+      totalWaitMs: row.totalWaitMs,
+    })),
     longTasksByRoute: [...target.longTasks.values()]
       .map((group) => {
         let rank = Math.ceil(group.count * 0.95);

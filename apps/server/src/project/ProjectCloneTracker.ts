@@ -1,3 +1,4 @@
+import { AnalyticsInterruptCause } from "../observability/analyticsInterruption.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import type {
   ProjectCloneSnapshot,
@@ -315,7 +316,11 @@ export const make = Effect.gen(function* () {
       // must not leave a dead fiber behind a "running" snapshot.
       yield* Effect.uninterruptible(
         Effect.gen(function* () {
-          yield* Fiber.interrupt(tracked.fiber!);
+          yield* Fiber.interruptAs(
+            tracked.fiber!,
+            undefined,
+            AnalyticsInterruptCause.context("stop"),
+          );
           const after = yield* get(projectId);
           if (after?.phase === "done") return;
           if (after?.phase === "running") yield* finish(projectId, "cancelled", null);
