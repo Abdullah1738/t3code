@@ -305,7 +305,7 @@ class ReconcileBoxes(Base):
         # The base image has no host keys: sshd fails at first boot until systemd refuses to start it again.
         b = self.box()
         boatd._fresh_identity(b)
-        cmd = [c for c in self.f.calls if c[:1] == ("exec",)][-1][-1]
+        cmd = next(c[-1] for c in self.f.calls if c[:1] == ("exec",) and "ssh-keygen -A" in c[-1])
         self.assertLess(cmd.index("ssh-keygen -A"), cmd.index("systemctl reset-failed ssh.service ssh.socket"))
         self.assertLess(cmd.index("systemctl reset-failed"), cmd.index("systemctl restart ssh"))
 
