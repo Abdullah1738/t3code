@@ -31,6 +31,7 @@ import {
   type KanbanBlock,
   type ChatAttachment,
   type KanbanBoard,
+  KanbanStandingApproval,
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
   KanbanCard,
@@ -358,6 +359,20 @@ export type WaitAnswerOutcome =
       readonly detail: string;
     };
 
+const decodeStandingApproval = Schema.decodeUnknownEffect(KanbanStandingApproval);
+
+export interface StandingApprovalInput {
+  readonly action: "grant" | "revoke";
+  readonly boards?: ReadonlyArray<string> | undefined;
+  readonly quote?: string | undefined;
+  readonly sourceThreadId?: string | undefined;
+  readonly saidAt?: string | undefined;
+  readonly cardId?: KanbanCardId | undefined;
+  readonly ask?: string | undefined;
+  readonly id?: string | undefined;
+  readonly reason?: string | undefined;
+}
+
 export interface KanbanServiceShape {
   readonly ready: Effect.Effect<void>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanError>;
@@ -403,6 +418,23 @@ export interface KanbanServiceShape {
     { readonly board: KanbanBoard; readonly applied: boolean; readonly reason?: string },
     KanbanError
   >;
+  readonly standingApproval: (
+    boardId: KanbanBoard["id"],
+    input: StandingApprovalInput,
+    actor: KanbanActor,
+  ) => Effect.Effect<
+    {
+      boards: ReadonlyArray<KanbanBoard>;
+      openReleaseAsks: ReadonlyArray<{ board: string; card: number; ask: string }>;
+    },
+    KanbanError
+  >;
+  readonly revokeStandingApproval: (
+    boardId: KanbanBoard["id"],
+    id: string | undefined,
+    reason: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly setNightlyReview: (
     boardId: KanbanBoard["id"],
     input: {
@@ -5084,6 +5116,7 @@ const make = Effect.gen(function* () {
             Subtasks.approvalProblem(
               next,
               subtask,
+              board.standingApprovals,
               board.guessedGates,
               subtask.state === "skipped" ? "skip" : "do",
             ) !== null),
@@ -11278,6 +11311,7 @@ const make = Effect.gen(function* () {
       reviewChains: [],
       defaultReviewChain: null,
       guessedGates: undefined,
+      standingApprovals: [],
       instructions: Defaults.DEFAULT_INSTRUCTIONS,
       setup: null,
       pause: null,
@@ -11511,6 +11545,219 @@ const make = Effect.gen(function* () {
     return result;
   });
 
+  const checkStandingEvaluator = Effect.fn("KanbanService.checkStandingEvaluator")(function* (
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "evaluator")
+      return yield* failWith("denied", "only evaluators may grant or revoke standing approvals");
+    const link = yield* store.threadLink(actor.threadId);
+    if (link?.role !== "evaluator")
+      return yield* failWith("denied", "only evaluators may grant or revoke standing approvals");
+  });
+
+  const saveStandingApprovals = Effect.fn("KanbanService.saveStandingApprovals")(function* (
+    board: KanbanBoard,
+    standingApprovals: ReadonlyArray<KanbanStandingApproval>,
+    action: string,
+  ) {
+    const next = { ...board, standingApprovals };
+    yield* store.putBoard(next);
+    yield* publish(board.id, { _tag: "board", board: next });
+    yield* Effect.logInfo("kanban.standing-approval", {
+      boardId: board.id,
+      action,
+      records: standingApprovals.map((entry) => ({
+        id: entry.id,
+        recordedBy: entry.recordedBy,
+        revokedBy: entry.revokedBy,
+        revokedAt: entry.revokedAt,
+      })),
+    });
+    return next;
+  });
+
+  const revokeStandingUnlocked = Effect.fn("KanbanService.revokeStandingUnlocked")(function* (
+    board: KanbanBoard,
+    id: string | undefined,
+    reason: string,
+    actor: KanbanActor,
+  ) {
+    if (!reason.trim())
+      return yield* failWith("invalid", "revoking a standing approval needs a reason");
+    const at = yield* nowIso;
+    return yield* saveStandingApprovals(
+      board,
+      board.standingApprovals.map((entry) =>
+        entry.revokedAt === null && (id === undefined || entry.id === id)
+          ? {
+              ...entry,
+              revokedAt: at,
+              revokedBy:
+                actor._tag === "owner" ? "owner" : actor._tag === "evaluator" ? actor.threadId : "",
+              revokeReason: reason.trim(),
+            }
+          : entry,
+      ),
+      "revoke",
+    );
+  });
+
+  const revokeStandingApproval: KanbanServiceShape["revokeStandingApproval"] = (
+    boardId,
+    id,
+    reason,
+    actor,
+  ) =>
+    guard(
+      "board.standing-approval.revoke",
+      Effect.gen(function* () {
+        if (actor._tag !== "owner") yield* checkStandingEvaluator(actor);
+        yield* checkText([["reason", reason]]);
+        return yield* revokeStandingUnlocked(yield* boardOf(boardId), id, reason, actor);
+      }),
+    );
+
+  const standingApproval: KanbanServiceShape["standingApproval"] = (boardId, input, actor) =>
+    guard(
+      "board.standing-approval",
+      Effect.gen(function* () {
+        yield* checkStandingEvaluator(actor);
+        if (actor._tag !== "evaluator")
+          return yield* failWith(
+            "denied",
+            "only evaluators may grant or revoke standing approvals",
+          );
+        const own = yield* boardOf(boardId);
+        const slugs = [...new Set(input.boards ?? [own.slug])];
+        if (slugs.length === 0) return yield* failWith("invalid", "name at least one board");
+        const all = yield* store.boards;
+        const boards: KanbanBoard[] = [];
+        for (const slug of slugs) {
+          const board = all.find((entry) => entry.slug === slug);
+          if (!board) return yield* failWith("not-found", `board slug ${slug}`);
+          boards.push(board);
+        }
+        yield* checkText([
+          ["quote", input.quote],
+          ["reason", input.reason],
+          ["sourceThreadId", input.sourceThreadId],
+        ]);
+        const changed: KanbanBoard[] = [];
+        const openReleaseAsks: { board: string; card: number; ask: string }[] = [];
+        if (input.action === "revoke") {
+          if (!input.reason?.trim())
+            return yield* failWith("invalid", "revoking a standing approval needs a reason");
+          for (const board of boards)
+            changed.push(
+              yield* revokeStandingUnlocked(
+                yield* boardOf(board.id),
+                input.id,
+                input.reason,
+                actor,
+              ),
+            );
+          return { boards: changed, openReleaseAsks };
+        }
+        if (!input.cardId || !input.ask)
+          return yield* failWith("invalid", "grant needs an owner-approved card and ask");
+        const card = yield* cardOf(input.cardId);
+        const ask = card.asks.find((entry) => entry.id === input.ask);
+        const answer = ask?.answer;
+        const others =
+          answer?.optionIds?.length === 1
+            ? (ask?.options ?? [])
+                .filter((option) => !answer.optionIds!.includes(option.id))
+                .map((option) => option.label)
+            : [];
+        if (
+          !ask?.closedAt ||
+          answer?.by._tag !== "owner" ||
+          !(
+            answer.verdict === "approved" ||
+            (answer.verdict === "picked" &&
+              Boolean(answer.optionIds?.length) &&
+              answer.optionIds!.every((id) => {
+                const option = ask.options?.find((entry) => entry.id === id);
+                return (
+                  option !== undefined &&
+                  Subtasks.approvesGate(
+                    option.label,
+                    "deploy",
+                    ask.action?.summary ?? ask.text,
+                    others,
+                  )
+                );
+              }))
+          )
+        )
+          return yield* failWith(
+            "denied",
+            "grant needs a closed ask approved by the owner (not open, dropped or answered by an evaluator)",
+          );
+        const words = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""} ${ask.action?.target ?? ""}`;
+        for (const board of boards) {
+          if (
+            !words
+              .toLowerCase()
+              .split(/[^a-z0-9_-]+/)
+              .includes(board.slug)
+          )
+            return yield* failWith(
+              "denied",
+              `owner-approved ask must name board ${board.slug} as a whole word`,
+            );
+        }
+        const at = yield* nowIso;
+        const record = yield* decodeStandingApproval({
+          id: `sa-${uuid()}`,
+          gate: "deploy",
+          quote: input.quote,
+          sourceThreadId: input.sourceThreadId,
+          saidAt: input.saidAt,
+          approvedAsk: { cardId: card.id, askId: ask.id },
+          recordedAt: at,
+          recordedBy: actor.threadId,
+          revokedAt: null,
+          revokedBy: null,
+          revokeReason: null,
+        }).pipe(
+          Effect.mapError(
+            () =>
+              new KanbanError({
+                code: "invalid",
+                detail: "grant needs quote, sourceThreadId and a valid saidAt",
+              }),
+          ),
+        );
+        for (const board of boards) {
+          const current = yield* boardOf(board.id);
+          const history = current.standingApprovals.map((entry) =>
+            entry.revokedAt === null
+              ? { ...entry, revokedAt: at, revokedBy: actor.threadId, revokeReason: "superseded" }
+              : entry,
+          );
+          changed.push(
+            yield* saveStandingApprovals(
+              current,
+              [...history, { ...record, id: `sa-${uuid()}` }],
+              "grant",
+            ),
+          );
+          for (const card of yield* store.openCards(board.id))
+            for (const ask of kanbanOpenAsks(card)) {
+              if (
+                /(?:^|[^a-z])(?:deploy|release|install|restart)[a-z]*/i.test(
+                  `${ask.batchKey ?? ""} ${ask.text}`,
+                )
+              )
+                openReleaseAsks.push({ board: board.slug, card: card.number, ask: ask.id });
+            }
+        }
+        yield* kick;
+        return { boards: changed, openReleaseAsks };
+      }),
+    );
+
   const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
       "board.open",
@@ -11595,6 +11842,11 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const stage = input.stage ?? "todo";
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
+    if (
+      actor._tag !== "evaluator" &&
+      input.subtasks?.some((entry) => entry.ownerOnly !== undefined)
+    )
+      return yield* failWith("denied", "only evaluators may set or clear ownerOnly");
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
     yield* checkScriptNames(boardId, plan.subtasks);
@@ -12090,6 +12342,11 @@ const make = Effect.gen(function* () {
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
         const board = yield* boardOf(card.boardId);
+        if (
+          actor._tag !== "evaluator" &&
+          patch.subtasks?.some((entry) => entry.ownerOnly !== undefined)
+        )
+          return yield* failWith("denied", "only evaluators may set or clear ownerOnly");
         const plan = patch.subtasks
           ? Subtasks.planSubtasks(
               card.subtasks,
@@ -12106,7 +12363,13 @@ const make = Effect.gen(function* () {
             const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
             if (replacement && Subtasks.gateOf(replacement, board.guessedGates) !== undefined)
               continue;
-            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates, "skip");
+            const missing = Subtasks.approvalProblem(
+              card,
+              subtask,
+              board.standingApprovals,
+              board.guessedGates,
+              "skip",
+            );
             if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
           }
           yield* checkScriptNames(card.boardId, plan.subtasks);
@@ -12341,6 +12604,7 @@ const make = Effect.gen(function* () {
               Subtasks.approvalProblem(
                 card,
                 subtask,
+                board.standingApprovals,
                 board.guessedGates,
                 subtask.state === "skipped" ? "skip" : "do",
               ),
@@ -13588,13 +13852,33 @@ const make = Effect.gen(function* () {
             ? Subtasks.approvalProblem(
                 card,
                 gated,
+                board.standingApprovals,
                 board.guessedGates,
                 state === "skipped" ? "skip" : "do",
               )
             : null;
         if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
         const at = yield* nowIso;
-        const subtasks = Subtasks.markSubtask(card.subtasks, subtaskId, state, note, actor, at);
+        const cleared =
+          gated &&
+          state === "done" &&
+          actor._tag !== "owner" &&
+          Subtasks.gateOf(gated, board.guessedGates) === "deploy" &&
+          !gated.ownerOnly &&
+          Subtasks.approvalProblem(card, gated, [], board.guessedGates) !== null
+            ? board.standingApprovals.find((entry) => entry.revokedAt === null)
+            : undefined;
+        const completionNote = cleared
+          ? [note?.trim(), `cleared by standing approval ${cleared.id}`].filter(Boolean).join("; ")
+          : note;
+        const subtasks = Subtasks.markSubtask(
+          card.subtasks,
+          subtaskId,
+          state,
+          completionNote,
+          actor,
+          at,
+        );
         const marked = (yield* upgradeFindings([
           {
             ...card,
@@ -13605,7 +13889,7 @@ const make = Effect.gen(function* () {
         ]))[0]!;
         const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
         yield* logEvent(marked, actor, "subtask", {
-          body: `${subtaskId} ${state}: ${text}${note?.trim() ? ` (${note.trim()})` : ""}`,
+          body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
         });
         const idle =
           (marked.stage === "todo" || Subtasks.BACK_TO_WORK_FROM.has(marked.stage)) &&
@@ -13846,7 +14130,12 @@ const make = Effect.gen(function* () {
             const reviewSubtasks = passed ? Subtasks.reviewSubtasksToPass(card) : [];
             if (passed) {
               for (const subtask of reviewSubtasks) {
-                const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
+                const missing = Subtasks.approvalProblem(
+                  card,
+                  subtask,
+                  board.standingApprovals,
+                  board.guessedGates,
+                );
                 if (missing) return yield* failWith("denied", missing);
               }
             }
@@ -15407,6 +15696,8 @@ const make = Effect.gen(function* () {
     createBoard,
     updateBoard,
     applyApprovedInstructions,
+    standingApproval,
+    revokeStandingApproval,
     setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {
       return yield* guard(
         "board.setNightlyReview",

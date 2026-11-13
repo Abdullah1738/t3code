@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   KanbanCardId,
   KanbanDiscussionId,
+  KanbanScriptId,
   KanbanError,
   ProjectId,
   ProviderInstanceId,
@@ -5814,5 +5815,302 @@ it.effect.each(defaultDiscussionCases)(
         }
       }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
     });
+  },
+);
+
+it.effect(
+  "standing approvals require the owner, cover named boards, preserve history and never clear money",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, store, board, card } = yield* waitFixture;
+      const other = yield* kanban.ensureBoard({
+        slug: "second",
+        name: "Second",
+        defaultProjectId: null,
+      });
+      const evaluator = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Record standing deploy approvals",
+      });
+      const actor = { _tag: "evaluator", threadId: evaluator } as const;
+      const grant = {
+        action: "grant",
+        boards: ["toy", "second"],
+        card: card.id,
+        ask: "q1",
+        quote: "These boards may release",
+        sourceThreadId: "owner-thread",
+        saidAt: card.createdAt,
+      };
+      const ask = {
+        id: "q1",
+        text: "Approve standing deploy approval for toy and second",
+        blocking: false,
+        by: actor,
+        at: card.createdAt,
+        seq: null,
+        closedAt: card.createdAt,
+        answer: { verdict: "approved" as const, by: owner, at: card.createdAt },
+      };
+      for (const bad of [
+        { ...ask, closedAt: null, answer: undefined },
+        { ...ask, answer: { ...ask.answer, verdict: "dropped" as const } },
+        { ...ask, answer: { ...ask.answer, by: actor } },
+        { ...ask, text: "Approve standing deploy approval for toy and second-other" },
+      ]) {
+        yield* store.putCard({ ...card, asks: [bad] });
+        const denied = yield* call(evaluator, "board_standing_approval", grant);
+        assert.isTrue(denied.isError, denied.text);
+        assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.standingApprovals, []);
+      }
+      yield* store.putCard({ ...card, asks: [ask] });
+      const release = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Ship tool",
+          description: "Ready",
+          prompt: "Ship tool",
+          subtasks: [
+            { text: "Deploy spectrum-bridge", owner: "evaluator" },
+            { text: "Pay the invoice", owner: "evaluator" },
+          ],
+        },
+        actor,
+      );
+      yield* kanban.askOwner(
+        release.id,
+        { question: "Release go?", blocking: false, batchKey: "release-standing-20261113" },
+        actor,
+        "evaluator",
+      );
+      const granted = yield* call(evaluator, "board_standing_approval", grant);
+      assert.isFalse(granted.isError, granted.text);
+      assert.deepStrictEqual(granted.structured.openReleaseAsks, [
+        { board: "toy", card: release.number, ask: "q1" },
+      ]);
+      for (const selected of [board, other]) {
+        const read = yield* call(evaluator, "board_get", { boardId: selected.slug });
+        assert.isFalse(read.isError, read.text);
+        assert.lengthOf(
+          (read.structured.board as { board: { standingApprovals: unknown[] } }).board
+            .standingApprovals,
+          1,
+        );
+      }
+      const record = (yield* kanban.snapshot(board.id)).board.standingApprovals[0]!;
+      const done = yield* call(evaluator, "subtask_done", {
+        card: release.id,
+        subtask: "s1",
+        state: "done",
+        note: "Installed",
+      });
+      assert.isFalse(done.isError, done.text);
+      const detail = yield* kanban.card(release.id);
+      assert.include(detail.card.subtasks[0]!.note!, `cleared by standing approval ${record.id}`);
+      assert.isTrue(
+        detail.events.some((event) =>
+          event.body?.includes(`cleared by standing approval ${record.id}`),
+        ),
+      );
+      const money = yield* call(evaluator, "subtask_done", {
+        card: release.id,
+        subtask: "s2",
+        state: "done",
+        note: "Paid",
+      });
+      assert.isTrue(money.isError);
+      const secondEvaluator = ThreadId.make("second-evaluator");
+      yield* store.putThreadLink({
+        ...(yield* kanban.caller(evaluator))!,
+        threadId: secondEvaluator,
+      });
+      const drop = yield* call(secondEvaluator, "card_ask_change", {
+        card: release.id,
+        ask: "q1",
+        action: "drop",
+      });
+      assert.isFalse(drop.isError, drop.text);
+      const superseded = yield* call(evaluator, "board_standing_approval", grant);
+      assert.isFalse(superseded.isError, superseded.text);
+      const history = (yield* kanban.snapshot(board.id)).board.standingApprovals;
+      assert.strictEqual(history[0]!.revokeReason, "superseded");
+      const revoked = yield* call(secondEvaluator, "board_standing_approval", {
+        action: "revoke",
+        reason: "Owner withdrew approval",
+      });
+      assert.isFalse(revoked.isError, revoked.text);
+      const reset = yield* call(evaluator, "subtask_done", {
+        card: release.id,
+        subtask: "s1",
+        state: "open",
+      });
+      assert.isFalse(reset.isError, reset.text);
+      const after = yield* call(evaluator, "subtask_done", {
+        card: release.id,
+        subtask: "s1",
+        state: "done",
+        note: "Installed",
+      });
+      assert.isTrue(after.isError);
+      assert.include(after.text, "no standing deploy approval");
+      for (const action of ["grant", "revoke"] as const) {
+        const refused = yield* kanban
+          .standingApproval(
+            board.id,
+            { action, reason: "Withdrawn" },
+            { _tag: "script", scriptId: KanbanScriptId.make("script-one") },
+          )
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "denied");
+      }
+      const workThread = ThreadId.make("standing-work");
+      yield* store.putThreadLink({
+        ...(yield* kanban.caller(evaluator))!,
+        threadId: workThread,
+        role: "work",
+        cardId: release.id,
+      });
+      for (const input of [grant, { action: "revoke", reason: "No" }]) {
+        const denied = yield* call(workThread, "board_standing_approval", input);
+        assert.isTrue(denied.isError);
+        assert.include(denied.text, "capability_denied");
+      }
+      const denied = yield* call(workThread, "card_create", {
+        title: "Owner only",
+        prompt: "Owner only",
+        subtasks: [{ text: "Do it", owner: "evaluator", ownerOnly: true }],
+      });
+      assert.isTrue(denied.isError);
+      assert.include(denied.text, "only evaluators");
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect(
+  "standing approval picks and board-name fields are checked without changing owner-only steps",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, store, board, card } = yield* waitFixture;
+      const evaluator = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Set standing deploy approval",
+      });
+      const actor = { _tag: "evaluator", threadId: evaluator } as const;
+      const grant = {
+        action: "grant",
+        card: card.id,
+        ask: "q1",
+        quote: "toy may release",
+        sourceThreadId: "owner-thread",
+        saidAt: card.createdAt,
+      };
+      const ask = {
+        id: "q1",
+        text: "Standing deploy approval",
+        blocking: false,
+        by: actor,
+        at: card.createdAt,
+        seq: null,
+        closedAt: card.createdAt,
+        options: [{ id: "o1", label: "Approve" }],
+        answer: { verdict: "picked" as const, optionIds: ["o1"], by: owner, at: card.createdAt },
+      };
+      for (const fields of [
+        { text: "Approve toy" },
+        { title: "Approve TOY" },
+        { action: { summary: "Deploy toy" } },
+        { action: { summary: "Deploy", target: "toy" } },
+      ]) {
+        yield* store.putCard({ ...card, asks: [{ ...ask, ...fields }] });
+        const result = yield* call(evaluator, "board_standing_approval", grant);
+        assert.isFalse(result.isError, result.text);
+      }
+      for (const label of ["No", "Show status", "Approve after tests"]) {
+        yield* store.putCard({
+          ...card,
+          asks: [{ ...ask, text: "toy deploy approval", options: [{ id: "o1", label }] }],
+        });
+        const result = yield* call(evaluator, "board_standing_approval", grant);
+        assert.isTrue(result.isError, label);
+      }
+      for (const { labels, picks, approved } of [
+        { labels: ["Tag and deploy now", "Wait"], picks: ["o1"], approved: true },
+        { labels: ["Tag and deploy now", "Install tonight"], picks: ["o1"], approved: false },
+        { labels: ["Tag and deploy now"], picks: ["o1"], approved: false },
+        { labels: ["Tag and deploy now", "Approve", "Wait"], picks: ["o1", "o2"], approved: false },
+        { labels: ["Approve", "Deploy now"], picks: ["o1", "o2"], approved: true },
+        { labels: ["Deploy now", "Wait"], picks: ["o3"], approved: false },
+      ]) {
+        yield* store.putCard({
+          ...card,
+          asks: [
+            {
+              ...ask,
+              text: "Standing deploy approval for toy",
+              options: labels.map((label, index) => ({ id: `o${index + 1}`, label })),
+              answer: { ...ask.answer, optionIds: picks },
+            },
+          ],
+        });
+        const result = yield* call(evaluator, "board_standing_approval", grant);
+        assert.strictEqual(result.isError, !approved, JSON.stringify({ labels, picks }));
+      }
+      const step = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Owner-only restart",
+          prompt: "Restart Robob",
+          subtasks: [
+            { text: "Restart Robob to pick up the watcher", owner: "evaluator", ownerOnly: true },
+          ],
+        },
+        actor,
+      );
+      const edited = yield* kanban.editCard(
+        step.id,
+        { subtasks: [{ id: "s1", text: step.subtasks[0]!.text }] },
+        actor,
+      );
+      assert.isTrue(edited.subtasks[0]!.ownerOnly);
+      const denied = yield* call(evaluator, "subtask_done", {
+        card: step.id,
+        subtask: "s1",
+        state: "done",
+        note: "Restarted",
+      });
+      assert.isTrue(denied.isError);
+      assert.include(denied.text, "marked owner-only");
+      yield* kanban.askOwner(
+        step.id,
+        { question: "Approve s1 restart?", action: { summary: "Restart Robob" }, blocking: false },
+        actor,
+        "evaluator",
+      );
+      yield* kanban.answerAsk(step.id, "q1", { verdict: "approved", revision: 0 }, owner);
+      const done = yield* call(evaluator, "subtask_done", {
+        card: step.id,
+        subtask: "s1",
+        state: "done",
+        note: "Restarted",
+      });
+      assert.isFalse(done.isError, done.text);
+      assert.notInclude((yield* kanban.card(step.id)).card.subtasks[0]!.note!, "standing approval");
+      for (const role of ["work", "review"] as const) {
+        const threadId = ThreadId.make(`denied-${role}`);
+        yield* store.putThreadLink({
+          ...(yield* kanban.caller(evaluator))!,
+          threadId,
+          role,
+          cardId: step.id,
+        });
+        for (const input of [grant, { action: "revoke", reason: "Withdrawn" }]) {
+          const reply = yield* call(threadId, "board_standing_approval", input);
+          assert.isTrue(reply.isError, role);
+          assert.include(reply.text, "capability_denied");
+        }
+      }
+    }).pipe(Effect.provide(layer));
   },
 );

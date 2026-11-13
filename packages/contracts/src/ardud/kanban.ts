@@ -138,6 +138,7 @@ export const KanbanSubtask = Schema.Struct({
   text: Schema.String,
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  ownerOnly: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -1975,6 +1976,21 @@ export const KanbanNightlyReview = Schema.Struct({
 });
 export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
 
+export const KanbanStandingApproval = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  gate: Schema.Literal("deploy"),
+  quote: TrimmedNonEmptyString,
+  sourceThreadId: TrimmedNonEmptyString,
+  saidAt: IsoDateTime,
+  approvedAsk: Schema.Struct({ cardId: TrimmedNonEmptyString, askId: TrimmedNonEmptyString }),
+  recordedAt: IsoDateTime,
+  recordedBy: TrimmedNonEmptyString,
+  revokedAt: Schema.NullOr(IsoDateTime),
+  revokedBy: Schema.NullOr(TrimmedNonEmptyString),
+  revokeReason: Schema.NullOr(Schema.String),
+});
+export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -1991,6 +2007,9 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
+  standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),

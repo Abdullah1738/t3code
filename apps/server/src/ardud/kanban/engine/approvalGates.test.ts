@@ -363,7 +363,7 @@ it.effect.each([
         owner,
       );
       const current = (yield* kanban.card(card.id)).card;
-      assert.isNull(approvalProblem(current, current.subtasks[0]!, undefined, "skip"));
+      assert.isNull(approvalProblem(current, current.subtasks[0]!, [], undefined, "skip"));
       const actionDenied = yield* kanban
         .markSubtask(card.id, "s1", "done", "Narrower choice", evaluator, "evaluator")
         .pipe(Effect.flip);
@@ -544,7 +544,7 @@ it.effect.each([
         );
         if (optionId === "o1") {
           const current = (yield* kanban.card(card.id)).card;
-          assert.isNull(approvalProblem(current, current.subtasks[0]!, undefined, "skip"));
+          assert.isNull(approvalProblem(current, current.subtasks[0]!, [], undefined, "skip"));
           const actionDenied = yield* kanban
             .markSubtask(card.id, "s1", "done", "Owner chose information", evaluator, "evaluator")
             .pipe(Effect.flip);
@@ -633,7 +633,7 @@ it.effect("#3917: a Sign off decision after a dropped draft allows verification"
           },
         ],
       };
-      assert.include(approvalProblem(legacy, subtask)!, "the latest decision, q2, was dropped");
+      assert.include(approvalProblem(legacy, subtask, [])!, "the latest decision, q2, was dropped");
       const signedOff: KanbanCard = {
         ...legacy,
         asks: [
@@ -663,7 +663,7 @@ it.effect("#3917: a Sign off decision after a dropped draft allows verification"
           },
         ],
       };
-      assert.isNull(approvalProblem(signedOff, subtask));
+      assert.isNull(approvalProblem(signedOff, subtask, []));
       yield* store.putCard(signedOff);
       assert.strictEqual(
         (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
@@ -688,7 +688,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask (this board has no standing deploy approval)`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -742,7 +742,7 @@ it.effect.each([
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: the latest decision, q2, ${suffix}`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: the latest decision, q2, ${suffix} (this board has no standing deploy approval)`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -783,7 +783,7 @@ it.effect.each([owner, evaluator])(
             .pipe(Effect.flip);
           assert.strictEqual(
             refused.detail,
-            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's ${state === "skipped" ? "answer before it can be skipped" : "approval"}: the latest decision, q1, was dropped (a dropped ask is not approval)`,
+            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's ${state === "skipped" ? "answer before it can be skipped" : "approval"}: the latest decision, q1, was dropped (a dropped ask is not approval) (this board has no standing deploy approval)`,
           );
         }
         const verify = yield* kanban
@@ -1053,21 +1053,21 @@ it.each([
             },
           ],
   };
-  assert.strictEqual(approvalProblem(card, subtask, undefined, "skip") === null, skip);
-  assert.strictEqual(approvalProblem(card, subtask, undefined, "do") === null, done);
+  assert.strictEqual(approvalProblem(card, subtask, [], undefined, "skip") === null, skip);
+  assert.strictEqual(approvalProblem(card, subtask, [], undefined, "do") === null, done);
   assert.strictEqual(
-    approvalProblem(card, subtask, undefined, "do"),
+    approvalProblem(card, subtask, [], undefined, "do"),
     approvalProblem(card, subtask),
   );
   if (!skip)
     assert.include(
-      approvalProblem(card, subtask, undefined, "skip")!,
+      approvalProblem(card, subtask, [], undefined, "skip")!,
       "needs Abdullah's answer before it can be skipped",
     );
   if (verdict === "picked" && by === "owner") {
     assert.strictEqual(
       approvalProblem(card, subtask),
-      `card #19 subtask s6 (deploy: Ask Abdullah to deploy) needs Abdullah's approval: the latest decision, q2, picked "Skip deploy", which doesn't read as approving deploy; ask again with an Approve option or an action ask`,
+      `card #19 subtask s6 (deploy: Ask Abdullah to deploy) needs Abdullah's approval: the latest decision, q2, picked "Skip deploy", which doesn't read as approving deploy; ask again with an Approve option or an action ask (this board has no standing deploy approval)`,
     );
   }
 });
@@ -1116,7 +1116,7 @@ it.each(
     }),
     relevanceAsk(),
   ]);
-  assert.isNull(approvalProblem(card, relevanceSubtask, undefined, intent));
+  assert.isNull(approvalProblem(card, relevanceSubtask, [], undefined, intent));
 });
 
 it.each(
@@ -1143,7 +1143,7 @@ it.each(
       }),
     ]);
     assert.include(
-      approvalProblem(card, relevanceSubtask, undefined, intent)!,
+      approvalProblem(card, relevanceSubtask, [], undefined, intent)!,
       "the latest decision, q2, was dropped",
     );
   },
@@ -1172,7 +1172,7 @@ it.each(["do", "skip"] as const)(
         answer: { verdict: "approved", by: owner, at: "2026-11-13T14:02:00.000Z" },
       }),
     ]);
-    const problem = approvalProblem(card, relevanceSubtask, undefined, intent)!;
+    const problem = approvalProblem(card, relevanceSubtask, [], undefined, intent)!;
     assert.include(
       problem,
       'q3 was approved but doesn\'t name s5; ask again naming the subtask id (e.g. "Approve s5")',
@@ -1203,7 +1203,7 @@ it.each([
 ])("a $label approval keeps the missing-answer reason", ({ ask }) => {
   for (const intent of ["do", "skip"] as const) {
     assert.include(
-      approvalProblem(relevanceCard([ask]), relevanceSubtask, undefined, intent)!,
+      approvalProblem(relevanceCard([ask]), relevanceSubtask, [], undefined, intent)!,
       "no owner answer on a secret ask since",
     );
   }
@@ -1220,7 +1220,7 @@ it.each(["do", "skip"] as const)(
         answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T13:59:00.000Z" },
       }),
     ]);
-    assert.isNull(approvalProblem(card, relevanceSubtask, undefined, intent));
+    assert.isNull(approvalProblem(card, relevanceSubtask, [], undefined, intent));
   },
 );
 
@@ -1235,7 +1235,7 @@ it.each(["do", "skip"] as const)("an inferred relevant drop still revokes %s", (
     }),
   ]);
   assert.include(
-    approvalProblem(card, relevanceSubtask, undefined, intent)!,
+    approvalProblem(card, relevanceSubtask, [], undefined, intent)!,
     "the latest decision, q2, was dropped",
   );
   const other = { ...relevanceSubtask, id: "s6" };
@@ -1243,6 +1243,7 @@ it.each(["do", "skip"] as const)("an inferred relevant drop still revokes %s", (
     approvalProblem(
       { ...card, subtasks: [...card.subtasks, other] },
       relevanceSubtask,
+      [],
       undefined,
       intent,
     ),
@@ -1280,6 +1281,7 @@ it("a later dropped decision still blocks skipping after the owner's earlier app
     approvalProblem(
       { number: 19, createdAt: at, subtasks: [subtask], asks },
       subtask,
+      [],
       undefined,
       "skip",
     )!,

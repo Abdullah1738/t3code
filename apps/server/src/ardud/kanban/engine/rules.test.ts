@@ -76,6 +76,7 @@ const board: KanbanBoard = {
     { name: "Default", steps: [opus] },
   ],
   defaultReviewChain: "Default",
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: null,

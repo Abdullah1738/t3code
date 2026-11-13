@@ -5,6 +5,7 @@
  */
 import {
   CARD_ASK_TOOL_DESCRIPTION,
+  IsoDateTime,
   KanbanBlockInput,
   KanbanNightlyReviewTime,
   KanbanNightlyReviewTimeZone,
@@ -124,6 +125,12 @@ const SubtasksInput = describe(
         ),
       ),
       gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+      ownerOnly: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "Evaluator only: set on steps the board keeps with the owner (Robob/OpenCode restarts from tool boards, sudo/macOS, rule or prompt changes). Omit to preserve; false clears.",
+        ),
+      ),
       script: Schema.optional(
         describe(
           TrimmedNonEmptyString,
@@ -560,6 +567,26 @@ const CardFlag = tool(
   { readonly: false },
 );
 
+const BoardStandingApproval = tool(
+  "board_standing_approval",
+  "Standing deploy approval",
+  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval.",
+  {
+    boardId: BoardRef,
+    action: Schema.Literals(["grant", "revoke"]),
+    boards: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    quote: Schema.optional(TrimmedNonEmptyString),
+    sourceThreadId: Schema.optional(TrimmedNonEmptyString),
+    saidAt: Schema.optional(IsoDateTime),
+    card: Schema.optional(CardRef),
+    ask: Schema.optional(TrimmedNonEmptyString),
+    id: Schema.optional(TrimmedNonEmptyString),
+    reason: Schema.optional(TrimmedNonEmptyString),
+  },
+  { boards: Records, openReleaseAsks: Records },
+  { readonly: false },
+);
+
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
@@ -802,7 +829,7 @@ const CardEdit = tool(
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -1059,6 +1086,7 @@ export const KanbanToolkit = Toolkit.make(
   CardAskAnswer,
   CardFlag,
   CardWait,
+  BoardStandingApproval,
   CardReviewResult,
   DiscussionPost,
   DiscussionRead,
