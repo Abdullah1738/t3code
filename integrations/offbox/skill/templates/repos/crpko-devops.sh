@@ -26,19 +26,26 @@ terraform_ready() {
   [ -x /usr/local/bin/terraform ] && [ "$(terraform version -json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["terraform_version"])' 2>/dev/null)" = "$terraform_version" ]
 }
 
+OFFBOX_GNU_TIME=${OFFBOX_GNU_TIME:-/usr/bin/time}
+gnu_time_ready() {
+  [ -x "$OFFBOX_GNU_TIME" ] && "$OFFBOX_GNU_TIME" -p true >/dev/null 2>&1
+}
+
 if [ "${1:-}" = --check ]; then
-  offbox_crpko_tools_ready && terraform_ready
+  offbox_crpko_tools_ready && terraform_ready && gnu_time_ready
   exit $?
 fi
 
 offbox_crpko_tools
+gnu_time_ready || offbox_apt_install time || { echo 'offbox: GNU time install failed' >&2; exit 98; }
+gnu_time_ready || { echo 'offbox: GNU time install failed' >&2; exit 98; }
 if ! terraform_ready; then
   case $(uname -m) in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
     *) echo 'offbox: unsupported Terraform architecture' >&2; exit 98 ;;
   esac
-  command -v unzip >/dev/null || sudo apt-get install -y -qq unzip
+  command -v unzip >/dev/null || offbox_apt_install unzip
   stage=$(mktemp -d)
   trap 'rm -rf "$stage"' EXIT
   archive="terraform_${terraform_version}_linux_${arch}.zip"

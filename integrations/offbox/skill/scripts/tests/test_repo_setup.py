@@ -150,10 +150,28 @@ class RepoSetupTests(unittest.TestCase):
         self.assertLess(len(wrapped.encode()) + 1, 64 * 1024)
 
     def test_real_recipe_provisions_bare_home_then_skips_installed_pieces(self):
+        self.assert_real_recipe_provisions()
+
+    def test_real_recipe_refreshes_empty_apt_lists_once(self):
+        self.assert_real_recipe_provisions(cold_apt=True)
+
+    def test_real_recipe_retries_failed_apt_update_on_next_setup(self):
+        self.assert_real_recipe_provisions(cold_apt=True,failed_update=True)
+
+    def assert_real_recipe_provisions(self, cold_apt=False, failed_update=False):
         java_home = self.home / 'jdk17'
         bins = self.home / 'bin'
+        if cold_apt:
+            (self.home/'empty-lists').touch()
+        if failed_update:
+            (self.home/'fail-update').touch()
         tools = {
-            'sudo': '#!/bin/bash\necho JDK >> "$HOME/installs"\nmkdir -p "$HOME/jdk17/bin"\n'
+            'sudo': '#!/bin/bash\necho "$*" >> "$HOME/apt-calls"\n'
+                    'if [ "$2" = update ]; then\n'
+                    ' [ ! -f "$HOME/fail-update" ] || exit 100\n'
+                    ' rm -f "$HOME/empty-lists"; exit 0\nfi\n'
+                    '[ ! -f "$HOME/empty-lists" ] || { echo "E: Unable to locate package openjdk-17-jdk-headless" >&2; exit 100; }\n'
+                    'echo JDK >> "$HOME/installs"\nmkdir -p "$HOME/jdk17/bin"\n'
                     'touch "$HOME/jdk17/bin/java"\nchmod +x "$HOME/jdk17/bin/java"\n',
             'curl': '#!/bin/bash\necho TOOLS >> "$HOME/installs"\n',
             'unzip': '#!/bin/bash\nmkdir -p "$4/cmdline-tools/bin"\n'
@@ -177,10 +195,19 @@ class RepoSetupTests(unittest.TestCase):
         path = self.home / 'real-recipe.sh'
         path.write_text(recipe)
         env = dict(self.env, OFFBOX_REPO_ROOT=str(self.root))
+        if failed_update:
+            result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.home/f'.offbox/repo-env/{KEY}.sh').exists())
+            (self.home/'fail-update').unlink()
         for _ in range(2):
             result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.home / 'installs').read_text().splitlines(), ['JDK', 'TOOLS'])
+        calls=(self.home/'apt-calls').read_text().splitlines()
+        self.assertEqual(calls.count('apt-get update -qq'),int(cold_apt)+int(failed_update))
+        self.assertEqual(calls.count('apt-get install -y -qq openjdk-17-jdk-headless'),
+                         1+int(cold_apt)+int(failed_update))
         self.assertEqual((self.home / 'packages').read_text().splitlines(), [
             'platform-tools', 'platforms;android-37.1', 'platforms;android-36',
             'build-tools;36.0.0', 'ndk;26.3.11579264'])
