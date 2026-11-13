@@ -115,6 +115,7 @@ runcloud ios accessibility-tree $ID --json        # check `truncated`
 runcloud ios tap $ID 0.5 0.82
 runcloud ios swipe $ID 0.5 0.8 0.5 0.3 --duration 300
 runcloud ios type-text $ID "hello"
+runcloud android type-text $ID "hello"
 runcloud ios press-button $ID home               # android: back, menu, home
 runcloud ios open-url $ID "myapp://route"
 runcloud ios logs $ID --tail 500
@@ -123,6 +124,14 @@ runcloud ios recording start $ID --idempotency-key rec-1   # then stop / downloa
 
 Same commands under `runcloud android`. `unsupported_action` errors are final,
 don't retry them. `simulator_capacity_unavailable` means retry later.
+
+Android typing: `completed` and `characterCount` acknowledge injection, not the
+field's value. In a Settings search probe (CLI 0.2.183), a double quote, JSON
+and mixed text left the field empty; a URL lost `://example.com/`. Check every
+typed string: read back non-secure fields from the accessibility tree, and use
+the app's validation for secure fields. Confirm focus before further input. Semantic
+`press-key` with `--shift` worked in the TorSSH report but did not reproduce
+reliably in Settings search; verify its result too.
 
 The signed viewer `url` in create/get/list/delete JSON is a secret (anyone with
 it can drive the session). Never print or paste it; strip it with
