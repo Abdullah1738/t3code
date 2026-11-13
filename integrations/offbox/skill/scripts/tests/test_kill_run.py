@@ -433,6 +433,47 @@ while True:
                                                        call('bx_test', 99, timeout=5, retries=0, deadline=ANY)])
                 self.assertEqual(tuple(self.status_of(rid)), ('killed', 143))
 
+    def test_prestart_command_race_uses_delayed_remote_confirmation_and_retry(self):
+        self.box('bx_test', member=True)
+        for box in (None, 'bx_test'):
+            for outcome in ('delayed', 'timeout'):
+                with self.subTest(box=box, outcome=outcome):
+                    rid = f'run-confirm-race-{box}-{outcome}'
+                    self.run_row(rid, box=box, pid=None, owner=self.me['owner'])
+                    child = self.client(rid, 'started')
+                    proof = {'running': True, 'commandId': 'cmd-99'}
+                    states = (proof, {'running': True}, {'running': True}, {'running': False}) if outcome == 'delayed' else (
+                        proof, {'running': True})
+                    km, sm = self.patched_kill(status_values=states)
+                    responses = sm.side_effect
+                    def still_reserved(*args, **kwargs):
+                        self.assertEqual(self.status_of(rid)['status'], 'running')
+                        self.assertEqual(lease.active_runs(self.con, 'bx_test'), 1)
+                        return next(responses)
+                    sm.side_effect = still_reserved
+                    began = self.elapsed
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(misc.kill_run(rid, self.me), 0 if outcome == 'delayed' else 1)
+                    self.assertEqual(child.wait(timeout=5), 130)
+                    self.assertEqual(sm.call_args_list[0], call('bx_test', 99))
+                    for poll in sm.call_args_list[1:]:
+                        self.assertEqual(poll.args, ('bx_test', 99))
+                        self.assertEqual(poll.kwargs['retries'], 0)
+                        self.assertLessEqual(poll.kwargs['timeout'], 5)
+                        self.assertIn('deadline', poll.kwargs)
+                    km.assert_called_once_with('bx_test', 99)
+                    self.assertEqual(self.elapsed - began, 2 if outcome == 'delayed' else misc.KILL_CONFIRM_S)
+                    if outcome == 'timeout':
+                        self.assertEqual(tuple(self.status_of(rid)), ('running', None))
+                        self.assertEqual(lease.active_runs(self.con, 'bx_test'), 1)
+                        sm.side_effect = None
+                        sm.return_value = {'running': False}
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            self.assertEqual(misc.kill_run(rid, self.me), 0)
+                        self.assertEqual(km.call_args_list, [call('bx_test', 99), call('bx_test', 99)])
+                    self.assertEqual(tuple(self.status_of(rid)), ('killed', 143))
+                    self.assertEqual(lease.active_runs(self.con, 'bx_test'), 0)
+
     def test_prestart_box_assignment_keeps_waiting_for_handler(self):
         self.run_row(box=None, pid=None, client=12345, owner=self.me['owner'], start=now())
         sleeps = []
