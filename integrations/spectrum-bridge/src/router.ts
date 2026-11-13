@@ -3948,6 +3948,7 @@ export class Router {
         if (idle.outcome === "interrupted" && !idle.firstTurnFailure && !idle.modelError && !priorFailure
           && !this.toolMode && !turn.background && turn.inboundId && !this.syntheticBatch(turn.inboundId)
           && final && !final.error && !final.continued && final.time.completed !== undefined && final.finish === "stop"
+          && !scope.slice(scope.indexOf(final) + 1).some(record => record.type === "idle")
           && final.answer !== false && final.interruptReplyComplete !== false && !quiet.has(final.id)
           && text && stripInternalText(visible).trim()) {
           const safeEarlier = earlier.filter(reply => {

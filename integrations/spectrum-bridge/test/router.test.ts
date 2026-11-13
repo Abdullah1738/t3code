@@ -8334,3 +8334,27 @@ test.each(["running", "visible", "quiet", "failed", "interrupted"].flatMap(outco
   expect(h.controls().filter(op => op.replyTo === "old")).toEqual([]);
   expect(h.controls().filter(op => op.replyTo === "new")).toHaveLength(["failed", "interrupted"].includes(outcome) ? 1 : 0);
 });
+
+test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutcome =>
+  ["empty", "tools", "partial"].map(finalKind => ({ previousOutcome, finalKind })),
+))("interruption recovery cannot adopt a prior run's final ($previousOutcome, $finalKind)", async ({ previousOutcome, finalKind }) => {
+  const stages: string[] = [];
+  const h = setup(":memory:", { failureNoticeMs: 0, log: event => stages.push(event) });
+  steering(h.backend, async () => "queued");
+  h.input("first", "First question");
+  await h.router.tick();
+  h.input("second", "One more thing");
+  await h.router.tick();
+  h.backend.step("Previous answer");
+  h.backend.settle(previousOutcome);
+  h.backend.records.push({ id: messageId("second"), type: "user", text: "One more thing", time: { created: Date.now() } });
+  if (finalKind !== "empty") {
+    const partial = h.backend.step("LATEST_PARTIAL", "tool-calls");
+    if (finalKind === "partial") { delete partial.finish; delete partial.time.completed; }
+  }
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+  expect(stages).not.toContain("reply-recovered-after-interrupt");
+});
