@@ -485,7 +485,7 @@ if sys.argv[1] == 'send':
             return {'imessage': {'cursor': 9001, 'items': [item('Google', 'New sign-in on Linux', ts=1005)]}}, {}
         with patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
              patch.object(t, 'collect', side_effect=collect), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(t.run_fast(types.SimpleNamespace(dry_run_hours=None)), 0)
+            self.assertEqual(t.run_fast(types.SimpleNamespace(dry_run_hours=None)), 1)
             clock[0] = 1015
             self.assertEqual(t.run_fast(types.SimpleNamespace(dry_run_hours=None)), 0)
         self.assertEqual(baselines, [True, False])

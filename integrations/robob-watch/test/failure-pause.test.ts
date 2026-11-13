@@ -2,14 +2,15 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { normalize, shouldPause, type State } from "../src/lib.ts";
+import { escalationText, normalize, shouldPause, type State } from "../src/lib.ts";
 
 const fixtures: ReturnType<typeof fixture>[] = [];
 function fixture(options: Record<string, string> = {}) {
   const sandbox = mkdtempSync(join(tmpdir(), "watch-failure-pause-"));
   const root = join(sandbox, "root"), calls = join(sandbox, "calls"), stub = join(sandbox, "bridge.ts");
   writeFileSync(stub, `import { appendFileSync, existsSync } from "node:fs";
-const args = process.argv.slice(2), ok = !existsSync(${JSON.stringify(join(sandbox, "fail-send"))});
+const args = process.argv.slice(2), ok = !existsSync(${JSON.stringify(join(sandbox, "fail-send"))})
+  && !(args[0] === "wake" && existsSync(${JSON.stringify(join(sandbox, "fail-wake"))}));
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({args, ok}) + "\\n");
 while (existsSync(${JSON.stringify(join(sandbox, "hold-send"))}) || existsSync(${JSON.stringify(join(sandbox, "hold-"))} + args[0])) await Bun.sleep(10);
 if (!ok) process.exit(1);
@@ -104,10 +105,55 @@ test("c: resume clears failure state and a new streak gets a new notice key", as
   f.save("resume", { ...f.state("resume"), failure_escalated: true });
   expect(f.cli("pause", "resume").exitCode).toBe(0); expect(f.cli("resume", "resume").exitCode).toBe(0);
   expect(f.state("resume")).toMatchObject({ consecutive_failures: 0, failure_alerted: false, next_at: 0 });
-  for (const field of ["failure_paused_at", "failure_escalated", "failing_since", "last_error"] as const) expect(f.state("resume")[field]).toBeUndefined();
+  for (const field of ["failure_paused_at", "failure_escalated", "failing_since", "last_error", "last_error_sources"] as const) expect(f.state("resume")[field]).toBeUndefined();
   await f.run("resume", s => !!s.failure_paused_at && s.failure_alerted);
   expect(f.runs("resume")).toBe(2);
   const keys = f.readCalls().map(c => opt(c.args, "--key")); expect(keys).toHaveLength(2); expect(keys[0]).not.toBe(keys[1]);
+});
+
+test.each([false, true])("long source errors survive runner clipping (wake fails=%s)", async (wakeFails) => {
+  const f = fixture();
+  const sources = ["outlook", "gmail", "icloud", "fund", "juno", "whatsapp", "imessage"];
+  const errors = Object.fromEntries(sources.map(source => [source, "TimeoutExpired: " + "x".repeat(160)]));
+  const stderr = "source failure: " + JSON.stringify(errors);
+  expect(stderr.length).toBeGreaterThan(500);
+  f.add("long-error", { mode: "wake", max_consecutive_failures: 1,
+    check: 'cat "$WATCH_DIR/error" >&2; exit 1' });
+  writeFileSync(f.path("long-error", "error"), stderr);
+  if (wakeFails) writeFileSync(join(f.sandbox, "fail-wake"), "");
+  await f.run("long-error", s => !!s.failure_escalated);
+  const saved = f.state("long-error");
+  expect(saved.last_error).toBe("exit 1: " + stderr.slice(-500));
+  expect(saved.last_error).not.toContain("outlook");
+  expect(saved.last_error_sources).toEqual(sources);
+  const summary = "failing sources: " + sources.join(", ");
+  expect(escalationText(normalize({ id: "long-error", title: "Long", mode: "wake", check: "true", context: "Repair it." }), saved, 0)).toContain(summary);
+  const calls = f.readCalls().filter(call => call.args[0] === "wake" || call.args[0] === "send");
+  expect(calls).toHaveLength(wakeFails ? 2 : 1);
+  for (const call of calls) expect(opt(call.args, "--text")).toContain(summary);
+  expect(f.cli("resume", "long-error").exitCode).toBe(0);
+  expect(f.state("long-error").last_error_sources).toBeUndefined();
+});
+
+test("runner replaces source names on a generic error and clears them on recovery", async () => {
+  const f = fixture();
+  f.add("source-reset", { max_consecutive_failures: 0,
+    check: 'echo run >> "$WATCH_DIR/runs"; cat "$WATCH_DIR/error" >&2; exit 1' });
+  writeFileSync(f.path("source-reset", "error"), 'source failure: {"outlook":"timeout"}');
+  await f.run("source-reset", s => s.consecutive_failures === 1 && s.failure_alerted);
+  expect(f.state("source-reset").last_error_sources).toEqual(["outlook"]);
+  writeFileSync(f.path("source-reset", "error"), "plain error");
+  await f.run("source-reset", s => s.consecutive_failures === 2 && s.failure_alerted);
+  expect(f.state("source-reset").last_error_sources).toBeUndefined();
+  // Another mapped failure followed by a real successful check exercises the other reset path.
+  writeFileSync(f.path("source-reset", "error"), 'source failure: {"gmail":"timeout"}');
+  await f.run("source-reset", s => s.consecutive_failures === 3 && s.failure_alerted);
+  expect(f.state("source-reset").last_error_sources).toEqual(["gmail"]);
+  const definition = JSON.parse(readFileSync(f.path("source-reset", "watcher.json"), "utf8"));
+  writeFileSync(f.path("source-reset", "watcher.json"), JSON.stringify({ ...definition, check: "true" }));
+  await f.run("source-reset", s => s.consecutive_failures === 0);
+  expect(f.state("source-reset").last_error_sources).toBeUndefined();
+  expect(f.state("source-reset").last_error).toBeUndefined();
 });
 
 test("d: zero threshold keeps backoff and admits every failure to one burst source", async () => {
