@@ -85,7 +85,10 @@ const make = Effect.gen(function* () {
     function* (source: RestartSource) {
       // Reservations cover the dispatch-to-provider gap and remain held after the
       // outbox claim succeeds. Durable turn state, not claim completion, frees them.
-      if (active.has(key(source))) return 0;
+      if (active.has(key(source))) {
+        yield* state.status(source, null);
+        return 0;
+      }
       yield* register(source);
       for (const [id, running] of active) {
         if (!running.dispatching && !(yield* state.active(running.source))) {
@@ -102,14 +105,16 @@ const make = Effect.gen(function* () {
           a.priority - b.priority || b.activityAt - a.activityAt || key(a).localeCompare(key(b)),
       );
       while (queue.length > 0 && !(yield* state.pending(queue[0]!))) {
-        const stale = queue.shift()!;
+        const stale = queue[0]!;
+        // Keep cleanup ownership while an unclaimed replacement owns the note.
+        if (!(yield* state.status(stale, null))) break;
+        queue.shift();
         requeuedHolds.set(key(stale), {
           loadHoldMs: stale.loadHoldMs,
           checkedAt: stale.checkedAt,
           wasLoaded: stale.wasLoaded,
         });
         pending.delete(key(stale));
-        yield* state.status(stale, null);
       }
       const entry = pending.get(key(source));
       if (entry === undefined) return 0;

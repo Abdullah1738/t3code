@@ -47,7 +47,7 @@ export class RestartPacingState extends Context.Service<
     readonly status: (
       source: RestartSource,
       position: number | null,
-    ) => Effect.Effect<void, RestartPacingStateError>;
+    ) => Effect.Effect<boolean, RestartPacingStateError>;
   }
 >()("t3/ardud/restart-pacing/RestartPacingState") {}
 
@@ -187,11 +187,29 @@ const make = Effect.gen(function* () {
     function* (source: RestartSource, position: number | null) {
       const projection = yield* projections.getThreadRecords(source.threadId, ["runs"]);
       const run = projection.runs.find((candidate) => candidate.id === source.sourceRunId);
-      if (!run) return;
+      if (!run) return true;
       const now = yield* DateTime.now;
       const itemId = TurnItemId.make(`turn-item:restart-pacing:${source.sourceRunId}`);
       const previous = yield* projections.getTurnItem({ threadId: source.threadId, itemId });
-      if (previous === null && position === null) return;
+      if (previous === null && position === null) return true;
+      if (position === null && previous?.status === "waiting" && source.effectId !== undefined) {
+        const effect = yield* outbox.get(source.effectId);
+        if (
+          (Option.isNone(effect) ||
+            (effect.value.status !== "pending" && effect.value.status !== "running")) &&
+          (yield* outbox.hasPendingRunStart({
+            threadId: source.threadId,
+            runIds: projection.runs
+              .filter(
+                (candidate) =>
+                  candidate.id === run.id || candidate.restartContinuationOfRunId === run.id,
+              )
+              .map((candidate) => candidate.id),
+          }))
+        )
+          // An old claim's cleanup must not complete a replacement's wait.
+          return false;
+      }
       const commandId = yield* ids.allocate.command({
         fixtureName: "restart-pacing",
         commandName: "status",
@@ -236,6 +254,7 @@ const make = Effect.gen(function* () {
         ],
         effects: [],
       });
+      return true;
     },
     // Linearize clearing the wait with fresh-message admission. A fresh send
     // cannot demote a stale waiting snapshot after this start was admitted.

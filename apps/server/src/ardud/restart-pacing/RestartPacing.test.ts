@@ -50,6 +50,7 @@ const harness = (options: { maxActive?: number; spacingMs?: number } = {}) => {
           status: (input, position) =>
             Effect.sync(() => {
               positions.push({ id: input.sourceRunId, position });
+              return true;
             }),
         }),
         Layer.succeed(RestartPacing.RestartLoad, () => load),

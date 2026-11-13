@@ -2165,6 +2165,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: startingRun,
           },
+          // Fresh input must see the wait before a worker claims this start.
+          ...(restartWait?.type === "notification"
+            ? [
+                {
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  ...(restartWait.runId === null ? {} : { runId: restartWait.runId }),
+                  occurredAt: now,
+                  payload: {
+                    ...restartWait,
+                    status: "waiting" as const,
+                    completedAt: null,
+                    updatedAt: now,
+                    summary: "Resuming after restart",
+                  },
+                },
+              ]
+            : []),
         ],
         [
           ...sessionsToDetach.map((session) => ({
@@ -10508,6 +10526,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         type: "run_interrupt_result",
         message: "Run interrupted before provider start",
       };
+      const restartWait = yield* projectionStore
+        .getTurnItem({
+          threadId: command.threadId,
+          itemId: TurnItemId.make(
+            `turn-item:restart-pacing:${run.restartContinuationOfRunId ?? run.id}`,
+          ),
+        })
+        .pipe(mapDispatchError(command));
+      if (restartWait?.type === "notification" && restartWait.status === "waiting") {
+        // The replacement may never have reached the process-local gate.
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          ...(restartWait.runId === null ? {} : { runId: restartWait.runId }),
+          occurredAt: now,
+          payload: {
+            ...restartWait,
+            status: "completed",
+            completedAt: now,
+            updatedAt: now,
+            summary: "Restart wait ended",
+          },
+        });
+      }
       yield* emitEvent({
         type: "turn-item.updated",
         threadId: command.threadId,

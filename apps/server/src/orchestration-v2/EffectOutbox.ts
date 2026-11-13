@@ -233,6 +233,10 @@ export interface EffectOutboxV2Shape {
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly hasPendingRunStart: (input: {
+    readonly threadId: ThreadId;
+    readonly runIds: ReadonlyArray<RunId>;
+  }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly listRestartContinuations: Effect.Effect<
     ReadonlyArray<OrchestrationEffectV2>,
     EffectOutboxError
@@ -477,6 +481,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
           LIMIT 1
         `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
+      hasPendingRunStart: Effect.fn("EffectOutbox.hasPendingRunStart")(
+        function* ({ threadId, runIds }) {
+          if (runIds.length === 0) return false;
+          const rows = yield* sql`
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+              AND effect_type = 'provider-turn.start'
+              AND json_extract(payload_json, '$.runId') IN ${sql.in(runIds)}
+            LIMIT 1
+          `;
           return rows.length > 0;
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),

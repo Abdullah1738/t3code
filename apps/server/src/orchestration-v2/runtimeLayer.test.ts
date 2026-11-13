@@ -1,5 +1,10 @@
-import { bootId, continuationReport } from "../ardud/fast-install/report.ts";
+import {
+  bootId,
+  continuationReport,
+  markQueuedRunRecovered,
+} from "../ardud/fast-install/report.ts";
 import * as RestartPacingState from "../ardud/restart-pacing/RestartPacingState.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 import * as ControlStore from "../ardud/control/ControlStore.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -8182,22 +8187,34 @@ const layerRestartPacingStateTest = RestartPacingState.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       IdAllocator.layer,
-      Layer.mock(ControlStore.ControlStore)({}),
-      Layer.mock(KanbanStore.KanbanStore)({}),
+      Layer.mock(ControlStore.ControlStore)({ getOrigin: () => Effect.succeed(null) }),
+      Layer.mock(KanbanStore.KanbanStore)({
+        threadLink: () => Effect.succeed(null),
+        discussionByEvaluator: () => Effect.succeed(null),
+      }),
     ),
   ),
   Layer.provideMerge(layerTest),
 );
+const layerRestartPacingTest = (load: () => number) =>
+  RestartPacing.layer.pipe(
+    Layer.provideMerge(layerRestartPacingStateTest),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(Layer.succeed(RestartPacing.RestartLoad, load)),
+  );
 
 it.effect.each([
-  ["web", "user", true],
-  ["mobile", "user", true],
-  ["server", "system", true],
-  ["server", "agent", false],
+  ["web", "user", true, "bypass"],
+  ["mobile", "user", true, "bypass"],
+  ["server", "system", true, "bypass"],
+  ["server", "agent", false, "bypass"],
+  ["web", "user", true, "thread.stop"],
+  ["web", "user", true, "run.interrupt"],
 ] as const)(
-  "a %s %s message obeys restart pacing on the same thread",
-  ([creationSource, createdBy, bypass]) =>
-    Effect.gen(function* () {
+  "a %s %s message obeys restart pacing (bypass=%s, action=%s)",
+  ([creationSource, createdBy, bypass, mode]) => {
+    let load = 2;
+    return Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const sink = yield* EventSink.EventSinkV2;
       const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -8230,6 +8247,7 @@ it.effect.each([
       });
       const before = yield* orchestrator.getThreadProjection(threadId);
       const old = before.runs[0]!;
+      markQueuedRunRecovered(old.id);
       const held = Option.getOrThrow(
         yield* outbox.claimNext({
           workerId: "paced-bypass",
@@ -8246,7 +8264,36 @@ it.effect.each([
         refundAttempt: true,
       });
       const state = yield* RestartPacingState.RestartPacingState;
+      const pacing = yield* RestartPacing.RestartPacing;
       const source = { threadId, sourceRunId: old.id, effectId: held.id };
+      assert.equal(yield* pacing.acquire(source), 15_000);
+      const otherThreadId = ThreadId.make(`runtime-paced-other:${creationSource}`);
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`paced-other-create:${creationSource}`),
+        createdBy: "agent",
+        creationSource: "server",
+        threadId: otherThreadId,
+        projectId: ProjectId.make("project:paced-bypass"),
+        title: "Other recovery",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`paced-other-start:${creationSource}`),
+        threadId: otherThreadId,
+        messageId: MessageId.make(`paced-other:${creationSource}`),
+        text: "Other recovery",
+        attachments: [],
+        createdBy: "agent",
+        creationSource: "server",
+        dispatchMode: { type: "start_immediately" },
+      });
+      const other = (yield* orchestrator.getThreadProjection(otherThreadId)).runs[0]!;
       for (const position of [1, 2, 1]) {
         yield* state.status(source, position);
         const note = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
@@ -8295,17 +8342,26 @@ it.effect.each([
       let currentFresh = fresh;
       const promotedIds = new Set<string>();
       for (let cycle = 0; cycle < 2; cycle++) {
-        // A delayed old start drains as a no-op while its run is queued.
-        yield* TestClock.adjust("15 seconds");
-        const stale = Option.getOrThrow(
-          yield* outbox.claimNext({
-            workerId: "paced-stale",
-            leaseDurationMs: 30_000,
-            threadId,
-            onlyEffectTypes: ["provider-turn.start"],
-          }),
-        );
-        yield* outbox.succeed({ effectId: stale.id, workerId: "paced-stale" });
+        if (cycle === 0) {
+          // A delayed old start drains as a no-op while its run is queued.
+          yield* TestClock.adjust("15 seconds");
+          const stale = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-stale",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          yield* outbox.succeed({ effectId: stale.id, workerId: "paced-stale" });
+        }
+        if (mode !== "bypass") {
+          // Prune E0 while its note is completed, before promotion creates E1.
+          assert.equal(
+            yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+            15_000,
+          );
+        }
         const now = yield* DateTime.now;
         yield* sink.write({
           commandId: CommandId.make(`paced-finish:${creationSource}:${cycle}`),
@@ -8325,28 +8381,65 @@ it.effect.each([
           threadId,
           commandId: CommandId.make(`paced-promote:${creationSource}:${cycle}`),
         });
-        const promoted = Option.getOrThrow(
-          yield* outbox.claimNext({
-            workerId: "paced-promoted",
-            leaseDurationMs: 30_000,
-            threadId,
-            onlyEffectTypes: ["provider-turn.start"],
-          }),
-        );
-        assert.equal(promoted.request.type, "provider-turn.start");
-        if (promoted.request.type === "provider-turn.start")
-          assert.equal(promoted.request.runId, old.id);
-        assert.isFalse(promotedIds.has(promoted.id));
-        promotedIds.add(promoted.id);
-        yield* outbox.retry({
-          effectId: promoted.id,
-          workerId: "paced-promoted",
-          error: "Resuming after restart",
-          delayMs: 15_000,
-          refundAttempt: true,
+        // A different thread prunes E0 after E1 has restored this run's wait,
+        // before E1 is claimed and replaces E0 in the pacing registry.
+        if (mode === "bypass")
+          assert.equal(
+            yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+            15_000,
+          );
+        const restoredWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+          threadId,
+          itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
         });
-        yield* state.status({ ...source, effectId: promoted.id }, 1);
-        const nextMessage = MessageId.make(`paced-next:${creationSource}:${cycle}`);
+        assert.equal(restoredWait?.status, "waiting");
+        assert.isNull(restoredWait?.completedAt);
+        if (mode !== "bypass") {
+          const commandId = CommandId.make(`paced-stop-unclaimed:${mode}`);
+          yield* orchestrator.dispatch(
+            mode === "thread.stop"
+              ? { type: "thread.stop", threadId, commandId }
+              : { type: "run.interrupt", threadId, commandId, runId: old.id, holdQueue: true },
+          );
+          const stoppedWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+            threadId,
+            itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+          });
+          assert.equal(stoppedWait?.status, "completed");
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+              (run) => run.id === old.id,
+            )?.status,
+            "interrupted",
+          );
+          return;
+        }
+        // Cover fresh input both before the worker claims the promoted start
+        // and after it has deferred it. Neither timing may queue owner input.
+        if (cycle === 1) {
+          const promoted = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-promoted",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          assert.equal(promoted.request.type, "provider-turn.start");
+          if (promoted.request.type === "provider-turn.start")
+            assert.equal(promoted.request.runId, old.id);
+          assert.isFalse(promotedIds.has(promoted.id));
+          promotedIds.add(promoted.id);
+          yield* outbox.retry({
+            effectId: promoted.id,
+            workerId: "paced-promoted",
+            error: "Resuming after restart",
+            delayMs: 15_000,
+            refundAttempt: true,
+          });
+          assert.equal(yield* pacing.acquire({ ...source, effectId: promoted.id }), 15_000);
+        }
+        const nextMessage = MessageId.make(`ardud-control:paced-next:${creationSource}:${cycle}`);
         yield* orchestrator.dispatch({
           type: "message.dispatch",
           threadId,
@@ -8354,14 +8447,31 @@ it.effect.each([
           messageId: nextMessage,
           text: "Another fresh owner turn",
           attachments: [],
-          createdBy: "user",
-          creationSource: "web",
+          createdBy,
+          creationSource,
           dispatchMode: { type: "queue_after_active" },
         });
         const projection = yield* orchestrator.getThreadProjection(threadId);
         assert.equal(projection.runs.find((run) => run.id === old.id)?.status, "queued");
         currentFresh = projection.runs.find((run) => run.userMessageId === nextMessage)!;
         assert.equal(currentFresh.status, "starting");
+        if (cycle === 0) {
+          const unclaimed = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-unclaimed",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          assert.equal(unclaimed.request.type, "provider-turn.start");
+          if (unclaimed.request.type === "provider-turn.start") {
+            assert.equal(unclaimed.request.runId, old.id);
+            assert.isUndefined(yield* state.sourceForRun(threadId, old.id));
+          }
+          promotedIds.add(unclaimed.id);
+          yield* outbox.succeed({ effectId: unclaimed.id, workerId: "paced-unclaimed" });
+        }
         const freshStart = Option.getOrThrow(
           yield* outbox.claimNext({
             workerId: "paced-fresh",
@@ -8372,5 +8482,109 @@ it.effect.each([
         );
         yield* outbox.succeed({ effectId: freshStart.id, workerId: "paced-fresh" });
       }
-    }).pipe(Effect.provide(layerRestartPacingStateTest)),
+      yield* TestClock.adjust("15 seconds");
+      const previousStart = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "paced-last-stale",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      yield* outbox.succeed({ effectId: previousStart.id, workerId: "paced-last-stale" });
+      const now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`paced-last-finish:${creationSource}`),
+            type: "run.updated",
+            threadId,
+            runId: currentFresh.id,
+            occurredAt: now,
+            payload: { ...currentFresh, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        threadId,
+        commandId: CommandId.make(`paced-last-promote:${creationSource}`),
+      });
+      assert.equal(
+        yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+        15_000,
+      );
+      yield* outbox.cancelUnsettled({
+        threadId,
+        effectTypes: ["provider-turn.start"],
+        reason: "Stopped before admission",
+      });
+      assert.equal(
+        yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+        15_000,
+      );
+      const cancelledWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+      });
+      assert.equal(cancelledWait?.status, "completed");
+      const saved = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (run) => run.id === old.id,
+      )!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`paced-requeue-admission:${creationSource}`),
+            type: "run.updated",
+            threadId,
+            runId: old.id,
+            occurredAt: now,
+            payload: {
+              ...saved,
+              status: "queued",
+              startedAt: null,
+              queueHeld: false,
+              queuePosition: 1,
+            },
+          },
+        ],
+      });
+      load = 0;
+      // Continuation dispatch reserves a slot before queue promotion. Its later
+      // provider start must complete the wait restored by that promotion.
+      const wakeId = `paced-reservation:${creationSource}`;
+      const wakeSource = { ...source, effectId: wakeId };
+      yield* outbox.enqueue([
+        {
+          id: wakeId,
+          commandId: CommandId.make(wakeId),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: old.id, queued: true },
+        },
+      ]);
+      assert.equal(yield* pacing.acquire(wakeSource), 0);
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        threadId,
+        commandId: CommandId.make(`paced-admit-promote:${creationSource}`),
+      });
+      yield* pacing.dispatched(wakeSource);
+      // High load at this second stage proves it reuses the admitted slot.
+      load = 2;
+      const admittedStart = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "paced-admitted",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      assert.equal(yield* pacing.acquireRun(threadId, old.id, admittedStart.id), 0);
+      const admittedWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+      });
+      assert.equal(admittedWait?.status, "completed");
+    }).pipe(Effect.provide(layerRestartPacingTest(() => load)));
+  },
 );
