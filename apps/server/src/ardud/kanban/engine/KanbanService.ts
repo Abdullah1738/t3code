@@ -5939,8 +5939,23 @@ const make = Effect.gen(function* () {
   /** A stopped worker hears about its cards still in Working, every time. nudgedAt records the last nudge instead of a card event, so a looping worker can't flood the history. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
-    cards: ReadonlyArray<KanbanCard>,
+    planned: ReadonlyArray<KanbanCard>,
   ) {
+    const cards: Array<KanbanCard> = [];
+    for (const initial of planned) {
+      const current = yield* store.card(initial.id);
+      if (
+        current === null ||
+        current.stage !== initial.stage ||
+        current.activeRole !== initial.activeRole ||
+        current.activeThreadId !== initial.activeThreadId ||
+        current.activeThreadId !== threadId ||
+        current.movedAt !== initial.movedAt ||
+        current.nudgedAt !== initial.nudgedAt
+      )
+        continue;
+      cards.push(current);
+    }
     const board = cards[0] ? yield* boardOf(cards[0].boardId) : null;
     // A batched thread may carry both kept and held cards. Do not start it for a
     // kept sibling while another card it owns is held.
@@ -5952,6 +5967,7 @@ const make = Effect.gen(function* () {
     const nudge = cards.filter(
       (card) =>
         card.stage === "working" &&
+        card.activeRole === "work" &&
         card.stalled === null &&
         (!board?.pause || board.pause.keep.includes(card.id)),
     );
@@ -5972,9 +5988,22 @@ const make = Effect.gen(function* () {
 
   /** A reviewer whose turn ended with no verdict: nudged once, then flagged and its slot freed. */
   const reviewerStopped = Effect.fn("KanbanService.reviewerStopped")(function* (
-    card: KanbanCard,
+    planned: KanbanCard,
     threadId: ThreadId,
   ) {
+    const card = yield* store.card(planned.id);
+    if (
+      card === null ||
+      card.stage !== "in_review" ||
+      card.stage !== planned.stage ||
+      card.activeRole !== "review" ||
+      card.activeRole !== planned.activeRole ||
+      card.activeThreadId !== planned.activeThreadId ||
+      card.activeThreadId !== threadId ||
+      card.movedAt !== planned.movedAt ||
+      card.nudgedAt !== planned.nudgedAt
+    )
+      return;
     const board = yield* boardOf(card.boardId);
     if (board.pause && !board.pause.keep.includes(card.id)) {
       yield* Ref.update(deferredNudges, (set) => new Set(set).add(threadId));
@@ -6045,8 +6074,8 @@ const make = Effect.gen(function* () {
   ) {
     const deferred = yield* Ref.get(deferredNudges);
     if (deferred.size === 0) return;
-    const cards = yield* store.cards(board.id);
     for (const threadId of deferred) {
+      const cards = yield* store.cards(board.id);
       const carried = cards.filter((card) => card.activeThreadId === threadId);
       if (carried.length === 0) {
         const link = yield* store.threadLink(threadId);

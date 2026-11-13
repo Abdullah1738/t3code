@@ -20131,3 +20131,126 @@ it.effect.each(["work", "review"] as const)(
       }).pipe(Effect.provide(testLayer(observed)));
     }),
 );
+
+it.effect("review878r3: unpause does not nudge a sibling moved during the first send", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let target: ThreadId | undefined;
+    let gated = false;
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          send: (input) =>
+            threads
+              .send(input)
+              .pipe(
+                Effect.tap(() =>
+                  gated && input.threadId === target
+                    ? Deferred.succeed(entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                      )
+                    : Effect.void,
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const a = yield* kanban.createCard(board.id, { prompt: "A" }, owner);
+      const b = yield* kanban.createCard(board.id, { prompt: "B" }, owner);
+      yield* kanban.dispatchNow;
+      target = (yield* kanban.card(a.id)).card.activeThreadId!;
+      const other = (yield* kanban.card(b.id)).card.activeThreadId!;
+      assert.notStrictEqual(target, other);
+      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+      yield* kanban.turnEnded(target);
+      yield* kanban.turnEnded(other);
+      gated = true;
+      const lifting = yield* Effect.forkChild(
+        kanban.pauseBoard(board.id, null, owner).pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      yield* kanban.moveCard(b.id, "todo", "owner", owner);
+      assert.isNull((yield* kanban.card(b.id)).card.activeThreadId);
+      gated = false;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(lifting);
+      const messages = (yield* Ref.get(fake.threads)).get(other)!.messages;
+      assert.strictEqual(
+        messages.filter((m) =>
+          m.startsWith(`Card #${b.number} is still in Working and your turn ended.`),
+        ).length,
+        0,
+      );
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
+
+it.effect("review878r3: unpause does not undo a completed sibling review", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let target: ThreadId | undefined;
+    let gated = false;
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          send: (input) =>
+            threads
+              .send(input)
+              .pipe(
+                Effect.tap(() =>
+                  gated && input.threadId === target
+                    ? Deferred.succeed(entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                      )
+                    : Effect.void,
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const a = yield* kanban.createCard(board.id, { prompt: "A" }, owner);
+      const b = yield* kanban.createCard(board.id, { prompt: "B" }, owner);
+      yield* kanban.dispatchNow;
+      target = (yield* kanban.card(a.id)).card.activeThreadId!;
+      const bWork = (yield* kanban.card(b.id)).card.activeThreadId!;
+      yield* kanban.moveCard(b.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: bWork,
+      });
+      yield* kanban.turnEnded(bWork);
+      yield* kanban.dispatchNow;
+      const other = (yield* kanban.card(b.id)).card.activeThreadId!;
+      yield* kanban.turnEnded(other);
+      assert.isNotNull((yield* kanban.card(b.id)).card.nudgedAt);
+      assert.notStrictEqual(target, other);
+      yield* kanban.pauseBoard(board.id, { reason: "Hold", keep: [] }, owner);
+      yield* kanban.turnEnded(target);
+      yield* kanban.turnEnded(other);
+      gated = true;
+      const lifting = yield* Effect.forkChild(
+        kanban.pauseBoard(board.id, null, owner).pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      yield* kanban.moveCard(b.id, "completed", "owner", owner);
+      assert.isNull((yield* kanban.card(b.id)).card.activeThreadId);
+      gated = false;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(lifting);
+      assert.strictEqual((yield* kanban.card(b.id)).card.stage, "completed");
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
