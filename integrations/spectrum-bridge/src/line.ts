@@ -76,7 +76,7 @@ export type LineOutbound = {
 };
 
 /** Failure codes a Line raises once sb-transport has cut any free text off an HTTP error key. Safe to log. */
-export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(:[a-z0-9_]{1,40})?)$/;
+export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|card_preview_unavailable|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(:[a-z0-9_]{1,40})?)$/;
 
 export type SendOptions = { replyTo?: string; sendStyle?: string; /** From upload(). */ mediaUrl?: string };
 

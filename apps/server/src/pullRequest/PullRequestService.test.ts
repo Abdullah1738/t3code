@@ -223,7 +223,7 @@ it.effect("keeps cached previews available and pauses uncached previews until qu
   }),
 );
 
-it.effect("keeps the base SHA reported by the host in detail", () =>
+it.effect("keeps the host commit identities in detail", () =>
   Effect.gen(function* () {
     const service = yield* makeService({
       projects: [project({ id: "p1", title: "web", workspaceRoot: "/w", repository: "acme/web" })],
@@ -234,6 +234,8 @@ it.effect("keeps the base SHA reported by the host in detail", () =>
               ...hostedChangeRequest("Description"),
               headSha: "head111",
               baseSha: "base111",
+              headBranchSha: "branch222",
+              checksHeadSha: "checks333",
             }),
         }),
       ],
@@ -245,6 +247,8 @@ it.effect("keeps the base SHA reported by the host in detail", () =>
     });
     assert.strictEqual(detail.headSha, "head111");
     assert.strictEqual(detail.baseSha, "base111");
+    assert.strictEqual(detail.headBranchSha, "branch222");
+    assert.strictEqual(detail.checksHeadSha, "checks333");
   }),
 );
 

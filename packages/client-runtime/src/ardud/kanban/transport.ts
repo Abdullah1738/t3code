@@ -18,6 +18,7 @@ import {
   squashAtomCommandFailure,
 } from "../../state/runtime.ts";
 import type { Unsubscribe } from "../common/store.ts";
+import type { PermissionStatus } from "../../state/commandPermissions.ts";
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
 export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe | typeof KANBAN_WS_METHODS.boards;
@@ -44,6 +45,7 @@ export interface KanbanTransport {
   ): Promise<EnvironmentRpcSuccess<TTag>>;
   /** Whether this connection's grants allow `tag`, for disabling its control. */
   permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
+  permissionStatus(tag: KanbanRequestTag): Atom.Atom<PermissionStatus>;
 }
 
 /** No server is connected yet. Reads wait and retry on it instead of failing. */
@@ -120,6 +122,9 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
 type KanbanRpcCommand = {
   readonly run: (...args: never[]) => unknown;
   readonly permissionAtom: (environmentId: EnvironmentId | null) => Atom.Atom<boolean>;
+  readonly permissionStatusAtom: (
+    environmentId: EnvironmentId | null,
+  ) => Atom.Atom<PermissionStatus>;
 };
 
 export function createAtomKanbanTransport<R, ER>(
@@ -136,6 +141,12 @@ export function createAtomKanbanTransport<R, ER>(
   };
 
   return {
+    permissionStatus(tag) {
+      const { permissionStatusAtom } = commandFor(tag);
+      return Atom.make((get) => get(permissionStatusAtom(get(environmentId)))).pipe(
+        Atom.withLabel(`kanban-permission-status:${tag}`),
+      );
+    },
     permission(tag) {
       const { permissionAtom } = commandFor(tag);
       // The primary environment changes with the connection, so the grant is read per target.

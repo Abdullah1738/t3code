@@ -1,38 +1,17 @@
 # Food payment transport status
 
-Food paid HTTP transport and NowNow paid checkout on 9546 remain disabled.
-The Food coordinator is covered with injected transports; the native reader
-refuses unknown unpaid states. This is not a completed paid Food lane.
+Food supports one automatic saved-card placement, with explicit false native
+CVV/completion requirements and an explicit null client secret. It defaults to
+Mashreq 9546; a new Marriott 2342 purchase needs an explicit selection and a
+recent recorded 9546 decline. Unknown sends keep account ownership and cannot
+be retried. Real intents, CVV and 3DS completion remain unsupported for Food.
 
-Static Food APK evidence establishes the place payload
-`sessionCode/orderTotal/orderPaymentAmount`, shared intent completion, and
-`encryptDataV2` using `cvv_encryption.public_key/public_key_name`. It does not
-establish eligible unpaid response states, encrypted-CVV acceptance or the
-3DS return contract. Automatic null-intent processing does not expose a
-captured-amount receipt. The existing delivered-order bank closure accepts
-EmiratesNBD 2342 evidence only, not Mashreq 9546 evidence.
+Capture requires exact native automatic processing plus a unique purchase
+notification for the original card, amount, merchant and placement time.
+Recovery uses the retained order after session expiry and never sends payment.
+Order-watch registration, durable readback and a sent delivery card precede
+completion. Merchant processing alone does not prove capture.
 
-Exact capture validation requires both the token hash and card suffix bound
-to the original order. A supported but different card remains unconfirmed;
-its delivery card stays held and the journal cannot complete. Historical
-recovery uses the retained card rather than the current account default.
-
-NowNow's historical single-send path uses `{sessionCode,total}` and infers
-confirmation from placed/preparing tracking. That proof has not been
-established for Visa 9546, so it must not be enabled by removing its guard.
-
-No placement or payment was sent during this follow-up. Fresh completion,
-CVV and 3DS behavior remains unproven until observed on an authorized real
-purchase. Never repeat an ambiguous placement or completion to obtain proof.
-
-Additional enablement work identified by independent review:
-- Wire NowNow CVV/device-verification decisions into its paid order coordinator;
-  the separate pre-order controller currently does not protect that entrypoint.
-- Reconcile automatic Food ACTIVE journals with the bank-close command's
-  FENCED-only prerequisite without fabricating unknown-send observations.
-- Add exact Mashreq evidence support before enabling automatic 9546 capture
-  closure; do not merely widen the accepted card suffixes.
-
-Validation: 261 legacy-card regression tests and 55 focused/default-card tests
-pass offbox (overlapping test selections). Linux uses a fail-closed Keychain
-stub and a private temporary journal parent; no account credentials are synced.
+Food's 9546 proof does not establish NowNow's separate placement or payment
+contract. See [Commerce HTTP](COMMERCE-HTTP.md#noon-card-selection-9-november-2026)
+for the supported operations and retained verification recovery.

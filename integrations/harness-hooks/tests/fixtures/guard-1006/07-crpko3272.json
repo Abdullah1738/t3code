@@ -1,0 +1,38 @@
+{
+  "case_number": 7,
+  "reporter_id": "crpko3272",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:f38292e8-34ad-4fb4-8da1-814b61cfda27",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T10-13-54-01a1c93d-d052-7c41-b2bf-50c7c68d0eb4.jsonl",
+    "source_call_line_0": 4352,
+    "timestamp": "2026-11-11T17:53:04.690Z",
+    "call_id": "call_83c36a69d2c14657be3e5cf109a52ee5",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 28,
+    "setup_files_provenance": {
+      "kind": "synthetic_representative_only",
+      "original_invocation_source_recovered": false,
+      "detail": "Minimal harmless source supplied for an existing invoked script. These bytes are authored for guard scanning, not recovered original contents. Never execute reporter commands."
+    }
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('internal/domain/cache/registry/timeline_identity_handoffs_realfdb_test.go');s=p.read_text();s=s.replace('\\n\\t\"sync\"','').replace('\\n\\t\"crypto/sha256\"','\\n\\t\"crypto/sha256\"\\n\\t\"errors\"');s=s.replace('''\tports.KafkaRegistryBootstrapSource\n\treplay''','''\t*ingressSource\n\tt *testing.T\n\treplay''');s=s.replace('s.KafkaRegistryBootstrapSource.PollReplay(ctx)','s.ingressSource.PollReplay(ctx)').replace('s.KafkaRegistryBootstrapSource.Poll(ctx)','s.ingressSource.Poll(ctx)');s=s.replace('''\tif err := s.KafkaRegistryBootstrapSource.AcknowledgeRegistryIntake(p, m); err != nil {\n\t\treturn err\n\t}\n\tif s.ack != nil {\n\t\ts.ack(m)\n\t}\n\treturn nil''','''\tif s.ack != nil {\n\t\ts.ack(m)\n\t}\n\terr := s.ingressSource.AcknowledgeRegistryIntake(p, m)\n\tif err != nil {\n\t\ts.t.Errorf(\"adapter ACK failed: %v\", err)\n\t}\n\treturn err''');s=s.replace('&identityHandoffSource{KafkaRegistryBootstrapSource: raw}','&identityHandoffSource{ingressSource:raw,t:t}');s=s.replace('''\t\t\tvar once sync.Once''','''\t\t\tacks := 0''');s=s.replace('''\t\t\t\t\tonce.Do(func() { close(acked) })''','''\t\t\t\t\tacks++\n\t\t\t\t\tif acks==1 {close(acked)}''');s=s.replace('''\t\t\tstop()\n\t\t\t<-done\n\t\t\tselect {''','''\t\t\tidentityHandoffStop(t,stop,done)\n\t\t\tif acks!=1 { t.Fatalf(\"healthy ACK attempts=%d\",acks) }\n\t\t\tselect {''',1);s=s.replace('''\tstop()\n\t<-done\n\tif acks != 1''','''\tidentityHandoffStop(t,stop,done)\n\tif acks != 1''',1);s=s.replace('''\t\t\tstop()\n\t\t\t<-done\n\t\t\tif acks != 1''','''\t\t\tidentityHandoffStop(t,stop,done)\n\t\t\tif acks != 1''',1);s=s.replace('''// ACK observations are forwarded to the production adapter. Successful calls\n// prove that the exact inFlight delivery was removed; a duplicate fails there.''','''// Keep the production adapter's optional pause interfaces. Observe every ACK\n// attempt before forwarding it; adapter rejection must fail the test too.''');s+='''\nfunc identityHandoffStop(t *testing.T, stop context.CancelFunc, done <-chan error) {\n t.Helper()\n stop()\n if err:=<-done; !errors.Is(err,context.Canceled) {t.Fatalf(\"unexpected coordinator exit: %v\",err)}\n}\n''';p.write_text(s)\nPY\ngofmt -w internal/domain/cache/registry/timeline_identity_handoffs_realfdb_test.go\nrg -n 'identityHandoffSource|KafkaRegistryBootstrapSource|identityHandoffStop|acks|sync' internal/domain/cache/registry/timeline_identity_handoffs_realfdb_test.go | head -28\ngit diff --stat\noffbox run --include tmp/3272/acceptance.sh -- env WIRING_TEST_PATTERN='TestBOOTREG037RealFDBNoDeliverable|TestBOOTREG037RealFDBLiveReset|TestBOOTREG031RealFDBCoordinatorCapHandoff|TestBOOTREG031RealFDBLivePending|TestBOOTREG031RealFDBReplayCurrent|TestBOOTREG031RealFDBCoordinatorDeletedReuse|TestBOOTREG037RealFDBCorruptHeld' bash tmp/3272/acceptance.sh > tmp/3272/acceptance-v2.log 2>&1",
+      "workdir": "/Users/ardud/checkouts/risk-identity-acceptance-3272",
+      "sha256": "54fe8be2bb1fdc818d6799eb85cc74e282a4cc928ab60109d0a265af55f796da"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.",
+  "setup_files": {
+    "/Users/ardud/checkouts/risk-identity-acceptance-3272/tmp/3272/acceptance.sh": "#!/usr/bin/env bash\n:\n"
+  }
+}

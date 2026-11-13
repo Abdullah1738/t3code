@@ -43,6 +43,7 @@ _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
+STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
@@ -129,6 +130,9 @@ def _refused(e: "ApiError", box_id: str | None):
     msg = str(e)
     m = SUPPLY_OUT.search(msg)
     if not m:
+        if 500 <= e.status < 600:
+            from . import home
+            e.outage = e.outage or home.may_fail_over()
         return None
     size = m.group(1).lower()
     capacity.supply_out(size, box_id, msg)
@@ -331,7 +335,7 @@ def _read_response(response, deadline):
 
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
-    from . import allocation
+    from . import allocation, pool
     if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
         return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
     box_id = path.split("/")[2] if path != "/sandboxes" else None
@@ -354,12 +358,13 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
         except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
             # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
-            if pending:
+            if pending and not isinstance(e, pool.PoolBusyError):
                 raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
                                             "Retry its original source and size later") from e
-            with contextlib.closing(db()) as con:
-                con.execute("DELETE FROM kv WHERE k=?", (key,))
-                con.commit()
+            if not pending:
+                with contextlib.closing(db()) as con:
+                    con.execute("DELETE FROM kv WHERE k=?", (key,))
+                    con.commit()
             raise
         except OffboxError as e:
             raise allocation.Unresolved(str(e)) from e
@@ -419,7 +424,23 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
     uncertain_start = False
+
+    def check_start_queue(request_id=None):
+        if not is_start:
+            return
+        from . import allocation
+        try:
+            allocation.check_queue()
+        except capacity.CapacityError as error:
+            if request_id:
+                capacity.complete(request_id, "not_sent")
+            if uncertain_start:
+                raise allocation.Unresolved("a previous machine start was unanswered before queue expiry; "
+                                            "its retained request still needs reconciliation; nothing ran") from error
+            raise
+
     while True:
+        check_start_queue()
         attempt += 1
         req_timeout = timeout
         # During an outage allocation retry, bound network calls only until a machine is accepted. Bring-up
@@ -451,6 +472,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 raise OffboxError("a previous create/fork was unanswered before the local start limit; "
                                   "nothing ran. Retry its retained key later") from e
             raise
+        check_start_queue(request_id)
         if _DEADLINE is not None:
             # capacity.reserve may wait on SQLite (BEGIN IMMEDIATE, 30 s busy timeout): recompute what is left now,
             # and never send a request whose budget is already gone.
@@ -470,6 +492,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
         try:
             if scope is not None:
                 scope.check()
+            check_start_queue(request_id)
             with _open(req, timeout=req_timeout) as r:
                 raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
@@ -802,6 +825,7 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
                stale_error: str | None = None, on_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
+    from . import home
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
@@ -816,8 +840,19 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if m and _supply_refusal(s, st, since, stale_error):
             capacity.supply_out(m.group(1).lower(), box_id, s["error"])
             raise SupplyOut(m.group(1).lower(), box_id, s["error"])
-        if st in ("error", "cancelled"):
-            raise OffboxError(f"box {box_id} went to {st}: {s.get('error')}")
+        http_error = re.match(r"^([45]\d{2})\b", s.get("error") or "")
+        status = int(http_error[1]) if http_error else None
+        server_error = status is not None and status >= 500
+        # Home clears the error before acknowledging a resume. A newer stopped error belongs to this attempt;
+        # updatedAt is truncated to milliseconds by the server.
+        failed_resume = (home.may_fail_over() and st in STOPPED_STATES and server_error and since is not None
+                         and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
+        if st in ("error", "cancelled") or failed_resume:
+            failed_start = server_error and (st == "error" or failed_resume)
+            error = OffboxError(f"box {box_id} went to {st}: {s.get('error')}",
+                                outage=failed_start and home.may_fail_over())
+            error.status = status
+            raise error
         if on_state is not None:
             on_state(s)
         if time.time() > deadline:

@@ -1,3 +1,4 @@
+import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -118,24 +119,40 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
+  const observer = yield* ErrorObserver;
   const snapshotGate = yield* Semaphore.make(1);
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
     Effect.sync(() => {
-      const marker = new NodeSqlite.DatabaseSync(dbPath);
       try {
-        const exists = marker
-          .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'")
-          .get();
-        const row =
-          exists === undefined
-            ? undefined
-            : marker.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 1").get();
-        return typeof row?.filename === "string"
-          ? path.resolve(path.dirname(dbPath), row.filename)
-          : undefined;
-      } finally {
-        marker.close();
+        const marker = new NodeSqlite.DatabaseSync(dbPath);
+        try {
+          const exists = marker
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'")
+            .get();
+          const row =
+            exists === undefined
+              ? undefined
+              : marker.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 1").get();
+          return typeof row?.filename === "string"
+            ? path.resolve(path.dirname(dbPath), row.filename)
+            : undefined;
+        } finally {
+          marker.close();
+        }
+      } catch (cause) {
+        annotateSqliteError(
+          cause,
+          {
+            file: dbPath,
+            role: "primary",
+            connection: "startup-marker",
+            operation: "open/query",
+            span: "sqlite.marker",
+          },
+          observer,
+        );
+        throw cause;
       }
     }),
   );

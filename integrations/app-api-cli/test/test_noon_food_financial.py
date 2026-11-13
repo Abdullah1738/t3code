@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import json
 import tempfile
@@ -41,6 +42,7 @@ class Reader:
 
 class FoodFinancialTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name)/"commerce"
         p=patch.object(j,'ROOT',self.root);p.start();self.addCleanup(p.stop)
@@ -345,6 +347,9 @@ class FoodFinancialTests(unittest.TestCase):
 
 
 class NativeOrderTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def fixture(self):
         flow=SimpleNamespace(account=fingerprint('synthetic-customer'),scope='b'*64,outlet='OUTLET1',
             headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'},
@@ -441,6 +446,19 @@ class NativeOrderTests(unittest.TestCase):
         with patch.object(recovery.vertical,'food_orders',return_value={'orders':[]}),patch.object(food,'FoodFlow',return_value=flow),patch.object(food,'request',side_effect=lambda *a:data),patch.object(j,'inspect',return_value={
                 'operations':[{'name':'set_payment_method','state':'OBSERVED','kind':'cart'}]}):
             self.assertIsNone(reader.session()['order_id'])
+            data.update(paymentRequireCvv=False,paymentRequireCompletion=False,paymentClientSecret=None)
+            self.assertTrue(reader.session()['automatic_eligible'])
+            for key in ('paymentRequireCvv','paymentRequireCompletion','paymentClientSecret'):
+                values = (True, None, 0, 'false') if key != 'paymentClientSecret' else ('intent', False, 0, '')
+                old = data[key]
+                for value in values:
+                    with self.subTest(key=key,value=value):
+                        data[key]=value
+                        self.assertFalse(reader.session()['automatic_eligible'])
+                del data[key]
+                with self.subTest(key=key,value='missing'):
+                    self.assertFalse(reader.session()['automatic_eligible'])
+                data[key]=old
             data['orderNr']=ORDER
             self.assertEqual(reader.session()['order_id'],ORDER)
             data['paymentToken']='other'
@@ -460,6 +478,9 @@ class NativeOrderTests(unittest.TestCase):
 
 
 class RegistrarTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_registration_requires_receipt_exact_config_watcher_and_hold(self):
         with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
             root=Path(temp);name='order-noon-'+ORDER.lower()

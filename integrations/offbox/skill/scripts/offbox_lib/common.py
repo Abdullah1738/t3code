@@ -209,9 +209,19 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
         named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
                                                                       and not x.startswith("-"))]
+        if sub == 'keep':
+            # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
+            import argparse
+            selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+            selector.add_argument('--box')
+            try:
+                selected, _ = selector.parse_known_args(argv)
+            except argparse.ArgumentError:
+                return first  # The full command parser reports malformed input.
+            named = [selected.box] if selected.box else []
         for name in (first, "boat" if first == "server" else "server"):
             if any(_known(name, x) for x in named):
                 return name
@@ -248,6 +258,7 @@ EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
 EXIT_HOME_DOWN = 93            # person-box work while the home server is down: it waits, it never goes to Boat
 EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
+EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)

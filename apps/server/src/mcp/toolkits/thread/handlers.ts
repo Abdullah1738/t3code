@@ -92,6 +92,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         taskId: task.id,
         threadId: task.threadId,
         lastRunStatus: task.lastRunStatus,
+        lastRunError: task.lastRunError,
+        missedRuns: task.missedRuns,
         runCount: task.runCount,
         nextRunAt: task.nextRunAt,
       };

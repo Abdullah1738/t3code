@@ -1,3 +1,4 @@
+import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -302,3 +303,23 @@ it.effect("enables checkpoint_fullfsync in the shared persistence setup", () =>
     assert.equal(rows[0]?.checkpoint_fullfsync, 1);
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
+
+it.effect("records a raw startup marker failure before the routed client opens", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "sqlite-marker-"));
+  const filename = NodePath.join(directory, "state.sqlite");
+  NodeFS.writeFileSync(filename, "bad database".repeat(1024));
+  const observations: unknown[] = [];
+  return Effect.exit(Layer.build(SqlitePersistence.layerFromPath(filename))).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.equal(observations.length, 1);
+        assert.equal(sqliteErrorDetails(observations[0])?.errcode, 26);
+        assert.equal(sqliteErrorDetails(observations[0])?.context?.connection, "startup-marker");
+      }),
+    ),
+    Effect.provideService(ErrorObserver, (cause) => observations.push(cause)),
+    Effect.scoped,
+    Effect.provide(NodeServices.layer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});

@@ -1,3 +1,5 @@
+import { redact } from "./redact.ts";
+import { allowQueuedAsk, flushBursts, runCloudUp } from "./notification-policy.ts";
 import { classifySendFailure, type SendFailure, type Telegram } from "./telegram.ts";
 import type { OutboxRecord, Store } from "./store.ts";
 
@@ -64,6 +66,14 @@ export class Delivery {
     this.options.log?.("outbound-failed", code);
   }
 
+  private accepted(id: string, providerId?: number): void {
+    this.store.db.transaction(() => {
+      this.store.outboxState(id, "sent", providerId);
+      this.store.set(`acceptedAt:${id}`, this.store.get<number>(`acceptedAt:${id}`) ?? Date.now());
+    }).immediate();
+    this.options.log?.("outbound-accepted");
+  }
+
   private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: SendFailure): void {
     if (!this.current(item, state)) return;
     this.store.db.transaction(() => {
@@ -85,23 +95,38 @@ export class Delivery {
     if (!this.options.enabled()) return;
     const boundChat = this.options.chatId();
     if (boundChat === undefined) return;
+    flushBursts(this.store);
     let dispatched = 0;
     operations: for (const queued of this.store.pendingOutbox()) {
       if (dispatched >= 10) break;
       if (!this.options.enabled() || this.options.chatId() === undefined) break;
       const item = this.store.getOperation(queued.id);
       if (!item || !this.current(item, "pending")) continue;
+      if (runCloudUp("run.cloud", item.text.replace(/^\[run\.cloud\] /, "")) && item.text.startsWith("[run.cloud] ")) {
+        this.store.outboxState(item.id, "cancelled");
+        continue;
+      }
       if (!item.text.trim() && !item.attachment) {
         this.store.outboxState(item.id, "failed");
         this.error("emptyContent");
         continue;
       }
       if ((this.store.get<number>(`retry:${item.id}`) ?? 0) > Date.now()) continue;
+      if (!allowQueuedAsk(this.store, item)) {
+        this.store.outboxState(item.id, "cancelled");
+        continue;
+      }
 
-      const characters = Array.from(item.text.trim() ? item.text : "");
+      // Accepted chunk indices belong to the original layout. Mask in place when resuming an older send.
+      const layoutKey = `redactionLayout:${item.id}`;
+      const layout = this.store.get<"preserve" | "compact">(layoutKey)
+        ?? (item.attempts > 0 || this.store.get<Checkpoint>(`chunk:${item.id}:0`)?.accepted ? "preserve" : "compact");
+      this.store.set(layoutKey, layout);
+      const characters = Array.from(item.text.trim() ? redact(item.text, layout === "preserve") : "");
       const chunks: string[] = [];
       for (let offset = 0; offset < characters.length; offset += CHUNK) {
-        chunks.push(characters.slice(offset, offset + CHUNK).join(""));
+        const chunk = characters.slice(offset, offset + CHUNK).join("");
+        chunks.push(chunk.trim() ? chunk : "[redacted]");
       }
       let state = "pending";
       let firstId = item.providerId;
@@ -189,6 +214,7 @@ export class Delivery {
         // Keep every message alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
+          this.store.set(`acceptedAt:${item.id}`, this.store.get<number>(`acceptedAt:${item.id}`) ?? Date.now());
           if (result.providerId !== undefined) {
             const key = `provider-operation:${result.providerId}`;
             const existing = this.store.get<string>(key) ?? this.store.byProviderId(result.providerId)?.id;
@@ -200,16 +226,14 @@ export class Delivery {
         firstId ??= result.providerId;
         const active = this.current(item, state);
         if (active && index === steps - 1) {
-          this.store.outboxState(item.id, "sent", firstId);
-          this.options.log?.("outbound-accepted");
+          this.accepted(item.id, firstId);
         }
         await this.sleep(800);
         if (!active || index === steps - 1) continue operations;
       }
       // All remaining chunks were already checkpointed; no RPC or attempt is needed.
       if (this.current(item, state)) {
-        this.store.outboxState(item.id, "sent", firstId);
-        this.options.log?.("outbound-accepted");
+        this.accepted(item.id, firstId);
       }
     }
   }

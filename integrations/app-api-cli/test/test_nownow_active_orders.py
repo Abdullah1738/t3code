@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """NowNow active-order attribution against an isolated, real journal."""
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 import commerce_journal as j
 import commerce_nownow_order as c
-from test.test_commerce_nownow_order import (
+from test_commerce_nownow_order import (
     ADDRESS_REF, FakeAuth, Harness, PRODUCT, STORE, happy_responses, make_flow,
 )
 
@@ -18,6 +19,7 @@ ACCOUNT = FakeAuth().revalidate('nownow').account_ref
 
 class ActiveOrderTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name).resolve() / 'commerce'
@@ -113,7 +115,7 @@ class ActiveOrderTests(unittest.TestCase):
         self.assertEqual(j.inspect(prior), before)
 
     def test_existing_store_cart_still_blocks_with_completed_active_order(self):
-        from test.test_commerce_nownow_order import nn_state
+        from test_commerce_nownow_order import nn_state
         self.prior()
         flow, harness = make_flow(self.responses(
             ORDER, carts_recent={'data': {'carts': [nn_state()['data']]}}))

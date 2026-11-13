@@ -201,7 +201,7 @@ export const reviewBrief = (
     card.subtasks.length > 0
       ? "Check the subtasks the worker marked done really are; a clear verdict ticks off the review's own."
       : null,
-    "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
+    "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat within 10 minutes, if the card has not moved since, is acknowledged with a replay note; later calls are refused unless this thread is assigned to the review step):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
     'After that call, end your final message with one line: "Verdict: clear" or "Verdict: changes needed: <top finding>".',
@@ -339,7 +339,7 @@ export const workerQuestionText = (
 
 /** Handed to an evaluator that asked on a card before the card discussion got its own evaluator. */
 export const cardHandoffText = (cardNumber: number, discussionId: string, threadId: string) =>
-  `The owner followed up in the discussion of card #${cardNumber} (${discussionId}), and it now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; if you know something it needs, post it in that discussion.`;
+  `The discussion of card #${cardNumber} (${discussionId}) now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; only post if you have information the new evaluator doesn't already have on the card or in the discussion.`;
 
 /** Start text for a new card evaluator: the evaluators that asked there first may have acted already. */
 export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
@@ -412,3 +412,6 @@ export const writerPrompt = (card: Pick<KanbanCard, "prompt" | "title" | "descri
     "Task:",
     card.prompt || card.description || card.title,
   );
+
+export const threadModelDiffersText = (card: KanbanCard, reason: string) =>
+  `Card #${card.number} was not started: ${reason}. It is flagged stalled. Fix the thread's model or card_edit the card's model, then clear the flag with card_flag stalled false and say in the card's discussion what you changed.`;

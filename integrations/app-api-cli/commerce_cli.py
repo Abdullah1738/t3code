@@ -204,7 +204,7 @@ def capabilities():
         'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,
         'selected_card':{'last4':order_card.LAST4,'network':order_card.NETWORK,'bank_app':order_card.BANK_APP},
         'live_paid_proof_card':'2342',
-        'nownow_selected_card_purchase_enabled':True,
+        'nownow_selected_card_purchase_enabled':order_card.LAST4 == '2342',
         'nownow_9546_paid_live_proof':False,
         'marketplace_card_selection':'requires matching default card in noon app',
         'verticals':{
@@ -280,7 +280,9 @@ def prepared_result(flow, prepared):
             or not isinstance(prepared.get('readback'),dict)
             or not prepared['readback']):
         journal.fail('PREPARE_ONLY_READBACK_UNCONFIRMED')
-    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED',
+    import owner_go
+    approval_item=owner_go.commerce_item(journal.binding(flow.flow_id))
+    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED','owner_go_item':approval_item,
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 
@@ -382,15 +384,20 @@ def order_minutes(args):
 
 
 def order_nownow(args):
+    if not args.prepare_only and order_card.LAST4 == '9546':
+        journal.fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
     flows = []
     try:
         return _order_nownow(args, flows)
     except BaseException as exc:
         from noon_nownow_checkout import NowNowError
         if (isinstance(exc, NowNowError) and exc.code == 'SEND_RESERVATION_FAILED'
-                and not exc.may_have_sent and isinstance(exc.__cause__, journal.PaymentError)
-                and exc.__cause__.code == 'NOWNOW_FRESH_PREPARE_REQUIRED'):
-            exc = exc.__cause__
+                and not exc.may_have_sent and isinstance(exc.__cause__, journal.JournalError)
+                and str(exc.__cause__) in ('NOWNOW_FRESH_PREPARE_REQUIRED', 'ORDERING_PAUSED',
+                    'NOWNOW_9546_PAID_CONTRACT_UNPROVEN', 'NOON_FALLBACK_REQUIRES_RECORDED_9546_DECLINE')):
+            cause = exc.__cause__
+            exc = cause if isinstance(cause, journal.PaymentError) else journal.PaymentError(str(cause), {
+                'financial_send': False, 'financial_retry': False})
         try:
             if flows:
                 cleanup = flows[-1].stop_unsent()
@@ -984,6 +991,7 @@ def card_preflight(args):
             if journal.inspect(args.resume_flow)['order_id']:return None
         except Exception:
             pass
+    order_card.require_purchase_fallback()
     status=card_status.check(ORDER_CARD_LAST4)
     return status if status['blocked'] else None
 

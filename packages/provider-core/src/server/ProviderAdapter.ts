@@ -295,6 +295,15 @@ export class ProviderAdapterTurnStartError extends Schema.TaggedError<ProviderAd
   }
 }
 
+export class ProviderAdapterRecoveryRefusedError extends Schema.TaggedError<ProviderAdapterRecoveryRefusedError>()(
+  "ProviderAdapterRecoveryRefusedError",
+  {},
+) {
+  override get message() {
+    return "Automatic recovery excluded after a native session refusal.";
+  }
+}
+
 export class ProviderAdapterSteerRunUnsupportedError extends Schema.TaggedError<ProviderAdapterSteerRunUnsupportedError>()(
   "ProviderAdapterSteerRunUnsupportedError",
   {
@@ -436,6 +445,7 @@ export interface ProviderAdapterV2TurnInput {
   readonly runId: RunId;
   readonly runOrdinal: number;
   readonly nativeThreadHasTurns?: boolean;
+  readonly automaticRecovery?: true;
   readonly providerTurnOrdinal: number;
   readonly restartContinuationOfRunId?: RunId;
   readonly attemptId: RunAttemptId;
@@ -648,6 +658,10 @@ export interface ProviderAdapterV2SessionRuntime {
     /** A delayed Stop must not interrupt a task resumed after this request. */
     readonly requestedAt?: NonNullable<OrchestrationV2Subagent["startedAt"]>;
   }) => Effect.Effect<void | ProviderAdapterV2SubagentOutcome, ProviderAdapterV2Error>;
+  readonly listLoadedNativeThreads?: () => Effect.Effect<
+    ReadonlyArray<string>,
+    ProviderAdapterV2Error
+  >;
   readonly unloadThread?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;

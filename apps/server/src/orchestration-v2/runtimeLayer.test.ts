@@ -1,4 +1,14 @@
-import { bootId, continuationReport } from "../ardud/fast-install/report.ts";
+import { nextLaunchRecovery, claudeRecoveryResult } from "./launchRecovery.ts";
+import {
+  bootId,
+  continuationReport,
+  markQueuedRunRecovered,
+} from "../ardud/fast-install/report.ts";
+import * as RestartPacingState from "../ardud/restart-pacing/RestartPacingState.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
+import * as ControlStore from "../ardud/control/ControlStore.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -4170,6 +4180,391 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect.each([false, true])(
+    "atomically excludes durable Claude refusal from retry commit: %s",
+    (refused) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`refusal-commit-${refused}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId: ProjectId.make("restart-project"),
+          title: "Refusal guard",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: "/tmp/runtime-layer-refusal-guard",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:message`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message`),
+          text: "Read",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const source = projection.runs[0]!;
+        const providerThread = projection.providerThreads.find(
+          (row) => row.id === source.providerThreadId,
+        )!;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:running`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...source, status: "running" },
+            },
+            {
+              id: EventId.make(`${threadId}:refusal`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                driver: ProviderDriverKind.make("claudeAgent"),
+                nativeMetadata: { claudeRefusalObserved: refused },
+              },
+            },
+          ],
+        });
+        const commandId = CommandId.make(`${threadId}:retry`);
+        const result = yield* sink.writeIfRunCurrent({
+          threadId,
+          runId: source.id,
+          activeAttemptId: source.activeAttemptId!,
+          expectedStatus: "running",
+          unlessClaudeRefused: providerThread.id,
+          commandId,
+          events: [
+            {
+              id: EventId.make(`${threadId}:next`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...source, status: "starting" },
+            },
+          ],
+          effects: [
+            {
+              id: `${threadId}:start`,
+              commandId,
+              threadId,
+              request: { type: "provider-turn.start", runId: source.id, retryDelayMs: 30000 },
+            },
+          ],
+        });
+        assert.equal(result.committed, !refused);
+        assert.lengthOf(
+          yield* (yield* EffectOutbox.EffectOutboxV2).listByCommandId(commandId),
+          refused ? 0 : 1,
+        );
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status,
+          refused ? "running" : "starting",
+        );
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect.each(
+    (
+      [
+        { model: "claude-haiku-5-5", kind: "model_access", retriesOnModel: 1, attempt: 1 },
+        { model: "claude-sonnet-5-5", kind: "model_access", retriesOnModel: 0, attempt: 2 },
+        { model: "claude-opus-5-5", kind: "model_access", retriesOnModel: 0, attempt: 4 },
+        { model: "claude-haiku-5-5", kind: "relay", retriesOnModel: 1, attempt: 1 },
+      ] as const
+    ).flatMap((row) => (["none", "before", "during"] as const).map((stop) => ({ ...row, stop }))),
+  )(
+    "recovers persisted launch backoff once: $kind/$model Stop=$stop",
+    ({ model, kind, retriesOnModel, attempt, stop }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const threadId = ThreadId.make(`launch-backoff-${kind}-${model}-${stop}`);
+        const selection = { ...modelSelection, model };
+        const initialSelection = { ...modelSelection, model: "claude-haiku-5-5" };
+        const text =
+          kind === "relay" ? "[Watcher event from build] Please relay: ready" : "Complete the task";
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId: ProjectId.make("restart-project"),
+          title: "Backoff",
+          modelSelection: initialSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: "/tmp/runtime-layer-backoff",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "agent",
+          creationSource: "server",
+          commandId: CommandId.make(`${threadId}:message`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message`),
+          text,
+          attachments: [],
+          modelSelection: initialSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const source = before.runs[0]!;
+        const now = yield* DateTime.now;
+        const marker = {
+          kind,
+          replayAllowed: true,
+          retriesOnModel,
+          attempt,
+          delayMs: 30_000,
+          since: DateTime.formatIso(now),
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:backoff`),
+              type: "run.updated",
+              threadId,
+              runId: source.id,
+              occurredAt: now,
+              payload: {
+                ...source,
+                modelSelection: selection,
+                startedAt: now,
+                launchRecovery: marker,
+              },
+            },
+          ],
+        });
+        const providerThread = before.providerThreads.find(
+          (thread) => thread.id === source.providerThreadId,
+        )!;
+        const resumedNativeId = model === "claude-haiku-5-5" ? "native-before-backoff" : null;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:native`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                status: "idle",
+                nativeThreadRef:
+                  resumedNativeId === null
+                    ? null
+                    : { driver, nativeId: resumedNativeId, strength: "strong" },
+                nativeMetadata: { ...providerThread.nativeMetadata, claudeRefusalObserved: false },
+              },
+            },
+          ],
+        });
+        yield* TestClock.adjust("10 seconds");
+        const interrupt = (runId: RunId) =>
+          orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make(`${threadId}:stop`),
+            threadId,
+            runId,
+            holdQueue: true,
+          });
+        if (stop === "before") yield* interrupt(source.id);
+        // This is the same isolated persisted-state reconciliation used on process startup.
+        yield* recovery.reconcile("startup");
+        const continuation = continueRestartedRun({ threadId, sourceRunId: source.id }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                dispatch: orchestrator.dispatch,
+                recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              }),
+            ),
+          ),
+        );
+        yield* continuation;
+        yield* continuation;
+        let after = yield* orchestrator.getThreadProjection(threadId);
+        if (stop === "before") {
+          assert.lengthOf(after.runs, 1);
+          return;
+        }
+        assert.lengthOf(after.runs, 2);
+        const resumed = after.runs[1]!;
+        assert.deepEqual(resumed.launchRecovery, marker);
+        assert.deepEqual(resumed.modelSelection, selection);
+        assert.equal(
+          after.providerThreads.find((thread) => thread.id === resumed.providerThreadId)
+            ?.nativeThreadRef?.nativeId ?? null,
+          resumedNativeId,
+        );
+        assert.equal(
+          after.messages.find((message) => message.id === resumed.userMessageId)?.text,
+          text,
+        );
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const pending = yield* outbox.listByCommandId(
+          CommandId.make(`command:restart-continuation:${source.id}`),
+        );
+        const starts = pending.filter((effect) => effect.request.type === "provider-turn.start");
+        assert.lengthOf(starts, 1);
+        if (starts[0]?.request.type === "provider-turn.start")
+          assert.equal(starts[0].request.retryDelayMs, 20_000);
+        if (stop === "during") {
+          yield* interrupt(resumed.id);
+          yield* recovery.reconcile("startup");
+          yield* continuation;
+          after = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(after.runs, 2);
+          assert.equal(after.runs[1]?.status, "interrupted");
+        }
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect("closes replay permission after a recovered attempt reached its native turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("launch-output-restart");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make("restart-project"),
+        title: "Output",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-backoff",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "server",
+        commandId: CommandId.make(`${threadId}:message`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message`),
+        text: "Complete the task",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const source = projection.runs[0]!;
+      const now = yield* DateTime.now;
+      const selection = { ...modelSelection, model: "claude-sonnet-5-5" };
+      const marker = {
+        kind: "model_access" as const,
+        replayAllowed: true,
+        retriesOnModel: 1,
+        attempt: 3,
+        delayMs: 30_000,
+        since: DateTime.formatIso(now),
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:cut`),
+            type: "run.updated",
+            threadId,
+            runId: source.id,
+            occurredAt: now,
+            payload: {
+              ...source,
+              modelSelection: selection,
+              status: "cancelled",
+              startedAt: now,
+              completedAt: now,
+              launchRecovery: marker,
+              delegatedTaskId: NodeId.make("task-output"),
+            },
+          },
+          {
+            id: EventId.make(`${threadId}:turn`),
+            type: "provider-turn.updated",
+            threadId,
+            runId: source.id,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make(`${threadId}:native`),
+              providerThreadId: source.providerThreadId!,
+              nodeId: source.rootNodeId!,
+              runAttemptId: source.activeAttemptId,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "cancelled",
+              startedAt: now,
+              completedAt: now,
+            },
+          },
+        ],
+      });
+      yield* continueRestartedRun({ threadId, sourceRunId: source.id }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+              dispatch: orchestrator.dispatch,
+              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+            }),
+          ),
+        ),
+      );
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 2);
+      const resumed = after.runs[1]!;
+      assert.isFalse(resumed.launchRecovery?.replayAllowed);
+      assert.equal(
+        claudeRecoveryResult({ ...resumed, status: "completed" }, "Done").finishedOn,
+        "claude-sonnet-5-5",
+      );
+      assert.isUndefined(
+        nextLaunchRecovery({
+          thread: {
+            ...after.thread,
+            lineage: { ...after.thread.lineage, relationshipToParent: "subagent" },
+          },
+          run: resumed,
+          failure: {
+            class: "provider_error",
+            category: "auth_expired",
+            code: "api_error_401",
+            retryable: true,
+            message: "401",
+            claudeAccess: { status: 401, beforeResponse: true, refusalFree: true, refused: false },
+          },
+          driver: "claudeAgent",
+          automated: false,
+          text: "Continue",
+          jitter: 0.5,
+        }),
+      );
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
   it.effect(
     "admits restart continuations once and rejects a stale continuation behind newer work",
     () =>
@@ -8316,5 +8711,411 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
           );
         }),
     );
+  },
+);
+
+const layerRestartPacingStateTest = RestartPacingState.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      IdAllocator.layer,
+      Layer.mock(ControlStore.ControlStore)({ getOrigin: () => Effect.succeed(null) }),
+      Layer.mock(KanbanStore.KanbanStore)({
+        threadLink: () => Effect.succeed(null),
+        discussionByEvaluator: () => Effect.succeed(null),
+      }),
+    ),
+  ),
+  Layer.provideMerge(layerTest),
+);
+const layerRestartPacingTest = (load: () => number) =>
+  RestartPacing.layer.pipe(
+    Layer.provideMerge(layerRestartPacingStateTest),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(Layer.succeed(RestartPacing.RestartLoad, load)),
+  );
+
+it.effect.each([
+  ["web", "user", true, "bypass"],
+  ["mobile", "user", true, "bypass"],
+  ["server", "system", true, "bypass"],
+  ["server", "agent", false, "bypass"],
+  ["web", "user", true, "thread.stop"],
+  ["web", "user", true, "run.interrupt"],
+] as const)(
+  "a %s %s message obeys restart pacing (bypass=%s, action=%s)",
+  ([creationSource, createdBy, bypass, mode]) => {
+    let load = 2;
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make(`runtime-paced-bypass:${creationSource}`);
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`paced-create:${creationSource}`),
+        createdBy: "user",
+        creationSource: "web",
+        threadId,
+        projectId: ProjectId.make("project:paced-bypass"),
+        title: "Paced recovery",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const oldCommand = CommandId.make(`paced-old:${creationSource}`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: oldCommand,
+        threadId,
+        messageId: MessageId.make(`paced-old:${creationSource}`),
+        text: "Saved before restart",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+      });
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const old = before.runs[0]!;
+      markQueuedRunRecovered(old.id);
+      const held = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "paced-bypass",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      yield* outbox.retry({
+        effectId: held.id,
+        workerId: "paced-bypass",
+        error: "Resuming after restart",
+        delayMs: 15_000,
+        refundAttempt: true,
+      });
+      const state = yield* RestartPacingState.RestartPacingState;
+      const pacing = yield* RestartPacing.RestartPacing;
+      const source = { threadId, sourceRunId: old.id, effectId: held.id };
+      assert.equal(yield* pacing.acquire(source), 15_000);
+      const otherThreadId = ThreadId.make(`runtime-paced-other:${creationSource}`);
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`paced-other-create:${creationSource}`),
+        createdBy: "agent",
+        creationSource: "server",
+        threadId: otherThreadId,
+        projectId: ProjectId.make("project:paced-bypass"),
+        title: "Other recovery",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`paced-other-start:${creationSource}`),
+        threadId: otherThreadId,
+        messageId: MessageId.make(`paced-other:${creationSource}`),
+        text: "Other recovery",
+        attachments: [],
+        createdBy: "agent",
+        creationSource: "server",
+        dispatchMode: { type: "start_immediately" },
+      });
+      const other = (yield* orchestrator.getThreadProjection(otherThreadId)).runs[0]!;
+      for (const position of [1, 2, 1]) {
+        yield* state.status(source, position);
+        const note = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+          threadId,
+          itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+        });
+        assert.equal(note?.type, "notification");
+        if (note?.type === "notification")
+          assert.equal(note.summary, `Resuming after restart (position ${position})`);
+        assert.equal(note?.status, "waiting");
+      }
+      const freshCommand = CommandId.make(`paced-fresh:${creationSource}`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: freshCommand,
+        threadId,
+        messageId: MessageId.make(`ardud-control:paced-fresh:${creationSource}`),
+        text: "Fresh owner turn",
+        attachments: [],
+        createdBy,
+        creationSource,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        after.runs.find((run) => run.id === old.id)?.status,
+        bypass ? "queued" : "starting",
+      );
+      const fresh = after.runs.find(
+        (run) => run.userMessageId === `ardud-control:paced-fresh:${creationSource}`,
+      )!;
+      assert.equal(fresh.status, bypass ? "starting" : "queued");
+      const candidate = yield* outbox.claimNext({
+        workerId: "paced-fresh",
+        leaseDurationMs: 30_000,
+        threadId,
+        onlyEffectTypes: ["provider-turn.start"],
+      });
+      assert.equal(Option.isSome(candidate), bypass);
+      if (!bypass) return;
+      const start = Option.getOrThrow(candidate);
+      assert.equal(start.request.type, "provider-turn.start");
+      assert.equal(start.commandId, freshCommand);
+      assert.equal((yield* outbox.get(held.id)).pipe(Option.getOrThrow).status, "pending");
+      yield* outbox.succeed({ effectId: start.id, workerId: "paced-fresh" });
+      let currentFresh = fresh;
+      const promotedIds = new Set<string>();
+      for (let cycle = 0; cycle < 2; cycle++) {
+        if (cycle === 0) {
+          // A delayed old start drains as a no-op while its run is queued.
+          yield* TestClock.adjust("15 seconds");
+          const stale = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-stale",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          yield* outbox.succeed({ effectId: stale.id, workerId: "paced-stale" });
+        }
+        if (mode !== "bypass") {
+          // Prune E0 while its note is completed, before promotion creates E1.
+          assert.equal(
+            yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+            15_000,
+          );
+        }
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          commandId: CommandId.make(`paced-finish:${creationSource}:${cycle}`),
+          events: [
+            {
+              id: EventId.make(`paced-finish:${creationSource}:${cycle}`),
+              type: "run.updated",
+              threadId,
+              runId: currentFresh.id,
+              occurredAt: now,
+              payload: { ...currentFresh, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          threadId,
+          commandId: CommandId.make(`paced-promote:${creationSource}:${cycle}`),
+        });
+        // A different thread prunes E0 after E1 has restored this run's wait,
+        // before E1 is claimed and replaces E0 in the pacing registry.
+        if (mode === "bypass")
+          assert.equal(
+            yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+            15_000,
+          );
+        const restoredWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+          threadId,
+          itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+        });
+        assert.equal(restoredWait?.status, "waiting");
+        assert.isNull(restoredWait?.completedAt);
+        if (mode !== "bypass") {
+          const commandId = CommandId.make(`paced-stop-unclaimed:${mode}`);
+          yield* orchestrator.dispatch(
+            mode === "thread.stop"
+              ? { type: "thread.stop", threadId, commandId }
+              : { type: "run.interrupt", threadId, commandId, runId: old.id, holdQueue: true },
+          );
+          const stoppedWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+            threadId,
+            itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+          });
+          assert.equal(stoppedWait?.status, "completed");
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+              (run) => run.id === old.id,
+            )?.status,
+            "interrupted",
+          );
+          return;
+        }
+        // Cover fresh input both before the worker claims the promoted start
+        // and after it has deferred it. Neither timing may queue owner input.
+        if (cycle === 1) {
+          const promoted = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-promoted",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          assert.equal(promoted.request.type, "provider-turn.start");
+          if (promoted.request.type === "provider-turn.start")
+            assert.equal(promoted.request.runId, old.id);
+          assert.isFalse(promotedIds.has(promoted.id));
+          promotedIds.add(promoted.id);
+          yield* outbox.retry({
+            effectId: promoted.id,
+            workerId: "paced-promoted",
+            error: "Resuming after restart",
+            delayMs: 15_000,
+            refundAttempt: true,
+          });
+          assert.equal(yield* pacing.acquire({ ...source, effectId: promoted.id }), 15_000);
+        }
+        const nextMessage = MessageId.make(`ardud-control:paced-next:${creationSource}:${cycle}`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          threadId,
+          commandId: CommandId.make(`paced-next:${creationSource}:${cycle}`),
+          messageId: nextMessage,
+          text: "Another fresh owner turn",
+          attachments: [],
+          createdBy,
+          creationSource,
+          dispatchMode: { type: "queue_after_active" },
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(projection.runs.find((run) => run.id === old.id)?.status, "queued");
+        currentFresh = projection.runs.find((run) => run.userMessageId === nextMessage)!;
+        assert.equal(currentFresh.status, "starting");
+        if (cycle === 0) {
+          const unclaimed = Option.getOrThrow(
+            yield* outbox.claimNext({
+              workerId: "paced-unclaimed",
+              leaseDurationMs: 30_000,
+              threadId,
+              onlyEffectTypes: ["provider-turn.start"],
+            }),
+          );
+          assert.equal(unclaimed.request.type, "provider-turn.start");
+          if (unclaimed.request.type === "provider-turn.start") {
+            assert.equal(unclaimed.request.runId, old.id);
+            assert.isUndefined(yield* state.sourceForRun(threadId, old.id));
+          }
+          promotedIds.add(unclaimed.id);
+          yield* outbox.succeed({ effectId: unclaimed.id, workerId: "paced-unclaimed" });
+        }
+        const freshStart = Option.getOrThrow(
+          yield* outbox.claimNext({
+            workerId: "paced-fresh",
+            leaseDurationMs: 30_000,
+            threadId,
+            onlyEffectTypes: ["provider-turn.start"],
+          }),
+        );
+        yield* outbox.succeed({ effectId: freshStart.id, workerId: "paced-fresh" });
+      }
+      yield* TestClock.adjust("15 seconds");
+      const previousStart = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "paced-last-stale",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      yield* outbox.succeed({ effectId: previousStart.id, workerId: "paced-last-stale" });
+      const now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`paced-last-finish:${creationSource}`),
+            type: "run.updated",
+            threadId,
+            runId: currentFresh.id,
+            occurredAt: now,
+            payload: { ...currentFresh, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        threadId,
+        commandId: CommandId.make(`paced-last-promote:${creationSource}`),
+      });
+      assert.equal(
+        yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+        15_000,
+      );
+      yield* outbox.cancelUnsettled({
+        threadId,
+        effectTypes: ["provider-turn.start"],
+        reason: "Stopped before admission",
+      });
+      assert.equal(
+        yield* pacing.acquire({ threadId: otherThreadId, sourceRunId: other.id }),
+        15_000,
+      );
+      const cancelledWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+      });
+      assert.equal(cancelledWait?.status, "completed");
+      const saved = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (run) => run.id === old.id,
+      )!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`paced-requeue-admission:${creationSource}`),
+            type: "run.updated",
+            threadId,
+            runId: old.id,
+            occurredAt: now,
+            payload: {
+              ...saved,
+              status: "queued",
+              startedAt: null,
+              queueHeld: false,
+              queuePosition: 1,
+            },
+          },
+        ],
+      });
+      load = 0;
+      // Continuation dispatch reserves a slot before queue promotion. Its later
+      // provider start must complete the wait restored by that promotion.
+      const wakeId = `paced-reservation:${creationSource}`;
+      const wakeSource = { ...source, effectId: wakeId };
+      yield* outbox.enqueue([
+        {
+          id: wakeId,
+          commandId: CommandId.make(wakeId),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: old.id, queued: true },
+        },
+      ]);
+      assert.equal(yield* pacing.acquire(wakeSource), 0);
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        threadId,
+        commandId: CommandId.make(`paced-admit-promote:${creationSource}`),
+      });
+      yield* pacing.dispatched(wakeSource);
+      // High load at this second stage proves it reuses the admitted slot.
+      load = 2;
+      const admittedStart = Option.getOrThrow(
+        yield* outbox.claimNext({
+          workerId: "paced-admitted",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        }),
+      );
+      assert.equal(yield* pacing.acquireRun(threadId, old.id, admittedStart.id), 0);
+      const admittedWait = yield* (yield* ProjectionStore.ProjectionStoreV2).getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(`turn-item:restart-pacing:${old.id}`),
+      });
+      assert.equal(admittedWait?.status, "completed");
+    }).pipe(Effect.provide(layerRestartPacingTest(() => load)));
   },
 );

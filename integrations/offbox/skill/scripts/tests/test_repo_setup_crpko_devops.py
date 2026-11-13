@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import bases, identity, runs
+from test_capacity import Isolated
 
 TEMPLATES = runs.REPO_RECIPES_DIR.parent
 KEY = 'crpko-devops'
@@ -31,7 +33,8 @@ def binary(tool, version):
     (home/'bin'/tool).chmod(0o755)
 def record():
     with (home/'calls').open('a') as f: f.write(name+' '+ ' '.join(args)+'\n')
-if name in ('vector','aws','terraform','ruby'):
+if name == 'time': sys.exit(0)
+elif name in ('vector','aws','terraform','ruby'):
     version = state[name]
     if name == 'vector': print('vector '+version+' (linux)')
     if name == 'aws': print('aws-cli/'+version+' Python/3 Linux')
@@ -91,12 +94,22 @@ elif name == 'sudo':
                 state['aws']='2.99.0'
                 save()
     elif args[0] == 'apt-get':
+        if args[1:] == ['update','-qq']:
+            if state.get('update_fails'): sys.exit(100)
+            state['apt_lists']=True
+            save()
+            sys.exit(0)
         assert args[1:4] == ['install','-y','-qq'], args
+        if (state.get('apt_lists') is False or args[-1] == state.get('apt_fails')
+                or args[-1] in state.get('apt_fail_packages', [])):
+            print('E: Unable to locate package '+args[-1],file=sys.stderr)
+            sys.exit(100)
         if args[-1] == 'ruby' and state.get('ruby_target_missing'):
             (home/'bin/ruby').unlink(missing_ok=True)
             (home/'bin/ruby').symlink_to(home/'bin/ruby3.3')
         elif args[-1] in ('ruby','ruby3.3') and (not state.get('ruby_cached') or '--reinstall' in args): binary('ruby','3.3.0')
         if args[-1] == 'unzip': binary('unzip','installed')
+        if args[-1] == 'time' and state.get('broken_tool') != 'time': binary('time','GNU')
     else: raise Exception(args)
 else: raise Exception(name)
 '''
@@ -116,7 +129,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.fake = self.home/'fake'
         self.fake.write_text('#!'+sys.executable+'\n'+FAKE)
         self.fake.chmod(0o755)
-        self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0')
+        self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0', time='GNU')
         for tool in ('curl','sudo','tar','unzip','uname','readlink','dpkg-query',*self.state):
             shutil.copy(self.fake, self.bin/tool)
         (self.bin/'python3').symlink_to(sys.executable)
@@ -126,14 +139,14 @@ class CrpkoSetupTests(unittest.TestCase):
         self.recipes = self.home/'templates/repos'
         self.recipes.mkdir(parents=True)
         (self.recipes.parent/'tools').mkdir()
-        for source in (TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
+        for source in (TEMPLATES/'tools/fetch.sh', TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
             target = self.recipes.parent/source.relative_to(TEMPLATES)
             # Keep all fake installs in a temporary tree, including the absolute Ruby check.
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
-                        OFFBOX_REPO_ROOT=str(self.root))
+                        OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
         self.env.pop('BASH_ENV',None)
 
     def pin(self, version):
@@ -144,7 +157,7 @@ class CrpkoSetupTests(unittest.TestCase):
         (self.home/'state').write_text(json.dumps(self.state))
         with patch.object(runs,'REPO_RECIPES_DIR',self.recipes), \
              patch.object(runs,'DOCKER_REPAIR',':'), patch.object(runs,'LDCACHE_REPAIR',':'), \
-             patch.object(runs,'GO_REPAIR',':'):
+             patch.object(runs,'GO_REPAIR',':'), patch.object(runs.userns,'setup',return_value=':'):
             script = runs.remote_script('w/repo','.',[command],None,'run-test',repo_key=KEY,node=node)
         result = subprocess.run(['bash','-c',script],env=self.env,capture_output=True,text=True,timeout=15)
         self.state = json.loads((self.home/'state').read_text())
@@ -161,6 +174,100 @@ class CrpkoSetupTests(unittest.TestCase):
     def assert_ok(self, result):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('USER_COMMAND',result.stdout)
+
+    def run_check(self):
+        (self.home/'state').write_text(json.dumps(self.state))
+        body=(self.recipes.parent/'tools/crpko.sh').read_text()+'\n'+(self.recipes/f'{KEY}.sh').read_text()
+        return subprocess.run(['bash','-c',body,'recipe','--check'],env=self.env,
+                              capture_output=True,text=True,timeout=15)
+
+    def test_empty_apt_lists_refresh_once_and_retry_install(self):
+        self.state['apt_lists']=False
+        self.state['ruby_target_missing']=True
+        self.missing('ruby')
+        (self.bin/'ruby').symlink_to(self.bin/'ruby3.3')
+        self.missing('time')
+        self.assert_ok(self.run_setup())
+        calls=self.calls()
+        self.assertEqual(calls.count('apt-get update -qq'),1)
+        self.assertEqual(calls.count('apt-get install -y -qq ruby\n'),2)
+        self.assertIn('apt-get install -y -qq --reinstall ruby\n',calls)
+        self.assertIn('apt-get install -y -qq --reinstall ruby3.3\n',calls)
+        self.assertIn('apt-get install -y -qq time\n',calls)
+
+    def test_each_ruby_install_form_refreshes_empty_lists(self):
+        # All apt argument forms must survive the retry, including the dpkg owner.
+        for args in ('ruby','--reinstall ruby','--reinstall ruby3.3','unzip'):
+            with self.subTest(args=args):
+                self.state['apt_lists']=False
+                (self.home/'state').write_text(json.dumps(self.state))
+                before=self.calls()
+                body=(self.recipes.parent/'tools/crpko.sh').read_text()
+                result=subprocess.run(['bash','-c',body+'\noffbox_apt_install '+args],
+                                      env=self.env,capture_output=True,text=True,timeout=15)
+                self.assertEqual(result.returncode,0,result.stderr)
+                calls=self.calls()[len(before):]
+                self.assertEqual(calls.count('apt-get update -qq'),1)
+                self.assertEqual(calls.count('apt-get install -y -qq '+args+'\n'),2)
+
+    def test_warm_apt_lists_need_no_update(self):
+        self.missing('ruby')
+        self.assert_ok(self.run_setup())
+        self.assertIn('apt-get install -y -qq ruby',self.calls())
+        self.assertNotIn('apt-get update',self.calls())
+
+    def test_failed_ruby_install_forms_share_one_update_in_the_shell(self):
+        self.state.update(apt_lists=False,apt_fail_packages=['ruby','ruby3.3'])
+        (self.home/'state').write_text(json.dumps(self.state))
+        body=(self.recipes.parent/'tools/crpko.sh').read_text()
+        body+='\noffbox_apt_install ruby || :\noffbox_apt_install --reinstall ruby || :\n'
+        body+='offbox_apt_install --reinstall ruby3.3 || exit 98\n'
+        result=subprocess.run(['bash','-c',body],env=self.env,capture_output=True,text=True,timeout=15)
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertEqual(self.calls().count('apt-get update -qq'),1)
+
+    def test_failed_update_leaves_no_stamp_and_next_setup_refreshes_again(self):
+        self.state.update(apt_lists=False,update_fails=True)
+        self.missing('ruby')
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertNotIn('USER_COMMAND',result.stdout)
+        self.assertFalse((self.home/f'.offbox/repo-setup-{KEY}.stamp').exists())
+        self.assertEqual(self.calls().count('apt-get update -qq'),1)
+        self.state['update_fails']=False
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls().count('apt-get update -qq'),2)
+
+    def test_later_install_failure_does_not_refresh_twice(self):
+        self.state.update(apt_lists=False,apt_fails='time')
+        self.missing('ruby')
+        self.missing('time')
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertIn('GNU time install failed',result.stderr)
+        self.assertEqual(self.calls().count('apt-get update -qq'),1)
+        self.assertNotIn('USER_COMMAND',result.stdout)
+        self.assertFalse((self.home/f'.offbox/repo-setup-{KEY}.stamp').exists())
+
+    def test_missing_gnu_time_fails_check_then_installs_and_passes_check(self):
+        self.missing('time')
+        self.assertNotEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertIn('apt-get install -y -qq time',self.calls())
+        self.assertEqual(self.run_check().returncode,0)
+
+    def test_present_gnu_time_is_not_installed(self):
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.run_check().returncode,0)
+        self.assertNotIn('apt-get install -y -qq time',self.calls())
+
+    def test_time_install_without_executable_fails_setup(self):
+        self.missing('time')
+        self.state['broken_tool']='time'
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertIn('offbox: GNU time install failed',result.stderr)
+        self.assertNotIn('USER_COMMAND',result.stdout)
 
     def test_ready_tools_and_second_run_install_nothing(self):
         self.assert_ok(self.run_setup())
@@ -327,7 +434,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn('offbox_crpko_tools\n',body)
 
 
-class RepoKeyTests(unittest.TestCase):
+class RepoKeyTests(Isolated):
     def test_origin_defines_key_for_main_ovnfs_and_tmp_clones(self):
         urls=['https://github.com/Equicom-Crypto/crpko-devops.git',
               'git@github.com:Equicom-Crypto/crpko-devops.git',

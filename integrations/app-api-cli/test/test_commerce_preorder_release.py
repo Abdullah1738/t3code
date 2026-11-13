@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import copy
 import tempfile
@@ -10,11 +11,12 @@ import commerce_preorder_release as r
 from commerce_preorder import IntentVault
 from noon_checkout import fingerprint
 from noon_nownow_checkout import Snapshot
-from test.test_commerce_preorder import Store
+from test_commerce_preorder import Store
 
 
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.p = patch.object(j, 'ROOT', Path(self.tmp.name) / 'commerce')
@@ -112,8 +114,11 @@ class ReleaseTests(unittest.TestCase):
 
 
 class CartReviewTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_cart_review_rejects_changed_session_amount_and_identity(self):
-        from test import test_commerce_nownow_order as f
+        import test_commerce_nownow_order as f
         import commerce_receipts
         import order_card
         from commerce_nownow import reader

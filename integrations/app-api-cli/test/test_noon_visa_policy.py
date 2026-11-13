@@ -22,7 +22,7 @@ class VisaPolicyTests(unittest.TestCase):
     def test_nownow_visa_capability_distinguishes_live_proof(self):
         with patch.object(order_card, 'LAST4', '9546'):
             result = cli.capabilities()
-            self.assertTrue(result['nownow_selected_card_purchase_enabled'])
+            self.assertFalse(result['nownow_selected_card_purchase_enabled'])
             self.assertFalse(result['nownow_9546_paid_live_proof'])
             self.assertEqual(result['verticals']['noon.nownow']['payment'],
                              'exact_native_order_and_unique_bank_purchase')

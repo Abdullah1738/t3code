@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """recover-payment re-reads of old declines block from when the decline happened."""
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
@@ -25,6 +26,7 @@ HOUR = 3600
 
 class RecoverDeclineTimeTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name).resolve()

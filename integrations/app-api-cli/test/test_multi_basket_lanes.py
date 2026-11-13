@@ -19,18 +19,18 @@ import commerce_main_order as cmain
 import commerce_supermall_order as csup
 import commerce_nownow_order as cnow
 
-from test.test_commerce_main_order import (
+from test_commerce_main_order import (
     FakeAuth as MainAuth, Harness as MainHarness, patched_resolve as main_resolve,
     cart_state as main_cart, session_state as main_session, FIXTURE as MAIN_FIXTURE,
     SKU as MAIN_SKU, OFFER as MAIN_OFFER, ORDER as MAIN_ORDER)
-from test.test_commerce_supermall_order import (
+from test_commerce_supermall_order import (
     FakeAuth as SuperAuth, Harness as SuperHarness, patched_resolve as super_resolve,
     cart_state as super_cart, session_state as super_session, FIXTURE as SUPER_FIXTURE,
     SKU as SUPER_SKU, OFFER as SUPER_OFFER, ORDER as SUPER_ORDER)
-from test.test_commerce_nownow_order import (
+from test_commerce_nownow_order import (
     FakeAuth as NowAuth, Harness as NowHarness, nn_state, place_state,
     happy_responses as now_happy, STORE, PRODUCT, SYNTHETIC_ORDER)
-from test.test_noon_minutes_checkout import (
+from test_noon_minutes_checkout import (
     Harness as MinHarness, HEADERS as MIN_HEADERS, fixture as min_fixture)
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint

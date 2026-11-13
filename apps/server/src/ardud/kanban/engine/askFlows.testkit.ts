@@ -6,6 +6,7 @@ import {
   ThreadId,
   type KanbanActor,
   type KanbanCard,
+  type ModelSelection,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -41,6 +42,7 @@ export const owner: KanbanActor = { _tag: "owner" };
 
 interface FakeThread {
   readonly title: string;
+  readonly model: ModelSelection;
   readonly messages: Array<string>;
 }
 
@@ -59,6 +61,7 @@ export const makeFake = Effect.gen(function* () {
           updatedAt: "2026-11-10T10:00:00.000Z",
           quietSince: "2026-11-10T10:00:00.000Z",
           runStartedAt: null,
+          lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],
@@ -80,7 +83,11 @@ export const makeFake = Effect.gen(function* () {
           : Ref.modify(threads, (all) => {
               const threadId = ThreadId.make(`thread-${all.size + 1}`);
               const copy = new Map(all);
-              copy.set(threadId, { title: input.title, messages: [input.text] });
+              copy.set(threadId, {
+                title: input.title,
+                model: input.model,
+                messages: [input.text],
+              });
               return [threadId, copy] as const;
             }),
       send: (input) =>
@@ -91,9 +98,16 @@ export const makeFake = Effect.gen(function* () {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
-      model: () => Effect.succeed(null),
-      setModel: () => Effect.void,
+      model: (threadId) =>
+        Ref.get(threads).pipe(Effect.map((all) => all.get(threadId)?.model ?? null)),
+      withdraw: () => Effect.void,
+      setModel: (threadId, model) =>
+        Ref.update(threads, (all) => {
+          const thread = all.get(threadId);
+          return thread ? new Map(all).set(threadId, { ...thread, model }) : all;
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

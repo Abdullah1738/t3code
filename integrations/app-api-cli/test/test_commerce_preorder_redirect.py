@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ FLOW = '10000000-0000-4000-8000-000000000001'
 
 class RedirectTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = patch.object(j, 'ROOT', Path(self.temp.name) / 'commerce')

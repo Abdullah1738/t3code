@@ -1,3 +1,4 @@
+import { redact } from "./redact.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -27,7 +28,7 @@ export function sanitizeSource(value: string): string {
 export function parseCommand(args: string[]): Command {
   const optionsByCommand: Record<string, string[]> = {
     health: [],
-    notify: ["source", "severity", "text", "key"],
+    notify: ["source", "severity", "text", "key", "ask-key", "burst-key"],
     "send-file": ["file", "key", "text", "mime"],
     remind: ["at", "text", "key", "timezone"],
     reminders: [],
@@ -96,7 +97,9 @@ export function parseCommand(args: string[]): Command {
       }
       return {
         method: "POST", path: "/notify",
-        body: { source: sanitizeSource(required(values.source, "--source")), severity, text: required(values.text, "--text"), dedupeKey: required(values.key, "--key") },
+        body: { source: sanitizeSource(required(values.source, "--source")), severity, text: redact(required(values.text, "--text")), dedupeKey: required(values.key, "--key"),
+          ...(values["ask-key"] === undefined ? {} : { askKey: required(values["ask-key"], "--ask-key") }),
+          ...(values["burst-key"] === undefined ? {} : { burstKey: required(values["burst-key"], "--burst-key") }) },
       };
     }
     case "send-file": {

@@ -18,6 +18,9 @@ import commerce_nownow_order as lane
 import commerce_preorder as pre
 import commerce_nownow as reads
 import order_card
+import card_status
+import owner_go
+from owner_go_support import approve_test_flows
 from test import test_commerce_nownow_order as f
 
 CASES = json.loads((Path(__file__).parent / 'fixture_nownow_postauth_states.json').read_text())
@@ -25,6 +28,7 @@ CASES = json.loads((Path(__file__).parent / 'fixture_nownow_postauth_states.json
 
 class StateFixtures(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         for mod, key, value in ((j, 'ROOT', Path(temp.name).resolve()/'commerce'),
                 (lane.receipts, 'ROOT', Path(temp.name).resolve()/'commerce'),
@@ -143,6 +147,7 @@ class StateFixtures(unittest.TestCase):
                         tempfile.TemporaryDirectory() as temp, patch.object(j, 'ROOT', Path(temp).resolve()/'commerce'):
                     flow = '10000000-0000-4000-8000-000000000001'
                     with patch.object(j.time, 'time', return_value=100000):
+                        card_status.record_declined('9546', reason='synthetic issuer decline', source='fixture')
                         j.open_flow(flow_id=flow, app='noon', vertical='nownow', account_hash='1'*64, scope_hash='2'*64)
                         if prep_age is not None or kind == 'payment': j.record_nownow_prepared(flow, '5'*64)
                         if kind == 'payment':
@@ -372,6 +377,101 @@ class StateFixtures(unittest.TestCase):
                 self.assertFalse(result['financial_retry'])
                 self.assertFalse(any(op in ('place','payment_subscription','payment_complete') for op, _ in harness.calls))
                 self.assertEqual(j.inspect(flow.flow_id)['reserved_minor'],0)
+
+    def test_live_9546_refuses_before_auth_cart_or_cleanup(self):
+        import commerce_nownow_cleanup as cleanup
+        card_status.record_ok('9546', source='fixture')
+        with patch.object(order_card, 'LAST4', '9546'), patch.object(cli, 'ORDER_CARD_LAST4', '9546'), \
+                patch.object(cli, 'CommerceAuth') as auth, \
+                patch.object(lane, 'NowNowOrderFlow') as flow, \
+                patch.object(cleanup, 'stop_retained_preparation') as stopped, \
+                patch.object(lane.native, 'native_request') as wire:
+            for resume in ([], ['--resume-flow', '10000000-0000-4000-8000-000000000001']):
+                with self.subTest(resume=resume), contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(['order', 'nownow', '--store-code', f.STORE,
+                        '--product-code', f.PRODUCT, '--quantity', '1', *resume])
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, 1)
+                self.assertEqual(result['error'], 'NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
+                self.assertNotIn('cleanup', result)
+            auth.assert_not_called(); flow.assert_not_called()
+            stopped.assert_not_called(); wire.assert_not_called()
+
+    def test_prepare_only_9546_still_reviews_without_financial_sends(self):
+        responses = json.loads(json.dumps(f.happy_responses()).replace('2342', '9546').replace('MASTERCARD', 'VISA'))
+        with patch.object(order_card, 'LAST4', '9546'), patch.object(order_card, 'NETWORK', 'visa'):
+            flow, harness = f.make_flow(responses)
+            with patch.object(cli, 'CommerceAuth', return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                    patch.object(lane, 'NowNowOrderFlow', return_value=flow), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = cli.main(['order', 'nownow', '--store-code', f.STORE,
+                    '--product-code', f.PRODUCT, '--quantity', '1', '--prepare-only'])
+            result = json.loads(output.getvalue().splitlines()[-1])
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result['prepared_only'])
+            self.assertEqual(flow.review['projection']['card_last4'], '9546')
+            self.assertFalse(result['financial_send'])
+            self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
+            self.assertFalse(any(op in ('place', 'payment_subscription', 'payment_complete') for op, _ in harness.calls))
+
+    def test_policy_denial_at_financial_boundary_keeps_code_and_cleans_owned_cart(self):
+        original_resume = lane.NowNowOrderFlow.resume_active
+        for boundary in ('place', 'payment_subscription'):
+            for policy, error in (('fallback', 'NOON_FALLBACK_REQUIRES_RECORDED_9546_DECLINE'),
+                                  ('pause', 'ORDERING_PAUSED'), ('approval', 'OWNER_GO_REQUIRED')):
+                with self.subTest(boundary=boundary, policy=policy), tempfile.TemporaryDirectory() as temp, \
+                        patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                        patch.object(lane.receipts, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                        patch.dict(os.environ, ORDERING_PAUSE_FILE=str(Path(temp) / 'paused')):
+                    card_status.record_declined('9546', reason='synthetic issuer decline', source='fixture')
+                    responses = f.happy_responses(payment_config={})
+                    responses['cart_get']['data']['prepaidPaymentMisc']['isCvvRequired'] = boundary == 'payment_subscription'
+                    flow, harness = f.make_flow(responses); flow.prepare_only()
+                    changed = False
+                    def resume(fid, **kw):
+                        resumed = original_resume(fid, request=self.clear_response(harness), **kw)
+                        headers = resumed.client._header_provider
+                        def header_provider(operation, deadline):
+                            nonlocal changed
+                            if operation == boundary and not changed:
+                                changed = True
+                                if policy == 'fallback':
+                                    card_status.record_ok('9546', source='fixture')
+                                elif policy == 'pause':
+                                    (Path(temp) / 'paused').touch()
+                                else:
+                                    ledger = owner_go.Ledger()
+                                    item = owner_go.commerce_item(j.binding(fid))
+                                    rows = ledger.list()
+                                    revoked = {r['target'] for r in rows if r['kind'] == 'revoke'}
+                                    for row in rows:
+                                        if row['kind'] == 'record' and row['item'] == item and row['id'] not in revoked:
+                                            ledger.close('revoke', row['id'], quote='revoke synthetic consent',
+                                                source='fixture', at=owner_go.dt.datetime.now(owner_go.UTC).isoformat())
+                            return headers(operation, deadline)
+                        resumed.client._header_provider = header_provider
+                        return resumed
+                    with patch.object(cli, 'CommerceAuth', return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                            patch.object(lane.NowNowOrderFlow, 'resume_active', side_effect=resume), \
+                            patch('noon_cvv.encrypt', return_value={'encCvv': 'fixture', 'publicKeyName': 'fixture'}), \
+                            patch.object(cli, 'cvv_from_keychain', return_value=b'123'), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        code = cli.main(['order', 'nownow', '--store-code', f.STORE,
+                            '--product-code', f.PRODUCT, '--quantity', '1', '--resume-flow', flow.flow_id,
+                            '--cvv-from-keychain'])
+                    result = json.loads(output.getvalue().splitlines()[-1])
+                    self.assertTrue(changed)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(result['error'], error)
+                    self.assertNotIn('next_action', result)
+                    self.assertIsNot(result.get('financial_send'), True)
+                    self.assertTrue(result['cleanup']['cart_empty'])
+                    state = j.inspect(flow.flow_id)
+                    self.assertEqual(state['state'], 'RELEASED')
+                    self.assertEqual(state['reserved_minor'], 0)
+                    self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls), 1)
+                    self.assertFalse(any(op in ('place', 'payment_subscription', 'payment_complete') for op, _ in harness.calls))
+                    j.require_account_available('noon', flow.account_hash)
 
     def test_early_prepare_failure_can_recover_delete_on_fresh_cli(self):
         import commerce_nownow_cleanup as cleanup

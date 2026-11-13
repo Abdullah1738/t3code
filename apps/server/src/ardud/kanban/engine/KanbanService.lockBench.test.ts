@@ -68,6 +68,7 @@ const AGENT_EVERY_MS = env("KANBAN_LOCK_BENCH_AGENT_EVERY_MS", 500);
 
 interface Thread {
   running: boolean;
+  model: ModelSelection;
   readonly messages: Array<string>;
 }
 
@@ -92,6 +93,7 @@ const makeThreads = Effect.gen(function* () {
         updatedAt: at,
         quietSince: at,
         runStartedAt: thread.running ? at : null,
+        lastActivityAt: thread.running ? at : null,
         backgroundWork: 0,
         prWatches: 0,
         prs: [],
@@ -109,10 +111,11 @@ const makeThreads = Effect.gen(function* () {
     KanbanThreads.of({
       view: read,
       find: read,
-      model: () => quick<ModelSelection | null>(null),
+      model: (threadId) => quick(null).pipe(Effect.map(() => threads.get(threadId)?.model ?? null)),
       lastFailure: () => quick(null),
       findLastFailure: () => quick(null),
       latestRun: () => quick(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => quick(null),
       // A launch reads and writes thread state several times (receipts, projection, transcript).
       launch: (input) =>
@@ -121,7 +124,7 @@ const makeThreads = Effect.gen(function* () {
           for (let i = 0; i < 4; i += 1) yield* hold(READ_MS);
           next += 1;
           const threadId = ThreadId.make(`bench-thread-${next}`);
-          threads.set(threadId, { running: true, messages: [input.text] });
+          threads.set(threadId, { running: true, model: input.model, messages: [input.text] });
           return threadId;
         }),
       send: (input) =>
@@ -134,7 +137,12 @@ const makeThreads = Effect.gen(function* () {
             thread.running = true;
           }
         }),
-      setModel: () => Effect.void,
+      withdraw: () => Effect.void,
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          const thread = threads.get(threadId);
+          if (thread) thread.model = model;
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {

@@ -26,7 +26,7 @@ class RawOutput {
   constructor(readonly value: string) {}
 }
 
-const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
+const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
   + " Public links: share, unshare, and shares."
@@ -59,6 +59,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "send-file": ["file", "key", "text", "session", "mime"],
   react: ["target", "kind"],
   send: ["text", "session", "key", "effect", "subject", "to"],
+  "cancel-send": ["session", "key"],
   poll: ["title", "option", "session", "key"],
   wake: ["text", "source", "key", "chat", "session"],
   "location-request": ["session", "key", "chat"],
@@ -232,6 +233,8 @@ export function parseCommand(args: string[]): Command {
   }
 
   switch (command) {
+    case "cancel-send":
+      return { method: "POST", path: "/cancel-send", body: session() };
     case "health":
       return { method: "GET", path: "/health" };
     case "send-file": {

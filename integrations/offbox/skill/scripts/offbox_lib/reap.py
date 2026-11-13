@@ -4,10 +4,12 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 
 from __future__ import annotations
 
-from . import api, bases, capacity, lease
+import time
+
+from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, mine, now, say)
+                     iso_ts, kv_set, mine, now, say)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -23,6 +25,23 @@ def _protected(con) -> set[str]:
     ids = {r[0] for r in con.execute("SELECT box_id FROM bases")}
     ids |= {r[0] for r in con.execute("SELECT box_id FROM templates")}
     return ids
+
+
+def _recheck_prune_holds(con, actions: list[str]) -> None:
+    # Check least recently probed first so an unreachable worker cannot starve the rest on every tick.
+    rows = con.execute("SELECT h.box_id, h.run_id FROM prune_holds h JOIN leases l USING(box_id) "
+                       "LEFT JOIN kv k ON k.k='prunecheck:' || h.box_id "
+                       f"WHERE l.state='running' AND {mine('l')} AND h.created_at<? "
+                       "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id "
+                       "AND r.status IN ('starting','running')) "
+                       "ORDER BY CAST(COALESCE(k.v, '0') AS REAL), h.created_at", (now() - 300,)).fetchall()
+    deadline = time.monotonic() + 10
+    for hold in rows:
+        if time.monotonic() >= deadline:
+            break
+        kv_set(con, 'prunecheck:' + hold['box_id'], now())
+        released = prune.recheck(con, hold['box_id'], hold['run_id'], deadline - time.monotonic())
+        actions.append(f"prune hold {'released' if released else 'kept'} {hold['box_id']}")
 
 
 def reap(dry: bool = False) -> list[str]:
@@ -51,16 +70,23 @@ def _bringup_lock(row) -> str:
 
 
 def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
+    if lease.pinned_until(con, box_id) > now():
+        actions.append(f"keep {box_id}: pinned; backend miss does not retire its lease")
+        return
     actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from {api.NAME}")
     if not dry:
-        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        con.commit()
-        event(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        try:
+            lease.forget_box(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        except lease.PinnedLeaseError as pin:
+            actions[-1] = f"keep {box_id}: {pin}"
 
 
 def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
     """Delete a quarantined or abandoned bring-up box. The bring-up lock is taken first (no wait), then the row is
     re-read: a live acquisition that finished meanwhile is left alone. act() takes the box lock itself."""
+    if lease.pinned_until(con, bid) > now():
+        actions.append(f"keep {bid}: pinned recipe box")
+        return
     if dry:
         actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
         return
@@ -155,6 +181,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     rows = con.execute("SELECT * FROM leases WHERE (state IN ('running','stopped') "
                        f"OR box_id IN (SELECT box_id FROM prune_holds)) AND {mine()}").fetchall()
     _renew_live_runs(con, rows, live, protected, dry)
+    if not dry:
+        _recheck_prune_holds(con, actions)
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -163,14 +191,19 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         if bid in protected:
             continue
+        if (b is None or b.get('dataExpiredAt')) and lease.pinned_until(con, bid) > now():
+            actions.append(f"keep {bid}: pinned; backend miss does not retire its lease")
+            continue
         if b is None:
             if not dry:
                 # Release first. The lease is retired only once no hold remains: a busy lock or a failed read keeps
                 # the hold and the lease state, so a later pass finds it again and retries.
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    try:
+                        lease.forget_box(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: gone from {api.NAME}")
                 else:
                     actions.append(f"hold kept {bid}: gone from {api.NAME}, not yet confirmed")
@@ -182,9 +215,11 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             # hold goes only after a locked, fresh confirmation; a busy lock leaves it for a later pass.
             if not dry:
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    try:
+                        lease.forget_box(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: {api.NAME} deleted its data")
                 else:
                     actions.append(f"hold kept {bid}: {api.NAME} deleted its data, not yet confirmed")
@@ -192,10 +227,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 actions.append(f"forget {bid}: {api.NAME} deleted its data")
             continue
         state = b.get("state")
-        if not dry and state in api.LIVE_STATES and con.execute(
-                "SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
-            released = lease.release_hold_if_worker_gone(con, bid)
-            actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions, start_budget)

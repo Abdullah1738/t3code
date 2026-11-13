@@ -5,6 +5,7 @@ An unknown send retains account ownership; a different flow ID cannot escape it.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import owner_go
 from contextlib import contextmanager
 import hashlib
 import json
@@ -407,6 +408,22 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
     with _db() as db:
         flow = _get(db, flow_id)
         _active(flow)
+        if financial:
+            pause = Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home() / '.local/state/ordering-paused')
+            if pause.exists():
+                fail('ORDERING_PAUSED')
+            if flow['app'] == 'noon':
+                if flow['vertical'] == 'nownow' and kind == 'place' and order_card.LAST4 == '9546':
+                    fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
+                try:
+                    order_card.require_purchase_fallback()
+                except RuntimeError as exc:
+                    fail(str(exc))
+            try:
+                owner_go.require(vendor=flow['app'], item=owner_go.commerce_item(flow),
+                                 amount=payable_minor, currency='AED')
+            except owner_go.ApprovalError:
+                fail('OWNER_GO_REQUIRED')
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
         if flow['app'] == 'noon' and flow['vertical'] == 'nownow' and kind in ('place', 'payment', 'preauthorize', 'prepay'):
             _nownow_prepare_gate(db, flow, review_hash)

@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 import json
@@ -140,6 +141,9 @@ def make_flow(responses, *, quantity=2, search=None):
 
 
 class CapturedContractTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_place_body_is_bare_total_and_response_is_bare_order(self):
         self.assertEqual(FIXTURE['place_req'], {'total': 19.8})
         self.assertEqual(FIXTURE['place_resp'], ORDER)
@@ -199,6 +203,9 @@ class CapturedContractTests(unittest.TestCase):
 
 
 class ResolveOfferTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_resolve_exact_buyable_hit(self):
         case = {'hits': [FIXTURE['search']['hits'][0], {'sku_config': 'OTHER'}]}
         with patch.object(c.urllib.request, 'build_opener', return_value=patched_resolve(case)()):
@@ -218,6 +225,9 @@ class ResolveOfferTests(unittest.TestCase):
 
 
 class LaneTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def run_lane(self, responses, *, quantity=2):
         with patch.object(c.urllib.request, 'build_opener',
                           return_value=patched_resolve(FIXTURE['search'])()):
@@ -374,6 +384,9 @@ class LaneTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def prepare_partial_flow(self):
         temp = tempfile.mkdtemp()
         roots = (patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'),
@@ -427,6 +440,9 @@ class ResumeTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_paid_order_completes_journal_with_tracker(self):
         temp = tempfile.mkdtemp()
         with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \

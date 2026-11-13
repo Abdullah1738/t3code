@@ -6,7 +6,7 @@ from unittest.mock import patch
 import talabat_checkout as checkout
 import talabat_place_contract as p
 import talabat_submit_journal as journal
-from test import test_talabat_quote as quote_tests
+import test_talabat_quote as quote_tests
 
 
 def draft_inputs():
