@@ -34,6 +34,7 @@ class LostReviewFixture(Isolated):
         self.stack.enter_context(patch.object(misc,'_catch_up_finished'))
         self.stack.enter_context(patch.object(misc,'_catch_up_log',return_value='complete'))
         self.stack.enter_context(patch('offbox_lib.lease.idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
 
     def row(self):
         return self.con.execute("SELECT * FROM runs WHERE run_id='run-t'").fetchone()

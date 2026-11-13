@@ -9,6 +9,7 @@ import {
   INSTALL_DATABASE_FILE,
   checkSignature,
   clearStaleStaging,
+  createDmgStage,
   getJson,
   hostPreflight,
   install,
@@ -19,6 +20,126 @@ import {
   relaunchAfterFailure,
   uStateProcesses,
 } from "./install-robob-fast.mjs";
+
+function dmgFixture({ detachFailures = 0, failAt, synchronous = false } = {}) {
+  const calls = [];
+  const phases = [];
+  let attempts = 0;
+  const dmg = createDmgStage({
+    mkdtemp: async () => "/scratch/mount",
+    rmdir: async (mount) => calls.push(["rmdir", mount]),
+    phase: async (name, data) => phases.push({ name, ...data }),
+    run: (cmd, args, options) => {
+      calls.push([cmd, args, options]);
+      const action = args[0];
+      if (action === "detach") attempts++;
+      if (action === failAt || (action === "detach" && attempts <= detachFailures)) {
+        const error = new Error(`${action} failed ${attempts}`);
+        if (synchronous) throw error;
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ stdout: "", stderr: "" });
+    },
+  });
+  const copy = async (mount) => {
+    calls.push(["ditto", mount]);
+    if (failAt === "copy") throw new Error("copy failed");
+  };
+  return { dmg, calls, phases, copy };
+}
+
+test("DMG staging detaches immediately after copy, before verification and quit", async () => {
+  const { dmg, calls, phases, copy } = dmgFixture();
+  const ops = Object.fromEntries(
+    ["verify", "migrations", "hostPreflight", "cancelWindow", "quit", "backup", "swap",
+      "launch", "readReady", "report", "phase"].map((name) => [name, async () => calls.push([name])]),
+  );
+  ops.stage = () => dmg.stage("/release.dmg", copy);
+  try {
+    await install(ops);
+  } finally {
+    await dmg.detach();
+  }
+  assert.deepEqual(calls.slice(0, 5).map(([cmd, args]) =>
+    cmd === "/usr/bin/hdiutil" ? args[0] : cmd), ["attach", "ditto", "detach", "rmdir", "verify"]);
+  const detaches = calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach");
+  assert.equal(detaches.length, 1);
+  assert.deepEqual(detaches[0], ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"],
+    { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 }]);
+  assert.deepEqual(phases, []);
+});
+
+for (const synchronous of [false, true]) {
+  test(`DMG detach retries once with force after a ${synchronous ? "synchronous throw" : "rejection"}`, async () => {
+    const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: 1, synchronous });
+    await dmg.stage("/release.dmg", copy);
+    await dmg.detach();
+    const detaches = calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach");
+    assert.deepEqual(detaches.map(([, args]) => args), [
+      ["detach", "-quiet", "/scratch/mount"],
+      ["detach", "-quiet", "-force", "/scratch/mount"],
+    ]);
+    assert.ok(detaches.every(([, , options]) => options.timeout === 30_000));
+    assert.equal(calls.at(-1)[0], "rmdir");
+    assert.deepEqual(phases, []);
+  });
+}
+
+for (const failure of [undefined, new Error("install failed")]) {
+  test(`double detach failure logs both errors and preserves install ${failure ? "failure" : "success"}`, async () => {
+    const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: Infinity });
+    const attempt = async () => {
+      try {
+        await dmg.stage("/release.dmg", copy);
+        if (failure) throw failure;
+        return "installed";
+      } finally {
+        await dmg.detach();
+      }
+    };
+    if (failure) await assert.rejects(attempt, (error) => error === failure);
+    else assert.equal(await attempt(), "installed");
+    assert.deepEqual(phases, [
+      { name: "dmg_detach_failed", mount: "/scratch/mount",
+        error: "Error: detach failed 1; force retry: Error: detach failed 2" },
+      { name: "dmg_detach_failed", mount: "/scratch/mount",
+        error: "Error: detach failed 3; force retry: Error: detach failed 4" },
+    ]);
+    assert.equal(calls.some(([cmd]) => cmd === "rmdir"), false);
+  });
+}
+
+for (const failAt of ["attach", "copy"]) {
+  test(`finally backstop detaches after ${failAt} failure`, async () => {
+    const { dmg, calls, copy } = dmgFixture({ failAt });
+    await assert.rejects(async () => {
+      try {
+        await dmg.stage("/release.dmg", copy);
+      } finally {
+        await dmg.detach();
+      }
+    }, new RegExp(`${failAt} failed`));
+    assert.deepEqual(calls.at(-2).slice(0, 2), ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"]]);
+    assert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
+  });
+}
+
+test("finally retries a mount left attached by failed early detach", async () => {
+  const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: 2 });
+  await dmg.stage("/release.dmg", copy);
+  assert.equal(phases.length, 1);
+  await dmg.detach();
+  await dmg.detach();
+  assert.equal(calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach").length, 3);
+  assert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
+});
+
+test("DMG backstop does nothing when staging was skipped", async () => {
+  const { dmg, calls, phases } = dmgFixture();
+  await dmg.detach();
+  assert.deepEqual(calls, []);
+  assert.deepEqual(phases, []);
+});
 
 // Every post-quit failure must keep its owner alive through recovery, including rollback.
 for (const rollback of [false, true]) {

@@ -133,9 +133,9 @@ def food_projection(data, order):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = core.base(order, 'food')
     out.update(raw_status=raw, status={'preparing': 'preparing', 'delivered': 'delivered', 'delivering': 'out for delivery',
-                                     'picked_up': 'picked up'}.get(raw, 'unknown'),
+                                     'picked_up': 'picked up', 'canceled': 'cancelled'}.get(raw, 'unknown'),
                scope='order', status_text=core.text(row.get('statusLabel')),
-               coverage='exact_native_food_order; delivered_delivering_picked_up_verified')
+               coverage='exact_native_food_order; delivered_delivering_picked_up_canceled_verified')
     estimate = row.get('estimate')
     if isinstance(estimate, dict):
         window = estimate.get('time')

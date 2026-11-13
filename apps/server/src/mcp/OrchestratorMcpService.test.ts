@@ -2219,12 +2219,16 @@ describe("OrchestratorMcpService provider resolution", () => {
     { mode: "wait", legacy: true },
     { mode: "async", legacy: false, recoveryTimeout: true },
     { mode: "async", legacy: true, recoveryTimeout: true },
+    { mode: "async", legacy: false, dispatchTimeout: "before commit" },
+    { mode: "async", legacy: false, dispatchTimeout: "after commit" },
+    { mode: "async", legacy: true, dispatchTimeout: "before commit" },
   ] as const)(
-    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout)",
+    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
       const recoveryTimeout = "recoveryTimeout" in testCase;
+      const dispatchTimeout = "dispatchTimeout" in testCase ? testCase.dispatchTimeout : undefined;
       return Effect.scoped(
         Effect.gen(function* () {
           const driver = ProviderDriverKind.make("codex");
@@ -2263,6 +2267,10 @@ describe("OrchestratorMcpService provider resolution", () => {
           const recoveryEntered = yield* Deferred.make<void>();
           const recoveryRelease = yield* Deferred.make<void>();
           const recoveryStopped = yield* Deferred.make<void>();
+          const dispatchEntered = yield* Deferred.make<void>();
+          const dispatchRelease = yield* Deferred.make<void>();
+          const dispatchFinished = yield* Deferred.make<void>();
+          let blockDispatch = dispatchTimeout !== undefined;
           let blockRecovery = false;
           const threadsWithWatchSignal = Layer.effect(
             ThreadManagementService.ThreadManagementService,
@@ -2270,6 +2278,20 @@ describe("OrchestratorMcpService provider resolution", () => {
               const real = yield* ThreadManagementService.ThreadManagementService;
               return {
                 ...real,
+                dispatch: (command) =>
+                  Effect.gen(function* () {
+                    if (command.type !== "delegated_task.request" || !blockDispatch)
+                      return yield* real.dispatch(command);
+                    blockDispatch = false;
+                    const hold = Deferred.succeed(dispatchEntered, undefined).pipe(
+                      Effect.andThen(Deferred.await(dispatchRelease)),
+                    );
+                    if (dispatchTimeout === "before commit") yield* hold;
+                    const result = yield* real.dispatch(command);
+                    if (dispatchTimeout === "after commit") yield* hold;
+                    yield* Deferred.succeed(dispatchFinished, undefined);
+                    return result;
+                  }).pipe(Effect.uninterruptible),
                 getThreadRecords: (threadId, fields, filter, options) =>
                   Effect.gen(function* () {
                     if (blockRecovery && filter?.messageRoles?.includes("user")) {
@@ -2364,12 +2386,41 @@ describe("OrchestratorMcpService provider resolution", () => {
                 interactionMode: "default",
               });
             }
+            let timeoutTaskId: string | undefined;
+            if (dispatchTimeout !== undefined) {
+              const timedCall = yield* service
+                .delegateTask(scope, request)
+                .pipe(Effect.flip, Effect.forkScoped);
+              yield* Deferred.await(dispatchEntered);
+              yield* TestClock.adjust("10 seconds");
+              const error = yield* Fiber.join(timedCall);
+              assert.equal(error.code, "delegation_timeout");
+              timeoutTaskId = /Task (\S+) may still be created; check it with task_status\./.exec(
+                error.message,
+              )?.[1];
+              assert.isDefined(timeoutTaskId);
+              assert.include(error.message, `clientRequestId: ${request.clientRequestId}.`);
+              const recoveringId = NodeId.make(timeoutTaskId!);
+              if (!legacy && dispatchTimeout === "before commit") {
+                const missing = yield* service.taskStatus(scope, recoveringId).pipe(Effect.flip);
+                assert.equal(missing.code, "task_not_found");
+                assert.include(missing.message, "Creation may still be in flight");
+                assert.include(missing.message, "retry task_status with this task id");
+                assert.include(missing.message, "same clientRequestId");
+              } else {
+                const accepted = yield* service.taskStatus(scope, recoveringId);
+                assert.equal(accepted.taskId, recoveringId);
+              }
+              yield* Deferred.succeed(dispatchRelease, undefined);
+              yield* Deferred.await(dispatchFinished);
+            }
             const firstCall = yield* service.delegateTask(scope, request).pipe(Effect.forkScoped);
             if (mode === "wait") {
               yield* Deferred.await(firstWatch);
               yield* TestClock.adjust(1_000);
             }
             const first = yield* Fiber.join(firstCall);
+            if (timeoutTaskId !== undefined) assert.equal(first.taskId, timeoutTaskId);
             assert.equal(first.waitTimedOut, mode === "wait");
             if ("parentRestart" in testCase) {
               const parent = yield* orchestrator.getThreadProjection(parentThreadId);
@@ -2479,7 +2530,10 @@ describe("OrchestratorMcpService provider resolution", () => {
             }
             const sent = yield* service.sendToThread(recoveryTimeout ? renewedScope : scope, send);
             const afterSend = yield* orchestrator.getThreadProjection(first.childThreadId);
-            const resent = yield* service.sendToThread(recoveryTimeout ? scope : renewedScope, send);
+            const resent = yield* service.sendToThread(
+              recoveryTimeout ? scope : renewedScope,
+              send,
+            );
             assert.equal(resent.messageId, sent.messageId);
             if (legacy)
               assert.equal(

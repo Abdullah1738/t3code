@@ -114,6 +114,7 @@ const testLayer = () => {
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
         getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
       }),
     ),

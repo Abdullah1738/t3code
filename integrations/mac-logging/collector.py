@@ -1,15 +1,19 @@
 #!/usr/bin/python3
-"""Read-only Mac crash evidence collector; persists only cursors and counts."""
+"""Read-only Mac evidence collector with bounded disk diagnostics."""
 from collections import Counter
 import datetime as dt
 import json
+import fcntl
+import os
+import plistlib
+import tempfile
 from pathlib import Path
 import re
 import subprocess
 import time
-from jobs import read_state, save_state, directory_inventory
+from jobs import read_state, save_state, state_path, directory_inventory
 from rollup import rollup
-from toollog import emit
+from toollog import emit, private_dir
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -119,7 +123,206 @@ def collect(now=None, roots=None, log_reader=unified):
     return not errors
 
 
+def elapsed_seconds(value):
+    days, _, clock = value.rpartition('-')
+    parts = [int(p) for p in clock.split(':')]
+    if len(parts) not in (2, 3):
+        raise ValueError('invalid etime')
+    return int(days or 0)*86400 + sum(n*60**i for i, n in enumerate(reversed(parts)))
+
+
+def daemon_state(run):
+    props = {name + suffix: None for name in ('storagekitd', 'diskarbitrationd')
+             for suffix in ('Pid', 'UptimeS', 'Stat')}
+    try:
+        result = run(['/bin/ps', '-axo', 'pid,etime,stat,comm'], capture_output=True,
+                     text=True, timeout=5)
+        if result.returncode:
+            return props
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) != 4:
+                continue
+            pid, uptime, stat, command = fields
+            name = Path(command).name
+            if name in ('storagekitd', 'diskarbitrationd'):
+                props.update({name+'Pid': int(pid), name+'UptimeS': elapsed_seconds(uptime),
+                              name+'Stat': stat})
+    except Exception:
+        pass
+    return props
+
+
+def alive(pid, run=subprocess.run):
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        # A stale PID marker can outlive a reboot or an interrupted collector.
+        # Do not let PID reuse by an unrelated process disable probes forever.
+        result = run(['/bin/ps', '-p', str(pid), '-o', 'comm='],
+                     capture_output=True, text=True, timeout=5)
+        return result.returncode == 0 and Path(result.stdout.strip()).name == 'diskutil'
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, subprocess.TimeoutExpired):
+        return True
+
+
+def stop_child(child):
+    # A kernel-stuck child may not acknowledge SIGKILL. Bound reaping too and
+    # retain its PID marker so subsequent hourly runs cannot accumulate children.
+    try:
+        child.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        child.communicate(timeout=5)
+        return True
+    except subprocess.TimeoutExpired:
+        for stream in (child.stdout, child.stderr):
+            if stream is not None:
+                stream.close()
+        return False
+
+
+def sample_child(pid, root, run):
+    props = {'blockedIn': 'unknown'}
+    fd, name = tempfile.mkstemp(prefix='diskutil-', suffix='.sample', dir=root)
+    os.close(fd)
+    props['samplePath'] = name
+    try:
+        run(['/usr/bin/sample', str(pid), '2', '-file', name],
+            capture_output=True, timeout=15)
+        with open(name) as stream:
+            for line in stream:
+                match = re.search(r'^\s*[+!:| ]*\d+\s+.*?(SKHelperClient|SKManager|DiskArbitration|DASession)', line)
+                if match:
+                    props['blockedIn'] = match[1]
+                    break
+    except Exception:
+        pass
+    return props
+
+
+def notify(text, key, run):
+    env = dict(os.environ)
+    env.pop('BUN_INSPECT', None)
+    result = run(['/Users/ardud/.bun/bin/bun',
+                  '/Users/ardud/.local/share/telegram-bridge/src/cli.ts', 'notify',
+                  '--source', 'Mac Upkeep', '--severity', 'attention', '--text',
+                  text,
+                  '--key', key], capture_output=True, timeout=20, env=env)
+    return result.returncode == 0
+
+
+def alert(props, run, advance=True):
+    state = read_state('disk-tooling-alert')
+    pid = props['storagekitdPid']
+    if not advance and pid is None:
+        # Missing daemon metadata on a skipped probe is not a recovery signal.
+        pid = state.get('pid')
+    key = 'mac-upkeep:diskutil-hang:%s' % pid
+    count = state.get('consecutiveTimeouts', 0) if state.get('pid') == pid else 0
+    if advance:
+        count = count + 1 if props['timedOut'] else 0
+    state.update(pid=pid, consecutiveTimeouts=count)
+    if count >= 2 and state.get('alertedKey') != key:
+        if state.get('pendingKey') != key:
+            uptime = props['storagekitdUptimeS']
+            up = 'unknown' if uptime is None else '%.1fh' % (uptime/3600)
+            state.update(pendingKey=key, pendingText=
+                         "diskutil is hanging: storagekitd (pid %s, up %s) isn't answering. Fix: sudo killall storagekitd" % (pid, up))
+        # A timeout may occur after durable queueing. The bridge requires the
+        # same key AND text on retry, even though daemon uptime has increased.
+        save_state('disk-tooling-alert', state)
+        try:
+            sent = notify(state['pendingText'], key, run)
+        except Exception:
+            sent = False
+        emit('disk', 'event' if sent else 'error', 'disk.tooling_alert', ok=sent,
+             error_tag=None if sent else 'disk.notify_failed')
+        if sent:
+            state['alertedKey'] = key
+    save_state('disk-tooling-alert', state)
+
+
+def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=alive):
+    props = dict(timedOut=False, exitCode=None, diskCount=None)
+    ok, duration = False, None
+    try:
+        marker = state_path('disk-tooling-pid')
+        props.update(daemon_state(run))
+        with (marker.parent / 'disk-tooling.lock').open('a') as lock:
+            os.chmod(lock.name, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                props['skipped'] = 'previous-probe-still-running'
+                return props
+            control = time.monotonic()
+            try:
+                result = run(['/usr/bin/hdiutil', 'info'], capture_output=True, timeout=10)
+                props['hdiutilOk'] = result.returncode == 0
+            except Exception:
+                props['hdiutilOk'] = False
+            props['hdiutilMs'] = (time.monotonic()-control)*1000
+            samples = marker.parent / 'diskutil-samples'
+            private_dir(samples)
+            for path in samples.glob('diskutil-*.sample'):
+                if path.stat().st_mtime < time.time()-7*86400:
+                    path.unlink()
+            previous = read_state('disk-tooling-pid').get('pid')
+            if is_alive(previous):
+                props['skipped'] = 'previous-probe-still-running'
+                # Skips do not advance the timeout streak, but a failed alert
+                # must still retry if the previous child could not be reaped.
+                alert(props, run, advance=False)
+                return props
+            child = popen(['/usr/sbin/diskutil', 'list', '-plist'],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            reaped = False
+            start = time.monotonic()
+            try:
+                save_state('disk-tooling-pid', {'pid': child.pid})
+                try:
+                    output, _ = child.communicate(timeout=20)
+                    reaped = True
+                    props['exitCode'] = child.returncode
+                    if child.returncode == 0:
+                        disks = plistlib.loads(output).get('WholeDisks')
+                        if isinstance(disks, list):
+                            props['diskCount'] = len(disks)
+                            ok = True
+                except subprocess.TimeoutExpired:
+                    # durationMs measures diskutil's deadline, excluding sampling
+                    # and reaping; hdiutil has its own independent duration.
+                    duration = (time.monotonic()-start)*1000
+                    props['timedOut'] = True
+                    props.update(sample_child(child.pid, samples, run))
+                except Exception:
+                    props['probeError'] = True
+            finally:
+                if duration is None:
+                    duration = (time.monotonic()-start)*1000
+                if not reaped:
+                    reaped = stop_child(child)
+                    props['exitCode'] = child.returncode
+                if reaped:
+                    marker.unlink(missing_ok=True)
+            alert(props, run)
+    except Exception:
+        props['probeError'] = True
+    finally:
+        skipped = 'skipped' in props
+        emit('disk', 'event' if skipped or ok else 'error', 'disk.tooling_probe',
+             ok=None if skipped else ok, duration_ms=duration, props=props,
+             error_tag='disk.probe_failed' if not skipped and not ok else None)
+    return props
+
+
 def main():
+    disk_tooling_probe()
     try:
         directory_inventory()
     except Exception:

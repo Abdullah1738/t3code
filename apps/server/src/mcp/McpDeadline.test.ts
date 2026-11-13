@@ -35,22 +35,32 @@ it.effect.each([
   {
     code: "delegation_timeout",
     stage: "dispatch",
+    taskId: "task",
     message:
-      "delegate_task timed out during dispatch for thread caller. Creation may still complete. Task task was accepted; use task_status to recover it. Retry only with the same clientRequestId: retry.",
+      "delegate_task timed out during dispatch for thread caller. Task task may still be created; check it with task_status. Retry only with the same clientRequestId: retry.",
+  },
+  {
+    code: "delegation_timeout",
+    stage: "dispatch",
+    taskId: undefined,
+    message:
+      "delegate_task timed out during dispatch for thread caller. Creation may still complete. Retry only with the same clientRequestId: retry.",
   },
   {
     code: "delegation_timeout",
     stage: "caller",
+    taskId: "task",
     message:
       "delegate_task timed out during caller for thread caller. Task task was accepted; use task_status to recover it. Retry only with the same clientRequestId: retry.",
   },
   {
     code: "caller_unresolved",
     stage: "records",
+    taskId: "task",
     message:
       "Caller resolution timed out during records for thread caller. Task task was accepted; use task_status to recover it. Retry only with the same clientRequestId: retry.",
   },
-] as const)("preserves $code text during $stage", ({ code, stage, message }) =>
+] as const)("preserves $code text during $stage", ({ code, stage, taskId, message }) =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const pending = yield* McpDeadline.withDeadline(
@@ -59,7 +69,7 @@ it.effect.each([
         code,
         stage,
         threadId: ThreadId.make("caller"),
-        taskId: "task",
+        ...(taskId === undefined ? {} : { taskId }),
         requestKey: "retry",
       },
     ).pipe(Effect.flip, Effect.forkChild);

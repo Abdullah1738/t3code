@@ -13,10 +13,15 @@ RUN_ID = uuid.uuid4().hex
 CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
+NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
+BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError'}
+NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
+            'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
+TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
@@ -28,7 +33,11 @@ def directory():
 def safe_fields(values):
     result = {}
     for key, value in (values or {}).items():
-        if key in NUMBERS and type(value) in (int, float) and math.isfinite(value):
+        if key in NULLABLE and value is None:
+            result[key] = None
+        elif key in BOOLEANS and type(value) is bool:
+            result[key] = value
+        elif key in NUMBERS and type(value) in (int, float) and math.isfinite(value):
             result[key] = value
         elif key in TEXT and isinstance(value, str) and ATOM.fullmatch(value) and not SECRET.search(value):
             result[key] = value

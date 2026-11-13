@@ -100,6 +100,49 @@ export function installCommandTimeout(timeout, quitAt, startupComplete, now = Da
   return remaining;
 }
 
+export function createDmgStage({
+  run = exec,
+  phase,
+  mkdtemp = fs.mkdtemp,
+  rmdir = fs.rmdir,
+}) {
+  let mount;
+  const detach = async () => {
+    if (!mount) return;
+    // Cleanup must still run after the install's three-minute startup deadline.
+    const options = { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 };
+    try {
+      await run("/usr/bin/hdiutil", ["detach", "-quiet", mount], options);
+    } catch (first) {
+      try {
+        await run("/usr/bin/hdiutil", ["detach", "-quiet", "-force", mount], options);
+      } catch (error) {
+        await phase("dmg_detach_failed", {
+          mount,
+          error: `${String(first)}; force retry: ${String(error)}`,
+        });
+        return;
+      }
+    }
+    const detached = mount;
+    mount = undefined;
+    await rmdir(detached).catch(() => {});
+  };
+  return {
+    stage: async (dmg, copy) => {
+      mount = await mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
+      await run(
+        "/usr/bin/hdiutil",
+        ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg],
+        { timeout: 60_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 },
+      );
+      await copy(mount);
+      await detach();
+    },
+    detach,
+  };
+}
+
 export async function checkSustainedReads({
   env = process.env,
   run = exec,
@@ -590,7 +633,7 @@ async function main(args) {
   try {
     oldBootId = (await get("/api/ardud/control/install-report")).bootId;
   } catch {}
-  let mount;
+  const dmgStage = createDmgStage({ phase });
   let quitTree;
   let ownsStaging = false;
   let swapped = false;
@@ -644,16 +687,12 @@ async function main(args) {
         remove: (target) => fs.rm(target, { recursive: true, force: true }),
         stat: fs.stat,
       });
-      mount = await fs.mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
-      await run(
-        "/usr/bin/hdiutil",
-        ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg],
-        60_000,
-      );
-      if (await exists(next))
-        throw new Error(`Staging bundle already exists: ${next}; inspect it before retrying`);
-      ownsStaging = true;
-      await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
+      await dmgStage.stage(dmg, async (mount) => {
+        if (await exists(next))
+          throw new Error(`Staging bundle already exists: ${next}; inspect it before retrying`);
+        ownsStaging = true;
+        await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
+      });
     },
     verify: () => verifyBundle(next),
     migrations: async () => {
@@ -809,7 +848,7 @@ async function main(args) {
         );
       });
       // Continuations still start inside the startup bound. Healthy-read observation,
-      // its notification and final DMG detach must be allowed to outlast that bound.
+      // and its notification must be allowed to outlast that bound.
       startupComplete = true;
       await reportInstall({
         report,
@@ -889,15 +928,12 @@ async function main(args) {
     throw e;
   } finally {
     try {
+      await dmgStage.detach();
       // Our own unswapped staging copy is useless after a failure; drop it so the
       // next run does not trip on it, but only while the live app is in place.
       if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
         await fs.rm(next, { recursive: true, force: true });
         if (quitAt !== undefined) await phase("staging_removed", { path: next });
-      }
-      if (mount) {
-        await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
-        await fs.rmdir(mount).catch(() => {});
       }
     } finally {
       await finishInstallHold({

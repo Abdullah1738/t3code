@@ -128,6 +128,7 @@ layer("064_CanonicalizeThreadPullRequestLinks", (it) => {
         [64, "CanonicalizeThreadPullRequestLinks"],
         [65, "CodexUsageNativeTurnIndex"],
         [66, "CallerActiveRunIndex"],
+        [67, "EffectOutboxSettledIndex"],
       ]);
       assert.deepEqual(yield* runMigrations(), []);
       yield* initializeHistoryArchive();

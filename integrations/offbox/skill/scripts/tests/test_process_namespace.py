@@ -18,6 +18,7 @@ class ProcessNamespace(Isolated):
         self.stack.enter_context(patch.object(misc, '_client_alive', return_value=False))
         self.stack.enter_context(patch.object(misc, '_require_my_run'))
         self.stack.enter_context(patch.object(misc, '_catch_up_finished'))
+        self.stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
         self.stack.enter_context(patch.object(runs, 'reconcile_lost'))
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
         self.stack.enter_context(patch.object(lease, 'ensure_ttl'))

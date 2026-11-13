@@ -114,7 +114,7 @@ it.effect("logs the actual SQLite open, setup, migration, index and archive boun
       records.filter(
         ({ phase, outcome }) => /^sqlite\.migration\.\d+$/.test(phase) && outcome === "success",
       ).length,
-      66,
+      67,
     );
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
