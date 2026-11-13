@@ -18,6 +18,7 @@ LIVE = re.compile(
     # The legacy home database is protected; workspace .t3 copies stay isolated.
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
 )
+DATABASE_NAME = re.compile(r"statev2(?:[.-][\w-]+)?\.sqlite|state\.sqlite|opencode\.db")
 READER = re.compile(
     r"(?:^|[\s;&|('\"`])(?:\S*/)?(?:sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|"
     r"datasette|uv|cp|rsync|ditto|dd|cat|strings|grep|rg|jq|xxd|hexdump|tar|zip|restic)"
@@ -780,10 +781,15 @@ def _source_hit(source, directory, python=False, shell=False):
             return "''"
         return match[0]
     source = re.sub(r"(['\"])([^'\"\\\n]+)\1", isolated_literal, source)
-    # Other languages have no text-only AST exemption. Preserve their existing
-    # conservative treatment of paths split across variables or join calls.
-    return bool("statev2.sqlite" in source and re.search(r"\.robob|robob-data", source) or
-                "opencode.db" in source and re.search(r"\.local/share|opencode-data|[\"']opencode[\"']", source))
+    # A bundle id such as com.ardud.robob is not a path segment. Keep split
+    # live roots conservative, including cwd changes separate from the name.
+    live_root = re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
+    home_userdata = (not shell and re.search(r"\buserdata\b", source) and
+                     re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
+    # Shell fixture proofs above discharge statev2/opencode paths, not other
+    # database names that their setup may also list as data.
+    database = re.search(r"statev2\.sqlite|opencode\.db", source) if shell else DATABASE_NAME.search(source)
+    return bool(database and (live_root or home_userdata))
 
 
 def _isolated_migration_source(source, directory):
@@ -856,6 +862,9 @@ def _isolated_migration_source(source, directory):
     if re.search(r'(?:sourcePath|\bsource)\s*[+*/%&|?^-]*=(?!=)', remainder):
         return False
     source = default.sub('const sourcePath = "guard_isolated_fixture";', source)
+    # The home initializer feeds only the discharged default and the verified
+    # realpath comparison above; it cannot supply the explicit source operand.
+    source = re.sub(r'const sharedHome = path\.resolve\(options\.sharedHome \?\? path\.join\(NodeOS\.homedir\(\), "\.t3"\)\);', '', source)
     # CLI help is data. Only a literal string argument is discounted, never
     # a computed expression or a filesystem operation appended to that line.
     source = re.sub(r'Flag\.withDescription\("[^"\\\n]*"\)', '', source)
@@ -884,7 +893,7 @@ def _database_reference(source):
             if match.start() <= protected.start() < match.end():
                 return match
         return protected
-    return re.search(r"statev2\.sqlite|opencode\.db", source)
+    return DATABASE_NAME.search(source)
 
 
 def refusal_reason(rule, cause, cwd):
@@ -1604,8 +1613,11 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 match = _database_reference(source)
                 if match:
                     line = source.count("\n", 0, match.start()) + 1
-                    raise LiveRead(rule, f"{location}:{line} names {_token(match[0])}.\n"
-                                   f"Run tests through the repo runner: vp test run {shlex.quote(test_target)}.")
+                    detail = f"{location}:{line} names {_token(match[0])}."
+                    runners = {m[2] for m in re.finditer(r"\bimport\s+(?:[^;'\"]*\bfrom\s*)?(['\"])(node:test|vitest|vite-plus/test)\1", source)}
+                    if 'node:test' not in runners and runners & {'vitest', 'vite-plus/test'}:
+                        detail += f"\nRun tests through the repo runner: vp test run {shlex.quote(test_target)}."
+                    raise LiveRead(rule, detail)
             raise LiveRead(rule)
 
     def migration_source(args, directory):

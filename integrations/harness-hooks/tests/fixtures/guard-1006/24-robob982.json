@@ -36,7 +36,6 @@
       "cmd": "node --test /Users/ardud/checkouts/install-prequit-982/apps/desktop/scripts/install-robob-fast.test.mjs",
       "workdir": "/Users/ardud/checkouts/install-prequit-982",
       "sha256": "4c9cd986c68a0e7da4230ef8569bf01f95450114f8adca1940e1c298e0fa97ba",
-      "expected": "live-database-script",
       "label": "node --test"
     }
   ],
