@@ -1,3 +1,5 @@
+import { Database } from "bun:sqlite";
+import { opencodeCompletedSteps } from "../src/opencode-steps.ts";
 import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
@@ -15,7 +17,7 @@ import type { Message } from "@photon-ai/advanced-imessage/grpc";
 import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
-import { recordsFromThread, RobobBackend } from "../src/robob.ts";
+import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
 import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 
@@ -4304,18 +4306,35 @@ test("a prompt still waiting in the OpenCode inbox counts as accepted without a 
   expect(h.backend.prompts).toHaveLength(1);
 });
 
+test("an interrupted turn recovers its finished reply exactly once", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Forward that to Moni's agent");
+  await h.router.tick();
+  h.backend.step("Done, Moni's agent has it now", "stop");
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Done, Moni's agent has it now"]);
+  expect(inbounds(h.store)[0]!.state).toBe("done");
+  expect(h.controls()).toEqual([]);
+});
+
 test("an interrupted or failed turn gets one friendly notice, never a reply, and does not block the next message", async () => {
   for (const outcome of ["interrupted", "failed"] as const) {
     const h = setup(":memory:", { failureNoticeMs: 0 });
     h.input("in", "Question");
     await h.router.tick();
-    h.backend.step("PRIVATE_PARTIAL");
+    const partial = h.backend.step("PRIVATE_PARTIAL");
+    delete partial.finish;
+    delete partial.time.completed;
     h.backend.settle(outcome);
     await h.router.tick();
     await h.router.tick();
     expect(h.conversations()).toEqual([]);
     expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed" });
-    expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+    expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", outcome === "interrupted"
+      ? "The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"
+      : "Something went wrong on my end with that one. Mind trying again?"]]);
     expect(inbounds(h.store)[0]!.state).toBe("done");
     h.input("again", "Try again");
     await h.router.tick();
@@ -7857,4 +7876,485 @@ test("watcher reply guard logs accepted silence and visible replies without text
   } finally {
     if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
   }
+});
+
+test("Robob interruption recovery uses native completion evidence, not its settled-run proxy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectrum-interrupted-step-"));
+  directories.push(dir);
+  const dbPath = join(dir, "opencode.db");
+  const db = new Database(dbPath);
+  db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, data TEXT)");
+  const insert = db.query("INSERT INTO session_message VALUES (?, ?)");
+  const content = [{ type: "text", text: "The final text" }];
+  insert.run("msg_completed", JSON.stringify({ finish: "stop", time: { completed: 42 }, content }));
+  insert.run("msg_prefix", JSON.stringify({ finish: "stop", time: { completed: 42 }, content }));
+  insert.run("msg_tool", JSON.stringify({ finish: "tool-calls", time: { completed: 42 }, content }));
+  insert.run("msg_partial", JSON.stringify({ time: { created: 41 }, content }));
+  insert.run("msg_incomplete", JSON.stringify({ finish: "stop", time: { created: 41 }, content }));
+  insert.run("msg_error", JSON.stringify({ finish: "stop", time: { completed: 42 }, error: { type: "aborted" }, content }));
+  db.close();
+  const completedSteps = opencodeCompletedSteps(dbPath);
+  for (const kind of ["completed", "prefix", "tool", "partial", "incomplete", "error", "missing"] as const) {
+    const h = setup(":memory:", { failureNoticeMs: 0 });
+    h.input("in", "Question");
+    await h.router.tick();
+    const prompt = h.backend.prompts[0]!.messageId;
+    const id = `message:provider:opencode:native-item:${encodeURIComponent(`msg_${kind}:text:0`)}`;
+    const runId = "run:thread:t:ordinal:1";
+    const timestamp = "2026-01-01T00:00:00Z";
+    const records = recordsFromThread({ threadId: "t", run: null, lastError: null,
+      recentRuns: [{ runId, ordinal: 1, status: "interrupted" }] }, [
+      { messageId: `${sentMessagePrefix("t")}${prompt}`, runId, role: "user", text: "Question", streaming: false, createdBy: "user", createdAt: timestamp, updatedAt: timestamp },
+      { messageId: id, runId, role: "assistant", text: kind === "prefix" ? "The final" : "The final text", streaming: true, createdAt: timestamp, updatedAt: timestamp },
+    ]);
+    const adapter = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test", completedSteps,
+      finishes: ids => new Map(ids.map(step => [step, kind === "tool" ? "tool-calls" : "stop"])) });
+    h.backend.records = adapter["markInterrupted"](adapter["markAnswers"](records));
+    for (let i = 0; i < 3; i++) await h.router.tick();
+    expect(h.conversations().map(c => c.text)).toEqual(kind === "completed" ? ["The final text"] : []);
+    expect(h.controls().map(c => c.text)).toEqual(kind === "completed" ? [] : ["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+    expect(inbounds(h.store)[0]!.state).toBe("done");
+  }
+});
+
+test("an earlier interrupted run cannot leak a partial or tool step when a steered run is recovered", async () => {
+  for (const finish of ["", "tool-calls"]) {
+    const h = setup(":memory:", { failureNoticeMs: 0 });
+    steering(h.backend, async () => "queued");
+    h.input("in_1", "First question");
+    await h.router.tick();
+    h.input("in_2", "One more thing");
+    await h.router.tick();
+    const partial = h.backend.step("PRIVATE_PARTIAL", finish);
+    if (!finish) delete partial.time.completed;
+    h.backend.settle("interrupted");
+    await h.router.tick();
+    h.backend.records.push({ id: messageId("in_2"), type: "user", text: "One more thing", time: { created: Date.now() } });
+    h.backend.step("Complete second answer", "stop");
+    h.backend.settle("interrupted");
+    await h.router.tick();
+    expect(h.conversations().map(c => c.text)).toEqual(["Complete second answer"]);
+  }
+});
+
+test("a quiet multi-block interrupted answer gets a notice, not an invisible metadata reply", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  for (const [index, text] of ["Logged it", "NO_REPLY", "@572@"].entries()) {
+    const step = h.backend.step(text, "stop", `msg_quiet:text:${index}`);
+    step.nativeMessage = "msg_quiet";
+    step.answer = true;
+  }
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.controls().map(c => c.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+});
+
+test("a complete multi-block interrupted reply retains each block in order", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  for (const [index, text] of ["First part", "Second part"].entries()) {
+    const step = h.backend.step(text, "stop", `msg_final:text:${index}`);
+    step.nativeMessage = "msg_final";
+    step.answer = true;
+    step.interruptReplyComplete = true;
+  }
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  expect(h.conversations().map(c => c.text)).toEqual(["First part", "Second part"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("an interrupted synthetic wake keeps its retry policy even with a finished answer", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("wake:check", "Background update");
+  await h.router.tick();
+  h.backend.step("A finished step", "stop");
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.controls()).toEqual([]);
+  expect(inbounds(h.store)[0]!.state).toBe("pending");
+  expect(h.store.get<{ attempts: number; reason: string }>("synthetic-retry:wake:check"))
+    .toMatchObject({ attempts: 1, reason: "errored" });
+});
+
+test("interrupted incomplete, tool-call, errored and empty steps never become replies", async () => {
+  for (const kind of ["no-finish", "no-completion", "tool-calls", "errored", "empty", "no-reply"] as const) {
+    const h = setup(":memory:", { failureNoticeMs: 0 });
+    h.input("in", "Question");
+    await h.router.tick();
+    const final = h.backend.step(kind === "empty" ? "   " : kind === "no-reply" ? "NO_REPLY" : "PRIVATE_PARTIAL", kind === "tool-calls" ? "tool-calls" : "stop");
+    if (kind === "no-finish") delete final.finish;
+    if (kind === "no-completion") delete final.time.completed;
+    if (kind === "errored") final.error = { type: "ProviderError" };
+    h.backend.settle("interrupted");
+    for (let i = 0; i < 3; i++) await h.router.tick();
+    expect(h.conversations()).toEqual([]);
+    expect(h.controls().map(c => c.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+    expect(inbounds(h.store)[0]!.state).toBe("done");
+  }
+});
+
+test("a failed turn with a finished error still sends only the existing failure notice", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  const final = h.backend.step("PRIVATE_ERROR_TEXT", "stop");
+  final.error = { type: "ProviderError" };
+  h.backend.settle("failed");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.controls().map(c => c.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  expect(inbounds(h.store)[0]!.state).toBe("done");
+});
+
+test("a held notice is dropped on route replacement or a new foreground turn", async () => {
+  for (const replacement of ["route", "foreground"] as const) {
+    const start = Date.parse("2026-09-10T12:00:00Z");
+    setSystemTime(start);
+    const h = setup();
+    h.input("in", "Question");
+    await h.router.tick();
+    h.backend.failed();
+    await h.router.tick();
+    if (replacement === "route") h.store.set("route", { id: "ses_new", directory: "/Chats/ses_new", generation: 2 });
+    else {
+      h.input("next", "New question");
+      await h.router.tick();
+      expect(h.store.get("activeTurn")).toMatchObject({ phase: "running" });
+    }
+    setSystemTime(start + 6 * 60_000);
+    await h.router.tick();
+    expect(h.controls()).toEqual([]);
+    expect(h.store.get("deferredNotice")).toBeNull();
+  }
+});
+
+test("a held failure notice survives a background watch until the grace passes", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  // watch() checks every five seconds. A busy background turn alone has not answered.
+  h.backend.states.ses_1 = { type: "busy" };
+  setSystemTime(start + 6_000);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ background: true, phase: "running" });
+  expect(h.store.get("deferredNotice")).not.toBeNull();
+  setSystemTime(start + 5 * 60_000 - 1);
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+  expect(h.store.get("deferredNotice")).toBeNull();
+});
+
+test("a completed background answer discovered at the grace boundary wins over the notice", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  h.backend.final("Done after all");
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(c => c.text)).toEqual(["Done after all"]);
+  expect(h.controls()).toEqual([]);
+  expect(h.store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: "ses_1", id: h.backend.records.at(-1)!.id });
+});
+
+test("a due notice forces a watch even when the previous check was a second ago", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  setSystemTime(start + 5 * 60_000 - 1_000);
+  await h.router.tick();
+  h.backend.final("Done after all");
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  expect(h.conversations().map(c => c.text)).toEqual(["Done after all"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("a direct conversation sent after failure suppresses the stale held notice", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  h.store.enqueue({ id: "send:answer", kind: "conversation", text: "Done directly", sessionId: "ses_1", generation: 1 });
+  h.backend.final("NO_REPLY");
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  expect(h.conversations().map(c => c.text)).toEqual(["Done directly"]);
+  expect(h.store.get("deferredNotice")).toBeNull();
+});
+
+test("a background watch that ends without a reply still leaves the held notice", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  h.backend.states.ses_1 = { type: "busy" };
+  setSystemTime(start + 6_000);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ background: true });
+  delete h.backend.states.ses_1;
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get("deferredNotice")).not.toBeNull();
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  expect(h.controls()).toHaveLength(1);
+});
+
+test("an admitted failed batch preserves its replay receipt", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("leader", "First");
+  h.input("member", "Second");
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:leader")).toBe("accepted");
+  h.backend.failed();
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:leader")).toBe("accepted");
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each(["codex", "claudeAgent", "opencode"].flatMap(driver =>
+  [true, false].flatMap(complete => ["answer", "narration", "unknown"].map(phase => ({ driver, complete, phase }))),
+))("interrupted $driver reply requires completed native streams and an answer ($complete, $phase)", async ({ driver, complete, phase }) => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  const runId = "run:thread:test:ordinal:1";
+  const run = { runId, ordinal: 1, status: "interrupted" };
+  const thread = { threadId: "thread:test", model: { instanceId: driver, model: "test" },
+    nativeSessionId: "ses_1", recentRuns: [run], run, lastError: null } as ThreadDetail;
+  const real = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test",
+    finishes: () => new Map(), completedSteps: () => new Map(), runEvidence: () => "unknown" });
+  spyOn(real.client, "thread").mockResolvedValue({ thread });
+  spyOn(real.client, "runEvidence").mockResolvedValue({ runId, status: "interrupted", complete, toolEvidence: "ran", messages: [] });
+  const at = new Date().toISOString();
+  spyOn(real.client, "messages").mockResolvedValue({ state: "idle", status: "interrupted", runId, messages: [
+    { messageId: messageId("in"), runId, role: "user", text: "Question", streaming: false, createdBy: "user", createdAt: at, updatedAt: at },
+    { messageId: "reply", runId, role: "assistant", text: "Finished safely", phase: phase as "answer" | "narration" | "unknown",
+      streaming: false, createdAt: at, updatedAt: at },
+  ] });
+  h.backend.messagesBehavior = () => real.messages(thread.threadId);
+  await h.router.tick();
+  await h.router.tick();
+  const recover = complete && phase === "answer";
+  expect(h.conversations().map(op => op.text)).toEqual(recover ? ["Finished safely"] : []);
+  expect(h.controls()).toHaveLength(recover ? 0 : 1);
+});
+
+test("an early reply followed by interruption is not queued twice", async () => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.step("Finished safely");
+  setSystemTime(start + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toHaveLength(1);
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Finished safely"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("a metadata-only background result does not cancel the notice", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  h.backend.final("@572@");
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  expect(h.controls().map(c => c.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+});
+
+test("interruption recovery retains an earlier successful reply without a native finish", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  steering(h.backend, async () => "queued");
+  h.input("first", "First question");
+  await h.router.tick();
+  h.input("second", "One more thing");
+  await h.router.tick();
+  const first = h.backend.step("First successful answer");
+  delete first.finish;
+  h.backend.settle();
+  h.backend.records.push({ id: messageId("second"), type: "user", text: "One more thing", time: { created: Date.now() } });
+  h.backend.step("Recovered second answer");
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["First successful answer", "Recovered second answer"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("a legacy held notice without an outbox mark drops when the background work replies", async () => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  const held = h.store.get<{ turn: object; text: string; at: number }>("deferredNotice")!;
+  h.store.set("deferredNotice", { turn: held.turn, text: held.text, at: held.at });
+  h.backend.final("Done after all");
+  await h.router.tick();
+  setSystemTime(start + 6 * 60_000);
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Done after all"]);
+  expect(h.controls()).toEqual([]);
+});
+
+const interruptedBlockCases = [1, 2, 9, 10, 11, 99, 100, 101].flatMap(count =>
+  [true, false].flatMap(quiet => [true, false].map(encoded => ({ count, quiet, encoded }))),
+);
+test.each(interruptedBlockCases)("native block order preserves reply and silence ($count, quiet=$quiet, encoded=$encoded)", async ({ count, quiet, encoded }) => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  const runId = "run:thread:test:ordinal:1";
+  const run = { runId, ordinal: 1, status: "interrupted" };
+  const thread = { threadId: "thread:test", model: { instanceId: "opencode", model: "test" },
+    nativeSessionId: "ses_1", recentRuns: [run], run, lastError: null } as ThreadDetail;
+  const texts = Array.from({ length: count }, (_, index) => quiet && index === count - 1 ? "NO_REPLY" : `Block ${index}`);
+  const real = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test",
+    finishes: ids => new Map(ids.map(id => [id, "stop"])),
+    completedSteps: () => new Map([["msg_blocks", texts]]), runEvidence: () => "ran" });
+  spyOn(real.client, "thread").mockResolvedValue({ thread });
+  spyOn(real.client, "runEvidence").mockResolvedValue({ runId, status: "interrupted", complete: false, toolEvidence: "ran", messages: [] });
+  const at = new Date().toISOString();
+  const blocks: ControlMessage[] = texts.map((text, index) => {
+    const suffix = `msg_blocks:text:${index}`;
+    return { messageId: `message:provider:opencode:native-item:${encoded ? encodeURIComponent(suffix) : suffix}`,
+      runId, role: "assistant", phase: "answer", text, streaming: false, createdAt: at, updatedAt: at };
+  });
+  spyOn(real.client, "messages").mockResolvedValue({ state: "idle", status: "interrupted", runId, messages: [
+    { messageId: messageId("in"), runId, role: "user", text: "Question", streaming: false, createdBy: "user", createdAt: new Date(Date.now() - 1000).toISOString(), updatedAt: at },
+    ...blocks.reverse(),
+  ] });
+  h.backend.messagesBehavior = () => real.messages(thread.threadId, undefined, { until: messageId("in") });
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(quiet ? [] : texts);
+  expect(h.controls()).toHaveLength(quiet ? 1 : 0);
+});
+
+test.each([
+  { blocks: ["@571@"], visible: [] },
+  { blocks: ["@571@", "@572@"], visible: [] },
+  { blocks: [" @571@ ", "@572@"], visible: [] },
+  { blocks: ["", "@572@"], visible: [] },
+  { blocks: ["@571@", "Visible answer"], visible: ["Visible answer"] },
+  { blocks: ["Visible answer", "@572@"], visible: ["Visible answer"] },
+])("held notices only yield to visible background blocks ($blocks)", async ({ blocks, visible }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("in", "Question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  for (const [index, text] of blocks.entries()) {
+    const step = h.backend.step(text, "stop", `background:text:${index}`);
+    step.nativeMessage = "background";
+    step.answer = true;
+  }
+  h.backend.settle();
+  setSystemTime(start + 5 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual([...visible]);
+  expect(h.controls()).toHaveLength(visible.length ? 0 : 1);
+});
+
+test.each(["running", "visible", "quiet", "failed", "interrupted"].flatMap(outcome =>
+  [false, true].map(lostResponse => ({ outcome, lostResponse })),
+))("new foreground admission cancels the old notice ($outcome, lostResponse=$lostResponse)", async ({ outcome, lostResponse }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("old", "Old question");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(h.store.get("deferredNotice")).not.toBeNull();
+  if (lostResponse) h.backend.promptBehavior = async call => {
+    h.backend.accept(call);
+    throw new Error("lost response after admission");
+  };
+  h.input("new", "New question");
+  await h.router.tick();
+  expect(h.store.get("deferredNotice")).toBeNull();
+  if (outcome === "visible") h.backend.final("New answer");
+  if (outcome === "quiet") h.backend.final("NO_REPLY");
+  if (outcome === "failed") h.backend.failed();
+  if (outcome === "interrupted") {
+    h.backend.step("Still working", "tool-calls");
+    h.backend.settle("interrupted");
+  }
+  await h.router.tick();
+  setSystemTime(start + 6 * 60_000);
+  await h.router.tick();
+  expect(h.controls().filter(op => op.replyTo === "old")).toEqual([]);
+  expect(h.controls().filter(op => op.replyTo === "new")).toHaveLength(["failed", "interrupted"].includes(outcome) ? 1 : 0);
+});
+
+test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutcome =>
+  ["empty", "tools", "partial"].map(finalKind => ({ previousOutcome, finalKind })),
+))("interruption recovery cannot adopt a prior run's final ($previousOutcome, $finalKind)", async ({ previousOutcome, finalKind }) => {
+  const stages: string[] = [];
+  const h = setup(":memory:", { failureNoticeMs: 0, log: event => stages.push(event) });
+  steering(h.backend, async () => "queued");
+  h.input("first", "First question");
+  await h.router.tick();
+  h.input("second", "One more thing");
+  await h.router.tick();
+  h.backend.step("Previous answer");
+  h.backend.settle(previousOutcome);
+  h.backend.records.push({ id: messageId("second"), type: "user", text: "One more thing", time: { created: Date.now() } });
+  if (finalKind !== "empty") {
+    const partial = h.backend.step("LATEST_PARTIAL", "tool-calls");
+    if (finalKind === "partial") { delete partial.finish; delete partial.time.completed; }
+  }
+  h.backend.settle("interrupted");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+  expect(stages).not.toContain("reply-recovered-after-interrupt");
 });
