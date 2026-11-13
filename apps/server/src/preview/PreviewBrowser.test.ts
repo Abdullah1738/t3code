@@ -276,8 +276,8 @@ it("pins one Chrome for Testing build per host", () => {
     undefined,
   ]);
   expect(PreviewBrowser.previewBrowserRelease("linux", "x64")).toMatchObject({
-    url: "https://storage.googleapis.com/chrome-for-testing-public/154.0.8037.92/linux64/chrome-headless-shell-linux64.zip",
-    bytes: 120_477_194,
+    url: "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/linux64/chrome-headless-shell-linux64.zip",
+    bytes: 127_965_683,
   });
 });
 
