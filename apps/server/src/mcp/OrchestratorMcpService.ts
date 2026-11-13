@@ -98,7 +98,10 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import type { ProjectionRecordField } from "../orchestration-v2/ProjectionStore.ts";
+import type {
+  ProjectionRecordField,
+  ThreadListCandidate,
+} from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
   subagentResultForRun,
@@ -861,7 +864,7 @@ function threadPullRequests(
 }
 
 function listItemFromShell(
-  shell: OrchestrationV2ThreadShell,
+  shell: ThreadListCandidate & Pick<OrchestrationV2ThreadShell, "visibleItemCount">,
   nowMs: number,
 ): OrchestratorMcpThreadListItem {
   return {
@@ -3379,10 +3382,7 @@ const make = Effect.gen(function* () {
       const { parent } = yield* loadCaller(scope);
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
       const projectThreads = yield* threadManagement
-        .listProjectThreads({
-          projectId,
-          includeSubagents: input.includeSubagents !== false,
-        })
+        .getThreadListCandidates(projectId)
         .pipe(
           Effect.mapError((error) =>
             failure("orchestration_error", `Unable to list threads: ${errorMessage(error)}`),
@@ -3392,6 +3392,15 @@ const make = Effect.gen(function* () {
       const statuses = input.statuses === undefined ? null : new Set(input.statuses);
       const titleContains = input.titleContains?.toLocaleLowerCase();
       const filtered = projectThreads
+        .filter(
+          (thread) =>
+            input.includeSubagents !== false || thread.lineage.relationshipToParent !== "subagent",
+        )
+        .toSorted(
+          (left, right) =>
+            DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
+            right.id.localeCompare(left.id),
+        )
         .filter(
           (thread) => statuses === null || statuses.has(thread.activityRunStatus ?? thread.status),
         )
@@ -3409,11 +3418,34 @@ const make = Effect.gen(function* () {
       const cursor = input.cursor ?? 0;
       const limit = input.limit ?? DEFAULT_THREAD_LIST_LIMIT;
       const page = filtered.slice(cursor, cursor + limit);
+      const shells =
+        page.length === 0
+          ? []
+          : (yield* threadManagement
+              .getShellSnapshot({
+                location: "active",
+                threadIds: page.map((thread) => thread.id),
+              })
+              .pipe(Effect.mapError(threadManagementFailure))).threads;
+      const shellsById = new Map(shells.map((shell) => [shell.id, shell]));
       const nextCursor = cursor + page.length < filtered.length ? cursor + page.length : null;
       return {
         projectId,
         currentThreadId: parent?.thread.id ?? null,
-        threads: page.map((shell) => listItemFromShell(shell, nowMs)),
+        threads: page.flatMap((candidate) => {
+          const shell = shellsById.get(candidate.id);
+          return shell === undefined
+            ? []
+            : [
+                listItemFromShell(
+                  {
+                    ...candidate,
+                    visibleItemCount: shell.visibleItemCount,
+                  },
+                  nowMs,
+                ),
+              ];
+        }),
         nextCursor,
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;

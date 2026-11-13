@@ -79,6 +79,7 @@ import {
   RuntimeMode,
   ThreadLinkedPullRequest,
   ThreadId,
+  type ProjectId,
   TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
@@ -148,6 +149,7 @@ import {
   type ProjectionRecords,
   type ProjectionCheckpointContext,
   type ShellSnapshotOptions,
+  type ThreadListCandidate,
 } from "./ProjectionStore.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -432,6 +434,9 @@ export interface OrchestratorV2Shape {
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, OrchestratorV2Error>,
     OrchestratorV2Error
   >;
+  readonly getThreadListCandidates: (
+    projectId: ProjectId,
+  ) => Effect.Effect<ReadonlyArray<ThreadListCandidate>, OrchestratorV2Error>;
   readonly getCallerRow: (
     threadId: ThreadId,
   ) => Effect.Effect<CallerActiveRow | null, OrchestratorV2Error>;
@@ -13517,6 +13522,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.mapError(shellProjectionError),
           Effect.map(Effect.mapError(shellProjectionError)),
         ),
+    getThreadListCandidates: (projectId) =>
+      projectionStore
+        .getThreadListCandidates(projectId)
+        .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getCallerRow: (threadId) =>
       projectionStore.getCallerRow(threadId).pipe(
         NodeSqliteClient.readOnly,
@@ -13668,6 +13677,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
         }),
       ),
     readShellSnapshot: () =>
+      Effect.fail(
+        new OrchestratorProjectionError({
+          threadId: ThreadId.make("thread:shell"),
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    getThreadListCandidates: () =>
       Effect.fail(
         new OrchestratorProjectionError({
           threadId: ThreadId.make("thread:shell"),
