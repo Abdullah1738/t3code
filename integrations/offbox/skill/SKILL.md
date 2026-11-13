@@ -298,8 +298,10 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
   ends with **94**.
-- Each backend has its own boxes, saved states and templates (`offbox list`, `bases` show the backend in use;
-  `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the run or box id). A saved state or template
+- Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
+  are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
+  `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
+  run or box id. A saved state or template
   that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
   first standby run of a repo is a cold one.
 - Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
