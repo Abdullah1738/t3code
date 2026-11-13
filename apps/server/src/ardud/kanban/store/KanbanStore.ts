@@ -270,6 +270,12 @@ export interface KanbanStoreShape {
       | { readonly boardId: KanbanBoardId; readonly open: boolean },
   ) => Effect.Effect<ReadonlyArray<KanbanThreadLink>, KanbanStoreError>;
   readonly putThreadLink: (link: KanbanThreadLink) => Effect.Effect<void, KanbanStoreError>;
+  readonly openReviewLinks: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<
+    ReadonlyArray<{ readonly link: KanbanThreadLink; readonly card: KanbanCard | null }>,
+    KanbanStoreError
+  >;
   /** Records that a work thread carries a card (idempotent). */
   readonly addThreadCard: (
     threadId: string,
@@ -1144,6 +1150,27 @@ const make = Effect.gen(function* () {
           }),
       ),
     );
+  const openReviewLinks: KanbanStoreShape["openReviewLinks"] = (boardId) =>
+    runRead(
+      "read open review links with cards",
+      Effect.flatMap(
+        sql<{ thread_json: string; card_json: string | null }>`
+          SELECT t.json AS thread_json, c.json AS card_json
+          FROM ardud_kanban_threads t
+          LEFT JOIN ardud_kanban_cards c ON c.id = t.card_id AND c.board_id = t.board_id
+          WHERE t.board_id = ${boardId} AND t.ended = 0
+            AND json_extract(t.json, '$.role') = 'review'
+          ORDER BY t.rowid
+        `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.all({
+              link: ThreadLink.decode(row.thread_json),
+              card: row.card_json === null ? Effect.succeed(null) : Card.decode(row.card_json),
+            }),
+          ),
+      ),
+    );
   const putThreadLink = (link: KanbanThreadLink) =>
     run(
       "write thread link",
@@ -1246,6 +1273,7 @@ const make = Effect.gen(function* () {
     threadLink,
     threadLinksByIds,
     threadLinks,
+    openReviewLinks,
     putThreadLink,
     addThreadCard,
     threadCards,

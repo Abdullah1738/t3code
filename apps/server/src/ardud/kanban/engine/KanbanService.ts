@@ -2423,6 +2423,13 @@ const make = Effect.gen(function* () {
   ) {
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
+        if (card.reviewThreadId !== null) {
+          const active = card.settledAt === null && card.activeThreadId === card.reviewThreadId;
+          const queued =
+            card.stage === "needs_review" &&
+            Rules.reviewThreadToReuse(yield* boardOf(card.boardId), card) === card.reviewThreadId;
+          if (!active && !queued) yield* endReviewLink(card.reviewThreadId);
+        }
         const write = store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
         yield* SavedWrite.record({ kind: "card", card });
@@ -2603,6 +2610,17 @@ const make = Effect.gen(function* () {
   const withFreshNote = (note: string | null | undefined) =>
     [note?.trim(), Briefs.FRESH_THREAD_NOTE].filter((part): part is string => !!part).join("\n\n");
 
+  const endReviewLink = Effect.fn("KanbanService.endReviewLink")(function* (
+    threadId: ThreadId | null,
+    at?: string,
+    known?: KanbanThreadLink,
+  ) {
+    if (threadId === null) return;
+    const link = known ?? (yield* store.threadLink(threadId));
+    if (link?.role !== "review" || link.endedAt !== null) return;
+    yield* store.putThreadLink({ ...link, endedAt: at ?? (yield* nowIso) });
+  });
+
   /**
    * A card leaves its live thread. The thread's own move happens mid-turn, so
    * the turn finishes by itself; a work thread with no card left keeps its
@@ -2628,6 +2646,7 @@ const make = Effect.gen(function* () {
     } = {},
   ) {
     if (threadId === null) return false;
+    if (threadId === card.reviewThreadId) yield* endReviewLink(threadId);
     const pending = delivering.get(card.id);
     if (pending?.threadId === threadId) pending.revoked = true;
     const others =
@@ -2676,6 +2695,7 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     what: string,
   ) {
+    yield* endReviewLink(card.reviewThreadId);
     let kept = false;
     for (const threadId of new Set([card.activeThreadId, card.workThreadId, card.reviewThreadId])) {
       if (threadId === null) continue;
@@ -6470,7 +6490,7 @@ const make = Effect.gen(function* () {
       ? null
       : dispatch.role === "work"
         ? card.workThreadId
-        : card.reviewThreadId;
+        : Rules.reviewThreadToReuse(board, card);
     let threadId: ThreadId | null = null;
     let adoptRunning = false;
     if (existing !== null) {
@@ -6785,12 +6805,23 @@ const make = Effect.gen(function* () {
     yield* Effect.gen(function* () {
       yield* logEvent(next, system, "moved", { fromStage: card.stage, toStage: to });
       destination.expectedCard = yield* saveDispatchCard(next);
+      if (dispatch.role === "review" && card.reviewThreadId !== threadId) {
+        yield* endReviewLink(card.reviewThreadId, at);
+      }
       // The saved claim replaces the pending reservation, including its batch count.
       starting.delete(`${board.id}:${card.id}`);
       if (reused !== null) {
         const link = yield* store.threadLink(reused);
-        if (link && !modelSelectionsEqual(link.model ?? board.evaluatorModel, dispatch.model)) {
-          yield* store.putThreadLink({ ...link, model: dispatch.model });
+        if (
+          link &&
+          (!modelSelectionsEqual(link.model ?? board.evaluatorModel, dispatch.model) ||
+            (dispatch.role === "review" && link.endedAt !== null))
+        ) {
+          yield* store.putThreadLink({
+            ...link,
+            model: dispatch.model,
+            endedAt: dispatch.role === "review" ? null : link.endedAt,
+          });
         }
       }
       yield* locks.attached(threadId);
@@ -7592,6 +7623,7 @@ const make = Effect.gen(function* () {
       at,
     });
     if (retry._tag === "hold" || retry._tag === "wait") return;
+    yield* endReviewLink(card.reviewThreadId, at);
     if (retry._tag === "restart") {
       const again: KanbanCard = {
         ...release(card),
@@ -8329,6 +8361,7 @@ const make = Effect.gen(function* () {
         card = current;
       }
       if (startFresh) {
+        yield* endReviewLink(card.reviewThreadId, at);
         const fresh: KanbanCard = {
           ...release(card),
           stage: "needs_review",
@@ -8361,6 +8394,7 @@ const make = Effect.gen(function* () {
         startedAtMs: Date.parse(card.movedAt),
       });
       if (retry._tag === "hold") return;
+      yield* endReviewLink(card.reviewThreadId, at);
       if (retry._tag === "wait") {
         const waiting: KanbanCard = {
           ...release(card),
@@ -9060,6 +9094,7 @@ const make = Effect.gen(function* () {
                     movedAt: at,
                     updatedAt: at,
                   };
+                  if (review) yield* endReviewLink(current.reviewThreadId, at);
                   yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
                     fromStage: current.stage,
                     toStage: next.stage,
@@ -9172,6 +9207,7 @@ const make = Effect.gen(function* () {
                     const reason = stale
                       ? "Stale queued runs on the thread"
                       : "Run went silent twice";
+                    yield* endReviewLink(current.reviewThreadId, at);
                     const next = releaseStalled(
                       { ...current, stalled: { reason, by: system, at } },
                       at,
@@ -12239,6 +12275,7 @@ const make = Effect.gen(function* () {
         const at = yield* nowIso;
         const selfFlag =
           reason !== null && actor._tag === "thread" && card.activeThreadId === actor.threadId;
+        if (selfFlag && card.activeRole === "review") yield* endReviewLink(card.reviewThreadId, at);
         if (reason !== null && card.activeThreadId !== null && !selfFlag) {
           yield* letGo(card, false, "is stalled", {
             until: "after the flag is cleared",
@@ -13961,7 +13998,33 @@ const make = Effect.gen(function* () {
     locks
       .run(
         Effect.flatMap(store.boards, (boards) =>
-          Effect.forEach(boards, rekeyBoard, { discard: true }),
+          Effect.forEach(
+            boards,
+            (board) =>
+              Effect.gen(function* () {
+                yield* rekeyBoard(board);
+                const at = yield* nowIso;
+                let ended = 0;
+                for (const { link, card } of yield* store.openReviewLinks(board.id)) {
+                  if (
+                    card !== null &&
+                    card.settledAt === null &&
+                    (card.activeThreadId === link.threadId ||
+                      Rules.reviewThreadToReuse(board, card) === link.threadId)
+                  )
+                    continue;
+                  // Historical rows have no definitive release event; use repair time.
+                  yield* endReviewLink(link.threadId, at, link);
+                  ended++;
+                }
+                if (ended > 0)
+                  yield* Effect.logInfo("kanban stale review links ended", {
+                    boardId: board.id,
+                    ended,
+                  });
+              }),
+            { discard: true },
+          ),
         ),
       )
       .pipe(
