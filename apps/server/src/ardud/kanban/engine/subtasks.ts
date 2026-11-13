@@ -10,17 +10,14 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
-const releaseResource =
-  /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?|devices?)\b/i;
-const releaseObject =
-  /^\s+(?:apps?|firmware|builds?|binar(?:y|ies)|images?|updates?|versions?|releases?|to)\b/i;
+// Unknown continuations need approval, including nouns and possessives after a resource name.
+const resourceReleaseClause =
+  /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|devices?)(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;!?](?=\s|$))/i;
 
 const hasReleaseGate = (text: string): boolean => {
   for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
     const tail = text.slice(release.index + release[0].length);
-    const resource = releaseResource.exec(tail);
-    // Only freeing the resource itself is exempt from owner approval.
-    if (!resource || releaseObject.test(tail.slice(resource[0].length))) return true;
+    if (!resourceReleaseClause.test(tail)) return true;
   }
   return false;
 };

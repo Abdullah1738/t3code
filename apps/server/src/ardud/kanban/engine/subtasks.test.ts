@@ -28,8 +28,43 @@ const at = "2026-10-26T12:00:00.000Z";
 const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
 
+const resourceReleaseCases = [
+  ["Release the device software to production", "deploy"],
+  ["Release the phone's firmware to production", "deploy"],
+  ["Release the phone’s firmware to production", "deploy"],
+  ["Release the devices' software to production", "deploy"],
+  ["Release the devices’ software to production", "deploy"],
+  ["Release the device operating system", "deploy"],
+  ["Release the phone mobile app", "deploy"],
+  ["Release the box container image", "deploy"],
+  ["Release the device v2", "deploy"],
+  ["Release the device something new", "deploy"],
+  ["Release the phone-app to production", "deploy"],
+  ["Release the device.software to production", "deploy"],
+  ["Release the phone/firmware to production", "deploy"],
+  ["Release the device\nsoftware to production", "deploy"],
+  ["Release the device\r\nsoftware to production", "deploy"],
+  ["Release the device\tsoftware to production", "deploy"],
+  ["Release the phone hold firmware to production", "deploy"],
+  ["Release the phone hold to production", "deploy"],
+  ["Release the phone hold/lock software to production", "deploy"],
+  ["Release the emulator when done shipping software", "deploy"],
+  ["Release the device after the run to production", "deploy"],
+  ["Release the device and its software", "deploy"],
+  ["Release the device; release the phone's firmware to production", "deploy"],
+  ["Release the emulator when done; Release the device software to production", "deploy"],
+  ["Release the phone hold when done", undefined],
+  ["Release the phone hold/lock after the run", undefined],
+  ["Release the device after the run.", undefined],
+  ["Release the emulator when done!", undefined],
+  ["Release the phone?", undefined],
+  ["Release the Run Cloud session; read back its status", undefined],
+  ["Release the device. Release the phone hold/lock.", undefined],
+] as const;
+
 describe("inferGate", () => {
   it.each([
+    ...resourceReleaseCases,
     ["Rotate the Linear API key", "secret"],
     ["Store the new token in Keychain", "secret"],
     ["Provide the signing key to CI", "secret"],
@@ -139,6 +174,18 @@ describe("approvalProblem", () => {
     doneBy: null,
     doneAt: null,
   };
+
+  it.each(
+    resourceReleaseCases.flatMap(([text, gate]) =>
+      (["evaluator", "script"] as const).map((owner) => ({ text, gate, owner })),
+    ),
+  )("checks no-ask $owner resource release: $text", ({ text, gate, owner }) => {
+    const action = { ...subtask, owner, text };
+    expect(gateOf(action)).toBe(gate);
+    const problem = approvalProblem({ ...card, subtasks: [action] }, action);
+    if (gate === "deploy") expect(problem).toContain("needs Abdullah's approval");
+    else expect(problem).toBeNull();
+  });
 
   it.each([undefined, "secret", "deploy", "money"] as const)(
     "allows a read-only review with stored gate %s and no asks",
