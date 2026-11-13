@@ -370,7 +370,7 @@ test("a trigger file runs the check within a couple of seconds, long before its 
   expect(readCalls().some(call => call.args.includes("robob-watch trig"))).toBe(true);
 }, 20_000);
 
-test("timeouts alert into the burst immediately but pause only after ten minutes, with fast retry", async () => {
+test("timeouts hold notices and pause until ten minutes, with fast retry", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
   const slowEnv = { ...env, ROBOB_WATCH_CHECK_TIMEOUT_MS: "300" };
@@ -386,17 +386,18 @@ test("timeouts alert into the burst immediately but pause only after ten minutes
   writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 4, failure_alerted: false,
     failing_since: new Date(Date.now() - 120_000).toISOString() }));
   await runSlow(2_000);
-  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
+  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: false });
   expect(state("slow").failure_paused_at).toBeUndefined();
   expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout", exitCode: null, signal: "SIGKILL", timedOut: true }), ok: false }));
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
-  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
+  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(0);
+  expect(events("watch.failure_notice_held", "slow")).toEqual([expect.objectContaining({ props: { count: 5, threshold: 2, timedOut: true } })]);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 6, failure_alerted: true });
   expect(state("slow").failure_paused_at).toBeString();
   const notices = readCalls().filter(call => call.cli === "telegram");
-  expect(notices).toHaveLength(2);
+  expect(notices).toHaveLength(1);
   expect(notices.every(call => call.args[call.args.indexOf("--burst-key") + 1] === "watcher-failure:slow")).toBe(true);
 }, 20_000);
 

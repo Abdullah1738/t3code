@@ -29,7 +29,8 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { FlatList, Pressable, View } from "react-native";
+import { useAskScope } from "./needsYou/askStore";
+import { AppState, FlatList, Pressable, View } from "react-native";
 import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import type { FlatListProps } from "react-native";
 import { WebView, type WebViewNavigation } from "react-native-webview";
@@ -165,6 +166,19 @@ export function Chat(props: {
   const feed = useKanbanMessagesFeed(boardId, discussionId);
   const discussion = discussionId === null ? undefined : state.discussions.get(discussionId);
   const discussionKey = `${boardId}\n${discussionId ?? ""}`;
+  const { api: timingApi } = useAskScope();
+  const timingContext = useRef({
+    card: discussion?.cardId ? state.cards.get(discussion.cardId) : undefined,
+    api: timingApi,
+    focused,
+  });
+  useEffect(() => {
+    timingContext.current = {
+      card: discussion?.cardId ? state.cards.get(discussion.cardId) : undefined,
+      api: timingApi,
+      focused,
+    };
+  }, [discussion?.cardId, state.cards, timingApi, focused]);
   const clock = useTypingClock(discussion?.participants);
   const presence =
     discussion && messages
@@ -209,6 +223,14 @@ export function Chat(props: {
         (item) => item.isViewable && item.item.seq === readEndContext.current.latestSeq,
       );
       noteReadEnd();
+      const { card, api, focused } = timingContext.current;
+      if (card && focused && AppState.currentState === "active")
+        for (const item of viewableItems) {
+          const ask = item.isViewable
+            ? card.asks.find((ask) => ask.closedAt === null && ask.seq === item.item.seq)
+            : undefined;
+          if (ask) void api.seen?.(card.id, ask.id, "mobile").catch(() => undefined);
+        }
     },
   ).current;
 

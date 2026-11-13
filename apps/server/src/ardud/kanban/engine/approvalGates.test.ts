@@ -361,12 +361,12 @@ it.effect.each([
         { verdict: "picked", optionIds: ["o1"], revision: 0 },
         owner,
       );
-      for (const state of ["done", "skipped"] as const) {
-        const refused = yield* kanban
-          .markSubtask(card.id, "s1", state, "Narrower choice", evaluator, "evaluator")
-          .pipe(Effect.flip);
-        assert.include(refused.detail, "needs Abdullah's approval");
-      }
+      const current = (yield* kanban.card(card.id)).card;
+      assert.isNull(approvalProblem(current, current.subtasks[0]!, undefined, "skip"));
+      const actionDenied = yield* kanban
+        .markSubtask(card.id, "s1", "done", "Narrower choice", evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(actionDenied.detail, "needs Abdullah's approval");
       const refused = yield* kanban
         .moveCard(card.id, "verified", "evaluator", evaluator)
         .pipe(Effect.flip);
@@ -398,7 +398,7 @@ it.effect.each(
     (["done", "skipped"] as const).map((state) => ({ ...fixture, state })),
   ),
 )(
-  "$reply selects $label; $state requires consent ($approved)",
+  "$reply selects $label; $state follows owner answer (action approval=$approved)",
   ({ task, label, reply, approved, state }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -440,7 +440,7 @@ it.effect.each(
           evaluator,
           "evaluator",
         );
-        if (approved) {
+        if (state === "skipped" || approved) {
           assert.strictEqual((yield* complete).subtasks[0]?.state, state);
           assert.strictEqual(
             (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
@@ -542,12 +542,12 @@ it.effect.each([
           owner,
         );
         if (optionId === "o1") {
-          for (const state of ["done", "skipped"] as const) {
-            const refused = yield* kanban
-              .markSubtask(card.id, "s1", state, "Owner chose information", evaluator, "evaluator")
-              .pipe(Effect.flip);
-            assert.include(refused.detail, "approval");
-          }
+          const current = (yield* kanban.card(card.id)).card;
+          assert.isNull(approvalProblem(current, current.subtasks[0]!, undefined, "skip"));
+          const actionDenied = yield* kanban
+            .markSubtask(card.id, "s1", "done", "Owner chose information", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(actionDenied.detail, "approval");
           const verify = yield* kanban
             .moveCard(card.id, "verified", "evaluator", evaluator)
             .pipe(Effect.flip);
@@ -782,7 +782,7 @@ it.effect.each([owner, evaluator])(
             .pipe(Effect.flip);
           assert.strictEqual(
             refused.detail,
-            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's approval: the latest decision, q1, was dropped (a dropped ask is not approval)`,
+            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's ${state === "skipped" ? "answer before it can be skipped" : "approval"}: the latest decision, q1, was dropped (a dropped ask is not approval)`,
           );
         }
         const verify = yield* kanban
@@ -866,6 +866,10 @@ it.effect("old approvals, text, drops and negative picks cannot approve a new ga
         },
         evaluator,
       );
+      const oldSkip = yield* kanban
+        .markSubtask(card.id, "s1", "skipped", "Old approval", evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(oldSkip.detail, "needs Abdullah's answer before it can be skipped");
       yield* kanban.askOwner(
         card.id,
         { question: "Deploy?", blocking: false, options: ["Yes", "No"] },
@@ -896,7 +900,7 @@ it.effect("old approvals, text, drops and negative picks cannot approve a new ga
         "owner",
       );
       const textDenied = yield* kanban
-        .markSubtask(card.id, "s1", "skipped", "text", evaluator, "evaluator")
+        .markSubtask(card.id, "s1", "done", "text", evaluator, "evaluator")
         .pipe(Effect.flip);
       assert.include(textDenied.detail, "approval");
       // A separate non-gated subtask is unaffected.
@@ -1002,6 +1006,108 @@ it.effect("dropping a blocking ask cannot restore a verified stage over an open 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.each([
+  { verdict: "picked", by: "owner", skip: true, done: false },
+  { verdict: "rejected", by: "owner", skip: true, done: false },
+  { verdict: "approved", by: "owner", skip: true, done: true },
+  { verdict: "answered", by: "owner", skip: true, done: false },
+  { verdict: "dropped", by: "owner", skip: false, done: false },
+  { verdict: "picked", by: "evaluator", skip: false, done: false },
+  { verdict: "absent", by: "owner", skip: false, done: false },
+] as const)("gate intent: $by $verdict", ({ verdict, by, skip, done }) => {
+  const at = "2026-11-13T18:00:00.000Z";
+  const subtask: KanbanCard["subtasks"][number] = {
+    id: "s6",
+    step: 2,
+    text: "Ask Abdullah to deploy",
+    owner: "evaluator",
+    gate: "deploy",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const card: Pick<KanbanCard, "number" | "createdAt" | "subtasks" | "asks"> = {
+    number: 19,
+    createdAt: at,
+    subtasks: [subtask],
+    asks:
+      verdict === "absent"
+        ? []
+        : [
+            {
+              id: "q2",
+              text: "Skip s6 deploy?",
+              blocking: false,
+              by: evaluator,
+              at,
+              seq: null,
+              closedAt: at,
+              options: [
+                { id: "o1", label: "Skip deploy" },
+                { id: "o2", label: "Deploy anyway" },
+              ],
+              answer: { verdict, by: by === "owner" ? owner : evaluator, at, optionIds: ["o1"] },
+            },
+          ],
+  };
+  assert.strictEqual(approvalProblem(card, subtask, undefined, "skip") === null, skip);
+  assert.strictEqual(approvalProblem(card, subtask, undefined, "do") === null, done);
+  assert.strictEqual(
+    approvalProblem(card, subtask, undefined, "do"),
+    approvalProblem(card, subtask),
+  );
+  if (!skip)
+    assert.include(
+      approvalProblem(card, subtask, undefined, "skip")!,
+      "needs Abdullah's answer before it can be skipped",
+    );
+  if (verdict === "picked" && by === "owner") {
+    assert.strictEqual(
+      approvalProblem(card, subtask),
+      `card #19 subtask s6 (deploy: Ask Abdullah to deploy) needs Abdullah's approval: the latest decision, q2, picked "Skip deploy", which doesn't read as approving deploy; ask again with an Approve option or an action ask`,
+    );
+  }
+});
+
+it("a later dropped decision still blocks skipping after the owner's earlier approval", () => {
+  const at = "2026-11-13T18:00:00.000Z";
+  const subtask: KanbanCard["subtasks"][number] = {
+    id: "s6",
+    step: 2,
+    text: "Deploy",
+    owner: "evaluator",
+    gate: "deploy",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const asks: KanbanCard["asks"] = (["approved", "dropped"] as const).map((verdict, index) => ({
+    id: `q${index + 1}`,
+    text: "s6 deploy",
+    blocking: false,
+    by: owner,
+    at,
+    seq: null,
+    closedAt: at,
+    answer: {
+      verdict,
+      by: owner,
+      at: index === 0 ? at : "2026-11-13T18:01:00.000Z",
+    },
+  }));
+  assert.include(
+    approvalProblem(
+      { number: 19, createdAt: at, subtasks: [subtask], asks },
+      subtask,
+      undefined,
+      "skip",
+    )!,
+    "the latest decision, q2, was dropped",
+  );
+});
 
 it.effect(
   "Crpko #3329 dev rollout follows board guesses while stored deploy gates stay enforced",

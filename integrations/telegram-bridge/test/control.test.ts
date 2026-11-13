@@ -53,6 +53,23 @@ test("control config takes env credentials before any file", () => {
 
 const logs = useToolLogFixture();
 
+test("ask receipts use the kanban route and contain only identity and time", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const calls: { url: string; body: unknown }[] = [];
+  try {
+    globalThis.fetch = Object.assign(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return Response.json({ recorded: true });
+    }, { preconnect: original.preconnect });
+    await client.askNotified("robob:1380:q1", 0);
+    await client.askNotified("arbitrary private text", 0);
+    expect(calls).toEqual([{ url: "http://127.0.0.1:1/api/ardud/kanban/cards/robob%3A1380/asks/q1/notified", body: { channel: "telegram", at: "1970-01-01T00:00:00.000Z" } }]);
+    globalThis.fetch = Object.assign(async () => Response.json({ error: { code: "not-found" } }, { status: 404 }), { preconnect: original.preconnect });
+    await client.askNotified("robob:1380:q1", 0);
+  } finally { globalThis.fetch = original; }
+});
+
 
 test("control transport failures preserve only safe causes through the wrapper", async () => {
   const original = globalThis.fetch;
