@@ -787,6 +787,11 @@ const WAIT_VIEW_READS = 8;
 const waitingToRun = (card: KanbanCard, now: number) =>
   card.activeThreadId === null &&
   (Retries.heldForRetry(card, now) || (Waits.WAITS_ENGINE_WIRED && kanbanWaiting(card)));
+const withoutDetachedSteer = (card: KanbanCard) => {
+  if (card.detachedSteerAt === undefined) return card;
+  const { detachedSteerAt: _steer, ...rest } = card;
+  return rest;
+};
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
@@ -2245,7 +2250,12 @@ const make = Effect.gen(function* () {
   });
 
   const release = (card: KanbanCard) =>
-    ({ ...card, activeThreadId: null, activeRole: null, activePool: null }) satisfies KanbanCard;
+    ({
+      ...withoutDetachedSteer(card),
+      activeThreadId: null,
+      activeRole: null,
+      activePool: null,
+    }) satisfies KanbanCard;
 
   const releaseStalled = (card: KanbanCard, at: string): KanbanCard => ({
     ...release(card),
@@ -6286,7 +6296,22 @@ const make = Effect.gen(function* () {
         lastActivityAt: at,
       },
     });
-    let card = link.cardId ? yield* store.card(link.cardId) : null;
+    const settleDetachedSteer = Effect.fn("KanbanService.settleDetachedSteer")(function* (
+      card: KanbanCard | null,
+    ) {
+      if (
+        card?.detachedSteerAt !== undefined &&
+        card.workThreadId === threadId &&
+        view?.state === "idle" &&
+        Date.parse(view.quietSince) >= Date.parse(card.detachedSteerAt)
+      ) {
+        const next = { ...withoutDetachedSteer(card), updatedAt: at };
+        yield* saveCard(next);
+        return next;
+      }
+      return card;
+    });
+    let card = yield* settleDetachedSteer(link.cardId ? yield* store.card(link.cardId) : null);
     const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
     if (link.role !== "evaluator") {
@@ -6317,7 +6342,7 @@ const make = Effect.gen(function* () {
     if (link.discussionId) discussionIds.add(link.discussionId);
     if (card?.discussionId) discussionIds.add(card.discussionId);
     for (const id of carriedIds) {
-      const other = id === card?.id ? card : yield* store.card(id);
+      const other = id === card?.id ? card : yield* settleDetachedSteer(yield* store.card(id));
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
     // A run that failed (the provider refused the model or variant, or a route is gone)
@@ -7227,7 +7252,12 @@ const make = Effect.gen(function* () {
                     : null);
               const threadId = threadFor(initial);
               if (threadId === null || initial.stalled !== null) continue;
-              if (waitingToRun(initial, now)) continue;
+              // A stop can promote queued work, so a delivered steer stays visible until idle.
+              if (
+                waitingToRun(initial, now) &&
+                (initial.detachedSteerAt === undefined || initial.workThreadId !== threadId)
+              )
+                continue;
               yield* step(
                 "silentRunBackstop",
                 Effect.gen(function* () {
@@ -10773,7 +10803,13 @@ const make = Effect.gen(function* () {
               NodeUtil.isDeepStrictEqual(current.retries, card.retries)
             )
               next = Retries.withoutRetries(next);
-            if (next !== current) next = { ...next, updatedAt: at };
+            const deliveredAt = yield* nowIso;
+            next = {
+              ...next,
+              detachedSteerAt: deliveredAt,
+              nudgedAt: null,
+              updatedAt: deliveredAt,
+            };
           }
           yield* logEvent(next, actor, "thread", { body: `Steered: ${text}` });
           if (next !== current) yield* saveCard(next);

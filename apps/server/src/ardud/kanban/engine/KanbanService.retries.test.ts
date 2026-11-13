@@ -151,7 +151,10 @@ const makeFake = () => {
         at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
       };
     });
-  return { layer, fail, recover, messages, readsOf, start, interrupted, sendControl };
+  const finish = (threadId: string) => {
+    threads.get(threadId)!.run = null;
+  };
+  return { layer, fail, recover, messages, readsOf, start, finish, interrupted, sendControl };
 };
 
 const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
@@ -557,11 +560,73 @@ it.effect.each(["wait", "retry", "thread"] as const)(
         const changed = (yield* now).card;
         yield* Deferred.succeed(delivered, undefined);
         yield* Fiber.join(steering);
-        assert.deepStrictEqual((yield* now).card, changed);
+        const steered = (yield* now).card;
+        if (replacement === "thread") {
+          assert.deepStrictEqual(steered, changed);
+          assert.isUndefined(steered.detachedSteerAt);
+        } else {
+          const deliveredAt = DateTime.formatIso(
+            DateTime.makeUnsafe(yield* Clock.currentTimeMillis),
+          );
+          assert.deepStrictEqual(steered, {
+            ...changed,
+            detachedSteerAt: deliveredAt,
+            nudgedAt: null,
+            updatedAt: deliveredAt,
+          });
+          yield* fake.start(thread);
+          if (replacement === "wait") assert.isTrue(kanbanWaiting((yield* now).card));
+          yield* TestClock.adjust(Rules.RUN_SILENT_MS + 1);
+          yield* kanban.tick;
+          assert.deepStrictEqual(fake.interrupted, [thread]);
+          yield* kanban.turnEnded(thread);
+          const reads = fake.readsOf(thread);
+          yield* kanban.tick;
+          if (replacement === "wait") assert.strictEqual(fake.readsOf(thread), reads);
+        }
       }).pipe(
         Effect.ensuring(Deferred.succeed(delivered, undefined)),
         Effect.provide(testLayer(fake.layer)),
       );
+    }),
+);
+
+it.effect.each(["running", "idle"] as const)(
+  "a parked steer's signal survives a delayed turn end only while its thread is %s",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now } = yield* workingCard;
+        yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        yield* kanban.cardThread(card.id, "steer", "Carry on now", owner);
+        yield* fake.start(thread);
+        yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: "2026-11-12T10:00:00.000Z", note: "Later" },
+          owner,
+        );
+        const before = (yield* now).card;
+        assert.isDefined(before.detachedSteerAt);
+        if (state === "idle") fake.finish(thread);
+        yield* kanban.turnEnded(thread);
+        assert.deepStrictEqual((yield* now).card.wait, before.wait);
+        if (state === "running") {
+          assert.strictEqual((yield* now).card.detachedSteerAt, before.detachedSteerAt);
+          yield* TestClock.adjust(Rules.RUN_SILENT_MS + 1);
+          yield* kanban.tick;
+          assert.deepStrictEqual(fake.interrupted, [thread]);
+        } else {
+          assert.isUndefined((yield* now).card.detachedSteerAt);
+          const reads = fake.readsOf(thread);
+          for (let tick = 0; tick < 3; tick += 1) {
+            yield* TestClock.adjust("15 seconds");
+            yield* kanban.tick;
+          }
+          assert.strictEqual(fake.readsOf(thread), reads);
+          assert.deepStrictEqual(fake.interrupted, []);
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
 

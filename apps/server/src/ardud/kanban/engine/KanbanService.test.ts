@@ -21778,56 +21778,117 @@ it.effect.each(["recent activity", "background work", "fresh activity during rer
     }),
 );
 
-it.effect.each(["second silence", "stale promotion", "stale wake queued during the run"])(
-  "the silent-run backstop flags %s without a second interrupt",
-  (kind) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake;
-      yield* Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
-        const { kanban, board } = yield* toyBoard;
-        const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
-        yield* kanban.dispatchNow;
-        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
-        yield* Ref.update(fake.threads, (all) => {
-          Object.assign(all.get(thread)!, {
-            running: true,
-            runStartedAt: "2026-10-25T13:00:00.000Z",
-            runId: "stuck",
-          });
-          return all;
+it.effect.each([
+  "second silence",
+  "stale promotion",
+  "stale wake queued during the run",
+  "stale promotion behind a replacement wait",
+])("the silent-run backstop flags %s without a second interrupt", (kind) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const parked = kind === "stale promotion behind a replacement wait";
+    const entered = yield* Deferred.make<void>();
+    const delivered = yield* Deferred.make<void>();
+    const layer = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            parked && input.text === "Detached steer"
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(delivered)),
+                  Effect.andThen(real.send(input)),
+                )
+              : real.send(input),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      if (parked) {
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putCard({
+          ...(yield* kanban.card(card.id)).card,
+          stage: "todo",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
         });
-        yield* TestClock.adjust("31 minutes");
-        yield* kanban.tick;
-        yield* Ref.update(fake.threads, (all) => {
-          Object.assign(all.get(thread)!, {
-            runId: "next",
-            runStartedAt: "2026-10-25T13:31:00.000Z",
-            runRequestedAt:
-              kind === "stale promotion"
-                ? "2026-10-25T12:50:00.000Z"
-                : kind === "stale wake queued during the run"
-                  ? "2026-10-25T13:10:00.000Z"
-                  : "2026-10-25T13:31:00.000Z",
-          });
-          return all;
-        });
-        // Reattachment resets nudgedAt; that must not hide a stale promotion.
-        if (kind !== "second silence") {
-          const store = yield* KanbanStore.KanbanStore;
-          yield* store.putCard({ ...(yield* kanban.card(card.id)).card, nudgedAt: null });
-        }
-        if (kind === "second silence") yield* TestClock.adjust("31 minutes");
-        yield* kanban.tick;
-        const flagged = (yield* kanban.card(card.id)).card;
-        assert.equal(
-          flagged.stalled?.reason,
-          kind !== "second silence" ? "Stale queued runs on the thread" : "Run went silent twice",
+        yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: "2026-10-26T13:00:00.000Z", note: "Tomorrow" },
+          owner,
         );
-        assert.equal(flagged.activeThreadId, null);
-        assert.deepEqual(fake.interrupted, [thread]);
-      }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
+        const steering = yield* Effect.forkChild(
+          kanban.cardThread(card.id, "steer", "Detached steer", owner),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("1 second");
+        const replacement = yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: "2026-10-27T13:00:00.000Z", note: "Later" },
+          owner,
+        );
+        yield* Deferred.succeed(delivered, undefined);
+        yield* Fiber.join(steering);
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card.wait, replacement.wait);
+      }
+      yield* Ref.update(fake.threads, (all) => {
+        Object.assign(all.get(thread)!, {
+          running: true,
+          runStartedAt: "2026-10-25T13:00:00.000Z",
+          runId: "stuck",
+        });
+        return all;
+      });
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      yield* Ref.update(fake.threads, (all) => {
+        Object.assign(all.get(thread)!, {
+          runId: "next",
+          runStartedAt: "2026-10-25T13:31:00.000Z",
+          runRequestedAt:
+            kind === "stale promotion" || parked
+              ? "2026-10-25T12:50:00.000Z"
+              : kind === "stale wake queued during the run"
+                ? "2026-10-25T13:10:00.000Z"
+                : "2026-10-25T13:31:00.000Z",
+        });
+        return all;
+      });
+      // Reattachment resets nudgedAt; that must not hide a stale promotion.
+      if (kind !== "second silence" && !parked) {
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putCard({ ...(yield* kanban.card(card.id)).card, nudgedAt: null });
+      }
+      if (parked) {
+        const before = (yield* kanban.card(card.id)).card;
+        assert.isNotNull(before.nudgedAt);
+        yield* kanban.turnEnded(thread);
+        assert.strictEqual(
+          (yield* kanban.card(card.id)).card.detachedSteerAt,
+          before.detachedSteerAt,
+        );
+      }
+      if (kind === "second silence") yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      const flagged = (yield* kanban.card(card.id)).card;
+      assert.equal(
+        flagged.stalled?.reason,
+        kind !== "second silence" ? "Stale queued runs on the thread" : "Run went silent twice",
+      );
+      assert.equal(flagged.activeThreadId, null);
+      assert.deepEqual(fake.interrupted, [thread]);
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(delivered, undefined)),
+      Effect.provide(testLayer(layer)),
+    );
+  }),
 );
 
 it.effect.each([false, true])("card_thread stop protects another attached card: %s", (shared) =>
