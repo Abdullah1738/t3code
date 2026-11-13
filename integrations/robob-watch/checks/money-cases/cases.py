@@ -463,12 +463,16 @@ def bind_purchase(data, result, at, qid):
     return True
 
 
-def receipt_for_question(data, charge, qid=None, questions=None):
+def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     questions = load_questions(data)['questions'] if questions is None else questions
-    # Same-card copies share a question. Distinct questions, including settled ones, are
-    # competing transactions; merchant and amount alone cannot assign their receipt.
+    current = next((q for q in questions if q['id'] == qid), None)
+    current = current or (dict(charge, at=stamp(at)) if at is not None else None)
+    transaction = unmatched_id(current) if current and current.get('kind') == 'charge' else None
+    # Descriptor variants of one alert may have different question IDs. Only
+    # different transactions, including settled ones, compete for a receipt.
     rivals = [q for q in questions if q['id'] != qid and q.get('kind') == 'charge'
-              and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])]
+              and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])
+              and (not transaction or not moment(q.get('at')) or unmatched_id(q) != transaction)]
 
     def accepts(row, text):
         received = dt.datetime.fromtimestamp(row['ts'], TZ)
@@ -492,7 +496,7 @@ def receipt_for_question(data, charge, qid=None, questions=None):
 
 def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None):
     return purchase_match(data, charge, at, qid) or charges.explain(
-        charge, at, now, deadline, find, said, receipt_ok=receipt_for_question(data, charge, qid))
+        charge, at, now, deadline, find, said, receipt_ok=receipt_for_question(data, charge, qid, at=at))
 
 
 def norm_ref(text):
@@ -2307,7 +2311,7 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
                 return {**base, 'verdict': 'held' if owner == 'moni' else 'case', 'why': f"money case {q['case']}", 'id': qid}
             if r.get('purchase') and not bind_purchase(data, r, at, q['id']):
                 r = charges.explain(charge, at, now, deadline, find, said,
-                                    receipt_ok=receipt_for_question(data, charge, q['id'], book['questions']))
+                                    receipt_ok=receipt_for_question(data, charge, q['id'], book['questions'], at))
                 verdict = 'explained' if r['verdict'] in ('receipt', 'owner') else r['verdict']
             if verdict == 'explained' and active(q):
                 explain_question(data, q, r, 'check' if q.get('asks') or q.get('passed') else 'triage', now, deadline)
@@ -2384,7 +2388,7 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
             r = explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None)
         if r.get('purchase') and not bind_purchase(data, r, at, q['id']):
             r = charges.explain(charge, at, now, deadline, find, said,
-                                receipt_ok=receipt_for_question(data, charge, q['id'], book['questions']))
+                                receipt_ok=receipt_for_question(data, charge, q['id'], book['questions'], at))
         note_why(q, r['why'], now)
         if r['errors']:
             return 4, '\n'.join(f"UNVERIFIED: source {e.split(':', 1)[0]} unreadable ({q['id']})" for e in r['errors'])
@@ -2436,7 +2440,7 @@ def answered(data, qid, note, now=None):
     with Locked(data, 'questions') as book:
         q = find_question(book, qid)
         recover_case(data, q)
-        if q.get('case') and q['status'] in ('case', 'awaiting_answer'):
+        if q.get('case') and q['status'] in ('open', 'case', 'awaiting_answer'):
             cid = q['case']
             settle(q, note, 'answered', now)
             q['was_case'] = cid
@@ -2524,7 +2528,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                     matched = subscription_match(data, charge_of(q), at, record=True, end=each) if q.get('subscription_dated', False) else None
                     charge = charge_of(q)
                     hit = matched or purchase_match(data, charge, at, q['id'])
-                    receipt_ok = receipt_for_question(data, charge, q['id'], questions)
+                    receipt_ok = receipt_for_question(data, charge, q['id'], questions, at)
                     if not hit and active(q) and not q.get('case') and now - at >= UNMATCHED_AFTER \
                             and charges.card_owner(charge) == 'abdullah':
                         result = charges.explain(charge, at, now, each, find, owner,
@@ -3396,7 +3400,9 @@ def main(argv=None):
             cases = [c for c in visible_cases(DATA) if args.all or (active(c) and case_owner(c) == 'abdullah')]
             print(json.dumps(redact_all(cases), ensure_ascii=False, indent=1) if args.json else table(cases))
         elif args.command == 'show':
-            print(json.dumps(redact_all(find({'cases': visible_cases(DATA)}, args.id)), ensure_ascii=False, indent=1))
+            case_id = next((q['case'] for q in load_questions(DATA)['questions']
+                            if q['id'] == args.id and active(q) and q.get('case')), args.id)
+            print(json.dumps(redact_all(find({'cases': visible_cases(DATA)}, case_id)), ensure_ascii=False, indent=1))
         elif args.command == 'add':
             case = add(DATA, args.id, args.merchant, args.amount, args.currency, args.state, args.next,
                        args.deadline, args.who, args.reference, args.why, args.watcher, charged=args.charged,

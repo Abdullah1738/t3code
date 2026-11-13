@@ -1216,6 +1216,108 @@ class UnmatchedCharges(Base):
         self.assertEqual(self.question(qid)['status'], 'closed')
         self.assertTrue(mc.find(mc.load(self.data), cid)['history'][-1]['owner'])
 
+    def test_reply_before_daily_ask_updates_the_parent_and_keeps_follow_up_live(self):
+        # question state       reply must reach the same parent, with no first ask
+        for status in ('open', 'case', 'awaiting_answer'):
+            with self.subTest(status=status):
+                self.data, self.wd = self.tmp / status, self.tmp / ('wd-' + status)
+                self.wd.mkdir()
+                qid = self.seed_charge()
+                self.follow('2026-10-24T10:00', finder())
+                cid = self.question(qid)['case_opened']
+                with mc.Locked(self.data, 'questions') as book:
+                    mc.find_question(book, qid)['status'] = status
+                mc.answered(self.data, qid, 'not my order', now=at('2026-10-24T10:05'))
+                parent = mc.find(mc.load(self.data), cid)
+                self.assertEqual(parent.get('answered_cycle'), parent['cycle'])
+                self.assertTrue(parent['history'][-1].get('owner'))
+                self.assertIn('owner reply ' + qid, parent['history'][-1]['text'])
+                self.assertEqual((self.question(qid)['status'], parent['status']), ('closed', 'open'))
+                self.assertEqual(parent['asks'], [])
+                self.assertEqual(mc.unasked_candidates(self.data, at('2026-10-27T09:00')), [])
+                event = self.follow('2026-10-27T09:00', finder())
+                self.assertIn(cid, event)
+                self.assertIn('OVERDUE', event)
+
+    def test_late_receipt_settles_descriptor_variants_sharing_one_alert_case(self):
+        first = self.seed_charge()
+        variant = ALERT.replace('ACME * EATS PENDING', 'ACME GROCERY')
+        second = mc.screen(variant, 'alerts@emiratesnbd.com', at('2026-10-24T08:00'), at('2026-10-24T08:00'),
+                           data=self.data, find=finder(), said=nobody, item='mail:auto')['id']
+        self.assertNotEqual(first, second)
+        self.follow('2026-10-24T10:00', finder())
+        cid = self.question(first)['case_opened']
+        self.assertEqual(self.question(second)['case_opened'], cid)
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+        self.follow('2026-10-24T11:00', finder(RECEIPT))
+        self.assertEqual([self.question(qid)['status'] for qid in (first, second)], ['closed', 'closed'])
+        self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'closed')
+
+    def test_receipt_competitors_use_alert_identity_across_known_and_new_questions(self):
+        charge = mc.charges.parse(ALERT, BANK)
+        observed = at('2026-10-24T08:00')
+        current = dict(charge, id='q-current', at=mc.stamp(observed))
+        # Rival form                     Competes for this receipt?
+        forms = (
+            ('descriptor', {'merchant': 'ACME GROCERY'}, False),
+            ('utc', {'merchant': 'ACME GROCERY', 'at': '2026-10-24T04:00:00Z'}, False),
+            ('amount-shape', {'amount': '12.3400'}, False),
+            ('other-card', {'card': '2222'}, True),
+            ('next-second', {'at': '2026-10-24T08:00:01+04:00'}, True),
+            ('next-charge', {'at': '2026-10-24T10:00:00+04:00'}, True),
+            ('other-amount', {'amount': '12.35'}, False),
+            ('other-currency', {'currency': 'USD'}, False),
+            ('decline', {'kind': 'decline'}, False),
+        )
+        for label, changes, competes in forms:
+            for known in (False, True):
+                for settled in (False, True):
+                    with self.subTest(form=label, known=known, settled=settled):
+                        rival = current | dict(id='q-rival', **changes)
+                        if settled:
+                            rival['explanation'] = {'msgs': RECEIPT['id']}
+                        questions = [rival, current] if known else [rival]
+                        accepts = mc.receipt_for_question(self.data, charge, 'q-current' if known else None,
+                                                         questions, observed)
+                        self.assertEqual(accepts(RECEIPT, read(RECEIPT)), not competes)
+
+    def test_shared_alert_receipt_screening_is_consistent_across_entry_points(self):
+        variant = ALERT.replace('ACME * EATS PENDING', 'ACME GROCERY')
+        for entry in ('screen', 'ask', 'charge', 'daily'):
+            with self.subTest(entry=entry):
+                self.data, self.wd = self.tmp / entry, self.tmp / ('wd-' + entry)
+                self.wd.mkdir()
+                first = self.seed_charge()
+                if entry != 'screen':
+                    self.follow('2026-10-24T10:00', finder())
+                receipt = dict(RECEIPT, ts=at('2026-10-24T08:01').timestamp())
+                if entry == 'screen':
+                    result = mc.screen(variant, 'alerts@emiratesnbd.com', at('2026-10-24T08:00'),
+                                       at('2026-10-24T11:00'), data=self.data, find=finder(receipt), said=nobody,
+                                       item='mail:variant')
+                    self.assertEqual(result['verdict'], 'explained')
+                elif entry == 'ask':
+                    rc, text = mc.ask(self.data, 'Yours?', text=variant, sender='alerts@emiratesnbd.com',
+                                      at=at('2026-10-24T08:00'), now=at('2026-10-24T11:00'),
+                                      find=finder(receipt), said=nobody)
+                    self.assertEqual(rc, mc.DONT_ASK)
+                    self.assertIn('is explained', text)
+                elif entry == 'charge':
+                    out = io.StringIO()
+                    with patch.object(mc, 'DATA', self.data), patch.object(mc.charges, 'search', finder(receipt)), \
+                            patch.object(mc.charges, 'owner_texts', nobody), redirect_stdout(out):
+                        self.assertEqual(mc.main(['charge', variant, '--sender', 'alerts@emiratesnbd.com',
+                                                  '--at', '2026-10-24T08:00+04:00',
+                                                  '--now', '2026-10-24T11:00+04:00']), 0)
+                    self.assertEqual(json.loads(out.getvalue())['verdict'], 'receipt')
+                else:
+                    mc.unasked(self.data, at('2026-10-25T09:00'), finder(receipt), nobody)
+                    self.assertEqual(self.question(first)['status'], 'closed')
+                self.follow('2026-10-25T09:15', finder(receipt))
+                self.assertTrue(all(q['status'] == 'closed' and not q['asks']
+                                    for q in mc.load_questions(self.data)['questions']))
+                self.assertTrue(all(c['status'] == 'closed' for c in mc.load(self.data)['cases']))
+
     def test_case_write_before_question_write_recovers_without_a_duplicate(self):
         qid = self.seed_charge()
         replace = mc.os.replace
@@ -1650,7 +1752,8 @@ class CheckBudget(Base):
 
     def test_msgs_cache_is_shared_by_ambiguous_questions_and_reset_each_run(self):
         now = at('2026-10-25T12:00')
-        self.seed([now, now])
+        times = [now, now - dt.timedelta(seconds=1)]
+        self.seed(times)
         row = {'id': 1, 'ts': now.timestamp(), 'sender': 'Acme', 'subject': 'Acme receipt'}
         calls = []
         def msgs(argv, **kw):
@@ -1660,7 +1763,7 @@ class CheckBudget(Base):
         with patch.object(mc.charges.subprocess, 'run', msgs):
             mc.run_check(self.wd, 'r', self.data, self.root, now, said=nobody)
             self.assertEqual([a[1] for a in calls], ['search', 'show', 'search'])
-            self.seed([now, now])
+            self.seed(times)
             mc.run_check(self.wd, 'r2', self.data, self.root, now, said=nobody)
         self.assertEqual([a[1] for a in calls], ['search', 'show', 'search'] * 2)
         self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
