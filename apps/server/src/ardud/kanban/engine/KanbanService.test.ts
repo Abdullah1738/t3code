@@ -8024,6 +8024,142 @@ const setRunStart = (
     return all;
   });
 
+it.effect("status maintenance only locks due evaluators across twenty ticks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const due = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Busy" });
+      const idle = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Done" });
+      yield* setRunStart(fake, due, true, "2026-10-25T13:00:00.000Z");
+      yield* setRunStart(fake, idle, false, "2026-10-25T13:00:00.000Z");
+      for (let i = 0; i < 200; i++) {
+        yield* store.putThreadLink({
+          threadId: ThreadId.make(`status-other-${i}`),
+          boardId: board.id,
+          cardId: null,
+          role: i % 2 === 0 ? "work" : "review",
+          purpose: null,
+          discussionId: null,
+          model: board.defaultCardModel,
+          startedAt: board.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+      }
+      yield* TestClock.adjust("46 minutes");
+      const counts = { steps: 0, links: 0 };
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          const attribute = span.attribute.bind(span);
+          span.attribute = (key, value) => {
+            attribute(key, value);
+            if (key === "kanban.tick_step" && value === "evaluatorStatus") counts.steps++;
+          };
+          return span;
+        },
+      });
+      const statements: Statement.Transformer = (statement, _sql, _fiber, span) => {
+        const [query] = statement.compile();
+        if (/SELECT json FROM ardud_kanban_threads WHERE thread_id =/.test(query)) {
+          let current: Tracer.AnySpan | undefined = span;
+          while (current?._tag === "Span") {
+            if (current.attributes.get("kanban.tick_step") === "evaluatorStatus") {
+              counts.links++;
+              break;
+            }
+            current = Option.getOrUndefined(current.parent);
+          }
+        }
+        return Effect.succeed(statement);
+      };
+      for (let i = 0; i < 20; i++) {
+        yield* kanban.tick.pipe(
+          Effect.withTracer(tracer),
+          Effect.provideService(Statement.CurrentTransformer, statements),
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+        );
+      }
+      yield* Effect.logInfo("KANBAN_STATUS_COUNTS", JSON.stringify({ ticks: 20, counts }));
+      assert.strictEqual(yield* statusAsksTo(fake, due), 1);
+      assert.strictEqual(yield* statusAsksTo(fake, idle), 0);
+      assert.strictEqual(counts.steps, 1);
+      assert.strictEqual(counts.links, 4);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["idle", "new-run", "missing", "failure", "ended-link", "work-link"] as const)(
+  "status planning rechecks a due evaluator after $0",
+  (change) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Busy" });
+        yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+        yield* TestClock.adjust("46 minutes");
+        fake.findCalls.length = 0;
+        let changed = false;
+        fake.findControl.beforeRead = (id, attempt) =>
+          Effect.gen(function* () {
+            if (id !== evaluator || attempt !== 2) return;
+            changed = true;
+            switch (change) {
+              case "idle":
+                yield* setRunStart(fake, id, false, "2026-10-25T13:00:00.000Z");
+                break;
+              case "new-run":
+                yield* setRunStart(fake, id, true, "2026-10-25T13:46:00.000Z");
+                break;
+              case "missing":
+                yield* Ref.update(fake.threads, (all) => {
+                  const next = new Map(all);
+                  next.delete(id);
+                  return next;
+                });
+                break;
+              case "failure":
+                return yield* Effect.fail(
+                  new KanbanThreadError({ operation: "view", detail: "failed" }),
+                );
+              case "ended-link":
+              case "work-link": {
+                const link = yield* store.threadLink(id).pipe(Effect.orDie);
+                assert.isNotNull(link);
+                yield* store
+                  .putThreadLink({
+                    ...link!,
+                    ...(change === "ended-link"
+                      ? { endedAt: "2026-10-25T13:46:00.000Z" }
+                      : { role: "work" as const }),
+                  })
+                  .pipe(Effect.orDie);
+              }
+            }
+          });
+        yield* kanban.tick;
+        assert.isTrue(changed, "the current-state read ran after planning");
+        assert.isFalse(
+          (yield* Ref.get(fake.threads))
+            .get(evaluator)
+            ?.messages.some((text) => text.startsWith("Board check: this turn has been running")) ??
+            false,
+        );
+        delete fake.findControl.beforeRead;
+        if (change === "failure") {
+          yield* kanban.tick;
+          assert.strictEqual(yield* statusAsksTo(fake, evaluator), 1);
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a long evaluator turn is asked for a status at 45 minutes, then hourly", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
