@@ -287,9 +287,13 @@ def _repo_node_pin_cd_proof(source):
     """The pinned cd wrapper refreshes after every cd. The startup proof walks
     only the invocation cwd and $(dirname "$0")/.., so allow at most one cd: the
     HERE line's subshell, which leaves the script's own cwd unchanged, with no
-    CDPATH search and an unchanged $0."""
+    CDPATH search, an unchanged $0 and $PWD, and logical cd."""
     code = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#'))
-    if re.search(r'CDPATH|BASH_ARGV0', code):
+    # Logical cd resolves against $PWD; physical mode and cdable_vars change
+    # what the one allowed cd reaches.
+    if re.search(r'CDPATH|BASH_ARGV0|cdable_vars|\bshopt\b|(?<![\w$])(?:OLD)?PWD\+?=|'
+                 r'\b(?:export|declare|typeset|local|readonly|unset|read)\b[^\n;]*\b(?:OLD)?PWD\b|'
+                 r'\bset\s+(?:-[A-Za-z]*P|-o\s+physical)', code):
         return False
     changes = list(re.finditer(r'(?<![\w.$/-])(?:cd|pushd|popd)(?![\w.-])', code))
     if not changes:

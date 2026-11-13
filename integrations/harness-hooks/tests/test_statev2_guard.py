@@ -1158,6 +1158,11 @@ class GuardTests(unittest.TestCase):
             ('fixture-exported-cdpath', original.replace('set -u\n', 'set -u\nexport CDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {}, SCRIPT),
             ('fixture-argv0', original.replace('set -u\n', 'set -u\nBASH_ARGV0=' + str(self.root / 'nested/nested/tests/x.sh') + '\n', 1), {}, SCRIPT),
         ]
+        # Logical cd joins $PWD; physical mode and cdable_vars change targets.
+        for statement in ('PWD=' + str(self.root / 'elsewhere'), 'export PWD=' + str(self.root / 'elsewhere'),
+                          'OLDPWD=/tmp', 'unset PWD', 'read -r PWD < /dev/null', 'shopt -s cdable_vars',
+                          'set -P', 'set -eP', 'set -o physical'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
         for label, source, extra, expected in rows:
             self.assertTrue(label.startswith('unchanged') or source != original or extra, label)
             self.write('nested/tests/fixture.sh', source)
