@@ -44,7 +44,7 @@ interface RetryAttempt {
   ok: boolean;
 }
 
-const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
+export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
   total: 0,
@@ -88,7 +88,7 @@ function bucket(value: number): number {
     : Math.ceil(Math.log(Math.max(0.000001, value)) / Math.log(HISTOGRAM_RATIO));
 }
 
-function addDuration(target: Durations, value: number): void {
+export function addDuration(target: Durations, value: number): void {
   target.count++;
   target.max = Math.max(target.max, value);
   if (!target.histogram && target.exact.length < EXACT_DURATIONS) {
@@ -191,7 +191,11 @@ export function accumulate(
     addDuration(summary, event.durationMs);
   }
 
-  if (/ask/i.test(event.kind) && /answer|respond|resolv/i.test(event.kind)) {
+  if (
+    event.kind !== "ask.answer_sent" &&
+    /ask/i.test(event.kind) &&
+    /answer|respond|resolv/i.test(event.kind)
+  ) {
     const duration =
       event.durationMs ??
       (event.props?.createdAt
@@ -259,7 +263,7 @@ export function accumulate(
   }
 }
 
-function summarize(values: Durations): AnalyticsLatency {
+export function summarize(values: Durations): AnalyticsLatency {
   const sorted = values.histogram
     ? [...values.histogram].sort(([a], [b]) => a - b)
     : values.exact.toSorted((a, b) => a - b).map((value) => [value, 1] as const);
@@ -346,6 +350,16 @@ export function finishRollup(
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
     usage: finishUsage(target.usage),
+    askLatency: {
+      source: "unavailable",
+      sentToSeen: summarize(durations()),
+      seenToAnswered: summarize(durations()),
+      createdToAnswered: summarize(durations()),
+      answeredWithoutSeen: 0,
+      openOver1hAtDayEnd: null,
+      byBlocking: {},
+      byKind: {},
+    },
     tickPhases: [...target.tickPhases.values()]
       .map((group) => ({
         boardId: group.boardId,

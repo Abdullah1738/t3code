@@ -1,3 +1,4 @@
+import { askNotificationsRef } from "./needsYou/useAskTiming";
 import { Link, useMatchRoute, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import { CircleHelpIcon, InboxIcon, MessageCircleIcon } from "lucide-react";
@@ -112,8 +113,19 @@ function NeedsYouRow(props: { onNavigate: () => void }) {
   const error = useAskStore((state) => state.error);
   const nowMs = useNowMs();
   const shown = askRowFigure(askQueueFigures({ feed, status, error }), count, nowMs);
+  const hidden = useAskStore((state) => state.hidden);
   return (
     <Link
+      ref={askNotificationsRef(
+        (shown.count === null ? [] : (feed?.open ?? [])).filter(
+          (entry) =>
+            entry.waitsOn === "owner" &&
+            !entry.expired &&
+            !entry.snoozed &&
+            entry.ask.respond?.ack !== true &&
+            hidden[askKey(entry)] === undefined,
+        ),
+      )}
       to="/needs-you"
       search={{}}
       onClick={props.onNavigate}

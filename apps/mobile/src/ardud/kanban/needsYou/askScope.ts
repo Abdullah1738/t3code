@@ -200,6 +200,8 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       detail: calls.detail,
       message: calls.message,
       // Writes: each one asks the gate at the moment it would leave.
+      seen: gated(calls.seen!),
+      notified: gated(calls.notified!),
       answer: gated(calls.answer),
       answerBatch: gated(calls.answerBatch),
       reply: gated(calls.reply),

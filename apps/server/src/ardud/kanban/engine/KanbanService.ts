@@ -128,6 +128,13 @@ import * as TickTimings from "./tickTimings.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import {
+  askKind,
+  askTimingProps,
+  markAskTiming,
+  type AskSurface,
+  type AskChannel,
+} from "../../analytics/askLatency.ts";
+import {
   analyticsErrorTag,
   recordServerAnalytics,
 } from "../../../observability/RpcInstrumentation.ts";
@@ -568,6 +575,17 @@ export interface KanbanServiceShape {
     /** The refs for the secret fields he filled in privately; only the wake text carries them. */
     secrets?: Asks.AskSecretRefs,
   ) => Effect.Effect<{ readonly card: KanbanCard; readonly heard: boolean }, KanbanError>;
+  readonly noteAskTiming: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    receipt:
+      | { readonly type: "seen"; readonly surface: AskSurface; readonly at?: string | undefined }
+      | {
+          readonly type: "notified";
+          readonly channel: AskChannel;
+          readonly at?: string | undefined;
+        },
+  ) => Effect.Effect<void, KanbanError>;
   /**
    * Who may use the refs for an open ask's secret fields (`fieldIds`), and the
    * project its card's threads run in. Fails when the ask is closed or one of
@@ -1433,6 +1451,10 @@ const tickQueueDepths = Context.Reference<
 const ownerAnswerAt = Context.Reference<string | undefined>("KanbanOwnerAnswerAt", {
   defaultValue: () => undefined,
 });
+export const askAnswerVia = Context.Reference<"single" | "batch" | undefined>(
+  "KanbanAskAnswerVia",
+  { defaultValue: () => undefined },
+);
 const ownerRouteAsks = Context.Reference<ReadonlySet<string> | undefined>("KanbanOwnerRouteAsks", {
   defaultValue: () => undefined,
 });
@@ -1441,13 +1463,15 @@ const make = Effect.gen(function* () {
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   // Measurements run inside the board operation's existing spans.
   const recordAnalytics = Effect.fnUntraced(function* (
-    event: Omit<AnalyticsEvent, "ts" | "surface" | "route">,
+    event: Omit<AnalyticsEvent, "ts" | "surface" | "route"> & {
+      readonly surface?: AnalyticsEvent["surface"];
+    },
   ) {
     if (Option.isNone(analytics)) return;
     yield* recordServerAnalytics(analytics.value, {
       ...event,
       ts: DateTime.formatIso(yield* DateTime.now),
-      surface: "server",
+      surface: event.surface ?? "server",
       route: "kanban",
     });
   });
@@ -2489,12 +2513,54 @@ const make = Effect.gen(function* () {
 
   // `by` is set when a move saved the card, so a script's own move doesn't re-trigger a card.moved script.
   const saveCard = Effect.fn("KanbanService.saveCard")(function* (
-    card: KanbanCard,
+    incoming: KanbanCard,
     by?: KanbanActor,
     dispatchMetadata = false,
   ) {
+    let card = incoming;
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
+        if (
+          card.asks.some(
+            (ask) => ask.timing === undefined && ask.seq === null && ask.closedAt === null,
+          )
+        ) {
+          const previous = yield* store.card(card.id);
+          card = {
+            ...card,
+            asks: card.asks.map((ask) => {
+              const timing = previous?.asks.find((old) => old.id === ask.id)?.timing;
+              return ask.timing === undefined && timing !== undefined ? { ...ask, timing } : ask;
+            }),
+          };
+          const fresh = card.asks.filter(
+            (ask) =>
+              ask.timing === undefined &&
+              ask.seq === null &&
+              ask.closedAt === null &&
+              !previous?.asks.some((old) => old.id === ask.id),
+          );
+          if (fresh.length > 0) {
+            const rows = yield* boardSql<{
+              count: number;
+            }>`SELECT COUNT(*) AS count FROM ardud_kanban_cards c, json_each(c.json, '$.asks') a WHERE instr(c.json, '"closedAt":null') > 0 AND json_extract(a.value, '$.closedAt') IS NULL AND COALESCE(json_extract(a.value, '$.to'), 'owner') != 'evaluator'`;
+            card = {
+              ...card,
+              asks: card.asks.map((ask) => {
+                const index = fresh.findIndex((entry) => entry.id === ask.id);
+                return index < 0
+                  ? ask
+                  : {
+                      ...ask,
+                      timing: {
+                        kind: askKind(ask),
+                        openAsksAtCreation: (rows[0]?.count ?? 0) + index,
+                      },
+                    };
+              }),
+            };
+          }
+        }
         if (card.reviewThreadId !== null) {
           const active = card.settledAt === null && card.activeThreadId === card.reviewThreadId;
           const queued =
@@ -4912,7 +4978,12 @@ const make = Effect.gen(function* () {
         (subtask) =>
           Subtasks.gateOf(subtask, board.guessedGates) !== undefined &&
           (subtask.state === "open" ||
-            Subtasks.approvalProblem(next, subtask, board.guessedGates) !== null),
+            Subtasks.approvalProblem(
+              next,
+              subtask,
+              board.guessedGates,
+              subtask.state === "skipped" ? "skip" : "do",
+            ) !== null),
       );
       const stage =
         back === "verified" && gated
@@ -4959,8 +5030,40 @@ const make = Effect.gen(function* () {
       const blocking = next.stage === "needs_owner" ? Asks.openBlockingAsk(next) : undefined;
       next = { ...next, question: blocking?.text ?? next.question, updatedAt: at };
     }
+    const via = yield* askAnswerVia;
+    const answeredIds = new Set(answered.map((ask) => ask.id));
+    if (answeredIds.size > 0)
+      next = {
+        ...next,
+        asks: next.asks.map((ask) =>
+          answeredIds.has(ask.id)
+            ? {
+                ...ask,
+                timing: {
+                  ...ask.timing,
+                  answeredVia:
+                    via ??
+                    (record === undefined || record.answer.text !== undefined
+                      ? "free_text"
+                      : "single"),
+                },
+              }
+            : ask,
+        ),
+      };
     // Saved before anyone is told: the card's new state never waits on a thread.
     if (next !== card) yield* saveCard(next);
+    if (answeredBy._tag === "owner")
+      for (const ask of next.asks) {
+        if (!answeredIds.has(ask.id) || ask.answer?.verdict === "dropped") continue;
+        yield* recordAnalytics({
+          kind: "ask.answered",
+          boardId: next.boardId,
+          cardId: next.id,
+          durationMs: Math.max(0, Date.parse(ask.answer?.at ?? at) - Date.parse(ask.at)),
+          props: askTimingProps(ask),
+        });
+      }
     const notice: AnsweredNotice = {
       singleEvaluator: yield* collapseEvaluatorReplies,
       discussionId: current.id,
@@ -11730,7 +11833,7 @@ const make = Effect.gen(function* () {
             const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
             if (replacement && Subtasks.gateOf(replacement, board.guessedGates) !== undefined)
               continue;
-            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
+            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates, "skip");
             if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
           }
           yield* checkScriptNames(card.boardId, plan.subtasks);
@@ -11961,7 +12064,14 @@ const make = Effect.gen(function* () {
           const board = yield* boardOf(card.boardId);
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           const missing = card.subtasks
-            .map((subtask) => Subtasks.approvalProblem(card, subtask, board.guessedGates))
+            .map((subtask) =>
+              Subtasks.approvalProblem(
+                card,
+                subtask,
+                board.guessedGates,
+                subtask.state === "skipped" ? "skip" : "do",
+              ),
+            )
             .find((problem) => problem !== null);
           if (open.length > 0) {
             const reason = `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`;
@@ -12152,8 +12262,14 @@ const make = Effect.gen(function* () {
       ask.id,
       kanbanAskRevision(ask),
     );
-    const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, {
+    const current = yield* cardOf(card.id);
+    const existing = current.asks.find((entry) => entry.id === ask.id)!;
+    const next = Asks.updateAsk(current, ask.id, {
       ...fields,
+      timing: {
+        ...existing.timing,
+        kind: askKind({ ...existing, ...fields }),
+      },
       ...Asks.storedBlocks(message.blocks, rich.length),
       seq: message.seq,
     });
@@ -12386,6 +12502,7 @@ const make = Effect.gen(function* () {
         );
         const edited = Asks.replaceAsk(yield* cardOf(card.id), {
           ...revised,
+          timing: { ...revised.timing, kind: askKind(revised) },
           ...Asks.storedBlocks(message.blocks, rich.length),
           seq: message.seq,
           ...(ask.firstSeq === undefined && ask.seq !== null ? { firstSeq: ask.seq } : {}),
@@ -12745,6 +12862,49 @@ const make = Effect.gen(function* () {
 
   const askFeed: KanbanServiceShape["askFeed"] = (input) =>
     readDb(nowIso.pipe(Effect.flatMap((at) => AskFeed.readAskFeed(boardSql, input, at))));
+
+  const noteAskTiming: KanbanServiceShape["noteAskTiming"] = (cardId, askId, receipt) =>
+    guardDeferred(
+      "ask.timing",
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (ask === undefined) return yield* failWith("not-found", "ask not found");
+        const now = yield* nowIso;
+        const observed = receipt.at ?? now;
+        if (receipt.type === "seen" && Math.abs(Date.parse(observed) - Date.parse(now)) > 300_000)
+          return yield* failWith("invalid", "receipt time is outside the clock window");
+        const at =
+          receipt.type === "seen" && Number.isFinite(Date.parse(observed))
+            ? DateTime.formatIso(
+                DateTime.makeUnsafe(
+                  Math.min(Date.parse(now), Math.max(Date.parse(ask.at), Date.parse(observed))),
+                ),
+              )
+            : observed;
+        if (!Number.isFinite(Date.parse(at)) || at < ask.at || at > now)
+          return yield* failWith("invalid", "receipt time is outside the ask lifetime");
+        const updated = markAskTiming(
+          ask,
+          receipt.type,
+          receipt.type === "seen" ? receipt.surface : receipt.channel,
+          at,
+        );
+        if (updated === ask) return;
+        yield* store.putCard(Asks.updateAsk(card, askId, { timing: updated.timing }));
+        yield* recordAnalytics({
+          kind: receipt.type === "seen" ? "ask.seen" : "ask.notified",
+          surface: receipt.type === "seen" ? receipt.surface : "server",
+          boardId: card.boardId,
+          cardId,
+          props: {
+            ...askTimingProps(updated),
+            ...(receipt.type === "seen" ? { originKind: receipt.surface } : {}),
+          },
+        });
+      }),
+      cardId,
+    );
 
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
     savedCardGuard(
@@ -13147,7 +13307,12 @@ const make = Effect.gen(function* () {
         const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
         const missing =
           gated && state !== "open"
-            ? Subtasks.approvalProblem(card, gated, board.guessedGates)
+            ? Subtasks.approvalProblem(
+                card,
+                gated,
+                board.guessedGates,
+                state === "skipped" ? "skip" : "do",
+              )
             : null;
         if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
         const at = yield* nowIso;
@@ -15058,6 +15223,7 @@ const make = Effect.gen(function* () {
     noteHandEvaluator,
     askDetail,
     askFeed,
+    noteAskTiming,
     reviewResult,
     cardThread,
     setPool,

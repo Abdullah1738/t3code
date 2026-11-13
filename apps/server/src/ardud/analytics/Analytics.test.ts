@@ -17,6 +17,9 @@ import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Sqlite from "../../persistence/Sqlite.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
@@ -48,9 +51,13 @@ function open(
   setup: Effect.Success<typeof fixture>,
   options: Partial<Analytics.AnalyticsOptions> = {},
   fs = setup.fs,
+  boards?: BoardsDatabase.BoardsDatabase["Service"],
 ) {
   return Layer.build(
     Analytics.layerWith(options).pipe(
+      Layer.provide(
+        boards === undefined ? Layer.empty : Layer.succeed(BoardsDatabase.BoardsDatabase, boards),
+      ),
       Layer.provide(Layer.succeed(ServerConfig.ServerConfig, setup.config)),
       Layer.provide(Layer.succeed(FileSystem.FileSystem, fs)),
     ),
@@ -151,6 +158,69 @@ describe("Analytics", () => {
       });
       assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+  it.effect(
+    "reads the ask split by board/card while persisting the full day without text",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, json TEXT)`;
+        const ask = {
+          id: "q1",
+          text: "private question",
+          at: `${day}T01:00:00.000Z`,
+          blocking: true,
+          closedAt: `${day}T03:00:00.000Z`,
+          answer: {
+            at: `${day}T03:00:00.000Z`,
+            by: { _tag: "owner" },
+            verdict: "approved",
+            text: "private answer",
+          },
+          timing: {
+            kind: "approve",
+            notified: { telegram: `${day}T01:10:00.000Z` },
+            firstSeen: { web: `${day}T02:00:00.000Z`, mobile: `${day}T02:30:00.000Z` },
+          },
+        };
+        for (const [cardId, boardId] of [
+          ["card-a", "board-a"],
+          ["card-b", "board-a"],
+          ["card-c", "board-b"],
+        ])
+          yield* sql`INSERT INTO ardud_kanban_cards VALUES (${cardId}, ${boardId}, ${JSON.stringify({ asks: [ask] })})`;
+        const analytics = yield* open(setup, {}, setup.fs, {
+          sql,
+          ready: Effect.void,
+          path: ":memory:",
+        });
+        yield* analytics.ingest({
+          events: [event({ kind: "ask.answered" }), event({ kind: "ask.seen" })],
+        });
+        yield* analytics.record(event({ kind: "server.rpc", surface: "server", route: "rpc" }));
+        const result = yield* analytics.read({ day, boardId: "board-a" });
+        assert.equal(result.rollup.askLatency.createdToAnswered.count, 2);
+        assert.equal(result.rollup.askLatency.sentToSeen.p50Ms, 50 * 60_000);
+        assert.equal(result.rollup.askLatency.seenToAnswered.p50Ms, 60 * 60_000);
+        assert.equal(result.rollup.askLatency.source, "stored-asks");
+        assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 3);
+        for (const [filter, count] of [
+          [{ cardId: "card-a" }, 1],
+          [{ boardId: "board-a", cardId: "card-a" }, 1],
+          [{ boardId: "board-b", cardId: "card-a" }, 0],
+          [{ cardId: "missing" }, 0],
+        ] as const) {
+          const filtered = yield* analytics.read({ day, ...filter });
+          assert.equal(filtered.rollup.askLatency.createdToAnswered.count, count);
+          const persisted = JSON.parse(
+            yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+          ) as AnalyticsRollup;
+          assert.equal(persisted.askLatency.createdToAnswered.count, 3);
+        }
+        assert.lengthOf(result.samples, 0);
+        assert.isFalse(JSON.stringify(result).includes("private"));
+      }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
   );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",

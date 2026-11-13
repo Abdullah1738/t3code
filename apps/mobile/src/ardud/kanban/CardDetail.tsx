@@ -1,3 +1,5 @@
+import { AskTimingScrollView } from "./needsYou/AskTimingScrollView";
+import { AskTiming } from "./needsYou/useAskTiming";
 import type { KanbanCard, KanbanThreadLink } from "@t3tools/contracts";
 import {
   askViews,
@@ -12,7 +14,7 @@ import {
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { clockLabel } from "@t3tools/client-runtime/ardud/common";
 import { type ReactNode, useState } from "react";
-import { Pressable, ScrollView, View } from "react-native";
+import { Pressable, View } from "react-native";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
@@ -94,7 +96,9 @@ export function CardDetail(props: {
     return (
       <View className="flex-1">
         <View style={{ maxHeight: "40%" }}>
-          <ScrollView contentContainerClassName="px-4 pt-2">{cardHeader}</ScrollView>
+          <AskTimingScrollView contentContainerClassName="px-4 pt-2">
+            {cardHeader}
+          </AskTimingScrollView>
         </View>
         <View className="px-4 pb-1 pt-3">{tabs}</View>
         <Chat
@@ -116,7 +120,7 @@ export function CardDetail(props: {
   }
 
   return (
-    <ScrollView
+    <AskTimingScrollView
       className="flex-1"
       contentContainerClassName="gap-3 px-4 pt-2"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
@@ -140,7 +144,7 @@ export function CardDetail(props: {
           onOpenThread={props.onOpenThread}
         />
       )}
-    </ScrollView>
+    </AskTimingScrollView>
   );
 }
 
@@ -234,6 +238,7 @@ function OwnerAsks(props: {
     <View className="gap-3 rounded-2xl bg-warning px-3.5 py-3">
       {props.asks.map((ask) => (
         <View key={ask.id} className="gap-2">
+          <AskTiming cardId={card.id} askId={ask.id} />
           <View className="flex-row items-start gap-2">
             <View className="pt-[5px]">
               <Glyph kind={ask.blocking ? "wait" : "ask"} />

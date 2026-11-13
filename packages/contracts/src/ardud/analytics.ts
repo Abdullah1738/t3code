@@ -87,6 +87,34 @@ const GeneralEvent = Schema.Struct({
       heapMB: Schema.optionalKey(Measurement),
       overlappingTicks: Schema.optionalKey(Measurement),
       createdAt: Schema.optionalKey(Timestamp),
+      askId: Schema.optionalKey(Id),
+      notifiedAt: Schema.optionalKey(Timestamp),
+      notifiedByChannel: Schema.optionalKey(
+        Schema.Struct({
+          in_app: Schema.optionalKey(Timestamp),
+          telegram: Schema.optionalKey(Timestamp),
+          push: Schema.optionalKey(Timestamp),
+        }),
+      ),
+      notificationChannels: Schema.optionalKey(
+        Schema.Array(Schema.Literals(["in_app", "telegram", "push"])),
+      ),
+      firstSeenAt: Schema.optionalKey(Timestamp),
+      firstSeenBySurface: Schema.optionalKey(
+        Schema.Struct({
+          web: Schema.optionalKey(Timestamp),
+          desktop: Schema.optionalKey(Timestamp),
+          mobile: Schema.optionalKey(Timestamp),
+        }),
+      ),
+      answeredAt: Schema.optionalKey(Timestamp),
+      blocking: Schema.optionalKey(Schema.Boolean),
+      askKind: Schema.optionalKey(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      hasBatchKey: Schema.optionalKey(Schema.Boolean),
+      openAsksAtCreation: Schema.optionalKey(Measurement),
+      answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
       bytes: Schema.optionalKey(Measurement),
@@ -192,6 +220,19 @@ const CardUsage = Schema.Struct({
   evaluatorWakes: Measurement,
   reviewRounds: Measurement,
 });
+export const AskLatencySplit = Schema.Struct({
+  sentToSeen: Schema.Struct(LatencyFields),
+  seenToAnswered: Schema.Struct(LatencyFields),
+  createdToAnswered: Schema.Struct(LatencyFields),
+  answeredWithoutSeen: Measurement,
+});
+export const AskLatencyRollup = Schema.Struct({
+  ...AskLatencySplit.fields,
+  source: Schema.Literals(["stored-asks", "unavailable"]),
+  openOver1hAtDayEnd: Schema.NullOr(Measurement),
+  byBlocking: Schema.Record(Label, AskLatencySplit),
+  byKind: Schema.Record(Label, AskLatencySplit),
+});
 export const AnalyticsRollup = Schema.Struct({
   day: AnalyticsReadInput.fields.day,
   generatedAt: Timestamp,
@@ -228,6 +269,7 @@ export const AnalyticsRollup = Schema.Struct({
     topCardsByTokens: Schema.Array(CardUsage),
     topCardsByWallMs: Schema.Array(CardUsage),
   }),
+  askLatency: AskLatencyRollup,
   tickPhases: Schema.optionalKey(
     Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
   ),

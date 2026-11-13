@@ -1026,7 +1026,7 @@ export function createKanbanClient(
       if (metadata) {
         // @effect-diagnostics-next-line globalDate:off - A client interaction, measured from the server's creation timestamp.
         const durationMs = Date.now() - Date.parse(metadata.createdAt);
-        analytics?.record("ask.answered", {
+        analytics?.record("ask.answer_sent", {
           boardId,
           discussionId,
           ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
