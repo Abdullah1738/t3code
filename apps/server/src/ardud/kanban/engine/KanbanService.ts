@@ -8274,7 +8274,7 @@ const make = Effect.gen(function* () {
     cardId?: string,
     turnEnd?: KanbanThreadLink,
   ) {
-    return yield* locks.step(effect, cardId).pipe(
+    return yield* locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
       Effect.map(Option.some),
       Effect.catchDefect((defect) =>
         Effect.gen(function* () {

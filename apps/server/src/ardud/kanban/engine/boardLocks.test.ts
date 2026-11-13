@@ -1,4 +1,6 @@
 import { assert, it, vi } from "@effect/vitest";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -227,6 +229,7 @@ it.effect.each([1, 2, 3])(
         );
         assert.isTrue(Exit.isFailure(yield* Fiber.await(cancelled)));
         assert.isTrue(interrupted);
+        assert.deepStrictEqual(yield* locks.holders, []);
         const reuse = yield* Effect.forkChild(
           Effect.gen(function* () {
             yield* locks.run(locks.access("a", Effect.void), "card-a");
@@ -901,10 +904,7 @@ it.effect("saved-reply admission expires before the reply budget and never write
     const result = yield* Fiber.join(waiter);
     assert.isTrue(Exit.isFailure(result));
     if (Exit.isFailure(result)) {
-      assert.include(
-        String(Cause.squash(result.cause)),
-        "Board busy: not written. Safe to retry once.",
-      );
+      assert.include(String(Cause.squash(result.cause)), "Board busy: not written (held");
     }
     assert.isFalse(written);
     yield* Deferred.succeed(release, undefined);
@@ -963,4 +963,216 @@ it.effect.each([
     assert.strictEqual(Exit.isSuccess(yield* Fiber.join(dispatch)), valid);
     assert.strictEqual(abandoned, !valid);
   }),
+);
+
+it.effect.each(["migration", "gate", "card"] as const)(
+  "#1290 %s refusal names the holder and logs all admission fields once",
+  (lock) => {
+    const logs: Array<{ message: unknown; annotations: Readonly<Record<string, unknown>> }> = [];
+    const logger = Logger.make(({ fiber, message }) => {
+      logs.push({ message, annotations: fiber.getRef(References.CurrentLogAnnotations) });
+    });
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const body = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(resume)),
+      );
+      const hold =
+        lock === "migration"
+          ? locks.exclusive(body)
+          : locks.run(locks.access("crpko", body), lock === "card" ? "907" : undefined);
+      const holder = yield* Effect.forkChild(hold.pipe(Effect.withSpan("test.longHolder")));
+      yield* Deferred.await(entered);
+      const waiter = yield* Effect.forkChild(
+        locks
+          .run(
+            locks.access("crpko", Effect.die("must not write"), true, "card:907"),
+            lock === "gate" ? undefined : "907",
+          )
+          .pipe(
+            Effect.withSpan("test.card_move"),
+            Effect.withSpan("tools/call", { attributes: { "mcp.tool.name": "card_move" } }),
+            Effect.provideService(BoardLocks.writeWaitMs, 134_000),
+            Effect.exit,
+          ),
+      );
+      yield* TestClock.adjust(134_000);
+      const result = yield* Fiber.join(waiter);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result)) {
+        const error = Cause.squash(result.cause);
+        assert.instanceOf(error, KanbanError);
+        assert.strictEqual((error as KanbanError).saved, false);
+        assert.include(
+          String(error),
+          "Board busy: not written (held 2m14s by test.longHolder). Safe to retry once.",
+        );
+      }
+      const refusals = logs.filter((log) =>
+        String(log.message).includes("kanban board write refused"),
+      );
+      assert.strictEqual(refusals.length, 1);
+      assert.deepInclude(refusals[0]!.annotations, {
+        "board.waiter": "card_move",
+        "board.id": "crpko",
+        "board.card_id": "907",
+        "board.waiting_on": lock,
+        "board.waited_ms": 134_000,
+      });
+      const blockers = refusals[0]!.annotations["board.blockers"] as Array<Record<string, unknown>>;
+      assert.lengthOf(blockers, 1);
+      assert.deepInclude(blockers[0], {
+        label: "test.longHolder",
+        lock,
+        heldForMs: 134_000,
+        acquiredAtMs: 0,
+      });
+      assert.isNumber(blockers[0]!.fiberId);
+      assert.strictEqual((yield* locks.holders).filter((h) => h.label === "card_move").length, 0);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(holder);
+      assert.deepStrictEqual(yield* locks.holders, []);
+      yield* locks.exclusive(Effect.void);
+    }).pipe(
+      Effect.provideService(References.MinimumLogLevel, "Error"),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+  },
+);
+
+it.effect.each(["success", "failure", "interrupt"] as const)(
+  "#1290 holder records are removed after %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks
+          .run(
+            locks.access(
+              "crpko",
+              Effect.gen(function* () {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(finish);
+                if (outcome === "failure") return yield* Effect.fail("broken");
+              }),
+            ),
+            "907",
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      assert.lengthOf(yield* locks.holders, 3);
+      if (outcome === "interrupt") yield* Fiber.interrupt(holder);
+      else {
+        yield* Deferred.succeed(finish, undefined);
+        yield* Fiber.join(holder);
+      }
+      assert.deepStrictEqual(yield* locks.holders, []);
+      yield* locks.exclusive(Effect.void);
+      const migrationEntered = yield* Deferred.make<void>();
+      const migrationFinish = yield* Deferred.make<void>();
+      const migration = yield* Effect.forkChild(
+        locks
+          .exclusive(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(migrationEntered, undefined);
+              yield* Deferred.await(migrationFinish);
+              if (outcome === "failure") return yield* Effect.fail("broken");
+            }),
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(migrationEntered);
+      assert.lengthOf(yield* locks.holders, 1);
+      if (outcome === "interrupt") yield* Fiber.interrupt(migration);
+      else {
+        yield* Deferred.succeed(migrationFinish, undefined);
+        yield* Fiber.join(migration);
+      }
+      assert.deepStrictEqual(yield* locks.holders, []);
+      yield* locks.board("crpko", Effect.void);
+    }),
+);
+
+it.effect("#1290 long-holder warnings are rate limited per board while waiters remain", () => {
+  const logs: Array<Readonly<Record<string, unknown>>> = [];
+  const logger = Logger.make(({ fiber, message }) => {
+    if (String(message).includes("kanban board lock held too long"))
+      logs.push(fiber.getRef(References.CurrentLogAnnotations));
+  });
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks.board("crpko", Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))),
+    );
+    yield* Deferred.await(entered);
+    const first = yield* Effect.forkChild(locks.board("crpko", Effect.void));
+    const second = yield* Effect.forkChild(locks.board("crpko", Effect.void));
+    yield* TestClock.adjust(59_999);
+    assert.lengthOf(logs, 0);
+    yield* TestClock.adjust(1);
+    assert.lengthOf(logs, 1);
+    yield* TestClock.adjust(30_000);
+    assert.lengthOf(logs, 2);
+    yield* Fiber.interrupt(first);
+    yield* Fiber.interrupt(second);
+    yield* Fiber.interrupt(holder);
+    assert.deepStrictEqual(yield* locks.holders, []);
+    yield* TestClock.adjust(60_000);
+    assert.lengthOf(logs, 2);
+  }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+});
+
+it.effect(
+  "#1290 an exclusive gate waiter logs every shared holder in its durable JSON line",
+  () => {
+    const messages: string[] = [];
+    const logger = Logger.make(({ message }) => {
+      if (String(message).includes("kanban board write refused")) messages.push(String(message));
+    });
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const holders = [];
+      for (const id of ["first", "second"]) {
+        const entered = yield* Deferred.make<void>();
+        holders.push(
+          yield* Effect.forkChild(
+            locks
+              .run(
+                locks.access(
+                  "crpko",
+                  Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+                ),
+                id,
+              )
+              .pipe(Effect.withSpan(`gate.${id}`)),
+          ),
+        );
+        yield* Deferred.await(entered);
+      }
+      const waiter = yield* Effect.forkChild(
+        locks
+          .board("crpko", Effect.void)
+          .pipe(Effect.provideService(BoardLocks.writeWaitMs, 25), Effect.exit),
+      );
+      yield* TestClock.adjust(25);
+      const result = yield* Fiber.join(waiter);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result))
+        assert.include(String(Cause.squash(result.cause)), "by gate.first +1 more");
+      assert.lengthOf(messages, 1);
+      assert.include(messages[0]!, '"event":"kanban board write refused"');
+      assert.include(messages[0]!, '"board.waiting_on":"gate"');
+      assert.include(messages[0]!, '"label":"gate.first"');
+      assert.include(messages[0]!, '"label":"gate.second"');
+      assert.include(messages[0]!, '"mode":"shared"');
+      for (const holder of holders) yield* Fiber.interrupt(holder);
+      assert.deepStrictEqual(yield* locks.holders, []);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  },
 );
