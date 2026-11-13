@@ -858,12 +858,19 @@ def _follow_forwarded(r, command, *, timeout=None, follow=False) -> int:
 
 
 def _never_started(r) -> bool:
-    return (r['mode'] != 'local' and r['status'] == 'lost' and r['exit_code'] is None
+    if r['mode'] == 'local':
+        return False
+    if r['status'] == 'killed':
+        return not r['box_id'] and not r['process_id']
+    return (r['status'] == 'lost' and r['exit_code'] is None
             and (r['error'] == 'client ended before it got a box' or
                  (not r['box_id'] and not r['process_id'])))
 
 
 def _report_never_started(r) -> int:
+    if r['status'] == 'killed':
+        say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        return 130
     say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box "
         "(caller interrupted?); nothing ran, safe to rerun")
     return EXIT_NOT_STARTED

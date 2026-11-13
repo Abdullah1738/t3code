@@ -102,9 +102,9 @@ class BackgroundQueueTests(Isolated):
                 self.fail('fixture milestone did not arrive')
             time.sleep(.01)
 
-    def test_full_pool_survives_caller_group_hup_and_kill_on_both_backends(self):
+    def test_full_pool_survives_caller_group_signals_on_both_backends(self):
         for backend, sig in ((backend, sig) for backend in ('boat', 'server')
-                             for sig in (signal.SIGHUP, signal.SIGKILL)):
+                             for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGKILL)):
             with self.subTest(backend=backend, signal=sig):
                 root = Path(self.tmp.name)
                 for name in ('returned', 'waiting', 'starts', 'ttl'):
@@ -214,6 +214,28 @@ runpy.run_path(target, run_name='__main__')
 
 
 class NeverStartedTests(Isolated):
+    def test_wait_and_logs_killed_while_queued_keep_exit_130(self):
+        for mode in ('fg', 'bg'):
+            for steps in (0, 2):
+                self.con.execute('DELETE FROM runs')
+                self.con.execute("INSERT INTO runs(run_id,mode,status,exit_code,step_count) "
+                                 "VALUES ('run-killed',?,'killed',130,?)", (mode, steps))
+                path = misc.LOGS_DIR / 'run-killed.log'
+                path.touch()
+                for command in (lambda: misc.wait('run-killed', 1), lambda: misc.logs('run-killed', False),
+                                lambda: misc.logs('run-killed', True)):
+                    with self.subTest(mode=mode, steps=steps, command=command), \
+                            contextlib.redirect_stdout(io.StringIO()) as out, \
+                            contextlib.redirect_stderr(io.StringIO()) as err, \
+                            patch.object(misc, '_catch_up_log', side_effect=AssertionError('nothing ran')):
+                        self.assertEqual(command(), 130)
+                        self.assertIn('killed while queued; never started; nothing ran, safe to rerun', err.getvalue())
+                        self.assertEqual(len(err.getvalue().splitlines()), 1)
+                        self.assertEqual(out.getvalue(), '')
+                        self.assertNotIn('incomplete', err.getvalue())
+                        self.assertNotIn('history', err.getvalue())
+                        self.assertEqual(path.stat().st_size, 0)
+
     def test_wait_reap_and_kill_ignore_stale_parent_pid_snapshots(self):
         for entry in ('wait', 'reap', 'kill'):
             self.con.execute('DELETE FROM runs')
@@ -283,6 +305,9 @@ class NeverStartedTests(Isolated):
         self.assertFalse(misc._never_started(row))
         self.assertFalse(misc._never_started(dict(row, mode='local', box_id=None, process_id=None)))
         self.assertFalse(misc._never_started(dict(row, box_id=None, process_id=None, exit_code=7)))
+        for box, pid in (('box', 42), ('box', None), (None, 42)):
+            self.assertFalse(misc._never_started(dict(row, status='killed', box_id=box, process_id=pid, exit_code=130)))
+        self.assertFalse(misc._never_started(dict(row, mode='local', status='killed', box_id=None, process_id=None)))
 
 
 class BackgroundRetryTests(Isolated):
