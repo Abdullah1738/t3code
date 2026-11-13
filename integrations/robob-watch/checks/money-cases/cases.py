@@ -107,9 +107,9 @@ EVENT_LIMIT = 4000
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
 FIELDS = ('merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline', 'due', 'why', 'who')
 REFUND_DONE = re.compile(
-    r'\brefund\s+(?:(?:has been|was|is)\s+)?(?P<after>processed|issued|initiated|credited|refunded|sent)\b'
+    r'\brefund\s+(?:(?:(?P<past>has been|was)|is)\s+)?(?P<after>processed|issued|initiated|credited|refunded|sent)\b'
     r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
-    r'|\b(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
+    r'|\b(?:(?P<credit_past>was|has been)\s+)?(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
 REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
 _REFUND_REQUEST = (r'(?:(?:re)?confirm|verify|check|advise|tell|inform|ensure|let)\b'
                    r'|(?:provide|send|share)\s+(?:(?:a|the|your)\s+)?confirmation\b')
@@ -121,8 +121,9 @@ REFUND_QUERY = re.compile(
     r'|\b(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?|need(?:s|ed)?|want(?:s|ed)?)\s+(?:that\s+)?you\b'
     r'|\b(?:asked|requested|required)\s+to\s+(?:confirm|verify|check)\b', re.I)
 REFUND_UNCERTAIN = re.compile(
-    r'\b(?:if|once|when|unless|until|before|after|upon|pending|provided|providing|assuming|tomorrow|later|soon)\b'
+    r'\b(?:if|unless|until|pending|provided|providing|assuming|tomorrow|later|soon)\b'
     r'|\b(?:in\s+case|as\s+long\s+as|so\s+long\s+as|subject\s+to|next\s+(?:day|week|month|year))\b', re.I)
+REFUND_TIMING = re.compile(r'\b(?:once|when|before|after|upon)\b', re.I)
 REFUND_FUTURE = re.compile(
     r'\b(?:will|would|shall|should|may|might|could|can(?!\s+confirm\b)|expect(?:s|ed|ing)?|hop(?:e[sd]?|ing)|plan(?:s|ned|ning)?|'
     r'anticipat(?:e|es|ed|ing)|intend(?:s|ed|ing)?|aim(?:s|ed|ing)?|scheduled|await(?:s|ing)?|'
@@ -2887,12 +2888,24 @@ def refund_mails(data, now, deadline, find=None, read=None):
                     # Abbreviations can look like sentence endings inside a question. Only
                     # a neutral trailing follow-up may be ignored; other questions block a hold.
                     confirmation = REFUND_FOLLOWUP.sub('', text)
-                    if '?' in confirmation or REFUND_QUERY.search(confirmation) or REFUND_UNCERTAIN.search(confirmation):
+                    if '?' in confirmation or REFUND_QUERY.search(confirmation):
                         continue
                     # A completed initiation may precede an estimate for the card credit.
                     future = REFUND_FUTURE.search(confirmation)
                     evidence = confirmation[:future.start()] if future else confirmation
-                    if not REFUND_DONE.search(evidence):
+                    done = REFUND_DONE.search(evidence)
+                    if not done:
+                        continue
+                    completed = done['past'] or done['before'] or done['credit_past']
+                    # Present/bare wording may depend on a condition after the future marker.
+                    context = evidence if completed else confirmation
+                    if REFUND_UNCERTAIN.search(context):
+                        continue
+                    # Past completion can be dated after approval; timing before it
+                    # or attached to present-tense processing still describes a condition.
+                    timings = list(REFUND_TIMING.finditer(context))
+                    if timings and (any(t.start() < done.end() for t in timings)
+                                    or not completed):
                         continue
                     changes = {'state': f'refund promised: {merchant} mail {mailed:%a %d %b %H:%M} says it was processed'}
                     due = mailed + dt.timedelta(days=7)

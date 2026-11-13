@@ -1471,8 +1471,59 @@ class Questions(Base):
             'Your refund is processed tomorrow.',
             'Your refund is processed next week.',
             'Your refund is processed next\nweek.',
+            'Your refund is processed after approval.',
+            'Your refund is processed before the cutoff.',
+            'Your refund is processed upon approval.',
+            'Your refund is processed once approved.',
+            'Your refund is processed when approved.',
         )
+        bodies += tuple(f'The amount {tense}credited back to your {destination} {timing}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approved', 'when approved'))
+        bodies += tuple(f'The amount {tense}credited back to your {destination}{separator}'
+                        f'this will happen only {condition}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for separator in ('; ', '.\n')
+                        for condition in ('after approval', 'if approval is received'))
         self.assert_refund_mail_ignored(bodies, 'future')
+
+    def test_completed_refund_keeps_past_timing_and_later_credit_estimates(self):
+        bodies = (
+            'We have initiated refund. The amount should be credited back to your card next week.',
+            'We have initiated refund. The amount should be credited back to your card next\nweek.',
+            'We have initiated refund. The amount should be credited back to your card tomorrow.',
+            'We have initiated refund. The amount should be credited back to your card soon.',
+            'Your refund was processed after approval.',
+            'Your refund has been processed after approval.',
+            'We processed the refund after approval.',
+            'Your refund was processed before the cutoff.',
+            'Your refund was processed upon approval.',
+            'Your refund was processed once approval was received.',
+            'Your refund was processed when approval was received.',
+        )
+        bodies += tuple(f'The amount {tense} credited back to your {destination} {timing}.'
+                        for tense in ('was', 'has been')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approval was received', 'when approval was received'))
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'completed-timing-{i}'
+                self.wd = self.tmp / f'completed-timing-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                row = dict(REFUND, body=body)
+                event = self.follow('2026-11-06T22:50', finder(row))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail']['id'], row['id'])
+                self.assertIn('refund promised', case['state'])
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(row), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
 
     def assert_refund_mail_ignored(self, bodies, label):
         for i, body in enumerate(bodies):
