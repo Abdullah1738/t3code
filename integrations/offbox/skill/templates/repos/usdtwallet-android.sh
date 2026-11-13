@@ -3,7 +3,10 @@ set -euo pipefail
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
-  sudo apt-get install -y -qq openjdk-17-jdk-headless
+  sudo apt-get install -y -qq openjdk-17-jdk-headless || {
+    sudo apt-get update -qq || exit 98
+    sudo apt-get install -y -qq openjdk-17-jdk-headless || exit 98
+  }
 fi
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
