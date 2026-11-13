@@ -611,6 +611,198 @@ export class Router {
     return this.checkingFailed ??= this.recoverFailedInbound().finally(() => { this.checkingFailed = undefined; });
   }
 
+  private checkingLatency?: Promise<void>;
+  private latencyScanAt = -Infinity;
+  private latencyParents = new Map<string, string>();
+  private latencyParentsAt = -Infinity;
+
+  /** Runs from the sender timer, independently of maintenance/health reads. */
+  checkInboundLatency(): Promise<void> {
+    return this.checkingLatency ??= this.sweepInboundLatency().finally(() => { this.checkingLatency = undefined; });
+  }
+
+  private latencyDue(): boolean {
+    const chat = this.options.context?.chat;
+    if (chat && chat.kind !== "owner" && chat.slug !== "moni") return false;
+    return this.store.pendingInbound().some(row => {
+      const input = row.payload as NormalizedInbound;
+      return row.state === "pending" && !synthetic(row.id) && input.source === "typed"
+        && !input.text.trimStart().startsWith("/") && !input.poll && !isTapback(input.text)
+        && input.receivedAt !== undefined && Date.now() - input.receivedAt >= 120_000;
+    });
+  }
+
+  /** Admission is a receipt, independent of whether the agent later succeeds. Call in a transaction. */
+  private delivered(leader: string, ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader]): void {
+    const deliveredAt = Date.now();
+    for (const id of ids) {
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      if (!row) continue;
+      this.store.updateInbound(id, "done");
+      if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
+      this.store.set(`inbound-delivered:${id}`, deliveredAt);
+      const receivedAt = (JSON.parse(row.payload) as NormalizedInbound).receivedAt;
+      if (receivedAt !== undefined && Number.isSafeInteger(receivedAt) && receivedAt >= 0) {
+        this.options.log?.("inbound-latency", `id=${id} receivedAt=${new Date(receivedAt).toISOString()} deliveredAt=${new Date(deliveredAt).toISOString()} ms=${deliveredAt - receivedAt}`);
+      }
+    }
+    this.store.set(`batch-phase:${leader}`, "accepted");
+  }
+
+  private async sweepInboundLatency(): Promise<void> {
+    const chat = this.options.context?.chat;
+    if (chat && chat.kind !== "owner" && chat.slug !== "moni") return;
+    const now = Date.now();
+    if (now - this.latencyScanAt < 1_000) return;
+    this.latencyScanAt = now;
+    const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+      `SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'batched', 'processing')
+        OR state = 'failed' AND EXISTS (SELECT 1 FROM kv WHERE key = 'batch-phase:' || inbound.id AND value = '"accepted"') ORDER BY rowid`,
+    ).all().filter(row => {
+      const input = JSON.parse(row.payload) as NormalizedInbound;
+      const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
+      const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
+        && !input.text.trimStart().startsWith("/") && !input.poll;
+      return !(row.state === "pending" && this.store.get(`inbound-delivered:${row.id}`) !== undefined)
+        && (wake || typed) && Number.isSafeInteger(input.receivedAt)
+        && now - input.receivedAt! >= (wake ? 15 * 60_000 : 120_000);
+    });
+    if (!rows.length) return;
+    // Sealed membership changes on a seal, not on the one-second delivery clock.
+    if (now - this.latencyParentsAt >= 60_000) {
+      this.latencyParents = new Map(this.store.db.query<{ member: string; leader: string }, []>(
+        `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
+          JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
+      ).all().map(row => [row.member, row.leader]));
+      this.latencyParentsAt = now;
+    }
+    const parents = this.latencyParents;
+    // Protect every candidate before the first backend await; an earlier slow read
+    // must not let the normal timer discard a later batch's membership.
+    const snapshots = new Map<string, { original: Turn | null | undefined; members: string[]; batch: NormalizedInbound | null | undefined }>();
+    for (const row of rows) {
+      const leader = parents.get(row.id) ?? row.id;
+      if (snapshots.has(leader)) continue;
+      const original = this.store.get<Turn | null>(`failed-delivery:${leader}`);
+      const batch = this.store.get<NormalizedInbound | null>(`batch:${leader}`);
+      const members = batch?.batchIds ?? [leader];
+      snapshots.set(leader, { original, members, batch });
+      const received = this.store.db.query<{ at: number }, [string]>("SELECT json_extract(payload, '$.receivedAt') AS at FROM inbound WHERE id = ?").get(leader)?.at;
+      if (!original || !this.current(original) || received === undefined || now - received > FAILED_INBOUND_REPLAY_MAX_AGE_MS) continue;
+      this.store.set(`latency-route:${leader}`, original);
+      const until = received + FAILED_INBOUND_REPLAY_MAX_AGE_MS;
+      this.store.set(`failed-replay-until:${leader}`, Math.min(this.store.get<number>(`failed-replay-until:${leader}`) ?? until, until));
+    }
+    const checked = new Set<string>();
+    let due = false;
+    for (const row of rows) {
+      const input = JSON.parse(row.payload) as NormalizedInbound;
+      const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
+      const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
+        && !input.text.trimStart().startsWith("/") && !input.poll;
+      if (!wake && !typed || !Number.isSafeInteger(input.receivedAt)) continue;
+      const age = now - input.receivedAt!;
+      if (age < (wake ? 15 * 60_000 : 120_000)) continue;
+      const leader = parents.get(row.id) ?? row.id;
+      const parent = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(leader);
+      if (parent?.state === "done" || this.store.get(`batch-phase:${leader}`) === "accepted") {
+        this.store.db.transaction(() => this.delivered(leader)).immediate();
+        continue;
+      }
+      if (row.state === "failed" || parent?.state === "failed") continue;
+      const retryKey = `stuck-wake-retry:${row.id}`;
+      const retryAt = this.store.get<number>(retryKey);
+      const firstRetry = wake && retryAt === undefined && age <= FAILED_INBOUND_REPLAY_MAX_AGE_MS;
+      if (firstRetry) {
+        const ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader];
+        for (const id of ids) if (id.startsWith("wake:") && this.store.get(`stuck-wake-retry:${id}`) === undefined) this.store.set(`stuck-wake-retry:${id}`, now);
+      }
+      if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
+      const { original, members, batch } = snapshots.get(leader)!;
+      let absent = true;
+      if (original) {
+        for (const id of [original.messageId, ...original.earlier ?? []]) {
+          try {
+            if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
+              this.store.db.transaction(() => {
+                // A normal tick may have admitted and already failed this turn during the read.
+                if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
+                  for (const member of members) if (this.store.get(`inbound-delivered:${member}`) === undefined) this.delivered(member, [member]);
+                  return;
+                }
+                const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
+                if (attempt) this.consumeSteer(leader, attempt);
+                else {
+                  const active = this.store.get<Turn | null>("activeTurn");
+                  if (this.current(original) && (!active || active.phase === "failed" || active.inboundId === leader)) {
+                    const admitted: Turn = { ...original, phase: "running" };
+                    this.store.set("activeTurn", admitted);
+                    this.landed(admitted);
+                  }
+                }
+                this.delivered(leader, members);
+              }).immediate();
+              absent = false;
+              break;
+            }
+          } catch { absent = false; }
+        }
+        const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
+        if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
+      }
+      if (wake && retryAt !== undefined && now - retryAt >= 5 * 60_000
+        && !this.store.get<boolean>(`stuck-wake-alert:${row.id}`) && this.options.notifyFailure) {
+        // Failed rows belong to #932. This path reports only an unadmitted wake still in the queue.
+        const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
+        if (live && ["pending", "batched", "processing"].includes(live.state)) {
+          const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch(() => false);
+          if (sent) this.store.set(`stuck-wake-alert:${row.id}`, true);
+        }
+      }
+      if (checked.has(leader)) continue;
+      checked.add(leader);
+      // Match #1179's replay horizon: never turn weeks of historical batched rows into new work.
+      if (!absent || age > FAILED_INBOUND_REPLAY_MAX_AGE_MS || parent?.state === "failed") continue;
+      // Idempotency is scoped to the destination thread. Never replay across a rotation.
+      if (original && (!this.current(original) || original.earlier?.length)) continue;
+      if (wake && this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined) continue;
+      // Batched rows retain the leader's original request id and sealed body. An orphan
+      // without a known destination cannot be safely replayed, but still earns the wake alert.
+      if ((row.state === "batched" || parent?.state === "processing") && !original) continue;
+      if (original) this.store.db.transaction(() => {
+        if (!this.current(original)) return;
+        this.store.set(`latency-route:${leader}`, original);
+        const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
+        const live = state.get(leader)?.state;
+        const active = this.store.get<Turn | null>("activeTurn");
+        const orphan = live === "processing" && !this.store.get("preparingDelivery")
+          && (!active || active.phase === "failed");
+        if (live !== "pending" && !orphan) return;
+        if (members.some(id => !["pending", "processing", "batched"].includes(state.get(id)?.state ?? ""))) return;
+        if (batch) this.store.set(`batch:${leader}`, batch);
+        for (const id of members) this.store.updateInbound(id, id === leader ? "pending" : "batched");
+        this.store.set(`batch-phase:${leader}`, "queued-steer");
+      }).immediate();
+      due = true;
+    }
+    if (due) await this.tick();
+  }
+
+  private stuckWakeAttempted(id: string | undefined): boolean {
+    return id !== undefined && id.startsWith("wake:") && this.store.get(`inbound-delivered:${id}`) === undefined
+      && this.store.get(`stuck-wake-attempt:${id}`) !== undefined;
+  }
+
+  private claimStuckWakeAttempt(id: string): boolean {
+    const ids = this.syntheticBatch(id) ?? [id];
+    // Once admitted, the existing no-tool execution retry policy owns this row.
+    if (ids.every(member => this.store.get(`inbound-delivered:${member}`) !== undefined)) return true;
+    if (!ids.some(member => member.startsWith("wake:") && this.store.get(`stuck-wake-retry:${member}`) !== undefined)) return true;
+    if (ids.some(member => this.stuckWakeAttempted(member))) return false;
+    for (const member of ids) this.store.set(`stuck-wake-attempt:${member}`, Date.now());
+    return true;
+  }
+
   /** Tool mode: the agent texts the chat itself, and no assistant text is ever forwarded. */
   private get toolMode(): boolean {
     return this.options.replyMode === "tool";
@@ -657,6 +849,17 @@ export class Router {
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
     const failure = this.store.inboundFailure(id)!;
+    if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined || this.store.get(`batch-phase:${id}`) === "accepted") {
+      this.store.updateInbound(id, "done");
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const input = row ? JSON.parse(row.payload) as NormalizedInbound : undefined;
+      // #932 still owns money/security execution alerts even though admission remains done.
+      if (input && criticalWake(id, input.text) && !this.store.get(`failed-alert:${id}`)) {
+        const time = new Date(input.sentAt ?? input.receivedAt ?? Date.now()).toLocaleString("en-GB", { timeZone: this.options.timezone });
+        this.store.set(`failed-alert-pending:${id}`, `Missed money/security update at ${time}:\n${wakeEventPreview(input.text)}`);
+      }
+      return;
+    }
     this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
   }
 
@@ -1018,10 +1221,9 @@ export class Router {
     this.store.set("resendBody", null);
     this.store.set("deliveryOutage", null);
     if (turn.inboundId) {
-      const ids = this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId];
-      for (const id of ids) this.store.updateInbound(id, "done");
-      this.store.set(`batch-phase:${turn.inboundId}`, "accepted");
+      this.delivered(turn.inboundId);
       this.store.set(`steer-attempt:${turn.inboundId}`, null);
+      this.store.set(`latency-route:${turn.inboundId}`, null);
       this.stage("prompt-accepted", turn.inboundId);
     }
     for (const id of this.syntheticBatch(turn.inboundId) ?? []) {
@@ -1029,6 +1231,7 @@ export class Router {
       if (retry) this.store.set(this.retryKey(id), { ...retry, prompts: retry.prompts.filter(p => p.messageId !== turn.messageId) });
     }
     if (turn.carried?.length) {
+      for (const id of turn.carried) this.delivered(id, [id]);
       this.store.set("missedSynthetic", (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => !turn.carried!.includes(m.id)));
     }
   }
@@ -1063,7 +1266,7 @@ export class Router {
       // Recover before taking the control snapshot so /new also sees restored members.
       for (const row of this.store.pendingInbound()) {
         const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
-        const held = preparing?.id === row.id && (preparing.attempt > 1 || preparing.held || this.store.get(`batch-phase:${row.id}`) === "creating");
+        const held = this.store.get(`latency-route:${row.id}`) || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held || this.store.get(`batch-phase:${row.id}`) === "creating");
         if (row.state === "processing" && !held) this.unsealBatch(row.id);
       }
       // Before controls, so a group line not meant for Robob never answers his pending question either.
@@ -1083,7 +1286,7 @@ export class Router {
         const input = row.payload as NormalizedInbound;
         if (row.state === "processing") {
           // A steer cut short is retried under its prompt id below, never dropped.
-          if (!this.owns(row.id) && !this.steering(row.id) && this.store.get<PreparingDelivery | null>("preparingDelivery")?.id !== row.id) {
+          if (!this.owns(row.id) && !this.steering(row.id) && this.store.get<PreparingDelivery | null>("preparingDelivery")?.id !== row.id && !this.store.get(`latency-route:${row.id}`)) {
             this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
           }
         } else {
@@ -1096,13 +1299,16 @@ export class Router {
       await this.preparationWatchdog(preceding);
       await this.poll();
       for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row, preceding);
+      // A typed message already waiting gets a dispatch before optional background discovery.
+      const dispatchFirst = this.latencyDue();
+      if (dispatchFirst) await this.dispatch(preceding);
       await this.watch();
       await this.nudgeDue();
       await this.nudgeDeferredNew();
       this.flushNotice();
       this.flushDropped();
       if (this.isGroup()) await this.gateGroup();
-      await this.dispatch(preceding);
+      if (!dispatchFirst) await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
       if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
       completed = true;
@@ -1153,7 +1359,7 @@ export class Router {
       // A reset nudge goes first, so texts sent right after /new reach the fresh context.
       // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
       // What a person typed goes ahead of watcher wakes queued before it: nobody waits behind an event they never sent.
-      const sendable = (row: InboundRecord) => row.state === "pending" && !this.backingOff(row.id, now)
+      const sendable = (row: InboundRecord) => row.state === "pending" && !this.stuckWakeAttempted(row.id) && !this.backingOff(row.id, now)
         && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart());
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
@@ -1208,9 +1414,9 @@ export class Router {
       const context = this.options.context;
       const quiet = this.options.quietMs ?? (context ? SENDBLUE_QUIET_MS : 15_000);
       // Someone is already waiting on the running turn, so a follow-up only gets the short wait.
-      if (!machine && now - latestReceivedAt < (steer ? Math.min(quiet, SENDBLUE_QUIET_MS) : quiet)) return;
+      if (!machine && !this.latencyDue() && now - latestReceivedAt < (steer ? Math.min(quiet, SENDBLUE_QUIET_MS) : quiet)) return;
       // Sendblue: someone still typing extends the wait, capped so a long typer cannot hold a batch forever.
-      if (!machine && context && context.typing()) {
+      if (!machine && !this.latencyDue() && context && context.typing()) {
         const oldest = Math.min(...inputs.map(item => item.receivedAt ?? now));
         if (now - oldest < SENDBLUE_TYPING_CAP_MS) return;
       }
@@ -1225,6 +1431,7 @@ export class Router {
         attachments: [...attachments.values()], isAudioMessage: inputs.some(item => item.isAudioMessage),
       };
       this.store.set(`batch:${leader.id}`, batch);
+      this.latencyParentsAt = -Infinity;
       this.store.set(`batch-phase:${leader.id}`, steer ? "steering" : "preparing");
       for (const row of members) this.store.updateInbound(row.id, row.id === leader.id ? "processing" : "batched");
       return { ...leader, state: "processing" };
@@ -1312,9 +1519,7 @@ export class Router {
       if (add || typed) this.store.set("activeTurn", {
         ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true } : {}),
       });
-      for (const member of this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id]) this.store.updateInbound(member, "done");
-      this.store.set(`batch:${id}`, null);
-      this.store.set(`batch-phase:${id}`, null);
+      this.delivered(id);
       this.store.set(`steer-attempt:${id}`, null);
     }).immediate();
   }
@@ -2540,6 +2745,8 @@ export class Router {
     const input = this.store.get<NormalizedInbound>(`batch:${row.id}`) ?? row.payload as NormalizedInbound;
     const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
     const steerAttempt = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`);
+    const latencyRoute = this.store.get<Turn | null>(`latency-route:${row.id}`);
+    if (latencyRoute && !this.current(latencyRoute)) return;
     if (steerAttempt && !this.current(steerAttempt)) {
       this.releaseSteer(row.id);
       this.store.set("preparingDelivery", null);
@@ -2747,7 +2954,7 @@ export class Router {
       try {
         const statuses = await this.statusesFor(activeRoute);
         busy = statuses[activeRoute.id] !== undefined;
-        if (!busy && !steerAttempt) activeRoute = await this.rotate(activeRoute, statuses);
+        if (!busy && !steerAttempt && !latencyRoute) activeRoute = await this.rotate(activeRoute, statuses);
       } catch { /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
@@ -2848,12 +3055,8 @@ export class Router {
             this.landed(adopted);
           } else {
             // It landed in a session the conversation has since left, where it was handled.
-            this.store.set(`batch:${row.id}`, null);
-            this.store.set(`batch-phase:${row.id}`, null);
-            for (const id of members) {
-              this.store.set(this.retryKey(id), null);
-              this.store.updateInbound(id, "done");
-            }
+            this.delivered(row.id, members);
+            for (const id of members) this.store.set(this.retryKey(id), null);
           }
         }).immediate();
         return;
@@ -2862,6 +3065,7 @@ export class Router {
       const attempts = this.store.get<SyntheticRetry | null>(this.retryKey(row.id))?.attempts ?? 0;
       if (attempts) promptId = `msg_${hash(`${row.id}:${attempts}`)}`;
     }
+    if (latencyRoute) promptId = latencyRoute.messageId;
     const turn: Turn = {
       id: activeRoute.id, directory: activeRoute.directory, generation: activeRoute.generation,
       inboundId: row.id, messageId: promptId, startedAt: steerAttempt?.startedAt ?? preparing?.startedAt ?? Date.now(), phase: "submitting",
@@ -2937,6 +3141,7 @@ export class Router {
         this.clearDeferredNew();
       }
       this.store.set(`batch-phase:${row.id}`, "submitting");
+      if (!this.claimStuckWakeAttempt(row.id)) return false;
       this.store.set("preparingDelivery", null);
       if (this.options.swipes) this.freezeSwipe(row.id);
       // Anything the agent sends for this turn lands after this mark.
@@ -3283,6 +3488,7 @@ export class Router {
   private async sendDelivery(turn: Turn, body: ResendBody, handled: Set<string>, replay = false): Promise<void> {
     if (this.expireFailedReplay(body.inboundId)) return;
     if (this.controlArrived(handled)) return;
+    if (!this.store.db.transaction(() => this.claimStuckWakeAttempt(body.inboundId)).immediate()) return;
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
     try {
@@ -3309,6 +3515,17 @@ export class Router {
     turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "running" || this.controlArrived(handled)) return;
     if (this.expireFailedReplay(turn.inboundId)) return;
+    if (this.stuckWakeAttempted(turn.inboundId)) {
+      if (this.inflight.has(turn.messageId)) return;
+      this.store.db.transaction(() => {
+        const ids = this.syntheticBatch(turn!.inboundId) ?? [turn!.inboundId!];
+        for (const id of ids) this.store.updateInbound(id, id === turn!.inboundId ? "pending" : "batched");
+        this.store.set(`batch-phase:${turn!.inboundId}`, "deferred-wake");
+        this.store.set("activeTurn", null);
+        this.store.set("resendBody", null);
+      }).immediate();
+      return;
+    }
     const stored = this.store.get<ResendBody | null>("resendBody");
     const body = stored && stored.inboundId === turn.inboundId ? stored : undefined;
     const elapsed = Date.now() - (turn.attemptAt ?? turn.startedAt);
@@ -3760,7 +3977,7 @@ export class Router {
         const said = this.toolMode ? sent ?? []
           : [turn!.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
-        if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
+        if (turn!.inboundId) this.delivered(turn!.inboundId);
         // Readback must not adopt a steer whose answer this transaction has already delivered.
         const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
         for (const row of this.store.pendingInbound()) {
