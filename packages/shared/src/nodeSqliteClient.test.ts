@@ -2130,7 +2130,9 @@ it.effect(
         yield* Effect.sync(() => {
           Atomics.store(gates, 2, 1);
           Atomics.notify(gates, 2);
-          assert.notEqual(Atomics.wait(gates, 1, 1, 10_000), "timed-out");
+          while (Atomics.load(gates, 1) < 2) {
+            assert.notEqual(Atomics.wait(gates, 1, 1, 10_000), "timed-out");
+          }
           assert.equal(Atomics.load(gates, 1), 2);
           vi.advanceTimersByTime(2_000);
         });
