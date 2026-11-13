@@ -799,9 +799,12 @@ const layerBase: Layer.Layer<
                     // Restore the caller's clock, tracing and references, but never its
                     // transaction binding: every statement must use this batch's writer.
                     Effect.provideContext(
-                      Context.add(entry.context, sql.transactionService, connection),
+                      Context.add(
+                        Context.add(entry.context, sql.transactionService, connection),
+                        WriteBatch,
+                        { publications },
+                      ),
                     ),
-                    Effect.provideService(WriteBatch, { publications }),
                   ),
                 );
                 yield* publishLane.take(1);
