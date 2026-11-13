@@ -408,15 +408,16 @@ def _fixture_setup(source):
     masked = re.sub(r'\$\(\([^()\n]*\)\)', 'guard_arithmetic', masked)
     masked = masked.replace('\\\n', '').replace('\\\r\n', '')
     masked = masked.replace('2>&1', ' guard_stderr_redirect')
-    lexer = shlex.shlex(masked, posix=True, punctuation_chars=';&|(){}\n')
+    lexer = shlex.shlex(masked, posix=True, punctuation_chars=';&|(){}\n<')
     lexer.whitespace = ' \t\r'
     lexer.whitespace_split = True
-    groups, group = [], []
+    groups, group, input_redirect = [], [], False
     for token in [*lexer, '\n']:
         if re.fullmatch(r'[;&|(){}\n]+', token):
-            groups.append((group, token))
-            group = []
+            groups.append((group, token, input_redirect))
+            group, input_redirect = [], False
         else:
+            input_redirect |= bool(re.fullmatch(r'[<;&|(){}\n]+', token) and '<' in token)
             for key, literal in quoted.items():
                 token = token.replace(key, literal)
             group.append(token)
@@ -452,7 +453,7 @@ def _fixture_setup(source):
         if target != '/dev/null' and not confined_path(target):
             return False
 
-    def command_safe(words):
+    def command_safe(words, input_redirect=False, piped_input=False):
         words = list(words)
         environment, isolated_environment = {}, False
         # Assignments and env are prefixes, never the executable being proved.
@@ -495,7 +496,11 @@ def _fixture_setup(source):
             sql_args = list(args)
             if sql_args[:1] == ['-readonly']:
                 sql_args.pop(0)
-            if not sql_args or sql_args[0] != ':memory:' and not confined_path(sql_args[0]):
+            # Only argv SQL is inspected here. File, pipe, heredoc and inherited
+            # stdin can carry additional commands, so none proves isolation.
+            if input_redirect or piped_input or len(sql_args) < 2:
+                return False
+            if sql_args[0] != ':memory:' and not confined_path(sql_args[0]):
                 return False
             # These SQLite helpers can change the fixture's filesystem; inspect
             # only SQL operands so Python's json.load remains a normal read.
@@ -535,7 +540,8 @@ def _fixture_setup(source):
             return args == ['$(dirname "$0")/..']
         return True
 
-    for words, separator in groups:
+    piped_input = False
+    for words, separator, input_redirect in groups:
         separator = separator.strip(';\n') or '\n'
         if separator == '()' and len(words) == 1:
             pending = words[0]
@@ -552,7 +558,7 @@ def _fixture_setup(source):
             return False
         if words:
             head = words[0]
-            if not command_safe(words):
+            if not command_safe(words, input_redirect, piped_input):
                 return False
             if defining is not None:
                 if head == 'return' or defining != function and any(fixture.search(word) for word in words):
@@ -581,6 +587,7 @@ def _fixture_setup(source):
             defining = None
         if words or '&' in separator or '|' in separator:
             conditional_call = '&' in separator or '|' in separator
+            piped_input = separator in {'|', '|&'}
     if defining is not None or pending is not None:
         return False
 
@@ -592,16 +599,19 @@ def _fixture_setup(source):
                 if not substitutions_safe(body, depth + 1):
                     return False
                 masked, quoted = _quoted_punctuation(body)
-                lexer = shlex.shlex(masked, posix=True, punctuation_chars=';&|\n')
+                lexer = shlex.shlex(masked, posix=True, punctuation_chars=';&|\n<')
                 lexer.whitespace = ' \t\r'
                 lexer.whitespace_split = True
-                group = []
+                group, input_redirect, piped_input = [], False, False
                 for token in [*lexer, '\n']:
                     if re.fullmatch(r'[;&|\n]+', token):
-                        if not command_safe(group):
+                        if not command_safe(group, input_redirect, piped_input):
                             return False
-                        group = []
+                        if group or '&' in token or '|' in token:
+                            piped_input = token.strip(';\n') in {'|', '|&'}
+                        group, input_redirect = [], False
                     else:
+                        input_redirect |= bool(re.fullmatch(r'[<;&|\n]+', token) and '<' in token)
                         for key, literal in quoted.items():
                             token = token.replace(key, literal)
                         group.append(token)

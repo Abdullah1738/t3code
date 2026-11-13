@@ -155,9 +155,11 @@ class RelativeScriptReporterTests(unittest.TestCase):
         rows += [('apps/server/scripts/migrate-dev-db.ts', 'node apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home', row) for row in isolated_source_cases.migration_mutations(migrate.read_text())]
         for path, command, (label, body, expected) in rows:
             self.write(path, body)
-            for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
-                with self.subTest(case=label, harness=harness, tool=tool):
-                    self.check(self.event(command, tool), expected, harness)
+            prefixes = ('', 'offbox run -- ', 'offbox run --remote --no-fallback -- ') if label.startswith('sqlite-input-') else ('',)
+            for prefix in prefixes:
+                for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
+                    with self.subTest(case=label, prefix=prefix, harness=harness, tool=tool):
+                        self.check(self.event(prefix + command, tool), expected, harness)
         self.write('tmp/fixture.sh', backup.read_text())
         for destination in (LIVE, '~/.t3/userdata/statev2.sqlite', '$HOME/.robob/userdata/statev2.sqlite'):
             for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:

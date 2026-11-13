@@ -282,6 +282,30 @@ cat "$T/.robob/userdata/statev2.sqlite"
     for operation in ('.shell ln -s', '.system ln -s', '.load', 'SELECT load_extension(', 'SELECT writefile('):
         call = '/opt/homebrew/opt/sqlite/bin/sqlite3 :memory: "' + operation + ' $HOME $T"'
         cases.append(('sqlite-helper-operations', minimal.replace('\n}\n', '\n  rm -rf "$T"\n  ' + call + '\n}\n'), 'live-database-script'))
+    sqlite = '/opt/homebrew/opt/sqlite/bin/sqlite3 :memory:'
+    generated_sql = '''  printf '.shell rm -rf "%s"; ln -s "%s" "%s"\\n' "$T" "$HOME" "$T" > "$TOP/fixture.sql"
+'''
+    for label, call, expected in (
+        ('argv', sqlite + ' "SELECT 1;"', None),
+        ('argv-comparison', sqlite + ' "SELECT 1 < 2;"', None),
+        ('inherited', sqlite, 'live-database-script'),
+        ('file', sqlite + ' < "$TOP/fixture.sql"', 'live-database-script'),
+        ('compact-file', sqlite + '<"$TOP/fixture.sql"', 'live-database-script'),
+        ('descriptor', sqlite + ' 0<"$TOP/fixture.sql"', 'live-database-script'),
+        ('descriptor-duplicate', sqlite + ' 0<&3', 'live-database-script'),
+        ('file-with-argv', sqlite + ' "SELECT 1;" < "$TOP/fixture.sql"', 'live-database-script'),
+        ('pipeline', 'cat "$TOP/fixture.sql" | ' + sqlite, 'live-database-script'),
+        ('env-pipeline', 'cat "$TOP/fixture.sql" | env ' + sqlite, 'live-database-script'),
+        ('pipeline-with-argv', 'cat "$TOP/fixture.sql" | ' + sqlite + ' "SELECT 1;"', 'live-database-script'),
+        ('multiline-pipeline', 'cat "$TOP/fixture.sql" |\n\n' + sqlite + ' "SELECT 1;"', 'live-database-script'),
+        ('pipeline-stderr', 'cat "$TOP/fixture.sql" |& ' + sqlite + ' "SELECT 1;"', 'live-database-script'),
+        ('here-string', sqlite + ' <<< "$SQL"', 'live-database-script'),
+        ('heredoc', sqlite + " <<'SQL'\nSELECT 1;\nSQL", 'live-database-script'),
+        ('substitution-file', 'result=$(' + sqlite + ' < "$TOP/fixture.sql")', 'live-database-script'),
+        ('substitution-pipeline', 'result=$(cat "$TOP/fixture.sql" | ' + sqlite + ' "SELECT 1;")', 'live-database-script'),
+    ):
+        setup = generated_sql if expected else ''
+        cases.append(('sqlite-input-' + label, minimal.replace('\n}\n', '\n' + setup + '  ' + call + '\n}\n'), expected))
     cases.append(('trap-root-mutation', minimal.replace('setup fake\n', 'trap \'rm -rf "$T"; ln -s "$HOME" "$T"\' DEBUG\nsetup fake\n'), 'live-database-script'))
     for linker in ('"$LINKER"', '"${LINKER}"', '"$(printf ln)"', '`printf ln`'):
         cases.append(('computed-link', original.replace('  R="$T/.local/share/memory-system"', '  LINKER=ln\n  ' + linker + ' -s "$HOME" "$T"\n  R="$T/.local/share/memory-system"'), 'live-database-script'))
