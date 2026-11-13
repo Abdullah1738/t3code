@@ -123,6 +123,8 @@ export interface SqliteClientConfig {
    * Ignored for in-memory databases.
    */
   readonly checkpointWorker?: boolean | undefined;
+  /** Defer routine checkpoints until startup completes; WAL backpressure still takes priority. */
+  readonly checkpointWorkerStart?: Effect.Effect<void> | undefined;
   /** Used by split stores to gate public access until their background copy commits. */
   readonly beforeAcquire?: Effect.Effect<void> | undefined;
 }
@@ -1266,6 +1268,7 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
   }
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   let stopped = false;
+  let started = options.checkpointWorkerStart === undefined;
   let generation = 0;
   let nextId = 0;
   let inFlight: number | undefined;
@@ -1336,6 +1339,9 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
   };
   const request = (force = false) => {
     if (stopped || writer.isTransaction) return;
+    // Even a background checkpoint can block a cold foreground pread on APFS.
+    // Keep routine inherited-WAL work off startup, without bypassing the WAL ceiling.
+    if (!started && !gated()) return;
     if (truncate !== undefined) {
       acknowledge();
       return;
@@ -1466,6 +1472,17 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
         Effect.onInterrupt(() => Effect.sync(() => release(waiter))),
       );
     });
+  if (options.checkpointWorkerStart !== undefined) {
+    yield* options.checkpointWorkerStart.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          started = true;
+          check();
+        }),
+      ),
+      Effect.forkScoped,
+    );
+  }
   return { check, runWithAdmission };
 });
 
