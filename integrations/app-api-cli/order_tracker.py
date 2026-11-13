@@ -1142,14 +1142,14 @@ def card_enrollment(new, cfg, args):
 
 
 def configure_problem_check(cfg, watchpath):
-    # Receipt modes have a separate CLI; untrackable orders must never poll.
-    if cfg.get('mode') in ('email_receipt', 'untrackable'):
+    if cfg.get('untrackable') or cfg.get('mode') == 'untrackable':
         return
     if not watchpath.exists():
         return
     watcher = read(watchpath)
-    command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check-pending',
-                          '--app', cfg['app'], '--order', cfg['order']])
+    target = (['--merchant', cfg['merchant'], '--order-id', cfg['order']]
+              if cfg.get('mode') == 'email_receipt' else ['--app', cfg['app'], '--order', cfg['order']])
+    command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check-pending', *target])
     if watcher.get('pending_check') != command:
         watcher['pending_check'] = command
         write(watchpath, watcher)

@@ -1,8 +1,11 @@
 import contextlib
 import datetime as dt
+import fcntl
 from email.message import EmailMessage
 import io
 import json
+import shlex
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -266,15 +269,19 @@ class OrderProof(unittest.TestCase):
     def test_untrackable_registration_never_polls_until_manual_delivery(self):
         argv = ['add', '--merchant', 'Acme', '--order-id', 'ORD-123', '--untrackable',
                 '--amount', '81.15', '--card', '2342', '--requester', 'moni']
-        with patch.object(tracker, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(tracker, 'run') as run, patch.object(tracker, 'fetch') as fetch, \
+                contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(tracker.main(argv), 0)
             self.assertEqual(tracker.main(argv), 0)
             self.assertTrue(receipt.can_report('ORD-123')['untrackable'])
             cfg = tracker.read(tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json'))
             self.assertTrue(cfg['active'])
+            tracker.main(['check', '--merchant', 'Acme', '--order-id', 'ORD-123'])
+            tracker.main(['check-pending', '--merchant', 'Acme', '--order-id', 'ORD-123'])
             tracker.main(['delivered', '--merchant', 'Acme', '--order-id', 'ORD-123'])
             self.assertFalse(receipt.can_report('ORD-123')['ok'])
         run.assert_not_called()
+        fetch.assert_not_called()
 
     def test_email_registration_creates_a_running_watcher_and_requires_readback(self):
         calls = []
@@ -292,7 +299,7 @@ class OrderProof(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn('--merchant Acme --order-id ORD-123', calls[0][calls[0].index('--check') + 1])
 
-    def test_native_problem_check_configuration_preserves_receipt_watchers(self):
+    def test_problem_check_configuration_routes_receipts_and_skips_untrackable(self):
         for mode in ('email_receipt', 'untrackable'):
             cfg = dict(self.cfg, mode=mode, watcher='order-acme-' + mode)
             tracker.write(tracker.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
@@ -303,11 +310,88 @@ class OrderProof(unittest.TestCase):
         tracker.write(tracker.WATCHERS / native['watcher'] / 'watcher.json',
                       {'id': native['watcher'], 'check': 'native check'})
         self.assertEqual(tracker.main(['configure-problem-checks']), 0)
-        for mode in ('email_receipt', 'untrackable'):
-            definition = tracker.read(tracker.WATCHERS / ('order-acme-' + mode) / 'watcher.json')
-            self.assertNotIn('pending_check', definition)
+        definition = tracker.read(tracker.WATCHERS / 'order-acme-email_receipt' / 'watcher.json')
+        self.assertIn('check-pending --merchant Acme --order-id ORD-123', definition['pending_check'])
+        self.assertNotIn('--app', definition['pending_check'])
+        definition = tracker.read(tracker.WATCHERS / 'order-acme-untrackable' / 'watcher.json')
+        self.assertNotIn('pending_check', definition)
         definition = tracker.read(tracker.WATCHERS / native['watcher'] / 'watcher.json')
         self.assertIn('check-pending --app noon --order N123', definition['pending_check'])
+
+    def test_receipt_registration_prime_problem_retry_delivery_and_retirement(self):
+        wid = self.cfg['watcher']
+        folder = tracker.WATCHERS / wid
+        config_path = tracker.ROOT / 'orders' / (wid + '.json')
+        state_path = folder / 'order-tracker-state.json'
+        result = {'status': 'unknown', 'errors': []}
+        attempts, removed = [], []
+
+        def invoke(command, run_id, main_checked=False):
+            with patch.dict('os.environ', {'WATCH_DIR': str(folder), 'WATCH_RUN': run_id,
+                                          'WATCH_MAIN_CHECKED': '1' if main_checked else '0'}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                tracker.main(shlex.split(command)[2:])
+            return output.getvalue()
+
+        def watch(command, timeout=12):
+            if command[:2] == ['robob-watch', 'add']:
+                definition = {'id': wid, 'check': command[command.index('--check') + 1]}
+                tracker.write(folder / 'watcher.json', definition)
+                tracker.write(folder / 'state.json', {'status': 'active', 'fires': 0})
+                invoke(definition['check'], 'prime-fixture')
+            elif command == ['robob-watch', 'remove', wid]:
+                removed.append(wid)
+                (folder / 'watcher.json').unlink()
+            else:
+                self.fail(f'Unexpected watcher command: {command}')
+            return '{}'
+
+        def send(command, **kwargs):
+            self.assertEqual(command[:3], [tracker.BUN, tracker.PROBLEM_CLI, 'notify'])
+            attempts.append(command)
+            if len(attempts) == 1:
+                return subprocess.CompletedProcess(command, 1, '', 'fixture unavailable')
+            return subprocess.CompletedProcess(command, 0, json.dumps({'id': 'notice:fixture', 'created': True}), '')
+
+        real_flock = fcntl.flock
+        def nonblocking_flock(fd, operation):
+            # A registration prime must not wait on its parent's registration lock.
+            return real_flock(fd, operation | fcntl.LOCK_NB)
+
+        argv = ['add', '--merchant', 'Acme', '--email-receipt', '--order-id', 'ORD-123',
+                '--amount', '600', '--card', '2342', '--requester', 'moni']
+        with patch.object(tracker, 'run', watch), patch.object(receipt, 'fetch', side_effect=lambda *a: dict(result)), \
+                patch.object(tracker.delivery_cards, 'safe_sync', return_value={}), \
+                patch.object(tracker.subprocess, 'run', send), patch.object(fcntl, 'flock', nonblocking_flock), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(tracker.main(argv), 0)
+            definition = tracker.read(folder / 'watcher.json')
+            self.assertIn('pending_check', definition)
+            self.assertEqual(attempts, [])
+            notices = tracker.read(state_path)['problem_notices']
+            self.assertEqual(len(notices), 1)
+            self.assertEqual(next(iter(notices.values()))['status'], 'pending')
+
+            invoke(definition['check'], 'poll-unknown')
+            invoke(definition['pending_check'], 'pending-retry', main_checked=True)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(next(iter(tracker.read(state_path)['problem_notices'].values()))['status'], 'pending')
+
+            result.update(status='delivered', whole_order_complete=True)
+            output = json.loads(invoke(definition['check'], 'poll-delivered'))
+            self.assertEqual(output['for'], 'moni')
+            self.assertIn({'kind': 'stage_change', 'status': 'delivered'}, output['events'])
+            tracker.write(folder / 'state.json', {'status': 'active', 'pending': {'run_id': 'poll-delivered'}})
+            invoke(definition['pending_check'], 'pending-after-delivery')
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual([call[call.index('--key') + 1] for call in attempts], list(notices) * 2)
+            self.assertEqual(next(iter(tracker.read(state_path)['problem_notices'].values()))['status'], 'sent')
+            self.assertEqual(removed, [])
+            tracker.write(folder / 'state.json', {'status': 'active'})
+            invoke(definition['check'], 'poll-retire')
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(removed, [wid])
+            self.assertFalse(tracker.read(config_path)['active'])
 
     def test_amazon_cancelled_item_uses_requester_drop_path(self):
         import amazon_email_orders as amazon

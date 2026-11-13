@@ -42,6 +42,11 @@ from the product type, order date or another merchant. `can-report` returns
 `no ETA given` when none was recorded, and fails for missing, ambiguous, paused,
 expired, inactive or payment-held tracking.
 
+Receipt watchers install a receipt-compatible callback to drain large-order
+problem notices. Deployment runs `order-watch configure-problem-checks` to
+repair this callback on existing active receipt trackers; untrackable orders
+remain without polling.
+
 Use `--untrackable` instead of `--email-receipt` when there is no tracking
 source. This registers an open order without polling; close it explicitly with
 `order-watch delivered --merchant Acme --order-id ORD-123`. `remove` stops either

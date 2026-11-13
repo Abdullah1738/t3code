@@ -210,7 +210,7 @@ def can_report(order):
 def main(argv):
     import order_tracker as tracker
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['add', 'check', 'status', 'delivered', 'remove'])
+    parser.add_argument('command', choices=['add', 'check', 'check-pending', 'status', 'delivered', 'remove'])
     parser.add_argument('--merchant', required=True)
     parser.add_argument('--order-id', '--order', dest='order', required=True)
     mode = parser.add_mutually_exclusive_group()
@@ -234,7 +234,10 @@ def main(argv):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     import fcntl
     with path.with_suffix('.registration.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        # The registration prime runs this CLI while its parent holds this lock.
+        # Checks serialize their state writes through order-tracker.lock instead.
+        if args.command not in ('check', 'check-pending'):
+            fcntl.flock(lock, fcntl.LOCK_EX)
         cfg = tracker.read(path)
         if args.command == 'add':
             if cfg and cfg.get('mode') not in ('email_receipt', 'untrackable'):
@@ -270,13 +273,20 @@ def main(argv):
                 tracker.run(['robob-watch', 'add', '--id', wid, '--title', cfg['merchant'] + ' ' + args.order,
                              '--check', command, '--interval', '300', '--mode', 'wake', '--max-fires', '0',
                              '--session', args.session, '--context', context], 55)
+            if not cfg['untrackable']:
+                tracker.configure_problem_check(cfg, tracker.WATCHERS / wid / 'watcher.json')
             proof = can_report(args.order)
             print(json.dumps(proof))
             return 0 if proof['ok'] else 1
         if not cfg:
             parser.error('Register the order first')
-        if args.command == 'check':
-            return tracker.check(cfg)
+        if args.command in ('check', 'check-pending'):
+            if not cfg['untrackable']:
+                if args.command == 'check-pending':
+                    tracker._check(cfg, pending_only=True)
+                else:
+                    tracker.check(cfg)
+            return 0
         if args.command == 'status':
             print(json.dumps(cfg if cfg['untrackable'] else fetch(cfg, {}, time.time())))
         elif args.command == 'delivered':
