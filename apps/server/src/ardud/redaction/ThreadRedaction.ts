@@ -1,3 +1,8 @@
+import { resolveClaudeHomePath } from "../../provider/Drivers/ClaudeHome.ts";
+import { resolveCodexHomeLayout } from "../../provider/Drivers/CodexHomeLayout.ts";
+import { resolveManagedCodexHomeLayout } from "../../provider/CodexManagedHome.ts";
+import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Exit from "effect/Exit";
@@ -9,6 +14,9 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 // @effect-diagnostics nodeBuiltinImport:off - Atomic fsync/rename and byte-preserving fixture verification require native file handles.
 import * as CommandOutputHub from "../../orchestration-v2/CommandOutputHub.ts";
 import {
+  ClaudeSettings,
+  CodexSettings,
+  ProviderInstanceId,
   EventId,
   ThreadId,
   OrchestrationV2TurnItemJson,
@@ -21,6 +29,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -90,6 +99,8 @@ export class ThreadRedactionError extends Schema.TaggedError<ThreadRedactionErro
   }
 }
 
+const decodeClaudeSettings = Schema.decodeUnknownEffect(ClaudeSettings);
+const decodeCodexSettings = Schema.decodeUnknownEffect(CodexSettings);
 const isThreadRedactionError = Schema.is(ThreadRedactionError);
 const isTurnItemJson = Schema.is(OrchestrationV2TurnItemJson);
 const isDomainEventJson = Schema.is(OrchestrationV2DomainEventJson);
@@ -203,6 +214,7 @@ const active = new Set([
 ]);
 
 const make = Effect.gen(function* () {
+  const path = yield* Path.Path;
   const writer = yield* SqlClient.SqlClient;
   const replica = yield* ReadonlyReplica.ReadonlyReplica;
   const traces = yield* SharedObservability.TraceStorageMaintenance;
@@ -281,7 +293,9 @@ const make = Effect.gen(function* () {
                               (recovery[0]?.item_id !== input.itemId ||
                                 retained?.itemId !== input.itemId)
                             )
-                              return yield* new ThreadRedactionError({ code: "recovery_required" });
+                              return yield* new ThreadRedactionError({
+                                code: "recovery_required",
+                              });
                             clearEarly = !wasPending;
                             if (!wasPending)
                               recoveryNeedles.set(input.threadId, {
@@ -678,9 +692,15 @@ const make = Effect.gen(function* () {
                                         const selectedProviderThreadId =
                                           selected.row.provider_thread_id ??
                                           selected.value.providerThreadId;
+                                        const settings = yield* settingsService.getSettings.pipe(
+                                          Effect.mapError(
+                                            () => new ThreadRedactionError({ code: "failed" }),
+                                          ),
+                                        );
                                         const sessionIds = new Set<string>();
                                         const ownerSessionIds = new Set<string>();
                                         const drivers = new Set<string>();
+                                        const instanceDrivers = new Map<string, string>();
                                         for (const { rows } of bindings)
                                           for (const row of rows) {
                                             const v = record(payload(row));
@@ -689,14 +709,25 @@ const make = Effect.gen(function* () {
                                               (typeof selectedProviderThreadId === "string" &&
                                                 row.provider_thread_id ===
                                                   selectedProviderThreadId);
-                                            const driver = String(
+                                            const bindingDriver = String(
                                               v.driver ??
                                                 row.driver ??
                                                 row.provider_name ??
                                                 row.provider ??
                                                 "unknown",
                                             );
+                                            const instanceId =
+                                              row.provider_instance_id ??
+                                              v.providerInstanceId ??
+                                              v.instanceId ??
+                                              bindingDriver;
+                                            const driver =
+                                              settings.providerInstances[
+                                                ProviderInstanceId.make(String(instanceId))
+                                              ]?.driver ?? bindingDriver;
                                             drivers.add(driver);
+                                            if (typeof instanceId === "string")
+                                              instanceDrivers.set(instanceId, driver);
                                             for (const value of [
                                               record(v.nativeThreadRef).nativeId,
                                               row.provider_session_id,
@@ -750,9 +781,124 @@ const make = Effect.gen(function* () {
                                               dir: NodePath.join(root, d.name),
                                             }));
                                         });
+                                        const baseEnvironment = yield* HostProcess.Environment;
+                                        for (const [id, boundDriver] of instanceDrivers) {
+                                          const instanceId = ProviderInstanceId.make(id);
+                                          const instance = settings.providerInstances[instanceId];
+                                          const driver = instance?.driver ?? boundDriver;
+                                          if (driver !== "codex" && driver !== "claudeAgent")
+                                            continue;
+                                          const environment =
+                                            yield* mergeProviderInstanceEnvironment(
+                                              instance?.environment,
+                                              baseEnvironment,
+                                            );
+                                          if (driver === "claudeAgent") {
+                                            const typed = yield* decodeClaudeSettings(
+                                              instance?.config ?? {},
+                                            ).pipe(
+                                              Effect.mapError(
+                                                () => new ThreadRedactionError({ code: "failed" }),
+                                              ),
+                                            );
+                                            // Relative inherited homes are resolved by the CLI from its session cwd.
+                                            if (
+                                              !typed.homePath.trim() &&
+                                              environment.CLAUDE_CONFIG_DIR?.trim() &&
+                                              !NodePath.isAbsolute(
+                                                environment.CLAUDE_CONFIG_DIR.trim(),
+                                              )
+                                            )
+                                              return yield* new ThreadRedactionError({
+                                                code: "invalid",
+                                              });
+                                            const defaultHome =
+                                              !typed.homePath.trim() &&
+                                              !environment.CLAUDE_CONFIG_DIR?.trim()
+                                                ? environment.HOME
+                                                : undefined;
+                                            if (defaultHome && !NodePath.isAbsolute(defaultHome))
+                                              return yield* new ThreadRedactionError({
+                                                code: "invalid",
+                                              });
+                                            roots.push({
+                                              driver,
+                                              dir: defaultHome
+                                                ? NodePath.join(defaultHome, ".claude")
+                                                : yield* resolveClaudeHomePath(typed, environment),
+                                            });
+                                          } else {
+                                            const typed = yield* decodeCodexSettings(
+                                              instance?.config ?? {},
+                                            ).pipe(
+                                              Effect.mapError(
+                                                () => new ThreadRedactionError({ code: "failed" }),
+                                              ),
+                                            );
+                                            if (
+                                              typed.setupMode !== "managed" &&
+                                              !typed.homePath.trim() &&
+                                              !typed.shadowHomePath.trim() &&
+                                              environment.CODEX_HOME?.trim() &&
+                                              !NodePath.isAbsolute(environment.CODEX_HOME.trim())
+                                            )
+                                              return yield* new ThreadRedactionError({
+                                                code: "invalid",
+                                              });
+                                            const defaultHome =
+                                              typed.setupMode !== "managed" &&
+                                              !typed.homePath.trim() &&
+                                              !typed.shadowHomePath.trim() &&
+                                              !environment.CODEX_HOME?.trim()
+                                                ? environment.HOME
+                                                : undefined;
+                                            if (defaultHome && !NodePath.isAbsolute(defaultHome))
+                                              return yield* new ThreadRedactionError({
+                                                code: "invalid",
+                                              });
+                                            const layout = yield* typed.setupMode === "managed"
+                                              ? resolveManagedCodexHomeLayout(
+                                                  config.stateDir,
+                                                  instanceId,
+                                                  typed,
+                                                )
+                                              : resolveCodexHomeLayout(
+                                                  !typed.homePath.trim() &&
+                                                    !typed.shadowHomePath.trim() &&
+                                                    environment.CODEX_HOME?.trim()
+                                                    ? {
+                                                        ...typed,
+                                                        homePath: environment.CODEX_HOME.trim(),
+                                                      }
+                                                    : defaultHome
+                                                      ? {
+                                                          ...typed,
+                                                          homePath: NodePath.join(
+                                                            defaultHome,
+                                                            ".codex",
+                                                          ),
+                                                        }
+                                                      : typed,
+                                                );
+                                            roots.push({ driver, dir: layout.sharedHomePath });
+                                            if (layout.effectiveHomePath)
+                                              roots.push({
+                                                driver,
+                                                dir: layout.effectiveHomePath,
+                                              });
+                                          }
+                                        }
+                                        const uniqueRoots = [
+                                          ...new Map(
+                                            roots.map((root) => [
+                                              `${root.driver}\0${root.dir}`,
+                                              root,
+                                            ]),
+                                          ).values(),
+                                        ];
                                         const providerPaths = new Set<string>();
                                         const taskRefs = new Set<string>();
-                                        for (const root of roots) {
+                                        for (const root of uniqueRoots) {
                                           const all = yield* io(async () =>
                                             (
                                               await Promise.all(
@@ -840,11 +986,6 @@ const make = Effect.gen(function* () {
                                             });
                                         }
                                         if (drivers.has("claudeAgent")) {
-                                          const settings = yield* settingsService.getSettings.pipe(
-                                            Effect.mapError(
-                                              () => new ThreadRedactionError({ code: "failed" }),
-                                            ),
-                                          );
                                           const tmpBases = new Set([
                                             "/tmp",
                                             process.env.CLAUDE_CODE_TMPDIR?.trim() || "/tmp",
@@ -945,7 +1086,16 @@ const make = Effect.gen(function* () {
                                         const logPaths = yield* io(() =>
                                           filesBelow(config.logsDir),
                                         );
-                                        for (const file of [...providerPaths, ...logPaths])
+                                        const physicalPaths = yield* io(async () => [
+                                          ...new Set(
+                                            await Promise.all(
+                                              [...providerPaths, ...logPaths].map((file) =>
+                                                NodeFSP.realpath(file),
+                                              ),
+                                            ),
+                                          ),
+                                        ]);
+                                        for (const file of physicalPaths)
                                           plans.push(
                                             yield* io(() => planFile(file, needles, marker)),
                                           );
@@ -1192,6 +1342,7 @@ const make = Effect.gen(function* () {
           );
         }),
         Effect.withTracerEnabled(false),
+        Effect.provideService(Path.Path, path),
       );
   });
   return ThreadRedaction.of({ redactItem });

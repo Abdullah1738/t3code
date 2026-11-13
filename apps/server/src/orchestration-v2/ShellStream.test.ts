@@ -17,6 +17,8 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  toShellApplicationEvent,
+  shellChangeEvents,
   archivedShellStreamItemFromThreadShell,
   buildActiveShellSnapshot,
   coalesceShellApplicationEvents,
@@ -745,3 +747,46 @@ describe("withSubagentRequestAncestors", () => {
     }),
   );
 });
+
+it.effect(
+  "redaction invalidation survives shell coalescing, archived removal, replay and unchanged-shell suppression",
+  () =>
+    Effect.gen(function* () {
+      const redacted = toShellApplicationEvent({
+        ...storedThreadEvent(8, "thread-a", { type: "thread.item-redacted" }),
+      });
+      const later = toShellApplicationEvent({
+        ...storedThreadEvent(9, "thread-a", { type: "thread.metadata-updated" }),
+      });
+      const [coalesced] = coalesceShellApplicationEvents([redacted, later]);
+      expect(coalesced).toEqual({
+        sequence: 9,
+        event: { threadId: "thread-a" },
+        redactionSequence: 8,
+      });
+      const replayed = shellChangeEvents({
+        threads: [{ threadId: ThreadId.make("thread-a"), sequence: 9, redactionSequence: 8 }],
+        projects: [],
+      });
+      expect(replayed).toEqual([coalesced]);
+      if (!coalesced || !("event" in coalesced)) throw new Error("Missing fixture event");
+      const shell = shellFixture({ id: ThreadId.make("thread-a") });
+      const ordinary = shellStreamItemFromThreadShell({
+        stored: { sequence: 7, event: { threadId: shell.id } },
+        shell,
+      });
+      const invalidation = shellStreamItemFromThreadShell({ stored: coalesced, shell });
+      expect(invalidation).toMatchObject({ kind: "thread.updated", redactionSequence: 8 });
+      const delivered = yield* Stream.make(ordinary, invalidation).pipe(
+        skipUnchangedThreadShells,
+        Stream.runCollect,
+      );
+      expect(delivered).toEqual([ordinary, invalidation]);
+      expect(
+        shellStreamItemFromThreadShell({
+          stored: coalesced,
+          shell: { ...shell, archivedAt: shell.createdAt },
+        }),
+      ).toMatchObject({ kind: "thread.removed", redactionSequence: 8, threadId: shell.id });
+    }),
+);

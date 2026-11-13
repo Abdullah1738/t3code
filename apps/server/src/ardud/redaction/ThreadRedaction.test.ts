@@ -1,3 +1,4 @@
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
 import * as FileSystem from "effect/FileSystem";
 import * as PlatformError from "effect/PlatformError";
@@ -93,7 +94,16 @@ const testLayer = ThreadRedaction.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(Effect.provide(testLayer), Effect.scoped);
+  Effect.gen(function* () {
+    const config = yield* Config.ServerConfig;
+    return yield* effect.pipe(
+      Effect.provideService(
+        HostProcess.HomeDirectory,
+        NodePath.join(config.baseDir, "fixture-host-home"),
+      ),
+      Effect.provideService(HostProcess.Environment, {}),
+    );
+  }).pipe(Effect.provide(testLayer), Effect.scoped);
 const seed = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`INSERT INTO orchestration_v2_projection_turn_items (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json) VALUES ('item-fixture', ${threadId}, 1, 'command_execution', 'completed', '2026-01-01', ${JSON.stringify(fixture)})`;
@@ -3349,6 +3359,241 @@ it.effect.each([
         pending: number;
       }>`SELECT pending FROM ardud_thread_redaction_recovery WHERE thread_id=${threadId}`;
       expect(pending[0]?.pending).toBe(0);
+    }),
+  ),
+);
+
+it.effect.each(
+  ["claudeAgent", "codex"].flatMap((driver) =>
+    [
+      "config",
+      "environment",
+      "inherited",
+      "default",
+      "tilde",
+      "shadow",
+      "managed",
+      "home-environment",
+      "home-inherited",
+      "home-whitespace-environment",
+      "home-whitespace-inherited",
+    ]
+      .filter((source) => driver === "codex" || (source !== "shadow" && source !== "managed"))
+      .map((source) => ({ driver, source })),
+  ),
+)(
+  "covers owning provider home $driver via $source despite an old harness copy",
+  ({ driver, source }) =>
+    run(
+      Effect.gen(function* () {
+        yield* seed;
+        const sql = yield* SqlClient.SqlClient;
+        const config = yield* Config.ServerConfig;
+        const settings = yield* ServerSettingsService;
+        const instanceId = ProviderInstanceId.make(driver + "-custom");
+        const home = yield* HostProcess.HomeDirectory;
+        const variable = source.startsWith("home-")
+          ? "HOME"
+          : driver === "codex"
+            ? "CODEX_HOME"
+            : "CLAUDE_CONFIG_DIR";
+        const custom =
+          source === "default" || source === "managed"
+            ? NodePath.join(home, driver === "codex" ? ".codex" : ".claude")
+            : source.startsWith("home-")
+              ? NodePath.join(
+                  home,
+                  source.includes("whitespace") ? "provider-account " : "provider-account",
+                  driver === "codex" ? ".codex" : ".claude",
+                )
+              : NodePath.join(home, "custom-" + driver);
+        yield* settings.updateProviderInstance({
+          operation: "upsert",
+          instanceId,
+          instance: {
+            driver: ProviderDriverKind.make(driver),
+            config: {
+              ...(driver === "codex"
+                ? { setupMode: source === "managed" ? "managed" : "existing" }
+                : {}),
+              ...(source === "config" || source === "tilde" || source === "shadow"
+                ? { homePath: source === "tilde" ? "~/custom-" + driver : custom }
+                : {}),
+              ...(source === "shadow"
+                ? { shadowHomePath: NodePath.join(home, "shadow-codex") }
+                : {}),
+            },
+            ...(source === "environment" ||
+            (source.startsWith("home-") && source.endsWith("environment"))
+              ? {
+                  environment: [
+                    {
+                      name:
+                        source.startsWith("home-") && source.endsWith("environment")
+                          ? "HOME"
+                          : variable,
+                      value:
+                        source.startsWith("home-") && source.endsWith("environment")
+                          ? NodePath.dirname(custom)
+                          : custom,
+                      sensitive: false,
+                    },
+                  ],
+                }
+              : {}),
+          },
+        });
+        yield* sql`INSERT INTO projection_thread_sessions(thread_id,status,provider_name,provider_session_id,provider_instance_id,updated_at) VALUES (${threadId},'stopped',${driver},'session-fixture',${instanceId},'2026-01-01')`;
+        const relative =
+          driver === "codex"
+            ? "sessions/rollout-session-fixture.jsonl"
+            : "projects/fixture/session-fixture.jsonl";
+        const old = NodePath.join(
+          config.baseDir,
+          "harness-homes",
+          driver === "codex" ? "codex" : "claude",
+          relative,
+        );
+        const actual = NodePath.join(custom, relative);
+        const providerOnly = "eyJFAKE.ONLY-ACTUAL-PROVIDER-HOME";
+        const line = (output: string) =>
+          JSON.stringify(
+            driver === "codex"
+              ? {
+                  type: "response_item",
+                  payload: { type: "function_call_output", call_id: "call-fixture", output },
+                }
+              : { type: "tool_result", tool_use_id: "call-fixture", content: output },
+          ) + "\n";
+        yield* Effect.promise(async () => {
+          for (const path of [old, actual])
+            await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
+          await NodeFSP.writeFile(old, line(fake));
+          await NodeFSP.writeFile(
+            actual,
+            line(providerOnly) + JSON.stringify({ summary: providerOnly }) + "\n",
+          );
+          if (source === "shadow") {
+            const shadow = NodePath.join(home, "shadow-codex");
+            await NodeFSP.mkdir(shadow, { recursive: true });
+            await NodeFSP.symlink(
+              NodePath.join(custom, "sessions"),
+              NodePath.join(shadow, "sessions"),
+              "dir",
+            );
+          }
+        });
+        const service = yield* ThreadRedaction.ThreadRedaction;
+        const result = yield* service
+          .redactItem({ threadId, itemId: "call-fixture", reason: "fixture", compact: true })
+          .pipe(
+            Effect.provideService(
+              HostProcess.Environment,
+              source === "inherited"
+                ? { [variable]: custom }
+                : source.startsWith("home-") && source.endsWith("inherited")
+                  ? { HOME: NodePath.dirname(custom) }
+                  : {},
+            ),
+          );
+        expect(result.verify).toBe(true);
+        for (const path of [old, actual]) {
+          const after = yield* Effect.promise(() => NodeFSP.readFile(path, "utf8"));
+          expect(after.includes(fake)).toBe(false);
+          expect(after.includes(providerOnly)).toBe(false);
+        }
+        expect(JSON.stringify(result).includes(providerOnly)).toBe(false);
+      }),
+    ),
+);
+
+it.effect.each(
+  ["claudeAgent", "codex"].flatMap((driver) =>
+    ["environment", "inherited", "home-environment", "home-inherited"].flatMap((source) =>
+      ["./provider-home", "../provider-home", "provider-home"].map((home) => ({
+        driver,
+        source,
+        home,
+      })),
+    ),
+  ),
+)("refuses ambiguous relative home $driver $source $home", ({ driver, source, home }) =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* Config.ServerConfig;
+      const settings = yield* ServerSettingsService;
+      const instanceId = ProviderInstanceId.make(driver + "-relative");
+      const variable = source.startsWith("home-")
+        ? "HOME"
+        : driver === "codex"
+          ? "CODEX_HOME"
+          : "CLAUDE_CONFIG_DIR";
+      yield* settings.updateProviderInstance({
+        operation: "upsert",
+        instanceId,
+        instance: {
+          driver: ProviderDriverKind.make(driver),
+          config: driver === "codex" ? { setupMode: "existing" } : {},
+          ...(source === "environment" || source === "home-environment"
+            ? { environment: [{ name: variable, value: home, sensitive: false }] }
+            : {}),
+        },
+      });
+      yield* sql`INSERT INTO projection_thread_sessions(thread_id,status,provider_name,provider_session_id,provider_instance_id,updated_at) VALUES (${threadId},'stopped',${driver},'session-fixture',${instanceId},'2026-01-01')`;
+      const relative =
+        driver === "codex"
+          ? "sessions/rollout-session-fixture.jsonl"
+          : "projects/fixture/session-fixture.jsonl";
+      const old = NodePath.join(
+        config.baseDir,
+        "harness-homes",
+        driver === "codex" ? "codex" : "claude",
+        relative,
+      );
+      const actual = NodePath.join(
+        config.baseDir,
+        "session-cwd",
+        home,
+        ...(source.startsWith("home-") ? [driver === "codex" ? ".codex" : ".claude"] : []),
+        relative,
+      );
+      const line =
+        JSON.stringify(
+          driver === "codex"
+            ? {
+                type: "response_item",
+                payload: { type: "function_call_output", call_id: "call-fixture", output: fake },
+              }
+            : { type: "tool_result", tool_use_id: "call-fixture", content: fake },
+        ) + "\n";
+      yield* Effect.promise(async () => {
+        for (const path of [old, actual]) {
+          await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
+          await NodeFSP.writeFile(path, line);
+        }
+      });
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const error = yield* service
+        .redactItem({ threadId, itemId: "call-fixture", reason: "fixture", compact: true })
+        .pipe(
+          Effect.provideService(
+            HostProcess.Environment,
+            source === "inherited" || source === "home-inherited" ? { [variable]: home } : {},
+          ),
+          Effect.flip,
+        );
+      expect(error.code).toBe("invalid");
+      for (const file of [old, actual])
+        expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(line);
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id='item-fixture'`;
+      expect(rows[0]!.payload_json).toBe(JSON.stringify(fixture));
+      const audit =
+        yield* sql`SELECT event_id FROM orchestration_events WHERE event_type='thread.item-redacted'`;
+      expect(audit.length).toBe(0);
     }),
   ),
 );
