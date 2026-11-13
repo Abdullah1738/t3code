@@ -4018,6 +4018,56 @@ const startReplayReview = Effect.gen(function* () {
   return { kanban, card, worker, reviewThread: reviewing.activeThreadId! };
 });
 
+it.effect.each([
+  { reviewer: "live", verdict: "clear", findings: [] },
+  { reviewer: "live", verdict: "findings", findings: ["Fee is wrong"] },
+  { reviewer: "late", verdict: "clear", findings: [] },
+  { reviewer: "late", verdict: "findings", findings: ["Fee is wrong"] },
+] as const)(
+  "#769 $reviewer $verdict replay with an advancing clock",
+  ({ reviewer, verdict, findings }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, reviewThread } = yield* startReplayReview;
+        if (reviewer === "late") {
+          yield* kanban.flagCard(card.id, "Needs attention", {
+            _tag: "thread",
+            threadId: reviewThread,
+          });
+          assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+        }
+        const clock = yield* Clock.Clock;
+        const base = yield* clock.currentTimeMillis;
+        let reads = 0;
+        const tickingClock: Clock.Clock = {
+          ...clock,
+          currentTimeMillis: Effect.sync(() => base + reads++),
+        };
+        const first = yield* kanban
+          .reviewResult(reviewThread, verdict, findings, "abc1234")
+          .pipe(Effect.provideService(Clock.Clock, tickingClock));
+        assert.isTrue(first.recorded);
+        const before = yield* kanban.card(card.id);
+        const review = before.events.findLast((event) => event.kind === "review")!;
+        assert.strictEqual(before.card.movedAt, review.at);
+        const sends = fake.sends.length;
+        const replay = yield* kanban
+          .reviewResult(reviewThread, verdict, findings, "abc1234")
+          .pipe(Effect.provideService(Clock.Clock, tickingClock));
+        assert.isAtLeast(reads, 2);
+        assert.isFalse(replay.recorded);
+        assert.strictEqual(
+          replay.note,
+          `Already recorded as review event ${review.id} at ${review.at}; not saved again.`,
+        );
+        assert.deepStrictEqual(replay.card, first.card);
+        assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        assert.strictEqual(fake.sends.length, sends);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("ignores a repeated clear with the same normalized head", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

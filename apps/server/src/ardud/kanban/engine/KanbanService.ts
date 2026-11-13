@@ -2146,6 +2146,7 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
     kind: KanbanCardEvent["kind"],
     extra: {
+      readonly at?: string;
       readonly fromStage?: KanbanStage | null;
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
@@ -2154,7 +2155,7 @@ const make = Effect.gen(function* () {
   ) {
     return yield* store.addCardEvent({
       cardId: card.id,
-      at: yield* nowIso,
+      at: extra.at ?? (yield* nowIso),
       actor,
       kind,
       fromStage: extra.fromStage ?? null,
@@ -10441,6 +10442,7 @@ const make = Effect.gen(function* () {
             updatedAt: at,
           };
           yield* logEvent(next, { _tag: "thread", threadId }, "review", {
+            at,
             fromStage: card.stage,
             toStage: next.stage,
             body,
