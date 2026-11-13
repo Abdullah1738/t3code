@@ -1,4 +1,5 @@
 """Allowlisted order merchandise projection. Never return raw payment/customer data."""
+import toollog
 import math
 import re
 import datetime as dt
@@ -58,6 +59,7 @@ def _check_order_identity(row, order):
         raise core.NoonError('ORDER_MISMATCH')
 
 
+@toollog.timed("noon", "provider.details")
 def details(order, service, timeout=12):
     deadline=core.operation_deadline(timeout)
     extra={}

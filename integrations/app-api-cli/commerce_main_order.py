@@ -12,6 +12,7 @@ Lifecycle (mutations journalled at-most-once):
   address + totals + manifest) -> place-order {total} -> order-status poll
   until success+shipments (paid signal; paymentError is failure) -> watcher.
 """
+import toollog
 import order_card
 import datetime as dt
 import json
@@ -175,6 +176,7 @@ class MainOrderFlow(MarketplacePayment):
 
     vertical = 'main'
 
+    @toollog.timed("commerce", "step.auth", lane="main")
     def __init__(self, *, sku_config=None, quantity=None, items=None, auth=None,
                  request=market.native_request):
         # Lane-native item validation strictly BEFORE any auth/network work.
@@ -360,6 +362,7 @@ class MainOrderFlow(MarketplacePayment):
         return result
 
     # -- lifecycle ----------------------------------------------------------
+    @toollog.timed("commerce", "step.cart_build", lane="main")
     def add(self, *, timeout=25):
         """Add every resolved offer to the empty basket; verify exact manifest.
 
@@ -407,6 +410,7 @@ class MainOrderFlow(MarketplacePayment):
                                                  timeout=timeout)
         return self.session_response
 
+    @toollog.timed("commerce", "step.checkout", lane="main")
     def review_session(self, *, timeout=25):
         """Verify the server-carried defaults and freeze the pre-place review.
 
@@ -544,6 +548,7 @@ class MainOrderFlow(MarketplacePayment):
                              'items': fresh_summary['items'],
                              'shipments': self.review['projection'].get('shipments')}}
 
+    @toollog.timed("commerce", "step.payment_submit", lane="main")
     def place(self, *, timeout=25):
         """Single financial send: place-order {total} -> bare order number."""
         if self.review is None:
@@ -554,6 +559,7 @@ class MainOrderFlow(MarketplacePayment):
         self.order = result.summary()['order']
         return {'order': self.order}
 
+    @toollog.timed("commerce", "step.confirmation", lane="main")
     def verify_tracking(self, *, timeout=25):
         tracking = self.client.track(self.order, timeout=timeout)
         if tracking.get('order') != self.order:

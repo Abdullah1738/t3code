@@ -1,4 +1,5 @@
 """Journalled Food preparation and automatic saved-card placement."""
+import toollog
 import json
 import os
 import re
@@ -105,6 +106,7 @@ def request(operation, headers, body):
 
 
 class FoodFlow:
+    @toollog.timed("commerce", "step.auth", lane="food")
     def __init__(self, outlet, rows, flow_id=None, *, read_only=False):
         require(isinstance(outlet, str) and re.fullmatch(r'[A-Z0-9]{5,64}', outlet), 'FOOD_OUTLET_INVALID')
         self.outlet, self.rows = outlet, manifest(rows)
@@ -161,6 +163,7 @@ class FoodFlow:
     def read(self):
         return request('details', self.headers, {'sessionCode':self.state['session']})
 
+    @toollog.timed("commerce", "step.checkout", lane="food")
     def review(self, data, *, quiet=True):
         require(data.get('checkoutSessionCode')==self.state['session'] and not data.get('orderNr'), 'FOOD_SESSION_ALREADY_ORDERED_OR_CHANGED')
         require(data.get('outletCode')==self.outlet and data.get('addressCode')==self.headers['x-addresscode'], 'FOOD_CART_HOME_OR_OUTLET_CHANGED')
@@ -186,6 +189,7 @@ class FoodFlow:
             'orderDeliveryFee','orderSmallOrderFee','orderServiceFee','orderRiderTip','orderDonationAmount') if data.get(k) is not None}
         return review
 
+    @toollog.timed("commerce", "step.cart_build", lane="food")
     def prepare(self):
         from commerce_pending import register
         register(self.flow_id, 'food', self.account, self.rows, card_last4=self.card_last4)

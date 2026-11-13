@@ -5,6 +5,7 @@ Verified native order APIs are primary. Email requires an exact order ID;
 notification fallback requires exact ID or explicit single-active correlation.
 Only projected evidence is persisted; raw notification dumps/mail stay in memory.
 """
+import toollog
 import argparse
 import datetime as dt
 import fcntl
@@ -892,6 +893,13 @@ def transition(result, state, cfg, now):
 
 
 def check(cfg):
+    toollog.previous_day_rollup()
+    with toollog.deferred():
+        _check(cfg)
+
+
+@toollog.timed('order-watch', 'track.poll')
+def _check(cfg):
     folder = Path(os.environ['WATCH_DIR'])
     with (folder / 'order-tracker.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -899,7 +907,20 @@ def check(cfg):
         state = read(path)
         now = time.time()
         result = fetch(cfg, state, now)
+        previous = state.get('status','unknown')
+        delayed = state.get('delay_sent',False)
         events = transition(result, state, cfg, now)
+        current = state.get('status','unknown')
+        if result.get('errors'):
+            toollog.emit('order-watch','track.error',kind='error',ok=False,
+                         ids={'orderId':cfg.get('order')},error='TRACK_POLL_SOURCE_ERROR')
+        if current != previous:
+            toollog.emit('order-watch','track.transition',ids={'orderId':cfg.get('order')},
+                         props={'from':previous,'to':current})
+            if current == 'delivered':
+                toollog.emit('order-watch','track.delivered',ids={'orderId':cfg.get('order')})
+        if state.get('delay_sent') and not delayed:
+            toollog.emit('order-watch','track.eta_elapsed',ids={'orderId':cfg.get('order')})
         if folder.resolve() == (Path.home() / '.local/share/robob-watch/watchers' / cfg['watcher']).resolve():
             proof = result.get('evidence', [{}])[0] if result.get('evidence') else {}
             if result['status'] == 'delivered':
@@ -944,6 +965,9 @@ def check(cfg):
                     state['retire_error'] = str(exc)[:200]
                     write(path, state)
 
+    return {'ok': not bool(result.get('errors')), 'error': 'TRACK_POLL_SOURCE_ERROR' if result.get('errors') else None,
+            'logProps': {'merchant':cfg.get('app'),'state':current,'changed':current != previous}}
+
 
 def card_enrollment(new, cfg, args):
     return new or bool(cfg.get('delivery_card')) or args.card
@@ -958,6 +982,7 @@ def retire(cfg, path, watcher=None):
         write(path, cfg)
 
 
+@toollog.registration
 def main(argv=None, _locked=False):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['aftercare']:
@@ -973,6 +998,7 @@ def main(argv=None, _locked=False):
     parser.add_argument('--label', default='')
     parser.add_argument('--single-active-order', action='store_true', help='Use ID-less app pushes as unconfirmed candidates. Only when this is the only active order in that app.')
     parser.add_argument('--session', default=SESSION)
+    parser.add_argument('--source',choices=('cli','phone','email'),default='cli')
     parser.add_argument('--expires', default='7d')
     parser.add_argument('--reported-at', help='Owner-reported actual arrival, ISO with timezone')
     parser.add_argument('--note', default='')
@@ -1145,6 +1171,9 @@ def main(argv=None, _locked=False):
             print(json.dumps({'watcher': wid, 'current': read(watchpath.parent / 'order-tracker-state.json')
                               .get('last_result', {})}, indent=2))
         registered = watchpath.exists()
+        toollog.emit('order-watch','track.add',kind='event' if registered else 'error',ok=registered,
+                     ids={'orderId':args.order},props={'merchant':app,'source':args.source},
+                     error=None if registered else 'TRACK_REGISTRATION_FAILED')
         result = read(watchpath.parent / 'order-tracker-state.json').get('last_result', {})
         card = None
         if registered and cfg.get('delivery_card'):

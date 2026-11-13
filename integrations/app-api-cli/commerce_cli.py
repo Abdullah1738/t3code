@@ -1,4 +1,5 @@
 """Native HTTP commerce: caller-authorized baskets and exact recovery."""
+import toollog
 import argparse
 import json
 import re
@@ -623,6 +624,7 @@ def minutes_payment_fail(flow,paid):
                          outcome=outcome)
 
 
+@toollog.timed("commerce", "step.bank_approval_wait")
 def await_payment_flow(args):
     """Restart-safe status-only continuation of a consumed, unconfirmed payment.
 
@@ -696,6 +698,7 @@ def await_payment_flow(args):
         **order_watch_receipt.fields(registration),'financial_retry':False}
 
 
+@toollog.timed("commerce", "flow.release")
 def release_flow(args):
     if getattr(args,'dry_run',False):
         with journal.read_only():
@@ -755,6 +758,7 @@ def _release_flow(args):
             'reservation_minor_retained':local['reserved_minor'],'financial_retry':False}
 
 
+@toollog.timed("commerce", "flow.abandon")
 def abandon_flow(args):
     """Terminal close of an ACTIVE flow that never sent anything (process-loss recovery)."""
     return {'ok':True,'flow_id':args.flow_id,**journal.abandon(args.flow_id),'financial_retry':False}
@@ -949,6 +953,7 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
     return finish_recovered(result.state, result.reason, poller.next_index)
 
 
+@toollog.timed("commerce", "flow.recover_payment")
 def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
     if binding['app']=='noon' and binding['vertical']=='food':
@@ -1068,6 +1073,8 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest='command',required=True)
     commands.add_parser('capabilities')
+    logs=commands.add_parser('log-rollup',help='Summarize a UTC orders log day')
+    logs.add_argument('--day',default=None)
     commands.add_parser('restaurant-cart-contract')
     options=commands.add_parser('item-options',help='Read Minutes option groups; no cart changes')
     options.add_argument('vertical',choices=('minutes',))
@@ -1201,11 +1208,18 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    return toollog.run_command(args, dispatch)
+
+
+def dispatch(args):
     # Talabat retired by the owner (2026-11-07): refuse before pause, auth or network.
     import talabat_retired
-    if talabat_retired.requested(args):return talabat_retired.refuse()
+    if talabat_retired.requested(args):
+        toollog.emit('commerce','guard.refused',kind='error',ok=False,error='TALABAT_RETIRED')
+        return talabat_retired.refuse()
     # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
     if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
+        toollog.emit('commerce','guard.refused',kind='error',ok=False,error='ORDERING_PAUSED')
         print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',
                           'message':f"Ordering is paused: {PAUSE_FILE.read_text().strip()}",
                           'financial_send':False,'financial_retry':False}))
@@ -1223,11 +1237,15 @@ def main(argv=None):
     try:
         declined=card_preflight(args)
         if declined:
+            toollog.emit('commerce','guard.refused',kind='error',ok=False,error=declined['error'])
             print(json.dumps({'ok':False,'error':declined['error'],'card_last4':declined['card_last4'],
                               'message':declined['message'],'financial_send':False,'financial_retry':False}))
             return card_status.EXIT_BLOCKED
         moni_go=require_moni_go(args)
-        if args.command=='capabilities':result=capabilities()
+        if args.command=='log-rollup':
+            summary=toollog.rollup(args.day)
+            result={'ok':summary is not None,'rollup':summary}
+        elif args.command=='capabilities':result=capabilities()
         elif args.command=='item-options':
             from noon_minutes_options import read_options
             result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
@@ -1347,9 +1365,15 @@ def main(argv=None):
             if not state['order_id']:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
             result=track_exact(state['app'],state['vertical'],state['order_id'])
         if moni_go and isinstance(result,dict):result={**result,'moni_go':moni_go}
+        if result.get('ok') is False:
+            toollog.emit('commerce','cmd.error',kind='error',ok=False,error=result.get('error'))
+            toollog.guard_refused(result.get('error'))
         print(json.dumps(result))
         return 1 if result.get('ok') is False else 0
     except Exception as exc:
+        code=toollog.tag(getattr(exc,'code',str(exc)))
+        toollog.emit('commerce','cmd.error',kind='error',ok=False,error=code)
+        toollog.guard_refused(code)
         from noon_minutes_options import OptionsError
         from commerce_supermall_order import CatalogError
         if isinstance(exc,(OptionsError,CatalogError)):

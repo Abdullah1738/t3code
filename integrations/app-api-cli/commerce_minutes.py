@@ -1,4 +1,5 @@
 """Journalled Minutes native operations with response-cookie lifecycle binding."""
+import toollog
 import order_card
 import datetime as dt
 import hashlib
@@ -197,6 +198,7 @@ class MinutesFlow:
     # Instances built without __init__ (resume and test paths) keep the old refusal.
     use_current_cart=False
 
+    @toollog.timed("commerce", "step.auth", lane="minutes")
     def __init__(self, *, skus=None, items=None, auth=None, driver_note_extra=None, use_current_cart=False):
         # Lane-native validation strictly BEFORE any auth/network work.
         if skus is not None and items is not None:
@@ -303,6 +305,7 @@ class MinutesFlow:
         self.current=self.client.get_session(before_send=self._before,timeout=25)
         return self.current.projection
 
+    @toollog.timed("commerce", "step.cart_build", lane="minutes")
     def fill_empty(self):
         if self.use_current_cart and self.current is not None and self.current.projection['lines']:
             # Adopt the cart already on the server: it must match the basket exactly, and nothing is sent.
@@ -436,6 +439,7 @@ class MinutesFlow:
             driver_notes=body['driverNotes'],save=False,before_send=self._before,timeout=25)
         return self.current.projection
 
+    @toollog.timed("commerce", "step.checkout", lane="minutes")
     def approve(self):
         snapshot=self.current
         card=m.saved_order_card(self.client.payment_cards(timeout=25).wire)
@@ -491,6 +495,7 @@ class MinutesFlow:
         return {'flow_id': self.flow_id, 'review': review, 'prepared_only': True,
                 'readback': dict(self.current.projection)}
 
+    @toollog.timed("commerce", "step.payment_submit", lane="minutes")
     def place(self,*,cvv_ready=False):
         if self.review is None:j.fail('MINUTES_REVIEW_REQUIRED')
         # A CVV-asking cart needs the CVV in hand before place: complete() runs after
@@ -549,6 +554,7 @@ class MinutesFlow:
             j.fail('MINUTES_PAYMENT_CONTEXT_CHANGED')
         return self
 
+    @toollog.timed("commerce", "step.payment_submit", lane="minutes")
     def complete(self, *, cvv_encryption=None, cvv=None):
         local=j.inspect(self.flow_id)
         if local['state']!='ACTIVE' or any(x['kind']=='payment' for x in local['operations']):
@@ -596,6 +602,7 @@ class MinutesFlow:
     def notify_3ds(self):
         return telegram_3ds_notify(self.review['order'],self.review['amount'])
 
+    @toollog.timed("commerce", "step.bank_approval_wait", lane="minutes")
     def await_payment(self,*,notify=None,poll_seconds=5.0,wait_seconds=240.0,
                       sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS,
                       open_redirect=False):
@@ -669,6 +676,7 @@ class MinutesFlow:
             http_status=200,order_id=self.review['order'],payable_minor=self.review['amount'],
             currency='AED',review_sha256=self.review['digest']))
 
+    @toollog.timed("commerce", "step.confirmation", lane="minutes")
     def verify_tracking(self,*,timeout=25):
         """Exact native track of OUR placed order; observe EXACT_ORDER_CONFIRMED."""
         tracking=self.client.track(self.review['order'],timeout=timeout)

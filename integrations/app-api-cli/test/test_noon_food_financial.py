@@ -70,6 +70,27 @@ class FoodFinancialTests(unittest.TestCase):
         self.co.recover()
         self.assertEqual(len(self.calls),1)
 
+    def test_placement_logs_confirmation_before_any_recovery_call(self):
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        self.reader.bank_capture=lambda order:{'paid':True,'order':order,'source':'native_and_bank'}
+        rows=[]
+        def record(row):
+            # A second descriptor cannot acquire the financial lock until place releases it.
+            with self.co.path.with_suffix('.lock').open('a') as lock:
+                f.fcntl.flock(lock,f.fcntl.LOCK_EX | f.fcntl.LOCK_NB)
+            rows.append(row)
+        with patch.object(self.co,'recover',side_effect=AssertionError('must not recover')) as recover, \
+                patch.object(f.toollog,'_write',side_effect=record):
+            result=self.co.place()
+            self.assertEqual(result['state'],'PAID_AND_ACCEPTED')
+            confirmation=[r for r in rows if r['name']=='step.confirmation']
+            self.assertEqual(len(confirmation),1)
+            self.assertTrue(confirmation[0]['ok'])
+            self.assertGreaterEqual(confirmation[0]['durationMs'],0)
+            self.assertEqual(confirmation[0]['props']['lane'],'food')
+            recover.assert_not_called()
+        self.assertEqual([call[0] for call in self.calls],['place'])
+
     def test_bank_receipt_cannot_be_claimed_by_another_order(self):
         self.co.place()
         bank={'source_id':516800,'amount_minor':4585}

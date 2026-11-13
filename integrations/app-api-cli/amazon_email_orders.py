@@ -6,6 +6,7 @@ orders(**options), track(order_id, **options). Raw mail lives in memory only.
 """
 from __future__ import annotations
 
+import toollog
 import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -566,10 +567,12 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
             'coverage': coverage, 'errors': sorted(errors, key=lambda e: json.dumps(e, sort_keys=True))}
 
 
+@toollog.timed("amazon", "provider.orders")
 def orders(**options):
     return _scan(**options)
 
 
+@toollog.timed('amazon', 'provider.track')
 def track(order_id, **options):
     result = _scan(order_id=order_id, **options)
     order = result.pop('orders')[0]

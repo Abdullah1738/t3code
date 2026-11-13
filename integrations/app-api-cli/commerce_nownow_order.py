@@ -12,6 +12,7 @@ Lifecycle (every mutation journalled at-most-once):
   (BOTH quiet flags true in ONE call) -> place-order {sessionCode,total} ->
   tracking poll until placed/preparing -> watcher registration.
 """
+import toollog
 import order_card
 import datetime as dt
 from decimal import Decimal
@@ -216,6 +217,7 @@ class NowNowOrderFlow:
     with absolute qty. Charges are never split: one session, one place send.
     """
 
+    @toollog.timed("commerce", "step.auth", lane="nownow")
     def __init__(self, *, store_code, product_code=None, quantity=None, items=None,
                  auth=None, request=native.native_request):
         # Lane-native item validation strictly BEFORE any auth/network work.
@@ -379,6 +381,7 @@ class NowNowOrderFlow:
         self.current = result
         return result.projection
 
+    @toollog.timed("commerce", "step.cart_build", lane="nownow")
     def apply_items(self, *, timeout=25):
         """edit-product per line until the cart equals the exact manifest.
 
@@ -421,6 +424,7 @@ class NowNowOrderFlow:
                                                  before_send=self._before, timeout=timeout)
         return self.current.projection
 
+    @toollog.timed("commerce", "step.checkout", lane="nownow")
     def guard_validated(self, *, timeout=25):
         """Pre-place guard on the validate response: sane fees, exact address.
 
@@ -469,6 +473,7 @@ class NowNowOrderFlow:
         self.current = readback
         return readback.projection
 
+    @toollog.timed("commerce", "step.checkout", lane="nownow")
     def review_final(self, *, timeout=25):
         """Freeze the pre-place review from the final readback state.
 
@@ -557,6 +562,7 @@ class NowNowOrderFlow:
             _fail('NOWNOW_QUIET_NOTE_MISMATCH')
         return {'driver_notes': native.QUIET_NOTE}
 
+    @toollog.timed("commerce", "step.payment_submit", lane="nownow")
     def place(self, *, timeout=25):
         """Single financial send: place-order {sessionCode, total}."""
         if self.review is None:
@@ -577,6 +583,7 @@ class NowNowOrderFlow:
         return result.projection
 
     # -- confirmation --------------------------------------------------------
+    @toollog.timed("commerce", "step.confirmation", lane="nownow")
     def poll_tracking(self, *, attempts=40, sleep=time.sleep, timeout=25):
         """Poll v1/order/tracking until placed/preparing (live paid-order proof).
 
@@ -615,6 +622,7 @@ class NowNowOrderFlow:
         from commerce_nownow_capture import retain
         retain(self)
 
+    @toollog.timed("commerce", "step.payment_submit", lane="nownow")
     def prepare_payment(self, cvv_loader=None):
         from commerce_preorder import IntentVault, payment_outcome, observe_zero_amounts
         from noon_cvv import encrypt
