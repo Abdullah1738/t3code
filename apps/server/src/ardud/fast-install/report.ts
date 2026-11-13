@@ -1,16 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off -- Synchronous process-local diagnostics, callable outside Effect.
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 
 export interface ContinuationDecision {
   readonly threadId: string;
   readonly continued: boolean;
   readonly reason?: string;
+  readonly lastMessage?: string;
   readonly dispatched?: boolean;
   readonly reconciledAt?: string;
   readonly queuedAt?: string;
 }
 
-export const bootId = randomUUID();
+export const bootId = NodeCrypto.randomUUID();
 const report = {
   bootId,
   completedAt: null as string | null,

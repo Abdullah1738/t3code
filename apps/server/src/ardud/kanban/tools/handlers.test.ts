@@ -3243,7 +3243,7 @@ it.effect.each(
         const board = yield* kanban.ensureBoard({
           slug: "post-reply",
           name: "Reply",
-          defaultProjectId: null,
+          defaultProjectId: ProjectId.make("project-1"),
         });
         const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
         const discussion = yield* kanban.cardDiscussion(card.id);
@@ -3271,7 +3271,20 @@ it.effect.each(
         assert.isFalse(result.isError, result.text);
         assert.strictEqual(result.structured.saved, true);
         assert.deepStrictEqual(result.structured.message, { discussionId: discussion.id, seq: 1 });
-        assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+        assert.deepStrictEqual(
+          (yield* kanban.messages(discussion.id)).map(({ seq, author, blocks }) => ({
+            seq,
+            author,
+            blocks,
+          })),
+          [
+            {
+              seq: 1,
+              author: { _tag: "evaluator", threadId: thread },
+              blocks: [{ _tag: "md", text: "Saved exactly once" }],
+            },
+          ],
+        );
       }).pipe(Effect.provide(fake.layer));
     }),
 );

@@ -7,7 +7,7 @@ export NVM_DIR="$HOME/.nvm"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
   mkdir -p "$NVM_DIR"
   nvm_install=$(mktemp)
-  curl -fsSL --retry 5 https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh -o "$nvm_install"
+  offbox_fetch "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh" "$nvm_install"
   PROFILE=/dev/null bash "$nvm_install"
   rm -f "$nvm_install"
 fi

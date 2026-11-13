@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
@@ -869,6 +869,7 @@ class BoxNotReady(OffboxError):
     def __init__(self, box_id: str, state: dict, cause: OffboxError):
         super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
                          code=cause.code, started=cause.started, outage=cause.outage)
+        self.status = getattr(cause, 'status', None)
         self.box_id, self.state = box_id, state
 
 
@@ -882,6 +883,10 @@ class ResumeUnresolved(OffboxError):
 
 class ResumeProvisionStalled(OffboxError):
     """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+    def __init__(self, message):
+        from . import home
+        super().__init__(message, outage=home.may_fail_over())
 
 
 def _wait_unanswered_resume(con, box_id):
@@ -1213,7 +1218,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         return None
     st = s.get("state")
     if st in api.STOPPING_STATES:
-        raise ArchivingSkip(f"{box_id} is {st}; skipping it for now", code=EXIT_BUSY)
+        queued = skip_archiving or allocation.in_queue()
+        action = "skipping it for now" if queued else "retry in a moment"
+        raise ArchivingSkip(f"{box_id} is {st}; {action}", code=EXIT_BUSY if queued else EXIT_INFRA)
     if st == "archiving":
         if skip_archiving or allocation.in_queue():
             action = "skipping it for now" if skip_archiving else "waiting to resume it"

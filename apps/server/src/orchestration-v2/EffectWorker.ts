@@ -29,6 +29,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -36,8 +37,11 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
     effectId: Schema.String,
     effectType: Schema.String,
     cause: Schema.optional(Schema.Defect()),
+    deferMs: Schema.optional(Schema.Number),
   },
 ) {}
+
+export const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
 
 /**
  * Do not apply this to `provider-turn.restart`: that compound effect also runs
@@ -85,6 +89,7 @@ export const layerExecutor: Layer.Layer<
   | ThreadManagementService.ThreadManagementService
   | ServerSettings.ServerSettingsService
   | McpSessionRegistry.McpSessionRegistry
+  | RestartPacing.RestartPacing
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -100,27 +105,51 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
     const mcpRegistry = yield* McpSessionRegistry.McpSessionRegistry;
+    const pacing = yield* RestartPacing.RestartPacing;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
           case "provider-runtime.continue": {
-            const sourceRunId = effect.request.sourceRunId;
-            return continueRestartedRun({ threadId: effect.threadId, sourceRunId, queued: effect.request.queued }).pipe(
+            const { sourceRunId, queued } = effect.request;
+            const source = { threadId: effect.threadId, sourceRunId, effectId: effect.id };
+            const finishDispatch = pacing
+              .dispatched(source)
+              .pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("restart-pacing.settlement-read-failed", {
+                    threadId: source.threadId,
+                    sourceRunId: source.sourceRunId,
+                  }),
+                ),
+              );
+            return Effect.gen(function* () {
+              const deferMs = yield* pacing.acquire(source);
+              if (deferMs > 0)
+                return yield* new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: effect.request.type,
+                  deferMs,
+                });
+              yield* continueRestartedRun({ ...source, queued });
+            }).pipe(
+              Effect.ensuring(finishDispatch),
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
-              Effect.tapError(() =>
-                willRetry
+              Effect.tapError((cause) =>
+                willRetry ||
+                (isOrchestrationEffectExecutionError(cause) && cause.deferMs !== undefined)
                   ? Effect.void
                   : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
               ),
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationEffectExecutionError({
-                    effectId: effect.id,
-                    effectType: effect.request.type,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isOrchestrationEffectExecutionError(cause)
+                  ? cause
+                  : new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
               ),
             );
           }
@@ -156,20 +185,38 @@ export const layerExecutor: Layer.Layer<
                 ),
               ),
             );
-          case "provider-turn.start":
-            return providerTurnStart
-              .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
-              .pipe(
-                Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationEffectExecutionError({
+          case "provider-turn.start": {
+            const startRequest = effect.request;
+            return Effect.gen(function* () {
+              const deferMs = yield* pacing.acquireRun(
+                effect.threadId,
+                startRequest.runId,
+                effect.id,
+              );
+              if (deferMs > 0)
+                return yield* new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: startRequest.type,
+                  deferMs,
+                });
+              yield* providerTurnStart.start({
+                threadId: effect.threadId,
+                runId: startRequest.runId,
+                willRetry,
+              });
+            }).pipe(
+              Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
+              Effect.mapError((cause) =>
+                isOrchestrationEffectExecutionError(cause)
+                  ? cause
+                  : new OrchestrationEffectExecutionError({
                       effectId: effect.id,
                       effectType: effect.request.type,
                       cause,
                     }),
-                ),
-              );
+              ),
+            );
+          }
           case "provider-turn.interrupt": {
             const request = effect.request;
             return providerTurnControl
@@ -633,6 +680,7 @@ export const layerWithOptions = (
       const requeueClaim = (
         effect: EffectOutbox.OrchestrationEffectV2,
         cause: Cause.Cause<unknown>,
+        refundAttempt = false,
       ) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.void
@@ -640,8 +688,11 @@ export const layerWithOptions = (
               .retry({
                 effectId: effect.id,
                 workerId,
-                error: `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
+                error: refundAttempt
+                  ? "Resuming after restart"
+                  : `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
                 delayMs: 0,
+                refundAttempt,
               })
               .pipe(
                 Effect.flatMap((requeued) =>
@@ -801,6 +852,24 @@ export const layerWithOptions = (
             }).pipe(Effect.onError((cause) => recoverPostSuccessSettlement(effect, cause)));
           }
 
+          const failure = Cause.findErrorOption(exit.cause);
+          if (Option.isSome(failure) && failure.value.deferMs !== undefined) {
+            const deferred = yield* outbox
+              .retry({
+                effectId: effect.id,
+                workerId,
+                error: "Resuming after restart",
+                delayMs: failure.value.deferMs,
+                refundAttempt: true,
+              })
+              .pipe(Effect.onError((cause) => requeueClaim(effect, cause, true)));
+            if (!deferred && !(yield* wasCancelled(effect.id)))
+              return yield* new OrchestrationEffectWorkerError({
+                operation: "defer",
+                effectId: effect.id,
+              });
+            return true;
+          }
           const error = Cause.pretty(exit.cause);
           const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
           yield* Effect.logWarning("Orchestration effect execution failed", {
@@ -916,55 +985,54 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Post-commit notifications are the low-latency path. `availableAt` is the
       // durable retry schedule, and the long liveness poll only recovers from a
       // missed in-process notification or work inserted by another process.
-      const runWorker = (controlLane: boolean) =>
-        Effect.gen(function* () {
-          while (true) {
-            const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
-              Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
-              Effect.catchCause((cause) =>
-                Effect.logWarning("Orchestration effect worker failed", cause).pipe(
-                  Effect.as("failed" as const),
-                ),
+      const runWorker = Effect.fn("EffectWorker.runWorker")(function* (controlLane: boolean) {
+        while (true) {
+          const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
+            Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Orchestration effect worker failed", cause).pipe(
+                Effect.as("failed" as const),
               ),
-            );
-            if (outcome === "worked") {
-              yield* Effect.yieldNow;
-              continue;
-            }
-            if (outcome === "failed") {
-              // A due row can remain visible when a claim UPDATE fails. Do not
-              // feed that past deadline back into the scheduler and retry at the
-              // one-millisecond floor; let transient database failures cool off.
-              yield* Effect.sleep(Duration.millis(Math.min(1_000, livenessPollIntervalMs)));
-              continue;
-            }
-
-            const nextClaimableAt = yield* (
-              controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt
-            ).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning(
-                  "Failed to read the next orchestration effect deadline",
-                  cause,
-                ).pipe(Effect.as(Option.none<DateTime.Utc>())),
-              ),
-            );
-            const now = DateTime.toEpochMillis(yield* DateTime.now);
-            const sleepMs = Option.match(nextClaimableAt, {
-              onNone: () => livenessPollIntervalMs,
-              onSome: (availableAt) => {
-                const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
-                return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
-              },
-            });
-            yield* Effect.raceFirst(
-              (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
-                Effect.as("notified" as const),
-              ),
-              Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
-            );
+            ),
+          );
+          if (outcome === "worked") {
+            yield* Effect.yieldNow;
+            continue;
           }
-        });
+          if (outcome === "failed") {
+            // A due row can remain visible when a claim UPDATE fails. Do not
+            // feed that past deadline back into the scheduler and retry at the
+            // one-millisecond floor; let transient database failures cool off.
+            yield* Effect.sleep(Duration.millis(Math.min(1_000, livenessPollIntervalMs)));
+            continue;
+          }
+
+          const nextClaimableAt = yield* (
+            controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                "Failed to read the next orchestration effect deadline",
+                cause,
+              ).pipe(Effect.as(Option.none<DateTime.Utc>())),
+            ),
+          );
+          const now = DateTime.toEpochMillis(yield* DateTime.now);
+          const sleepMs = Option.match(nextClaimableAt, {
+            onNone: () => livenessPollIntervalMs,
+            onSome: (availableAt) => {
+              const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
+              return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
+            },
+          });
+          yield* Effect.raceFirst(
+            (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
+              Effect.as("notified" as const),
+            ),
+            Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
+          );
+        }
+      });
 
       return yield* Effect.all(
         [
@@ -980,7 +1048,3 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
   );
 
 export const runDaemon = runDaemonWithOptions();
-
-const layerDaemon: Layer.Layer<never, never, OrchestrationEffectWorkerV2> = Layer.effectDiscard(
-  runDaemon.pipe(Effect.forkScoped),
-);
