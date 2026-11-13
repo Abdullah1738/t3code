@@ -204,12 +204,10 @@ class RelativeScriptReporterTests(unittest.TestCase):
         cases = json.loads((FIXTURES / 'reporters.json').read_text())
         cases += json.loads((FIXTURES / 'added-reporters.json').read_text())
         unresolved = {
-            # These later calls use variables; #841 owns their resolution.
-            'toolu_01HSF5SDthxAE7CbBKJtcbqA': '$SCRIPT_DIR/write_card.py',
+            # Dynamic paths without a matching source proof stay unresolved.
             'toolu_01LPn1qyRFv4j2FU9XM3ojgT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01Xp2QFFAsiQnUd25VKtmmyT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01EJVS24gL3YVQkyaDpezY74': '$f',
-            'toolu_01BcVNBuxA9GW9DqcBXTJHEj': 'scripts/$t.mjs',
         }
         seen = set()
         # Replaying old commands must not read checkouts that still happen to
