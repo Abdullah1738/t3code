@@ -52,8 +52,14 @@ Daily rollups count `backup.skipped_runs` and `backup.ok_runs` by target;
 `log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
 skips count only as skips.
 
-Samples also include `internalFreeGbDelta`/`externalFreeGbDelta` (null on the
-first measurement), and optional `internal`/`external` `PurgeableGb` and
+Samples also include `internalFreeGbDelta`/`externalFreeGbDelta`, compared with
+each volume's last numeric measurement even across failed samples.
+`internalDeltaFromTs`/`externalDeltaFromTs` and the matching `DeltaWindowS`
+give each comparison's window; `deltaFromTs`/`deltaWindowS` use the internal
+comparison when available, otherwise external. Unknown deltas are null with a
+`deltaUnavailable` reason. Legacy state recovers missing numeric baselines from at
+most 1 MiB of each of today's and yesterday's logs; missing or corrupt state
+starts a tagged baseline instead. Samples also include optional `internal`/`external` `PurgeableGb` and
 `LocalSnapshotCount`. Four read-only diskutil/tmutil calls run concurrently
 under one five-second budget, including cleanup. Missing purgeable keys are
 `PurgeableError=unsupported`, never zero; command failures carry short error
@@ -73,6 +79,20 @@ Changes of at least 20 GB on either volume emit one
 to three flattened `topMover` pairs. These events never alert. The inventory is
 hourly and covers selected roots, so movers are evidence of tracked changes,
 not a complete accounting of each free-space delta.
+
+A volume losing more than 10 GB since its last numeric sample emits one
+`disk.drop` with its delta, window, purgeable space and local snapshot count
+(null when unavailable). Its five `grower…Name`/`grower…Bytes` pairs are positive
+directory growth from the existing inventory: immediate directory children of
+the two big roots, or the other tracked roots. File entries and deeper names
+are excluded. Fresh, fully measured child directories remain useful evidence
+when their parent scan is partial. `inventoryComplete=false` explicitly marks
+missing, stale, partial or reused inventory on either side; stale or reused
+snapshots supply no growers. A newly created child directory has a zero baseline
+only when a prior complete parent entry set proves that path was absent.
+Partial inventories and older snapshots without that evidence remain unknown.
+An unknown directory baseline also makes the event incomplete.
+These events never alert or launch extra scans.
 
 ## Source events
 
