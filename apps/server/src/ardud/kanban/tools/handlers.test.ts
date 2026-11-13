@@ -2378,6 +2378,21 @@ it.effect(
         "Success",
       );
       assert.include(JSON.stringify(Schema.toJsonSchemaDocument(parameters)), '"maxLength":500');
+      const kept = yield* call(evaluator, "card_edit", {
+        card: card.id,
+        subtasks: [{ id: "s1" }, { id: "s2" }],
+      });
+      assert.isFalse(kept.isError, kept.text);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card.subtasks, card.subtasks);
+      for (const input of [{ text: "New" }, { owner: "work" }]) {
+        const refused = yield* call(evaluator, "card_edit", {
+          card: card.id,
+          subtasks: [{ id: "s1" }, { id: "s2" }, input],
+        });
+        assert.isTrue(refused.isError);
+        assert.include(refused.text, "a new subtask needs text and owner");
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card.subtasks, card.subtasks);
+      }
     }).pipe(Effect.provide(layer));
   },
 );

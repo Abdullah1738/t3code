@@ -195,12 +195,12 @@ export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
 export interface SubtaskInput {
-  /** An existing subtask's id keeps its state; leave out for a new one. */
+  /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
   readonly id?: string | undefined;
-  /** Same step as another means any order; leave out for the step after the previous entry. */
+  /** Same step means any order; defaults to the stored step, or the next step for a new entry. */
   readonly step?: number | undefined;
-  readonly text: string;
-  readonly owner: KanbanSubtask["owner"];
+  readonly text?: string | undefined;
+  readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
@@ -242,11 +242,12 @@ export type MarkCheck = { readonly ok: true } | { readonly ok: false; readonly r
 const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
 
 /**
- * Replaces a card's plan with `inputs`. Listed ids keep their state; new
- * entries get the next id. A done or skipped subtask left out stays: what
- * happened isn't rewritten, only what's still to do. `seq` is the card's
- * counter of ids ever handed out, so an open subtask dropped from the plan
- * never has its id reused by a later entry.
+ * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
+ * omitted text, owner and step on open ids keep their stored values. New
+ * entries need text and owner and get the next id. Listed done and skipped
+ * subtasks stay unchanged, and omitted ones stay: what happened isn't rewritten.
+ * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
+ * from the plan never has its id reused by a later entry.
  */
 export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
@@ -261,20 +262,49 @@ export function planSubtasks(
   const planned: Array<KanbanSubtask> = [];
   let step = 0;
   for (const input of inputs) {
-    const text = input.text.trim();
+    const id = input.id?.trim();
+    const known = id ? byId.get(id) : undefined;
+    if (id) {
+      if (!known)
+        return {
+          ok: false,
+          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
+        };
+      if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
+      listed.add(id);
+      // An id alone also preserves script bindings and approval timestamps.
+      if (
+        known.state !== "open" ||
+        (input.text === undefined &&
+          input.owner === undefined &&
+          input.step === undefined &&
+          input.gate === undefined &&
+          input.script === undefined)
+      ) {
+        planned.push(known);
+        step = known.step;
+        continue;
+      }
+    }
+    const rawText = input.text ?? known?.text;
+    const owner = input.owner ?? known?.owner;
+    if (rawText === undefined || owner === undefined) {
+      return { ok: false, reason: "a new subtask needs text and owner" };
+    }
+    const text = rawText.trim();
     if (text.length === 0) return { ok: false, reason: "a subtask needs text" };
     if (text.length > MAX_TEXT) {
       return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
     }
-    if (input.owner === "work" && input.gate != null) {
+    if (owner === "work" && input.gate != null) {
       return {
         ok: false,
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner: input.owner, text, gate: input.gate ?? undefined });
+    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined });
     const script = input.script?.trim() || undefined;
-    if (script && input.owner !== "script") {
+    if (script && owner !== "script") {
       return {
         ok: false,
         reason: `subtask "${text}" names a script, so its owner must be "script"`,
@@ -283,28 +313,16 @@ export function planSubtasks(
     if (input.step !== undefined && (!Number.isInteger(input.step) || input.step < 1)) {
       return { ok: false, reason: "a subtask's step is a whole number from 1" };
     }
-    step = input.step ?? step + 1;
-    const id = input.id?.trim();
-    if (id) {
-      const known = byId.get(id);
-      if (!known)
-        return {
-          ok: false,
-          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
-        };
-      if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
-      listed.add(id);
+    step = input.step ?? known?.step ?? step + 1;
+    if (known) {
       const { script: _old, gate: _oldGate, ...rest } = known;
       const previousGate = gateOf(known);
-      const gate =
-        input.owner === "work" || input.owner === "review"
-          ? undefined
-          : (previousGate ?? inputGate);
+      const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
       planned.push({
         ...rest,
         step,
         text,
-        owner: input.owner,
+        owner,
         ...(gate === undefined ? {} : { gate }),
         ...((text !== known.text || script !== known.script || !previousGate) && gate && at
           ? { createdAt: at }
@@ -318,7 +336,7 @@ export function planSubtasks(
         id: `s${nextId}`,
         step,
         text,
-        owner: input.owner,
+        owner,
         ...(gate === undefined ? {} : { gate }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
