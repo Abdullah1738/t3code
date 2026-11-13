@@ -146,7 +146,7 @@ class WebMailProofTests(TestCase):
         cfg = dict(self.f.cfg, placed_at=tracker.stamp(self.f.now - 5 * 86400))
         tracker.write(tracker.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
         tracker.write(tracker.WATCHERS / cfg['watcher'] / 'order-tracker-state.json',
-                      {'status': 'ordered', 'web_proof_version': 2, 'web_mail_last_at': self.f.now - 60,
+                      {'status': 'ordered', 'web_proof_version': 3, 'web_mail_last_at': self.f.now - 60,
                        'mail_cache': [{'stage': 'delivered'}], 'mail_checked': self.f.now})
         with self.f.mail([]) as search, redirect_stdout(io.StringIO()) as output:
             tracker.main(['status', '--app', 'web', '--order', '2606', '--merchant-domain', 'fabrique.ae'])
@@ -236,6 +236,161 @@ class WebMailProofTests(TestCase):
             state = {'primed': True, 'status': 'ordered'}
             self.assertIn('problem', [e['kind'] for e in tracker.transition(result, state, self.f.cfg, self.f.now)])
             self.assertEqual(tracker.transition(result, state, self.f.cfg, self.f.now + 60), [])
+
+    def test_explicit_partial_delivery_statements_in_body_keep_order_open(self):
+        partials = ['This is a partial delivery; the rest will follow.',
+                    'Your delivery is partial.', 'The order remains partial.',
+                    'Your order has been partially delivered.', 'The order was partially delivered.',
+                    'Partial delivery: more to follow.', 'Partially delivered; the rest will follow.',
+                    'The rest will follow.', 'The remainder is still in transit.']
+        for statement in partials:
+            with self.subTest(statement=statement):
+                cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
+                self.assertFalse(tracker.terminal_order(cfg, result))
+                self.assertFalse(result['whole_order_complete'])
+        for statement in ('This is not a partial delivery.', 'Your delivery is not partial.',
+                          'Your entire order has been delivered.', 'No remaining items.'):
+            with self.subTest(statement=statement):
+                cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
+                self.assertTrue(tracker.terminal_order(cfg, result))
+
+    def test_worded_and_mixed_partial_counts_in_body(self):
+        for unit in ('items', 'packages', 'parcels', 'shipments'):
+            for count in ('one of two', 'one of 2', '1 of two', 'one out of two', 'one / two', '1 of 2'):
+                with self.subTest(unit=unit, count=count):
+                    cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. {count} {unit} has been delivered.')
+                    self.assertFalse(tracker.terminal_order(cfg, result))
+            cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. {unit}: two of two delivered.')
+            self.assertTrue(tracker.terminal_order(cfg, result))
+
+    def test_other_parts_still_in_transit_keep_order_open(self):
+        for unit in ('item', 'package', 'parcel', 'shipment'):
+            for predicate in ('is still on the way', 'will ship separately', 'is on its way', 'remains pending',
+                              'has not arrived yet', 'is still not delivered', "hasn't been delivered",
+                              "aren't delivered", 'weren’t delivered'):
+                statement = f'Other {unit} {predicate}.'
+                with self.subTest(unit=unit, predicate=predicate):
+                    cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
+                    self.assertFalse(tracker.terminal_order(cfg, result))
+            for predicate in ('are still on the way', 'will ship separately', 'are in transit'):
+                cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. Other {unit}s {predicate}.')
+                self.assertFalse(tracker.terminal_order(cfg, result))
+        for statement in ('No other shipments are still on the way.', 'Other shipments have been delivered.',
+                          'Other shipments are not pending.',
+                          'All other items have already arrived.'):
+            cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
+            self.assertTrue(tracker.terminal_order(cfg, result))
+
+    def test_newer_scoped_nonterminal_progress_advances_confirmation(self):
+        for unit in ('package', 'parcel', 'shipment', 'item'):
+            for predicate, stage in (('has shipped', 'shipped'), ('is out for delivery', 'out for delivery')):
+                hits = [self.f.hit(subject='Order #2606 confirmed', uid=1, date=tracker.stamp(self.f.now - 600)),
+                        self.f.hit(subject=f'Your {unit} {predicate} - Order #2606', uid=2)]
+                with self.subTest(unit=unit, stage=stage), self.f.mail(hits), mock.patch.object(tracker, 'run', return_value='Order #2606'):
+                    result = tracker.fetch(self.f.cfg, {}, self.f.now)
+                self.assertEqual(result['status'], stage)
+                self.assertFalse(tracker.terminal_order(self.f.cfg, result))
+                state = {'primed': True, 'status': 'ordered'}
+                self.assertEqual(tracker.transition(result, state, self.f.cfg, self.f.now),
+                                 [{'kind': 'stage_change', 'status': stage}])
+                view = tracker.delivery_cards.view(self.f.cfg, result, {})
+                self.assertEqual(view['stage'], 'Shipped' if stage == 'shipped' else 'Out for delivery')
+
+    def test_old_whole_scope_cache_and_terminal_flag_are_reverified(self):
+        cfg = self.f.cfg
+        folder = tracker.WATCHERS / cfg['watcher']
+        path = tracker.ROOT / 'orders' / (cfg['watcher'] + '.json')
+        tracker.write(path, dict(cfg, active=True))
+        tracker.write(folder / 'watcher.json', {})
+        tracker.write(folder / 'order-tracker-state.json',
+                      {'primed': True, 'status': 'delivered', 'web_proof_version': 2,
+                       'last_result': {'status': 'delivered', 'whole_order_complete': True},
+                       'mail_checked': self.f.now, 'mail_cache': [],
+                       'mail_bodies_verified': {'icloud:Inbox:1': {'version': 2, 'matched': True, 'scope': 'order'}}})
+        with self.f.mail([self.f.hit(subject='Order #2606 delivered')]), \
+                mock.patch.object(tracker, 'run', return_value='Order #2606. This is a partial delivery.') as read, \
+                mock.patch.object(tracker.delivery_cards, 'safe_sync', return_value={'status': 'skipped'}), \
+                mock.patch.dict(os.environ, {'WATCH_DIR': str(folder), 'WATCH_RUN': 'scheduled-fixture'}), \
+                redirect_stdout(io.StringIO()):
+            tracker._check(cfg)
+            tracker._check(cfg)
+        self.assertTrue(tracker.read(path)['active'])
+        self.assertTrue(any(call.args[0][:2] == ['mailsearch', 'read'] for call in read.call_args_list))
+
+    def test_status_discards_obsolete_terminal_label_but_keeps_current_proof(self):
+        cfg = self.f.cfg
+        tracker.write(tracker.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
+        for version, expected in ((2, 'unknown'), (3, 'delivered')):
+            tracker.write(tracker.WATCHERS / cfg['watcher'] / 'order-tracker-state.json',
+                          {'status': 'delivered', 'web_proof_version': version,
+                           'last_result': {'status': 'delivered', 'whole_order_complete': True,
+                                           'web_proof_version': version}})
+            with self.subTest(version=version), self.f.mail([]), redirect_stdout(io.StringIO()) as output:
+                tracker.main(['status', '--app', 'web', '--order', '2606', '--merchant-domain', 'fabrique.ae'])
+            self.assertEqual(json.loads(output.getvalue())['last_confirmed_status'], expected)
+
+    def test_conditional_support_text_does_not_invent_partial_scope(self):
+        for condition in ('If', 'When', 'Once', 'Unless'):
+            for phrase in ('your order is partially delivered', 'this is a partial delivery',
+                           'other shipments are pending', 'one of two shipments has arrived',
+                           'your Order no. 2606 is partially delivered'):
+                body = f'Order #2606 delivered in full.\n{condition} {phrase}, contact support.'
+                with self.subTest(condition=condition, phrase=phrase):
+                    cfg, result = self.fetch('2606', 'Order #2606 delivered', body)
+                    self.assertTrue(tracker.terminal_order(cfg, result))
+        for body in ('If you need help, contact support. This is a partial delivery.',
+                     'This is a partial delivery. If you need help, contact support.',
+                     'Product WHEN-ITEM: this is a partial delivery.',
+                     'If you need help, contact support; other shipments are still on the way.'):
+            cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + body)
+            self.assertFalse(tracker.terminal_order(cfg, result))
+
+    def test_no_longer_pending_scope_is_distinct_from_missing_parts(self):
+        for unit in ('items', 'packages', 'parcels', 'shipments'):
+            for predicate in ('are no longer pending', 'are no longer in transit', 'are no longer on the way',
+                              'are no  longer pending', "aren't pending", 'aren’t pending'):
+                with self.subTest(unit=unit, predicate=predicate):
+                    cfg, result = self.fetch('2606', 'Order #2606 delivered',
+                                             f'Order #2606 delivered in full. The other {unit} {predicate}.')
+                    self.assertTrue(tracker.terminal_order(cfg, result))
+
+    def assert_partial_check_stays_active(self, body):
+        cfg = self.f.cfg
+        folder = tracker.WATCHERS / cfg['watcher']
+        path = tracker.ROOT / 'orders' / (cfg['watcher'] + '.json')
+        tracker.write(path, dict(cfg, active=True))
+        tracker.write(folder / 'watcher.json', {})
+        tracker.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'ordered'})
+        with self.f.mail([self.f.hit(subject='Order #2606 delivered')]), \
+                mock.patch.object(tracker, 'run', return_value=body), \
+                mock.patch.object(tracker.delivery_cards, 'safe_sync', return_value={'status': 'skipped'}), \
+                mock.patch.dict(os.environ, {'WATCH_DIR': str(folder), 'WATCH_RUN': 'scheduled-fixture'}), \
+                redirect_stdout(io.StringIO()) as output:
+            tracker._check(cfg)
+            tracker._check(cfg)
+        self.assertTrue(tracker.read(path)['active'])
+        result = tracker.read(folder / 'order-tracker-state.json')['last_result']
+        self.assertFalse(result['whole_order_complete'])
+        self.assertFalse(tracker.terminal_order(cfg, result))
+        for line in output.getvalue().splitlines():
+            events = json.loads(line).get('events', [])
+            self.assertNotIn({'kind': 'stage_change', 'status': 'delivered'}, events)
+
+    def test_support_clause_keeps_following_partial_sentence_boundary(self):
+        for separator in ('. ', '! ', '? ', '; ', '\n'):
+            with self.subTest(separator=repr(separator)):
+                self.assert_partial_check_stays_active('Order #2606. Please contact support if you need help'
+                                                       + separator + 'Partial delivery.')
+
+    def test_pending_negation_does_not_hide_independent_transit_clause(self):
+        for separator in ('; ', '; however, ', ' but '):
+            with self.subTest(separator=separator):
+                self.assert_partial_check_stays_active('Order #2606. Other shipments are no longer pending'
+                                                       + separator + 'they are still in transit.')
+        for body in ('Other shipments are not pending; they are not in transit.',
+                     'Other shipments are no longer pending; they have been delivered.'):
+            cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + body)
+            self.assertTrue(tracker.terminal_order(cfg, result))
 
     def test_partial_check_keeps_watcher_and_later_whole_delivery_retires(self):
         cfg = self.f.cfg

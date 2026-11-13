@@ -64,6 +64,9 @@ RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
+WEB_PROOF_VERSION = 3
+WEB_NUMBER_WORDS = {word: value for value, word in enumerate(
+    'zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty'.split())}
 # Bridge chat slug rule; group slugs carry "_" (group-sb_gro). Env is read at call time.
 CHAT_RE = re.compile(r'[a-z0-9][a-z0-9._-]{0,99}')
 
@@ -237,7 +240,8 @@ def eta_elapsed_due(cfg, state, now):
 def terminal_order(cfg, result, status=None):
     status = result.get('status') if status is None else status
     return (status in TERMINAL and result.get('whole_order_complete') is not False
-            and (cfg['app'] not in {'amazon', 'web'} or result.get('whole_order_complete') is True))
+            and (cfg['app'] not in {'amazon', 'web'} or result.get('whole_order_complete') is True)
+            and (cfg['app'] != 'web' or result.get('web_proof_version') == WEB_PROOF_VERSION))
 
 
 def part_delivered(result, state):
@@ -515,6 +519,10 @@ def web_status_text(text, order):
 def web_mail_scope(subject, body, order=None):
     text = web_status_text(subject.lower(), order)
     body = web_status_text(body, order)
+    # Support instructions describe hypothetical failures, not this delivery.
+    # Normalize the reference-label abbreviation before finding sentence ends.
+    body = re.sub(r'\bno\.', 'no', body, flags=re.I)
+    body = re.sub(r'(?<![\w-])(?:if|when|once|unless|should)(?![\w-])[^.!?;\n]*([.!?;]?)', r'\1', body, flags=re.I)
     # An order reference in a package notice does not widen that notice's scope.
     full = r'\b(?:all|both)\s+(?:[0-9]+\s+)?(?:item|package|parcel|shipment)s?\b'
     scoped = re.sub(full, '', text)
@@ -523,21 +531,40 @@ def web_mail_scope(subject, body, order=None):
     if re.search(r'\bitems?\b', scoped):
         return 'item'
     unit = r'(?:item|package|parcel|shipment)s?'
-    for match in re.finditer(r'\b(?:(no|zero|[0-9]+)[ \t]+)?remaining\s+(' + unit +
-                             r')(?:\s*[:=-]\s*([0-9]+))?', body, re.I):
+    if re.search(r'\b(?:this|it|(?:your |the )?(?:delivery|order))\s+(?:is|was|remains)\s+(?:a\s+)?partial\b|'
+                 r'\b(?:has been|was|is)\s+partially\s+delivered\b|'
+                 r'(?:^|[.!?;\n])\s*(?:partial delivery|partially delivered)\b|'
+                 r'\b(?:the\s+)?(?:rest|remainder)\s+(?:will|is still|is yet to|is to)\b', body, re.I):
+        return 'shipment'
+    for match in re.finditer(r'\b(?:(no|zero|0)\s+)?other\s+(' + unit + r')\b([^.!?\n]{0,80})', body, re.I):
+        if match[1]:
+            continue
+        for clause in re.split(r';|\b(?:but|however)\b', match[3], flags=re.I):
+            missing = re.search(r"\b(?:not|never|\w+n['’]t)\b.{0,30}\b(?:arrive[ds]?|deliver(?:ed)?)\b", clause, re.I)
+            pending = (not re.search(r"\b(?:not|never|no\s+longer|\w+n['’]t)\b", clause, re.I) and
+                       re.search(r'\b(?:still|will|pending|remain\w*|in transit|on (?:the|its|their) way)\b', clause, re.I))
+            if missing or pending:
+                return 'item' if match[2].lower().startswith('item') else 'shipment'
+    number = r'(?:[0-9]+|' + '|'.join(WEB_NUMBER_WORDS) + ')'
+    for match in re.finditer(r'\b(?:(no|' + number + r')[ \t]+)?remaining\s+(' + unit +
+                             r')(?:\s*[:=-]\s*(' + number + r'))?', body, re.I):
         count = match[3] if match[3] is not None else match[1]
-        if count is not None and (count.lower() in {'no', 'zero'} or int(count) == 0):
+        if count is not None and (count.lower() == 'no' or web_count(count) == 0):
             continue
         return 'item' if match[2].lower().startswith('item') else 'shipment'
-    for match in re.finditer(r'\b(?:(' + unit + r')\s*[:#-]?\s*)?([0-9]+)\s*(?:of|/)\s*'
-                             r'([0-9]+)(?:\s*(' + unit + r'))?\b', body, re.I):
+    for match in re.finditer(r'\b(?:(' + unit + r')\s*[:#-]?\s*)?(' + number + r')\s*(?:out\s+of|of|/)\s*'
+                             r'(' + number + r')(?:\s*(' + unit + r'))?\b', body, re.I):
         part = match[1] or match[4]
         # "Shipment 2 of 2" identifies one shipment; "2 of 2 items"
         # counts the inventory. Neither "1 of 2" form is whole-order proof.
         inventory = part and part.lower().endswith('s')
-        if part and int(match[3]) > 1 and ((match[1] and not inventory) or int(match[2]) < int(match[3])):
+        if part and web_count(match[3]) > 1 and ((match[1] and not inventory) or web_count(match[2]) < web_count(match[3])):
             return 'item' if part.lower().startswith('item') else 'shipment'
     return 'order' if re.search(r'\border\b', text) else 'unknown'
+
+
+def web_count(value):
+    return int(value) if value.isdigit() else WEB_NUMBER_WORDS[value.lower()]
 
 
 def careem_live_stage(text, merchant):
@@ -735,7 +762,7 @@ def mail_evidence(cfg, verified=None):
             if refs and refs != {cfg['order']}:
                 continue
             cached = verified.get(mail_key) if cacheable else None
-            valid_cache = isinstance(cached, dict) and cached.get('version') == 2
+            valid_cache = isinstance(cached, dict) and cached.get('version') == WEB_PROOF_VERSION
             if valid_cache:
                 if not cached['matched']:
                     continue
@@ -771,7 +798,7 @@ def mail_evidence(cfg, verified=None):
                 matched = (refs | web_order_references(body)) == {cfg['order']}
                 scope = web_mail_scope(subject, body, cfg['order'])
                 if cacheable:
-                    verified[mail_key] = {'version': 2, 'matched': matched, 'scope': scope}
+                    verified[mail_key] = {'version': WEB_PROOF_VERSION, 'matched': matched, 'scope': scope}
             else:
                 matched = contains_id(body, cfg['order'])
                 if cacheable:
@@ -820,13 +847,13 @@ def email_body(value):
 
 
 def web_fetch(cfg, state, now):
-    if state.get('web_proof_version') != 2:
+    if state.get('web_proof_version') != WEB_PROOF_VERSION:
         for key in ('mail_cache', 'mail_checked', 'mail_bodies_verified', 'web_mail_last_at'):
             state.pop(key, None)
         if state.get('status') in TERMINAL and not terminal_order(cfg, state.get('last_result', {})):
             state.pop('status', None)
             state.pop('terminal_at', None)
-        state['web_proof_version'] = 2
+        state['web_proof_version'] = WEB_PROOF_VERSION
     if 'mail_cache' not in state or now - state.get('mail_checked', 0) >= 300:
         state['mail_checked'] = now
         try:
@@ -837,12 +864,14 @@ def web_fetch(cfg, state, now):
         except (RuntimeError, OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             state['mail_errors'] = ['email_unavailable']
     mails = state.get('mail_cache', [])
-    order_mails = [proof for proof in mails if proof['scope'] == 'order']
-    best = max(order_mails or mails, key=lambda e: e['observed_at'], default=None)
+    completion = [proof for proof in mails if proof['scope'] == 'order' and proof['stage'] in TERMINAL]
+    progress = [proof for proof in mails if proof['stage'] not in TERMINAL]
+    best = max(completion or progress or mails, key=lambda e: e['observed_at'], default=None)
     result = {'app': 'web', 'order': cfg['order'], 'status': best['stage'] if best else 'unknown',
               'eta': cfg.get('eta'), 'eta_source': 'checkout_supplied' if cfg.get('eta') else None,
               'rider': None, 'checked_at': stamp(now), 'source': 'order_email',
-              'coverage': 'merchant_email_only', 'evidence': [best] if best else [],
+              'coverage': 'merchant_email_only', 'web_proof_version': WEB_PROOF_VERSION,
+              'evidence': [best] if best else [],
               'errors': state.get('mail_errors', [])}
     problem = max((proof for proof in mails if proof['stage'] == 'problem'),
                   key=lambda e: e['observed_at'], default=None)
@@ -1230,7 +1259,7 @@ def transition(result, state, cfg, now):
                 seen.append(key)
                 events.append({'kind': 'aftercare', 'status': proof['stage'], **proof})
     current = result['status']
-    if cfg.get('app') == 'web' and current in TERMINAL and result.get('whole_order_complete') is not True:
+    if cfg.get('app') == 'web' and current in TERMINAL and not terminal_order(cfg, result, current):
         result['status'] = current = 'unknown'
     if cfg.get('app') != 'amazon' and current in TERMINAL and result.get('whole_order_complete') is False:
         result['status'] = current = 'unknown'
@@ -1580,6 +1609,9 @@ def main(argv=None, _locked=False):
         status_state = {key: saved[key] for key in ('status', 'web_mail_last_at', 'web_proof_version') if key in saved} if app == 'web' else {}
         result = fetch(cfg, status_state, time.time())
         result['last_confirmed_status'] = saved.get('status', 'unknown')
+        if (app == 'web' and result['last_confirmed_status'] in TERMINAL
+                and not terminal_order(cfg, saved.get('last_result', {}), result['last_confirmed_status'])):
+            result['last_confirmed_status'] = 'unknown'
         if result['status'] == 'pending confirmation' and result['last_confirmed_status'] == 'placed':
             result['last_confirmed_status'] = 'pending confirmation'
         print(json.dumps(result, indent=2))

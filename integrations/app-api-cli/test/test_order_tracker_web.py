@@ -144,7 +144,7 @@ class WebTrackerTest(unittest.TestCase):
         serialized = json.dumps([result, state])
         for private in ('Private customer detail', 'secret marker', 'Your order has been delivered'):
             self.assertNotIn(private, serialized)
-        self.assertEqual(state['mail_bodies_verified'], {'icloud:Inbox:1': {'version': 2, 'matched': True, 'scope': 'order'}})
+        self.assertEqual(state['mail_bodies_verified'], {'icloud:Inbox:1': {'version': 3, 'matched': True, 'scope': 'order'}})
 
     def test_web_stages_and_promises(self):
         rows = [('Thanks for your order #2606', 'ordered'), ('Order #2606 confirmed', 'ordered'),
