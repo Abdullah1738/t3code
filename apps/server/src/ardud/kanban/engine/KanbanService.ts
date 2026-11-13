@@ -9093,28 +9093,34 @@ const make = Effect.gen(function* () {
           paused.activePool !== Rules.poolOf(pools, paused.model)
             ? { ...paused, activePool: Rules.poolOf(pools, paused.model) }
             : paused;
-        yield* saveCard(saved);
-        if (
-          workThread !== null &&
-          !modelSelectionsEqual(card.model, saved.model) &&
-          NodeUtil.isDeepStrictEqual(yield* cardOf(saved.id), saved)
-        ) {
-          // The thread now runs the new model's pool; its slot follows, so the pool
-          // counts and the one-slot limit stay right. Cards sharing the thread take the
-          // same model, so a steer or wake to any of them keeps the thread on it.
-          const newPool = Rules.poolOf(pools, saved.model);
-          for (const other of yield* store.cardsByThread(workThread)) {
-            if (other.id === saved.id) continue;
-            yield* saveCard({ ...other, model: saved.model, activePool: newPool });
-          }
-          const held = (yield* Ref.get(holds)).get(workThread);
-          if (held !== undefined && held.boardId === saved.boardId && held.pool !== newPool) {
-            yield* Ref.update(holds, (all) =>
-              new Map(all).set(workThread, { ...held, pool: newPool }),
-            );
-          }
-        }
-        yield* releaseModel;
+        // Once one card is saved, finish its shared model and hold updates before
+        // cancellation can run cleanup against a partially updated thread.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* saveCard(saved);
+            if (
+              workThread !== null &&
+              !modelSelectionsEqual(card.model, saved.model) &&
+              NodeUtil.isDeepStrictEqual(yield* cardOf(saved.id), saved)
+            ) {
+              // The thread now runs the new model's pool; its slot follows, so the pool
+              // counts and the one-slot limit stay right. Cards sharing the thread take the
+              // same model, so a steer or wake to any of them keeps the thread on it.
+              const newPool = Rules.poolOf(pools, saved.model);
+              for (const other of yield* store.cardsByThread(workThread)) {
+                if (other.id === saved.id) continue;
+                yield* saveCard({ ...other, model: saved.model, activePool: newPool });
+              }
+              const held = (yield* Ref.get(holds)).get(workThread);
+              if (held !== undefined && held.boardId === saved.boardId && held.pool !== newPool) {
+                yield* Ref.update(holds, (all) =>
+                  new Map(all).set(workThread, { ...held, pool: newPool }),
+                );
+              }
+            }
+            yield* releaseModel;
+          }),
+        );
         yield* laterEvaluatorTurn(card, saved, actor);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });

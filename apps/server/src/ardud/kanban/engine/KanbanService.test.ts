@@ -640,7 +640,6 @@ const assignmentCases = [
   ["work", "queue"],
   ["work", "turn-end"],
   ["work", "card"],
-  ["work", "model"],
   ["work", "project"],
   ["work", "slot"],
   ["work", "pause"],
@@ -668,6 +667,62 @@ const assignmentCases = [
   ["own-work", "unrelated"],
   ["own-work", "turn-end"],
 ] as const;
+
+it.effect("a work model edit waits for a pending wake before confirming its selection", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let target: ThreadId | null = null;
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (input.threadId === target && input.model) {
+                target = null;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(resume);
+              }
+              return yield* threads.send(input);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId } = yield* parkedWork;
+      yield* kanban.setPool(board.id, astraXhigh, 1);
+      const other = yield* kanban.createCard(
+        board.id,
+        { prompt: "Other", title: "Other", priority: 99 },
+        owner,
+      );
+      target = threadId;
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      const editing = yield* Effect.forkChild(
+        kanban.editCard(card.id, { model: astraXhigh }, owner),
+      );
+      yield* Effect.yieldNow;
+      assert.isUndefined(editing.pollUnsafe());
+      assert.isEmpty(fake.modelSwitches);
+      // Waiting for this thread's model lock does not hold the board's write gate.
+      yield* kanban.editCard(other.id, { description: "Unrelated edit" }, owner);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(dispatch);
+      yield* Fiber.join(editing);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card.model, astraXhigh);
+      assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, astraXhigh);
+      yield* kanban.dispatchNow;
+      const saved = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(saved.stage, "working");
+      assert.strictEqual(saved.activeThreadId, threadId);
+      assert.deepStrictEqual(saved.model, astraXhigh);
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
 
 it.effect.each(assignmentCases.map(([role, change]) => ({ role, change })))(
   "dispatch $role reuse with a $change write during wake",
@@ -14078,7 +14133,9 @@ it.effect("a level change refuses a level another pool of the model already has"
       assert.strictEqual(refused.code, "conflict");
       assert.include(refused.detail, "already has a pool at max");
       const other = yield* kanban
-        .setPool(board.id, board.defaultCardModel, undefined, { replaces: Rules.poolKey(sonnetMax) })
+        .setPool(board.id, board.defaultCardModel, undefined, {
+          replaces: Rules.poolKey(sonnetMax),
+        })
         .pipe(Effect.flip);
       assert.include(other.detail, "a level change keeps the model");
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -14645,6 +14702,92 @@ const parkedWork = Effect.gen(function* () {
   assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
   return { kanban, board, card, threadId };
 });
+
+it.effect.each([
+  { fixture: "parked", write: "source" },
+  { fixture: "parked", write: "sibling" },
+  { fixture: "active", write: "source" },
+  { fixture: "active", write: "sibling" },
+  { fixture: "held", write: "source" },
+] as const)(
+  "model edits finish shared updates after cancellation ($fixture / $write)",
+  ({ fixture, write }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const committed = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let target: string | null = null;
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putCard: (card) =>
+              real
+                .putCard(card)
+                .pipe(
+                  Effect.andThen(
+                    Effect.suspend(() =>
+                      card.id === target && card.model.model === astraXhigh.model
+                        ? Deferred.succeed(committed, undefined).pipe(
+                            Effect.andThen(Deferred.await(release)),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, astraXhigh, 1);
+        const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const threadId = (yield* kanban.card(first.id)).card.workThreadId!;
+        yield* setRunning(fake, threadId, true);
+        const carried =
+          fixture === "held"
+            ? []
+            : [first, (yield* kanban.createForThread(threadId, { prompt: "C", title: "C" })).card];
+        if (fixture === "held") {
+          yield* kanban.moveCard(first.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId,
+          });
+          assert.isTrue((yield* kanban.nextCards(threadId)).holdsSlot);
+        }
+        const source =
+          fixture === "active"
+            ? first
+            : yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+        if (fixture !== "active") {
+          const store = yield* KanbanStore.KanbanStore;
+          yield* store.putCard({ ...source, workThreadId: threadId });
+        }
+        target = write === "source" ? source.id : carried.find((card) => card.id !== source.id)!.id;
+        const editing = yield* Effect.forkChild(
+          kanban.editCard(source.id, { model: astraXhigh }, owner),
+        );
+        yield* Deferred.await(committed);
+        const cancelling = yield* Effect.forkChild(Fiber.interrupt(editing));
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(cancelling);
+        assert.deepStrictEqual((yield* kanban.card(source.id)).card.model, astraXhigh);
+        for (const sibling of carried) {
+          const saved = (yield* kanban.card(sibling.id)).card;
+          assert.deepStrictEqual(saved.model, astraXhigh);
+          assert.strictEqual(saved.activePool, Rules.poolKey(astraXhigh));
+        }
+        assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(threadId)?.model, astraXhigh);
+        // A new card can reuse the worker's model and slot after cancellation.
+        const follow = yield* kanban.createForThread(threadId, { prompt: "D", title: "D" });
+        assert.deepStrictEqual(follow.card.model, astraXhigh);
+        assert.strictEqual(follow.card.activePool, Rules.poolKey(astraXhigh));
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+    }),
+);
 
 it.effect.each(["model", "models", "equal"] as const)(
   "a parked work thread follows a card edit (%s)",
