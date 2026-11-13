@@ -224,6 +224,16 @@ class Instrumentation(Isolated):
             self.assertEqual(runs._detach(rn,15),common.EXIT_DETACHED)
         self.assertEqual(self.rows('run.error')[-1]['error']['tag'],'install_mid_run')
 
+    def test_install_landing_during_run_is_detected_without_affecting_result(self):
+        with patch.object(runs,'_source_stamp',return_value=('new installed source',)):
+            runs._log_source_change('run-fixture')
+        row=self.rows('run.error')[0]
+        self.assertEqual(row['error']['tag'],'install_mid_run')
+        self.assertEqual(row['props']['stage'],'install_mid_run')
+        with patch.object(runs,'_source_stamp',side_effect=OSError('unreadable installed source')):
+            runs._log_source_change('run-fixture')
+        self.assertEqual(len(self.rows('run.error')),1)
+
     def test_pool_lease_success_failure_and_snapshot(self):
         row={'box_id':'bx_fixture','_log_lease_kind':'saved-base'}
         with patch.object(pool,'_acquire_logged',return_value=row): pool.acquire(self.me,run_id='run-fixture')

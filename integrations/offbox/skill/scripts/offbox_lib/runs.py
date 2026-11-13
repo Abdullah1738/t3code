@@ -23,6 +23,29 @@ from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      offsets_path, person, read_json, say, silence, write)
 
+
+def _source_stamp():
+    try:
+        folder = Path(__file__).resolve().parent
+        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py']
+        return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(files))
+    except Exception:
+        return None
+
+
+_SOURCE_STAMP = _source_stamp()
+
+
+def _log_source_change(run_id):
+    try:
+        current = _source_stamp()
+        if current is not None and _SOURCE_STAMP is not None and current != _SOURCE_STAMP:
+            import toollog
+            toollog.emit('run', 'run.error', kind='error', ok=False, ids={'run': run_id},
+                         props={'stage': 'install_mid_run'}, tag='install_mid_run')
+    except Exception:
+        pass
+
 BG_TTL_S = ORPHAN_RUN_MAX_S
 RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
 RESTART_MARKER_MAX_S = 300
@@ -2453,6 +2476,7 @@ def _run_attempt(a, me: dict) -> int:
         failure.box = rn.box
         raise failure from e
     finally:
+        _log_source_change(rn.run_id)
         pool.release_guard(rn.lease_row)
 
 
