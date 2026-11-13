@@ -155,6 +155,11 @@ export class ControlClient {
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
     const loggingAt = performance.now();
+    let loggingIds: Record<string, string> | undefined;
+    toolLog.capture(() => {
+      const encoded = /^\/threads\/(?!by-native(?:\/|$))([^/?]+)/.exec(path)?.[1];
+      loggingIds = toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined);
+    });
     let loggingOk = false;
     try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
@@ -191,7 +196,7 @@ export class ControlClient {
       toolLog.capture(() => {
       const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, props: { method, route } }));
+        ok: loggingOk, ids: loggingIds, props: { method, route } }));
       });
     }
   }
