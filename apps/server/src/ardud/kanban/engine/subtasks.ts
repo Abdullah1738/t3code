@@ -39,6 +39,21 @@ const approvalAction = (text: string): string =>
     .replace(/^sharing\b/, "share")
     .replace(/\s+/g, " ");
 
+const harmlessFollowup = (task: string, target: string): boolean => {
+  const text = task
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  const suffix =
+    /(?:\s+(?:(?:and(?:\s+then)?|then)\s+)?|\s*,\s*(?:then\s+)?)(?:read back|read-back|verify|check|confirm|test|report back)(?:\s+(?:its version|it|the result))?$/i.exec(
+      text,
+    );
+  if (!suffix) return false;
+  const action = text.slice(0, suffix.index).trimEnd();
+  // Keep the suffix raw: removing articles could turn an extra object ("the test") into a verb.
+  return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
+};
+
 const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
@@ -61,8 +76,8 @@ const approvesGate = (
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
   const normalized = approvalAction(action);
   const target = normalized.replace(/\s+now$/, "");
-  const taskAction = approvalAction(task).replace(/\s+now$/, "");
-  if (target === taskAction) return true;
+  const taskAction = approvalAction(task);
+  if (target === taskAction.replace(/\s+now$/, "")) return true;
   let verb: RegExp;
   switch (gate) {
     case "deploy":
@@ -78,10 +93,12 @@ const approvesGate = (
   const operation = action !== command ? normalized : action;
   const matched = verb.exec(operation)?.[0];
   if (!matched) return false;
-  // A targeted action need not repeat follow-up work, but must end at a word or clause boundary.
+  const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
+  if (suffix !== null && action === command && normalized === target)
+    return harmlessFollowup(task, target);
   return (
     /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
-    (taskAction.startsWith(target) && /^(?:\s|[,;:(]|\.\s)/.test(taskAction.slice(target.length)))
+    (suffix !== null && harmlessFollowup(task, target))
   );
 };
 
