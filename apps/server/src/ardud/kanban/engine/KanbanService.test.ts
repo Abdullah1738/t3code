@@ -8904,6 +8904,112 @@ it.effect(
     }),
 );
 
+it.effect.each(
+  (
+    [
+      { role: "work", change: "edit" },
+      { role: "review", change: "edit" },
+      { role: "work", change: "move" },
+      { role: "review", change: "move" },
+    ] as const
+  ).flatMap((scenario) => [false, true].map((sendError) => ({ ...scenario, sendError }))),
+)(
+  "an accepted $role nudge survives a concurrent $change without a duplicate or stale card save (sendError=$sendError)",
+  ({ role, change, sendError }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let target: ThreadId | undefined;
+      let nudge: string | undefined;
+      let gated = false;
+      const delayed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (threads) =>
+          KanbanThreads.of({
+            ...threads,
+            send: (input) =>
+              threads
+                .send(input)
+                .pipe(
+                  Effect.ensuring(
+                    Effect.suspend(() =>
+                      gated &&
+                      input.threadId === target &&
+                      nudge !== undefined &&
+                      input.text.startsWith(nudge)
+                        ? Deferred.succeed(entered, undefined).pipe(
+                            Effect.andThen(Deferred.await(resume)),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(card.id)).card.activeThreadId!;
+        if (role === "review") {
+          yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: work,
+          });
+          yield* kanban.turnEnded(work);
+          yield* kanban.dispatchNow;
+        }
+        target = (yield* kanban.card(card.id)).card.activeThreadId!;
+        nudge =
+          role === "review"
+            ? `Card #${card.number}: record your verdict with card_review_result (clear or findings).`
+            : `Card #${card.number} is still in Working and your turn ended.`;
+        const nudges = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map(
+              (all) => all.get(target!)!.messages.filter((text) => text.startsWith(nudge!)).length,
+            ),
+          );
+        const observed = (yield* Ref.get(fake.threads)).get(target)!;
+        fake.runOnSend.add(target);
+        if (sendError) fake.commitThenReject.add(target);
+        gated = true;
+        const ending = yield* Effect.forkChild(kanban.turnEnded(target).pipe(Effect.exit));
+        yield* Deferred.await(entered);
+        assert.strictEqual(yield* nudges(), 1);
+        yield* TestClock.adjust("1 second");
+        yield* kanban.editCard(
+          card.id,
+          { description: "Concurrent update after send acceptance" },
+          owner,
+        );
+        if (change === "move") yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        const changed = (yield* kanban.card(card.id)).card;
+        gated = false;
+        yield* Deferred.succeed(resume, undefined);
+        const ended = yield* Fiber.join(ending);
+        const acknowledged = (yield* kanban.card(card.id)).card;
+        // The accepted nudge's run finishes before the next board tick.
+        observed.running = false;
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudges(), 1);
+        assert.isTrue(Exit.isSuccess(ended));
+        assert.strictEqual(acknowledged.description, changed.description);
+        assert.strictEqual(acknowledged.stage, changed.stage);
+        assert.strictEqual(acknowledged.activeThreadId, changed.activeThreadId);
+        assert.isAtLeast(Date.parse(acknowledged.updatedAt), Date.parse(changed.updatedAt));
+        if (change === "move") assert.strictEqual(acknowledged.nudgedAt, changed.nudgedAt);
+        else assert.isNotNull(acknowledged.nudgedAt);
+        if (role === "work" && change === "edit") {
+          yield* kanban.turnEnded(target);
+          assert.strictEqual(yield* nudges(), 2);
+        }
+      }).pipe(Effect.provide(testLayer(delayed)));
+    }),
+);
+
 it.effect("an unreadable failure on a delayed turn end never restarts the failed thread", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

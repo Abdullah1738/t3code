@@ -5907,6 +5907,35 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const nudgeThread = Effect.fn("KanbanService.nudgeThread")(function* (
+    threadId: ThreadId,
+    cards: ReadonlyArray<KanbanCard>,
+    text: string,
+  ) {
+    // The send is accepted before the gate resumes. Acknowledge it on current rows,
+    // like discussion delivery, so a concurrent edit cannot replay the same nudge.
+    yield* locks.outside(
+      threads.send({ threadId, text }).pipe(Effect.ignore),
+      undefined,
+      false,
+      Effect.succeed(true),
+    );
+    const at = yield* nowIso;
+    for (const card of cards) {
+      const current = yield* store.card(card.id);
+      if (
+        current === null ||
+        current.activeThreadId !== threadId ||
+        current.stage !== card.stage ||
+        current.activeRole !== card.activeRole ||
+        current.movedAt !== card.movedAt ||
+        current.nudgedAt !== card.nudgedAt
+      )
+        continue;
+      yield* saveCard({ ...current, nudgedAt: at, updatedAt: at });
+    }
+  });
+
   /** A stopped worker hears about its cards still in Working, every time. nudgedAt records the last nudge instead of a card event, so a looping worker can't flood the history. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
@@ -5938,9 +5967,7 @@ const make = Effect.gen(function* () {
       next.delete(threadId);
       return next;
     });
-    const at = yield* nowIso;
-    yield* threads.send({ threadId, text: Briefs.nudgeWorkText(nudge) }).pipe(Effect.ignore);
-    for (const card of nudge) yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+    yield* nudgeThread(threadId, nudge, Briefs.nudgeWorkText(nudge));
   });
 
   /** A reviewer whose turn ended with no verdict: nudged once, then flagged and its slot freed. */
@@ -5961,8 +5988,7 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
     if (card.nudgedAt === null) {
-      yield* threads.send({ threadId, text: Briefs.nudgeReviewText(card) }).pipe(Effect.ignore);
-      yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
+      yield* nudgeThread(threadId, [card], Briefs.nudgeReviewText(card));
       return;
     }
     // A reviewer that still has no verdict after the nudge frees its slot. The first
