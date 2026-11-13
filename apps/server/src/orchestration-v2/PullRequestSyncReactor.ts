@@ -428,7 +428,10 @@ export const make = Effect.gen(function* () {
       if (scope === "requested") requestedSweepQueued = false;
       // A fresh memo per sweep: each project's shell is read once per sweep, never reused after.
       return sweep(scope).pipe(
-        Effect.provideService(PullRequestService.SweepProjectShells, new Map()),
+        Effect.provideService(
+          PullRequestService.SweepProjectShells,
+          PullRequestService.makeSweepProjectMemo(),
+        ),
       );
     }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
   );

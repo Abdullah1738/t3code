@@ -30,6 +30,7 @@ import {
 } from "effect/http";
 
 import * as ProjectService from "../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -88,6 +89,9 @@ const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
   Layer.provide(
     Layer.mergeAll(
       Layer.mock(ProjectService.ProjectService)({}),
+      Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+        resolve: () => Effect.succeed(null),
+      }),
       Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
       Layer.mock(Orchestrator.OrchestratorV2)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
@@ -178,6 +182,9 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         McpToolAccessTestkit.liveThreadsLayer,
         Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+          resolve: () => Effect.succeed(null),
+        }),
         NodeServices.layer,
       ),
     ),

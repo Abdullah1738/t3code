@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import time
 import sqlite3
+import re
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner)
+                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -46,6 +47,22 @@ def _recheck_prune_holds(con, actions: list[str]) -> None:
 
 
 def reap(dry: bool = False) -> list[str]:
+    import toollog
+    with toollog.span("reaper", "reaper.pass", props={"dryRun": dry}, tag="reaper_failed") as data:
+        actions = _reap_logged(dry)
+        data["props"]["count"] = len(actions)
+        data["ok"] = not any("(FAILED:" in action or " list failed:" in action for action in actions)
+        for action in actions:
+            word = action.removeprefix("would ").split(" ", 1)[0]
+            failed = "(FAILED:" in action or " list failed:" in action
+            lost = re.fullmatch(r"(?:would )?mark (?:local |no-box )?run (\S+) lost(?: \(client \d+ gone\))?", action)
+            toollog.emit("reaper", "reaper.action", kind="error" if failed else "event", ok=not failed,
+                         tag="reaper_action" if failed else None, ids={"run": lost[1]} if lost else None,
+                         props={"dryRun": dry, "action": word if word in {"stop", "delete", "forget", "settle", "keep"} else "other"})
+        return actions
+
+
+def _reap_logged(dry: bool = False) -> list[str]:
     actions: list[str] = []
     con = db()
     try:
@@ -102,6 +119,18 @@ def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> No
         lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
 
 
+def _mark_lost(con, run_id, error=None, *, no_box=False):
+    from .runs import claim_terminal_log, emit_terminal
+    with write(con):
+        changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=COALESCE(?,error) "
+                              "WHERE run_id=? AND status IN ('starting','running')" +
+                              (" AND box_id IS NULL" if no_box else ""), (now(), error, run_id))
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone() if changed.rowcount else None
+        log_row = claim_terminal_log(con, row)
+    if log_row is not None:
+        emit_terminal(log_row)
+
+
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
     # Cleanup can declare an absent client/box lost before _check_unlocked ever sees its runs.
@@ -136,9 +165,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} local run {rid} lost")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=? WHERE run_id=? AND status IN ('starting','running')", (now(), rid))
-    if stale and not dry:
-        con.commit()
+            _mark_lost(con, rid)
     # Foreground/--bg runs that never got a box (client died while waiting in the pool): nothing remote to check.
     # Two hours is past any pool wait, so live waiters are never touched.
     nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
@@ -148,10 +175,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND status IN ('starting','running')",
-                        (now(), "client ended before it got a box", rid))
-    if nobox and not dry:
-        con.commit()
+            _mark_lost(con, rid, "client ended before it got a box")
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
     from .misc import _client_alive
     orphan = [tuple(r) for r in con.execute(
@@ -164,9 +188,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
-                        "AND status IN ('starting','running')", (now(), "client ended before it got a box", rid))
-            con.commit()
+            _mark_lost(con, rid, "client ended before it got a box", no_box=True)
     start_budget = {'checks': START_CHECKS_PER_PASS}
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)

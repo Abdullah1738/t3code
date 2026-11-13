@@ -1,4 +1,4 @@
-import { SourceControlProviderKind } from "@t3tools/contracts";
+import { ProjectId, SourceControlProviderKind } from "@t3tools/contracts";
 // @effect-diagnostics nodeBuiltinImport:off - realpathSync.native resolves Windows 8.3 short names, which the Effect realPath does not.
 import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -14,6 +14,7 @@ import { TestClock } from "effect/testing";
 
 import * as ProcessRunner from "../processRunner.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
+import { resolveTarget } from "../mcp/toolkits/pullRequests/handlers.ts";
 
 const normalizePathSeparators = (value: string) => value.replaceAll("\\", "/");
 const normalizeResolvedPath = (value: string) => normalizePathSeparators(value);
@@ -165,6 +166,9 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
       expect(yield* resolver.resolve("/repo/packages/web")).toBeNull();
       expect(attempts).toBe(failedAttempts);
 
+      yield* TestClock.adjust(Duration.minutes(14));
+      expect(yield* resolver.resolve("/repo/packages/web")).toBeNull();
+      expect(attempts).toBe(failedAttempts);
       yield* TestClock.adjust(Duration.minutes(1));
       const recovered = yield* resolver.resolve("/repo/packages/web");
       expect(recovered?.rootPath).toBe("/repo");
@@ -560,3 +564,66 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
     ),
   );
 });
+
+it.effect.each(["missing-folder", "no-remotes"] as const)(
+  "PR target refresh recovers %s after git init or remote add",
+  (state) =>
+    Effect.gen(function* () {
+      let ready = false;
+      let calls = 0;
+      const resolver = yield* RepositoryIdentityResolver.make().pipe(
+        Effect.provide(
+          Layer.succeed(ProcessRunner.ProcessRunner, {
+            run: (input) =>
+              Effect.sync(() => {
+                calls++;
+                const noRoot = !ready && state === "missing-folder";
+                return {
+                  stdout: noRoot
+                    ? ""
+                    : input.args.includes("remote")
+                      ? ready
+                        ? "origin\thttps://github.com/acme/new.git (fetch)\n"
+                        : ""
+                      : "/repo\n",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(noRoot ? 1 : 0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                };
+              }),
+          }),
+        ),
+      );
+      expect(yield* resolver.resolve("/repo")).toBeNull();
+      ready = true;
+      expect(yield* resolver.resolve("/repo")).toBeNull();
+      const project = {
+        id: ProjectId.make("new"),
+        title: "New",
+        workspaceRoot: "/repo",
+        defaultModelSelection: null,
+        scripts: [],
+        repositoryIdentity: null,
+        createdAt: "2026-07-01T00:00:00Z",
+        updatedAt: "2026-07-01T00:00:00Z",
+      };
+      const before = calls;
+      yield* resolveTarget({ host: "github.com", repository: "acme/new", number: 1 }, project).pipe(
+        Effect.provideService(RepositoryIdentityResolver.RepositoryIdentityResolver, resolver),
+      );
+      yield* resolveTarget({ url: "https://github.com/acme/new/pull/1" }, project).pipe(
+        Effect.provideService(RepositoryIdentityResolver.RepositoryIdentityResolver, resolver),
+      );
+      expect(calls).toBe(before);
+      const result = yield* resolveTarget({ repository: "acme/new", number: 1 }, project).pipe(
+        Effect.provideService(RepositoryIdentityResolver.RepositoryIdentityResolver, resolver),
+      );
+      expect(result.url).toBe("https://github.com/acme/new/pull/1");
+      expect(calls - before).toBe(2);
+      expect((yield* resolver.resolve("/repo"))?.canonicalKey).toBe("github.com/acme/new");
+    }).pipe(Effect.provide(NodeServices.layer)),
+);

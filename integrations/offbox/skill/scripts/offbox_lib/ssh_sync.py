@@ -18,6 +18,8 @@ import time
 import unicodedata
 from pathlib import Path
 
+import toollog
+
 from . import api, capacity, common, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 
@@ -52,6 +54,7 @@ def cfg_path(box_id: str) -> Path:
     return SSH_DIR / f"config_{box_id}"
 
 
+@toollog.observed("ssh", "ssh.setup", "ssh_setup")
 def setup(box_id: str) -> Path:
     """Authorize our key on the box's current machine and pin its host key. Needed after every create/resume/fork."""
     ensure_dirs()
@@ -120,11 +123,14 @@ def ssh_base(box_id: str) -> list[str]:
 
 def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
     p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+    if p.returncode == 255:
+        toollog.emit("ssh", "ssh.drop", kind="error", ok=False, ids={"box": box_id}, tag="ssh_drop", props={"exitCode": 255})
     if check and p.returncode != 0:
         raise OffboxError(f"ssh {box_id} failed ({p.returncode}): {p.stderr.decode(errors='replace')[-400:]}")
     return p
 
 
+@toollog.observed("ssh", "ssh.readiness", "readiness")
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
     left = api.left()
     deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
@@ -579,6 +585,16 @@ def _stats(out: str) -> dict:
 def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeout: float = 3600,
          includes: list[str] | None = None, seed_candidates: list[str] | None = None,
          run_id: str | None = None) -> dict:
+    with toollog.span("sync", "run.sync", ids={"run": run_id, "box": box_id}, tag="sync_failed") as data:
+        result = _push(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        data["props"].update(bytes=result.get("sent", 0), files=result.get("files", 0),
+                             skipped=result.get("skipped", 0))
+        return result
+
+
+def _push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeout: float = 3600,
+         includes: list[str] | None = None, seed_candidates: list[str] | None = None,
+         run_id: str | None = None) -> dict:
     """Mirror root/ to ~/<remote_dir>/ on the box. Deletes remote files removed locally (inside remote_dir only)."""
     if str(root) in ("/", str(Path.home())):
         raise OffboxError(f"refusing to sync {root} (not a repo). cd into a repo first.", code=2)
@@ -590,6 +606,8 @@ def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeo
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
+    st["secret_skips"] = tracked_secret_matches(root, includes)
+    st["skipped"] = len(st["secret_skips"])
     log(f"push {box_id} {root} -> {remote_dir} {st}")
     return st
 
@@ -1040,6 +1058,15 @@ def _missing_pull(code: int, error: str) -> bool:
 
 
 def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
+    with toollog.span("sync", "run.pull", ids={"box": box_id}, tag="pull_failed") as data:
+        result = _pull(box_id, remote_dir, rel_cwd, path, local_cwd, timeout)
+        data["ok"] = bool(result.get("ok"))
+        data["props"].update(bytes=result.get("received", 0), files=result.get("files", 0),
+                             failed=not data["ok"], stale=not data["ok"])
+        return result
+
+
+def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
     if path.startswith("/") or ".." in Path(path).parts:
@@ -1060,6 +1087,7 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path,
     return st
 
 
+@toollog.observed("ssh", "ssh.put_file", "put_file_failed", timeout_tag="put_file_timeout")
 def put_file(box_id: str, remote_path: str, content: bytes, mode: str = "600", timeout: float = 120) -> None:
     d = os.path.dirname(remote_path)
     ssh(box_id, f"umask 077; mkdir -p {shlex.quote(d)} && cat > {shlex.quote(remote_path)} && chmod {mode} "

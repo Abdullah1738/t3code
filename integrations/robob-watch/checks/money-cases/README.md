@@ -4,7 +4,7 @@ One place for open money cases (refunds, disputes, failed or unexpected charges,
 
 The code lives here. The cases live in `~/Documents/assistant/money-cases/cases.json` (mode 600), never in git.
 
-The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads Robob's server-owned read replica `readonly/state.sqlite`, never the live statev2 database.
+The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads owner messages through Robob's control API.
 
 ## Use
 
@@ -94,13 +94,15 @@ money-cases questions [--all] [--json]
 
 `charges.py` reads ENBD, Emirates Islamic, ADCB, Wio and Mashreq charge and decline alerts. A charge is explained by a receipt mail that shows the amount as money in the charge's currency and reads as a receipt or order, and either names the merchant (from two hours before through 36 hours after the alert) or shows the card's last four digits within 15 minutes of it. Something he typed in his own Robob threads within 30 minutes of it also explains it when one statement names the merchant and says he paid, ordered or owns it (and any amount in it is the charge's), unless the message denies, questions or hedges it. Only his typing counts: app turns, and iMessage turns that relay a real inbound message; scheduled runs, notifications, watcher and bridge wakes, coord and crw turns never do. A merchant that mailed him receipts before, or a pending hold from a merchant his bank alerts show, waits up to 36 hours for the receipt. Declines on his cards go to him. `ask` needs the alert's own time (`--at`) so the same alert stays one question; it exits 0 and counts the ask only when he should be asked, allows one re-ask 24 hours later, and a third ask instead opens a money case. Exit 3 says why not. Exit 4 prints `UNVERIFIED: source <name> unreadable` for each failed source and does not count an ask. `answered` on a question that became a case notes his answer on the case and leaves it open.
 
-Owner-thread evidence comes from the server-owned
-`~/.robob/userdata/readonly/state.sqlite` replica. `MONEY_CASES_STATE_DB` overrides
-shared `ROBOB_READONLY_DB`. A missing, incomplete or >120-second-old export is a
-failed lookup, never evidence that he said nothing, and never falls back to the
-live writer. Symlink and hardlink aliases of the writer are refused too.
+Owner-thread evidence comes from Robob's control API, using
+`T3_CONTROL_TOKEN_FILE`, the watchers component credential, or
+`~/.robob/ardud-control.json`. The server must supply message provenance
+(`automated` and `inboundMessageId`); an older server or a failed/timed-out
+lookup supplies no owner evidence and records a lookup error. There is no
+SQLite fallback. The per-check union-window fetch is capped at four seconds
+and the remaining check budget; `timing.owner_queries` counts HTTP requests.
 
-Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), raises a wait that ran out once, retains asked questions as awaiting_answer, and queues unasked charges older than 24 hours regardless of age. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
+Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
 
@@ -129,9 +131,9 @@ robob-watch test money-cases
 
 ## Unanswered charges and purchase notes
 
-`questions`, `list`, `show` and `brief` retain asked charges as `awaiting_answer` until an answer or a sourced closure. `answered QID --note ...` records the answer; `close ID --outcome ... --source mail:<id>|sms:<id>|imessage:<id>|statement:<path>#<line>` closes a waiting case with evidence. A charge with no asks older than 24 hours queues once, behind any unanswered question, and still goes through the receipt gate. Quiet hours and the check budget apply.
+`questions`, `list`, `show` and `brief` retain asked charges as `awaiting_answer` until an answer or a sourced closure. `answered QID --note ...` records the answer; `close ID --outcome ... --source mail:<id>|sms:<id>|imessage:<id>|statement:<path>#<line>` closes a waiting case with evidence. Never-asked charges older than 24 hours go through the daily list and receipt gate, even while other questions await answers. Quiet hours and the check budget apply.
 
-Overdue bills bypass that queue. Their alert includes the latest recorded statement balance less later posted credits for that card, including closed refund cases. Promised refunds are excluded. Repeated or corroborating events retain an OVERDUE state and a separate history line.
+Overdue bills still bypass unanswered questions. Their alert includes the latest recorded statement balance less later posted credits for that card, including closed refund cases. Promised refunds are excluded. Repeated or corroborating events retain an OVERDUE state and a separate history line.
 
 At payment time, record a delegated purchase:
 
@@ -141,3 +143,9 @@ money-cases note-purchase --merchant MERCHANT --amount AMOUNT --currency CUR \
 ```
 
 Use `--asked-by moni` for her purchases. This records the request, not a payment or a ledger entry. The charge matcher (including inbox triage) checks merchant, exact amount/currency, last four digits and a 15-minute payment window before external lookups. Once matched, the note cannot explain a separate later charge. Purchase notes stay in the private case book, outside git.
+
+## Daily unasked list
+
+The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
+
+The command screens receipts, orders, purchase notes and subscriptions before listing each charge, oldest first, then summarizes explanations it settled. Listed charges become `awaiting_answer`; reruns cannot list them again. Moni's charges stay held. Failed screens rotate behind untouched items so later charges get checked. Unreadable or unscreened items stay for a later run: the command has a 40-second total budget and a 6-second limit per item. Cases without a known card or charge time stay held for inspection. Quiet hours, overdue bills and payment deadlines keep their existing behavior.

@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-import sqlite3
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,13 +17,9 @@ spec = importlib.util.spec_from_file_location('money_cases', Path(__file__).with
 mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
 
+from test_charges import ControlServer, summary
+
 TZ = mc.TZ
-
-
-def replica_meta(db):
-    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
-                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
 
 
 def at(text):
@@ -460,11 +455,6 @@ class CheckEntry(Base):
         book = {'version': 1, 'questions': []}
         mc.new_question(book, mc.charges.parse(ALERT, BANK), ALERT, now, now)
         mc.write_json(self.data / 'questions.json', book)
-        replica = self.tmp / 'owner.sqlite'
-        with sqlite3.connect(replica) as db:
-            replica_meta(db)
-            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
-            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
         fake = self.tmp / 'msgs'
         fake.write_text('#!/usr/bin/python3\nimport json, sys\n'
                         'assert sys.stdin.read() == ""\n'
@@ -476,16 +466,18 @@ class CheckEntry(Base):
                                 str(home / '.bun/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin',
                                 '/bin', '/usr/sbin', '/sbin'])
         env = {'HOME': str(home), 'PATH': runner_path, 'LANG': 'en_US.UTF-8', 'WATCH_DIR': str(self.wd),
-               'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_STATE_DB': str(replica),
+               'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
                'MONEY_CASES_MSGS': str(fake)}
         started = time.monotonic()
-        done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
-                              env=env, stdin=subprocess.DEVNULL, start_new_session=True,
-                              capture_output=True, text=True, timeout=5)
+        with ControlServer() as server:
+            env['T3_CONTROL_TOKEN_FILE'] = str(server.credentials)
+            done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
+                                  env=env, stdin=subprocess.DEVNULL, start_new_session=True,
+                                  capture_output=True, text=True, timeout=5)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 1)
+        self.assertEqual(state['timing']['owner_queries'], 2)
         self.assertEqual(state['timing']['msgs_calls'], 2)
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
@@ -603,7 +595,7 @@ class Rules(Base):
         (self.wd / '.run-ok').write_text('r1')
         self.deliver('2026-10-26T10:00')
         # Delivery day 26 Oct: that is the one reminder for the day, so no second reminder today.
-        self.assertEqual(self.check('2026-10-26T11:00', 'r2'), '')
+        self.assertNotIn('acme:', self.check('2026-10-26T11:00', 'r2'))
         # The clock starts at delivery (26 Oct), so no yes/no on 27 Oct; it is due 28 Oct, two full days later.
         self.assertNotIn('Yes or no', self.check('2026-10-27T10:00', 'r3'))
         self.assertIn('Yes or no', self.check('2026-10-28T10:00', 'r4'))
@@ -865,8 +857,8 @@ class Questions(Base):
         self.assertEqual(r['verdict'], 'wait')
         self.assertEqual(self.follow('2026-10-25T09:00', finder(HISTORY)), '')
         event = self.follow('2026-10-25T12:00', finder(HISTORY))
-        self.assertIn('no receipt came while we waited', event)
-        self.assertIn(f"money-cases ask --id {self.questions()[0]['id']}", event)
+        self.assertIn('unasked charges older than 24 h', event)
+        self.assertIn('money-cases unasked --ask', event)
         self.assertEqual(self.follow('2026-10-25T12:15', finder(HISTORY), 'r2'), '')
 
     def screen(self, text, sender, when, now, item):
@@ -900,11 +892,11 @@ class Questions(Base):
         mc.triaged(self.data, [(a['id'], 'imsg:1', False)], at('2026-10-24T00:37'))
         self.assertEqual((self.questions()[0]['status'], self.questions()[0]['outcome']),
                          ('closed', 'already answered in a chat'))
-        # Held for a receipt and never raised: age cannot bypass the first-question queue.
+        # A never-raised charge still joins the daily list after the receipt wait.
         held = self.screen(ALERT.replace('12.34', '5.55'), BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:2')
         event = self.follow('2026-10-31T09:00', finder())
         self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'open')
-        self.assertIn('money-cases ask --id ' + held['id'], event)
+        self.assertIn('money-cases unasked --ask', event)
 
     def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
         pending = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
@@ -1340,26 +1332,28 @@ class CheckBudget(Base):
         now = at('2026-10-25T12:00')
         times = [now - dt.timedelta(hours=2*n) for n in range(5)]
         self.seed(times)
-        path = self.tmp / 'owner.sqlite'
-        with sqlite3.connect(path) as db:
-            replica_meta(db)
-            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
-            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
-            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)',
-                       ('t', 'app', mc.charges.iso(now)))
-            for n, when in enumerate(times):
-                payload = {'createdBy': 'user', 'creationSource': 'web', 'text': f'I paid Acme, item {n}'}
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?, ?, ?, ?)',
-                           ('t', 'user', mc.charges.iso(when), json.dumps(payload)))
-        with patch.object(mc.charges, 'STATE_DB', path), \
-                patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
+        rows = [summary(f'I paid Acme, item {n}', createdAt=mc.charges.iso(when)) for n, when in enumerate(times)]
+        with ControlServer(rows), patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
         self.assertEqual(query.call_count, 1)
         for n, q in enumerate(self.questions()):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 1)
+        self.assertEqual(state['timing']['owner_queries'], 2)
+
+    def test_stalled_control_lookup_keeps_check_in_budget_and_questions_unverified(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(minutes=n) for n in range(5)])
+        with ControlServer(stall='/messages') as server, patch.object(mc, 'CHECK_BUDGET', 11):
+            started = time.time()
+            mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
+            self.assertGreater(time.time() - started, 1)
+            self.assertLess(time.time() - started, mc.CHECK_BUDGET + 2)
+            self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('Robob control:', str(state['question_errors']))
+        self.assertTrue(all(q['status'] != 'closed' for q in self.questions()))
 
     def test_union_lookup_failure_is_recorded_once(self):
         now = at('2026-10-25T12:00')

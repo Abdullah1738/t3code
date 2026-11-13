@@ -18,10 +18,33 @@ import time
 from pathlib import Path
 
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync
-from . import containers, prune, prepare, userns
+from . import common, containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      offsets_path, person, read_json, say, silence, write)
+
+
+def _source_stamp():
+    try:
+        folder = Path(__file__).resolve().parent
+        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py']
+        return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(files))
+    except Exception:
+        return None
+
+
+_SOURCE_STAMP = _source_stamp()
+
+
+def _log_source_change(run_id):
+    try:
+        current = _source_stamp()
+        if current is not None and _SOURCE_STAMP is not None and current != _SOURCE_STAMP:
+            import toollog
+            toollog.emit('run', 'run.error', kind='error', ok=False, ids={'run': run_id},
+                         props={'stage': 'install_mid_run'}, tag='install_mid_run')
+    except Exception:
+        pass
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
 RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
@@ -1281,6 +1304,35 @@ class Runner:
         self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
 
+    def _log_pool(self, con):
+        import toollog
+        for backend in ("server", "boat"):
+            other = None
+            try:
+                counts = {"busy": 0, "idle": 0, "stopped": 0}
+                source = con
+                if backend != common.backend():
+                    path = common.db_path_for(backend)
+                    if path.exists():
+                        other = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=.05)
+                        source = other
+                    else:
+                        source = None
+                if source is not None:
+                    for state, active in source.execute("SELECT l.state, EXISTS(SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running')) FROM leases l WHERE l.state IN ('running','bringing_up','stopped','archived')"):
+                        counts["busy" if active or state == "bringing_up" else "stopped" if state in ("stopped", "archived") else "idle"] += 1
+                toollog.emit("pool", "pool.snapshot", ids={"run": self.run_id},
+                             props=dict(counts, backend="home" if backend == "server" else "boat"))
+            except Exception:
+                toollog.emit("pool", "pool.snapshot", kind="error", ok=False, tag="pool_snapshot",
+                             props={"backend": "home" if backend == "server" else "boat"})
+            finally:
+                if other is not None:
+                    try:
+                        other.close()
+                    except Exception:
+                        pass
+
     def record(self, **kw):
         def update():
             con = db()
@@ -1294,6 +1346,7 @@ class Runner:
     def start(self) -> dict:
         a, me = self.a, self.me
         con = db()
+        self._log_pool(con)
         steps = getattr(a, "steps", None) or []
         if steps:
             cmd_text = " ; ".join(steps)
@@ -1411,6 +1464,8 @@ class Runner:
                     con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (self.box,))
                     con.commit()
                     ssh_sync.close_master(self.box)
+                    import toollog
+                    toollog.emit("run", "run.error", kind="error", ok=False, ids={"run": self.run_id, "box": self.box}, props={"stage": "readiness"}, tag="readiness")
                     event(con, self.box, "lease_not_ready", str(e)[:200])
                     raise OffboxError(f"{e}. Nothing ran; offbox resumes {self.box} on the next run. "
                                       "Retry; don't run `boat resume` by hand.", code=EXIT_INFRA) from e
@@ -1428,7 +1483,7 @@ class Runner:
                         'status': 'done' if result.code == 0 else 'failed', 'exit_code': result.code, 'end_at': now()}
                     save_run_state(self.run_id, box_id=self.box, wrapper_pid=result.pid, **saved)
                     try:
-                        self.record(wrapper_pid=result.pid, status='running')
+                        self.record(wrapper_pid=result.pid, status='running', command_at=now())
                     except sqlite3.Error as error:
                         state_warning(self.run_id, result.code, error)
                     say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
@@ -1450,7 +1505,7 @@ class Runner:
         self.started = True
         save_run_state(self.run_id, box_id=self.box, process_id=self.pid, command_id=r.get("commandId"))
         try:
-            self.record(process_id=self.pid, command_id=r.get("commandId"), status="running")
+            self.record(process_id=self.pid, command_id=r.get("commandId"), status="running", command_at=now())
             lease.touch(self.box)
             event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
                                               f"cmd={cmd_text[:200]}")
@@ -1548,7 +1603,7 @@ class Runner:
                 note = ssh_sync.tracked_ignored_note(st)
                 if note:
                     say(note)
-                skipped = ssh_sync.tracked_secret_matches(self.root, getattr(a, "include", None))
+                skipped = st.get("secret_skips", [])
                 if skipped:
                     say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
                         f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
@@ -2244,9 +2299,42 @@ def state_warning(run_id, code, error):
     log(message)
 
 
+def claim_terminal_log(con, row):
+    # Both finish and recovered-start settlement already hold the state writer. Never acquire it only to log.
+    try:
+        if row is None or row['status'] in ('starting', 'running'):
+            return None
+        if row['exit_code'] is None and con.execute('SELECT 1 FROM kv WHERE k=?', ('start_unknown:'+row['run_id'],)).fetchone():
+            return None
+        claimed = con.execute("UPDATE runs SET logged_end_at=? WHERE run_id=? AND logged_end_at IS NULL",
+                              (now(), row['run_id']))
+        return row if claimed.rowcount else None
+    except Exception:
+        return None
+
+
+def emit_terminal(row):
+    try:
+        import toollog
+        code, run_id = row['exit_code'], row['run_id']
+        ended = row['end_at'] or now()
+        elapsed = max(0, ended - (row['start_at'] or ended)) * 1000
+        toollog.emit('run', 'run.end', kind='perf' if code == 0 else 'error', ok=code == 0, duration_ms=elapsed,
+                     ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local'},
+                     tag='run_failed' if code != 0 else None)
+        if row['process_id'] or row['wrapper_pid']:
+            command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
+            toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
+                         duration_ms=command_ms, ids={'run': run_id, 'box': row['box_id']},
+                         props={'exitCode': code, 'timeoutHit': code == 124}, tag='command_failed' if code != 0 else None)
+    except Exception:
+        pass
+
+
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
            until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
     incoming = code
+    log_row = None
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
         nonlocal code, st
@@ -2265,6 +2353,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def persist():
+        nonlocal log_row
         con = db()
         try:
             with write(con):
@@ -2276,6 +2365,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
                                 (st, code, now(), run_id, st, code))
                     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                    log_row = claim_terminal_log(con, r)
                     if terminal_result(r):
                         con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{run_id}',))
             return r
@@ -2295,6 +2385,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     if not r:
         return code
     st, code = r['status'], r['exit_code']
+    if log_row is not None:
+        emit_terminal(log_row)
     if not r["box_id"] or not bookkeeping:
         return code
     # No transaction is open while Docker/TTL calls reach the box or boat.
@@ -2384,6 +2476,7 @@ def _run_attempt(a, me: dict) -> int:
         failure.box = rn.box
         raise failure from e
     finally:
+        _log_source_change(rn.run_id)
         pool.release_guard(rn.lease_row)
 
 
@@ -2399,6 +2492,9 @@ def _host_restarting(signum) -> bool:
 
 
 def _detach(rn, signum) -> int:
+    import toollog
+    toollog.emit("run", "run.error", kind="error", ok=False, ids={"run": rn.run_id, "box": rn.box},
+                 props={"stage": "install_mid_run"}, tag="install_mid_run")
     # Keep start_at: detaching must not restart #866's orphan age allowance.
     rn.record(mode='bg')
     message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "

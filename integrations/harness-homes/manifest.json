@@ -86,6 +86,15 @@
     ],
     "offbox": [
       "../harness-hooks/src/engine.py",
+      "../harness-hooks/src/offbox_toollog.py",
+      {
+        "source": "../offbox/skill/scripts/toollog.py",
+        "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.py"
+      },
+      {
+        "source": "../offbox/skill/scripts/toollog.ts",
+        "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.ts"
+      },
       {
         "source": "../offbox/skill/scripts/classify.py",
         "installed": "~/.config/opencode/skills/remote-compute/scripts/classify.py"

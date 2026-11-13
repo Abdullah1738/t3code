@@ -23,6 +23,7 @@ import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlockInput,
   KanbanBoard,
+  KanbanNightlyReviewSettings,
   KanbanBoardIcon,
   KanbanBoardIconImage,
   KanbanBoardId,
@@ -127,6 +128,7 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
   instructions: Schema.optional(KanbanInstructions),
+  nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
 

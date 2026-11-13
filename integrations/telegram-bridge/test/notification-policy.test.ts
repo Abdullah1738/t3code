@@ -5,6 +5,31 @@ import { join } from "node:path";
 import { boardAskKey, enqueueNotice, flushBursts } from "../src/notification-policy.ts";
 import { redact } from "../src/redact.ts";
 import { Store } from "../src/store.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
+
+test("tg.dedupe records receipt replays, conflicts and coalesced bursts without source or payload", () => {
+  const store = new Store(":memory:");
+  const first = { id: "PRIVATE_KEY", source: "PRIVATE_SOURCE", text: "PRIVATE_MESSAGE", severity: "error", burstKey: "PRIVATE_BURST" };
+  try {
+    expect(enqueueNotice(store, first, 0)).toBe(true);
+    expect(enqueueNotice(store, first, 0)).toBe(false);
+    expect(() => enqueueNotice(store, { ...first, text: "PRIVATE_CHANGED_BODY" }, 1)).toThrow("content mismatch");
+    expect(enqueueNotice(store, { ...first, id: "PRIVATE_SECOND_KEY" }, 1)).toBe(false);
+    store.outboxState(first.id, "sent");
+    flushBursts(store, 3_600_000);
+    const entries = logs.entries().filter(row => row.name === "tg.dedupe");
+    expect(entries).toMatchObject([
+      { kind: "event", ok: true, props: { action: "check", deduped: true } },
+      { kind: "error", ok: false, props: { action: "conflict" }, error: { tag: "tg.dedupe.noticeConflict" } },
+      { kind: "event", ok: true, props: { action: "coalesce", deduped: true, count: 1 } },
+      { kind: "event", ok: true, props: { action: "coalesce", deduped: true, count: 2, state: "queued" } },
+    ]);
+    for (const row of entries) expect(row.ids?.key).toMatch(/^[a-f0-9]{24}$/);
+    expect(logs.text()).not.toContain("PRIVATE_");
+  } finally { store.close(); }
+});
 
 const HOUR = 3_600_000;
 const notice = (id: string) => ({ id, source: "offbox", text: `failure ${id}`, severity: "error", burstKey: "infra" });

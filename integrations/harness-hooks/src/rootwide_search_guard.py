@@ -10,16 +10,16 @@ import sys
 
 from statev2_guard import _heredocs, _quoted_punctuation, AmbiguousScript
 
-ROOTS = frozenset({"/Users/ardud/checkouts", "/Volumes/ExternalSSD/board-wt",
+ROOTS = frozenset({"/Volumes/ExternalSSD/board-wt",
                    "/Volumes/ExternalSSD", "/Users/ardud", "/"})
 OVERRIDE = "AGENT_GUARD_APPROVED"
 
 
 def reason(root, cwd):
-    return (f"Refused: recursive search over {root} walks every agent's checkout through the shared ovnfs mount and loads the whole Mac.\n"
-            f"Search your own checkout ({cwd} or /Users/ardud/checkouts/<name>) or pass the exact file path. "
+    return (f"Refused: a recursive search over {root} walks large trees on this Mac and slows every agent.\n"
+            f"Search inside the repo or worktree you are working in ({cwd}), or pass the exact file path. "
             "Your packet is your card prompt; files it names are under the paths it gives. "
-            "AGENTS.md rules for your work are in your checkout root and its parent folders, not elsewhere.")
+            "AGENTS.md rules for your work are in your repo root and its parent folders, not elsewhere.")
 
 
 # Arity matters: a glob, pattern, replacement or ignore file is never a search

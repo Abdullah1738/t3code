@@ -1,44 +1,78 @@
 import { assert, it } from "@effect/vitest";
-import { CommandId, RunId, ThreadId } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { CommandId, RunId, ThreadId, type ServerSettingsError } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../orchestration-v2/EffectWorker.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ServerConfig from "../../config.ts";
+import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as RestartPacing from "./RestartPacing.ts";
 import * as RestartPacingState from "./RestartPacingState.ts";
 import type { RestartSource } from "./RestartPacingState.ts";
+import { makeRestartLoad } from "./RestartLoad.ts";
 
 const source = (id: number): RestartSource => ({
   threadId: ThreadId.make(`thread:${id}`),
   sourceRunId: RunId.make(`run:${id}`),
 });
-const harness = (options: { maxActive?: number; spacingMs?: number } = {}) => {
+const harness = <E = never>(
+  options: { maxActive?: number; spacingMs?: number } = {},
+  settingsLayer?: Layer.Layer<ServerSettings.ServerSettingsService, E>,
+) => {
+  const resolvedSettings: Layer.Layer<
+    ServerSettings.ServerSettingsService,
+    E | ServerSettingsError
+  > = settingsLayer ?? ServerSettings.layerTest({ restartPacing: options });
   const running = new Set<string>();
   const priorities = new Map<string, number>();
   const cancelled = new Set<string>();
   const positions: Array<{ id: string; position: number | null }> = [];
+  const reads = { settings: 0, sources: 0, descriptions: 0, active: 0 };
+  const runSources = new Map<string, RestartSource>();
   let load = 0;
   let failActive = false;
   const layer = RestartPacing.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
-        ServerSettings.layerTest({ restartPacing: options }),
+        Layer.effect(
+          ServerSettings.ServerSettingsService,
+          Effect.gen(function* () {
+            const settings = yield* ServerSettings.ServerSettingsService;
+            return {
+              ...settings,
+              getSettings: Effect.suspend(() => {
+                reads.settings++;
+                return settings.getSettings;
+              }),
+            };
+          }),
+        ).pipe(Layer.provide(resolvedSettings)),
         Layer.succeed(RestartPacingState.RestartPacingState, {
           pending: (input) =>
             Effect.sync(
               () => !cancelled.has(input.sourceRunId) && !cancelled.has(input.effectId ?? ""),
             ),
-          sourceForRun: () => Effect.succeed(undefined),
+          sourceForRun: (_, runId) =>
+            Effect.sync(() => {
+              reads.sources++;
+              return runSources.get(runId);
+            }),
           describe: (input) =>
-            Effect.sync(() => ({
-              priority: priorities.get(input.sourceRunId) ?? 3,
-              activityAt: Number(input.sourceRunId.split(":")[1]),
-            })),
+            Effect.sync(() => {
+              reads.descriptions++;
+              return {
+                priority: priorities.get(input.sourceRunId) ?? 3,
+                activityAt: Number(input.sourceRunId.split(":")[1]),
+              };
+            }),
           active: (input) =>
             failActive
               ? Effect.fail(
@@ -46,7 +80,10 @@ const harness = (options: { maxActive?: number; spacingMs?: number } = {}) => {
                     cause: "temporary read failure",
                   }),
                 )
-              : Effect.sync(() => running.has(input.sourceRunId)),
+              : Effect.sync(() => {
+                  reads.active++;
+                  return running.has(input.sourceRunId);
+                }),
           status: (input, position) =>
             Effect.sync(() => {
               positions.push({ id: input.sourceRunId, position });
@@ -60,6 +97,8 @@ const harness = (options: { maxActive?: number; spacingMs?: number } = {}) => {
   return {
     layer,
     running,
+    reads,
+    runSources,
     cancelled,
     failActive: (value: boolean) => {
       failActive = value;
@@ -71,6 +110,223 @@ const harness = (options: { maxActive?: number; spacingMs?: number } = {}) => {
     },
   };
 };
+
+it.effect(
+  "50 waiters share one settings materialization per pass and no projection reads while held",
+  () => {
+    const secretReads = new Map<string, number>();
+    const config = Layer.effect(
+      ServerConfig.ServerConfig,
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(
+          config.settingsPath,
+          JSON.stringify({
+            providerInstances: {
+              codex_fixture: {
+                driver: "codex",
+                environment: [
+                  { name: "FIXTURE_SECRET", value: "", sensitive: true, valueRedacted: true },
+                ],
+                config: {},
+              },
+            },
+          }),
+        );
+        return config;
+      }),
+    ).pipe(
+      Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "restart-pacing-settings-" })),
+    );
+    const realSettings = ServerSettings.layer.pipe(
+      Layer.provide(
+        Layer.succeed(ServerSecretStore.ServerSecretStore, {
+          get: (name) =>
+            Effect.sync(() => {
+              secretReads.set(name, (secretReads.get(name) ?? 0) + 1);
+              return Option.none();
+            }),
+          set: () => Effect.void,
+          create: () => Effect.void,
+          getOrCreateRandom: () => Effect.succeed(new Uint8Array()),
+          remove: () => Effect.void,
+        }),
+      ),
+      Layer.provide(SqlitePersistence.layerMemory),
+      Layer.provide(config),
+      Layer.provide(NodeServices.layer),
+    );
+    const h = harness({}, realSettings);
+    h.setLoad(2);
+    const queued = Array.from({ length: 50 }, (_, id) => source(id));
+    for (const input of queued) h.runSources.set(input.sourceRunId, input);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      for (const input of queued) yield* pacing.register(input);
+      const check = Effect.forEach(queued, (input) =>
+        pacing.acquireRun(input.threadId, input.sourceRunId),
+      );
+      assert.deepEqual(yield* check, Array(50).fill(15_000));
+      assert.equal(h.reads.settings, 1);
+      assert.equal(secretReads.size, 1);
+      assert.isTrue([...secretReads.values()].every((count) => count === 1));
+      assert.equal(h.reads.sources, 50);
+      assert.equal(h.reads.descriptions, 50);
+      assert.equal(h.positions.length, 50);
+      yield* TestClock.adjust("15 seconds");
+      assert.deepEqual(yield* check, Array(50).fill(30_000));
+      assert.equal(h.reads.settings, 2);
+      yield* TestClock.adjust("30 seconds");
+      assert.deepEqual(yield* check, Array(50).fill(60_000));
+      assert.equal(h.reads.settings, 3);
+      yield* TestClock.adjust("60 seconds");
+      assert.deepEqual(yield* check, Array(50).fill(60_000));
+      assert.equal(h.reads.settings, 4);
+      assert.isTrue([...secretReads.values()].every((count) => count === 4));
+      assert.equal(h.reads.sources, 50);
+      assert.equal(h.reads.descriptions, 50);
+      assert.equal(h.reads.active, 0);
+      assert.equal(h.positions.length, 50);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect(
+  "an outbox waiter resumes after the twenty minute hold and revalidates its run only at admission",
+  () => {
+    const h = harness();
+    h.setLoad(2);
+    const input = source(1);
+    h.runSources.set(input.sourceRunId, input);
+    let starts = 0;
+    const executor = Layer.effect(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        return {
+          execute: (effect) =>
+            Effect.gen(function* () {
+              if (effect.request.type !== "provider-turn.start") return;
+              const deferMs = yield* pacing.acquireRun(
+                effect.threadId,
+                effect.request.runId,
+                effect.id,
+              );
+              if (deferMs > 0)
+                return yield* new EffectWorker.OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: effect.request.type,
+                  deferMs,
+                });
+              starts++;
+            }).pipe(
+              Effect.mapError((cause) =>
+                EffectWorker.isOrchestrationEffectExecutionError(cause)
+                  ? cause
+                  : new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+              ),
+            ),
+        };
+      }),
+    ).pipe(Layer.provide(h.layer));
+    return Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* outbox.enqueue([
+        {
+          id: "effect:held",
+          commandId: CommandId.make("command:held"),
+          threadId: input.threadId,
+          request: { type: "provider-turn.start", runId: input.sourceRunId },
+        },
+      ]);
+      yield* worker.drain();
+      for (;;) {
+        const held = Option.getOrThrow(yield* outbox.get("effect:held"));
+        if (held.status === "succeeded") break;
+        assert.equal(h.reads.sources, 1);
+        const now = yield* Clock.currentTimeMillis;
+        const next = Date.parse(held.availableAt);
+        assert.isAtMost(next, 20 * 60_000);
+        yield* TestClock.adjust(next - now);
+        yield* worker.drain();
+      }
+      assert.equal(yield* Clock.currentTimeMillis, 20 * 60_000);
+      assert.equal(starts, 1);
+      assert.equal(h.reads.sources, 2);
+      assert.equal(Option.getOrThrow(yield* outbox.get("effect:held")).status, "succeeded");
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layer.pipe(
+          Layer.provideMerge(
+            Layer.mergeAll(
+              EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              executor,
+            ),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "a cancelled provider start is rechecked at admission and cannot strand the next waiter",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    h.setLoad(2);
+    const first = source(1);
+    h.runSources.set(first.sourceRunId, first);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      assert.equal(yield* pacing.acquireRun(first.threadId, first.sourceRunId), 15_000);
+      h.runSources.delete(first.sourceRunId);
+      h.setLoad(0);
+      yield* TestClock.adjust("15 seconds");
+      assert.equal(yield* pacing.acquireRun(first.threadId, first.sourceRunId), 0);
+      assert.equal(yield* pacing.acquire(source(2)), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect("system CPU and event-loop interval counters ignore a busy load average", () =>
+  Effect.sync(() => {
+    let sample = { at: 0, idle: 0, total: 0, loopIdle: 0, loopActive: 0, loadavg: 30 };
+    const load = makeRestartLoad(() => sample);
+    sample = {
+      at: 10_000,
+      idle: 5_700,
+      total: 10_000,
+      loopIdle: 9_000,
+      loopActive: 1_000,
+      loadavg: 30,
+    };
+    assert.isBelow(load(), 1);
+    sample = {
+      at: 20_000,
+      idle: 6_700,
+      total: 20_000,
+      loopIdle: 18_000,
+      loopActive: 2_000,
+      loadavg: 0,
+    };
+    assert.isAbove(load(), 1);
+    sample = {
+      at: 30_000,
+      idle: 15_700,
+      total: 30_000,
+      loopIdle: 18_500,
+      loopActive: 11_500,
+      loadavg: 0,
+    };
+    assert.isAbove(load(), 1);
+  }),
+);
 
 it.effect("ten continuations retain slots after dispatch until their provider turns settle", () => {
   const h = harness({ maxActive: 3, spacingMs: 0 });
@@ -91,6 +347,7 @@ it.effect("ten continuations retain slots after dispatch until their provider tu
       }
       assert.equal(h.running.size, Math.min(3, queued.length - (starts.length - h.running.size)));
       h.running.clear();
+      yield* TestClock.adjust("1 minute");
     }
     assert.equal(starts.length, 10);
   }).pipe(Effect.provide(h.layer));
@@ -131,7 +388,8 @@ it.effect.each([false, true])(
       assert.deepEqual(h.positions, [{ id: original.sourceRunId, position: 1 }]);
       h.running.clear();
       h.setLoad(2);
-      assert.equal(yield* pacing.acquire(replacement), 15_000);
+      yield* TestClock.adjust("15 seconds");
+      assert.equal(yield* pacing.acquire(replacement), 30_000);
       yield* TestClock.adjust("20 minutes");
       assert.equal(yield* pacing.acquire(replacement), 0);
     }).pipe(Effect.provide(h.layer));
@@ -145,7 +403,7 @@ it.effect("load holds until the next check after load drops", () => {
     const pacing = yield* RestartPacing.RestartPacing;
     assert.equal(yield* pacing.acquire(source(1)), 15_000);
     yield* TestClock.adjust("15 seconds");
-    assert.equal(yield* pacing.acquire(source(1)), 15_000);
+    assert.equal(yield* pacing.acquire(source(1)), 30_000);
     h.setLoad(0);
     yield* TestClock.adjust("15 seconds");
     assert.equal(yield* pacing.acquire(source(1)), 0);
@@ -161,7 +419,7 @@ it.effect("pruning an old effect preserves the run's cumulative load hold", () =
     const original = { ...source(0), effectId: "start:before-requeue" };
     assert.equal(yield* pacing.acquire(original), 15_000);
     yield* TestClock.adjust("19 minutes");
-    assert.equal(yield* pacing.acquire(original), 15_000);
+    assert.equal(yield* pacing.acquire(original), 30_000);
     h.cancelled.add(original.effectId);
     assert.equal(yield* pacing.acquire(source(1)), 15_000);
     yield* TestClock.adjust("1 minute");
@@ -197,6 +455,7 @@ it.effect("spacing admits another start after twenty seconds, never over the act
     yield* TestClock.adjust("20 minutes");
     assert.isAbove(yield* pacing.acquire(source(3)), 0);
     h.running.delete(source(1).sourceRunId);
+    yield* TestClock.adjust("1 minute");
     assert.equal(yield* pacing.acquire(source(3)), 0);
   }).pipe(Effect.provide(h.layer));
 });
@@ -405,6 +664,7 @@ it.effect("holds the reservation while dispatch has not persisted its continuati
     yield* pacing.dispatched(source(1));
     assert.isAbove(yield* pacing.acquire(source(2)), 0);
     h.running.delete(source(1).sourceRunId);
+    yield* TestClock.adjust("1 minute");
     assert.equal(yield* pacing.acquire(source(2)), 0);
   }).pipe(Effect.provide(h.layer));
 });

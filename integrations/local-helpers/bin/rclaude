@@ -60,7 +60,7 @@ key_helper=''
 if [[ -n ${ANTHROPIC_API_KEY:-} ]]; then
   export RCLAUDE_API_KEY=$ANTHROPIC_API_KEY
   unset ANTHROPIC_API_KEY
-  key_helper='printenv RCLAUDE_API_KEY'
+  key_helper="${(q)HOME}/.local/bin/rclaude-key-helper"
 fi
 # Robob's default selection when it's this instance (model, effort, fastMode), like compileClaudeModelSelection.
 sel='if .defaultModelSelection.instanceId == $i then .defaultModelSelection else {} end'

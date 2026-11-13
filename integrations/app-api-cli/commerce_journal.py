@@ -4,6 +4,7 @@ No network, credentials, raw cart/payment payloads, retry, reset or cancellation
 An unknown send remains consumed on its flow; new noon flows remain independent.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
+import toollog
 import order_card
 import inbox_auth
 import owner_go
@@ -436,6 +437,7 @@ def open_flow(*, flow_id, app, vertical, account_hash, scope_hash):
     return {'flow_id': flow_id, 'state': 'ACTIVE', 'request_sent': False}
 
 
+@toollog.consumed
 def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
             review_hash=None, payable_minor=None, payment_order_id=None, payment_intent_hash=None):
     """Return True ONLY after durable MAY_HAVE_SENT; no second use of an operation.

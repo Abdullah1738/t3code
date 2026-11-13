@@ -80,6 +80,7 @@ const board: KanbanBoard = {
   setup: null,
   pause: null,
   createdAt: "2026-10-25T00:00:00Z",
+  nightlyReview: null,
   archivedAt: null,
 };
 

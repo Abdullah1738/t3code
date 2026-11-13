@@ -523,15 +523,18 @@ export function createReadonlyReplica(
     const copyRow = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
       const table = tables.get(name)!;
       if (name.endsWith("_turn_items") && !selectedItems.has(String(row.type))) {
-        out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(row[table.primary]!);
+        return out
+          .prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`)
+          .run(row[table.primary]!).changes;
       } else {
-        table.upsert.run(...table.columns.map((c) => row[c]!));
+        const changes = table.upsert.run(...table.columns.map((c) => row[c]!)).changes;
         if (name.endsWith("_turn_items"))
           out
             .prepare(
               "INSERT INTO ardud_readonly_item_fences VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET sequence=excluded.sequence",
             )
             .run(row[table.primary]!, threadSequence(row.thread_id!));
+        return changes;
       }
     };
     const selectColumns = (name: string) =>
@@ -548,8 +551,8 @@ export function createReadonlyReplica(
       const row = table.db
         .prepare(`SELECT ${selectColumns(name)} FROM ${q(name)} WHERE ${q(table.primary)}=?`)
         .get(id);
-      if (row) copyRow(name, row);
-      else out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(id);
+      if (row) return copyRow(name, row);
+      return out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(id).changes;
     };
     const page = (name: string, cursor: number) => {
       const table = tables.get(name)!;
@@ -823,6 +826,10 @@ export function createReadonlyReplica(
               meta("sequence", String(sequence()));
               out.prepare("DELETE FROM ardud_readonly_progress").run();
               meta("resetting_events", "1");
+              meta(
+                "lineage_repair_revision",
+                String(Number(getMeta("lineage_repair_revision") ?? 0) + 1),
+              );
             });
             // Publish the reset: readers must not keep using this replica
             // while projections are rebuilt and events are cleared.
@@ -992,7 +999,23 @@ export function createReadonlyReplica(
         }
         reconcileIndex++;
         transaction(() => {
-          for (const row of rows) refresh(name, row.id!);
+          let lineageRepaired = false;
+          for (const row of rows) {
+            const changed = refresh(name, row.id!);
+            if (
+              changed &&
+              (name === "orchestration_v2_projection_threads" ||
+                name === "orchestration_v2_projection_provider_threads")
+            )
+              lineageRepaired = true;
+          }
+          // Eventless repairs cannot be replayed from orchestration_events.
+          // Readers invalidate only for those repairs, not ordinary publishes.
+          if (lineageRepaired || getMeta("lineage_repair_revision") === undefined)
+            meta(
+              "lineage_repair_revision",
+              String(Number(getMeta("lineage_repair_revision") ?? 0) + Number(lineageRepaired)),
+            );
           checkpoint(`reconcile:${name}`, {
             cursor: rows.length < batchSize ? 0 : Number(rows.at(-1)!.__rowid),
             done: false,
@@ -1005,8 +1028,8 @@ export function createReadonlyReplica(
               "INSERT OR IGNORE INTO orchestration_events VALUES (?, 'readonly.watermark', '', '{}')",
             )
             .run(cycleTarget!);
-          // Recall invalidates its lineage cache at each completed generation;
-          // it does not need an unbounded copy of the event history.
+          // Readers rebuild if this retained prefix no longer covers their overlay.
+          // They do not need an unbounded copy of the event history.
           out
             .prepare(
               "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events WHERE sequence<? ORDER BY sequence LIMIT ?)",
@@ -1023,6 +1046,9 @@ export function createReadonlyReplica(
               Math.max(Math.min(confirmedAt, auxiliaryCapturedAt ?? confirmedAt), previous + 1),
             ).toISOString(),
           );
+          // Bind capability evidence to this publication. An older exporter
+          // leaves it behind, so readers safely fall back after a downgrade.
+          meta("lineage_repair_watermark", getMeta("updated_at")!);
           meta("ready", "1");
           out
             .prepare(

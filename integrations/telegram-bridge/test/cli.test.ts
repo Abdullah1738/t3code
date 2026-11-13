@@ -6,6 +6,9 @@ import * as os from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadCommandPayload, MAX_FILE_BYTES, parseCommand, sanitizeSource } from "../src/cli.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
 
 const at = "2026-09-11T09:30:00+04:00";
 const notify = ["notify", "--source", "tests", "--text", "hello", "--key", "event-1"];
@@ -368,7 +371,7 @@ describe("local file payloads (temporary fixtures only)", () => {
         if (outcome === "invalid-ack") { status = 200; reply = { id: "PRIVATE_ID", created: true }; }
         if (outcome === "control-ack") { status = 200; reply = { id: id + "\n", created: true }; }
         const child = Bun.spawn([process.execPath, "run", cli, "send-file", `--file=${path}`, "--key=k", "--text=Caption"], {
-          env: { HOME: home, TELEGRAM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+          env: { HOME: home, TELEGRAM_BRIDGE_SOCKET: socket, TOOLLOG_DIR: logs.directory() }, stdout: "pipe", stderr: "pipe",
         });
         const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         expect(exitCode).toBe(outcome === "accepted" ? 0 : 1);
@@ -398,7 +401,7 @@ describe("CLI entry point (no live socket)", () => {
     { args: ["health"], socket: `${cli}/missing-private-socket`, error: "Bridge socket is unavailable" },
   ] as { args: string[]; socket: string; error: string }[])("emits only sanitized JSON for %j", async ({ args, socket, error }) => {
     const child = Bun.spawn([process.execPath, "run", cli, ...args], {
-      env: { TELEGRAM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+      env: { TELEGRAM_BRIDGE_SOCKET: socket, TOOLLOG_DIR: logs.directory() }, stdout: "pipe", stderr: "pipe",
     });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -406,5 +409,9 @@ describe("CLI entry point (no live socket)", () => {
     expect(exitCode).toBe(1);
     expect(stdout).toBe("");
     expect(stderr).toBe(`${JSON.stringify({ error })}\n`);
+    expect(logs.entries().find(row => row.error?.tag === "tg.cli.commandFailed")).toMatchObject({
+      tool: "watchers", kind: "error", ok: false, error: { tag: "tg.cli.commandFailed", message: "tg.cli.commandFailed" },
+    });
+    expect(logs.text()).not.toContain("private");
   });
 });

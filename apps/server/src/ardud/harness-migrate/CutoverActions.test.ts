@@ -121,6 +121,7 @@ const board: KanbanBoard = {
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
   createdAt: at,
+  nightlyReview: null,
   archivedAt: null,
 };
 const pool = (model: ModelSelection, slots: number): KanbanPool => ({

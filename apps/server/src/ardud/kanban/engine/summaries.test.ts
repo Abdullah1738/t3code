@@ -34,6 +34,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   setup: null,
   pause: null,
   createdAt: at,
+  nightlyReview: null,
   archivedAt: null,
 });
 

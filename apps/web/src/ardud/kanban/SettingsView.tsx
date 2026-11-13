@@ -17,6 +17,7 @@ import {
   selectionEffort,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import {
+  KanbanNightlyReviewSettings,
   KANBAN_BOARD_ICONS,
   KANBAN_BOARD_IMAGE_MAX,
   kanbanBoardIcon,
@@ -38,6 +39,9 @@ import {
 } from "@t3tools/shared/model";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
+import * as Schema from "effect/Schema";
+import { Input } from "../../components/ui/input";
+import { Link } from "@tanstack/react-router";
 import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/utils";
 import { BOARD_ICONS, BoardIcon } from "./boardIcon";
@@ -301,6 +305,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onChange={(icon) => update({ icon, iconImage: null })}
           onImage={(iconImage) => update({ iconImage })}
         />
+      </Section>
+      <Section title="Nightly review">
+        <NightlyReviewSettings key={board.id} board={board} disabled={!canEdit} />
       </Section>
       <Section title="Pools">
         {pools.map((pool) => {
@@ -980,5 +987,109 @@ function InstructionBlock(props: {
         className="min-h-28 resize-y bg-transparent text-sm leading-normal text-(--m-text) outline-none [field-sizing:content] placeholder:text-(--m-muted)"
       />
     </label>
+  );
+}
+
+function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean }) {
+  const { board } = props;
+  const saved = board.nightlyReview;
+  const settings =
+    saved ?? Schema.decodeUnknownSync(KanbanNightlyReviewSettings)({ enabled: false });
+  const [pending, setPending] = useState(false);
+  const [time, setTime] = useState<string | null>(null);
+  const cancelled = useRef(false);
+  const disabled = props.disabled || pending;
+  const save = async (patch: Partial<typeof settings>) => {
+    setPending(true);
+    try {
+      await runAction("Couldn't save nightly review", () =>
+        kanban.updateBoard({
+          boardId: board.id,
+          nightlyReview: { ...settings, ...patch },
+        }),
+      );
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <div className="grid gap-3 py-3">
+      <div className="flex items-center justify-between gap-4">
+        <label htmlFor="nightly-review-enabled" className="font-medium">
+          Enabled
+        </label>
+        <Switch
+          id="nightly-review-enabled"
+          aria-label="Nightly review"
+          checked={settings.enabled}
+          disabled={disabled}
+          onCheckedChange={(enabled) => void save({ enabled })}
+        />
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <label htmlFor="nightly-review-time" className="font-medium">
+          Time
+        </label>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-(--m-muted)">{settings.timeZone}</span>
+          <div className="w-30">
+            <Input
+              id="nightly-review-time"
+              name="nightly-review-time"
+              autoComplete="off"
+              type="time"
+              nativeInput
+              size="default"
+              value={time ?? settings.timeOfDay}
+              disabled={disabled}
+              onChange={(event) => setTime(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+                if (event.key === "Escape") {
+                  cancelled.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
+              onBlur={(event) => {
+                const value = event.currentTarget.value;
+                setTime(null);
+                if (cancelled.current) {
+                  cancelled.current = false;
+                  return;
+                }
+                if (
+                  event.currentTarget.validity.valid &&
+                  /^([01]\d|2[0-3]):[0-5]\d$/.test(value) &&
+                  value !== settings.timeOfDay
+                )
+                  void save({ timeOfDay: value });
+              }}
+            />
+          </div>
+        </div>
+      </div>
+      {saved?.lastRunAt ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-(--m-muted)">
+          <span>
+            Last run{" "}
+            {new Intl.DateTimeFormat(undefined, {
+              timeZone: saved.timeZone,
+              dateStyle: "medium",
+              timeStyle: "short",
+            }).format(new Date(saved.lastRunAt))}
+          </span>
+          {saved.lastDiscussionId ? (
+            <Link
+              to="/boards/$boardId"
+              params={{ boardId: board.id }}
+              search={{ view: "discussions", discussion: saved.lastDiscussionId }}
+              className="rounded text-(--m-accent-text) underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent)"
+            >
+              View review
+            </Link>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }

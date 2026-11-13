@@ -1,4 +1,5 @@
 """Merchant observations and checkout routes; card numbers never enter this store."""
+import toollog
 import datetime as dt
 import json
 import re
@@ -162,7 +163,7 @@ def list_merchants(*, dead=False):
         return rows
 
 
-def assert_final(merchant, last4, *, fallback=False):
+def _assert_final(merchant, last4, *, fallback=False):
     cs._last4(last4)
     config = routes()
     key = merchant_key(merchant, config)
@@ -181,3 +182,17 @@ def assert_final(merchant, last4, *, fallback=False):
         suffix = '; fallback requires --fallback after failure/decline and reconciliation' if row.get('fallback') == last4 else ''
         return False, f'{key}: expected card {expected}, saw {last4}{suffix}'
     return True, f'{key}: final card {last4} matches'
+
+
+def assert_final(merchant, last4, *, fallback=False):
+    ok = False
+    try:
+        ok, message = _assert_final(merchant, last4, fallback=fallback)
+        return ok, message
+    finally:
+        try:
+            toollog.emit('card_status', 'card.assert', kind='event' if ok else 'error', ok=ok,
+                     props={'merchant': next((m for m in ('noon','amazon','uber','careem') if type(merchant) is str and m in merchant.lower()), 'other'), 'last4': last4, 'fallback': fallback},
+                     error=None if ok else 'CARD_ASSERT_FINAL_REFUSED')
+        except Exception:
+            pass

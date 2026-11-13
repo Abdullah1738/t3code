@@ -10,6 +10,7 @@ live exercise, exact pinned-account and saved-Home validation, rotation
 stability, single-flight lock on the target key only. Neither invents a
 refresh grant, writes donor/native state, or retries a rejected request.
 """
+import toollog
 import argparse
 import copy
 from contextlib import contextmanager
@@ -588,6 +589,7 @@ class NoonAuthLifecycle:
                     'rejected_session_recovery_verified': False, 'automatic_otp': False,
                     'mutation_retry': False}
 
+    @toollog.timed("commerce", "step.auth")
     def revalidate(self, service, *, timeout=20, deadline=None, rejected_ref=None):
         end = deadline_for(timeout, deadline)
         key = session_key(service)
@@ -622,6 +624,7 @@ class NoonAuthLifecycle:
                 candidate = newest
             return self._publish(service, key, state, data, candidate, end)
 
+    @toollog.timed("commerce", "step.auth")
     def reconcile(self, service, *, timeout=20):
         """Revalidate retained cookie material. Never discard it or initiate login."""
         end = deadline_for(timeout)
@@ -637,6 +640,7 @@ class NoonAuthLifecycle:
             data, candidate = self._exchange(service, key, state, headers, end)
             return self._publish(service, key, state, data, candidate, end)
 
+    @toollog.timed("commerce", "step.auth")
     def fresh_before_mutation(self, service, *, timeout=20, deadline=None):
         """Return one-use headers after live validation; caller sends its mutation once."""
         return self.revalidate(service, timeout=timeout, deadline=deadline)

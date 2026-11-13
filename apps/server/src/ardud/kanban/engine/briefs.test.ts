@@ -33,6 +33,7 @@ const board: KanbanBoard = {
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: null,
+  nightlyReview: null,
   createdAt: "2026-10-25T00:00:00Z",
   archivedAt: null,
 };
@@ -230,4 +231,27 @@ it.each(["fresh", "reused", "claimed", "nudge"] as const)("worker brief cleanup:
   expect(brief).not.toContain("Do s1 again");
   expect(brief).toContain("For s3, use 2%.");
   expect(brief).toContain("worker (now): Current work");
+});
+
+it("nightly review puts information gaps before improvements and limits proposals", () => {
+  const brief = evaluatorBrief(board, {
+    kind: "nightly",
+    day: "2026-11-13",
+    discussionId: "disc-nightly",
+  });
+  expect(brief.indexOf("1. Information gaps first")).toBeLessThan(brief.indexOf("2. Improvements"));
+  for (const text of [
+    "last 24 hours",
+    "analytics_read",
+    "todo at P3",
+    "settled cards",
+    "at most 5",
+    "Approve / Change / Drop",
+    "disc-nightly",
+    "Do not merge, deploy",
+    "board's instructions",
+  ]) {
+    expect(brief).toContain(text);
+  }
+  expect(brief).not.toContain("full authority");
 });

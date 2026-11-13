@@ -4,6 +4,10 @@
 # then hung after FileVault unlock while ~280 GB of temp/orphaned files were
 # cleaned up at boot. Fires once per low episode, repeats every 12h while low.
 emulate -L zsh
+mac_log() { :; }
+. "${MAC_LOG_HOME:-$HOME/.local/lib/mac-logging}/toollog.sh" 2>/dev/null || :
+T=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)
+mac_log disk "${WATCH_DIR:-$PWD}" "$T"
 FREE_MIN_GB=${FREE_MIN_GB:-150}
 TMP_MAX_GB=${TMP_MAX_GB:-100}
 REPEAT_S=$((12*3600))
@@ -42,6 +46,9 @@ top=$(cat "$W/tmp_top" 2>/dev/null)  # from the detached du job above
 msg="Disk space warning: ${(j:, :)why}. TMPDIR top: ${top:-n/a}. Low free space preceded the 2026-10-16 hang/reboot. Free space (old agent scratch in \$TMPDIR/opencode, caches) or reboot when idle."
 # Owner rule 2026-10-20: deliver on Telegram only, never iMessage (prints nothing to robob-watch).
 unset BUN_INSPECT
-/Users/ardud/.bun/bin/bun /Users/ardud/.local/share/telegram-bridge/src/cli.ts notify --source "Disk space guard" --severity attention --text "$msg" --key "disk-space-guard:$now" >/dev/null 2>&1 || { echo "telegram notify failed" >&2; exit 1; }
+/Users/ardud/.bun/bin/bun /Users/ardud/.local/share/telegram-bridge/src/cli.ts notify --source "Disk space guard" --severity attention --text "$msg" --key "disk-space-guard:$now" >/dev/null 2>&1
+notify_rc=$?
+mac_log alert "$notify_rc"
+(( notify_rc == 0 )) || { echo "telegram notify failed" >&2; exit 1; }
 echo "$now" > "$W/last_fire"
 exit 0

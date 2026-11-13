@@ -18,6 +18,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import { makeSweepFixture } from "../pullRequest/testkit/sweepFixture.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
@@ -566,5 +567,85 @@ it.effect("clears the unsuccessful-read count once a settled head can be evaluat
     assert.deepStrictEqual(harness.commands, []);
     yield* harness.reactor.sweep;
     assert.isNull(harness.commands[0]!.watch);
+  }),
+);
+
+it.effect("measures project listing and identity spawns across watch sweeps", () =>
+  Effect.gen(function* () {
+    const workspace = yield* makeSweepFixture();
+    const commands: WatchCommand[] = [];
+    const threads = Array.from({ length: 20 }, (_, index) => ({
+      id: ThreadId.make(`watch-${index}`),
+      projectId: workspace.projects[0]!.id,
+      lineage: {
+        rootThreadId: ThreadId.make(`watch-${index}`),
+        parentThreadId: null,
+        relationshipToParent: null,
+      },
+      settledOverride: null,
+      settledAt: null,
+      pullRequests: [
+        {
+          host: "github.com",
+          repository: index < 18 ? "Abdullah1738/robob-mission-control" : "pingdotgg/t3code",
+          number: index + 1,
+          url: `https://github.com/Abdullah1738/robob-mission-control/pull/${index + 1}`,
+          source: "agent" as const,
+          linkedAt: "2026-11-12T00:00:00.000Z",
+          snapshot: null,
+          stack: null,
+          watch: {
+            startedAt: "2026-11-12T00:00:00.000Z",
+            headSha: null,
+            failedChecks: [],
+            passed: false,
+            passedChecks: [],
+            passedPending: [],
+            remarksThrough: "2026-11-12T00:00:00.000Z",
+            remarkIds: [],
+            conflicting: false,
+            conflictHead: null,
+            conflictWokeFor: null,
+            wakes: 0,
+          },
+        },
+      ],
+    }));
+    const reactor = yield* PullRequestWatchReactor.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(PullRequestService.PullRequestService, workspace.service),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getThreadsWithPullRequests: () => Effect.succeed(threads),
+          }),
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            dispatch: (command) =>
+              Effect.sync(() => {
+                if (command.type === "thread.pull-request-watch.sync") commands.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+          }),
+          Layer.succeed(
+            Crypto.Crypto,
+            Crypto.make({
+              randomBytes: (size) => new Uint8Array(size).fill(1),
+              digest: (_algorithm, data) => Effect.succeed(data),
+            }),
+          ),
+        ),
+      ),
+    );
+    yield* reactor.sweep;
+    const first = workspace.counts();
+    assert.strictEqual(commands.length, 20);
+    workspace.reset();
+    yield* TestClock.adjust("2 minutes");
+    yield* reactor.sweep;
+    const second = workspace.counts();
+    assert.deepStrictEqual({ first, second }, {
+      first: { listShells: 1, gitSpawns: 180 },
+      second: { listShells: 1, gitSpawns: 0 },
+    });
+    assert.strictEqual(commands.length, 40);
   }),
 );

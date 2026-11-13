@@ -282,6 +282,9 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+tool_log="$HERE/toollog.py"
+[ -f "$tool_log" ] || tool_log="$HERE/../skill/scripts/toollog.py"
+install -m 0644 "$tool_log" /opt/boatd/toollog.py
 printf '#!/bin/sh\nexec /usr/bin/python3 /opt/boatd/boatd.py "$@"\n' > /usr/local/sbin/boatd
 chmod 0755 /usr/local/sbin/boatd
 # Settings this script owns are set; anything else already in config.json (owners, retention, sizes) is kept.

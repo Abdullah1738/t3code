@@ -1,6 +1,7 @@
 """boatd (the offbox server): restart reconcile, persistent queue, tokens per owner, health, retention.
 
 Runs anywhere: Incus, systemd, ZFS and /proc are replaced by fakes; SQLite and the HTTP handler are real."""
+import io
 import importlib.util
 import json
 import os
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 SERVER = Path(__file__).resolve().parents[1] / "server"
 spec = importlib.util.spec_from_file_location("boatd", SERVER / "boatd.py")
@@ -83,6 +85,9 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="boatd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        log_env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.tmp / "shared-logs"))
+        log_env.start()
+        self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
             "VAR", "ETC", "CMDS", "DB_PATH", "ADMIT_LOCK", "incus", "_sh", "spawn_runner", "unit_active",
             "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log")}
@@ -129,6 +134,31 @@ class Base(unittest.TestCase):
 
     def state(self, bid):
         return self.con.execute("SELECT * FROM boxes WHERE id=?", (bid,)).fetchone()
+
+
+class Logging(Base):
+    def rows(self, name):
+        return [json.loads(line) for p in (self.tmp / "shared-logs").glob("*.ndjson")
+                for line in p.read_text().splitlines() if json.loads(line)["name"] == name]
+
+    def test_reaper_logs_stop_success_and_failure(self):
+        b = self.box()
+        self.con.execute("UPDATE boxes SET last_active=? WHERE id=?", (boatd.now()-10000,b))
+        with patch.object(boatd, "ssh_sessions", return_value=0), patch.object(boatd, "stop_box"):
+            boatd.reap_once(self.con)
+        with patch.object(boatd, "ssh_sessions", return_value=0), patch.object(boatd, "stop_box", side_effect=RuntimeError("private error")):
+            boatd.reap_once(self.con)
+        self.assertEqual({r['ok'] for r in self.rows('reaper.action')}, {True,False})
+        self.assertEqual(len(self.rows('reaper.pass')), 2)
+
+    def test_memory_admission_logs_queue_before_wait(self):
+        b = self.box()
+        pid = self.cmd(b, status='queued')
+        with patch.object(boatd, 'mem_available', return_value=0), patch.object(boatd.time, 'sleep', side_effect=RuntimeError('stop fixture wait')):
+            with self.assertRaises(RuntimeError): boatd.admit(self.con,b,pid,'k',io.BytesIO())
+        row = self.rows('run.queue')[0]
+        self.assertTrue(row['props']['queued'])
+        self.assertEqual(row['props']['position'],1)
 
 
 class ReconcileRuns(Base):

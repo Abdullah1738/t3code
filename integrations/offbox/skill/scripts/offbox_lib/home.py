@@ -18,12 +18,15 @@ import time
 import urllib.error
 import urllib.request
 
+import toollog
+
 from . import common
 from .common import EXIT_HOME_DOWN, EXIT_INFRA, OffboxError, log, say
 
 PROBE_TIMEOUT_S = 3.0
 FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this run is on Boat ("unreachable: ...")
 MAX_FAILURE_LINES = 200
+WAIT_STARTED = None
 
 
 def active() -> bool:
@@ -42,6 +45,13 @@ def health_url() -> str | None:
 
 
 def probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
+    with toollog.span("health", "home.probe", tag="home_probe") as data:
+        result = _probe(timeout)
+        data["ok"] = result is None
+        return result
+
+
+def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
     """One GET /health (no token). None = the server takes runs; else a short reason why not."""
     url = health_url()
     if not url:
@@ -100,6 +110,9 @@ def unreachable(e: OffboxError) -> bool:
 def fail_over(reason: str, argv: list[str], run_id: str = "") -> None:
     """Send this one run to Boat: record why, say so once, and start over as a Boat process. Does not return.
     Only called while nothing has started on the home server."""
+    elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
+    toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
+                 props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
     record_failure(reason, run_id)
     say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
     log(f"failover to boat: {reason[:300]}")

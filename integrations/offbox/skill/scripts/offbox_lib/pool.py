@@ -414,15 +414,33 @@ def _clear_queue_rows(con, me, run_id):
 
 
 def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
+    import toollog
+    with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
+        started = time.monotonic()
+        try:
+            row = _acquire_logged(me, size, template, base, fresh, run_id, exclude)
+        except BaseException:
+            toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
+                         ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
+            raise
+        data["ids"] = {"run": run_id, "box": row["box_id"]}
+        data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
+        data["props"]["size"] = row.get("size")
+        return row
+
+
+def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
     from . import allocation
     con = db()
     token = new_id('waiter')
+    queue_start = time.monotonic()
     granted, got = False, None
     key = me['repo_key']
     source = _source(key, template, base, fresh)
     try:
         with allocation.scope(key), allocation.queue(), prepare.attempts():
             queue = allocation._QUEUE.get()
+            queue["log_setup_ms"] = 0
             poll = _QueuePoll(con, queue['wait'], run_id, deadline=queue['end'])
             poll.call(lambda: capacity.schema(con))
             def register():
@@ -439,6 +457,10 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
                     granted = True
                     if not run_id:
                         got['_pool_cap_token'] = token
+                    import toollog
+                    elapsed = max(0, (time.monotonic() - queue_start) * 1000 - queue["log_setup_ms"])
+                    toollog.emit("pool", "run.queue", kind="perf", duration_ms=elapsed, ok=True,
+                                 ids={"run": run_id}, props={"waitMs": elapsed, "queued": elapsed > 1000, "position": 1})
                     return got
                 except prepare.Stalled as e:
                     con.execute("UPDATE leases SET state=CASE WHEN source LIKE 'recipe:%' THEN 'quarantined' "
@@ -448,6 +470,10 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
                 except PoolBusyError as e:
                     if 'kept its pool lock' not in str(e):
                         state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=token))
+                        import toollog
+                        toollog.emit("pool", "run.queue", ids={"run": run_id}, ok=False,
+                                     props={"queued": True, "position": state.get("place"),
+                                            "waitMs": (time.monotonic()-queue_start)*1000})
                         e.args = (f"{e}; {_queue_line(state, source)}",)
                     raise
     except (sqlite3.Error, OffboxError) as error:
@@ -480,9 +506,21 @@ def _source(key, template, base, fresh):
             f"template:{template}" if template else None)
 
 
+@contextlib.contextmanager
+def _lease_work():
+    from . import allocation
+    queue = allocation._QUEUE.get()
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if queue is not None:
+            queue["log_setup_ms"] = queue.get("log_setup_ms", 0) + (time.monotonic()-started)*1000
+
+
 def _reuse_prepared(con, row, *args, **kwargs):
     from . import lease
-    with prepare.guard(row['box_id']) as budget:
+    with _lease_work(), prepare.guard(row['box_id']) as budget:
         got = lease._reuse(con, row, *args, **kwargs)
         if got:
             got['_prepare_end'] = budget.end
@@ -882,6 +920,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         _claim(con, me, got, run_id)
                         got["_guard"] = guard
                         guard = None
+                        got["_log_lease_kind"] = "reused"
                         say(f"reusing repository pool box {got['box_id']} ({got['size']})")
                         return got
                     if row['state'] != 'running':
@@ -895,9 +934,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
                     try:
-                        with prepare.guard('new allocation') as budget:
+                        with _lease_work(), prepare.guard('new allocation') as budget:
                             got = creator(shared, size, template, base, fresh)
                             got['_prepare_end'] = budget.end
+                            got['_log_lease_kind'] = 'saved-base' if str(got.get('source', '')).startswith('base:') else 'fresh'
                     except (allocation.Busy, allocation.Fenced):
                         break
                     except capacity.CapacityError as e:
@@ -962,6 +1002,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             raise last_error
         state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=waiter))
         if t >= next_progress or state != previous_state:
+            import toollog
+            toollog.emit("pool", "run.queue", ids={"run": run_id},
+                         props={"queued": True, "position": state.get("place"), "waitMs": (t-started)*1000})
             detail = _queue_line(state, source)
             if not said:
                 say(f"queued for a {key} pool box: {detail}; will wait up to {_span(wait)}" +

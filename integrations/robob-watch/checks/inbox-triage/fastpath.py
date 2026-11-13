@@ -2,7 +2,25 @@
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr
 from html.parser import HTMLParser
+import os
+from pathlib import Path
 import re
+import sys
+import time
+
+HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (HELPERS / 'toollog.py').is_file():
+    HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(HELPERS))
+try:
+    from toollog import tool_error, tool_log
+except ImportError:
+    # Scratch checks also run while an older helpers install is still in place.
+    def tool_log(*_args, **_kwargs):
+        pass
+
+    def tool_error(*_args, **_kwargs):
+        pass
 
 # These currencies have fixed USD pegs. Other currencies need an explicit local rate.
 AED_RATES = {'AED': '1', 'USD': '3.6725', 'SAR': str(Decimal('3.6725') / Decimal('3.75')),
@@ -93,6 +111,34 @@ def sender_label(sender):
 
 
 def classify(item, actions=(), rates=None):
+    started = time.perf_counter()
+    ids = {'watcher': os.environ.get('WATCH_ID', 'inbox-triage-fastpath'), 'item': item.get('id')}
+    if os.environ.get('WATCH_RUN'):
+        ids['run'] = os.environ['WATCH_RUN']
+    props = {}
+    source = item.get('source')
+    if source == 'email':
+        props['source'] = 'mail'
+    elif source in ('imessage', 'sms'):
+        props['source'] = 'sms'
+    try:
+        result = _classify(item, actions, rates)
+    except Exception:
+        tool_error('fastpath', 'fastpath.classify_failed', ids)
+        tool_log({'component': 'fastpath', 'kind': 'perf', 'name': 'fastpath.classify', 'ok': False,
+                  'durationMs': (time.perf_counter() - started) * 1000, 'ids': ids,
+                  'props': {**props, 'class': 'unknown'}})
+        raise
+    category = {'auth': 'otp', 'debit': 'charge', 'sim': 'security', 'login': 'security'}.get((result or {}).get('kind'), 'unknown')
+    if category == 'charge':
+        props['source'] = 'charge'
+    tool_log({'component': 'fastpath', 'kind': 'perf', 'name': 'fastpath.classify', 'ok': True,
+              'durationMs': (time.perf_counter() - started) * 1000, 'ids': ids,
+              'props': {**props, 'class': category}})
+    return result
+
+
+def _classify(item, actions=(), rates=None):
     if item.get('source') not in ('email', 'imessage', 'sms'):
         return None
     sender = identity(item.get('sender'))
@@ -157,6 +203,7 @@ def classify(item, actions=(), rates=None):
         if not rate.is_finite() or rate <= 0 or amount * rate < 1000:
             return None
     except (InvalidOperation, TypeError, ValueError):
+        tool_error('fastpath', 'fastpath.rate_invalid', {'watcher': os.environ.get('WATCH_ID', 'inbox-triage-fastpath'), 'item': item.get('id')})
         return None
     card = re.search(r'\bcard\s*(?:(?:ending|number|no\.?|used|with)\s*[:#-]?\s*)*(?:[xX* -]*)(\d[\d -]{2,25}\d)', text, re.I)
     digits = re.sub(r'\D', '', card[1]) if card else ''

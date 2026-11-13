@@ -11,6 +11,7 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import type * as Tracer from "effect/Tracer";
+import { vi } from "vite-plus/test";
 
 import {
   KanbanAutomationId,
@@ -62,6 +63,7 @@ const board: KanbanBoard = {
   createdAt: at,
   setup: null,
   pause: null,
+  nightlyReview: null,
   archivedAt: null,
 };
 
@@ -912,4 +914,163 @@ it.effect("releases the reader every 64 summary rows on a 3,000-card board", () 
     yield* store.putCard({ ...expected[0]!, stage: "verified", settledAt: at });
     assert.strictEqual((yield* store.summaryCards(boardId))[0]!.stage, "verified");
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reuses decoded rows across list and single reads without parsing again", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putBoard(board);
+    yield* store.putCard(card(1, "todo"));
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const firstBoard = yield* store.board(boardId);
+      const firstCard = yield* store.card(KanbanCardId.make("card-1"));
+      const parses = parse.mock.calls.length;
+      assert.strictEqual((yield* store.boards)[0], firstBoard);
+      assert.strictEqual((yield* store.cards(boardId))[0], firstCard);
+      assert.strictEqual(parse.mock.calls.length, parses);
+      assert.deepStrictEqual(firstBoard, board);
+      assert.deepStrictEqual(firstCard, card(1, "todo"));
+      assert.isTrue(Object.isFrozen(firstBoard));
+      assert.isTrue(Object.isFrozen(firstBoard!.instructions));
+      assert.isTrue(Object.isFrozen(firstCard!.subtasks));
+      assert.isTrue(Object.isFrozen(firstCard!.model));
+      assert.throws(
+        () => Object.assign(firstBoard!.instructions, { escalation: "mutated" }),
+        TypeError,
+      );
+      assert.throws(() => Object.assign(firstCard!.projects, { 0: "mutated" }), TypeError);
+    } finally {
+      parse.mockRestore();
+    }
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("decodes changed JSON for the same id, including raw SQL writes", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* store.putBoard(board);
+    const before = yield* store.board(boardId);
+    const changed = { ...board, name: "Changed outside the store" };
+    yield* sql`UPDATE ardud_kanban_boards SET json = ${JSON.stringify(changed)} WHERE id = ${boardId}`;
+    const after = yield* store.board(boardId);
+    assert.deepStrictEqual(after, changed);
+    assert.notStrictEqual(after, before);
+    assert.strictEqual((yield* store.boards)[0], after);
+    assert.strictEqual(before!.name, board.name);
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.live(
+  "a rollback returns committed rows even after decoding the uncommitted write",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* store.putBoard(board);
+        yield* store.putCard(card(1, "todo"));
+        const before = yield* store.board(boardId);
+        const beforeCard = yield* store.card(KanbanCardId.make("card-1"));
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* store.putBoard({ ...board, name: "Uncommitted" });
+              yield* store.putCard({ ...card(1, "todo"), title: "Uncommitted" });
+              assert.strictEqual((yield* store.board(boardId))!.name, "Uncommitted");
+              assert.strictEqual(
+                (yield* store.card(KanbanCardId.make("card-1")))!.title,
+                "Uncommitted",
+              );
+              return yield* Effect.fail("rollback");
+            }),
+          )
+          .pipe(Effect.flip);
+        assert.strictEqual(yield* store.board(boardId), before);
+        assert.strictEqual(yield* store.card(KanbanCardId.make("card-1")), beforeCard);
+      }),
+    ),
+  30_000,
+);
+
+it.live(
+  "evicts the least recently used card text past the 4096 entry cap",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.withTransaction(
+        Effect.forEach(
+          Array.from({ length: 4096 }, (_, i) => card(i + 1, "todo")),
+          store.putCard,
+          { discard: true },
+        ),
+      );
+      const rows = yield* store.cards(boardId);
+      const oldest = rows[0]!;
+      const evicted = rows[1]!;
+      assert.strictEqual(yield* store.card(oldest.id), oldest);
+      yield* store.putCard(card(4097, "todo"));
+      yield* store.card(KanbanCardId.make("card-4097"));
+      assert.strictEqual(yield* store.card(oldest.id), oldest);
+      const reread = yield* store.card(evicted.id);
+      assert.notStrictEqual(reread, evicted);
+      assert.deepStrictEqual(reread, evicted);
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+  30_000,
+);
+
+it.live(
+  "observes a second connection's board, card and thread changes",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "kanban-cache-writer-" });
+      const dbPath = path.join(dir, "boards.sqlite");
+      const other = yield* Layer.build(NodeSqliteClient.layer({ filename: dbPath }));
+      const writer = Context.get(other, SqlClient.SqlClient);
+      yield* Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const link = {
+          threadId: ThreadId.make("cache-thread"),
+          boardId,
+          cardId: KanbanCardId.make("card-1"),
+          role: "work" as const,
+          purpose: null,
+          discussionId: null,
+          model,
+          startedAt: at,
+          endedAt: null,
+          paused: null,
+        };
+        yield* store.putBoard(board);
+        yield* store.putCard(card(1, "todo"));
+        yield* store.putThreadLink(link);
+        const originalBoard = yield* store.board(boardId);
+        const originalCard = yield* store.card(link.cardId);
+        const originalLink = yield* store.threadLink(link.threadId);
+        assert.strictEqual((yield* store.threadLinksByIds([link.threadId]))[0], originalLink);
+        assert.deepStrictEqual(yield* store.threadLinksByIds([]), []);
+        assert.isTrue(Object.isFrozen(originalLink));
+        assert.isTrue(Object.isFrozen(originalLink!.model));
+        const nextBoard = { ...board, name: "Other writer" };
+        const nextCard = { ...card(1, "todo"), title: "Other writer" };
+        const nextLink = { ...link, endedAt: at };
+        yield* writer`UPDATE ardud_kanban_boards SET json = ${JSON.stringify(nextBoard)} WHERE id = ${boardId}`;
+        yield* writer`UPDATE ardud_kanban_cards SET json = ${JSON.stringify(nextCard)} WHERE id = ${link.cardId}`;
+        yield* writer`UPDATE ardud_kanban_threads SET json = ${JSON.stringify(nextLink)} WHERE thread_id = ${link.threadId}`;
+        assert.deepStrictEqual(yield* store.board(boardId), nextBoard);
+        assert.deepStrictEqual(yield* store.card(link.cardId), nextCard);
+        assert.deepStrictEqual(yield* store.threadLink(link.threadId), nextLink);
+        assert.deepStrictEqual(yield* store.threadLinksByIds([link.threadId, "absent"]), [
+          nextLink,
+        ]);
+        assert.deepStrictEqual(originalBoard, board);
+        assert.deepStrictEqual(originalCard, card(1, "todo"));
+        assert.deepStrictEqual(originalLink, link);
+      }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerFromPath(dbPath)))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  30_000,
 );

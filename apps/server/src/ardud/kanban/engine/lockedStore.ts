@@ -42,6 +42,7 @@ export const wrap = (
   return {
     ...store,
     boards: locks.observe(store.boards),
+    board: (id) => locks.access(id, store.board(id), false, "board"),
     putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
     putBoardWithPools: (row, pools) =>
       locks.access(row.id, store.putBoardWithPools(row, pools), true, "board"),
@@ -81,6 +82,7 @@ export const wrap = (
     wiki: (id) => locks.access(id, store.wiki(id)),
     putWiki: (row) => locks.access(row.boardId, store.putWiki(row), true),
     threadLink: (id) => thread(id, store.threadLink(id)),
+    threadLinksByIds: (ids) => locks.observe(store.threadLinksByIds(ids)),
     threadLinks: (filter) =>
       "boardId" in filter
         ? locks.access(filter.boardId, store.threadLinks(filter))

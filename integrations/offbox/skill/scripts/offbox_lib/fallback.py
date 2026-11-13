@@ -135,4 +135,10 @@ def run_local(argv: list[str], reason: str, run_id: str | None = None) -> int:
                    f"Do not rerun the command; read/repair its result with: offbox wait {run_id or ''}")
         say("warning: " + message)
         log(message)
+    import toollog
+    for name in ("run.command", "run.end"):
+        toollog.emit("run", name, kind="perf" if code == 0 else "error", ok=code == 0,
+                     duration_ms=max(0, now()-t)*1000, ids={"run": run_id},
+                     props={"exitCode": code, "fallback": True, "timeoutHit": code == 124},
+                     tag="local_command_failed" if code else None)
     return code

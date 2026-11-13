@@ -1,4 +1,5 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
 import { backendKind } from "../src/config.ts";
 import type { PendingRequest } from "../src/control.ts";
@@ -279,3 +280,5 @@ test("a request in a folder the board does not list is still found, such as a su
   await alerts.tick();
   expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("needs your approval")]);
 });
+
+useToolLogFixture();

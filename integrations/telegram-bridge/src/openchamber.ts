@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { toolError } from "./toollog.ts";
 
 // JSON.parse establishes this representation; notification consumers decode its
 // event variants before using them as session/request identities.
@@ -239,11 +240,13 @@ export class OpenChamber implements AlertBackend {
       }
       this.baseUrl = new URL(baseUrl).origin;
     } catch {
+      toolError("telegram", "tg.openchamber.url");
       throw new Error("OpenChamber URL must be an HTTP origin on 127.0.0.1 or localhost");
     }
     try {
       this.headers = new Headers(headers);
     } catch {
+      toolError("telegram", "tg.openchamber.headers");
       throw new Error("Invalid OpenChamber headers");
     }
   }
@@ -276,10 +279,11 @@ export class OpenChamber implements AlertBackend {
         verbose: false,
       });
     } catch {
+      toolError("telegram", "tg.openchamber.request");
       throw requestError(0, signal);
     }
     if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("telegram", "tg.openchamber.responseCancel"); });
       throw requestError(response.status, signal);
     }
     return response;
@@ -293,6 +297,7 @@ export class OpenChamber implements AlertBackend {
     try {
       return (await response.json()) as T;
     } catch {
+      toolError("telegram", "tg.openchamber.responseJson");
       throw requestError(response.status, signal);
     }
   }
@@ -352,7 +357,7 @@ export class OpenChamber implements AlertBackend {
         assert.match(session.parentID, ID);
         id = session.parentID;
       }
-    } catch { /* Keep pending permissions visible when the policy owner is unavailable. */ }
+    } catch { toolError("telegram", "tg.openchamber.runtimeMode", { thread: sessionId }); }
   }
 
   async getSession(id: string, directory: string): Promise<SessionRecord | undefined> {
@@ -431,7 +436,7 @@ export class OpenChamber implements AlertBackend {
     const response = await this.response(path, { signal }, "text/event-stream");
     if (response.status === 204) return;
     if (!response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("telegram", "tg.openchamber.eventBodyCancel"); });
       throw requestError(response.status, signal);
     }
     const reader = response.body.getReader();
@@ -474,9 +479,10 @@ export class OpenChamber implements AlertBackend {
         if (done) return;
       }
     } catch {
+      toolError("telegram", "tg.openchamber.events");
       throw requestError(response.status, signal);
     } finally {
-      await reader.cancel().catch(() => {});
+      await reader.cancel().catch(() => { toolError("telegram", "tg.openchamber.eventReaderCancel"); });
       reader.releaseLock();
     }
   }

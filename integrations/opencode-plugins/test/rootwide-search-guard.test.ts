@@ -29,7 +29,7 @@ for (const row of cases) test(`shared corpus: ${row.command} [${row.cwd}]`, asyn
       // Execute only the refusal, never the corpus's original search command.
       const refused = spawnSync("/bin/sh", ["-c", event.input.command], { encoding: "utf8" });
       expect(refused.status).toBe(3);
-      expect(refused.stderr).toContain("Refused: recursive search over " + row.root);
+      expect(refused.stderr).toContain("Refused: a recursive search over " + row.root);
     } else expect(event.input.command).toBe(row.command);
   }
 });
@@ -52,8 +52,13 @@ test("registration, cwd fallback, cmd shape and non-shell text", async () => {
 
 
 test("async Python transport returns refusals and allowed verdicts", async () => {
-  expect((await classify("rg --files /Users/ardud/checkouts", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBe("/Users/ardud/checkouts");
+  const refusal = await classify("rg --files /Volumes/ExternalSSD", "/tmp", source, process.env.HARNESS_TEST_PYTHON);
+  expect(refusal.root).toBe("/Volumes/ExternalSSD");
+  expect(refusal.reason).not.toContain("ovnfs");
+  expect(refusal.reason).not.toContain("/Users/ardud/checkouts");
+  expect((await classify("rg --files /Users/ardud/checkouts", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
   expect((await classify("rg foo /Users/ardud/checkouts/task-1", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
+  expect((await classify("rg foo /Volumes/ExternalSSD/t3code-fork-wt/task-1", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
 });
 
 test("a classifier error does not turn non-search commands into refusals", async () => {

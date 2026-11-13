@@ -1,4 +1,5 @@
 """NowNow pre-order intent binding. Secrets stay in Keychain, hashes in journal."""
+import toollog
 import copy
 import hashlib
 
@@ -91,6 +92,7 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20, challenge=None):
             'journal_state':journal.inspect(flow_id)['state']}
 
 
+@toollog.timed("commerce", "step.bank_approval_wait", lane="nownow")
 def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600,
                   poll_seconds=5, sleep=None, clock=None):
     """Continue a consumed verification; never place or send completion again.

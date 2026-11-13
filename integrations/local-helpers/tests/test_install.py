@@ -180,6 +180,25 @@ exit 0
             os.chmod(os.path.join(helpers, name), 0o755)
         return self.nvm_uber("v26.2.0")
 
+    def test_image_helper_link_preserves_previous_script_and_dry_run_is_readonly(self):
+        script = self.live(".config/opencode/skills/image-generation/scripts/genimg.py")
+        os.makedirs(os.path.dirname(script))
+        with open(script, "w") as out:
+            out.write("old image helper\n")
+        rc, _, err = self.run_install("--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.islink(script))
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.readlink(script), self.live(".local/libexec/image-generation/genimg.py"))
+        backups = [x for x in os.listdir(os.path.dirname(script)) if x.startswith("genimg.py.bak-")]
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(os.path.dirname(script), backups[0])) as old:
+            self.assertEqual(old.read(), "old image helper\n")
+        for name in ("9router-log-poll", "9router-log-rollup", "rclaude-key-helper"):
+            self.assertTrue(os.access(self.live(".local/bin/" + name), os.X_OK))
+        self.assertIn("com.ardud.9router-log-poll", os.listdir(self.loaded))
+
     def test_second_run_changes_nothing_and_check_passes(self):
         self.ready()
         rc, _, err = self.run_install()

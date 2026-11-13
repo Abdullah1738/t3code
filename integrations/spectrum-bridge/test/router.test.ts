@@ -7374,3 +7374,27 @@ test.each(["permission", "question"] as const)("an incomplete child scan cannot 
   expect(kind === "permission" ? h.backend.permissionReplies : h.backend.questionReplies).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
 });
+
+test("watcher reply guard logs accepted silence and visible replies without text", async () => {
+  const previous = process.env.TOOLLOG_DIR;
+  const logs = mkdtempSync(join(tmpdir(), "wake-guard-log-")); directories.push(logs);
+  process.env.TOOLLOG_DIR = logs;
+  try {
+    for (const [text, accepted] of [["NO_REPLY", true], ["private fixture reply", false]] as const) {
+      const h = setup();
+      h.input(`wake:${"c".repeat(64)}`, "private fixture event");
+      await h.router.tick();
+      h.backend.final(text);
+      await h.router.tick();
+      const raw = readFileSync(join(logs, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8");
+      const rows = raw.trim().split("\n").map(line => JSON.parse(line));
+      expect(rows.at(-1)).toMatchObject({ tool: "watchers", component: "wakes", name: "wake.reply_guard", props: { accepted } });
+      expect(rows.at(-1).ids.key).toBe(createHash("sha256").update(`wake:${"c".repeat(64)}`).digest("hex").slice(0, 24));
+      if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + JSON.stringify(rows.at(-1)));
+      expect(raw).not.toContain("private fixture");
+      expect(raw).not.toContain("NO_REPLY");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = previous;
+  }
+});

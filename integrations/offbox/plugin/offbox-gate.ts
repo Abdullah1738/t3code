@@ -15,6 +15,7 @@ import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
+import { gateLog } from "../skills/remote-compute/scripts/toollog.ts"
 import { classify, loadRules } from "../skills/remote-compute/scripts/classify.ts"
 
 const HOME = homedir()
@@ -131,7 +132,7 @@ export default {
   id: "offbox-gate",
   setup: async (ctx: any) => {
     try { ensureRules() } catch {
-      log({ event: "rules-load-error", error: "rules.load_failed" })
+      log({ event: "rules-load-error", errorTag: "rules_load_failed" })
       toolLogHook('offbox-gate', 'allowed', 'rules-load-error', performance.now(), undefined, 'rules.load_failed')
     }
 
@@ -145,14 +146,19 @@ export default {
         command = cmd
         if (typeof cmd !== "string" || !cmd) return
         const m = mode()
-        if (m === "off") return
+        if (m === "off") { gateLog("allowed", "unknown", 0); return }
         const t0 = performance.now()
         ensureRules()
         const v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null)
         const ms = +(performance.now() - t0).toFixed(3)
-        if (v.error) errorTag = "hook.classifier_failed"
         rule = v.rule ?? "no-policy"
-        if (!v.heavy) return
+        if (v.error) {
+          errorTag = "hook.classifier_failed"
+          gateLog("allowed", "unknown", ms, true)
+          log({ event: "classify-error", session: e.sessionID, errorTag: "classify_failed" })
+          return
+        }
+        if (!v.heavy) { gateLog("allowed", "light", ms); return }
         const ids = [e.sessionID]
         let ex = exempt(ids)
         if (!ex && m === "enforce") {
@@ -168,11 +174,13 @@ export default {
           ms,
         })
         if (deny) e.input = { ...input, command: denial(cmd, v), background: false }
+        gateLog(ex ? "local-override" : deny ? "denied" : "allowed", v.class, ms)
       } catch (err) {
         errorTag = 'hook.error'
-        log({ event: "hook-error", error: 'hook.error' })
+        gateLog("allowed", "unknown", 0, true)
+        log({ event: "hook-error", session: e?.sessionID, errorTag: "hook_failed" })
       } finally {
-        if (typeof command === 'string') toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e.sessionID})
+        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID})
       }
     })
 
@@ -191,7 +199,7 @@ export default {
         if (!path.split(":").includes(BLOCKERS)) env.PATH = `${BLOCKERS}:${path}`
         env.OFFBOX_GATE = "1"
       } catch (err) {
-        log({ event: "shell-hook-error", error: 'shell.hook_failed' })
+        log({ event: "shell-hook-error", errorTag: "hook_failed" })
         toolLogHook('shell', 'allowed', 'shell-hook-error', performance.now(), undefined, 'shell.hook_failed')
       }
     })

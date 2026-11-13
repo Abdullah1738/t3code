@@ -1,3 +1,4 @@
+import { toolLog } from "./toollog.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { isAbsolute } from "node:path";
@@ -3964,6 +3965,7 @@ export class Router {
         .find(tokens => typeof tokens?.input === "number");
       // Tool mode: a final ending in NO_REPLY (one block or a whole multi-block message) is a deliberate silence.
       const silent = !!final && (quiet.has(final.id) || (!!assistantText(final).trim() && !replyText(assistantText(final))));
+      if (turn.inboundId?.startsWith("wake:")) toolLog({ component: "wakes", kind: "event", name: "wake.reply_guard", ok: true, ids: { key: turn.inboundId, thread: turn.id }, props: { accepted: silent } });
       this.store.db.transaction(() => {
         if (priorFailure) this.notice(turn!, "failed", firstFailureText(priorFailure.modelError));
         // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.

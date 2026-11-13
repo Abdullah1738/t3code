@@ -9756,9 +9756,86 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
           "cardThread",
         )
         .pipe(Effect.flip);
-      assert.include(edit.detail, "is not assigned to this thread");
+      assert.strictEqual(edit.code, "not-found");
+      assert.strictEqual(edit.detail, `open ask q1 on card #${created.number}`);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(["needs_owner", "todo"] as const)(
+  "#1282 an unattached own worker can revise and reply on an open ask in %s",
+  (stage) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(created.id)).card;
+        const worker: KanbanActor = { _tag: "thread", threadId: running.workThreadId! };
+        const blocking = stage === "needs_owner";
+        const asked = yield* kanban.askOwner(
+          created.id,
+          { question: "Which fee?", options: ["1%", "2%"], blocking },
+          worker,
+          "cardThread",
+        );
+        yield* store.putCard({
+          ...asked,
+          stage,
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+
+        const edited = yield* kanban.editAsk(
+          created.id,
+          "q1",
+          { question: "Which updated fee?", options: ["2%", "3%", "4%"], revisionNote: "New choices" },
+          worker,
+          "cardThread",
+        );
+        assert.strictEqual(edited.stage, stage);
+        assert.isNull(edited.activeThreadId);
+        assert.isNull(edited.activeRole);
+        assert.isNull(edited.activePool);
+        assert.strictEqual(edited.workThreadId, running.workThreadId);
+        assert.strictEqual(edited.asks[0]!.text, "Which updated fee?");
+        assert.deepStrictEqual(edited.asks[0]!.options?.map((option) => option.label), [
+          "2%",
+          "3%",
+          "4%",
+        ]);
+        assert.isNull(edited.asks[0]!.closedAt);
+        assert.strictEqual(edited.asks[0]!.blocking, blocking);
+        if (blocking) assert.strictEqual(edited.question, "Which updated fee?");
+
+        const blocks = [{ _tag: "md", text: "The revised choices include the new fee." }] as const;
+        const reply = yield* kanban.replyOnAsk(created.id, "q1", worker, blocks, "cardThread");
+        assert.deepStrictEqual(reply.author, worker);
+        assert.deepStrictEqual(reply.blocks, blocks);
+        const talk = yield* kanban.cardDiscussion(created.id);
+        assert.deepStrictEqual(
+          (yield* kanban.messages(talk.id)).find((message) => message.seq === reply.seq),
+          reply,
+        );
+        const after = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(after.stage, stage);
+        assert.isNull(after.activeThreadId);
+        assert.isNull(after.activeRole);
+        assert.isNull(after.activePool);
+        assert.strictEqual(after.workThreadId, running.workThreadId);
+        assert.strictEqual(after.asks[0]!.text, "Which updated fee?");
+        assert.deepStrictEqual(after.asks[0]!.options?.map((option) => option.label), [
+          "2%",
+          "3%",
+          "4%",
+        ]);
+        assert.isNull(after.asks[0]!.closedAt);
+        assert.strictEqual(after.asks[0]!.blocking, blocking);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect.each([false, true])(
@@ -10022,6 +10099,22 @@ it.effect.each([
           .pipe(Effect.flip);
         assert.strictEqual(change.detail, ask.detail);
       }
+      const edit = yield* kanban
+        .editAsk(
+          created.id,
+          "q1",
+          { question: "Edit?", revisionNote: "Changed" },
+          actor,
+          "cardThread",
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(edit.code, "denied");
+      assert.strictEqual(edit.detail, ask.detail);
+      const reply = yield* kanban
+        .replyOnAsk(created.id, "q1", actor, [{ _tag: "md", text: "Reply" }], "cardThread")
+        .pipe(Effect.flip);
+      assert.strictEqual(reply.code, "denied");
+      assert.strictEqual(reply.detail, ask.detail);
       const move = yield* kanban
         .moveCard(
           created.id,
@@ -27497,4 +27590,335 @@ it.effect("review878r3: unpause does not undo a completed sibling review", () =>
       assert.strictEqual((yield* kanban.card(b.id)).card.stage, "completed");
     }).pipe(Effect.provide(testLayer(delayed)));
   }),
+);
+
+it.live(
+  "measures decode and statement work over twenty 200-card ticks",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const board = yield* kanban.ensureBoard({
+          slug: "decode-counts",
+          name: "Decode counts",
+          defaultProjectId: null,
+        });
+        const created = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Measure",
+            title: "Decode fixture",
+            description: "",
+          },
+          owner,
+        );
+        yield* sql.withTransaction(
+          Effect.forEach(
+            Array.from({ length: 199 }, (_, i) => i + 2),
+            (number) =>
+              store.putCard({ ...created, id: KanbanCardId.make(`decode-${number}`), number }),
+            { discard: true },
+          ),
+        );
+        // Three boards share the unresolved set; a failed result read keeps one
+        // evaluator end pending across all twenty passes without changing cards.
+        for (const slug of ["decode-other-a", "decode-other-b"]) {
+          yield* kanban.ensureBoard({ slug, name: slug, defaultProjectId: null });
+        }
+        const threadId = ThreadId.make("decode-pending-evaluator");
+        yield* store.putThreadLink({
+          threadId,
+          boardId: board.id,
+          cardId: null,
+          role: "evaluator",
+          purpose: null,
+          discussionId: null,
+          model: board.evaluatorModel,
+          startedAt: board.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+        fake.failFailureReads.left = 1000;
+        yield* kanban.turnEnded(threadId);
+        yield* kanban.tick;
+        const counts = {
+          boards: 0,
+          maintenanceBoards: 0,
+          cards: 0,
+          threads: 0,
+          threadBatches: 0,
+          boardDecodes: 0,
+          cardDecodes: 0,
+        };
+        const statements: Statement.Transformer = (statement, _sql, _fiber, span) => {
+          const [query] = statement.compile();
+          if (/^\s*SELECT\b/i.test(query)) {
+            if (/\bFROM ardud_kanban_boards\b/.test(query)) {
+              counts.boards++;
+              let current: Tracer.AnySpan | undefined = span;
+              while (current?._tag === "Span") {
+                if (current.name === "KanbanService.tickSteps") {
+                  counts.maintenanceBoards++;
+                  break;
+                }
+                current = Option.getOrUndefined(current.parent);
+              }
+            }
+            if (/\bFROM ardud_kanban_cards\b/.test(query)) counts.cards++;
+            if (/\bFROM ardud_kanban_threads\b/.test(query)) {
+              counts.threads++;
+              if (/WHERE thread_id IN/.test(query)) counts.threadBatches++;
+            }
+          }
+          return Effect.succeed(statement);
+        };
+        const parse = JSON.parse;
+        const spy = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+          const value = parse(text, reviver);
+          if (value && typeof value === "object" && "slug" in value && "managerModel" in value)
+            counts.boardDecodes++;
+          if (value && typeof value === "object" && "number" in value && "subtaskSeq" in value)
+            counts.cardDecodes++;
+          return value;
+        });
+        try {
+          for (let i = 0; i < 20; i++) {
+            yield* kanban.tick.pipe(
+              Effect.provideService(Statement.CurrentTransformer, statements),
+              Effect.provideService(Statement.SpanPropagationEnabled, true),
+            );
+          }
+        } finally {
+          spy.mockRestore();
+        }
+        yield* Effect.logInfo(
+          "KANBAN_DECODE_COUNTS",
+          JSON.stringify({ ticks: 20, boardCount: 3, cards: 200, totals: counts }),
+        );
+        if (process.env.KANBAN_DECODE_BASELINE !== "1") {
+          assert.strictEqual(counts.boardDecodes, 0);
+          assert.strictEqual(counts.cardDecodes, 0);
+          assert.strictEqual(counts.maintenanceBoards, 60);
+          assert.strictEqual(counts.threadBatches, 20);
+          assert.isAtMost(counts.boards, 200);
+          assert.isAtMost(counts.threads, 160);
+        }
+        assert.strictEqual((yield* store.cards(board.id)).length, 200);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+  60_000,
+);
+
+it.effect(
+  "nightly review catches up once per local day, preserves its marker across toggles and refuses overlap",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* TestClock.setTime(Date.parse("2026-11-12T19:59:00Z"));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const off = yield* kanban.ensureBoard({
+          slug: "off",
+          name: "Off",
+          defaultProjectId: board.defaultProjectId,
+        });
+        const channel = yield* kanban.createDiscussion(board.id, "Day's owner chat", {
+          _tag: "system",
+          component: "fixture",
+        });
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        yield* kanban.nightlyTick;
+        // It catches up the current day even when the server missed midnight.
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        const first = [...(yield* Ref.get(fake.threads)).entries()][0]!;
+        assert.include(first[1].messages[0]!, channel.id);
+        assert.strictEqual(first[1].model.instanceId, "claudeAgent");
+        assert.strictEqual(first[1].model.model, "claude-sonnet-5-5");
+        assert.deepStrictEqual(first[1].model.options, [{ id: "effort", value: "medium" }]);
+        yield* setRunning(fake, ThreadId.make(first[0]), true);
+        const refused = yield* kanban
+          .startEvaluator(board.id, { kind: "nightly" })
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "conflict");
+        yield* kanban.nightlyTick;
+        yield* kanban.setNightlyReview(board.id, { enabled: false });
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        yield* setRunning(fake, ThreadId.make(first[0]), false);
+        yield* TestClock.setTime(Date.parse("2026-11-12T20:00:00Z"));
+        yield* kanban.nightlyTick;
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+        const saved = (yield* kanban.snapshot(board.id)).board.nightlyReview!;
+        assert.strictEqual(saved.lastRunDay, "2026-11-13");
+        assert.strictEqual(saved.lastRunAt, "2026-11-12T20:00:00.000Z");
+        assert.isNotNull(saved.lastDiscussionId);
+        assert.isNull((yield* kanban.snapshot(off.id)).board.nightlyReview);
+        yield* kanban.setNightlyReview(board.id, { enabled: false });
+        yield* TestClock.setTime(Date.parse("2026-11-13T20:00:00Z"));
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("nightly review waits for the configured time and survives a service restart", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-nightly-" });
+    const db = path.join(dir, "test.sqlite");
+    yield* TestClock.setTime(Date.parse("2026-11-12T20:29:00Z"));
+    const boardId = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setNightlyReview(board.id, { enabled: true, timeOfDay: "00:30" });
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+        yield* TestClock.adjust("1 minute");
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        return board.id;
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        assert.strictEqual(
+          (yield* kanban.snapshot(boardId)).board.nightlyReview?.lastRunDay,
+          "2026-11-13",
+        );
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  { point: "discussion", trigger: "INSERT ON ardud_kanban_discussions" },
+  { point: "marker", trigger: "UPDATE ON ardud_kanban_boards" },
+  { point: "queue", trigger: "INSERT ON ardud_kanban_evaluator_queue" },
+])("nightly admission rolls back a failed $point write and retries the same day", ({ trigger }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-12T20:00:00Z"));
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setNightlyReview(board.id, { enabled: true });
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* KanbanStore.KanbanStore;
+      const before = (yield* kanban.snapshot(board.id)).board.nightlyReview;
+      const discussions = yield* store.discussions(board.id);
+      yield* sql.unsafe(
+        `CREATE TRIGGER fail_nightly_admission BEFORE ${trigger} BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END`,
+      );
+      yield* kanban.nightlyTick;
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.nightlyReview, before);
+      assert.deepStrictEqual(yield* store.discussions(board.id), discussions);
+      const pending = yield* sql<{
+        count: number;
+      }>`SELECT count(*) AS count FROM ardud_kanban_evaluator_queue`;
+      assert.strictEqual(pending[0]!.count, 0);
+      yield* sql`DROP TRIGGER fail_nightly_admission`;
+      yield* kanban.nightlyTick;
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+      assert.strictEqual((yield* store.discussions(board.id)).length, discussions.length + 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("nightly admission retries after a failed queue insert and service restart", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-nightly-admission-" });
+    const db = path.join(dir, "test.sqlite");
+    yield* TestClock.setTime(Date.parse("2026-11-12T20:00:00Z"));
+    const boardId = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TRIGGER fail_nightly_queue BEFORE INSERT ON ardud_kanban_evaluator_queue BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END`;
+        yield* kanban.nightlyTick;
+        yield* sql`DROP TRIGGER fail_nightly_queue`;
+        return board.id;
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        assert.strictEqual(
+          (yield* kanban.snapshot(boardId)).board.nightlyReview?.lastRunDay,
+          "2026-11-13",
+        );
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["scheduled", "scheduled-null", "manual"] as const)(
+  "nightly queue respects disabling for %s requests",
+  (origin) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let launchFails = true;
+      const wrapped = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.suspend(() =>
+                launchFails
+                  ? Effect.fail(
+                      new KanbanThreadError({
+                        operation: "launch",
+                        detail: "injected provider down",
+                      }),
+                    )
+                  : real.launch(input),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-12T20:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        if (origin !== "manual") yield* kanban.nightlyTick;
+        else
+          assert.isTrue(
+            Exit.isFailure(
+              yield* kanban.startEvaluator(board.id, { kind: "nightly" }).pipe(Effect.exit),
+            ),
+          );
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+        if (origin === "scheduled-null")
+          yield* kanban.updateBoard(board.id, { nightlyReview: null });
+        else yield* kanban.setNightlyReview(board.id, { enabled: false });
+        launchFails = false;
+        yield* kanban.tick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, origin === "manual" ? 1 : 0);
+        const sql = yield* SqlClient.SqlClient;
+        const pending = yield* sql<{
+          count: number;
+        }>`SELECT count(*) AS count FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL`;
+        assert.strictEqual(pending[0]!.count, 0);
+        // A cancelled automatic job cannot come back when the board is re-enabled that day.
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        yield* kanban.nightlyTick;
+        yield* kanban.tick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, origin === "manual" ? 1 : 0);
+      }).pipe(Effect.provide(testLayer(wrapped)));
+    }),
 );
