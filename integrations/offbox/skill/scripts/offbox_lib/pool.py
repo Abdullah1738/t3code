@@ -781,9 +781,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         # The member row and the slot's removal happen in one step under the pool lock, so a
                         # selection never sees the box as neither a member nor a pending slot.
                         with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id']):
-                            _claim(con, me, got, run_id)
-                            con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
-                            con.commit()
+                            _claim(con, me, got, run_id, pending_token=token)
                             token = None
                     except BaseException:
                         guard.__exit__(None, None, None)
@@ -933,7 +931,7 @@ def _recheck_prune_holds(con, key) -> bool:
     return released
 
 
-def _claim(con, me, row, run_id):
+def _claim(con, me, row, run_id, *, pending_token=None):
     bid = row["box_id"]
     row["remote_dir"] = remote_dir_for(me["repo_root"])
     row["_new_checkout"] = con.execute(
@@ -952,15 +950,18 @@ def _claim(con, me, row, run_id):
         detail = ("new checkout there, dependencies not carried over" if row["_new_checkout"]
                   else "existing checkout there")
         say(f"your last box {last[0]} is {state}; using {bid} ({detail})")
-    con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (bid, me["repo_key"]))
-    con.execute("INSERT OR REPLACE INTO pool_callers VALUES (?,?,?,?)",
-                (me["owner"], me["repo_root"], bid, row["remote_dir"]))
-    # Shared leases outlive their original worker's archive state.
-    con.execute("UPDATE leases SET thread_gone_since=NULL, last_used_at=? WHERE box_id=?", (now(), bid))
-    if run_id:
-        con.execute("UPDATE runs SET box_id=?,remote_dir=?,size=? WHERE run_id=?",
-                    (bid, row["remote_dir"], row["size"], run_id))
-    con.commit()
+    # Progress readers do not take the pool lock: adoption and slot removal must share a database commit.
+    with con:
+        con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (bid, me["repo_key"]))
+        con.execute("INSERT OR REPLACE INTO pool_callers VALUES (?,?,?,?)",
+                    (me["owner"], me["repo_root"], bid, row["remote_dir"]))
+        # Shared leases outlive their original worker's archive state.
+        con.execute("UPDATE leases SET thread_gone_since=NULL, last_used_at=? WHERE box_id=?", (now(), bid))
+        if run_id:
+            con.execute("UPDATE runs SET box_id=?,remote_dir=?,size=? WHERE run_id=?",
+                        (bid, row["remote_dir"], row["size"], run_id))
+        if pending_token is not None:
+            con.execute("DELETE FROM pool_pending WHERE token=?", (pending_token,))
 
 
 def _refresh_background(con, key, pull_artifacts=True):

@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import threading
 import sys
 import unittest
@@ -210,7 +211,7 @@ class PoolLockTests(Isolated):
         real_claim = pool._claim
         seen_lock_free = []
 
-        def claim(con, me, row, run_id):
+        def claim(con, me, row, run_id, **kwargs):
             seen_lock_free.append(pool_lock_free())
 
             def other():
@@ -221,7 +222,7 @@ class PoolLockTests(Isolated):
             th = threading.Thread(target=other)
             th.start()
             th.join(10)
-            return real_claim(con, me, row, run_id)
+            return real_claim(con, me, row, run_id, **kwargs)
 
         with patch.object(lease, 'acquire_private', side_effect=creator), \
                 patch.object(pool, '_claim', side_effect=claim), \
@@ -235,6 +236,76 @@ class PoolLockTests(Isolated):
             self.assertEqual([r['box_id'] for r in pool.members(self.con, 'repo')], ['bx_a'])
         finally:
             pool.release_guard(row)
+
+    def test_queue_snapshot_counts_create_once_through_member_handoff(self):
+        for run_id in (None, 'starting-run'):
+            with self.subTest(run_id=run_id):
+                for table in ('leases', 'pool_members', 'pool_callers', 'runs'):
+                    self.con.execute('DELETE FROM ' + table)
+                if run_id:
+                    self.con.execute("INSERT INTO runs(run_id,status) VALUES (?,'starting')", (run_id,))
+                self.con.commit()
+                observer = common.db()
+                self.addCleanup(observer.close)
+                real_claim, observations, lines = pool._claim, [], []
+
+                def snapshot(phase):
+                    # The observer only reads while the creator has a write transaction open.
+                    state = pool._queue_snapshot(observer, 'repo', None, 'template:crpko-go', None)
+                    observations.append((phase, state['busy'], state['pending'], state['total'], state['cap']))
+                    lines.append(pool._queue_line(state))
+
+                def claim(con, me, row, run_id, **kwargs):
+                    snapshot('before claim')
+                    def trace(sql):
+                        if sql.startswith('DELETE FROM pool_pending'):
+                            snapshot('before slot removal')
+                        elif sql == 'COMMIT':
+                            snapshot('before commit')
+                    con.set_trace_callback(trace)
+                    try:
+                        real_claim(con, me, row, run_id, **kwargs)
+                    finally:
+                        con.set_trace_callback(None)
+                    # The review's exact interleaving: a full progress read immediately after _claim returns.
+                    state = pool.queue_state(observer, 'repo', source='template:crpko-go')
+                    observations.append(('after claim', state['busy'], state['pending'], state['total'], state['cap']))
+                    lines.append(pool._queue_line(state))
+
+                with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                        patch.object(lease, 'acquire_private', side_effect=self.new_box()), \
+                        patch.object(pool, '_claim', side_effect=claim):
+                    row = pool.acquire(self.me, run_id=run_id)
+                try:
+                    self.assertEqual(observations, [
+                        ('before claim', 0, 1, 0, 1),
+                        ('before slot removal', 0, 1, 0, 1),
+                        ('before commit', 0, 1, 0, 1),
+                        ('after claim', 1, 0, 1, 1),
+                    ])
+                    for line in lines:
+                        self.assertNotIn('cap fell', line)
+                        self.assertNotIn('surplus', line)
+                finally:
+                    pool.release_guard(row)
+
+    def test_failed_claim_rolls_back_member_adoption_and_preserves_create_slot(self):
+        self.box('created')
+        self.pending(os.getpid())
+        self.con.execute("INSERT INTO runs(run_id,status) VALUES ('starting-run','starting')")
+        self.con.execute("""CREATE TRIGGER reject_claim BEFORE INSERT ON pool_callers BEGIN
+            SELECT RAISE(ABORT, 'claim failed'); END""")
+        self.con.commit()
+        row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='created'").fetchone())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'claim failed'):
+            pool._claim(self.con, self.me, row, 'starting-run', pending_token='create-x')
+        observer = common.db()
+        try:
+            self.assertEqual(observer.execute('SELECT COUNT(*) FROM pool_members').fetchone()[0], 0)
+            self.assertEqual(observer.execute('SELECT token FROM pool_pending').fetchone()[0], 'create-x')
+            self.assertEqual(observer.execute("SELECT box_id FROM runs WHERE run_id='starting-run'").fetchone()[0], None)
+        finally:
+            observer.close()
 
     def test_pooled_recipe_creation_runs_with_creator_box_lock_held(self):
         """Integration through pool.acquire: a pool-created recipe box runs its recipe under the lock the creator
