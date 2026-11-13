@@ -93,9 +93,6 @@ const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
 const MAX_WAIT_MS = 60 * 60 * 1000;
 
-// ---------------------------------------------------------------------------
-// Errors and responses
-// ---------------------------------------------------------------------------
 
 type ControlErrorCode =
   | "unauthorized"
@@ -188,9 +185,6 @@ const errorResponse = (error: ControlError) => {
     : response;
 };
 
-// ---------------------------------------------------------------------------
-// Request helpers
-// ---------------------------------------------------------------------------
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
@@ -200,33 +194,35 @@ const searchParams = Effect.gen(function* () {
   return Option.isSome(url) ? url.value.searchParams : new URLSearchParams();
 });
 
-const param = (name: string) =>
-  Effect.gen(function* () {
-    const params = yield* HttpRouter.params;
-    const value = params[name];
-    if (value === undefined || value.length === 0) {
-      return yield* fail("invalid_request", `Missing path parameter ${name}.`);
-    }
-    // The router already percent-decodes path parameters.
-    return value;
-  });
+const param = Effect.fn("ControlHttp.param")(function* (name: string) {
+  const params = yield* HttpRouter.params;
+  const value = params[name];
+  if (value === undefined || value.length === 0) {
+    return yield* fail("invalid_request", `Missing path parameter ${name}.`);
+  }
+  // The router already percent-decodes path parameters.
+  return value;
+});
 
-const decodeBody = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>) =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const text = yield* request.text.pipe(
-      Effect.mapError(() => fail("invalid_request", "Unable to read the request body.")),
-    );
-    const raw =
-      text.trim().length === 0
-        ? {}
-        : yield* decodeJsonText(text).pipe(
-            Effect.mapError(() => fail("invalid_request", "The request body is not valid JSON.")),
-          );
-    return yield* decode(raw).pipe(
-      Effect.mapError((error) => fail("invalid_request", error.message)),
-    );
-  });
+const decodeBody = Effect.fn("ControlHttp.decodeBody")(function* <A>(
+  decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const text = yield* request.text.pipe(
+    Effect.mapError(() => fail("invalid_request", "Unable to read the request body.")),
+  );
+  const raw =
+    text.trim().length === 0
+      ? {}
+      : yield* decodeJsonText(text).pipe(
+          Effect.mapError(() =>
+            fail("invalid_request", "The request body is not valid JSON."),
+          ),
+        );
+  return yield* decode(raw).pipe(
+    Effect.mapError((error) => fail("invalid_request", error.message)),
+  );
+});
 
 const clampInt = (raw: string | null, fallback: number, max: number) => {
   const value = raw === null ? Number.NaN : Number(raw);
@@ -236,9 +232,6 @@ const clampInt = (raw: string | null, fallback: number, max: number) => {
 const boolParam = (raw: string | null): boolean | undefined =>
   raw === null ? undefined : raw === "" || raw === "1" || raw === "true";
 
-// ---------------------------------------------------------------------------
-// Bodies
-// ---------------------------------------------------------------------------
 
 const OptionalString = Schema.optional(Schema.String);
 const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
@@ -363,9 +356,6 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-// ---------------------------------------------------------------------------
-// Event projection for SSE
-// ---------------------------------------------------------------------------
 
 export type ControlEvent =
   | {
@@ -462,9 +452,6 @@ const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
   `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
 
 const makeRoutes = Effect.gen(function* () {
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
@@ -545,29 +532,28 @@ const makeRoutes = Effect.gen(function* () {
     return selection;
   });
 
-  const authenticate = (scope: Scope) =>
-    Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest;
-      const session = yield* auth.authenticateHttpRequest(request).pipe(
-        // A session read the auth lane never ran is retried once; a busy lane is
-        // "retry shortly" (503), not an internal error.
-        Effect.retry({
-          times: 1,
-          while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
-        }),
-        Effect.mapError((error) =>
-          EnvironmentAuth.isServerAuthCredentialError(error)
-            ? fail("unauthorized", "A valid bearer token is required.")
-            : NodeSqliteClient.readerLaneFailure(error) !== undefined
-              ? fail("unavailable", READER_BUSY_MESSAGE)
-              : fail("internal", "Authentication failed."),
-        ),
-      );
-      if (!session.scopes.includes(scope)) {
-        return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
-      }
-      return session;
-    });
+  const authenticate = Effect.fn("ControlHttp.authenticate")(function* (scope: Scope) {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const session = yield* auth.authenticateHttpRequest(request).pipe(
+      // A session read the auth lane never ran is retried once; a busy lane is
+      // "retry shortly" (503), not an internal error.
+      Effect.retry({
+        times: 1,
+        while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
+      }),
+      Effect.mapError((error) =>
+        EnvironmentAuth.isServerAuthCredentialError(error)
+          ? fail("unauthorized", "A valid bearer token is required.")
+          : NodeSqliteClient.readerLaneFailure(error) !== undefined
+            ? fail("unavailable", READER_BUSY_MESSAGE)
+            : fail("internal", "Authentication failed."),
+      ),
+    );
+    if (!session.scopes.includes(scope)) {
+      return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
+    }
+    return session;
+  });
 
   const uuid = crypto.randomUUIDv4().pipe(Effect.orDie);
   const commandIdFor = (operation: string, clientRequestId: string | undefined) =>
@@ -645,62 +631,61 @@ const makeRoutes = Effect.gen(function* () {
       .getThreadRecords(ThreadId.make(threadId), ["messages"])
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
-  const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
-    Effect.gen(function* () {
-      const ids = shells.map((shell) => shell.id);
-      const [origins, natives, bindings] = yield* Effect.all([
-        store.getOrigins(ids),
-        store.nativeSessionIds(ids),
-        store.nativeBindings(ids),
-      ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      // Children inherit the root's origin.
-      const rootIds = shells
-        .map((shell) => shell.lineage.rootThreadId)
-        .filter((rootId) => !origins.has(rootId));
-      const rootOrigins =
-        rootIds.length === 0
-          ? new Map<string, string>()
-          : yield* store
-              .getOrigins(rootIds)
-              .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      return shells.map((shell) => ({
-        ...shellSummary(shell, {
-          origin:
-            origins.get(shell.id) ??
-            origins.get(shell.lineage.rootThreadId) ??
-            rootOrigins.get(shell.lineage.rootThreadId) ??
-            null,
-          nativeSessionId: natives.get(shell.id) ?? null,
-        }),
-        native: bindings.get(shell.id) ?? null,
-      }));
-    });
+  const summarize = Effect.fn("ControlHttp.summarize")(function* (
+    shells: ReadonlyArray<OrchestrationV2ThreadShell>,
+  ) {
+    const ids = shells.map((shell) => shell.id);
+    const [origins, natives, bindings] = yield* Effect.all([
+      store.getOrigins(ids),
+      store.nativeSessionIds(ids),
+      store.nativeBindings(ids),
+    ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    // Children inherit the root's origin.
+    const rootIds = shells
+      .map((shell) => shell.lineage.rootThreadId)
+      .filter((rootId) => !origins.has(rootId));
+    const rootOrigins =
+      rootIds.length === 0
+        ? new Map<string, string>()
+        : yield* store
+            .getOrigins(rootIds)
+            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return shells.map((shell) => ({
+      ...shellSummary(shell, {
+        origin:
+          origins.get(shell.id) ??
+          origins.get(shell.lineage.rootThreadId) ??
+          rootOrigins.get(shell.lineage.rootThreadId) ??
+          null,
+        nativeSessionId: natives.get(shell.id) ?? null,
+      }),
+      native: bindings.get(shell.id) ?? null,
+    }));
+  });
 
-  const threadDetail = (threadId: string) =>
-    Effect.gen(function* () {
-      const shell = yield* getShell(threadId);
-      // ardud: the detail reports the current run and the newest five. Reading every
-      // run the thread ever had made this the slowest call on the iMessage reply path
-      // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
-      const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
-      const pending = records.runtimeRequests.filter((request) => request.status === "pending");
-      const { state, run } = stateFromRuns(records.runs, pending.length > 0);
-      const [summary] = yield* summarize([shell]);
-      return {
-        ...summary!,
-        state,
-        status: run?.status ?? "idle",
-        run: run === null ? null : runSummary(run),
-        recentRuns: runsNewestFirst(records.runs)
-          .slice(0, THREAD_DETAIL_RECENT_RUNS)
-          .map(runSummary),
-        pendingRequests: pending.map((request) =>
-          pendingRequestSummary(request, records.turnItems),
-        ),
-      };
-    });
+  const threadDetail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
+    const shell = yield* getShell(threadId);
+    // ardud: the detail reports the current run and the newest five. Reading every
+    // run the thread ever had made this the slowest call on the iMessage reply path
+    // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
+    const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
+    const pending = records.runtimeRequests.filter((request) => request.status === "pending");
+    const { state, run } = stateFromRuns(records.runs, pending.length > 0);
+    const [summary] = yield* summarize([shell]);
+    return {
+      ...summary!,
+      state,
+      status: run?.status ?? "idle",
+      run: run === null ? null : runSummary(run),
+      recentRuns: runsNewestFirst(records.runs)
+        .slice(0, THREAD_DETAIL_RECENT_RUNS)
+        .map(runSummary),
+      pendingRequests: pending.map((request) =>
+        pendingRequestSummary(request, records.turnItems),
+      ),
+    };
+  });
 
-  // -- projects -------------------------------------------------------------
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -780,71 +765,74 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  // -- threads --------------------------------------------------------------
 
-  const resolveProject = (body: typeof CreateThreadBody.Type) =>
-    Effect.gen(function* () {
-      const chosen = [
-        body.projectId,
-        body.directory,
-        body.scratch === true ? "scratch" : undefined,
-      ].filter((value) => value !== undefined).length;
-      if (chosen > 1) {
-        return yield* fail("invalid_request", "Pass only one of projectId, directory or scratch.");
-      }
-      if (body.projectId !== undefined) {
-        const project = yield* projects
-          .getById(ProjectId.make(body.projectId))
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-        if (Option.isNone(project)) {
-          return yield* fail("not_found", `Project ${body.projectId} was not found.`);
-        }
-        return { projectId: project.value.id, workspaceStrategy: { type: "root" as const } };
-      }
-      if (body.directory !== undefined) {
-        const directory = body.directory.replace(/\/+$/, "") || "/";
-        if (!directory.startsWith("/")) {
-          return yield* fail("invalid_request", "directory must be an absolute path.");
-        }
-        // A registered project root runs at its root; a folder inside one runs
-        // there as its own worktree; anything else becomes a project of its own.
-        const all = yield* projects
-          .listShells()
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-        const exact = all.find((project) => project.workspaceRoot === directory);
-        if (exact !== undefined) {
-          return { projectId: exact.id, workspaceStrategy: { type: "root" as const } };
-        }
-        const parent = all
-          .filter((project) => directory.startsWith(`${project.workspaceRoot}/`))
-          .toSorted((left, right) => right.workspaceRoot.length - left.workspaceRoot.length)[0];
-        if (parent !== undefined) {
-          // Chat folders under a registered root (iMessage, Telegram) are made on demand.
-          yield* fileSystem
-            .makeDirectory(directory, { recursive: true })
-            .pipe(Effect.mapError((cause) => fail("invalid_request", errorDetail(cause))));
-          return {
-            projectId: parent.id,
-            workspaceStrategy: { type: "existing_worktree" as const, worktreePath: directory },
-          };
-        }
-        const id = yield* uuid;
-        const created = yield* projects
-          .bootstrap({
-            commandId: CommandId.make(`ardud-control:project:${id}`),
-            projectId: ProjectId.make(id),
-            title: directory.slice(directory.lastIndexOf("/") + 1) || directory,
-            workspaceRoot: directory,
-            createWorkspaceRootIfMissing: true,
-          })
-          .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
-        return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
-      }
-      const scratch = yield* folders.ensureScratchProject.pipe(
-        Effect.mapError((cause) => fail("unavailable", errorDetail(cause))),
+  const resolveProject = Effect.fn("ControlHttp.resolveProject")(function* (
+    body: typeof CreateThreadBody.Type,
+  ) {
+    const chosen = [
+      body.projectId,
+      body.directory,
+      body.scratch === true ? "scratch" : undefined,
+    ].filter((value) => value !== undefined).length;
+    if (chosen > 1) {
+      return yield* fail(
+        "invalid_request",
+        "Pass only one of projectId, directory or scratch.",
       );
-      return { projectId: scratch.projectId, workspaceStrategy: { type: "root" as const } };
-    });
+    }
+    if (body.projectId !== undefined) {
+      const project = yield* projects
+        .getById(ProjectId.make(body.projectId))
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      if (Option.isNone(project)) {
+        return yield* fail("not_found", `Project ${body.projectId} was not found.`);
+      }
+      return { projectId: project.value.id, workspaceStrategy: { type: "root" as const } };
+    }
+    if (body.directory !== undefined) {
+      const directory = body.directory.replace(/\/+$/, "") || "/";
+      if (!directory.startsWith("/")) {
+        return yield* fail("invalid_request", "directory must be an absolute path.");
+      }
+      // A registered project root runs at its root; a folder inside one runs
+      // there as its own worktree; anything else becomes a project of its own.
+      const all = yield* projects
+        .listShells()
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      const exact = all.find((project) => project.workspaceRoot === directory);
+      if (exact !== undefined) {
+        return { projectId: exact.id, workspaceStrategy: { type: "root" as const } };
+      }
+      const parent = all
+        .filter((project) => directory.startsWith(`${project.workspaceRoot}/`))
+        .toSorted((left, right) => right.workspaceRoot.length - left.workspaceRoot.length)[0];
+      if (parent !== undefined) {
+        // Chat folders under a registered root (iMessage, Telegram) are made on demand.
+        yield* fileSystem
+          .makeDirectory(directory, { recursive: true })
+          .pipe(Effect.mapError((cause) => fail("invalid_request", errorDetail(cause))));
+        return {
+          projectId: parent.id,
+          workspaceStrategy: { type: "existing_worktree" as const, worktreePath: directory },
+        };
+      }
+      const id = yield* uuid;
+      const created = yield* projects
+        .bootstrap({
+          commandId: CommandId.make(`ardud-control:project:${id}`),
+          projectId: ProjectId.make(id),
+          title: directory.slice(directory.lastIndexOf("/") + 1) || directory,
+          workspaceRoot: directory,
+          createWorkspaceRootIfMissing: true,
+        })
+        .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
+    }
+    const scratch = yield* folders.ensureScratchProject.pipe(
+      Effect.mapError((cause) => fail("unavailable", errorDetail(cause))),
+    );
+    return { projectId: scratch.projectId, workspaceStrategy: { type: "root" as const } };
+  });
 
   const createThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationOperateScope);
@@ -1747,7 +1735,6 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, requests });
   }, NodeSqliteClient.foregroundReads);
 
-  // -- events ---------------------------------------------------------------
 
   const events = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
