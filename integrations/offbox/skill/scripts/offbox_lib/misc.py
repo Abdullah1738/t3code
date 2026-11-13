@@ -857,11 +857,11 @@ def wait(run_id: str, timeout: float | None) -> int:
     from . import start_check
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
-        return _settled(r, until=None if timeout is None else now() + timeout)
+        return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
     return _wait_locked(r, echo=False, timeout=timeout)
 
 
-def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
+def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
@@ -872,6 +872,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
         raise _wait_timeout(checked)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
+    elif show_failure and r['mode'] == 'bg' and r['exit_code'] not in (0, None):
+        _failure_tail(LOGS_DIR / f"{r['run_id']}.log")
     if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
         say(f"{r['run_id']} settled with no output on record")
     else:
@@ -897,6 +899,15 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
     return code if code is not None else 90
+
+
+def _failure_tail(path) -> None:
+    # A wait that starts after settlement missed the stream; bound the error replay to 16 KiB.
+    try:
+        pos = max(0, os.path.getsize(path) - 16384)
+    except OSError:
+        return
+    _tail(path, pos, True)
 
 
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
