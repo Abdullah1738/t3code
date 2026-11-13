@@ -33,7 +33,11 @@ Do not overwrite an old source worktree by hand; select the merged CLI source.
 
 The server heartbeat requires a separately approved Robob release. Until that
 build is running, quiet periods remain `unknown`, and recovery is suppressed
-without complete sampling evidence. Local lag is used only when the target listener and boot match the persisted runtime; other targets remain unknown. Do not infer recovery from HTTP 200.
+without complete sampling evidence. Local lag is used only when the target listener and boot match the persisted runtime.
+When the health request fails, a bounded `lsof` check (one second, 64 KiB)
+independently verifies that the runtime PID is the only listener owner on that
+port, so stalls can still alert during an outage. Missing or ambiguous ownership
+leaves lag unverified. macOS provides `lsof`; other hosts need it for this fallback. Do not infer recovery from HTTP 200.
 
 After approval and installation, run `robob-watch test robob-stall`, inspect
 `robob-watch show robob-stall`, then inspect its log after the first scheduled
@@ -45,6 +49,6 @@ is no silent baseline. Verify queued Telegram notifications with the bridge's
 Focused tests (no real messages or live database access):
 
 ```
-node --test apps/server/src/ardud/control/deep-health.test.mjs integrations/robob-watch/checks/robob-stall/check.test.mjs
+node --test apps/server/src/ardud/control/deep-health.test.mjs integrations/robob-watch/checks/robob-stall/check.test.mjs integrations/robob-watch/checks/robob-stall/outage-health.test.mjs
 vp test run apps/server/src/observability/EventLoopMonitor.test.ts apps/server/src/ardud/control/t3ctl.test.ts
 ```

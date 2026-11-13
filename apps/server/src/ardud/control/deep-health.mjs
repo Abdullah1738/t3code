@@ -1,6 +1,7 @@
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
 
 export const WINDOW_MS = 10 * 60_000;
 export const SAMPLE_INTERVAL_MS = 30_000;
@@ -167,12 +168,37 @@ export function readRuntimeState(file) {
   }
 }
 
-function matchesLocalRuntime(url, connection, runtime) {
+export function ownsListener({ pid, port }, run = NodeChildProcess.execFileSync) {
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port < 1 || port > 65535)
+    return false;
+  try {
+    const output = run(
+      // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI probe; no Effect runtime.
+      process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof",
+      ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fp"],
+      {
+        encoding: "utf8",
+        timeout: 1000,
+        maxBuffer: 64 * 1024,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    const owners = new Set(output.split("\n").filter((line) => /^p\d+$/.test(line)));
+    // Check all listeners on the port, including both address families. A
+    // second owner could be a tunnel that receives the loopback request.
+    return owners.size === 1 && owners.has(`p${pid}`);
+  } catch {
+    return false;
+  }
+}
+
+function matchesLocalRuntime(url, connection, runtime, checkListener) {
   try {
     const target = new URL(url);
     const expected = new URL(runtime.origin);
     const loopback = (host) => ["localhost", "127.0.0.1", "[::1]"].includes(host);
     if (
+      !["http:", "https:"].includes(expected.protocol) ||
       !loopback(target.hostname) ||
       !loopback(expected.hostname) ||
       target.protocol !== expected.protocol ||
@@ -181,18 +207,18 @@ function matchesLocalRuntime(url, connection, runtime) {
       target.search
     )
       return false;
-    const started = Date.parse(connection.serverStartedAt);
     const recorded = Date.parse(runtime.startedAt);
-    if (
-      !Number.isFinite(started) ||
-      !Number.isFinite(recorded) ||
-      Math.abs(started - recorded) > 60_000 ||
-      !Number.isInteger(runtime.pid) ||
-      runtime.pid <= 0
-    )
+    if (!Number.isFinite(recorded) || !Number.isInteger(runtime.pid) || runtime.pid <= 0)
       return false;
     process.kill(runtime.pid, 0);
-    return true;
+    // HTTP cannot identify its boot while blocked. Preserve local evidence only
+    // when the OS independently confirms the persisted process owns the listener.
+    if (connection.status !== "ok") {
+      const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
+      return checkListener({ pid: runtime.pid, port });
+    }
+    const started = Date.parse(connection.serverStartedAt);
+    return Number.isFinite(started) && Math.abs(started - recorded) <= 60_000;
   } catch {
     return false;
   }
@@ -204,6 +230,7 @@ export async function deepHealth({
   timeoutMs = 10_000,
   readTail = readLagTail,
   readRuntime = readRuntimeState,
+  checkListener = ownsListener,
 }) {
   const controller = new AbortController();
   const deadline = Math.min(timeoutMs, 10_000);
@@ -252,10 +279,10 @@ export async function deepHealth({
   const runtime = readRuntime(
     NodePath.join(NodePath.dirname(logPath), "..", "server-runtime.json"),
   );
-  const local = matchesLocalRuntime(client.url, connection, runtime);
+  const local = matchesLocalRuntime(client.url, connection, runtime, checkListener);
   const tail = local
     ? readTail(logPath)
-    : { text: "", bytesRead: 0, error: "target does not match local runtime; lag unverified" };
+    : { text: "", bytesRead: 0, error: "local runtime identity unverified" };
   const now = Date.now();
   const lag = summarizeLag(tail, now);
   const report = {

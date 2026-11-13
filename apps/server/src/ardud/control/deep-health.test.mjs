@@ -12,6 +12,7 @@ import {
   readLagTail,
   healthVerdict,
   TAIL_BYTES,
+  ownsListener,
 } from "./deep-health.mjs";
 
 const now = Date.parse("2026-11-13T10:10:00Z");
@@ -355,4 +356,49 @@ for (const [readiness, verdict] of [
   NodeTest.test(`readiness state: ${readiness}`, () => {
     const lag = summarizeLag(fixture(), now);
     NodeAssert.equal(healthVerdict(lag, { ...ok, readiness }, ok).verdict, verdict);
+  });
+
+for (const [name, output, owned] of [
+  ["one owner", "p123\n", true],
+  ["multiple sockets, same owner", "p123\np123\n", true],
+  ["another owner", "p456\n", false],
+  ["two owners on different address families", "p123\np456\n", false],
+  ["empty output", "", false],
+  ["non-PID output", "lsof: unavailable\n", false],
+])
+  NodeTest.test(`independent listener ownership: ${name}`, () => {
+    NodeAssert.equal(
+      ownsListener({ pid: 123, port: 3773 }, (command, args, options) => {
+        NodeAssert.equal(NodePath.basename(command), "lsof");
+        NodeAssert.deepEqual(args, ["-nP", "-iTCP:3773", "-sTCP:LISTEN", "-Fp"]);
+        NodeAssert.equal(options.timeout, 1000);
+        NodeAssert.equal(options.maxBuffer, 64 * 1024);
+        return output;
+      }),
+      owned,
+    );
+  });
+NodeTest.test("listener command failure never authorizes local evidence", () => {
+  for (const error of ["timeout", "not installed", "permission denied"]) {
+    NodeAssert.equal(
+      ownsListener({ pid: 123, port: 3773 }, () => {
+        throw new Error(error);
+      }),
+      false,
+    );
+  }
+});
+for (const target of [
+  { pid: 0, port: 3773 },
+  { pid: -1, port: 3773 },
+  { pid: 123, port: 0 },
+  { pid: 123, port: 65536 },
+])
+  NodeTest.test(`invalid listener identity ${JSON.stringify(target)}`, () => {
+    NodeAssert.equal(
+      ownsListener(target, () => {
+        throw new Error("must not execute");
+      }),
+      false,
+    );
   });
