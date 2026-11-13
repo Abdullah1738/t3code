@@ -17,6 +17,13 @@ export const kanbanDDL = [
   `CREATE TABLE IF NOT EXISTS ardud_kanban_boards (
     id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, json TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_instruction_applications (
+    id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT NOT NULL,
+    field TEXT NOT NULL, ask_id TEXT NOT NULL, json TEXT NOT NULL, audit_event_id INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_instruction_applications_pending
+    ON ardud_kanban_instruction_applications (card_id, board_id, field, ask_id)
+    WHERE audit_event_id IS NULL`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_cards (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, number INTEGER NOT NULL,
     stage TEXT NOT NULL, active_thread_id TEXT, json TEXT NOT NULL, UNIQUE (board_id, number)

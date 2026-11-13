@@ -89,7 +89,12 @@ import * as Stream from "effect/Stream";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { actorKey, KanbanStore, KanbanStoreError } from "../store/KanbanStore.ts";
+import {
+  actorKey,
+  KanbanStore,
+  KanbanStoreError,
+  type InstructionApplication,
+} from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
@@ -2463,18 +2468,39 @@ const make = Effect.gen(function* () {
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
       readonly head?: string | null;
+      readonly instructionApplication?: InstructionApplication;
     } = {},
   ) {
-    return yield* store.addCardEvent({
-      cardId: card.id,
-      at: extra.at ?? (yield* nowIso),
-      actor,
-      kind,
-      fromStage: extra.fromStage ?? null,
-      toStage: extra.toStage ?? null,
-      body: extra.body ?? null,
-      head: extra.head ?? null,
-    });
+    const write = store.addCardEvent(
+      {
+        cardId: card.id,
+        at: extra.at ?? (yield* nowIso),
+        actor,
+        kind,
+        fromStage: extra.fromStage ?? null,
+        toStage: extra.toStage ?? null,
+        body: extra.body ?? null,
+        head: extra.head ?? null,
+      },
+      extra.instructionApplication?.id,
+    );
+    if (extra.instructionApplication === undefined) return yield* write;
+    const application = extra.instructionApplication;
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const event = yield* write;
+        yield* Effect.logInfo("kanban board instructions applied", {
+          boardId: application.boardId,
+          board: application.boardSlug,
+          field: application.field,
+          cardId: application.cardId,
+          askId: application.askId,
+          threadId: application.threadId,
+          applicationId: application.id,
+        });
+        return event;
+      }),
+    );
   });
 
   /**
@@ -10696,6 +10722,7 @@ const make = Effect.gen(function* () {
   const updateBoardUnlocked = Effect.fn("KanbanService.updateBoardUnlocked")(function* (
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
+    application?: InstructionApplication,
   ) {
     yield* checkText([
       ["name", patch.name],
@@ -10776,7 +10803,7 @@ const make = Effect.gen(function* () {
       }
     }
     const pools = missingPools(yield* store.pools(board.id), boardModels(next));
-    yield* store.putBoardWithPools(next, pools);
+    yield* store.putBoardWithPools(next, pools, application);
     if (pools.length > 0) {
       yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
     }
@@ -10854,41 +10881,45 @@ const make = Effect.gen(function* () {
             "the board's text changed since he approved it; ask again",
           );
         }
-        const next = yield* updateBoardUnlocked(board.id, {
-          instructions: { ...board.instructions, [field]: text },
-        });
+        const application: InstructionApplication = {
+          id: NodeCrypto.randomUUID(),
+          boardId: board.id,
+          boardSlug: board.slug,
+          cardId,
+          field,
+          askId,
+          threadId: actor.threadId,
+        };
+        const next = yield* updateBoardUnlocked(
+          board.id,
+          {
+            instructions: { ...board.instructions, [field]: text },
+          },
+          application,
+        );
         return { board: next, applied: true };
       }),
     );
-    // A cross-board comment must start with a fresh card snapshot. Retries also
-    // complete the audit if the board write committed before the comment failed.
+    // Receipts commit with the board write. A fresh card operation drains them
+    // independently, so failed audits can retry without hiding later applications.
     yield* guard(
       "board.auditApprovedInstructions",
       Effect.gen(function* () {
-        const prefix = `Applied ${field} on board ${result.board.slug} from ${askId} (by `;
-        const events = yield* store.cardEvents(cardId);
-        if (
-          events.some(
-            (event) =>
-              event.kind === "comment" &&
-              event.actor._tag === "evaluator" &&
-              event.body?.startsWith(prefix),
-          )
-        )
-          return;
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* editCard(cardId, { comment: `${prefix}${actor.threadId})` }, actor);
-            yield* Effect.logInfo("kanban board instructions applied", {
-              boardId,
-              board: result.board.slug,
-              field,
-              cardId,
-              askId,
-              threadId: actor.threadId,
-            });
-          }),
-        );
+        for (const application of yield* store.pendingInstructionApplications(
+          cardId,
+          boardId,
+          field,
+          askId,
+        )) {
+          yield* editCard(
+            cardId,
+            {
+              comment: `Applied ${application.field} on board ${application.boardSlug} from ${application.askId} (by ${application.threadId})`,
+            },
+            { _tag: "evaluator", threadId: application.threadId },
+            application,
+          );
+        }
       }),
       cardId,
     );
@@ -11413,7 +11444,12 @@ const make = Effect.gen(function* () {
     return paused;
   });
 
-  const editCard: KanbanServiceShape["editCard"] = (cardId, patch, actor) => {
+  const editCard = (
+    cardId: KanbanCard["id"],
+    patch: CardPatch,
+    actor: KanbanActor,
+    instructionApplication?: InstructionApplication,
+  ): ReturnType<KanbanServiceShape["editCard"]> => {
     let lockedWork: ThreadId | null = null;
     let releaseModel: Effect.Effect<void> = Effect.void;
     let confirmingModel = false;
@@ -11430,10 +11466,17 @@ const make = Effect.gen(function* () {
             "Card work thread changed before the model edit; re-read and retry.",
           );
         }
-        // A retry of an already saved edit must not emit another event or update the card.
+        // Instruction audits deduplicate by receipt: two real applications can
+        // have identical comments, even from the same evaluator.
         const events =
-          isRetryActor(actor) && patch.comment?.trim() ? yield* store.cardEvents(card.id) : [];
-        if (editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)) return card;
+          instructionApplication === undefined && isRetryActor(actor) && patch.comment?.trim()
+            ? yield* store.cardEvents(card.id)
+            : [];
+        if (
+          instructionApplication === undefined &&
+          editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)
+        )
+          return card;
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
@@ -11521,7 +11564,10 @@ const make = Effect.gen(function* () {
             body: changed.join(", "),
           });
         if (patch.comment?.trim())
-          yield* logEvent(next, actor, "comment", { body: patch.comment.trim() });
+          yield* logEvent(next, actor, "comment", {
+            body: patch.comment.trim(),
+            ...(instructionApplication === undefined ? {} : { instructionApplication }),
+          });
         const paused = yield* pauseIfBacklog(card, next, actor, at);
         // An open work thread now runs the new model's pool, so the card's slot moves with it.
         const saved =

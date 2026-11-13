@@ -20,7 +20,8 @@ import {
   KanbanThreadLink,
   KanbanWikiPage,
   type KanbanActor,
-  type KanbanBoardId,
+  KanbanBoardId,
+  ThreadId,
   KanbanCardId,
   type KanbanDiscussionId,
   type KanbanScriptId,
@@ -89,6 +90,18 @@ interface IdJsonRow extends JsonRow {
   readonly id: number;
 }
 
+const InstructionApplication = Schema.Struct({
+  id: Schema.String,
+  boardId: KanbanBoardId,
+  boardSlug: Schema.String,
+  cardId: KanbanCardId,
+  field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting"]),
+  askId: Schema.String,
+  threadId: ThreadId,
+});
+export type InstructionApplication = typeof InstructionApplication.Type;
+const Application = codec(InstructionApplication);
+
 export type NewCardEvent = Omit<KanbanCardEvent, "id">;
 export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
@@ -108,6 +121,7 @@ export interface KanbanStoreShape {
   readonly putBoardWithPools: (
     board: KanbanBoard,
     pools: ReadonlyArray<KanbanPool>,
+    application?: InstructionApplication,
   ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly cards: (
@@ -142,7 +156,16 @@ export interface KanbanStoreShape {
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly nextCardNumber: (boardId: KanbanBoardId) => Effect.Effect<number, KanbanStoreError>;
   readonly putCard: (card: KanbanCard) => Effect.Effect<void, KanbanStoreError>;
-  readonly addCardEvent: (event: NewCardEvent) => Effect.Effect<KanbanCardEvent, KanbanStoreError>;
+  readonly addCardEvent: (
+    event: NewCardEvent,
+    applicationId?: string,
+  ) => Effect.Effect<KanbanCardEvent, KanbanStoreError>;
+  readonly pendingInstructionApplications: (
+    cardId: KanbanCardId,
+    boardId: KanbanBoardId,
+    field: InstructionApplication["field"],
+    askId: string,
+  ) => Effect.Effect<ReadonlyArray<InstructionApplication>, KanbanStoreError>;
   readonly cardEvents: (
     cardId: KanbanCardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
@@ -503,7 +526,11 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const putBoardWithPools = (board: KanbanBoard, pools: ReadonlyArray<KanbanPool>) =>
+  const putBoardWithPools = (
+    board: KanbanBoard,
+    pools: ReadonlyArray<KanbanPool>,
+    application?: InstructionApplication,
+  ) =>
     run(
       "write board with pools",
       sql.withTransaction(
@@ -513,6 +540,13 @@ const make = Effect.gen(function* () {
             INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${board.id}, ${board.slug}, ${json})
             ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
           `;
+          if (application !== undefined) {
+            const receipt = yield* Application.encode(application);
+            yield* sql`
+              INSERT INTO ardud_kanban_instruction_applications (id, board_id, card_id, field, ask_id, json)
+              VALUES (${application.id}, ${board.id}, ${application.cardId}, ${application.field}, ${application.askId}, ${receipt})
+            `;
+          }
           for (const pool of pools) {
             const poolJson = yield* Pool.encode(pool);
             yield* sql`
@@ -693,18 +727,57 @@ const make = Effect.gen(function* () {
         `;
       }),
     );
-  const addCardEvent = (event: NewCardEvent) =>
-    run(
-      "write card event",
-      Effect.gen(function* () {
-        const json = yield* CardEvent.encode(event);
-        const rows = yield* sql<{ readonly id: number }>`
-          INSERT INTO ardud_kanban_card_events (card_id, json) VALUES (${event.cardId}, ${json})
-          RETURNING id
-        `;
-        return { ...event, id: Number(rows[0]?.id ?? 0) } as KanbanCardEvent;
-      }),
+  const pendingInstructionApplications: KanbanStoreShape["pendingInstructionApplications"] = (
+    cardId,
+    boardId,
+    field,
+    askId,
+  ) =>
+    runRead(
+      "read pending instruction applications",
+      Effect.flatMap(
+        sql<JsonRow>`
+      SELECT json FROM ardud_kanban_instruction_applications
+      WHERE card_id = ${cardId} AND board_id = ${boardId} AND field = ${field}
+        AND ask_id = ${askId} AND audit_event_id IS NULL
+      ORDER BY rowid
+    `,
+        (rows) => decodeAll(rows, Application.decode),
+      ),
     );
+
+  const addCardEvent = (event: NewCardEvent, applicationId?: string) => {
+    const insert = Effect.gen(function* () {
+      if (applicationId !== undefined) {
+        const existing = yield* sql<IdJsonRow>`
+          SELECT e.id, e.json FROM ardud_kanban_instruction_applications a
+          JOIN ardud_kanban_card_events e ON e.id = a.audit_event_id
+          WHERE a.id = ${applicationId} AND a.card_id = ${event.cardId}
+        `;
+        if (existing[0]) {
+          const saved = yield* CardEvent.decode(existing[0].json);
+          return { ...saved, id: Number(existing[0].id) } as KanbanCardEvent;
+        }
+      }
+      const json = yield* CardEvent.encode(event);
+      const rows = yield* sql<{ readonly id: number }>`
+        INSERT INTO ardud_kanban_card_events (card_id, json) VALUES (${event.cardId}, ${json})
+        RETURNING id
+      `;
+      const id = Number(rows[0]?.id ?? 0);
+      if (applicationId !== undefined) {
+        yield* sql`
+          UPDATE ardud_kanban_instruction_applications SET audit_event_id = ${id}
+          WHERE id = ${applicationId} AND card_id = ${event.cardId} AND audit_event_id IS NULL
+        `;
+      }
+      return { ...event, id } as KanbanCardEvent;
+    });
+    return run(
+      "write card event",
+      applicationId === undefined ? insert : sql.withTransaction(insert),
+    );
+  };
   const cardEvents = (cardId: KanbanCardId) =>
     runRead(
       "read card events",
@@ -1239,6 +1312,7 @@ const make = Effect.gen(function* () {
     nextCardNumber,
     putCard,
     addCardEvent,
+    pendingInstructionApplications,
     cardEvents,
     goals,
     putGoal,
