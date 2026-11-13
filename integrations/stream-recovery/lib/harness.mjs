@@ -17,6 +17,8 @@ export function openCodeSession(thread) {
 export function parseCutoverStatus(body) {
   const value = body?.cutover;
   if (body?.ok !== true || !value || typeof value.active !== 'boolean' || typeof value.completed !== 'boolean'
+    || (value.threadClaimsIncluded !== undefined && (typeof value.threadClaimsIncluded !== 'boolean'
+      || (!value.threadClaimsIncluded && (!value.completed || value.active))))
     || !Array.isArray(value.claimedThreadIds) || !value.claimedThreadIds.every((id) => typeof id === 'string')
     || (value.claimedRunIds !== undefined && (!Array.isArray(value.claimedRunIds)
       || !value.claimedRunIds.every((id) => typeof id === 'string')))

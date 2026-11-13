@@ -36,6 +36,8 @@ export interface Lease extends IdentifiedRequest {
   readonly acquiredAt: string;
   readonly heartbeatAt: string;
   readonly state: LeaseState;
+  readonly staleAfterMs?: number;
+  readonly heartbeatBy?: string;
 }
 
 export interface QueuedRequest extends IdentifiedRequest {
@@ -109,6 +111,9 @@ const leaseOf = (row: Row): Lease => ({
   acquiredAt: iso(row.acquired_at),
   heartbeatAt: iso(row.heartbeat_at),
   state: row.lease_state!,
+  ...(row.lease_state === "held"
+    ? { staleAfterMs: STALE_MS, heartbeatBy: iso(row.heartbeat_at! + STALE_MS) }
+    : {}),
 });
 
 export const defaultDesktopLeasePath = () =>
@@ -363,6 +368,27 @@ export class DesktopLease {
     });
   }
 
+  // The service must check turn liveness before status can expire the holder.
+  currentLease(): Lease | null {
+    const row = this.holder();
+    return row ? leaseOf(row) : null;
+  }
+
+  touchHolder(childThreadId: string, ticket?: string): void {
+    this.transaction((now) => {
+      const row = this.holder();
+      if (
+        row?.lease_state === "held" &&
+        row.child_thread_id === childThreadId &&
+        (ticket === undefined || row.ticket === ticket)
+      ) {
+        this.db
+          .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
+          .run(now, row.seq);
+      }
+    });
+  }
+
   acquire(caller: Caller, input: LeaseRequest): AcquireResult {
     validateCaller(caller);
     nonempty(input?.taskId, "taskId");
@@ -484,6 +510,9 @@ export class DesktopLease {
           "INSERT INTO ardud_desktop_calls (call_id, ticket, state, started_at) VALUES (?, ?, 'started', ?)",
         )
         .run(toolUseId, row.ticket, now);
+      this.db
+        .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
+        .run(now, row.seq);
       return this.snapshot();
     });
   }
@@ -509,6 +538,12 @@ export class DesktopLease {
         .prepare("UPDATE ardud_desktop_calls SET state = ?, ended_at = ? WHERE call_id = ?")
         .run(outcome, now, toolUseId);
       if (isCurrent && this.holder()?.ticket === call.ticket) this.advance(now);
+      const holder = this.holder();
+      if (holder?.ticket === call.ticket && holder.lease_state === "held") {
+        this.db
+          .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
+          .run(now, holder.seq);
+      }
       return this.snapshot();
     });
   }

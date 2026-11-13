@@ -1155,9 +1155,10 @@ const make = Effect.gen(function* () {
   const loadProjection = <K extends ProjectionRecordField>(
     threadId: ThreadId,
     fields: ReadonlyArray<K>,
+    options?: { readonly projectionOnly: boolean },
   ) =>
     threadManagement
-      .getThreadRecords(threadId, fields, { turnItemTypes: [], messageRoles: ["user"] })
+      .getThreadRecords(threadId, fields, { turnItemTypes: [], messageRoles: ["user"] }, options)
       .pipe(
         Effect.mapError((error) =>
           failure(
@@ -1910,7 +1911,7 @@ const make = Effect.gen(function* () {
         undefined,
         { projectionOnly: true },
       )
-      .pipe(Effect.mapError(threadManagementFailure));
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure));
     const task = parentProjection.subagents.find(
       (candidate) =>
         candidate.id === taskId &&
@@ -1943,7 +1944,7 @@ const make = Effect.gen(function* () {
         { messageRoles: ["user"], omitSettledLeafNodes: true },
         { projectionOnly: true },
       )
-      .pipe(Effect.mapError(threadManagementFailure));
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure));
     const childRun = delegatedTaskRun(childControls, task);
     const terminalRun = latestTerminalResultRun(childControls, childRun);
     const unfinishedRuns = childControls.runs
@@ -2007,7 +2008,7 @@ const make = Effect.gen(function* () {
         },
         { projectionOnly: true },
       )
-      .pipe(Effect.mapError(threadManagementFailure));
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure));
     const childProjection = {
       ...childControls,
       messages: [...childControls.messages, ...resultRecords.messages],
@@ -2018,7 +2019,11 @@ const make = Effect.gen(function* () {
       taskWorkState === "result_available" &&
       (yield* threadManagement
         .delegatedTaskResultPending(task.childThreadId, childRun?.delegatedTaskId)
-        .pipe(NodeSqliteClient.readOnly, Effect.mapError(threadManagementFailure)));
+        .pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError(threadManagementFailure),
+        ));
     const workState =
       task.result !== null ? "result_available" : heldForRestart ? "working" : taskWorkState;
     const reportedStatus =
@@ -2714,7 +2719,7 @@ const make = Effect.gen(function* () {
               : stage === "receipt"
                 ? "threadManagement.hasReceipt"
                 : stage === "caller"
-                  ? "caller identity or active-run records"
+                  ? "caller identity"
                   : stage,
           ...(retryKey === undefined ? {} : { requestKey: retryKey }),
           ...(taskId === undefined ? {} : { taskId }),
@@ -2724,8 +2729,10 @@ const make = Effect.gen(function* () {
         loadThreadCaller(callerScope, "delegate_task"),
       );
       const parentRecords = yield* bounded(
-        "caller",
-        loadProjection(parent.thread.id, ["runs", "subagents"]),
+        "parent_records",
+        loadProjection(parent.thread.id, ["runs", "subagents"], { projectionOnly: true }).pipe(
+          NodeSqliteClient.foregroundReads,
+        ),
       );
       const parentRun = parentRecords.runs
         .filter(ThreadManagementService.isActiveRun)
@@ -2754,7 +2761,9 @@ const make = Effect.gen(function* () {
       );
       const isRetryOfAcceptedDelegation = yield* bounded(
         "receipt",
-        threadManagement.hasReceipt(commandId),
+        threadManagement
+          .hasReceipt(commandId)
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads),
       );
       const settings = yield* bounded(
         "settings",
@@ -3190,19 +3199,10 @@ const make = Effect.gen(function* () {
           status: current.status,
         } satisfies OrchestratorMcpTaskCancelResult;
       }
-      const child = yield* loadProjection(current.childThreadId, ["runs"]);
-      if (
-        current.workState !== "waiting_for_children" &&
-        ThreadManagementService.latestActiveRun(child) === undefined &&
-        !child.runs.some(
-          (run) =>
-            run.status === "queued" &&
-            (run.delegatedTaskId === input.taskId || run.id === current.childRunId),
-        )
-      ) {
+      if (current.childRunId === null && current.workState !== "waiting_for_children") {
         return yield* failure(
           "task_not_cancellable",
-          `Delegated task ${input.taskId} has no interruptible child run.`,
+          `Delegated task ${input.taskId} has no recorded child run to settle.`,
         );
       }
       yield* stopWithinLimit;
@@ -3214,9 +3214,10 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      const stopped = yield* readTask(scope, input.taskId);
       return {
         taskId: input.taskId,
-        status: "cancel_requested",
+        status: isTerminalTaskStatus(stopped.status) ? stopped.status : "cancel_requested",
       };
     }),
     createThreads: Effect.fn("OrchestratorMcpService.createThreads")(

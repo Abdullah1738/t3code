@@ -1604,6 +1604,8 @@ class Runner:
                         resumed = lease._reuse(con, row, row['size'])
                         if resumed is None:
                             raise OffboxError(f"lease {self.box} is no longer available")
+                    except common.SshHostKeyMismatch:
+                        raise
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
                     log(f"push_box_stopped_resumed {self.box}")
@@ -1656,9 +1658,15 @@ class Runner:
         err: list = []
         left = api.left()
         upload_timeout = 120 if left is None else max(.001, min(120, left))
-        tw = threading.Thread(target=_safe,
-                              args=(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout), daemon=True)
-        tw.start()
+        upload = (err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+        tw = None
+        home = api.BACKEND == "server"
+        if home:
+            # A terminal identity failure must reach this thread before bulk sync can retry or hit its deadline.
+            _safe(*upload, terminal_identity=True)
+        else:
+            tw = threading.Thread(target=_safe, args=upload, daemon=True)
+            tw.start()
         push_exc = None
         try:
             if not a.no_sync:
@@ -1676,17 +1684,26 @@ class Runner:
                 if skipped:
                     say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
                         f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
+        except common.SshHostKeyMismatch:
+            raise
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
             push_exc = e
         finally:
-            left = api.left()
-            tw.join(timeout=max(0, left) if left is not None else None)
+            if tw is not None:
+                left = api.left()
+                tw.join(timeout=max(0, left) if left is not None else None)
+        # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.
+        for e in (push_exc, err[0] if err else None):
+            if isinstance(e, common.SshHostKeyMismatch):
+                raise e
         if not a.no_sync and push_exc is None and err and not ssh_sync.dead_mount(str(err[0])):
             # Resetting SSH can interrupt the parallel upload even when the file push recovers.
             err.clear()
             left = api.left()
             upload_timeout = 120 if left is None else max(.001, min(120, left))
-            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
+            if err and isinstance(err[0], common.SshHostKeyMismatch):
+                raise err[0]
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -1741,10 +1758,12 @@ def _seed_candidates(con, box_id: str, current: str, repo_key: str) -> list[str]
     return out
 
 
-def _safe(err: list, fn, *args):
+def _safe(err: list, fn, *args, terminal_identity=False):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
+        if terminal_identity and isinstance(e, common.SshHostKeyMismatch):
+            raise
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
 
 

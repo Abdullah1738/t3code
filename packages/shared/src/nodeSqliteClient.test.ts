@@ -1026,7 +1026,10 @@ const withCheckpointClient = <A, E>(
     sql: SqlClient.SqlClient,
     filename: string,
   ) => Effect.Effect<A, E, SqlClient.SqlClient | FileSystem.FileSystem | Scope.Scope>,
-  options: { readonly readerWorker?: boolean } = {},
+  options: {
+    readonly readerWorker?: boolean;
+    readonly checkpointWorkerStart?: Effect.Effect<void>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1267,6 +1270,73 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   }
   return { log: state.log, checkpointed: state.checkpointed };
 };
+
+it.effect("defers routine checkpoints during startup and drains pending WAL on activation", () =>
+  Effect.gen(function* () {
+    const activated = yield* Deferred.make<void>();
+    yield* withCheckpointClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const worker = startedWorkers.at(-1)!;
+          const send = vi.spyOn(worker, "postMessage");
+          yield* Effect.addFinalizer(() => Effect.sync(() => send.mockRestore()));
+          yield* sql`CREATE TABLE pages(payload BLOB)`;
+          yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+            INSERT INTO pages SELECT randomblob(4000) FROM n`;
+          const holder = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const pending = readCheckpointState(holder);
+          holder.exec("BEGIN IMMEDIATE");
+          assert.isAbove(pending.log - pending.checkpointed, 1000);
+          assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1200 }]);
+          assert.equal(send.mock.calls.length, 0);
+          holder.exec("ROLLBACK");
+          assert.deepEqual(readCheckpointState(holder), pending);
+          const reply = waitForCheckpointMessage(worker, 1);
+          yield* Deferred.succeed(activated, undefined);
+          const result = yield* Effect.promise(() => reply);
+          assert.equal(result.checkpointed, result.log);
+          assert.deepEqual(readCheckpointState(holder), {
+            log: result.log,
+            checkpointed: result.log,
+          });
+        }),
+      { checkpointWorkerStart: Deferred.await(activated) },
+    );
+  }),
+);
+
+it.effect("keeps WAL backpressure active before startup activation", () =>
+  withCheckpointClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const requests = pauseCheckpointRequests(worker);
+        yield* Effect.addFinalizer(() => Effect.sync(requests.release));
+        yield* sql`CREATE TABLE pages(payload BLOB)`;
+        yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 11000)
+          INSERT INTO pages SELECT randomblob(4000) FROM n`;
+        const observer = yield* Effect.acquireRelease(
+          Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+          (db) => Effect.sync(() => db.close()),
+        );
+        assert.isAtLeast(readCheckpointState(observer).log, 10000);
+        assert.isAbove(requests.queued.length, 0);
+        const mutation = yield* sql`INSERT INTO pages VALUES ('after checkpoint')`.pipe(
+          Effect.forkChild,
+        );
+        requests.release();
+        yield* Fiber.join(mutation);
+        yield* checkpointWorkerReply(worker);
+        assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 11001 }]);
+        const state = readCheckpointState(observer);
+        assert.isBelow(state.log - state.checkpointed, 1000);
+      }),
+    { checkpointWorkerStart: Effect.never },
+  ),
+);
 
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>
   withCheckpointClient((sql, filename) =>

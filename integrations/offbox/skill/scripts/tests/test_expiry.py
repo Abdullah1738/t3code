@@ -48,7 +48,7 @@ class ExpiryTests(Isolated):
         self.con.commit()
 
     def new_box(self, template=None, base=None, fresh=False):
-        with patch.object(lease, "pick_template", return_value="crpko-node"):
+        with patch.object(lease, "pick_template", return_value=("crpko-node", "package.json")):
             return lease._new_box(self.con, self.me, None, template, base, fresh)
 
     def kinds(self, box_id=None):
@@ -121,7 +121,7 @@ class ExpiryTests(Isolated):
     def test_recipe_lease_runs_the_recipe_and_serves_template_pools(self):
         self.template(expired_at=common.now())
         with patch.object(api, "create", return_value={"id": "bx_r"}), patch.object(api, "rename"), \
-                patch.object(lease, "_bring_up") as up, patch.object(lease, "pick_template", return_value="crpko-node"):
+                patch.object(lease, "_bring_up") as up, patch.object(lease, "pick_template", return_value=("crpko-node", "package.json")):
             row = lease.acquire_private(dict(self.me, owner="pool:repo"))
         self.assertEqual(row["source"], "recipe:crpko-node")
         self.assertEqual(up.call_args.kwargs["recipe"], "crpko-node")
@@ -201,7 +201,9 @@ class ExpiryTests(Isolated):
 
     def test_bases_json_keeps_its_shape(self):
         self.base()
-        with patch.object(api, "get", side_effect=common.OffboxError("boat API unreachable")):
+        with patch.object(common, "db_path_for", side_effect=lambda backend:
+                          common.DB_PATH if backend == "boat" else common.STATE / "offbox-home.db"), \
+                patch.object(api, "get", side_effect=common.OffboxError("boat API unreachable")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 bases.list_bases(True)
@@ -410,7 +412,7 @@ class ExpiryTests(Isolated):
         # Ctrl-C (KeyboardInterrupt) while the recipe runs: no Exception/OffboxError handler sees it, so the row must
         # already be a non-reusable state. The next acquisition must not get the box back; the reaper retires it.
         with patch.object(api, "create", return_value={"id": "bx_int"}), patch.object(api, "rename"), \
-                patch.object(lease, "pick_template", return_value="crpko-node"), \
+                patch.object(lease, "pick_template", return_value=("crpko-node", "package.json")), \
                 patch.object(lease, "_bring_up", side_effect=KeyboardInterrupt), \
                 patch.object(lease, "ssh_sync"):
             self.template(expired_at=common.now())
@@ -505,7 +507,7 @@ class ExpiryTests(Isolated):
         # The box fails before the recipe starts (SSH never comes up). It is blank: it must be retired, not left as a
         # pool candidate that a later acquisition would return as recipe:crpko-node without building Node.
         with patch.object(api, "create", return_value={"id": "bx_ssh"}), patch.object(api, "rename"), \
-                patch.object(lease, "pick_template", return_value="crpko-node"), \
+                patch.object(lease, "pick_template", return_value=("crpko-node", "package.json")), \
                 patch.object(lease, "_bring_up", side_effect=common.OffboxError("ssh never came up")), \
                 patch.object(api, "cmd_kill"), patch.object(api, "usage", return_value=None), \
                 patch.object(api, "delete", return_value={}) as delete, \

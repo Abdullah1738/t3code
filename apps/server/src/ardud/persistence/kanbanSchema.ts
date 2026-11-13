@@ -17,6 +17,13 @@ export const kanbanDDL = [
   `CREATE TABLE IF NOT EXISTS ardud_kanban_boards (
     id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, json TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_instruction_applications (
+    id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT NOT NULL,
+    field TEXT NOT NULL, ask_id TEXT NOT NULL, json TEXT NOT NULL, audit_event_id INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_instruction_applications_pending
+    ON ardud_kanban_instruction_applications (card_id, board_id, field, ask_id)
+    WHERE audit_event_id IS NULL`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_cards (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, number INTEGER NOT NULL,
     stage TEXT NOT NULL, active_thread_id TEXT, json TEXT NOT NULL, UNIQUE (board_id, number)
@@ -29,11 +36,20 @@ export const kanbanDDL = [
     ON ardud_kanban_cards (board_id, number) WHERE instr(json, '"closedAt":"') > 0`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_open ON ardud_kanban_cards(board_id, number)
     WHERE json_extract(json, '$.settledAt') IS NULL`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_dispatch ON ardud_kanban_cards(board_id, number)
+    WHERE json_extract(json, '$.settledAt') IS NULL
+      AND (stage IN ('todo', 'working', 'needs_review', 'in_review')
+        OR json_extract(json, '$.wait') IS NOT NULL
+        OR json_extract(json, '$.deciding') IS NOT NULL
+        OR active_thread_id IS NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_thread ON ardud_kanban_cards (active_thread_id)`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_card_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, json TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_card ON ardud_kanban_card_events (card_id, id)`,
+  // Board activity reads a time window of events (board_get since, board_activity).
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_at
+    ON ardud_kanban_card_events (json_extract(json, '$.at'))`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_goals (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, json TEXT NOT NULL
   )`,
@@ -45,6 +61,13 @@ export const kanbanDDL = [
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, evaluator_thread_id TEXT, json TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_board ON ardud_kanban_discussions (board_id)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_open ON ardud_kanban_discussions (board_id)
+    WHERE json_extract(json, '$.settledAt') IS NULL
+      AND json_extract(json, '$.archivedAt') IS NULL`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_system_channel
+    ON ardud_kanban_discussions (board_id, json_extract(json, '$.createdBy.component'))
+    WHERE card_id IS NULL AND json_extract(json, '$.archivedAt') IS NULL
+      AND json_extract(json, '$.createdBy._tag') = 'system'`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_messages (
     discussion_id TEXT NOT NULL, seq INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (discussion_id, seq)
   )`,

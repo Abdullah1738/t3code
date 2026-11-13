@@ -75,6 +75,31 @@ class SelectionTest(unittest.TestCase):
                 self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr)
                 self.assertIn('v20 unavailable', r.stderr)
 
+    def test_pins_preserve_quint_guard_and_blocker_prefix(self):
+        (self.repo / '.nvmrc').write_text('22')
+        self.pkg(packageManager='pnpm@10')
+        self.pnpm()
+        prefix = [self.home / rel for rel in [
+            '.config/opencode/skills/remote-compute/scripts/blockers',
+            '.local/share/harness-hooks/coord-blockers',
+            '.local/share/quint-guard/bin',
+        ]]
+        wrapper = self.home / '.local/bin/quint'
+        self.exe(wrapper, 'echo guarded')
+        prefix[-1].mkdir(parents=True)
+        (prefix[-1] / 'quint').symlink_to(wrapper)
+        self.exe(self.home / '.nvm/versions/node/v22.23.2/bin/quint', 'echo raw')
+        self.env['PATH'] = ':'.join(map(str, prefix)) + ':' + self.env['PATH']
+        for shell in ['/bin/zsh', '/bin/bash']:
+            with self.subTest(shell=shell):
+                r = self.run_shell('command -v quint; quint typecheck; node -v; pnpm -v; printf "%s\\n" "$PATH"', shell)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                lines = r.stdout.splitlines()
+                self.assertEqual(lines[:4], [str(prefix[-1] / 'quint'), 'guarded', 'v22.23.2', '10.26.2'])
+                self.assertEqual(lines[4].split(':')[:3], list(map(str, prefix)))
+                r = self.run_shell('cd ' + shlex.quote(str(self.plain)) + '; cd ' + shlex.quote(str(self.repo)) + '; command -v quint; node -v', shell)
+                self.assertEqual(r.stdout.splitlines(), [str(prefix[-1] / 'quint'), 'v22.23.2'], r.stderr)
+
     def test_no_pin_is_unchanged(self):
         for shell in ['/bin/zsh', '/bin/bash']:
             r = self.run_shell('printf "%s\\n" "$PATH"; node -v; pnpm -v', shell, self.plain)

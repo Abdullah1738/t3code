@@ -1,0 +1,40 @@
+#!/bin/sh
+# Local iOS simulators are blocked on this Mac (owner rule 2026-10-09).
+# Simulators run on Run Cloud: load the run-cloud skill and use `rcsim`.
+# Everything that isn't simulator creation/boot passes straight to /usr/bin/xcrun.
+REAL=/usr/bin/xcrun
+[ -n "$RCSIM_ALLOW_LOCAL_SIM" ] && exec "$REAL" "$@"
+
+# find the tool name, skipping xcrun's own options
+i=0; tool=""; sub=""; sub2=""
+for a in "$@"; do
+  if [ -z "$tool" ]; then
+    case "$a" in
+      --sdk|-sdk|--toolchain|-toolchain) skip=1; continue ;;
+      -*) continue ;;
+    esac
+    if [ -n "$skip" ]; then skip=""; continue; fi
+    tool="$a"; continue
+  fi
+  case "$a" in -*) continue ;; esac
+  if [ -z "$sub" ]; then sub="$a"; elif [ -z "$sub2" ]; then sub2="$a"; break; fi
+done
+
+if [ "$tool" = "simctl" ]; then
+  block=""
+  case "$sub" in
+    create|clone|boot|install|launch|openurl) block=1 ;;
+    runtime) case "$sub2" in add|import) block=1 ;; esac ;;
+  esac
+  if [ -n "$block" ]; then
+    cat >&2 <<'EOF'
+xcrun simctl: local iOS simulators are disabled on this Mac.
+Use Run Cloud instead: load the run-cloud skill, then
+  rcsim create ios --name "<what>" --purpose "<why>"     # blank simulator
+  rcsim launch ios --build <xcode build id>              # build + install (runcloud xcode build . --until installable)
+Heartbeat with `rcsim heartbeat` every 15 min and `rcsim release` when done (billed per minute).
+EOF
+    exit 69
+  fi
+fi
+exec "$REAL" "$@"

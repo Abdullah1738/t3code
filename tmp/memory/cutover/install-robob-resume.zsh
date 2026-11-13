@@ -165,7 +165,7 @@ for (const f of [process.env.T3_CONTROL_TOKEN_FILE, os.homedir() + "/.robob/comp
   try { cfg = JSON.parse(fs.readFileSync(f, "utf8")); break; } catch {}
 }
 const url = (process.env.T3_CONTROL_URL || cfg.url || "http://127.0.0.1:3773").replace(/\/$/, "");
-fetch(`${url}/api/ardud/control/harness-cutover/status`,
+fetch(`${url}/api/ardud/control/harness-cutover/status?claims=1`,
   { headers: { authorization: `Bearer ${process.env.T3_CONTROL_TOKEN || cfg.token}` }, signal: AbortSignal.timeout(300000) })
   .then(async (r) => { if (!r.ok) throw new Error(`status ${r.status}`); fs.writeFileSync(process.argv[1], await r.text()); })
   .catch((e) => { console.error(`harness-cutover status: ${e.message}`); process.exit(1); });' "$1"

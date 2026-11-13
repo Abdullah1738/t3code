@@ -28,6 +28,7 @@ STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
 SYNC_PROGRESS_S = 60
 RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
+_HOME_PORTS: dict[str, tuple[str, int]] = {}
 
 # Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
@@ -90,6 +91,13 @@ def setup(box_id: str) -> Path:
         host, port = r.get("machineIp"), "22"
     if not host or not r.get("hostKey"):
         raise OffboxError(f"no ssh endpoint/host key for {box_id}")
+    home_ports = ""
+    if api.BACKEND == "server" and r.get("managementSshEndpoint"):
+        mgmt_host, mgmt_port = r["managementSshEndpoint"].rsplit(":", 1)
+        if mgmt_host != host:
+            raise OffboxError(f"management SSH host differs from legacy SSH host for {box_id}")
+        # Both are allocated host proxy ports, not the guest's 2222/22 listeners.
+        home_ports = f"# offbox-home-ports {int(mgmt_port)} {int(port)}\n"
     kh = SSH_DIR / f"known_hosts_{box_id}"
     kh.write_text(f"{box_id} {r['hostKey']}\n")
     cfg = cfg_path(box_id)
@@ -111,18 +119,65 @@ def setup(box_id: str) -> Path:
   ControlPath {CM_DIR}/%C
   ControlPersist 600
   LogLevel ERROR
-""")
+""" + home_ports)
     os.replace(tmp, cfg)
     log(f"ssh setup {box_id} endpoint={host}:{port}")
     return cfg
 
 
-def ssh_base(box_id: str) -> list[str]:
-    return ["ssh", "-F", str(cfg_path(box_id))]
+def _host_key_error(stderr: bytes) -> bool:
+    return any(s in stderr for s in (b"Host key verification failed", b"REMOTE HOST IDENTIFICATION",
+                                     b"Offending ", b"host key has changed"))
+
+
+def _management_unreachable(box_id: str) -> common.SshHostKeyMismatch:
+    return common.SshHostKeyMismatch(f"management SSH unreachable for {box_id}: host key mismatch; "
+                       "use `offbox exec` through the home control API (#95); leave known_hosts unchanged")
+
+
+def check_host_key(box_id: str, stderr: bytes) -> None:
+    if api.BACKEND == "server" and _host_key_error(stderr):
+        raise _management_unreachable(box_id)
+
+
+def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
+    base = ["ssh", "-F", str(cfg_path(box_id))]
+    if api.BACKEND != "server":
+        return base
+    try:
+        config = cfg_path(box_id).read_text()
+    except OSError:
+        return base
+    ports = re.search(r"^# offbox-home-ports (\d+) (\d+)$", config, re.M)
+    if not ports:
+        return base  # pre-upgrade daemon: only its legacy endpoint is known
+    cached = _HOME_PORTS.get(box_id)
+    if cached and cached[0] == config:
+        return base + ["-p", str(cached[1])]
+    if not probe:
+        return base
+    for port in ports.groups():
+        left = api.left()
+        timeout = 5 if left is None else min(5, max(0, left))
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired(base, timeout)
+        try:
+            p = subprocess.run(base + ["-p", port, "-o", "ConnectTimeout=3", "-o", "ControlPath=none",
+                                      box_id, "true"], capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        check_host_key(box_id, p.stderr)
+        if p.returncode == 0:
+            _HOME_PORTS[box_id] = (config, int(port))
+            return base + ["-p", port]
+    raise OffboxError(f"management SSH unreachable for {box_id} on management and legacy endpoints; "
+                       "use the home control API (`offbox exec`, #95)")
 
 
 def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
     p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+    if p.returncode == 255:
+        check_host_key(box_id, p.stderr)
     if p.returncode == 255:
         toollog.emit("ssh", "ssh.drop", kind="error", ok=False, ids={"box": box_id}, tag="ssh_drop", props={"exitCode": 255})
     if check and p.returncode != 0:
@@ -141,7 +196,9 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
             if p.returncode == 0:
                 return
             err = p.stderr.decode(errors="replace")[-300:]
-            if "Host key verification failed" in err or "REMOTE HOST IDENTIFICATION" in err:
+            if _host_key_error(p.stderr):
+                if api.BACKEND == "server":
+                    raise _management_unreachable(box_id)
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
@@ -158,7 +215,7 @@ def close_master(box_id: str) -> None:
         timeout = 2 if left is None else min(2, max(0, left))
         if timeout > 0:
             # Resolve %C before exit can exhaust the budget, without connecting to the remote machine.
-            config = subprocess.run(ssh_base(box_id) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
+            config = subprocess.run(ssh_base(box_id, probe=False) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
             if config.returncode == 0:
                 for line in config.stdout.splitlines():
                     if line.startswith("controlpath "):
@@ -172,7 +229,7 @@ def close_master(box_id: str) -> None:
         left = api.left()
         timeout = 10 if left is None else min(10, max(0, left))
         if timeout > 0:
-            subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
+            subprocess.run(ssh_base(box_id, probe=False) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         pass  # closing a cached connection must not undo a confirmed box stop
     try:
@@ -752,22 +809,33 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
     return subprocess.CompletedProcess(cmd, proc.returncode, _without_progress(out), err)
 
 
-def _bounded_command(cmd, timeout, *, stdout=None):
+def _bounded_command(cmd, timeout, *, stdout=None, capture_stderr=False):
     # A pipe's communicate()/wait() cleanup can itself hang after SIGKILL on an uninterruptible filesystem call.
     # A temporary file lets us abandon an unreaped helper without waiting for EOF or blocking a reader thread.
-    with tempfile.TemporaryFile() if stdout is None else nullcontext(stdout) as output:
-        proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+    with (tempfile.TemporaryFile() if stdout is None else nullcontext(stdout)) as output, \
+            (tempfile.TemporaryFile() if capture_stderr else nullcontext(None)) as errors:
+        proc = subprocess.Popen(cmd, stdout=output, stderr=errors if capture_stderr else subprocess.DEVNULL,
+                                start_new_session=True)
         try:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                if capture_stderr:
+                    errors.seek(0)
+                    stderr = errors.read()
+                    if _host_key_error(stderr):
+                        return subprocess.CompletedProcess(cmd, 255, b"", stderr)
                 return None
             if stdout is None:
                 output.seek(0)
                 data = output.read()
             else:
                 data = b""
-            return subprocess.CompletedProcess(cmd, proc.returncode, data, b"")
+            stderr = b""
+            if capture_stderr:
+                errors.seek(0)
+                stderr = errors.read()
+            return subprocess.CompletedProcess(cmd, proc.returncode, data, stderr)
         finally:
             if proc.poll() is None:
                 try:
@@ -799,11 +867,14 @@ def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
         # A separate connection must not wait behind the stalled multiplexed session.
         cmd = ssh_base(box_id) + ["-o", "ControlMaster=no", "-o", "ControlPath=none", box_id,
                                   "ps -eo pid,ppid,stat,wchan:32,etime,comm,args"]
-        p = _bounded_command(cmd, timeout)
+        p = _bounded_command(cmd, timeout, capture_stderr=api.BACKEND == "server")
         if p is None:
             return "remote_probe=unavailable", None
         if p.returncode:
+            check_host_key(box_id, p.stderr)
             return "remote_probe=failed", None
+    except common.SshHostKeyMismatch:
+        raise
     except (OffboxError, OSError, subprocess.TimeoutExpired):
         return "remote_probe=unavailable", None
     states, prune, blocked = [], [], None
@@ -885,6 +956,10 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                        f"{_sync_wait(source_sent)}")
 
         try:
+            if api.BACKEND == "server" and "-e" in cmd:
+                # setup can change the proxy endpoint between rsync attempts.
+                with api.budget(left):
+                    cmd[cmd.index("-e") + 1] = shlex.join(ssh_base(box_id))
             p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress)
         except SyncStalled:
             with api.budget(max(0, deadline - time.monotonic())):
@@ -905,6 +980,8 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                 _refresh_master(box_id, close=False)
             stalls += 1
             continue
+        if p.returncode:
+            check_host_key(box_id, p.stderr.encode(errors="replace"))
         if p.returncode not in (255, 12):
             return p
         old = _endpoint(box_id)
@@ -950,6 +1027,8 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float, *, run
     finally:
         try:
             ssh(box_id, f"rm -rf -- {qstage}", check=True, timeout=5)
+        except common.SshHostKeyMismatch:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             log(f"push_git cleanup failed {box_id} {staging}")
 
@@ -1079,6 +1158,8 @@ def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path
     cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
            f"{box_id}:{rbase}/{path}", f"{dest}/"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode:
+        check_host_key(box_id, p.stderr.encode(errors="replace"))
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:

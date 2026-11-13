@@ -13,6 +13,8 @@
 # Files next to this script: boatd.py, boatd-wrap, base-image.sh, boatd.service.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+MGMT_ASSETS=$HERE
+[ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
 
@@ -22,6 +24,9 @@ image() {
   for _ in $(seq 60); do incus exec offbox-build -- systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break; sleep 1; done
   incus file push "$HERE/boatd-wrap" offbox-build/usr/local/sbin/boatd-wrap --mode 0755
   incus file push "$HERE/base-image.sh" offbox-build/root/base-image.sh --mode 0700
+  incus file push "$MGMT_ASSETS/offbox-mgmt-ssh.service" offbox-build/root/offbox-mgmt-ssh.service --mode 0644
+  incus file push "$MGMT_ASSETS/offbox_mgmt_sshd_config" offbox-build/root/offbox_mgmt_sshd_config --mode 0600
+  incus file push "$MGMT_ASSETS/offbox-ssh-runtime.conf" offbox-build/root/offbox-ssh-runtime.conf --mode 0644
   incus exec offbox-build -- bash /root/base-image.sh
   incus exec offbox-build -- rm -f /root/base-image.sh
   incus stop offbox-build
@@ -282,6 +287,7 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
 [ -f "$tool_log" ] || tool_log="$HERE/../skill/scripts/toollog.py"
 install -m 0644 "$tool_log" /opt/boatd/toollog.py
