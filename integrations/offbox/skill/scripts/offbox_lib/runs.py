@@ -554,6 +554,8 @@ SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
 GO_STD_GLITCH = re.compile(r"package (unsafe|internal/\S+|runtime(/\S+)?) is not in std \(/usr/local/go/src/|"
                            r"build constraints exclude all Go files in /usr/local/go/src/(internal|runtime|unsafe)\b")
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
+STEP_RETRY = re.compile(r"^offbox-server: the server restarted while this run was going \(attempt \d+ is lost\); "
+                        r"it is queued again as attempt \d+$")
 
 
 PIPELINE_STATUS = r'''__offbox_pipeline_status() {
@@ -681,6 +683,10 @@ def step_results(log_path: Path | None) -> list[tuple[int, int]]:
         return []
     out = []
     for line in Path(log_path).read_text(errors="replace").splitlines():
+        # Home retries append to the same stderr. Earlier attempts cannot supply a missing result.
+        # The server note precedes even a retry that never reaches our command preamble.
+        if line.startswith(COMMAND_STARTED_MARKER) or STEP_RETRY.fullmatch(line):
+            out.clear()
         m = STEP_RESULT.search(line)
         if m:
             out.append((int(m.group(1)), int(m.group(2))))
@@ -717,7 +723,7 @@ def planned_steps(run) -> int:
 
 def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, planned: int | None = None,
                        locked: bool = False, until: float | None = None, catch_up: bool = True,
-                       report: bool = True) -> int | None:
+                       report: bool = True, history_result: str | None = None) -> int | None:
     """Completion requires evidence from every step, even when a process/receipt says zero.
 
     Reuse history catch-up before rejecting a partial follow, including for a process whose
@@ -730,13 +736,21 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     if known not in (None, 0) and code in (None, 0):
         code = known
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
-    if catch_up and missing_step_count(step_results(path), planned):
+    result = history_result
+    if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned)):
         from .misc import _catch_up_log
         budget = 10 if until is None else min(10, max(0, until - now()))
-        _catch_up_log(dict(run, status='done'), budget=budget, locked=locked)
+        result = _catch_up_log(dict(run, status='done'), budget=budget, locked=locked)
         if until is not None and now() >= until:
             raise OffboxError(f"--timeout reached; wait again: offbox wait {run['run_id']}", code=EXIT_WAIT_TIMEOUT)
+    # Complete old markers cannot prove the final attempt when the host's appended retry note is unread.
+    history_incomplete = (api.BACKEND == 'server' and run['command_id'] and result is not None
+                          and result not in ('complete', 'caught_up'))
     checked = checked_steps_code(path, planned, code, report=report)
+    if history_incomplete:
+        if report and checked is not None:
+            say('steps incomplete: final attempt output unavailable; remote exit unknown')
+        checked = None
     if checked is None and code not in (None, 0) and known is None:
         # A missing tail can be recovered later; it must never erase a known failure.
         con = db()
@@ -2148,7 +2162,7 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
 
 
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
-           until: float | None = None) -> None:
+           until: float | None = None) -> int | None:
     con = db()
     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if not r:
@@ -2173,6 +2187,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
             with api.budget(until-now()):
                 lease.idle_ttl(r['box_id'])
         event(con, r["box_id"], "run_end", f"{run_id} status={st} exit={code} {round(now() - (r['start_at'] or now()))}s")
+    return code
 
 
 def run_remote(a, me: dict) -> int:
@@ -2299,7 +2314,10 @@ def _run_remote(a, rn) -> int:
         try:
             code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
         except Interrupted:
-            finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
+            code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
+            if code is None:
+                raise OffboxError(f"{rn.run_id}: steps incomplete after the server restart; remote exit unknown",
+                                  code=EXIT_INFRA, started=True) from None
             raise
     except KeyboardInterrupt:
         if rn.started and rn.box and _host_restarting(interrupted['sig']):
@@ -2368,7 +2386,7 @@ def _run_remote(a, rn) -> int:
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
         finally:
             con.close()
-        step_run = row if row is not None else dict(run_id=rn.run_id, box_id=rn.box, command_id=None)
+        step_run = row if row is not None else dict(run_id=rn.run_id, box_id=rn.box, command_id=None, mode='fg')
         code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True)
     finish(rn.run_id, code)
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)

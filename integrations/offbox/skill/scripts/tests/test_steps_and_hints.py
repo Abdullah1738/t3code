@@ -855,6 +855,14 @@ class SummaryAndHintTests(unittest.TestCase):
     def test_summary_mentions_steps_not_run(self):
         self.assertEqual(runs.steps_summary([(1, 0)], 3), 'offbox steps: 1 ok, 0 failed, 2 not run')
 
+    def test_command_restart_marker_discards_prior_step_results(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'run.log'
+            log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
+                           + runs.COMMAND_STARTED_MARKER + ' run-retry\noffbox step 1 rc=0: a\n')
+            self.assertEqual(runs.step_results(log), [(1, 0)])
+            self.assertIsNone(runs.steps_exit(log, 2))
+
     def test_grep_hint_only_for_exit_1_from_trailing_grep(self):
         self.assertTrue(runs.last_stage_is_grep('go test ./... 2>&1 | tee /tmp/l | tail -40; grep -c FAIL /tmp/l'))
         self.assertTrue(runs.last_stage_is_grep('go test ./... | grep FAIL'))

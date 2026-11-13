@@ -802,7 +802,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     _tail(p, 0, True)
     _incomplete_log(r, result)
     from .runs import settled_steps_code, planned_steps
-    code = settled_steps_code(r, r['exit_code'], catch_up=False)
+    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     if planned_steps(r) and code is None:
         return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
@@ -840,7 +840,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
-    code = settled_steps_code(r, r['exit_code'], catch_up=False)
+    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log")
     status = r['status']
     if planned_steps(r) and code is not None and status in ('done', 'failed', 'infra', 'lost'):
@@ -1244,7 +1244,10 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
                       mirror_keep=mirror_keep, receipt_locked=True)
     except Interrupted as e:
         # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
-        finish(r["run_id"], e.code, "interrupted")
+        code = finish(r["run_id"], e.code, "interrupted")
+        if code is None:
+            raise OffboxError(f"{r['run_id']}: steps incomplete after the server restart; remote exit unknown",
+                              code=EXIT_INFRA, started=True) from None
         raise
     if code is None:
         code, how = _recover_by(r, log_path, until)
