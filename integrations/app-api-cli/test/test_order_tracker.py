@@ -1337,7 +1337,7 @@ class RetireTest(unittest.TestCase):
 
 
 class TerminalCardRenderTest(unittest.TestCase):
-    def scenario(self, failure, *, fail_render=False):
+    def scenario(self, failure, *, fail_render=False, bank_pending=False, pending_terminal=False):
         import tempfile
         cards = t.delivery_cards
         with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
@@ -1347,6 +1347,13 @@ class TerminalCardRenderTest(unittest.TestCase):
                    'watcher': 'order-noon-fixture', 'registered_at': t.stamp(time.time() - 60),
                    'delivery_card': {'ready': True}, 'card_meta': {'items': [{'name': 'Fixture', 'qty': 1}]},
                    'active': True}
+            if bank_pending:
+                now = float(int(time.time()))
+                clock = stack.enter_context(mock.patch.object(t.time, 'time', return_value=now))
+                cfg.update(placed_at=t.stamp(now - 60), total='AED 1,000.00')
+                charges = SimpleNamespace(Lookup=RuntimeError, search=mock.Mock(return_value=[]),
+                                          day=lambda value: value.astimezone(t.DUBAI).date().isoformat())
+                stack.enter_context(mock.patch.object(t.order_bank_charge, 'load_charges', return_value=charges))
             folder = watchers / cfg['watcher']
             folder.mkdir(parents=True)
             record = root / 'orders' / (cfg['watcher'] + '.json')
@@ -1357,7 +1364,8 @@ class TerminalCardRenderTest(unittest.TestCase):
                                      (cards, 'ROOT', root), (cards, 'APPS', root / 'apps')):
                 stack.enter_context(mock.patch.object(obj, name, value))
             stack.enter_context(mock.patch.object(t.toollog, 'root', return_value=root / 'logs'))
-            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'))
+            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture',
+                                               WATCH_MAIN_CHECKED='0'))
             stack.enter_context(mock.patch.object(cards, 'preview', return_value=False))
             stack.enter_context(mock.patch.object(cards, 'route', return_value='fixture-session'))
             def bridge(args, **kwargs):
@@ -1398,13 +1406,32 @@ class TerminalCardRenderTest(unittest.TestCase):
                 if fail_render:
                     with mock.patch.object(cards, 'atomic', side_effect=atomic):
                         t.check(cfg)
-                        t.check(cfg)
+                        if not bank_pending:
+                            t.check(cfg)
                     removal.assert_not_called()
                     self.assertEqual(status_path.read_bytes(), before_status)
                 else:
                     t.check(cfg)
                     removal.assert_not_called()
                     self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                if bank_pending:
+                    self.assertEqual(cards.read(status_path)['stage'], 'Packing')
+                    self.assertIn('card_error', t.read(folder / 'order-tracker-state.json'))
+                    terminal_check = (lambda: t._check(cfg, pending_only=True)) if pending_terminal else lambda: t.check(cfg)
+                    clock.return_value = now + 60
+                    terminal_check()
+                    state = t.read(folder / 'order-tracker-state.json')
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                    self.assertNotIn('card_error', state)
+                    self.assertTrue(t.bank_match_pending(cfg, state['last_result'], state, clock.return_value))
+                    self.assertNotIn('bank_msg_id', t.read(record))
+                    self.assertTrue(t.read(record)['active'])
+                    removal.assert_not_called()
+                    clock.return_value = now + 3600
+                    terminal_check()
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                    removal.assert_not_called()
+                    clock.return_value = now + 48 * 3600
                 t.check(cfg)
             fetch.assert_called_once()
             transport.assert_not_called()
@@ -1422,6 +1449,11 @@ class TerminalCardRenderTest(unittest.TestCase):
 
     def test_terminal_render_failure_retries_before_retiring_despite_placement_failure(self):
         self.scenario('publish_ack', fail_render=True)
+
+    def test_pending_bank_match_allows_terminal_card_render_recovery(self):
+        for pending in (False, True):
+            with self.subTest(pending_terminal=pending):
+                self.scenario('send_ack', fail_render=True, bank_pending=True, pending_terminal=pending)
 
 
 class CareemLiveTests(unittest.TestCase):

@@ -1295,10 +1295,6 @@ def _check(cfg, pending_only=False):
 def retire_terminal(cfg, folder, path, state):
     if folder.resolve() != (WATCHERS / cfg['watcher']).resolve():
         return
-    # Both normal and pending checks retire here. A throttled or failed bank
-    # lookup must leave the watcher scheduled for its next bank-only attempt.
-    if bank_match_pending(cfg, state.get('last_result', {}), state, time.time()):
-        return
     # Direct checks can race the runner before it stores or delivers an event.
     # Primes must finish registration before the watcher can be archived.
     run_id = os.environ.get('WATCH_RUN', '')
@@ -1315,6 +1311,9 @@ def retire_terminal(cfg, folder, path, state):
             return
         state.pop('card_error', None)
         write(path, state)
+    # Hold watcher removal for bank retries after recovering the terminal card.
+    if bank_match_pending(cfg, state.get('last_result', {}), state, time.time()):
+        return
     try:
         retire(cfg, ROOT / 'orders' / (cfg['watcher'] + '.json'))
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
