@@ -3,12 +3,19 @@
 import contextlib as _log_context
 import sys as _log_sys
 from pathlib import Path as _LogPath
+_FOLD = __name__ == '__main__' and _log_sys.argv[1:2] == ['--fold']
+@_log_context.contextmanager
+def _fold_errors():
+    try: yield
+    except BaseException:
+        # A reminder must never prevent the bridge from delivering its reply.
+        if not _FOLD: raise
 try:
     _log_sys.path.insert(0, str(_LogPath(__file__).resolve().parents[2]))
     import toollog as _tl
 except Exception:
     _tl = None
-with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
+with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
       if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()):
     # Nags owner hourly (09:00-23:45 Dubai) about meds due today until confirmed.
     # Confirm with: ./took.py [YYYY-MM-DD] all|name...   (state in taken.json)
@@ -31,7 +38,14 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
         if d.weekday() in (0,4): items.append("Test E 250mg" if d < CRUISE else "Test E 100mg = 0.4ml (cruise)")
         # one-off moves: moved.json {"YYYY-MM-DD": {"add": [...], "skip": [...]}}
         try: m = json.load(open(os.path.join(D,"moved.json"))).get(str(d), {})
-        except Exception: m = {}
+        except FileNotFoundError: m = {}
+        except Exception:
+            if _FOLD: raise
+            m = {}
+        if _FOLD and (not isinstance(m, dict) or any(
+                not isinstance(m.get(field, []), list) or any(not isinstance(x, str) for x in m[field])
+                for field in ("skip", "add") if field in m)):
+            raise ValueError("invalid schedule override")
         items = [i for i in items if i.split()[0].lower() not in [x.lower() for x in m.get("skip", [])]]
         items += [x for x in m.get("add", []) if x not in items]
         return items
@@ -62,17 +76,39 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
         left = [i for i in due(d) if key(i) not in tk]
         left += ["%s (from %s, missed)" % (lab, x.strftime("%a %-d %b")) for lab, x in carried(d, taken)]
         return left
-    def load(p, default):
-        try: return json.load(open(os.path.join(D,p)))
-        except Exception: return default
+    def load(p, default, strict=_FOLD):
+        try:
+            value = json.load(open(os.path.join(D,p)))
+            if strict and p == "taken.json" and (not isinstance(value, dict) or any(
+                    not isinstance(names, list) or any(not isinstance(name, str) for name in names)
+                    for names in value.values())):
+                raise ValueError("invalid confirmations")
+            return value
+        except FileNotFoundError:
+            if strict and p == "taken.json": raise
+            return default
+        except Exception:
+            if strict: raise
+            return default
     def active_snoozes():
         active = {}
         for name, until in load("snooze.json", {}).items():
             try:
                 if dt.datetime.fromisoformat(until) > now: active[name] = until
-            except (ValueError, TypeError): pass
+            except (ValueError, TypeError):
+                if _FOLD: raise
         return active
-    import sqlite3, subprocess, time
+    import fcntl, sqlite3, subprocess, time
+    def nag_time(st, field):
+        try:
+            value = dt.datetime.fromisoformat(st[field])
+            return value if value.tzinfo is not None else None
+        except (KeyError, TypeError, ValueError): return None
+    def write_nagstate(st):
+        for field in ("day", "count", "seen"): st.pop(field, None)
+        path = os.path.join(D, "nagstate.json"); tmp = path + ".tmp"
+        with open(tmp, "w") as f: json.dump(st, f)
+        os.replace(tmp, path)
     def awake():
         # Mac in use in last 15 min, or owner sent an iMessage (not to Moni chat 45, where robob also sends) in last 20 min
         try:
@@ -87,12 +123,19 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
             if n: return True
         except Exception: pass
         return False
-    def main():
-      taken = load("taken.json", {})
-      st = load("nagstate.json", {})
+    def main(fold=False):
       if 9 <= now.hour <= 23: day = today
-      elif now.hour < 5 and awake(): day = today - dt.timedelta(days=1)  # late night: keep nagging about yesterday while he's up
-      else: raise SystemExit(0)
+      elif now.hour < 5 and (fold or awake()): day = today - dt.timedelta(days=1)
+      else: return
+      # Bridge replies and watcher ticks share a clock; skip rather than wait for a concurrent run.
+      with open(os.path.join(D, "nagstate.lock"), "a") as lock:
+          try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except BlockingIOError: return
+          nag(day, fold)
+    def nag(day, fold):
+      taken = load("taken.json", {})
+      st = load("nagstate.json", {}, strict=False)
+      if not isinstance(st, dict): st = {}
       left = outstanding(day, taken)
       if not left:
           if _tl is not None: _tl.emit('meds-nag', 'nag.stopped', props={'count': 0})
@@ -102,20 +145,22 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
       if not left:
           if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': 0})
           raise SystemExit(0)
-      seen = sorted(taken.get(str(day), []))
-      count = st.get("count", 0)
-      if st.get("day") != str(day) or set(seen) - set(st.get("seen", [])): count = 0
-      if count >= 3:
-          if _tl is not None: _tl.emit('meds-nag', 'nag.stopped', props={'count': len(left)})
-          raise SystemExit(0)
-      last = st.get("last")
+      if fold:
+          last = nag_time(st, "fold_last")
+          if last and (now - last).total_seconds() < 1800: return
+          st["fold_last"] = now.isoformat()
+          write_nagstate(st)
+          print("💊 Still need: " + ", ".join(left) + ". Text me when done.")
+          if _tl is not None: _tl.emit('meds-nag', 'nag.folded', props={'count': len(left)})
+          return
+      times = [t for t in (nag_time(st, "last"), nag_time(st, "fold_last")) if t is not None]
+      last = max(times) if times else None
       gap = 3600 if now.hour >= 9 else 1800
-      if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
+      if last and (now - last).total_seconds() < gap:
           if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': len(left)})
           raise SystemExit(0)
-      count += 1
-      st.update(last=now.isoformat(), day=str(day), count=count, seen=seen)
-      json.dump(st, open(os.path.join(D,"nagstate.json"),"w"))
+      st["last"] = now.isoformat()
+      write_nagstate(st)
       def site_hint():
           # last Test E pin side: health.db (hlog.py) first, then sites.json
           last = None
@@ -132,7 +177,6 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
           where = "subQ glute (upper-outer)" if day.isoformat() >= "2026-11-06" else "VG"
           return " (pin %s %s, last was %s on %s)" % ({"L": "left", "R": "right"}[nxt], where, {"L": "left", "R": "right"}[last[1]], last[0])
       left = [i + site_hint() if i.lower().startswith("test") else i for i in left]
-      ending = " Last reminder today; text me when you take it." if count == 3 else " Text me when done and I'll stop."
-      print("💊 Meds check: still need to take " + ", ".join(left) + "." + ending)
+      print("💊 Meds check: still need to take " + ", ".join(left) + ". Text me when done and I'll stop.")
       if _tl is not None: _tl.emit('meds-nag', 'nag.sent', props={'count': len(left)})
-    if __name__ == "__main__": main()
+    if __name__ == "__main__": main(_FOLD)

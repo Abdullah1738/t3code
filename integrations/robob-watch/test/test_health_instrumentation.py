@@ -182,6 +182,16 @@ class InstrumentationTests(unittest.TestCase):
         self.assertEqual(self.run_script(script), 1)
         self.assert_run('meds-nag', 1, 'watcher.run')
 
+    def test_meds_fold_logs_only_when_printed(self):
+        script = PACKAGE / 'watchers/meds-nag/check.py'
+        (self.watch / 'taken.json').write_text('{}')
+        self.assertEqual(self.run_script(script, ['--fold']), 0)
+        self.assertTrue(self.stdout.getvalue().startswith('💊 Still need: '))
+        self.assertEqual([r['name'] for r in self.rows()].count('nag.folded'), 1)
+        self.assertEqual(self.run_script(script, ['--fold']), 0)
+        self.assertEqual(self.stdout.getvalue(), '')
+        self.assertEqual([r['name'] for r in self.rows()].count('nag.folded'), 1)
+
     def test_gym_and_forge_watchers_success_and_failure(self):
         script = PACKAGE / 'watchers/gym-nudge/check.py'
         self.assertEqual(self.run_script(script), 0)
