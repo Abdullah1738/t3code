@@ -1,0 +1,179 @@
+#!/opt/homebrew/bin/python3
+"""Approval gate in front of the Homebrew hcloud CLI."""
+import hashlib
+import json
+from pathlib import Path
+import os
+import subprocess
+import sys
+import tomllib
+
+REAL = '/opt/homebrew/bin/hcloud'
+VALUE_GLOBALS = {'--context', '--config', '--endpoint', '--hetzner-endpoint', '--output', '-o', '--poll-interval'}
+BOOL_GLOBALS = {'--quiet', '--debug'}
+
+
+def command_parts(args):
+    options = {}
+    index = 0
+    while index < len(args) and args[index].startswith('-'):
+        flag, equal, value = args[index].partition('=')
+        if flag in ('--help', '-h', '--version', '-v'):
+            return {}, args if len(args) == 1 else []
+        if flag in VALUE_GLOBALS:
+            if not equal:
+                index += 1
+                if index >= len(args):
+                    raise ValueError('missing global option value')
+                value = args[index]
+            if flag in options:
+                raise ValueError('duplicate global option')
+            options[flag] = value
+        elif flag not in BOOL_GLOBALS:
+            raise ValueError('unknown global option')
+        index += 1
+    return options, args[index:]
+
+
+def read_only(args):
+    if args and args[0] == 'help':
+        return True
+    options, words = command_parts(args)
+    if args in (['--help'], ['-h'], ['--version'], ['-v'], ['version'], ['help']) or not args:
+        return True
+    return len(words) >= 2 and words[1] in ('list', 'describe') and '--' not in words
+
+
+def approval_args(args):
+    clean, approval = [], {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == '--owner-go-describe':
+            approval['describe'] = True
+        elif arg.startswith('--owner-go-'):
+            flag, sep, value = arg.partition('=')
+            name = flag.removeprefix('--owner-go-')
+            if name not in ('amount', 'currency', 'recurring') or name in approval:
+                raise ValueError('unknown or duplicate approval option')
+            if not sep:
+                index += 1
+                if index >= len(args):
+                    raise ValueError('missing approval option value')
+                value = args[index]
+            approval[name] = value
+        else:
+            clean.append(arg)
+        index += 1
+    return clean, approval
+
+
+CLOUD_ENDPOINT = 'https://api.hetzner.cloud/v1'
+HETZNER_ENDPOINT = 'https://api.hetzner.com/v1'
+REFERENCE_FLAGS = {'--ssh-key', '--network', '--firewall', '--volume', '--placement-group',
+                   '--primary-ipv4', '--primary-ipv6'}
+CREATE_VALUES = {'--name', '--type', '--image', '--location', '--label'} | REFERENCE_FLAGS
+CREATE_BOOLS = {'--without-ipv4', '--without-ipv6', '--start-after-create', '--automount'}
+
+
+def numeric(value):
+    return bool(value) and value.isascii() and value.isdecimal()
+
+
+def validate_write(words):
+    # Only the two paid server entry points are supported. All other mutations,
+    # including aliases/new resource kinds, stay closed until explicitly mapped.
+    if len(words) < 2 or words[:2] not in (['server', 'create'], ['server', 'change-type']):
+        raise ValueError('unsupported mutation')
+    if words[1] == 'change-type':
+        if len(words) < 4 or not numeric(words[2]) or words[3].startswith('-'):
+            raise ValueError('numeric server ID and type required')
+        tail, values, booleans = words[4:], set(), {'--keep-disk'}
+    else:
+        tail, values, booleans = words[2:], CREATE_VALUES, CREATE_BOOLS
+    seen = set()
+    index = 0
+    while index < len(tail):
+        flag, equal, value = tail[index].partition('=')
+        if flag in booleans:
+            if equal and value not in ('true', 'false'):
+                raise ValueError('invalid boolean')
+        elif flag in values:
+            seen.add(flag)
+            if not equal:
+                index += 1
+                if index >= len(tail):
+                    raise ValueError('missing option value')
+                value = tail[index]
+            if flag in REFERENCE_FLAGS and not all(numeric(v) for v in value.split(',')):
+                raise ValueError('linked resources need numeric IDs')
+        else:
+            raise ValueError('unsupported option or operand')
+        index += 1
+    # v1.70.2 injects preference default_ssh_keys unless this flag is Changed.
+    # An explicit, nonempty numeric list suppresses both named/mutable defaults.
+    if words[1] == 'create' and '--ssh-key' not in seen:
+        raise ValueError('explicit numeric SSH keys required')
+
+
+def bound_write(args, environment):
+    options, words = command_parts(args)
+    context = options.get('--context')
+    if not context or any(f in options for f in ('--config', '--endpoint', '--hetzner-endpoint')):
+        raise ValueError('explicit context required; endpoint/config overrides refused')
+    if any(a.split('=', 1)[0] == '--debug' for a in args):
+        raise ValueError('debug output refused for authenticated mutations')
+    if any(name.startswith(('HCLOUD_', 'HETZNER_')) for name in environment):
+        raise ValueError('remove provider environment overrides')
+    validate_write(words)
+    config = Path.home() / '.config/hcloud/cli.toml'
+    settings = tomllib.loads(config.read_text())
+    configured = settings.get('contexts', [])
+    if not isinstance(configured, list) or any(not isinstance(c, dict) for c in configured):
+        raise ValueError('invalid contexts')
+    contexts = [c for c in configured if c.get('name') == context]
+    if len(contexts) != 1 or not isinstance(contexts[0].get('token'), str) or not contexts[0]['token']:
+        raise ValueError('context has no unique configured token')
+    token = contexts[0]['token']
+    identity = hashlib.sha256(token.encode()).hexdigest()
+    request = hashlib.sha256(json.dumps(args, ensure_ascii=False).encode()).hexdigest()
+    # Arg values can contain secrets. Persist only a digest of the exact request.
+    item = f'hcloud:{words[0]}:{words[1]}:request:{request}:credential:{identity}'
+    return item, {**environment, 'HCLOUD_TOKEN': token,
+                  'HCLOUD_ENDPOINT': CLOUD_ENDPOINT, 'HETZNER_ENDPOINT': HETZNER_ENDPOINT}, 'monthly'
+
+
+def main(args=None, runner=subprocess.run, execute=os.execve, environment=None):
+    try:
+        clean, approval = approval_args(list(sys.argv[1:] if args is None else args))
+        env = dict(os.environ if environment is None else environment)
+        if not read_only(clean):
+            item, env, cadence = bound_write(clean, env)
+            if approval.get('describe'):
+                print(json.dumps({'vendor':'hetzner', 'item':item, 'recurring':cadence, 'financial_send':False}))
+                return 0
+            if not approval.get('amount') or not approval.get('currency') or not approval.get('recurring'):
+                raise ValueError('supply --owner-go-amount, --owner-go-currency and --owner-go-recurring (none for one-time)')
+            if cadence and approval['recurring'] != cadence:
+                raise ValueError('this resource has a monthly liability')
+            command = [str(Path.home() / '.local/bin/owner-go'), 'verify', '--vendor', 'hetzner',
+                       '--item', item, '--amount', approval['amount'], '--currency', approval['currency']]
+            if approval['recurring'] != 'none':
+                command += ['--recurring', approval['recurring']]
+            result = runner(command, capture_output=True, text=True, timeout=10)
+            if result.returncode:
+                raise ValueError('no matching unexpired approval')
+        execution = [REAL, *clean]
+        if not read_only(clean):
+            execution = [REAL, '--debug=false', '--endpoint', CLOUD_ENDPOINT,
+                         '--hetzner-endpoint', HETZNER_ENDPOINT, *clean]
+        execute(REAL, execution, env)
+        return 0
+    except (ValueError, OSError, subprocess.SubprocessError):
+        # TOML/parser and provider errors may contain credentials; never echo them.
+        print(json.dumps({'ok': False, 'error': 'OWNER_GO_REQUIRED'}))
+        return 4
+
+
+if __name__ == '__main__':
+    sys.exit(main())

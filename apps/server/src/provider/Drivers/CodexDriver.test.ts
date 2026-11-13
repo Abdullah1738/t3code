@@ -41,6 +41,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderCredentialStore from "../ProviderCredentialStore.ts";
 import * as ProviderHostLive from "../ProviderHostLive.ts";
+import { modelProblem } from "../../ardud/kanban/engine/modelCheck.ts";
 
 const layerDeps = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-codex-driver-maintenance-",
@@ -96,7 +97,135 @@ const noSpawn = ChildProcessSpawner.make(() =>
 );
 const encodeCredentials = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
+const CATALOG_APP_SERVER = String.raw`#!/usr/bin/env node
+const readline = require("node:readline");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const { id, method } = JSON.parse(line);
+  if (id === undefined) return;
+  const results = {
+    initialize: { userAgent: "codex/0.167.1", codexHome: process.env.CODEX_HOME, platformFamily: "unix", platformOs: "linux" },
+    "account/read": { account: { type: "apiKey" }, requiresOpenaiAuth: false },
+    "skills/list": { data: [] },
+    "config/read": { config: {}, origins: {}, layers: null },
+    "model/list": { data: [{
+      id: "gpt-6.1-sol", model: "gpt-6.1-sol", displayName: "Sol", description: "",
+      hidden: false, isDefault: true, defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "" }],
+      ...(process.env.TEST_CATALOG_TIERS === "current" ? { serviceTiers: [{ id: "priority", name: "Fast", description: "" }] }
+        : process.env.TEST_CATALOG_TIERS === "legacy" ? { additionalSpeedTiers: ["fast"] } : {}),
+    }], nextCursor: null },
+  };
+  process.stdout.write(JSON.stringify({ id, result: results[method] ?? {} }) + "\n");
+});
+`;
+
 it.layer(layerTest)("CodexDriver", (it) => {
+  it.effect.each(windowsHost ? [] : ["current", "legacy", "none"])(
+    "managed catalogs retain the standard tier for card validation (%s)",
+    (catalog) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-managed-catalog-" });
+        const executablePath = NodePath.join(dir, "codex");
+        yield* fs.writeFileString(executablePath, CATALOG_APP_SERVER);
+        yield* fs.chmod(executablePath, 0o755);
+        const instanceId = ProviderInstanceId.make("codex");
+        const credentials = new Map<string, Uint8Array>();
+        const secrets = ServerSecretStore.ServerSecretStore.of({
+          get: (key) => Effect.sync(() => Option.fromUndefinedOr(credentials.get(key))),
+          set: (key, value) =>
+            Effect.sync(() => {
+              credentials.set(key, value);
+            }),
+          remove: (key) =>
+            Effect.sync(() => {
+              credentials.delete(key);
+            }),
+          create: () => Effect.die("unused"),
+          getOrCreateRandom: () => Effect.die("unused"),
+        });
+        const installation = yield* CodexInstallation.CodexInstallation;
+        const executable = {
+          executablePath,
+          managedVersionDirectory: null,
+          source: "local" as const,
+          version: "0.167.1",
+        };
+        yield* Effect.gen(function* () {
+          const store = yield* ProviderCredentialStore.make("codex-chatgpt", instanceId);
+          const json = yield* encodeCredentials({
+            clientId: "oaiapp_test",
+            accessToken: "catalog-test",
+            refreshToken: "test-refresh",
+            expiresAt: Number.MAX_SAFE_INTEGER,
+            earliestRefreshAt: null,
+            scopes: ["chatgpt.tokens.use.direct"],
+            subject: "test-user",
+            email: "test@example.test",
+          });
+          yield* store.set(new TextEncoder().encode(json));
+          const instance = yield* CodexDriver.create({
+            instanceId,
+            displayName: "Managed catalog",
+            enabled: true,
+            environment: [{ name: "TEST_CATALOG_TIERS", value: catalog, sensitive: false }],
+            config: { ...CodexDriver.defaultConfig(), setupMode: "managed", homePath: dir },
+          });
+          const snapshot = yield* instance.snapshot.refresh;
+          expect(snapshot.auth.status).toBe("authenticated");
+          expect(snapshot.models).toHaveLength(1);
+          const descriptors = snapshot.models[0]!.capabilities?.optionDescriptors;
+          expect(descriptors?.map((option) => option.id)).toEqual([
+            "reasoningEffort",
+            "serviceTier",
+          ]);
+          expect(descriptors?.find((option) => option.id === "serviceTier")).toMatchObject({
+            type: "select",
+            options: [{ id: "default", label: "Standard", isDefault: true }],
+          });
+          expect(
+            modelProblem([snapshot], {
+              instanceId,
+              model: "gpt-6.1-sol",
+              options: [
+                { id: "reasoningEffort", value: "xhigh" },
+                { id: "serviceTier", value: "default" },
+              ],
+            }),
+          ).toBeNull();
+          for (const value of ["priority", "fast", "unknown", false]) {
+            expect(
+              modelProblem([snapshot], {
+                instanceId,
+                model: "gpt-6.1-sol",
+                options: [{ id: "serviceTier", value }],
+              }),
+            ).toContain("serviceTier");
+          }
+        }).pipe(
+          Effect.provideService(ServerSecretStore.ServerSecretStore, secrets),
+          Effect.provideService(CodexInstallation.CodexInstallation, {
+            ...installation,
+            resolve: () => Effect.succeed(executable),
+            acquire: () => Effect.succeed(executable),
+          }),
+          Effect.provideService(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.succeed(
+                HttpClientResponse.fromWeb(
+                  request,
+                  Response.json({
+                    models: [{ slug: "gpt-6.1-sol", display_name: "Sol", visibility: "list" }],
+                  }),
+                ),
+              ),
+            ),
+          ),
+        );
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("reports a disabled managed account as disabled", () =>
     Effect.gen(function* () {
       const instance = yield* CodexDriver.create({

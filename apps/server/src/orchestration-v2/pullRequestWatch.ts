@@ -27,27 +27,56 @@ export interface PullRequestWatchReport {
 }
 
 // "action-required" is a finished check that needs someone, so the agent hears about it.
-const isFailedCheck = (check: PullRequestCheck) =>
+export const isFailedCheck = (check: Pick<PullRequestCheck, "status">) =>
   check.status === "failure" || check.status === "cancelled" || check.status === "action-required";
+
+export const pullRequestChecksSettling = (
+  detail: Pick<PullRequestDetail, "headSha" | "headBranchSha" | "checksHeadSha">,
+): boolean =>
+  (detail.headBranchSha != null && detail.headBranchSha !== detail.headSha) ||
+  (detail.checksHeadSha != null && detail.checksHeadSha !== detail.headSha);
+
+export function headCiState(
+  checks: ReadonlyArray<Pick<PullRequestCheck, "status" | "required">>,
+): "passing" | "failing" | "pending" | null {
+  if (checks.length === 0) return null;
+  if (checks.some(isFailedCheck)) return "failing";
+  return checks.some((check) => check.status === "pending") ? "pending" : "passing";
+}
+
+export function failedCheckLabel(check: PullRequestCheck): string {
+  return `${check.name} (${check.status}${check.required === true ? "" : ", not required"})`;
+}
 
 export function evaluatePullRequestWatch(
   watch: ThreadPullRequestWatch,
   detail: Pick<
     PullRequestDetail,
-    "headSha" | "baseSha" | "checks" | "mergeability" | "viewer" | "author"
+    | "headSha"
+    | "headBranchSha"
+    | "checksHeadSha"
+    | "baseSha"
+    | "checks"
+    | "mergeability"
+    | "viewer"
+    | "author"
   >,
   remarks: ReadonlyArray<PullRequestComment> | null,
 ): PullRequestWatchReport {
   const changes: Array<PullRequestWatchChange> = [];
   const headSha = detail.headSha ?? null;
   const headMoved = headSha !== watch.headSha;
+  // GitHub's PR record and rollup can lag its branch ref after a push. Preserve the
+  // check watermark until these reads agree, so the settled head still gets its verdict.
+  const checksSettling = pullRequestChecksSettling(detail);
+  const checkHeadMoved = headMoved && !checksSettling;
 
   // An empty list keeps the last state: a host can answer with one when its check read fails.
-  let failedChecks = headMoved ? [] : watch.failedChecks;
-  let passed = headMoved ? false : watch.passed;
-  let passedChecks = headMoved ? [] : watch.passedChecks;
-  let passedPending = headMoved ? [] : watch.passedPending;
-  if (detail.checks.length > 0) {
+  let failedChecks = checkHeadMoved ? [] : watch.failedChecks;
+  let passed = checkHeadMoved ? false : watch.passed;
+  let passedChecks = checkHeadMoved ? [] : watch.passedChecks;
+  let passedPending = checkHeadMoved ? [] : watch.passedPending;
+  if (!checksSettling && detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
     const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
     if (newlyFailed.length > 0) changes.push({ kind: "checks-failed", failed: newlyFailed });
@@ -55,7 +84,7 @@ export function evaluatePullRequestWatch(
 
     const required = detail.checks.filter((check) => check.required === true);
     const gate = required.length > 0 ? required : detail.checks;
-    const passedNow = gate.every((check) => check.status !== "pending" && !isFailedCheck(check));
+    const passedNow = headCiState(detail.checks) === "passing";
     const gateNames = gate.map((check) => check.name);
     const told = passed && passedChecks.length === 0 ? gateNames : passedChecks;
     // A required job created and finished between two passes is never seen pending. Without
@@ -72,7 +101,7 @@ export function evaluatePullRequestWatch(
     passedPending = required.length === 0 && passedNow ? gateNames : [];
     passed = passedNow && (passed || confirmed);
     passedChecks = passed ? gateNames : [];
-  } else {
+  } else if (!checksSettling) {
     passedPending = [];
   }
 
@@ -121,13 +150,13 @@ export function evaluatePullRequestWatch(
   }
 
   const commentsOnly = changes.length > 0 && changes.every((change) => change.kind === "remarks");
-  const progress = headMoved || (changes.length > 0 && !commentsOnly);
+  const progress = checkHeadMoved || (changes.length > 0 && !commentsOnly);
   const wakes = (progress ? 0 : watch.wakes) + (commentsOnly ? 1 : 0);
   return {
     changes,
     next: {
       startedAt: watch.startedAt,
-      headSha,
+      headSha: checksSettling ? watch.headSha : headSha,
       failedChecks,
       passed,
       passedChecks,
@@ -167,8 +196,7 @@ function changeLines(
         `- Checks failed${context.commit}:`,
         ...listed(
           change.failed,
-          (check) =>
-            `  - ${check.name}${check.status === "failure" ? "" : ` (${check.status})`}${check.url ? ` ${check.url}` : ""}`,
+          (check) => `  - ${failedCheckLabel(check)}${check.url ? ` ${check.url}` : ""}`,
         ),
       ];
     case "checks-passed":

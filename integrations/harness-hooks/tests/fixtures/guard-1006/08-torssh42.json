@@ -1,0 +1,33 @@
+{
+  "case_number": 8,
+  "reporter_id": "torssh42",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:dfb73003-3c44-46b1-936f-ea6a6dd31712",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T21-41-49-01a1cbb3-a116-7d33-bf7a-fd4842d672e3.jsonl",
+    "source_call_line_0": 560,
+    "timestamp": "2026-11-11T18:10:22.934Z",
+    "call_id": "call_643807283f164fef83a68d10776df836",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 23,
+    "intentionally_absent_from_setup_files": [
+      "tmp/lyrebird42/shell-control.py"
+    ]
+  },
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "commands": [
+    {
+      "cmd": "cat > tmp/lyrebird42/shell-control.py <<'PY'\nfrom pathlib import Path\nimport base64,json,secrets,shlex,struct,subprocess\nhold=Path.home()/'.local/share/phone-lock/priority-hold'\nif hold.exists(): raise SystemExit(0)\nadb=['adb','-s','002473611000997']\napk=subprocess.check_output([*adb,'shell','pm','path','dev.torssh'],timeout=20).decode().strip().removeprefix('package:')\nexe=str(Path(apk).parent/'lib/arm64/libtorcore_lyrebird.so')\nreport=[]\nfor stage,cmd in [('two-step','exec 3<&0; exec \"$1\" --torssh-launch-fd=3'),('one-step','exec \"$1\" --torssh-launch-fd=3 3<&0')]:\n if hold.exists(): break\n config={'version':1,'token':secrets.token_hex(32),'transport':'obfs4','bridges':[{'address':'127.0.0.1:9','options':{'cert':base64.b64encode(bytes(52)).decode().rstrip('='),'iat-mode':'0'}}]}\n raw=json.dumps(config).encode(); frame=struct.pack('!I',len(raw))+raw\n script='state=\"$PWD/no_backup/lyrebird42-shell\"; mkdir -p \"$state\"; chmod 700 \"$state\"; cat | env -i TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_EXIT_ON_STDIN_CLOSE=1 TOR_PT_CLIENT_TRANSPORTS=obfs4 TOR_PT_STATE_LOCATION=\"$state\" /system/bin/sh -c '+shlex.quote(cmd)+' probe '+shlex.quote(exe)+'; result=$?; rm -rf \"$state\"; exit \"$result\"'\n r=subprocess.run([*adb,'shell',shlex.join(['run-as','dev.torssh','/system/bin/sh','-c',script])],input=frame,capture_output=True,timeout=20)\n report.append(f'{stage} exit={r.returncode} handshake={b\"CMETHODS DONE\" in r.stdout} stderr_empty={not r.stderr}')\ntext='\\n'.join(report)+'\\n'\nPath('tmp/lyrebird42/phone-shell-control.txt').write_text(text)\nprint(text,end='')\nPY\npython3 tmp/lyrebird42/shell-control.py\ntail -10 tmp/lyrebird42/diagnostic-build.log",
+      "workdir": "/Users/ardud/checkouts/torssh-lyrebird-probe",
+      "sha256": "fe52614903f9e5d5e8456b4137447b0e40b642f5e70853bcc163f27f05d12ed0"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

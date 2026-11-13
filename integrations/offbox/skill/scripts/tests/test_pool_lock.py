@@ -1,6 +1,7 @@
 """The pool lock covers only choosing a box (31 Oct, edge-api: a 900 s resume under the pool lock failed every other
 caller with exit 90 "timed out waiting for lock pool-..."). Offline: no boat calls."""
 import contextlib
+import contextvars
 import io
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, capacity, cli, common, lease, pool, prune, runs  # noqa: E402
+from offbox_lib import allocation, api, capacity, cli, common, lease, pool, prune, runs  # noqa: E402
 from test_exit_and_queue import FakeClock
 from test_capacity import Isolated  # noqa: E402
 
@@ -356,21 +357,25 @@ class PruneQueueTests(Isolated):
         self.box('busy', member=True)
         self.busy('busy')
         calls = []
-        def gone(bid, *args):
+        def gone(con, bid, rid, budget):
             self.assertTrue(pool_lock_free(), 'worker probe must not hold the pool lock')
             calls.append(bid)
-            return bid == 'held1'
+            if bid == 'held3':
+                con.execute('DELETE FROM prune_holds WHERE box_id=?', (bid,))
+                con.commit()
+                return True
+            return False
         with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4'}), \
                 patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', side_effect=gone), \
+                patch.object(prune, 'recheck', side_effect=gone), \
                 patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
                 patch.object(lease, 'acquire_private') as new, contextlib.redirect_stderr(io.StringIO()):
             state = pool.queue_state(self.con, 'repo')
             self.assertEqual((state['busy'], state['cap'], state['held']), (1, 4, 3))
             row = pool.acquire(self.me)
             pool.release_guard(row)
-        self.assertEqual(row['box_id'], 'held1')
-        self.assertCountEqual(calls, ['held1', 'held2', 'held3'])
+        self.assertEqual(row['box_id'], 'held3')
+        self.assertEqual(calls, ['held3', 'held2'])
         new.assert_not_called()
 
     def test_rechecks_throttled_across_callers_per_box_and_pool(self):
@@ -379,12 +384,12 @@ class PruneQueueTests(Isolated):
         self.hold('other', key='other-repo')
         t = common.now()
         with patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', return_value=False) as probe:
+                patch.object(prune, 'recheck', return_value=False) as probe:
             for age, count in ((0, 2), (1, 2), (59, 2), (60, 4), (61, 4), (120, 6)):
                 with self.subTest(age=age), patch.object(pool, 'now', return_value=t + age):
                     self.assertFalse(pool._recheck_prune_holds(self.con, 'repo'))
                     self.assertEqual(probe.call_count, count)
-        self.assertNotIn('other', [call.args[0] for call in probe.call_args_list])
+        self.assertNotIn('other', [call.args[1] for call in probe.call_args_list])
 
     def test_concurrent_caller_cannot_repeat_probe(self):
         self.hold('one')
@@ -393,37 +398,29 @@ class PruneQueueTests(Isolated):
             seen.append(pool._recheck_prune_holds(self.con, 'repo'))
             return False
         with patch.object(api, 'get', return_value={'state': 'idle'}), \
-                patch.object(prune, 'worker_gone', side_effect=probe) as worker:
+                patch.object(prune, 'recheck', side_effect=probe) as worker:
             self.assertFalse(pool._recheck_prune_holds(self.con, 'repo'))
         self.assertEqual(seen, [False])
         worker.assert_called_once()
 
-    def test_queue_names_held_capacity_and_waiter_gets_box_after_next_probe(self):
+    def test_queued_acquire_does_not_repeat_ssh_probes(self):
         for bid in ('one', 'two', 'three'):
             self.hold(bid)
         self.box('busy', member=True)
         self.busy('busy')
         clock = [0.0]
-        epoch = common.now()
         def sleep(seconds):
             clock[0] += seconds
-        def gone(bid, *args):
-            return clock[0] >= 60 and bid == 'one'
-        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4', 'OFFBOX_POOL_WAIT_SECONDS': '120'}), \
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4', 'OFFBOX_POOL_WAIT_SECONDS': '65'}), \
                 patch.object(pool.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(pool.time, 'sleep', side_effect=sleep), \
-                patch.object(pool, 'now', side_effect=lambda: epoch + clock[0]), \
-                patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', side_effect=gone) as probe, \
-                patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
+                patch.object(prune, 'recheck', return_value=False) as probe, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            row = pool.acquire(self.me)
-            pool.release_guard(row)
+            with self.assertRaises(pool.PoolBusyError):
+                pool.acquire(self.me)
         self.assertIn('1 busy + 3 idle that can', err.getvalue())
         self.assertIn('3 held by checkout cleanup; #1 of 1', err.getvalue())
-        self.assertEqual(row['box_id'], 'one')
-        self.assertEqual(clock[0], 60)
-        self.assertEqual(probe.call_count, 6)
+        self.assertEqual(probe.call_count, 2)
 
     def test_active_run_with_hold_counted_once_as_busy(self):
         self.hold('held-busy')
@@ -565,7 +562,8 @@ class FairQueueTests(Isolated):
             checks.append(old['reserved'])
             self.assertEqual(old['reserved'], 0)
             with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '0'}), \
-                    patch.object(lease, 'acquire_private') as create:
+                    patch.object(lease, 'acquire_private') as create, \
+                    patch.object(allocation, '_QUEUE', contextvars.ContextVar('newer_queue', default=None)):
                 with self.assertRaises(pool.PoolBusyError):
                     pool.acquire(dict(self.me, owner='newer'))
                 create.assert_not_called()
@@ -625,7 +623,7 @@ class FairQueueTests(Isolated):
                 self.con.commit()
                 self.box('unanswered', member=True, source='template:a')
                 self.box('ready', member=True, source='template:b')
-                self.con.execute("INSERT INTO kv(k,v) VALUES ('resume_unanswered:unanswered','large')")
+                self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:unanswered', 'large', common.now() - 3600))
                 self.con.commit()
                 if older_source:
                     self.waiter(source=older_source)
@@ -647,7 +645,7 @@ class FairQueueTests(Isolated):
                 self.box('first', member=True, used=200)
                 self.box('second', member=True, used=100)
                 if path == 'recovery':
-                    self.con.execute("INSERT INTO kv(k,v) VALUES ('resume_unanswered:first','large')")
+                    self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:first', 'large', common.now() - 3600))
                     self.con.commit()
                 real_lock, checked, failed = common.file_lock, [], []
                 @contextlib.contextmanager
@@ -689,12 +687,12 @@ class FairQueueTests(Isolated):
                 self.box('pending', member=True, source='template:a')
                 self.box('other', state='stopped' if kind == 'stopped' else 'running', member=True,
                          size='default' if kind == 'undersized' else 'large', source='template:b')
-                self.con.execute("INSERT INTO kv(k,v) VALUES ('resume_unanswered:pending','large')")
+                self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:pending', 'large', common.now() - 3600))
                 self.con.commit()
                 guard = common.file_lock('box-other', timeout=0) if kind == 'locked' else contextlib.nullcontext()
                 def recover(con, row, size, **kwargs):
                     self.assertEqual(row['box_id'], 'pending')
-                    raise lease.ResumeProvisionStalled('provisioning stalled', box='pending')
+                    raise lease.ResumeProvisionStalled('provisioning stalled')
                 with guard, patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '3'}), \
                         patch.object(lease, '_reuse', side_effect=recover) as reuse, \
                         patch.object(lease, 'acquire_private', side_effect=self.new_box('replacement')) as create, \

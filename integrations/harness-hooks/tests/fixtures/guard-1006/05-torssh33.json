@@ -1,0 +1,37 @@
+{
+  "case_number": 5,
+  "reporter_id": "torssh33",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:fec7f394-291c-4515-afa3-862f86a9c5fb",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/10/rollout-2026-11-10T20-10-21-01a1c639-885b-7750-9b9b-b1078a4fe3e9.jsonl",
+    "source_call_line_0": 8597,
+    "timestamp": "2026-11-11T17:33:19.043Z",
+    "call_id": "call_4c66c1c4ddda45e08d5d2605b885a920",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "source_refusal_line_0": 8599,
+    "activity_confirmation": {
+      "position": 2039,
+      "item_id": "turn-item:provider:codex:native-item:exec-953ed14d-ff40-450b-a1b1-8d5acf26b211",
+      "detail": "Reporter evaluator request at 2026-11-11T17:34:45.754Z names this exact refused write-then-run command."
+    },
+    "intentionally_absent_from_setup_files": [
+      "tmp/test-session-merge-gradle-outcomes.py"
+    ]
+  },
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "commands": [
+    {
+      "cmd": "cat > tmp/test-session-merge-gradle-outcomes.py <<'PY'\nfrom pathlib import Path\nimport json\nimport re\nimport subprocess\nimport sys\nimport tempfile\n\ntasks = re.findall(r':[A-Za-z0-9_-]+:[A-Za-z0-9]+', Path('scripts/gradle-tasks.sh').read_text())\ntasks += [':app:buildNative', ':torcore:buildTorNative', ':torcore:buildLyrebird', ':torcore:buildTorCoreJni']\nstatuses = ('UP-TO-DATE', 'FROM-CACHE', 'SKIPPED', 'NO-SOURCE', 'FAILED', 'UNKNOWN')\ncount = 0\nwith tempfile.TemporaryDirectory() as directory:\n    log = Path(directory) / 'gradle.log'\n    def check(name, changed, suffixes, expected, success=True):\n        global count\n        rows = ['> Task ' + task for task in tasks if task != changed]\n        rows += ['> Task ' + changed + suffix for suffix in suffixes]\n        log.write_text('\\n'.join(rows + (['BUILD SUCCESSFUL'] if success else ['BUILD FAILED'])) + '\\n')\n        result = subprocess.run([sys.executable, 'tmp/session-merge-gradle-outcomes.py', str(log)],\n                                capture_output=True, text=True)\n        assert (result.returncode == 0) == expected, (name, changed, result.stderr)\n        if expected:\n            output = json.loads(log.with_name('forced-task-outcomes.json').read_text())\n            assert set(output) == set(tasks)\n        count += 1\n    for task in tasks:\n        check('single-executed', task, [''], True)\n        check('resumed-output-header', task, ['', ''], True)\n        check('multiple-resumed-headers', task, ['', '', ''], True)\n        check('missing', task, [], False)\n        for status in statuses:\n            suffix = ' ' + status\n            allowed = task == ':torcore-sample:testDebugUnitTest' and status == 'NO-SOURCE'\n            check('single-' + status, task, [suffix], allowed)\n            check('duplicate-' + status, task, [suffix, suffix], allowed)\n            check('mixed-final-' + status, task, ['', suffix], False)\n            check('mixed-initial-' + status, task, [suffix, ''], False)\n        check('no-success-summary', task, [''], False, success=False)\n    check('similar-task-is-not-target', ':app:buildNative', ['Extra'], False)\n    captured = Path('tmp/session-auditor-failure-211144/gradle-forced-offline.log')\n    log.write_bytes(captured.read_bytes())\n    result = subprocess.run([sys.executable, 'tmp/session-merge-gradle-outcomes.py', str(log)],\n                            capture_output=True, text=True)\n    assert result.returncode == 0, result.stderr\n    count += 1\nprint('PASS', count, 'task-header/status cases including the exact captured offline log')\nPY\n/usr/bin/python3 tmp/test-session-merge-gradle-outcomes.py",
+      "workdir": "/Users/ardud/checkouts/torssh-session-core",
+      "sha256": "7dea010c2c03397b6098fa081db13a1dedc6eec9f62b41a042f4c4df58450f6a"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

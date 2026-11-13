@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 from dataclasses import replace
 import json
@@ -7,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import talabat_fresh_review as r
-from test import test_talabat_place_contract as fixtures
+import test_talabat_place_contract as fixtures
 
 
 def snapshot():
@@ -34,6 +35,9 @@ def acknowledgement(value, at=1006):
 
 
 class FreshReviewTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_full_local_bundle_derives_journal_shape_without_io(self):
         frozen = freeze()
         review = json.loads(frozen._review)

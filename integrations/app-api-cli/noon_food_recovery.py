@@ -32,6 +32,11 @@ class NativeReader:
         self.flow=food.FoodFlow(self.state['outlet'],rows,self.flow_id,read_only=True)
         try:
             data=self.flow.read()
+            if not any(o['kind'] in ('place','payment') for o in j.inspect(self.flow_id)['operations']):
+                orders=vertical.food_orders(timeout=15)['orders']
+                require(all(o['raw_status'] in ('delivered','cancelled','canceled','failed','rejected') for o in orders),
+                        'FOOD_ACTIVE_OR_UNKNOWN_ORDER')
+                data=food.request('can-place',self.flow.headers,{'sessionCode':self.state['session']})
         except j.JournalError as exc:
             if str(exc) == 'FOOD_RESPONSE_UNVERIFIED':
                 local=j.inspect(self.flow_id)
@@ -57,24 +62,55 @@ class NativeReader:
         return {'account_hash':self.flow.account,'scope_hash':self.flow.scope,
                 'session_id':self.state['session'],'review_hash':self.state['review_hash'],
                 'amount_minor':review['payable_minor'],'card_hash':self.state['card_hash'],
-                'order_id':data.get('orderNr')}
+                'order_id':data.get('orderNr'),
+                'automatic_eligible':data.get('paymentRequireCvv') is False
+                    and data.get('paymentRequireCompletion') is False
+                    and 'paymentClientSecret' in data
+                    and data.get('paymentClientSecret') is None
+                    and minor(data.get('orderPaymentFinalTotal'))==review['payable_minor']}
+
+    def retained_session(self, financial, order):
+        rows=[{'item_code':r['itemCode'],'qty':r['qty'],'modifiers':r['modifiers'],'notes':r['notes']}
+              for r in self.state['items']]
+        self.flow=food.FoodFlow(self.state['outlet'],rows,self.flow_id,read_only=True)
+        require(j.digest(self.state['review']) == self.state['review_hash']
+                and all(financial[k] == v for k,v in {
+                    'session_id':self.state['session'], 'review_hash':self.state['review_hash'],
+                    'amount_minor':self.state['review']['payable_minor'], 'card_hash':self.state['card_hash']}.items()),
+                'FOOD_FINANCIAL_REVIEW_CHANGED')
+        self.session_data={}
+        return {**financial,'order_id':order,'account_hash':self.flow.account,'scope_hash':self.flow.scope}
 
     def order(self, order):
+        from commerce_food_capture import valid_processed_at
         require(self.flow is not None,'FOOD_SESSION_READ_REQUIRED')
         data=vertical._food_data(vertical._read('food_detail',self.flow.headers,core.operation_deadline(15),order))
         row=project_order(data,order,self.flow,self.state)
+        if self.session_data:
+            cvv=self.session_data.get('paymentRequireCvv')
+            row['cvv_required']=cvv if type(cvv) is bool and ('paymentRequireCvv' not in data or data['paymentRequireCvv'] is cvv) else None
+        row['completion_required']=data.get('paymentRequireCompletion')
         row['automatic_payment_processed']=(
-            self.session_data.get('paymentRequireCompletion') is False
-            and self.session_data.get('paymentRequireCvv') is False
-            and j.digest(str(self.session_data.get('paymentToken')))==self.state['card_hash']
-            and data.get('paymentClientSecret') is None
-            and isinstance(data.get('paymentProcessedAt'),str)
-            and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d',data['paymentProcessedAt']) is not None
+            'paymentClientSecret' in data and data['paymentClientSecret'] is None
+            and (not self.session_data or (self.session_data.get('paymentRequireCvv') is False
+                and self.session_data.get('paymentRequireCompletion') is False
+                and j.digest(str(self.session_data.get('paymentToken')))==self.state['card_hash']
+                and minor(self.session_data.get('orderPaymentFinalTotal'))==self.state['review']['payable_minor']))
+            and ('paymentRequireCvv' not in data or data['paymentRequireCvv'] is False)
+            and ('paymentRequireCompletion' not in data or data['paymentRequireCompletion'] is False)
+            and valid_processed_at(data.get('paymentProcessedAt'))
             and (data.get('miscInfo') or {}).get('isPaymentAutoCapture') is True
-            and minor(self.session_data.get('orderPaymentFinalTotal'))==self.state['review']['payable_minor']
-            and all(data.get(k)==0 for k in ('orderRefundToWallet','orderIssuedCredit','orderAdjustments'))
+            and all(type(data.get(k)) in (int,float) and data[k]==0
+                    for k in ('orderRefundToWallet','orderIssuedCredit','orderAdjustments'))
             and data.get('failedErrorMsg') is None and row['accepted'])
         return row
+
+    def bank_capture(self, order):
+        from commerce_food_capture import find_bank_capture
+        placed=j.food_capture_placed_at(self.flow_id)
+        bank=find_bank_capture(placed,self.state['review']['payable_minor'],self.state['review']['card_last4'])
+        j.claim_food_bank_purchase(self.flow_id,bank)
+        return {'paid':True,'order':order,'bank':bank,'source':'exact_native_automatic_and_bank_purchase'}
 
     def payment(self, intent):
         import noon_nownow_checkout as payment
@@ -91,7 +127,7 @@ class NativeReader:
         data=payment.native_request('payment_cards',self.flow.headers,core.operation_deadline(15),None,
                                    response_observer=lambda *a,**k:None)
         rows=[r for r in data.get('data',[]) if isinstance(r,dict) and r.get('isDeleted') is False
-              and str(r.get('ccMasked') or '').endswith('2342') and str(r.get('id','')).isdigit()]
+              and str(r.get('ccMasked') or '').endswith(self.flow.card_last4) and str(r.get('id','')).isdigit()]
         require(len(rows)==1 and j.digest(str(rows[0]['id']))==self.state['card_hash'],'FOOD_PAYMENT_TOKEN_MISMATCH')
         return str(rows[0]['id'])
 
@@ -111,7 +147,7 @@ def project_order(data, order, flow, state):
     require(data.get('currencyCode')=='AED' and minor(data.get('orderTotal'))==amount
             and minor(data.get('orderPaymentAmount'))==amount and minor(data.get('orderWalletAmount'))==0,
             'FOOD_ORDER_AMOUNT_CHANGED')
-    require(str(data.get('creditCardMask') or '').endswith('2342')
+    require(str(data.get('creditCardMask') or '').endswith(state['review']['card_last4'])
             and data.get('paymentMethodCode')=='prepaid' and data.get('prepaidPaymentMethodCode')=='cc_noonpay'
             and data.get('paymentProviderCode')=='NOON_PAY','FOOD_ORDER_PAYMENT_METHOD_CHANGED')
     # Quiet preferences in order details use "choice"; sessions use "value".
@@ -119,7 +155,8 @@ def project_order(data, order, flow, state):
     require(all(prefs.get(k) is True for k in food.QUIET) and data.get('driverNotes')==food.QUIET_NOTE,
             'FOOD_ORDER_QUIET_CHANGED')
     return {'order_id':order,'account_hash':flow.account,'scope_hash':flow.scope,
-            'amount_minor':amount,'card_hash':state['card_hash'],'intent':data.get('paymentClientSecret'),
+            'amount_minor':amount,'card_hash':state['card_hash'],'card_last4':state['review']['card_last4'],
+            'intent':data.get('paymentClientSecret'),
             'cvv_required':data.get('paymentRequireCvv'),
             'accepted':(data.get('orderStatusCode')=='accepted' and data.get('outletStatusCode')=='accepted') or data.get('orderStatusCode')=='delivered' or
                        (data.get('outletStatusCode')=='picked_up' and data.get('orderStatusCode') in ('delivering','picked_up'))}
@@ -155,4 +192,6 @@ class TrackerRegistrar:
                 and cfg.get('vertical')=='food' and watcher.get('id')==name
                 and cfg.get('delivery_card',{}).get('held') is (not paid),'FOOD_TRACKER_REGISTRATION_UNVERIFIED')
         _,receipt=order_watch_receipt.parse(result.stdout,result.returncode,'owner',name)
+        require(not paid or (receipt.get('delivery_card') or {}).get('status')=='sent',
+                'FOOD_DELIVERY_CARD_SEND_UNVERIFIED')
         return {'registered':True,'order':order,'held':not paid,**receipt}

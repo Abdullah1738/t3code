@@ -6,7 +6,8 @@ from pathlib import Path
 HOME = Path.home()
 MARKER = '# app-api-cli managed launcher\n'
 COMMANDS = {'talabat-auth': 'talabat_auth.py', 'amazon-orders': 'amazon_email_orders.py',
-            'amazon-browser-orders': 'amazon_dia_cli.py'}
+            'amazon-browser-orders': 'amazon_dia_cli.py', 'owner-go': 'owner_go.py',
+            'card-vault-fill': 'card_vault_fill.py'}
 HELPERS = ('amazon_browser_orders.py', 'amazon_dia_transport.mjs')
 
 

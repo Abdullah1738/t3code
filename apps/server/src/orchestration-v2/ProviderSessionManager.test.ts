@@ -27,6 +27,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -371,6 +372,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly listLoadedNativeThreads?: ProviderAdapter.ProviderAdapterV2SessionRuntime["listLoadedNativeThreads"];
+    readonly ensureThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
     readonly afterResume?: Effect.Effect<void>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
@@ -476,7 +479,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           ...(options.pendingWorkForThread === undefined
             ? {}
             : { hasPendingBackgroundWorkForThread: options.pendingWorkForThread }),
-          ensureThread: () => unimplemented("ensureThread unused in test"),
+          ensureThread:
+            options.ensureThread ?? (() => unimplemented("ensureThread unused in test")),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
               ...current,
@@ -505,6 +509,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                 })),
               ),
             ),
+          ...(options.listLoadedNativeThreads === undefined
+            ? {}
+            : { listLoadedNativeThreads: options.listLoadedNativeThreads }),
           respondToRuntimeRequest: () => Effect.void,
           readThreadSnapshot: () => unimplemented("readThreadSnapshot unused in test"),
           rollbackThread: () => unimplemented("rollbackThread unused in test"),
@@ -542,6 +549,8 @@ function layerTest(input: {
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
   readonly beforeUnload?: Effect.Effect<void>;
+  readonly listLoadedNativeThreads?: ProviderAdapter.ProviderAdapterV2SessionRuntime["listLoadedNativeThreads"];
+  readonly ensureThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
   readonly afterResume?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
@@ -585,6 +594,10 @@ function layerTest(input: {
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
       ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+      ...(input.listLoadedNativeThreads === undefined
+        ? {}
+        : { listLoadedNativeThreads: input.listLoadedNativeThreads }),
+      ...(input.ensureThread === undefined ? {} : { ensureThread: input.ensureThread }),
       ...(input.afterResume === undefined ? {} : { afterResume: input.afterResume }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
       ...(input.scopeCloseReached === undefined
@@ -964,7 +977,11 @@ const makeSessionAudienceFixture = Effect.fnUntraced(function* (
       modelSelection,
       runtimePolicy,
     });
-  const start = Effect.fnUntraced(function* (threadId: ThreadId, ordinal = 1) {
+  const start = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    ordinal = 1,
+    providerThread = providerThreadOf(threadId),
+  ) {
     const runId = idAllocator.derive.run({ threadId, ordinal });
     yield* runtime.startTurn({
       appThread: created.find((event) => event.threadId === threadId)!.payload,
@@ -974,7 +991,7 @@ const makeSessionAudienceFixture = Effect.fnUntraced(function* (
       providerTurnOrdinal: ordinal,
       attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
       rootNodeId: idAllocator.derive.rootNode({ runId }),
-      providerThread: providerThreadOf(threadId),
+      providerThread,
       message: {
         createdBy: "user",
         creationSource: "web",
@@ -5886,12 +5903,14 @@ it.effect(
           threadId: firstThreadId,
           providerSessionId,
           now,
+          nativeThreadId: "shared-runtime-first",
         });
         const secondProviderThread = makeProviderThread({
           idAllocator,
           threadId: secondThreadId,
           providerSessionId,
           now,
+          nativeThreadId: "shared-runtime-second",
         });
         const firstRunId = idAllocator.derive.run({ threadId: firstThreadId, ordinal: 1 });
         yield* eventSink.write({
@@ -5994,13 +6013,18 @@ it.effect(
         yield* resumeSecondThread;
         assert.equal((yield* Ref.get(state)).resumeCount, 4);
 
-        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          "shared-runtime-second",
+        ]);
 
         yield* manager.detach({ providerSessionId, threadId: firstThreadId });
         assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
         assert.equal((yield* Ref.get(state)).closeCount, 0);
         assert.equal((yield* Ref.get(state)).interruptCount, 1);
-        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          "shared-runtime-second",
+          "shared-runtime-first",
+        ]);
 
         yield* manager.detach({ providerSessionId, threadId: secondThreadId });
         yield* TestClock.adjust("1 second");
@@ -6815,4 +6839,1200 @@ it.effect("ProviderSessionManagerV2 unloads a thread whose resume preparation is
       },
     );
   }),
+);
+
+it.effect.each([false, true])(
+  "ProviderSessionManagerV2 unloads the superseded native ID while its replacement turn remains busy (resume fails: %s)",
+  (resumeFails) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const failNextResume = yield* Ref.make(false);
+      const effect = Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const [target, sibling] = f.threadIds;
+        yield* f.resume(target!);
+        yield* f.start(sibling!);
+        if (resumeFails) {
+          yield* Ref.set(failNextResume, true);
+          const failedResume = yield* Effect.exit(
+            f.runtime.resumeThread({
+              providerThread: f.providerThreadOf(target!),
+              threadId: target!,
+              modelSelection: { ...modelSelection, model: "gpt-6-astra" },
+              runtimePolicy,
+            }),
+          );
+          assert.equal(failedResume._tag, "Failure");
+        } else {
+          yield* f.resume(target!);
+        }
+        const prior = f.providerThreadOf(target!);
+        const replacement = yield* f.runtime.ensureThread({
+          threadId: target!,
+          title: "replacement",
+          providerSessionId: f.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          existingProviderThread: { ...prior, nativeThreadRef: null },
+          forceNewNativeThread: true,
+        });
+        yield* f.start(target!, 1, replacement);
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${target}`]);
+        yield* f.finish(target!);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          `native-${target}`,
+          "replacement-native",
+        ]);
+        yield* TestClock.adjust("2 seconds");
+        assert.equal((yield* Ref.get(state)).unloadedNativeThreadIds.length, 2);
+      });
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            afterResume: Ref.getAndSet(failNextResume, false).pipe(
+              Effect.flatMap((fail) =>
+                fail ? Effect.die("resume transport failure") : Effect.void,
+              ),
+            ),
+            ensureThread: (input) =>
+              Effect.succeed({
+                ...input.existingProviderThread!,
+                nativeThreadRef: {
+                  driver: CODEX_DRIVER,
+                  nativeId: "replacement-native",
+                  strength: "strong" as const,
+                },
+              }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([0, 1, 3])(
+  "ProviderSessionManagerV2 bounds detach cleanup retries and does not unsubscribe an unloaded generation again (failures: %s)",
+  (failures) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const attempts = yield* Ref.make(0);
+      const effect = Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const [target, sibling] = f.threadIds;
+        yield* f.resume(target!);
+        yield* f.start(sibling!);
+        const providerThread = f.providerThreadOf(target!);
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId: target! }),
+              type: "provider-thread.updated",
+              threadId: target!,
+              driver: CODEX_DRIVER,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: f.now,
+              payload: providerThread,
+            },
+          ],
+        });
+        yield* f.manager.detach({ providerSessionId: f.providerSessionId, threadId: target! });
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Ref.get(attempts), Math.min(failures + 1, 3));
+        assert.deepEqual(
+          (yield* Ref.get(state)).unloadedNativeThreadIds,
+          failures < 3 ? [`native-${target}`] : [],
+        );
+        yield* f.manager.detach({ providerSessionId: f.providerSessionId, threadId: target! });
+        assert.equal(yield* Ref.get(attempts), Math.min(failures + 1, 3));
+      });
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            beforeUnload: Ref.updateAndGet(attempts, (n) => n + 1).pipe(
+              Effect.flatMap((attempt) =>
+                attempt <= failures ? Effect.die("unsubscribe transport failure") : Effect.void,
+              ),
+            ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 defers an idle unload when its background-work probe fails, then unloads after recovery",
+  () =>
+    Effect.gen(function* () {
+      const failing = yield* Ref.make(true);
+      yield* runIdleThreadUnloadScenario(
+        "probe-error",
+        ({ state, threadA, startTurn, endTurn }) =>
+          Effect.gen(function* () {
+            yield* startTurn(threadA, 1);
+            yield* endTurn(threadA, 1);
+            yield* TestClock.adjust("3 seconds");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+            yield* Ref.set(failing, false);
+            yield* TestClock.adjust("1 second");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+              `native-${threadA}`,
+            ]);
+          }),
+        {
+          hasPendingBackgroundWorkForThread: Ref.get(failing).pipe(
+            Effect.flatMap((fail) =>
+              fail ? Effect.die("probe transport failure") : Effect.succeed(false),
+            ),
+          ),
+        },
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps the session alive when its background-work probe fails",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const failing = yield* Ref.make(true);
+      const probe = Ref.get(failing).pipe(
+        Effect.flatMap((fail) =>
+          fail ? Effect.die("probe transport failure") : Effect.succeed(false),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 1);
+        yield* f.resume(f.threadIds[0]!);
+        yield* TestClock.adjust("3 seconds");
+        assert.isTrue(Option.isSome(yield* f.manager.get(f.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* Ref.set(failing, false);
+        yield* TestClock.adjust("1 second");
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            hasPendingBackgroundWork: probe,
+            hasPendingBackgroundWorkForThread: probe,
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect("ProviderSessionManagerV2 detach skips a native generation already idle-unloaded", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 2);
+      const [target, sibling] = f.threadIds;
+      yield* f.resume(target!);
+      yield* f.start(sibling!);
+      yield* f.eventSink.write({
+        events: [
+          {
+            id: yield* f.idAllocator.allocate.event({ threadId: target! }),
+            type: "provider-thread.updated",
+            threadId: target!,
+            driver: CODEX_DRIVER,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: f.now,
+            payload: f.providerThreadOf(target!),
+          },
+        ],
+      });
+      yield* TestClock.adjust("1 second");
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${target}`]);
+      yield* f.manager.detach({ providerSessionId: f.providerSessionId, threadId: target! });
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${target}`]);
+    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
+  }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 detaches every pending native generation of a replaced provider row",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const [target, sibling] = f.threadIds;
+        yield* f.resume(target!);
+        yield* f.start(sibling!);
+        yield* f.runtime.ensureThread({
+          threadId: target!,
+          title: "replacement",
+          providerSessionId: f.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          existingProviderThread: { ...f.providerThreadOf(target!), nativeThreadRef: null },
+          forceNewNativeThread: true,
+        });
+        yield* f.manager.detach({ providerSessionId: f.providerSessionId, threadId: target! });
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          `native-${target}`,
+          "replacement-native",
+        ]);
+        yield* TestClock.adjust("2 seconds");
+        assert.equal((yield* Ref.get(state)).unloadedNativeThreadIds.length, 2);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            ensureThread: (input) =>
+              Effect.succeed({
+                ...input.existingProviderThread!,
+                nativeThreadRef: {
+                  driver: CODEX_DRIVER,
+                  nativeId: "replacement-native",
+                  strength: "strong" as const,
+                },
+              }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 retains superseded cleanup when reattachment wins before detach unloads",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const armed = yield* Ref.make(false);
+      const detached = yield* Deferred.make<void>();
+      const continueDetach = yield* Deferred.make<void>();
+      const mcpRegistryLayer = Layer.effect(
+        McpSessionRegistry.McpSessionRegistry,
+        Effect.gen(function* () {
+          const delegate = yield* McpSessionRegistry.McpSessionRegistry;
+          return McpSessionRegistry.McpSessionRegistry.of({
+            ...delegate,
+            revokeThread: (threadId) =>
+              delegate
+                .revokeThread(threadId)
+                .pipe(
+                  Effect.tap(() =>
+                    Ref.getAndSet(armed, false).pipe(
+                      Effect.flatMap((pause) =>
+                        pause
+                          ? Deferred.succeed(detached, undefined).pipe(
+                              Effect.andThen(Deferred.await(continueDetach)),
+                            )
+                          : Effect.void,
+                      ),
+                    ),
+                  ),
+                ),
+          });
+        }),
+      ).pipe(Layer.provide(layerTestMcpRegistry), Layer.orDie);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const [target, sibling] = f.threadIds;
+        yield* f.resume(target!);
+        yield* f.start(sibling!);
+        const replacement = yield* f.runtime.ensureThread({
+          threadId: target!,
+          title: "replacement",
+          providerSessionId: f.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          existingProviderThread: { ...f.providerThreadOf(target!), nativeThreadRef: null },
+          forceNewNativeThread: true,
+        });
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId: target! }),
+              type: "provider-thread.updated",
+              threadId: target!,
+              driver: CODEX_DRIVER,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: f.now,
+              payload: replacement,
+            },
+          ],
+        });
+        yield* Ref.set(armed, true);
+        const detaching = yield* f.manager
+          .detach({
+            providerSessionId: f.providerSessionId,
+            threadId: target!,
+            revokeMcpCredential: true,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(detached);
+        yield* f.runtime.resumeThread({
+          providerThread: replacement,
+          threadId: target!,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* f.start(target!, 1, replacement);
+        yield* Deferred.succeed(continueDetach, undefined);
+        yield* Fiber.join(detaching);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${target}`]);
+        yield* f.finish(target!);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          `native-${target}`,
+          "replacement-native",
+        ]);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            mcpRegistryLayer,
+            ensureThread: (input) =>
+              Effect.succeed({
+                ...input.existingProviderThread!,
+                nativeThreadRef: {
+                  driver: CODEX_DRIVER,
+                  nativeId: "replacement-native",
+                  strength: "strong" as const,
+                },
+              }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 unloading a superseded native ID preserves the replacement's loaded cache",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const pending = yield* Ref.make(true);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const [target, sibling] = f.threadIds;
+        yield* f.resume(target!);
+        yield* f.start(sibling!);
+        const replacement = yield* f.runtime.ensureThread({
+          threadId: target!,
+          title: "replacement",
+          providerSessionId: f.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          existingProviderThread: { ...f.providerThreadOf(target!), nativeThreadRef: null },
+          forceNewNativeThread: true,
+        });
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${target}`]);
+        const resumes = (yield* Ref.get(state)).resumeCount;
+        yield* f.runtime.resumeThread({
+          providerThread: replacement,
+          threadId: target!,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal((yield* Ref.get(state)).resumeCount, resumes);
+        yield* Ref.set(pending, false);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          `native-${target}`,
+          "replacement-native",
+        ]);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            pendingWorkForThread: (thread) =>
+              thread.nativeThreadRef?.nativeId === "replacement-native"
+                ? Ref.get(pending)
+                : Effect.succeed(false),
+            ensureThread: (input) =>
+              Effect.succeed({
+                ...input.existingProviderThread!,
+                nativeThreadRef: {
+                  driver: CODEX_DRIVER,
+                  nativeId: "replacement-native",
+                  strength: "strong" as const,
+                },
+              }),
+          }),
+        ),
+      );
+    }),
+);
+
+const orphanSweepFixture = Effect.fn("test.orphanSweepFixture")(function* (count: number) {
+  const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+  const eventSink = yield* EventSink.EventSinkV2;
+  const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const now = yield* DateTime.now;
+  const providerSessionId = idAllocator.derive.providerSession({
+    providerInstanceId: modelSelection.instanceId,
+  });
+  const threads = [];
+  for (let i = 0; i < count; i++) {
+    const threadId = ThreadId.make(`orphan-sweep-${i}`);
+    const providerThread = makeProviderThread({
+      idAllocator,
+      threadId,
+      providerSessionId,
+      now,
+      nativeThreadId: `orphan-native-${i}`,
+    });
+    yield* eventSink.write({
+      events: [
+        yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+        {
+          id: yield* idAllocator.allocate.event({ threadId }),
+          type: "provider-thread.updated",
+          threadId,
+          driver: CODEX_DRIVER,
+          occurredAt: now,
+          payload: providerThread,
+        },
+      ],
+    });
+    threads.push({ threadId, providerThread });
+  }
+  const first = threads[0]!;
+  const runtime = yield* manager.open({
+    threadId: first.threadId,
+    providerSessionId,
+    modelSelection,
+    runtimePolicy,
+  });
+  for (const { threadId } of threads.slice(1)) {
+    yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+  }
+  // Keep the shared session alive without registering any orphan's unload timer.
+  const keeper = threads.at(-1)!;
+  const runId = idAllocator.derive.run({ threadId: keeper.threadId, ordinal: 1 });
+  const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+  yield* runtime.startTurn({
+    appThread: yield* projectionStore.getThread(keeper.threadId),
+    threadId: keeper.threadId,
+    providerThread: keeper.providerThread,
+    runId,
+    runOrdinal: 1,
+    providerTurnOrdinal: 1,
+    attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+    rootNodeId: idAllocator.derive.rootNode({ runId }),
+    modelSelection,
+    runtimePolicy,
+    message: {
+      createdBy: "user",
+      creationSource: "web",
+      messageId: yield* idAllocator.allocate.message({ threadId: keeper.threadId, ordinal: 1 }),
+      text: "keep running",
+      attachments: [],
+    },
+  });
+  return {
+    manager,
+    runtime,
+    threads,
+    providerSessionId,
+    sweep: manager.sweepOrphanedThreads(providerSessionId),
+  };
+});
+
+it.effect("orphan sweep reaps missed registrations and keeps busy and unknown threads", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(2);
+      yield* TestClock.adjust("1 second");
+      yield* fixture.sweep;
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () =>
+            Effect.succeed(["orphan-native-0", "orphan-native-1", "unknown-native"]),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("orphan sweep caps unsubscribes at 50 and continues next sweep", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(56);
+      yield* TestClock.adjust("1 second");
+      yield* fixture.sweep;
+      assert.equal((yield* Ref.get(state)).unloadedNativeThreadIds.length, 50);
+      yield* fixture.sweep;
+      assert.equal((yield* Ref.get(state)).unloadedNativeThreadIds.length, 55);
+      assert.isFalse((yield* Ref.get(state)).unloadedNativeThreadIds.includes("orphan-native-55"));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () =>
+            Ref.get(state).pipe(
+              Effect.map((s) =>
+                Array.from({ length: 56 }, (_, i) => `orphan-native-${i}`).filter(
+                  (id) => !s.unloadedNativeThreadIds.includes(id),
+                ),
+              ),
+            ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("orphan sweep keeps background work, recent and held threads", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const resumed = yield* Deferred.make<void>();
+    const resumeGate = yield* Deferred.make<void>();
+    const holdResume = yield* Ref.make(false);
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(4);
+      // All rows are recent on the first sweep.
+      yield* fixture.sweep;
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      yield* TestClock.adjust("1 second");
+      yield* Ref.set(holdResume, true);
+      const held = fixture.threads[1]!;
+      const fiber = yield* fixture.runtime
+        .resumeThread({
+          providerThread: held.providerThread,
+          threadId: held.threadId,
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(resumed);
+      yield* fixture.sweep;
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-2"]);
+      yield* Deferred.succeed(resumeGate, undefined);
+      yield* Fiber.join(fiber);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: (thread) =>
+            Effect.succeed(thread.nativeThreadRef?.nativeId === "orphan-native-0"),
+          afterResume: Ref.get(holdResume).pipe(
+            Effect.flatMap((hold) =>
+              hold
+                ? Deferred.succeed(resumed, undefined).pipe(
+                    Effect.andThen(Deferred.await(resumeGate)),
+                  )
+                : Effect.void,
+            ),
+          ),
+          listLoadedNativeThreads: () =>
+            Effect.succeed(Array.from({ length: 4 }, (_, i) => `orphan-native-${i}`)),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect.each(["preparing", "queued", "starting", "running", "waiting"] as const)(
+  "orphan sweep keeps a persisted %s run without an in-memory busy marker",
+  (status) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const fixture = yield* orphanSweepFixture(2);
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const { threadId, providerThread } = fixture.threads[0]!;
+        const now = yield* DateTime.now;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              threadId,
+              occurredAt: now,
+              type: "run.created",
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId: modelSelection.instanceId,
+                modelSelection,
+                providerThreadId: providerThread.id,
+                userMessageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                rootNodeId: idAllocator.derive.rootNode({ runId }),
+                activeAttemptId: null,
+                status,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+        });
+        yield* TestClock.adjust("1 second");
+        yield* fixture.sweep;
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            pendingWorkForThread: () => Effect.succeed(false),
+            listLoadedNativeThreads: () => Effect.succeed(["orphan-native-0", "orphan-native-1"]),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect("orphan sweep does nothing when listing fails", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const logs: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(2);
+      yield* TestClock.adjust("1 second");
+      yield* fixture.sweep;
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      assert.isTrue(
+        logs.some(
+          (message) =>
+            Array.isArray(message) &&
+            message[0] === "orchestration-v2.driver-session.orphan-sweep" &&
+            message[1]?.listFailed === true,
+        ),
+      );
+    }).pipe(
+      Effect.provide([
+        Logger.layer([logger]),
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () => unimplemented("loaded list unavailable"),
+        }),
+      ]),
+    );
+  }),
+);
+
+it.effect("orphan sweep skips a thread resumed while its loaded list is in flight", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const listing = yield* Deferred.make<void>();
+    const listed = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(2);
+      yield* TestClock.adjust("1 second");
+      const sweep = yield* fixture.sweep.pipe(Effect.forkScoped);
+      yield* Deferred.await(listing);
+      const owner = fixture.threads[0]!;
+      yield* fixture.runtime.resumeThread({
+        threadId: owner.threadId,
+        providerThread: owner.providerThread,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* Deferred.succeed(listed, undefined);
+      yield* Fiber.join(sweep);
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () =>
+            Deferred.succeed(listing, undefined).pipe(
+              Effect.andThen(Deferred.await(listed)),
+              Effect.as(["orphan-native-0", "orphan-native-1"]),
+            ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("orphan sweep starts after 30 seconds and recovers on its ten minute interval", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const calls = yield* Ref.make(0);
+    yield* Effect.gen(function* () {
+      yield* orphanSweepFixture(2);
+      yield* TestClock.adjust("29 seconds");
+      assert.equal(yield* Ref.get(calls), 0);
+      yield* TestClock.adjust("1 second");
+      assert.equal(yield* Ref.get(calls), 1);
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      yield* TestClock.adjust("10 minutes");
+      assert.equal(yield* Ref.get(calls), 2);
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () =>
+            Ref.updateAndGet(calls, (n) => n + 1).pipe(
+              Effect.flatMap((n) =>
+                n === 1
+                  ? unimplemented("list failure")
+                  : Effect.succeed(["orphan-native-0", "orphan-native-1"]),
+              ),
+            ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect.each(["missing", "failed"] as const)(
+  "orphan sweep keeps ownership whose background probe is %s",
+  (probe) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const fixture = yield* orphanSweepFixture(2);
+        yield* TestClock.adjust("1 second");
+        yield* fixture.sweep;
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            ...(probe === "missing"
+              ? {}
+              : { pendingWorkForThread: () => Effect.die("probe failed") }),
+            listLoadedNativeThreads: () => Effect.succeed(["orphan-native-0", "orphan-native-1"]),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  "self",
+  "native-child",
+  "unknown-owner",
+  "other-session",
+  "other-instance",
+  "other-driver",
+  "missing-native-id",
+] as const)("orphan sweep uses the actual owner of a %s provider row during child resume", (kind) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const listing = yield* Deferred.make<void>();
+    const listed = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* orphanSweepFixture(2);
+      const parent = f.threads[0]!;
+      const childId = ThreadId.make("orphan-native-child-owner");
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const child = {
+        ...makeProviderThread({
+          idAllocator,
+          threadId: childId,
+          providerSessionId: f.providerSessionId,
+          now,
+          nativeThreadId: "orphan-child-native",
+        }),
+        appThreadId:
+          kind === "native-child" ? childId : kind === "unknown-owner" ? null : parent.threadId,
+        providerSessionId:
+          kind === "other-session"
+            ? idAllocator.derive.providerSession({
+                providerInstanceId: ProviderInstanceId.make("other"),
+              })
+            : f.providerSessionId,
+        providerInstanceId:
+          kind === "other-instance" ? ProviderInstanceId.make("other") : modelSelection.instanceId,
+        nativeThreadRef: {
+          driver: kind === "other-driver" ? ProviderDriverKind.make("other") : CODEX_DRIVER,
+          nativeId: kind === "missing-native-id" ? null : "orphan-child-native",
+          strength: "strong" as const,
+        },
+      };
+      const runId = idAllocator.derive.run({ threadId: parent.threadId, ordinal: 1 });
+      const parentNodeId = idAllocator.derive.rootNode({ runId });
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId: childId, now }),
+          {
+            id: yield* idAllocator.allocate.event({ threadId: parent.threadId }),
+            threadId: parent.threadId,
+            occurredAt: now,
+            driver: CODEX_DRIVER,
+            type: "provider-thread.updated",
+            payload: child,
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId: parent.threadId }),
+            threadId: parent.threadId,
+            occurredAt: now,
+            driver: CODEX_DRIVER,
+            type: "subagent.updated",
+            payload: {
+              id: idAllocator.derive.rootNode({
+                runId: idAllocator.derive.run({ threadId: childId, ordinal: 1 }),
+              }),
+              threadId: parent.threadId,
+              runId,
+              parentNodeId,
+              origin: "provider_native",
+              createdBy: "system",
+              driver: CODEX_DRIVER,
+              providerInstanceId: modelSelection.instanceId,
+              providerThreadId: child.id,
+              childThreadId: childId,
+              nativeTaskRef: child.nativeThreadRef,
+              prompt: "child",
+              title: null,
+              model: null,
+              status: "completed",
+              result: null,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      assert.isTrue(
+        (yield* store.getThreadRecords(parent.threadId, ["providerThreads"])).providerThreads.some(
+          (row) => row.id === child.id,
+        ),
+      );
+      yield* TestClock.adjust("1 second");
+      const sweep = yield* f.sweep.pipe(Effect.forkScoped);
+      yield* Deferred.await(listing);
+      if (kind === "native-child") {
+        yield* f.manager.open({
+          threadId: childId,
+          providerSessionId: f.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* f.runtime.resumeThread({
+          threadId: childId,
+          providerThread: child,
+          modelSelection,
+          runtimePolicy,
+        });
+      }
+      yield* Deferred.succeed(listed, undefined);
+      yield* Fiber.join(sweep);
+      assert.deepEqual(
+        (yield* Ref.get(state)).unloadedNativeThreadIds,
+        kind === "self" ? ["orphan-child-native"] : [],
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          pendingWorkForThread: () => Effect.succeed(false),
+          listLoadedNativeThreads: () =>
+            Deferred.succeed(listing, undefined).pipe(
+              Effect.andThen(Deferred.await(listed)),
+              Effect.as(["orphan-child-native"]),
+            ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect(
+  "orphan sweep retires a deferred timer before a resumed thread gets a new idle window",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const background = yield* Ref.make(true);
+      yield* Effect.gen(function* () {
+        const f = yield* orphanSweepFixture(2);
+        const owner = f.threads[0]!;
+        const resume = f.runtime.resumeThread({
+          threadId: owner.threadId,
+          providerThread: owner.providerThread,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* resume;
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* Ref.set(background, false);
+        yield* TestClock.adjust("500 millis");
+        yield* f.sweep;
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);
+        yield* resume;
+        yield* TestClock.adjust("500 millis");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);
+        yield* TestClock.adjust("500 millis");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          "orphan-native-0",
+          "orphan-native-0",
+        ]);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            pendingWorkForThread: () => Ref.get(background),
+            listLoadedNativeThreads: () => Effect.succeed(["orphan-native-0"]),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["same", "session", "native", "instance", "driver", "missing", "thread"] as const)(
+  "persists only the current idle Claude refusal session: %s",
+  (identity) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 1);
+        const threadId = f.threadIds[0]!;
+        const old = {
+          ...f.providerThreadOf(threadId),
+          nativeMetadata: { claudeRefusalObserved: false },
+        };
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: old,
+            },
+          ],
+        });
+        yield* f.resume(threadId);
+        yield* f.start(threadId);
+        yield* f.finish(threadId);
+        // f.publish uses a temporary raw receipt subscriber only. There is no
+        // run ingestion subscriber; the receipt proves the real pump completed.
+        const incoming = {
+          ...old,
+          status: "error" as const,
+          nativeMetadata: { claudeRefusalObserved: true },
+        };
+        if (identity === "session")
+          incoming.providerSessionId = "old-provider-session" as typeof old.providerSessionId;
+        if (identity === "native")
+          incoming.nativeThreadRef = { ...old.nativeThreadRef!, nativeId: "old-native-session" };
+        if (identity === "missing") incoming.nativeThreadRef = null;
+        if (identity === "thread") incoming.appThreadId = ThreadId.make("retired-thread");
+        if (identity === "instance")
+          incoming.providerInstanceId = ProviderInstanceId.make("old-instance");
+        if (identity === "driver") incoming.driver = ProviderDriverKind.make("codex");
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: incoming,
+        });
+        const records = yield* f.projectionStore.getThreadRecords(threadId, ["providerThreads"]);
+        const stored = records.providerThreads.find((thread) => thread.id === old.id);
+        assert.equal(
+          stored?.nativeMetadata?.claudeRefusalObserved,
+          identity === "same",
+          "only the current native session may record its exclusion",
+        );
+        assert.equal(stored?.status, old.status, "marker persistence must not copy a stale status");
+        assert.deepEqual(stored?.nativeThreadRef, old.nativeThreadRef);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60000,
+            driver: ProviderDriverKind.make("claudeAgent"),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(
+  (
+    [
+      "snapshot",
+      "batch",
+      "new-runtime",
+      "new-native",
+      "new-instance",
+      "other-driver",
+      "missing-native",
+    ] as const
+  ).flatMap((change) => [false, undefined].map((marker) => ({ change, marker }))),
+)("keeps durable Claude refusal history through $change/$marker", ({ change, marker }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const threadId = f.threadIds[0]!;
+      const initial: OrchestrationV2ProviderThread = {
+        ...f.providerThreadOf(threadId),
+        nativeMetadata: { claudeRefusalObserved: false },
+      };
+      const write = (payloads: ReadonlyArray<OrchestrationV2ProviderThread>) =>
+        Effect.forEach(payloads, (payload) =>
+          Effect.gen(function* () {
+            return {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated" as const,
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload,
+            };
+          }),
+        ).pipe(Effect.flatMap((events) => f.eventSink.write({ events })));
+      yield* write([initial]);
+      yield* f.resume(threadId);
+      yield* f.start(threadId);
+      yield* f.finish(threadId);
+      const observed = { ...initial, nativeMetadata: { claudeRefusalObserved: true } };
+      if (change !== "batch")
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: observed,
+        });
+      const snapshot = {
+        ...initial,
+        nativeMetadata: marker === undefined ? {} : { claudeRefusalObserved: marker },
+      };
+      if (change === "new-runtime")
+        snapshot.providerSessionId = yield* f.idAllocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+      if (change === "new-native")
+        snapshot.nativeThreadRef = { ...initial.nativeThreadRef!, nativeId: "new-native-session" };
+      if (change === "new-instance")
+        snapshot.providerInstanceId = ProviderInstanceId.make("new-instance");
+      if (change === "other-driver") snapshot.driver = CODEX_DRIVER;
+      if (change === "missing-native") snapshot.nativeThreadRef = null;
+      yield* write(change === "batch" ? [observed, snapshot] : [snapshot]);
+      const stored = (yield* f.projectionStore.getThreadRecords(threadId, [
+        "providerThreads",
+      ])).providerThreads.find((row) => row.id === initial.id);
+      const preserved = change === "snapshot" || change === "batch" || change === "new-runtime";
+      assert.equal(stored?.nativeMetadata?.claudeRefusalObserved, preserved ? true : marker);
+      const events = yield* f.eventStore
+        .read({ eventType: "provider-thread.updated" })
+        .pipe(Stream.runCollect);
+      const last = events.at(-1)?.event;
+      assert.equal(
+        last?.type === "provider-thread.updated"
+          ? last.payload.nativeMetadata?.claudeRefusalObserved
+          : undefined,
+        preserved ? true : marker,
+      );
+    }).pipe(
+      Effect.provide(
+        layerTest({ state, driver: ProviderDriverKind.make("claudeAgent"), idleTimeoutMs: 60000 }),
+      ),
+    );
+  }),
+);
+
+it.effect.each([false, true, "session"] as const)(
+  "guards a refusal write racing native replacement: %s",
+  (replaceNative) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const before = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 1);
+        const threadId = f.threadIds[0]!;
+        const initial = {
+          ...f.providerThreadOf(threadId),
+          nativeMetadata: { claudeRefusalObserved: false },
+        };
+        const write = (payload: OrchestrationV2ProviderThread) =>
+          Effect.gen(function* () {
+            yield* f.eventSink.write({
+              events: [
+                {
+                  id: yield* f.idAllocator.allocate.event({ threadId }),
+                  type: "provider-thread.updated",
+                  threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload,
+                },
+              ],
+            });
+          });
+        yield* write(initial);
+        yield* f.resume(threadId);
+        yield* f.start(threadId);
+        yield* f.finish(threadId);
+        const concurrent = {
+          ...initial,
+          status: "active" as const,
+          nativeThreadRef:
+            replaceNative === true
+              ? { ...initial.nativeThreadRef!, nativeId: "replacement-native" }
+              : initial.nativeThreadRef,
+        };
+        if (replaceNative === "session")
+          concurrent.providerSessionId = yield* f.idAllocator.allocate.providerSession({
+            threadId,
+            providerInstanceId: modelSelection.instanceId,
+          });
+        yield* Ref.set(before, write(concurrent).pipe(Effect.orDie));
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: { ...initial, nativeMetadata: { claudeRefusalObserved: true } },
+        });
+        const stored = (yield* f.projectionStore.getThreadRecords(threadId, [
+          "providerThreads",
+        ])).providerThreads.find((row) => row.id === initial.id);
+        assert.equal(stored?.nativeMetadata?.claudeRefusalObserved, replaceNative !== true);
+        assert.equal(stored?.status, "active");
+        assert.equal(stored?.providerSessionId, concurrent.providerSessionId);
+        assert.equal(stored?.nativeThreadRef?.nativeId, concurrent.nativeThreadRef?.nativeId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            beforeUnchangedWrite: before,
+            driver: ProviderDriverKind.make("claudeAgent"),
+            idleTimeoutMs: 60000,
+          }),
+        ),
+      );
+    }),
 );

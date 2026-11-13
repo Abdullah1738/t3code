@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import time
@@ -9,7 +10,7 @@ from noon_nownow_checkout import SavedCard,Snapshot
 from noon_nownow_controller import CardSyncBinding
 import commerce_nownow as c
 import commerce_preorder as p
-from test import test_noon_nownow_review as fixtures
+import test_noon_nownow_review as fixtures
 
 
 class Store:
@@ -19,6 +20,9 @@ class Store:
 
 
 class PreorderFlowTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_native_preorder_reserves_before_wire_and_recovery_never_replays(self):
         fixture=fixtures.ReviewTests();fixture.setUp();fixture.row['prepaidPaymentMisc']['isCvvRequired']=True
         with tempfile.TemporaryDirectory() as temp,patch.object(c.journal,'ROOT',Path(temp).resolve()/'commerce'), \
@@ -102,8 +106,11 @@ class PreorderFlowTests(unittest.TestCase):
             c.journal.observe(flow,'subscription',outcome='PREORDER_INTENT_RECEIVED',evidence_hash=intent)
             c.journal.consume(flow,'prepay',kind='prepay',payment_intent_hash=intent,**args)
             client=Mock();client._call.return_value=Snapshot({}, {'payment_status':'payment_confirmed','redirect_required':False},time.time())
-            with patch('commerce_nownow.reader',return_value=client):result=p.recover(flow,auth=Mock(),vault=vault)
-            self.assertEqual(result['journal_state'],'FENCED')
+            with patch('commerce_nownow.reader',return_value=client):
+                with self.assertRaisesRegex(c.journal.JournalError, 'NOWNOW_PREORDER_RECONCILIATION_UNPROVEN'):
+                    p.recover(flow,auth=Mock(),vault=vault)
+            self.assertEqual(c.journal.inspect(flow)['state'],'FENCED')
+            self.assertEqual(client._call.call_count, 1)
             with self.assertRaises(c.journal.JournalError):c.journal.consume(flow,'place',kind='place',**args)
             self.assertEqual(c.journal.inspect(flow)['reserved_minor'],2500)
 

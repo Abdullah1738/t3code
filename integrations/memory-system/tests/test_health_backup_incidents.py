@@ -111,10 +111,11 @@ print(label + ' = {\\n state = not running\\n runs = 1\\n}')
         self.assertEqual(len(self.sent()), 3)
         self.assertNotEqual(self.sent()[0][3], self.sent()[2][3])
 
-    def test_fresh_success_passes_even_if_latest_run_failed(self):
+    def test_latest_failed_run_alerts_even_with_a_recent_success(self):
         self.status(ok=False, stage='replica', message='failed run')
         self.tick()
-        self.assertEqual(self.sent(), [])
+        self.assertEqual(len(self.sent()), 1)
+        self.assertIn('last backup failed at replica: failed run', self.sent()[0][-1])
 
     def test_stale_loaded_alerts(self):
         self.status(last_success_ts=time.time() - 10 * 3600)

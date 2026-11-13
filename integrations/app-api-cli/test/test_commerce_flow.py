@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import hashlib
 from pathlib import Path
 import tempfile
@@ -15,6 +16,7 @@ ORDER = '1234567890'
 
 class FlowTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         p = patch.object(j, 'ROOT', Path(temp.name) / 'commerce')

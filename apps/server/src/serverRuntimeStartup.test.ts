@@ -20,6 +20,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Ref from "effect/Ref";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -104,6 +105,7 @@ it.effect.each([
       const dependencies = Layer.mergeAll(
         NodeCrypto.layer,
         Path.layer,
+        FileSystem.layerNoop({}),
         Layer.mock(ServerConfig.ServerConfig)({
           ...(yield* ServerConfig.deriveServerPaths("/bootstrap-project", undefined).pipe(
             Effect.provide(Path.layer),
