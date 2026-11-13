@@ -139,7 +139,9 @@ export const layerExecutor: Layer.Layer<
                 });
               yield* continueRestartedRun({ ...source, queued });
             }).pipe(
-              Effect.ensuring(finishDispatch),
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit) ? pacing.release(source) : finishDispatch,
+              ),
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
               Effect.tapError((cause) =>
@@ -211,6 +213,14 @@ export const layerExecutor: Layer.Layer<
                 willRetry,
               });
             }).pipe(
+              Effect.onExit((exit) =>
+                pacing.releaseRun(
+                  effect.threadId,
+                  startRequest.runId,
+                  effect.id,
+                  Exit.isFailure(exit),
+                ),
+              ),
               Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
               Effect.mapError((cause) =>
                 isOrchestrationEffectExecutionError(cause)

@@ -1,11 +1,11 @@
 // Populate only a marked synthetic home; never copy a production database.
-import fs from "node:fs";
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 export function addRecoveryHistory(home, count = 100000) {
-  if (!fs.existsSync(path.join(home, ".crash-sandbox")))
+  if (!NodeFS.existsSync(NodePath.join(home, ".crash-sandbox")))
     throw Error("Expected marked synthetic home");
-  const db = new DatabaseSync(path.join(home, "userdata", "statev2.sqlite"));
+  const db = new NodeSqlite.DatabaseSync(NodePath.join(home, "userdata", "statev2.sqlite"));
   const table = "orchestration_v2_projection_provider_threads";
   const columns = db
     .prepare(`PRAGMA table_info(${table})`)

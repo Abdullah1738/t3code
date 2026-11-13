@@ -3,7 +3,7 @@ import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync,
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { writeFile, readFile, rename, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -57,7 +57,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
 }
 
 export function createToolLog(options: { root?: string; now?: () => number; capBytes?: number; defer?: boolean } = {}) {
-  const root = () => options.root ?? process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/imessage");
+  const root = () => options.root ?? logDirectory("imessage");
   const now = options.now ?? Date.now;
   let maintainedDay = "";
   let maintainedRoot = "";

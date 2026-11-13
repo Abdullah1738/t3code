@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsError, type AnalyticsEvent } from "@t3tools/contracts";
+import {
+  AnalyticsError,
+  CommandId,
+  LONG_TASK_HISTOGRAM_RATIO,
+  AnalyticsEvent,
+} from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -8,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -51,6 +58,100 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads filtered tick phase percentiles and persists the complete day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [boardId, durationMs] of [
+        ["a", 10],
+        ["a", 20],
+        ["a", 90],
+        ["b", 1_000],
+      ] as const)
+        yield* analytics.record(
+          event({
+            kind: "kanban.tick_phase",
+            surface: "server",
+            route: "kanban",
+            boardId,
+            durationMs,
+            props: { tickId: "tick-1", phase: "thread_status", count: 1 },
+          }),
+        );
+      yield* analytics.record(
+        event({
+          kind: "kanban.tick_overlap",
+          surface: "server",
+          route: "kanban",
+          boardId: "a",
+          props: { tickId: "tick-2", activeTickId: "tick-1", reason: "local_waits_only" },
+        }),
+      );
+      const result = yield* analytics.read({
+        day,
+        kind: "kanban.tick_phase",
+        boardId: "a",
+        limit: 1,
+      });
+      assert.equal(result.rollup.total, 3);
+      assert.lengthOf(result.samples, 1);
+      assert.deepEqual(result.rollup.tickPhases, [
+        {
+          boardId: "a",
+          phase: "thread_status",
+          count: 3,
+          p50Ms: 20,
+          p95Ms: 90,
+          maxMs: 90,
+          approximate: false,
+        },
+      ]);
+      const full = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(full.total, 5);
+      assert.equal(full.tickPhases?.length, 2);
+      assert.equal(full.kindCounts["kanban.tick_overlap"], 1);
+      assert.isFalse(yield* setup.fs.exists(`${setup.directory}/rollup-${day}.json.tmp`));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps a minute summary delivered after midnight in the task's UTC day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      yield* TestClock.setTime(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-14T00:00:01.000Z")),
+      );
+      yield* analytics.ingest({
+        events: [
+          event({
+            ts: "2026-11-13T23:59:00.000Z",
+            kind: "performance.long-task-summary",
+            surface: "desktop",
+            route: "board",
+            props: {
+              count: 1,
+              totalMs: 500,
+              maxMs: 500,
+              wallTimeMs: 60_000,
+              histogram: [[Math.ceil(Math.log(500) / Math.log(LONG_TASK_HISTOGRAM_RATIO)), 1]],
+            },
+          }),
+        ],
+      });
+      const previous = yield* analytics.read({ day });
+      assert.deepInclude(previous.rollup.longTasksByRoute[0], {
+        route: "board",
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        p95Ms: 500,
+        wallTimeShare: 500 / 60_000,
+      });
+      assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>
@@ -486,4 +587,81 @@ it.effect("reads run usage by card and kind with capped samples and persists the
       .split("\n");
     assert.equal(lines.filter((line) => JSON.parse(line).kind === "run.usage").length, 4);
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const delegatedUsageKeys = [
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const;
+const delegatedUsage = (key: string) => {
+  const threadId = IdAllocator.derive.delegatedTaskThread({
+    commandId: CommandId.make(`command:mcp:delegate-task:caller:${encodeURIComponent(key)}`),
+  });
+  const runId = IdAllocator.derive.run({ threadId, ordinal: 1 });
+  return {
+    ts,
+    kind: "run.usage" as const,
+    surface: "server" as const,
+    route: "provider",
+    runId,
+    threadId,
+    boardId: "robob",
+    cardId: "card:1338",
+    role: "delegated" as const,
+    providerInstance: "codex",
+    model: "gpt-6.1-sol",
+    effort: null,
+    inputTokens: 123,
+    outputTokens: 45,
+    cachedInputTokens: null,
+    reasoningTokens: null,
+    wallMs: 50,
+    turnCount: 1,
+    endReason: "completed" as const,
+    usageStatus: "partial" as const,
+    reviewRound: null,
+  };
+};
+const delegatedUsageCases = delegatedUsageKeys.map(([name, key]) => ({ name, key }));
+const decodeUsage = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+it.each(delegatedUsageCases)("accepts derived usage IDs with $name allocator keys", ({ key }) => {
+  const row = delegatedUsage(key);
+  assert.deepEqual(decodeUsage(row), row);
+});
+// The maximum key's two IDs exceed the 8 KiB row cap; its schema is checked above.
+it.effect.each(delegatedUsageCases.filter(({ name }) => name !== "maximum-key"))(
+  "persists delegated run usage and card/model totals with $name allocator keys",
+  ({ key }) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const row = delegatedUsage(key);
+      yield* analytics.record(row);
+      const result = yield* analytics.read({ day, kind: "run.usage", cardId: row.cardId });
+      assert.deepEqual(result.samples, [row]);
+      assert.deepInclude(result.rollup.usage.cards[0], {
+        cardId: row.cardId,
+        runs: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+      });
+      assert.deepInclude(result.rollup.usage.perModel[0], {
+        model: row.model,
+        runs: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+      });
+      const lines = (yield* setup.fs.readFileString(`${setup.directory}/${day}.ndjson`))
+        .trim()
+        .split("\n");
+      assert.deepEqual(lines.map((line) => JSON.parse(line)), [row]);
+    }).pipe(Effect.provide(NodeServices.layer)),
 );

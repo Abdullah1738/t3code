@@ -16,6 +16,16 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_missing_override_uses_private_temp_root(self):
+        with patch.dict(os.environ):
+            os.environ.pop('TOOLLOG_ROOT', None)
+            root = toollog.root()
+            self.assertTrue(root.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()))
+            self.assertFalse(root.is_relative_to(Path.home() / '.robob'))
+            self.assertEqual(toollog.root(), root)
+            toollog.emit('fixture', 'event', 'test.start', board='imessage')
+            self.assertTrue(list((root / 'imessage').glob('*.ndjson')))
+
     def setUp(self):
         sampling = patch.object(toollog.random, 'random', return_value=0)
         sampling.start()

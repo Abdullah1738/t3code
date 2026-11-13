@@ -388,8 +388,8 @@ const make = Effect.gen(function* () {
    * result, as before pages were recorded. "orphaned" means the thread was
    * deleted first, so nothing will ever clean the page up.
    */
-  const record = (threadId: ThreadId, htmlRender: HtmlRenderReference) =>
-    Effect.gen(function* () {
+  const record = Effect.fn("HtmlRender.record")(
+    function* (threadId: ThreadId, htmlRender: HtmlRenderReference) {
       const { thread, runs } = yield* threads.getThreadRecords(threadId, ["runs"], {
         turnItemTypes: [],
         messageRoles: [],
@@ -421,16 +421,14 @@ const make = Effect.gen(function* () {
               ),
           ),
         );
-    }).pipe(
-      // The page is stored and the caller still gets its reference, so a
-      // direct call shows it either way.
-      Effect.catchCause((cause) =>
-        Effect.logWarning("Could not record an HTML render in its thread.", cause).pipe(
-          Effect.as("unrecorded" as const),
-        ),
+    },
+    // The stored page still reaches the caller if recording fails.
+    Effect.catchCause((cause) =>
+      Effect.logWarning("Could not record an HTML render in its thread.", cause).pipe(
+        Effect.as("unrecorded" as const),
       ),
-      Effect.withSpan("HtmlRender.record"),
-    );
+    ),
+  );
 
   // The bootstrap goes in first so its head scan never runs over inlined image data.
   const inline = (html: string) =>

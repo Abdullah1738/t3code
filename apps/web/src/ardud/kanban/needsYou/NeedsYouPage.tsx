@@ -65,7 +65,8 @@ import { Bar, Btn, FilterChip, IconBtn, Layer, linkClass, usePageLayout } from "
 import "../tokens.css";
 import "../kanban.css";
 import "./needsYou.css";
-import { useAnalyticsSearch } from "../../useAnalytics";
+import { useAnalyticsCounts, useAnalyticsSearch } from "../../useAnalytics";
+import { analyticsQueueCount } from "../../analyticsCounts";
 import { analyticsForEnvironment } from "@t3tools/client-runtime/ardud/analytics";
 
 const NO_MARKS: Readonly<Record<string, NeedsYouMark>> = {};
@@ -164,6 +165,11 @@ export function NeedsYouPage(props: {
   const owed = needsYou.items.filter((item) => !hidden.has(item.key));
   const order = needsYouFocusOrder(sections, openBatches);
   useAnalyticsSearch(usePrimaryEnvironmentId(), "needs-owner", local.query.length, order.length);
+  useAnalyticsCounts(
+    environmentId,
+    view === "queue" ? "needs-owner" : `needs-owner.${view}`,
+    analyticsQueueCount(layout, view, queueOpen, order.length),
+  );
   const focusKey =
     search.ask !== undefined && order.includes(search.ask)
       ? search.ask

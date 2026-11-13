@@ -779,28 +779,30 @@ export const make = Effect.gen(function* () {
   // The origin a session minted from this grant gets: the desktop app's own
   // bootstrap, dev mode's credential, or a link an owner session issued.
   // Links made on the Mac (`t3 pair`, the startup URL) are never marked.
-  const grantOrigin = (credential: string, method: string) =>
-    Effect.gen(function* () {
-      const source: SessionOrigins.MintedOwnerSource | null =
-        method === "desktop-bootstrap"
-          ? "desktop"
-          : method === "reusable-dev-token"
-            ? "dev-token"
-            : yield* origins.ownerGrant(credential);
-      if (source === null) return null;
-      // The claim is a record, not a gate, so failing to write it never
-      // keeps the owner out.
-      yield* origins
-        .claimOwner(source)
-        .pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Could not record the owner claim.").pipe(
-              Effect.annotateLogs({ cause: String(cause) }),
-            ),
+  const grantOrigin = Effect.fn("EnvironmentAuth.grantOrigin")(function* (
+    credential: string,
+    method: string,
+  ) {
+    const source: SessionOrigins.MintedOwnerSource | null =
+      method === "desktop-bootstrap"
+        ? "desktop"
+        : method === "reusable-dev-token"
+          ? "dev-token"
+          : yield* origins.ownerGrant(credential);
+    if (source === null) return null;
+    // The claim is a record, not a gate, so failing to write it never
+    // keeps the owner out.
+    yield* origins
+      .claimOwner(source)
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not record the owner claim.").pipe(
+            Effect.annotateLogs({ cause: String(cause) }),
           ),
-        );
-      return { _tag: "owner", source } satisfies SessionOrigins.MintedOrigin;
-    });
+        ),
+      );
+    return { _tag: "owner", source } satisfies SessionOrigins.MintedOrigin;
+  });
   // Written before the token leaves; if it cannot be, the new session is revoked.
   const recordOrigin = (
     sessionId: AuthSessionId,
@@ -1359,25 +1361,25 @@ export const make = Effect.gen(function* () {
     return yield* revokeSession(targetSessionId);
   });
 
-  const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = (
-    currentSessionId,
-  ) =>
-    // ardud: - a session that is not the owner's spares owner sessions.
-    Effect.gen(function* () {
+  const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = Effect.fn("EnvironmentAuth.revokeOtherClientSessions")(
+    function* (currentSessionId) {
       const owner = (sessionId: AuthSessionId) =>
         isOwnerSession(sessionId).pipe(
           Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
         );
-      if (yield* owner(currentSessionId)) return yield* revokeOtherSessionsExcept(currentSessionId);
+      if (yield* owner(currentSessionId))
+        return yield* revokeOtherSessionsExcept(currentSessionId);
       // One at a time and not atomic: a failure stops partway, and a session
       // paired meanwhile is left alone. Owner sessions are never touched.
       let revoked = 0;
       for (const session of yield* listSessions()) {
-        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId))) continue;
+        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId)))
+          continue;
         if (yield* revokeSession(session.sessionId)) revoked += 1;
       }
       return revoked;
-    }).pipe(Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"));
+    },
+  );
 
   const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
     issueStartupPairingCredential().pipe(

@@ -11,6 +11,8 @@ import hashlib
 import time
 import struct
 import random
+import sys
+import tempfile
 from functools import lru_cache
 
 CAP_BYTES = 50 * 1024 * 1024
@@ -154,8 +156,21 @@ def _repeat_count(harness, ids, guard, rule, first_word):
         return 1
 
 
+_test_root = None
+
+
 def root():
-    return Path(os.environ.get('TOOLLOG_ROOT', str(Path.home() / '.robob/logs/tools')))
+    global _test_root
+    override = os.environ.get('TOOLLOG_ROOT')
+    if override:
+        return Path(override)
+    if ('unittest' in sys.modules or 'pytest' in sys.modules or
+            os.environ.get('NODE_ENV') == 'test' or os.environ.get('ROBOB_TEST')):
+        if _test_root is None:
+            _test_root = tempfile.TemporaryDirectory(prefix='helpers-test-logs-')
+        os.environ['TOOLLOG_ROOT'] = _test_root.name
+        return Path(_test_root.name)
+    return Path.home() / '.robob/logs/tools'
 
 
 def board_dir(board):

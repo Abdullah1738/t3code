@@ -58,6 +58,34 @@ class SourceFailure(Exception):
         self.exit_code = exit_code
 
 
+def deadline_call(deadline, operation, *args, **kwargs):
+    if deadline is None:
+        return operation(*args, **kwargs)
+    started = time.monotonic()
+    remaining = deadline-started
+    if remaining <= 0:
+        raise SourceFailure('timeout', 'collector budget exhausted')
+
+    def expired(signum, frame):
+        raise SourceFailure('timeout', 'collector I/O budget exhausted')
+
+    # This is a single-threaded macOS LaunchAgent. Alarm only the I/O call,
+    # never the counter/checkpoint updates that follow a completed report.
+    handler = signal.signal(signal.SIGALRM, expired)
+    previous = signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        result = operation(*args, **kwargs)
+        if time.monotonic() > deadline:
+            raise SourceFailure('timeout', 'collector I/O budget exhausted')
+        return result
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if previous[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, previous[0]-(time.monotonic()-started)), previous[1])
+
+
 def stderr_line(value):
     if isinstance(value, bytes):
         value = value.decode(errors='replace')
@@ -121,56 +149,114 @@ def du_total(path, run, timeout):
     raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
 
 
-def big_root_inventory(path, run, deadline):
+def big_root_inventory(path, run, deadline, cache=None):
     total, completed, failed, denied = 0, 0, 0, 0
     children = {}
+    cache = {} if cache is None else cache
+    now = time.time()
+    for key, value in list(cache.items()):
+        if not isinstance(value, dict):
+            cache.pop(key)
+            continue
+        attempted = value.get('attemptedAt', 0)
+        value['attemptedAt'] = attempted if number(attempted) and attempted <= now else 0
+        if not number(value.get('bytes')) or not number(value.get('at')) or value['at'] > now:
+            cache[key] = dict(attemptedAt=value['attemptedAt'])
     # A slow subtree must not discard every other child's completed total.
     scan_started = time.monotonic()
+    entries, listed = [], False
     try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                child = Path(entry.path)
-                started = time.monotonic()
-                try:
-                    size, unreadable, code = du_total(child, run, min(15, deadline-started))
-                    total += size
-                    completed += 1
-                    denied += unreadable
-                    children[str(child)] = size
-                    emit('disk', 'event', 'disk.inventory.source', ok=True,
-                         props=dict(source=str(child), bytes=size, partial=bool(unreadable),
-                                    deniedCount=unreadable, exitCode=code,
-                                    elapsedMs=(time.monotonic()-started)*1000))
-                except Exception as exc:
-                    failed += 1
-                    source_error('disk', 'disk.inventory.source', child, started, exc)
-                if time.monotonic() >= deadline:
-                    # Name the root as incomplete without enumerating an unbounded
-                    # remainder. The child error identifies the subtree that stalled.
-                    failed += 1
-                    break
-    except OSError as exc:
+        with deadline_call(deadline, os.scandir, path) as listing:
+            deadline_call(deadline, entries.extend, listing)
+        listed = True
+    except (OSError, SourceFailure) as exc:
         failed += 1
         source_error('disk', 'disk.inventory.source', path, scan_started, exc)
+    if listed:
+        present = {entry.path for entry in entries}
+        for key in set(cache)-present:
+            cache.pop(key)
+    entries.sort(key=lambda entry: cache.get(entry.path, {}).get('attemptedAt', 0))
+    for turn, entry in enumerate(entries):
+        child = Path(entry.path)
+        started = time.monotonic()
+        if started >= deadline:
+            failed += 1
+            break
+        old = cache.get(str(child), {})
+        timeout = min(15, deadline-started)
+        try:
+            size, unreadable, code = du_total(child, run, timeout)
+            completed += 1
+            denied += unreadable
+            cache[str(child)] = dict(bytes=size, at=now, attemptedAt=now,
+                                     partial=bool(unreadable))
+            children[str(child)] = size
+            emit('disk', 'event', 'disk.inventory.source', ok=True,
+                 props=dict(source=str(child), bytes=size, partial=bool(unreadable),
+                            deniedCount=unreadable, exitCode=code,
+                            elapsedMs=(time.monotonic()-started)*1000))
+        except Exception as exc:
+            failed += 1
+            # A shortened timeout must not spend this child's next full turn.
+            attempted_at = now if turn == 0 or timeout >= 15 else old.get('attemptedAt', 0)
+            if old:
+                old['attemptedAt'] = attempted_at
+            else:
+                # Attempts need to rotate even before the first total.
+                cache[str(child)] = dict(attemptedAt=attempted_at)
+            source_error('disk', 'disk.inventory.source', child, started, exc)
+        if time.monotonic() >= deadline:
+            # Name the root as incomplete without enumerating an unbounded
+            # remainder. The child error identifies the subtree that stalled.
+            failed += 1
+            break
+    total = sum(value['bytes'] for value in cache.values() if 'bytes' in value)
+    cached = [value for value in cache.values() if 'bytes' in value and value['at'] < now]
     return total, dict(partial=bool(failed or denied), failedCount=failed,
-                      completedCount=completed, deniedCount=denied), children
+                      completedCount=completed, deniedCount=denied, cachedCount=len(cached),
+                      ageS=max((now-value['at'] for value in cached), default=0)), children
 
 
 def directory_inventory(paths=None, run=subprocess.run, deadline=None):
     started = time.monotonic()
     deadline = min(started + 210, deadline) if deadline is not None else started + 210
     sizes, errors, partials, children = {}, 0, {}, {}
-    for path in DIRECTORY_ROOTS if paths is None else paths:
+    previous = read_state('disk-inventory')
+    attempts = previous.get('attemptedAt', {})
+    attempts = dict(attempts) if isinstance(attempts, dict) else {}
+    child_state = previous.get('childState', {})
+    child_state = child_state if isinstance(child_state, dict) else {}
+    old_sizes = previous.get('sizes', {})
+    old_sizes = old_sizes if isinstance(old_sizes, dict) else {}
+    now = time.time()
+    roots = list(DIRECTORY_ROOTS if paths is None else paths)
+    for path in roots:
+        key = str(path)
+        # Migrate installed state, which has sizes but no attempt timestamps.
+        value = attempts.get(key, previous.get('at', 0) if key in old_sizes else 0)
+        attempts[key] = value if number(value) and value <= now else 0
+    roots.sort(key=lambda path: attempts[str(path)])
+    turn_budget = min(60, max(0, deadline-started))
+    for turn, path in enumerate(roots, 1):
         source_started = time.monotonic()
         try:
-            path.stat()
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
+            # Full failed attempts rotate; shortened timeouts keep priority.
+            if turn == 1 or remaining >= turn_budget:
+                attempts[str(path)] = time.time()
+            emit('disk', 'event', 'disk.inventory.turn',
+                 props=dict(source=str(path), turn=turn))
+            deadline_call(deadline, path.stat)
             if path in BIG_ROOTS:
-                total, flags, measured = big_root_inventory(path, run, min(deadline, source_started+60))
+                cache = child_state.setdefault(str(path), {})
+                if not isinstance(cache, dict):
+                    cache = child_state[str(path)] = {}
+                total, flags, measured = big_root_inventory(path, run, min(deadline, source_started+60), cache)
                 children[str(path)] = measured
-                if flags['completedCount'] or not flags['failedCount']:
+                if flags['completedCount'] or flags['cachedCount'] or not flags['failedCount']:
                     sizes[str(path)] = total
                 if flags['partial']:
                     partials[str(path)] = flags
@@ -180,11 +266,13 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
                     source_error('disk', 'disk.inventory.source', path, source_started,
                                  SourceFailure('partial', 'directory total is incomplete'), props)
                 else:
+                    attempts[str(path)] = time.time()
                     emit('disk', 'event', 'disk.inventory.source', ok=True,
                          props=dict(source=str(path), elapsedMs=(time.monotonic()-source_started)*1000, **props))
                 continue
-            total, denied, code = du_total(path, run, min(60, remaining))
+            total, denied, code = du_total(path, run, min(60, deadline-time.monotonic()))
             sizes[str(path)] = total
+            attempts[str(path)] = time.time()
             if code:
                 partials[str(path)] = dict(partial=True, deniedCount=denied)
                 emit('disk', 'event', 'disk.inventory.source', ok=True,
@@ -194,6 +282,7 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
         except FileNotFoundError as exc:
             if confirmed_absent(path, exc):
                 sizes[str(path)] = 0
+                attempts[str(path)] = time.time()
                 continue
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
@@ -201,7 +290,8 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
     save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials,
-                                    children=children, sourceErrors=errors))
+                                    children=children, sourceErrors=errors, attemptedAt=attempts,
+                                    childState=child_state))
     emit('disk', 'error' if errors else 'perf', 'disk.inventory', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000, props={'count': len(sizes), 'sourceErrors': errors},
          error_tag='disk.inventory_failed' if errors else None)

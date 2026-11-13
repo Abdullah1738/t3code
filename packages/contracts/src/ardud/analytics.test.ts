@@ -120,6 +120,16 @@ it("requires the metadata-only usage schema and preserves null measurements", ()
   ).toBe("card:one");
 });
 
+it.each(["runId", "threadId"] as const)("accepts bounded derived usage %s values", (field) => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent);
+  for (const value of ["derived:review!~'()*1338", "a".repeat(8192)]) {
+    expect(decodeUsage({ ...usage, [field]: value })[field]).toBe(value);
+  }
+  for (const value of ["a".repeat(8193), "unencoded space", "unencoded界", "line\nbreak"]) {
+    expect(() => decodeUsage({ ...usage, [field]: value })).toThrow();
+  }
+});
+
 it.each([
   "claude-opus-5[1m]",
   "Claude Opus 5.5",

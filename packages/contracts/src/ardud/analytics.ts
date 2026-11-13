@@ -27,6 +27,12 @@ const DerivedId = Schema.String.check(
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
+// Mergeable, bounded duration distribution; bucket upper bounds have at most 2% error.
+export const LONG_TASK_HISTOGRAM_RATIO = 1.02;
+export const LONG_TASK_HISTOGRAM_BUCKETS = 1024;
+const LongTaskHistogram = Schema.Array(
+  Schema.Tuple([Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1023 })), Measurement]),
+).check(Schema.isMaxLength(LONG_TASK_HISTOGRAM_BUCKETS));
 const McpOutcome = Schema.Literals([
   "ok",
   "error",
@@ -72,6 +78,14 @@ const GeneralEvent = Schema.Struct({
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       phase: Schema.optionalKey(Label),
+      tickId: Schema.optionalKey(Id),
+      activeTickId: Schema.optionalKey(Id),
+      cardsScanned: Schema.optionalKey(Measurement),
+      cardsChanged: Schema.optionalKey(Measurement),
+      dbMs: Schema.optionalKey(Measurement),
+      queueWaitMs: Schema.optionalKey(Measurement),
+      heapMB: Schema.optionalKey(Measurement),
+      overlappingTicks: Schema.optionalKey(Measurement),
       createdAt: Schema.optionalKey(Timestamp),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
@@ -83,6 +97,18 @@ const GeneralEvent = Schema.Struct({
       depth: Schema.optionalKey(Measurement),
       droppedFrames: Schema.optionalKey(Measurement),
       memoryBytes: Schema.optionalKey(Measurement),
+      screen: Schema.optionalKey(Label),
+      containerType: Schema.optionalKey(Label),
+      containerName: Schema.optionalKey(Label),
+      ownerAction: Schema.optionalKey(Label),
+      visibleCardCount: Schema.optionalKey(Measurement),
+      visibleThreadCount: Schema.optionalKey(Measurement),
+      subscriptionBytes: Schema.optionalKey(Measurement),
+      subscriptionMessages: Schema.optionalKey(Measurement),
+      totalMs: Schema.optionalKey(Measurement),
+      maxMs: Schema.optionalKey(Measurement),
+      wallTimeMs: Schema.optionalKey(Measurement),
+      histogram: Schema.optionalKey(LongTaskHistogram),
     }),
   ),
 });
@@ -94,8 +120,8 @@ export const RunUsageEvent = Schema.Struct({
   ...GeneralEvent.fields,
   kind: Schema.Literal("run.usage"),
   surface: Schema.Literal("server"),
-  runId: Id,
-  threadId: Id,
+  runId: DerivedId,
+  threadId: DerivedId,
   role: Schema.Literals(["work", "review", "evaluator", "discussion", "delegated", "chat"]),
   providerInstance: Label,
   model: ModelId,
@@ -174,6 +200,19 @@ export const AnalyticsRollup = Schema.Struct({
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
   errorCounts: Schema.Record(Label, Measurement),
+  longTasksByRoute: Schema.Array(
+    Schema.Struct({
+      route: Label,
+      surface: GeneralEvent.fields.surface,
+      count: Measurement,
+      totalMs: Measurement,
+      p95Ms: Schema.NullOr(Measurement),
+      maxMs: Measurement,
+      wallTimeMs: Measurement,
+      wallTimeShare: Schema.NullOr(Measurement),
+      approximate: Schema.Boolean,
+    }),
+  ),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
   usage: Schema.Struct({
@@ -189,6 +228,9 @@ export const AnalyticsRollup = Schema.Struct({
     topCardsByTokens: Schema.Array(CardUsage),
     topCardsByWallMs: Schema.Array(CardUsage),
   }),
+  tickPhases: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
+  ),
   mcpCalls: Schema.Array(
     Schema.Struct({
       tool: Label,

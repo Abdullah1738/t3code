@@ -7,4 +7,6 @@ export const layer = Layer.succeed(RestartPacing.RestartPacing, {
   acquire: () => Effect.succeed(0),
   acquireRun: () => Effect.succeed(0),
   dispatched: () => Effect.void,
+  release: () => Effect.void,
+  releaseRun: () => Effect.void,
 });
