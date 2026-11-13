@@ -246,12 +246,22 @@ def _cancel_before_start(r):
                     "check `offbox list`")
                 return r, 1
             con = db()
+            start_keys = tuple(f"{kind}:{rid}" for kind in
+                               ("start_unknown", "start_unattached", "containers_expected"))
+            pending = con.execute("SELECT 1 FROM kv WHERE k IN (?,?,?)", start_keys).fetchone()
+            if r["box_id"] and (r["error"] or r["command_id"] or pending):
+                say(f"run {rid}: remote start unconfirmed on {r['box_id']}; row left as {r['status']}, "
+                    "box remains reserved. `offbox reap` fences or reconciles the start")
+                return r, 1
             error = "client ended before its command started" if r["box_id"] else "client ended before it got a box"
-            # The client/reaper can record a command or an end between our read and this write.
+            # A pending cmd_start has no process_id either. Preserve its evidence for the reaper's start fence,
+            # including evidence the client records between our read and this write.
             changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? "
-                                  "AND process_id IS NULL AND status IN ('starting','running')"
+                                  "AND process_id IS NULL AND status IN ('starting','running') "
+                                  "AND (box_id IS NULL OR (COALESCE(error,'')='' AND command_id IS NULL "
+                                  "AND NOT EXISTS (SELECT 1 FROM kv WHERE k IN (?,?,?))))"
                                   + (" AND box_id IS NULL" if not r["box_id"] else ""),
-                                  (now(), error, rid)).rowcount
+                                  (now(), error, rid, *start_keys)).rowcount
             con.commit()
             if not changed:
                 alive = False

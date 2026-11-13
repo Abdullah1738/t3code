@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import ANY, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, cli, common, home, identity, lease, misc, pool, reap, runs, start_check  # noqa: E402
+from offbox_lib import api, cli, common, home, identity, lease, misc, pool, reap, runs, ssh_sync, start_check  # noqa: E402
 from offbox_lib.common import now  # noqa: E402
 
 from test_capacity import Isolated  # noqa: E402
@@ -23,6 +23,7 @@ class KillRunTests(Isolated):
     def setUp(self):
         super().setUp()
         # The fake boxes have no start claim: the SSH check fences any late start by default.
+        self.real_start_check = start_check.check
         self.start_check = self.stack.enter_context(patch.object(start_check, 'check',
                                                                 return_value=start_check.Result('fenced')))
         self.elapsed = 0.0
@@ -276,7 +277,7 @@ print('ready', flush=True)
 while True:
     signal.pause()
 """
-        child = subprocess.Popen([sys.executable, '-c', script, str(common.DB_PATH), rid, action],
+        child = subprocess.Popen([sys.executable, '-I', '-c', script, str(common.DB_PATH), rid, action],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         waiter = threading.Thread(target=child.wait)
         waiter.start()
@@ -536,12 +537,135 @@ while True:
         tables = {t: [tuple(r) for r in self.con.execute(f'SELECT * FROM {t}')]
                   for t in ('leases', 'pool_members', 'kv')}
         with self.no_remote_actions(), patch.object(os, 'kill', side_effect=ProcessLookupError), \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(misc.kill_run('run-1'), 0)
-        self.assertEqual(self.status_of('run-1')['status'], 'lost')
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-1'), 1)
+        self.assertEqual(self.status_of('run-1')['status'], 'running')
         for table, rows in tables.items():
             self.assertEqual([tuple(r) for r in self.con.execute(f'SELECT * FROM {table}')], rows)
         self.assertEqual(lease.active_runs(self.con, 'bx_test'), 1)
+
+    def test_prestart_start_evidence_is_preserved_including_update_races(self):
+        cases = (
+            # name, box, error, start marker, command_id, expected kill result
+            ('queued', None, None, None, None, 0),
+            ('prepared', 'bx_test', None, None, None, 0),
+            ('empty-error', 'bx_test', '', None, None, 0),
+            ('interrupted', 'bx_test', 'interrupted; awaiting confirmed remote termination', None, None, 1),
+            ('start-error', 'bx_test', 'start unknown: connection reset', None, None, 1),
+            ('unknown', 'bx_test', None, 'start_unknown', None, 1),
+            ('unattached', 'bx_test', None, 'start_unattached', None, 1),
+            ('start-boundary', 'bx_test', None, 'containers_expected', None, 1),
+            ('command-id', 'bx_test', None, None, 'cmd-pending', 1),
+        )
+        self.box('bx_test', member=True)
+        for name, box, error, marker, command_id, expected in cases:
+            for status in ('starting', 'running'):
+                for race in ('before', 'read', 'update'):
+                    with self.subTest(evidence=name, status=status, race=race):
+                        rid = f'run-evidence-{name}-{status}-{race}'
+                        self.run_row(rid, box=box, pid=None, client=12345, owner=self.me['owner'], status=status)
+                        def evidence():
+                            self.con.execute('UPDATE runs SET error=?, command_id=? WHERE run_id=?',
+                                             (error, command_id, rid))
+                            if marker:
+                                self.con.execute('INSERT INTO kv(k,v) VALUES (?,?)', (f'{marker}:{rid}', box))
+                            self.con.commit()
+                        if race == 'before':
+                            evidence()
+                        read = misc._run_row
+                        reads = 0
+                        def read_before_evidence(run_id):
+                            nonlocal reads
+                            row = read(run_id)
+                            reads += 1
+                            if race == 'read' and reads == 2:
+                                evidence()
+                            return row
+                        con = self.con
+                        class UpdateRace:
+                            def execute(self, sql, *args):
+                                if race == 'update' and sql.startswith("UPDATE runs SET status='lost'"):
+                                    evidence()
+                                return con.execute(sql, *args)
+
+                            def __getattr__(self, name):
+                                return getattr(con, name)
+                        with self.no_remote_actions(), patch.object(misc, 'db', return_value=UpdateRace()), \
+                                patch.object(misc, '_run_row', side_effect=read_before_evidence), \
+                                patch.object(misc, '_client_alive', return_value=False), patch.object(os, 'kill') as kill, \
+                                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            self.assertEqual(misc.kill_run(rid, self.me), expected)
+                        row = read(rid)
+                        self.assertEqual(row['status'], status if expected else 'lost')
+                        self.assertEqual(row['command_id'], command_id)
+                        if expected:
+                            self.assertEqual(row['error'], error)
+                            self.assertIsNone(row['end_at'])
+                            self.assertEqual(lease.active_runs(self.con, 'bx_test'), 1)
+                        if marker:
+                            self.assertEqual(self.con.execute('SELECT v FROM kv WHERE k=?', (f'{marker}:{rid}',)).fetchone()[0], box)
+                        kill.assert_not_called()
+                        self.start_check.assert_not_called()
+                        self.con.execute('DELETE FROM runs WHERE run_id=?', (rid,))
+                        self.con.execute('DELETE FROM kv WHERE k IN (?,?)', (f'{marker}:{rid}', f'start_claim:{rid}'))
+                        self.con.commit()
+
+    def test_sigterm_during_cmd_start_keeps_run_reserved_until_reaper_fences(self):
+        self.box('bx_test', member=True)
+        rid = 'run-pending-start'
+        remote_home = Path(self.tmp.name) / 'remote-home'
+        remote_home.mkdir()
+        remote_env = dict(os.environ, HOME=str(remote_home))
+        pending = []
+        def deliver_later(box, command, **kw):
+            pending.append(command)
+            signal.raise_signal(signal.SIGTERM)
+            self.fail('SIGTERM should interrupt the pending start response')
+        def ssh(box, command, **kw):
+            return subprocess.run(['bash', '-c', command], env=remote_env, capture_output=True, timeout=5)
+        args = cli.build_parser().parse_args(['run', '--remote', '--', 'echo test'])
+        with patch.object(runs, 'new_id', return_value=rid), \
+                patch.object(pool, 'acquire', return_value=dict(box_id='bx_test', remote_dir='w/test', size='large')), \
+                patch.object(pool, 'release_guard') as release, \
+                patch.object(runs.Runner, '_prepare_box', return_value=None), \
+                patch.object(runs, '_ttl_keeper'), patch.object(runs, '_host_restarting', return_value=False), \
+                patch.object(runs, 'remote_script', return_value='touch "$HOME/side-effect"'), \
+                patch.object(lease, 'auto_size', return_value=('large', None)), \
+                patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), \
+                patch.object(api, '_call', side_effect=AssertionError('unexpected backend call')), \
+                patch.object(api, 'cmd_start', side_effect=deliver_later), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(runs._run_attempt(args, dict(self.me, repo_root=self.tmp.name)), 130)
+        release.assert_called_once()
+        row = misc._run_row(rid)
+        interrupted = 'interrupted; awaiting confirmed remote termination'
+        self.assertEqual((row['status'], row['process_id'], row['error']), ('starting', None, interrupted))
+        # Model the client exiting after _run_attempt, without signalling this test's own process.
+        self.con.execute('UPDATE runs SET client_pid=12345 WHERE run_id=?', (rid,))
+        self.con.commit()
+        with self.no_remote_actions(), patch.object(misc, '_client_alive', return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(misc.kill_run(rid, self.me), 1)
+        row = misc._run_row(rid)
+        self.assertEqual((row['status'], row['process_id'], row['error'], row['end_at']),
+                         ('starting', None, interrupted, None))
+        self.assertIn('remote start unconfirmed', err.getvalue())
+        with patch.object(runs, 'confirmed_lost', return_value={'status': 'lost'}) as lost:
+            runs.reconcile_lost(self.con, 'bx_test', state='running')
+        lost.assert_not_called()
+        self.assertEqual(lease.active_runs(self.con, 'bx_test'), 1)
+        self.assertIsNone(self.con.execute('SELECT 1 FROM kv WHERE k=?', (f'lost_confirmed:{rid}',)).fetchone())
+        with patch.object(ssh_sync, 'ssh', side_effect=ssh), \
+                patch.object(start_check, 'check', side_effect=self.real_start_check) as check, \
+                patch.object(reap, 'now', return_value=now() + reap.START_GRACE_S + 1):
+            reap._check_unlocked(self.con, 'bx_test', 'running', False, [])
+        check.assert_called_once_with('bx_test', rid, claim=True)
+        self.assertEqual(lease.active_runs(self.con, 'bx_test'), 0)
+        self.assertEqual(self.con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{rid}',)).fetchone()[0], 'fenced')
+        self.assertEqual(len(pending), 1)
+        late = ssh('bx_test', pending[0])
+        self.assertEqual(late.returncode, start_check.REFUSED_RC, late.stderr)
+        self.assertFalse((remote_home / 'side-effect').exists())
 
     def test_prestart_api_id_provenance_failure_never_sends_remote_kill(self):
         for i, status in enumerate((None, {}, {'commandId': 'other-command'}, api.OffboxError('status failed'))):
