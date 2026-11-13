@@ -21,7 +21,7 @@ from . import api, capacity, identity, lease, node_tools, node_version, package_
 from . import command_usage, common, containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
-                     offsets_path, person, read_json, say, silence, write)
+                     offsets_path, person, read_json, record_delivery, say, silence, write)
 
 
 def _source_stamp():
@@ -45,6 +45,7 @@ def _log_source_change(run_id):
                          props={'stage': 'install_mid_run'}, tag='install_mid_run')
     except Exception:
         pass
+
 
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
@@ -1989,6 +1990,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
     # append (never truncated) so that prefix survives, and its checkpoint starts at the length it already holds.
     target = replay_path or log_path
     lf = open(target, "ab") if target else None
+    delivered = 0
     # A takeover also mirrors every committed chunk into the original log (`mirror_path`), so a lock-blocked
     # `logs --follow` sees the new output while the owner runs. The mirror is opened for append, never truncated.
     # Never truncated: the original keeps its committed prefix, and readers only trust bytes up to its checkpoint.
@@ -2133,6 +2135,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
                             _commit(target, out_off, err_off, lf.tell())
+                            if echo:
+                                delivered = lf.tell()
                             if mf:
                                 mf.write(b)
                                 mf.flush()
@@ -2249,6 +2253,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
             lf.close()
         if mf:
             mf.close()
+        if delivered and log_path:
+            record_delivery(mirror_path or log_path, delivered)
 
 
 def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None:

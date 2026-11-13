@@ -21,7 +21,7 @@ from time import monotonic, sleep
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, log, month_key, now,
-                     offsets_path, out, read_json, require_mine, say, silence)
+                     delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
 
@@ -902,11 +902,13 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
 
 
 def _failure_tail(path) -> None:
-    # A wait that starts after settlement missed the stream; bound the error replay to 16 KiB.
+    # Repeated waits and waits after a follower must not replay output already delivered by another invocation.
     try:
-        pos = max(0, os.path.getsize(path) - 16384)
+        size = os.path.getsize(path)
     except OSError:
         return
+    delivered = delivered_bytes(path)
+    pos = max(0, size - 16384, delivered if delivered <= size else 0)
     _tail(path, pos, True)
 
 
@@ -914,6 +916,7 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
     """Consume the holder's local log from `pos`, up to `limit` bytes when given (the committed length: bytes past it
     are not yet checkpointed and must not be printed). Prints only when echoing. Returns the new position."""
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    delivered = 0
     try:
         with open(path, 'rb') as f:
             f.seek(pos)
@@ -930,8 +933,10 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
                         else:
                             sys.stdout.write(decoder.decode(data))
                             sys.stdout.flush()
+                        delivered = pos + len(data)
                     except (OSError, ValueError):
                         silence(sys.stdout)
+                        echo = False
                 pos += len(data)
             if echo and getattr(sys.stdout, 'buffer', None) is None:
                 try:
@@ -941,6 +946,8 @@ def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
                     silence(sys.stdout)
     except OSError:
         pass
+    if delivered:
+        record_delivery(path, delivered)
     return pos
 
 

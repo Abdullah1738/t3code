@@ -243,6 +243,99 @@ class BackgroundOutputTests(Isolated):
                         if source == 'empty':
                             self.assertIn('no output on record', err.getvalue())
 
+    def test_follow_then_wait_does_not_replay_delivered_failure(self):
+        for source in ('stream', 'history', 'remote', 'broken-output'):
+            with self.subTest(source=source):
+                self.path.unlink(missing_ok=True)
+                common.offsets_path(self.path).unlink(missing_ok=True)
+                Path(str(self.path) + '.delivered').unlink(missing_ok=True)
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+                self.con.commit()
+                self.history.side_effect = self.empty
+                if source == 'history':
+                    self.streams()
+                self.box_get.return_value = dict(state='running')
+                frames = [dict(type='exit', exitCode=7)]
+                if source in ('stream', 'broken-output'):
+                    frames[:0] = [dict(type='stdout', data='hello\n', nextOffset=6),
+                                  dict(type='stderr', data='error\n', nextOffset=6)]
+                def ssh(argv, **kw):
+                    kw['stdout'].write(b'hello\nerror\n' if source == 'remote' else b'')
+                    return subprocess.CompletedProcess(argv, 0)
+                output, errors = io.BytesIO(), io.BytesIO()
+                stdout = io.TextIOWrapper(output, write_through=True)
+                stderr = io.TextIOWrapper(errors, write_through=True)
+                self.addCleanup(stdout.close)
+                self.addCleanup(stderr.close)
+                with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+                     patch.object(api, 'cmd_attach', return_value=iter(frames)), \
+                     patch.object(misc.subprocess, 'run', side_effect=ssh), \
+                     patch.object(runs, '_echo', return_value=False) if source == 'broken-output' else contextlib.nullcontext(), \
+                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(misc.logs('run-x', True), 7)
+                self.assertEqual(self.path.read_bytes(), b'hello\nerror\n')
+                if source != 'broken-output':
+                    self.assertIn(b'hello\n', output.getvalue())
+                    self.assertIn(b'error\n', output.getvalue() + errors.getvalue())
+                code, text, err = self.invoke(wait=True)
+                expected = 'hello\nerror\n' if source == 'broken-output' else ''
+                self.assertEqual((code, text), (7, expected + 'run-x: failed exit=7\n'))
+                if source == 'remote':
+                    self.assertIn('this output is incomplete', err)
+                else:
+                    self.assertEqual(err, '')
+                code, text, _ = self.invoke(wait=True)
+                self.assertEqual((code, text), (7, 'run-x: failed exit=7\n'))
+
+    def test_settled_log_read_or_wait_then_wait_is_quiet(self):
+        self.con.execute("UPDATE runs SET status='failed',exit_code=7 WHERE run_id='run-x'")
+        self.con.commit()
+        self.streams()
+        for reader in ('logs', 'follow', 'wait'):
+            with self.subTest(reader=reader):
+                Path(str(self.path) + '.delivered').unlink(missing_ok=True)
+                code, output, _ = self.invoke(wait=reader == 'wait', follow=reader == 'follow')
+                self.assertEqual(code, 7 if reader == 'wait' else 0)
+                self.assertIn('hello\nerror\n', output)
+                self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_quiet_active_wait_leaves_failure_unread_for_next_wait(self):
+        self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        self.streams()
+        with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+             patch.object(api, 'cmd_attach', return_value=iter([dict(type='exit', exitCode=7)])):
+            self.assertEqual(self.invoke(wait=True), (7, 'run-x: exit=7\n', ''))
+        self.assertEqual(self.invoke(wait=True), (7, 'hello\nerror\nrun-x: failed exit=7\n', ''))
+        self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_partial_delivery_and_broken_pipe_preserve_unread_failure(self):
+        self.path.write_text('hello\nerror\n')
+        self.con.execute("UPDATE runs SET status='failed',exit_code=7 WHERE run_id='run-x'")
+        self.con.commit()
+        for broken in (False, True):
+            with self.subTest(broken=broken):
+                Path(str(self.path) + '.delivered').unlink(missing_ok=True)
+                output = io.StringIO()
+                if broken:
+                    output.close()
+                with contextlib.redirect_stdout(output):
+                    misc._tail(self.path, 0, True, limit=6)
+                with patch.object(misc, '_catch_up_log', return_value='complete'):
+                    expected = ('hello\n' if broken else '') + 'error\n'
+                    self.assertEqual(self.invoke(wait=True), (7, expected + 'run-x: failed exit=7\n', ''))
+                    self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_replaced_shorter_log_does_not_reuse_an_out_of_range_delivery(self):
+        self.con.execute("UPDATE runs SET status='failed',exit_code=7 WHERE run_id='run-x'")
+        self.con.commit()
+        self.path.write_text('old output\n' * 20)
+        with patch.object(misc, '_catch_up_log', return_value='complete'):
+            self.assertIn('old output', self.invoke(wait=True)[1])
+            self.path.write_text('new error\n')
+            self.assertEqual(self.invoke(wait=True), (7, 'new error\nrun-x: failed exit=7\n', ''))
+            self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
     def test_fallback_ssh_failure_leaves_empty_log_and_warns(self):
         self.box_get.return_value = dict(state='running')
         with patch.object(misc.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):

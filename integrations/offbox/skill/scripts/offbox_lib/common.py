@@ -694,6 +694,36 @@ def offsets_path(log_path: Path) -> Path:
     return Path(str(log_path) + ".offsets")
 
 
+def delivered_bytes(log_path: Path) -> int:
+    try:
+        with open(str(log_path) + '.delivered') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            return max(0, int(f.read()))
+    except (OSError, ValueError):
+        return 0
+
+
+def record_delivery(log_path: Path, position: int) -> None:
+    # Keep this separate from stream checkpoints: fetching output is not delivering it to a caller.
+    if position <= 0:
+        return
+    try:
+        with open(str(log_path) + '.delivered', 'a+') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                previous = int(f.read() or 0)
+            except ValueError:
+                previous = 0
+            if position > previous or previous > Path(log_path).stat().st_size:
+                f.seek(0)
+                f.truncate()
+                f.write(str(position))
+                f.flush()
+    except OSError:
+        pass
+
+
 def checkpoint(log_path: Path | None) -> dict | None:
     """The last committed checkpoint of a local log (remote stream offsets and the log length they match), or None
     when there is no log or the run never committed one. Shared by `runs` (writer) and `misc` (takeover reader)."""
