@@ -15,8 +15,8 @@ import type { Message } from "@photon-ai/advanced-imessage/grpc";
 import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
-import { RobobBackend } from "../src/robob.ts";
-import type { ThreadDetail } from "../src/control.ts";
+import { recordsFromThread, RobobBackend } from "../src/robob.ts";
+import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
@@ -4681,6 +4681,253 @@ test("a request-opened turn hands over to the root when it resumes", async () =>
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations().at(-1)).toMatchObject({ text: "Audit done: all clear", sessionId: "ses_1" });
   expect(h.store.get("activeTurn")).toBeNull();
+});
+
+const delegatedNotices = [
+  "Delegated task node:delegated-task:order reached a terminal state. Use task_status with taskId node:delegated-task:order to read the result.",
+  "Delegated tasks node:delegated-task:order, node:delegated-task:search reached terminal states. Use task_status with each taskId to read the results.",
+  ...["completed", "failed", "cancelled", "interrupted"].map(status => `Delegated task node:delegated-task:order (Place the order) [${status}]:\nResult details`),
+  "Delegated task node:delegated-task:order (Review\nchanges) [completed]:\nResult details",
+  "Delegated task node:delegated-task:order (Review\r\nchanges (again)) [completed]. Use task_status with taskId node:delegated-task:order to read the result.",
+  "Delegated task node:delegated-task:order (Review\rchanges) [completed]:\nResult details",
+  "Delegated task node:delegated-task:order [completed]. Use task_status with taskId node:delegated-task:order to read the result.",
+];
+
+function delegatedNoticeReply(h: ReturnType<typeof setup>, text = "Done: order #2635", createdBy = "agent", notice = delegatedNotices[0]!) {
+  const runId = `run:thread:ses_1:ordinal:${h.backend.records.length + 1}`;
+  const at = new Date(Date.now()).toISOString();
+  const messages: ControlMessage[] = [
+    { messageId: `${runId}:notice`, runId, role: "user", createdBy, streaming: false,
+      text: notice, createdAt: at, updatedAt: at },
+    { messageId: `${runId}:reply`, runId, role: "assistant", createdBy: "agent", streaming: false,
+      phase: "answer", text, createdAt: at, updatedAt: at },
+  ];
+  // Feed the router the production adapter's records, including its attribution filtering.
+  h.backend.records.push(...recordsFromThread({ threadId: "ses_1", run: null, lastError: null,
+    recentRuns: [{ runId, ordinal: h.backend.records.length + 1, status: "completed" }] }, messages));
+  return `${runId}:reply`;
+}
+
+test.each(delegatedNotices)("a delegated-task notice after the watermark forwards its reply exactly once (%s)", async notice => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Place the order", "On it");
+  const replyId = delegatedNoticeReply(h, "Done: order #2635", "agent", notice);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Done: order #2635"]]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-delegated");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+});
+
+test.each([
+  { outcome: "reply", boundary: "idle" },
+  { outcome: "NO_REPLY", boundary: "idle" },
+  { outcome: "failed", boundary: "idle" },
+  { outcome: "NO_REPLY", boundary: "steer" },
+  { outcome: "NO_REPLY", boundary: "desktop" },
+  { outcome: "NO_REPLY", boundary: "multiline" },
+])("a delegated-task notice racing a batch-sealed wake forwards its own reply once (%j)", async ({ outcome, boundary }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Place the order", "On it");
+  const wake = "wake:delegated-race";
+  let replyId = "";
+  let phase: string | undefined;
+  h.backend.promptBehavior = async call => {
+    phase = h.store.get(`batch-phase:${wake}`);
+    if (boundary === "desktop") delegatedNoticeReply(h, "Desktop answer", "user", "From the desktop");
+    replyId = delegatedNoticeReply(h, "Done: order #2635", "agent", boundary === "multiline" ? delegatedNotices[6]! : delegatedNotices[0]!);
+    if (boundary === "steer") h.backend.records.pop();
+    h.backend.accept(call);
+  };
+  h.input(wake, "Another background update");
+  await h.router.tick();
+  expect(phase).toBe("submitting");
+  expect(replyId).not.toBe("");
+  // The completion delivers while the wake is still running, independently of its outcome.
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Done: order #2635"]]);
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-delegated");
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  if (outcome === "failed") h.backend.failed();
+  else h.backend.final(outcome === "reply" ? "Wake handled" : "NO_REPLY");
+  for (let i = 0; i < 4; i++) await restarted.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([
+    ...(outcome === "reply" ? [[`reply:1:${h.backend.records.at(-2)!.id}`, "Wake handled"]] : []),
+  ]);
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toMatchObject({ state: "sent", text: "Done: order #2635" });
+});
+
+test.each([
+  { arrival: "first", phase: "unknown", restart: false, unavailable: false },
+  { arrival: "retry", phase: "unknown", restart: false, unavailable: false },
+  { arrival: "deadline", phase: "unknown", restart: true, unavailable: false },
+  { arrival: "first", phase: "submitting", restart: true, unavailable: false },
+  { arrival: "first", phase: "held", restart: true, unavailable: false },
+  { arrival: "first", phase: "unknown", restart: true, unavailable: true },
+])("a delegated reply survives a sealed wake that never gains admission (%j)", async ({ arrival, phase, restart, unavailable }) => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Place the order", "On it");
+  let replyId = "";
+  h.backend.promptBehavior = async () => {
+    const due = arrival === "first" || arrival === "retry" && h.backend.prompts.length === 3;
+    if (!replyId && due) replyId = delegatedNoticeReply(h);
+    throw new Error("Wake not accepted");
+  };
+  const wake = "wake:delegated-rejected";
+  h.input(wake, "Another update");
+  await h.router.tick();
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase });
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  if (unavailable) h.backend.messagesBehavior = async () => { throw new Error("Record read unavailable"); };
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1]) {
+    if (arrival === "deadline" && offset > ACCEPT_WAIT_MS) replyId = delegatedNoticeReply(h);
+    setSystemTime(start + offset);
+    await router.tick();
+  }
+  h.backend.messagesBehavior = undefined;
+  for (let i = 0; i < 4; i++) await router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Done: order #2635"]]);
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).not.toBe("done");
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-delegated");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toMatchObject({ state: "sent", text: "Done: order #2635" });
+});
+
+test.each(["NO_REPLY", "owner", "tool"])("a rejected wake keeps delegated reply silence for %s", async mode => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  let inserted = false;
+  h.backend.promptBehavior = async () => {
+    if (!inserted) {
+      delegatedNoticeReply(h, mode === "NO_REPLY" ? "Logged.\nNO_REPLY" : "Desktop note", mode === "owner" ? "user" : "agent");
+      inserted = true;
+    }
+    throw new Error("Wake not accepted");
+  };
+  h.input("wake:delegated-rejected", "Another update");
+  await h.router.tick();
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1]) {
+    setSystemTime(start + offset);
+    await h.router.tick();
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test("a typed message queued during rejected-wake admission cannot overtake its notice reply", async () => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "On it");
+  let replyId = "";
+  h.backend.promptBehavior = async () => {
+    if (!replyId) replyId = delegatedNoticeReply(h);
+    throw new Error("Wake not accepted");
+  };
+  h.input("wake:delegated-rejected", "Another update");
+  await h.router.tick();
+  h.input("delegated-next", "Are you there?", { source: "typed" });
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS + 1);
+  await h.router.tick();
+  h.backend.final("Yes");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toContain("Done: order #2635");
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toBeDefined();
+});
+
+test.each([...delegatedNotices, "From the desktop"])("a real owner user record after the watermark keeps its reply in the desktop (%s)", async notice => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Place the order", "On it");
+  delegatedNoticeReply(h, "Desktop answer", "user", notice);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test.each([false, true])("a delegated-task NO_REPLY stays silent (sealed wake=%s)", async sealed => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "On it");
+  if (sealed) {
+    h.backend.promptBehavior = async call => { delegatedNoticeReply(h, "Logged.\nNO_REPLY"); h.backend.accept(call); };
+    h.input("wake:delegated-quiet", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else delegatedNoticeReply(h, "Logged.\nNO_REPLY");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test("tool mode keeps delegated-task replies in the thread, including before a sealed wake", async () => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, replyMode: "tool" });
+  await exchange(h, "delegated-first", "Place the order", "NO_REPLY");
+  h.backend.promptBehavior = async call => { delegatedNoticeReply(h); h.backend.accept(call); };
+  h.input("wake:delegated-tool", "Another update");
+  await h.router.tick();
+  h.backend.final("Wake handled");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("a sealed wake does not forward an owner-authored notice or a mixed owner turn", async () => {
+  for (const mixed of [false, true]) {
+    setSystemTime(10_000);
+    const h = setup(":memory:", { watchMs: 0 });
+    await exchange(h, "delegated-first", "Place the order", "On it");
+    h.backend.promptBehavior = async call => {
+      const before = h.backend.records.length;
+      delegatedNoticeReply(h, "Desktop answer", "user");
+      if (mixed) h.backend.records.splice(before, 0, { id: "mixed-notice", type: "user", text: delegatedNotices[0]!, createdBy: "agent", time: { created: Date.now() } });
+      h.backend.accept(call);
+    };
+    h.input("wake:delegated-owner", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+    for (let i = 0; i < 4; i++) await h.router.tick();
+    expect(h.conversations()).toEqual([]);
+  }
+});
+
+test.each(["narration", "unknown", "unfinished", "tools", "error", "NO_REPLY", "tool-mode"])("a wake steered into a notice does not forward %s", async kind => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, ...(kind === "tool-mode" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  h.backend.promptBehavior = async call => {
+    delegatedNoticeReply(h, kind === "NO_REPLY" ? "Logged.\nNO_REPLY" : "Still checking");
+    h.backend.records.pop();
+    const step = h.backend.records.at(-1) as Assistant;
+    if (kind === "narration") step.answer = false;
+    if (kind === "unknown") delete step.answer;
+    if (kind === "unfinished") delete step.time.completed;
+    if (kind === "tools") { step.finish = "tool-calls"; step.continued = true; }
+    if (kind === "error") step.error = { type: "provider", message: "Failed" };
+    h.backend.accept(call);
+  };
+  h.input("wake:delegated-steer", "Another update");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
 });
 
 test("background follow-ups after a finished turn are forwarded; sessions driven from OpenChamber stay there", async () => {

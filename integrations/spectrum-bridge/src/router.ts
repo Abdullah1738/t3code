@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isDelegatedCompletionText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { chatKey } from "./line.ts";
@@ -474,6 +474,11 @@ export function quietMessages(records: readonly MessageRecord[]): Set<string> {
     if (group.length > 1 && !replyText(group.map(assistantText).join("\n"))) for (const record of group) quiet.add(record.id);
   }
   return quiet;
+}
+
+/** T3's continuation prompt, never an explicitly owner-authored desktop message. */
+function delegatedCompletion(record: MessageRecord): boolean {
+  return record.type === "user" && record.createdBy !== "user" && isDelegatedCompletionText(record.text);
 }
 
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
@@ -3324,7 +3329,7 @@ export class Router {
         size += said.length + 1;
       }
       if (full) break;
-      const said = record.type === "user" ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
+      const said = record.type === "user" && !delegatedCompletion(record) ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
         : !this.toolMode && record.type === "assistant" && !providerRefusal(record) && replyText(assistantText(record)) ? `You: ${replyText(assistantText(record))}` : "";
       if (!said || said === "Owner: ") continue;
       if (size + said.length > MAX_RECAP) break;
@@ -3687,13 +3692,59 @@ export class Router {
     return found;
   }
 
+  /** Completed notice runs retain their own outcome even when a sealed wake overtakes them. */
+  private settlePrecedingCompletions(turn: Turn, records: MessageRecord[]): void {
+    const replies: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    let scope: MessageRecord[] = [];
+    let settled: string | undefined;
+    for (const record of records) {
+      if (record.type !== "idle") { scope.push(record); continue; }
+      if (!scope.some(delegatedCompletion) || scope.some(m => m.type === "user" && !delegatedCompletion(m))) { scope = []; continue; }
+      const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+      const final = steps.at(-1);
+      if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
+        if (final && (final.time.completed === undefined || final.finish === "tool-calls")) break;
+        const quiet = quietMessages(scope);
+        replies.push(...steps.filter(m => !quiet.has(m.id) && !m.error && (m.answer === true || (m === final && m.answer !== false))));
+      }
+      settled = record.id;
+      scope = [];
+    }
+    // mode:auto can steer the wake into the notice's run. Its completed answer
+    // still belongs to the notice, even though the shared idle will follow the wake.
+    if (scope.some(delegatedCompletion) && !scope.some(m => m.type === "user" && !delegatedCompletion(m))) {
+      const quiet = quietMessages(scope);
+      const answered = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
+        && m.answer === true && m.time.completed !== undefined && !m.error && !m.continued && m.finish !== "tool-calls" && !quiet.has(m.id));
+      replies.push(...answered);
+      settled = answered.at(-1)?.id ?? settled;
+    }
+    if (!settled) return;
+    let enqueued = false;
+    this.store.db.transaction(() => {
+      for (const reply of this.toolMode ? [] : replies) {
+        const text = replyText(assistantText(reply));
+        const id = `reply:${turn.generation}:${reply.id}`;
+        if (text && !this.store.getOperation(id)) {
+          this.store.enqueue({ id, kind: "conversation", text, sessionId: turn.id, generation: turn.generation });
+          enqueued = true;
+        }
+      }
+      this.store.set("watermark", { sessionId: turn.id, id: settled! } satisfies Watermark);
+    }).immediate();
+    if (enqueued) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
+  }
+
   private async poll(): Promise<void> {
     let turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
+      const mark = this.store.get<Watermark | null>("watermark");
       let messages = await this.reading(this.backend.messages(turn.id, turn.directory, turn.background
-        ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 }));
+        ? { until: turn.messageId, limit: 20 }
+        : mark?.sessionId === turn.id ? { until: mark.id }
+        : { until: turn.messageId, since: turn.startedAt - 60_000 }));
       if (!this.current(turn)) return;
       if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
         await this.reconcile(turn, messages);
@@ -3801,6 +3852,10 @@ export class Router {
       const start = messages.findIndex(m => m.type === "user" && ownedPrompts.has(m.id)
         || turn!.background && m.id === turn!.messageId);
       const after = start < 0 ? [] : messages.slice(start + 1);
+      if (!turn.background && mark?.sessionId === turn.id) {
+        const markIndex = messages.findIndex(m => m.id === mark.id);
+        if (markIndex >= 0 && start > markIndex) this.settlePrecedingCompletions(turn, messages.slice(markIndex + 1, start));
+      }
       // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
       let steered = -1;
       after.forEach((m, index) => { if (m.type === "user" && ownedPrompts.has(m.id)) steered = index; });
@@ -4126,8 +4181,8 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
-      if (after.some(m => m.type === "user")) {
-        // The owner is driving this session from OpenChamber directly; those replies stay there.
+      if (after.some(m => m.type === "user" && !delegatedCompletion(m))) {
+        // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");
         if (idle && statuses[route.id] === undefined) this.store.set("watermark", { sessionId: route.id, id: idle.id } satisfies Watermark);
         return;
@@ -4201,7 +4256,9 @@ export class Router {
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);
       this.store.set("pendingApprovals", null);
-      this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
+      // An unadmitted wake has no run outcome: retain the last delivered record
+      // so watch() can still find independent completions that arrived during its POST.
+      if (watermark || reason !== "undelivered") this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
       this.store.set("settledAt", Date.now());
     }).immediate();
   }
