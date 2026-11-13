@@ -1583,6 +1583,8 @@ def clip(text, n=160):
 
 
 def is_bill(case):
+    if case.get('kind') == 'merchant_card' or case.get('amount') in (None, '') or case.get('currency') in (None, ''):
+        return False
     text = ' '.join(str(case.get(k, '')) for k in ('merchant', 'state', 'reference', 'id'))
     return case.get('kind') == 'payment_deadline' or bool(re.search(
         r'\b(?:bill|statement|autopay|premium|repayment)\b', text, re.I))
@@ -1595,6 +1597,8 @@ def overdue_bill(case, now):
 
 def balance_after_credits(case, cases, now):
     """Use the newest recorded statement, then posted same-card credits, including closed refunds."""
+    if case.get('kind') == 'merchant_card' or case.get('amount') in (None, '') or case.get('currency') in (None, ''):
+        return money(case)
     balance = Decimal(case.get('statement_balance', case['amount']))
     statement_at = moment(case.get('statement_at')) or moment(case['opened'])
     amount_re = re.compile(r'(?P<currency>[A-Z]{3})\s*(?P<amount>\d[\d,]*(?:\.\d{1,2})?)', re.I)
