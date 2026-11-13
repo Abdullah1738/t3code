@@ -62,6 +62,29 @@ export function isTransientSessionStateError(error: {
   return cause instanceof Error;
 }
 
+export function isRejectedSessionStateError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return false;
+  switch (error._tag) {
+    case "EnvironmentAuthInvalidError":
+    case "EnvironmentScopeRequiredError":
+    case "EnvironmentOperationForbiddenError":
+    case "ConnectionBlockedError":
+      return true;
+    case "RemoteEnvironmentAuthUndeclaredStatusError":
+      return "status" in error && (error.status === 401 || error.status === 403);
+    case "RemoteEnvironmentAuthFetchError":
+      return (
+        "cause" in error &&
+        (isRejectedSessionStateError(error.cause) ||
+          (typeof error.cause === "object" &&
+            error.cause !== null &&
+            "authenticated" in error.cause))
+      );
+    default:
+      return false;
+  }
+}
+
 export const fetchEnvironmentSessionState = Effect.fn(
   "clientRuntime.state.fetchEnvironmentSessionState",
 )(function* (input: {

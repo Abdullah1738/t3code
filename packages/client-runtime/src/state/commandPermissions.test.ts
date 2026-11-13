@@ -4,8 +4,8 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import type { RpcSession } from "../rpc/session.ts";
-import { describe, expect, it } from "@effect/vitest";
-import { vi } from "vite-plus/test";
+import { it } from "@effect/vitest";
+import { vi, afterEach, describe, expect } from "vite-plus/test";
 import {
   AuthOrchestrationOperateScope,
   AuthPreviewOperateScope,
@@ -26,10 +26,21 @@ import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
 import { createEnvironmentRpcCommand } from "./runtime.ts";
+import { sessionHarness, delayedSession } from "./session.testkit.ts";
 
-vi.mock("./session.ts", () => ({
-  createEnvironmentSessionAtoms: () => ({ sessionStateAtom: sessions }),
-}));
+vi.mock("./session.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session.ts")>();
+  return {
+    ...actual,
+    createEnvironmentSessionAtoms: (
+      runtime: Parameters<typeof actual.createEnvironmentSessionAtoms>[0],
+    ) =>
+      liveRuntimes.has(runtime)
+        ? actual.createEnvironmentSessionAtoms(runtime)
+        : { sessionStateAtom: sessions },
+  };
+});
+const liveRuntimes = new WeakSet<object>();
 const sessions = Atom.family((_id: EnvironmentId) =>
   Atom.make<AsyncResult.AsyncResult<AuthSessionState, string>>(AsyncResult.initial()),
 );
@@ -169,8 +180,8 @@ describe("command permissions", () => {
         const fiber = yield* permissions
           .authorize(registry, env)
           .pipe(Effect.flip, Effect.forkChild);
-        yield* TestClock.adjust("6 seconds");
-        expect((yield* Fiber.join(fiber))._tag).toBe("EnvironmentAuthorizationError");
+        yield* TestClock.adjust("15 seconds");
+        expect((yield* Fiber.join(fiber))._tag).toBe("EnvironmentRpcUnavailableError");
       }),
     ),
   );
@@ -182,7 +193,7 @@ describe("command permissions", () => {
           const registry = yield* setup;
           registry.set(sessions(env), AsyncResult.failure(Cause.fail("offline")));
           expect((yield* permissions.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
-            "EnvironmentAuthorizationError",
+            "EnvironmentRpcUnavailableError",
           );
           registry.set(
             sessions(env),
@@ -238,6 +249,129 @@ describe("command permissions", () => {
   });
 });
 
+describe("slow session authorization", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("waits through a first read over six seconds and its fast retry, then authorizes again", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    let aborted = 0;
+    const harness = await sessionHarness((_url, init) => {
+      reads++;
+      init?.signal?.addEventListener("abort", () => aborted++);
+      return delayedSession(reads === 1 ? 8_000 : 100, init?.signal);
+    });
+    liveRuntimes.add(harness.runtime);
+    const permission = createCommandPermissions(harness.runtime, WS_METHODS.scheduledTasksDelete);
+    try {
+      const first = Effect.runPromiseExit(
+        permission.authorize(harness.registry, harness.environmentId),
+      );
+      let settled = false;
+      void first.then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(6_001);
+      expect(reads).toBe(1);
+      expect(aborted).toBe(1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect((await first)._tag).toBe("Success");
+      expect(reads).toBe(2);
+      const second = Effect.runPromiseExit(
+        permission.authorize(harness.registry, harness.environmentId),
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      expect((await second)._tag).toBe("Success");
+    } finally {
+      harness.registry.dispose();
+    }
+  });
+
+  it("reports a retryable connection failure when no session read can finish", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const harness = await sessionHarness((_url, init) => {
+      reads++;
+      return delayedSession(20_000, init?.signal);
+    });
+    liveRuntimes.add(harness.runtime);
+    const permission = createCommandPermissions(harness.runtime, WS_METHODS.scheduledTasksDelete);
+    try {
+      const result = Effect.runPromise(
+        permission.authorize(harness.registry, harness.environmentId).pipe(Effect.flip),
+      );
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect(await result).toMatchObject({ _tag: "EnvironmentRpcUnavailableError" });
+      const readsAtClose = reads;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(reads).toBe(readsAtClose);
+    } finally {
+      harness.registry.dispose();
+    }
+  });
+
+  it("cancels an authorization request during backoff without retrying after its scope closes", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const harness = await sessionHarness((_url, init) => {
+      reads++;
+      return delayedSession(8_000, init?.signal);
+    });
+    liveRuntimes.add(harness.runtime);
+    const permission = createCommandPermissions(harness.runtime, WS_METHODS.scheduledTasksDelete);
+    try {
+      const fiber = Effect.runFork(permission.authorize(harness.registry, harness.environmentId));
+      await vi.advanceTimersByTimeAsync(6_001);
+      await Effect.runPromise(Fiber.interrupt(fiber));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(reads).toBe(1);
+    } finally {
+      harness.registry.dispose();
+    }
+  });
+
+  it.each([401, 403])(
+    "keeps HTTP %s denial terminal rather than turning it into a connection retry",
+    async (status) => {
+      vi.useFakeTimers();
+      let reads = 0;
+      const harness = await sessionHarness(async () => {
+        reads++;
+        return Response.json(
+          status === 401
+            ? {
+                _tag: "EnvironmentAuthInvalidError",
+                code: "auth_invalid",
+                reason: "invalid_credential",
+                traceId: "test",
+              }
+            : {
+                _tag: "EnvironmentScopeRequiredError",
+                code: "insufficient_scope",
+                requiredScope: "orchestration:operate",
+                traceId: "test",
+              },
+          { status },
+        );
+      });
+      liveRuntimes.add(harness.runtime);
+      const permission = createCommandPermissions(harness.runtime, WS_METHODS.scheduledTasksDelete);
+      try {
+        const result = Effect.runPromise(
+          permission.authorize(harness.registry, harness.environmentId).pipe(Effect.flip),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await result).toMatchObject({ _tag: "EnvironmentAuthorizationError" });
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(reads).toBe(1);
+      } finally {
+        harness.registry.dispose();
+      }
+    },
+  );
+});
+
 it.effect(
   "requires source control alone for git, and both grants when attaching a worktree to a thread",
   () =>
@@ -246,9 +380,9 @@ it.effect(
         const registry = yield* setup;
         registry.set(sessions(env), AsyncResult.success(grant(true)));
         const git = createCommandPermissions(runtime, WS_METHODS.vcsInit);
-        expect((yield* git.authorize(registry, env).pipe(Effect.flip)).requiredPermission).toBe(
-          AuthSourceControlWriteScope,
-        );
+        expect(yield* git.authorize(registry, env).pipe(Effect.flip)).toMatchObject({
+          requiredPermission: AuthSourceControlWriteScope,
+        });
         registry.set(
           sessions(env),
           AsyncResult.success({
@@ -266,9 +400,9 @@ it.effect(
           threadId: ThreadId.make("thread"),
         };
         expect(registry.get(prepare.permissionAtom(env, input))).toBe(false);
-        expect(
-          (yield* prepare.authorize(registry, env, input).pipe(Effect.flip)).requiredScope,
-        ).toBe(AuthOrchestrationOperateScope);
+        expect(yield* prepare.authorize(registry, env, input).pipe(Effect.flip)).toMatchObject({
+          requiredScope: AuthOrchestrationOperateScope,
+        });
         yield* prepare.authorize(registry, env, { ...input, threadId: undefined });
         registry.set(
           sessions(env),

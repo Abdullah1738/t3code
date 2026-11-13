@@ -4,14 +4,17 @@ import {
   authScopeRequiredResponse,
   EnvironmentAuthorizationError,
   type EnvironmentId,
-  type AuthSessionState,
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { createEnvironmentSessionAtoms } from "./session.ts";
+import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
+import { createEnvironmentSessionAtoms, isRejectedSessionStateError } from "./session.ts";
+
+// Two six-second reads plus the first one-second backoff, with room to settle.
+const SESSION_AUTHORIZATION_TIMEOUT_MS = 15_000;
 
 function makeCommandPermissions<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -45,6 +48,11 @@ function makeCommandPermissions<R, E>(
     Effect.suspend(() => {
       const scopes = requiredScopes(input);
       if (scopes.length === 0) return Effect.void;
+      const denied = (scope: AuthEnvironmentScope) =>
+        new EnvironmentAuthorizationError({
+          ...authScopeRequiredResponse(scope),
+          message: `This connection requires ${scope}.`,
+        });
       const atom = sessions.sessionStateAtom(environmentId);
       return Effect.scoped(
         Effect.gen(function* () {
@@ -52,19 +60,18 @@ function makeCommandPermissions<R, E>(
           const session = yield* AtomRegistry.getResult(registry, atom, {
             suspendOnWaiting: false,
           }).pipe(
-            Effect.timeoutOption(6_000),
-            Effect.catch(() => Effect.succeed(Option.none<AuthSessionState>())),
+            Effect.timeout(SESSION_AUTHORIZATION_TIMEOUT_MS),
+            Effect.mapError((error) =>
+              isRejectedSessionStateError(error)
+                ? denied(scopes[0]!)
+                : new EnvironmentRpcUnavailableError({
+                    environmentId,
+                    message: "Could not check this connection's permissions. Try again.",
+                  }),
+            ),
           );
-          const missing = scopes.find(
-            (scope) => Option.isNone(session) || !sessionGrantsScope(session.value, scope),
-          );
-          if (missing !== undefined)
-            return yield* Effect.fail(
-              new EnvironmentAuthorizationError({
-                ...authScopeRequiredResponse(missing),
-                message: `This connection requires ${missing}.`,
-              }),
-            );
+          const missing = scopes.find((scope) => !sessionGrantsScope(session, scope));
+          if (missing !== undefined) return yield* Effect.fail(denied(missing));
         }),
       );
     });
