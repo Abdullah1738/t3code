@@ -77,6 +77,7 @@ import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/Provid
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as KanbanThreadLifecycle from "./threads.ts";
+import { evaluatePullRequestWatch } from "../../../orchestration-v2/pullRequestWatch.ts";
 import {
   DEFAULT_CARD_MODEL,
   DEFAULT_EVALUATOR_MODEL,
@@ -22552,7 +22553,13 @@ const clearedHandoff = Effect.fn("clearedHandoff")(function* (
   const current = (yield* started.kanban.card(started.card.id)).card;
   const url = "https://github.com/o/r/pull/925";
   fake.prs.set(started.worker.threadId!, [
-    { url, title: "Fix", state: "open", head: "aaaaaaa111111111" },
+    {
+      url,
+      title: "Fix",
+      state: "open",
+      head: "aaaaaaa111111111",
+      observedHead: "aaaaaaa111111111",
+    },
   ]);
   yield* store.putCard({
     ...current,
@@ -22716,7 +22723,13 @@ it.effect.each(["completed", "deployed"] as const)(
         const cleared = (yield* kanban.card(card.id)).card;
         const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator") };
         fake.prs.set(worker.threadId!, [
-          { url, title: "Fix", state: "open", head: "bbbbbbb222222222" },
+          {
+            url,
+            title: "Fix",
+            state: "open",
+            head: "aaaaaaa111111111",
+            observedHead: "bbbbbbb222222222",
+          },
         ]);
         const denied = yield* kanban
           .moveCard(card.id, to, "evaluator", evaluator)
@@ -22728,7 +22741,13 @@ it.effect.each(["completed", "deployed"] as const)(
         assert.deepStrictEqual((yield* kanban.card(card.id)).card, cleared);
         for (const head of ["aaaaaaa111111111", "AAAAAAA111111111", "aaaaaaa", null, undefined]) {
           fake.prs.set(worker.threadId!, [
-            { url, title: "Fix", state: "open", ...(head === undefined ? {} : { head }) },
+            {
+              url,
+              title: "Fix",
+              state: "open",
+              head: "aaaaaaa111111111",
+              ...(head === undefined ? {} : { observedHead: head }),
+            },
           ]);
           const moved = yield* kanban.moveCard(card.id, to, "evaluator", evaluator);
           assert.strictEqual(moved.stage, to);
@@ -22740,13 +22759,19 @@ it.effect.each(["completed", "deployed"] as const)(
             url: "https://github.com/o/r/pull/999",
             title: "Other",
             state: "open",
-            head: "bbbbbbb222222222",
+            observedHead: "bbbbbbb222222222",
           },
         ]);
         assert.strictEqual((yield* kanban.moveCard(card.id, to, "evaluator", evaluator)).stage, to);
         yield* store.putCard(cleared);
         fake.prs.set(worker.threadId!, [
-          { url, title: "Fix", state: "open", head: "bbbbbbb222222222" },
+          {
+            url,
+            title: "Fix",
+            state: "open",
+            head: "aaaaaaa111111111",
+            observedHead: "bbbbbbb222222222",
+          },
         ]);
         yield* store.addCardEvent({
           cardId: card.id,
@@ -22763,6 +22788,68 @@ it.effect.each(["completed", "deployed"] as const)(
         assert.strictEqual((yield* kanban.moveCard(card.id, to, "owner", owner)).stage, to);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.effect.each([
+  { pr: "bbbbbbb222222222", branch: "bbbbbbb222222222", checks: "aaaaaaa111111111" },
+  { pr: "aaaaaaa111111111", branch: "bbbbbbb222222222", checks: "aaaaaaa111111111" },
+  { pr: "bbbbbbb222222222", branch: null, checks: "aaaaaaa111111111" },
+  { pr: null, branch: "bbbbbbb222222222", checks: "aaaaaaa111111111" },
+])("#925 observed head blocks merge while checks settle (PR=$pr, branch=$branch)", (heads) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, worker, url } = yield* clearedHandoff(fake);
+      const report = evaluatePullRequestWatch(
+        {
+          startedAt: "2026-11-13T00:00:00.000Z",
+          headSha: "aaaaaaa111111111",
+          failedChecks: [],
+          passed: true,
+          passedChecks: ["test"],
+          passedPending: [],
+          remarksThrough: "2026-11-13T00:00:00.000Z",
+          remarkIds: [],
+          conflicting: false,
+          conflictHead: null,
+          conflictWokeFor: null,
+          wakes: 0,
+        },
+        {
+          ...(heads.pr === null ? {} : { headSha: heads.pr }),
+          headBranchSha: heads.branch,
+          checksHeadSha: heads.checks,
+          checks: [],
+          mergeability: "mergeable",
+          viewer: "worker",
+          author: null,
+        },
+        [],
+      );
+      assert.strictEqual(report.next.headSha, "aaaaaaa111111111");
+      assert.strictEqual(report.next.observedHeadSha, "bbbbbbb222222222");
+      assert.deepStrictEqual(report.changes, []);
+      fake.prs.set(worker.threadId!, [
+        {
+          url,
+          title: "Fix",
+          state: "open",
+          head: report.next.headSha,
+          observedHead: report.next.observedHeadSha!,
+        },
+      ]);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator") };
+      for (const to of ["completed", "deployed"] as const) {
+        const denied = yield* kanban
+          .moveCard(card.id, to, "evaluator", evaluator)
+          .pipe(Effect.flip);
+        assert.strictEqual(
+          denied.detail,
+          `card #${card.number} was cleared at aaaaaaa but its PR is now at bbbbbbb: send it back to needs_review`,
+        );
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect(

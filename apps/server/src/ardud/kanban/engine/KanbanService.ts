@@ -11651,15 +11651,15 @@ const make = Effect.gen(function* () {
               const view = yield* threads.view(card.workThreadId);
               const changed = view?.prs.find(
                 (pr) =>
-                  pr.head &&
+                  pr.observedHead &&
                   card.links.some((link) => link.kind === "pr" && link.url === pr.url) &&
-                  !pr.head.toLowerCase().startsWith(reviewed.toLowerCase()) &&
-                  !reviewed.toLowerCase().startsWith(pr.head.toLowerCase()),
+                  !pr.observedHead.toLowerCase().startsWith(reviewed.toLowerCase()) &&
+                  !reviewed.toLowerCase().startsWith(pr.observedHead.toLowerCase()),
               );
-              if (changed?.head)
+              if (changed?.observedHead)
                 return yield* failWith(
                   "denied",
-                  `card #${card.number} was cleared at ${reviewed.slice(0, 7)} but its PR is now at ${changed.head.slice(0, 7)}: send it back to needs_review`,
+                  `card #${card.number} was cleared at ${reviewed.slice(0, 7)} but its PR is now at ${changed.observedHead.slice(0, 7)}: send it back to needs_review`,
                 );
             }
           }
