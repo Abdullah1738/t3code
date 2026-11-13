@@ -1482,6 +1482,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invocation_written = {}
     invocation_fresh = set()
     invocation_literals = set()
+    invocation_reader_literals = set()
     invocation_quoted = set()
     uncertain_write = 0
     unsafe_bindings = False
@@ -1678,11 +1679,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             script_values[name] = candidates | script_values.get(name, {"$" + name}) if conditional or transient else candidates
             if not conditional and not transient and re.fullmatch(r'\$\(mktemp -d(?: [^;&|()`\n]*)?\)', value):
                 fresh_variables.add(name)
-        candidates = [values[0] for values in variants([value])]
-        shell_values[name] = expand(value)
+        candidates = [value] if word in invocation_reader_literals else [values[0] for values in variants([value])]
+        shell_values[name] = value if word in invocation_reader_literals else expand(value)
         for candidate in candidates:
             path = _literal_path(candidate, directory)
-            if re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", candidate):
+            if LIVE.search(candidate) or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", candidate):
                 path_values.setdefault(name, set()).add(candidate)
             if LIVE.search(candidate) or path is not None and LIVE.search(str(path)):
                 # Branches and env prefixes may not execute; retain possible
@@ -1892,16 +1893,26 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
 
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False):
-        nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_quoted, unsafe_bindings, noclobber
+        nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, unsafe_bindings, noclobber
         words = list(words)
         if stdin_words and not any(word in {'<<', '<<<', '<'} for word in words):
             words.extend(stdin_words)
         checked = set()
         literal_words = set()
+        reader_literal_words = set()
         double_words = set()
         unquoted_words = set()
         def decode(value):
             decoded = decode_word(value, directory, depth, quoted, checked, cwd_only, bodies)
+            reader_word = value
+            for key, text in reversed(quoted.items()):
+                if key.startswith('\0guard_literal_double_'):
+                    text = re.sub(r'\\[$`"\\\n]', '', text)
+                elif key.startswith('\0guard_literal_'):
+                    text = ''
+                reader_word = reader_word.replace(key, text)
+            if not re.search(r'[$`]', reader_word):
+                reader_literal_words.add(decoded)
             if any(key in value and key.startswith('\0guard_literal_') and re.search(r'[$`]', text)
                    for key, text in quoted.items()):
                 literal_words.add(decoded)
@@ -1935,12 +1946,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         raw_words = list(words)
         words = [decode(word) for word in words]
         invocation_literals = literal_words
+        invocation_reader_literals = reader_literal_words
         invocation_quoted = double_words - unquoted_words
 
         def caller_argv(count):
             # Prefix unwrapping only removes words from the front. Preserve
             # literal quote segments until caller expansions are complete.
-            bindings = {'HOME': {str(Path.home())}, **({'PWD': {str(directory)}} if directory is not None else {}), **script_values}
+            bindings = {'HOME': {str(Path.home())}, **({'PWD': {str(directory)}} if directory is not None else {}),
+                        **{name: set(values) for name, values in script_values.items()}}
+            # Reader evidence survives declarations that invalidate script
+            # proofs. Keep an unknown alternative rather than trusting it.
+            for name, value in shell_values.items():
+                if name in script_values:
+                    bindings[name].update(path_values.get(name, ()))
+                elif name != 'HOME' or value != str(Path.home()) or name in path_values:
+                    bindings[name] = {'$' + name, value, *path_values.get(name, ())}
             arguments = [[]]
             variable = r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)'
             markers = dict(quoted)
@@ -2095,6 +2115,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         after = caller_directory if child_directory else directory
         if binary in {"export", "readonly", "declare", "typeset", "local"}:
             if not cwd_only:
+                if binary in {'declare', 'typeset', 'local'} and any(re.fullmatch(r'-[A-Za-z]*[naiA][A-Za-z]*', arg) for arg in args):
+                    unsafe_bindings = True
                 if any(arg.partition('=')[0] in {'PATH', 'IFS', 'ENV', 'BASH_ENV', 'BASHOPTS', 'SHELLOPTS', 'ZDOTDIR'} for arg in args):
                     unsafe_bindings = True
                 script_values.clear()

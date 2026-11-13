@@ -231,6 +231,52 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/"$S.py"'), SCRIPT)
         self.assertIsNone(self.classify('S=tmp/live.py; offbox run -- cat \'$S\''))
 
+    def test_remote_declarations_keep_conservative_reader_bindings(self):
+        declarations = [
+            'export DB=' + LIVE,
+            'readonly DB=' + LIVE,
+            'declare DB=' + LIVE,
+            'typeset DB=' + LIVE,
+            'local DB=' + LIVE,
+            'export -x DB=' + LIVE,
+            'declare -x DB=' + LIVE,
+            'declare -r DB=' + LIVE,
+            'declare -- DB=' + LIVE,
+            'DB=' + LIVE + '; export DB',
+            'DB=' + LIVE + '; readonly DB',
+            'DB=' + LIVE + '; declare DB',
+            'DB=' + LIVE + '; export -p',
+            'DB=' + LIVE + '; readonly DB; declare X=unrelated',
+            'DB=' + LIVE + '; export DB; read DB',
+            'readonly DB=' + LIVE + '; DB=tmp/t.py',
+            'declare -r DB=' + LIVE + '; DB=tmp/t.py',
+        ]
+        for wrapper in ['offbox run -- ', 'ssh box ', 'python3 /abs/offbox.py ssh box ']:
+            for declaration in declarations:
+                for operand in ['"$DB"', '"${DB}"']:
+                    with self.subTest(wrapper=wrapper, declaration=declaration, operand=operand):
+                        self.assertEqual(self.classify(declaration + '; ' + wrapper + 'cat ' + operand), READ)
+            for root in ['/Users/x/.robob/userdata', str(Path.home() / '.t3/userdata')]:
+                with self.subTest(wrapper=wrapper, root=root):
+                    self.assertEqual(self.classify('export D=' + shlex.quote(root) + '; ' + wrapper + 'cat "$D/statev2.sqlite"'), READ)
+                    self.assertEqual(self.classify('export D=' + shlex.quote(root) + '; DB="$D/statev2.sqlite"; ' + wrapper + 'cat "$DB"'), READ)
+            alias = 'DB=' + LIVE + '; declare -n REF=DB; ' + wrapper + 'cat "$REF"'
+            self.assertIn(self.classify(alias), (READ, UNRESOLVED))
+        for declaration in ['export', 'readonly', 'declare', 'typeset', 'local']:
+            self.assertIsNone(self.classify(declaration + ' S=tmp/t.py; offbox run -- cat "$S"'))
+            self.assertEqual(self.classify(declaration + ' S=tmp/t.py; offbox run -- python3 "$S"'), UNRESOLVED)
+        prefix = 'export DB=' + LIVE + '; offbox run -- '
+        self.assertIsNone(self.classify(prefix + "cat '$DB'"))
+        self.assertIsNone(self.classify(prefix + shlex.quote('DB=tmp/t.py; cat "$DB"')))
+        self.assertEqual(self.classify('offbox run -- ' + shlex.quote('export DB=' + LIVE + '; cat "$DB"')), READ)
+        self.assertIsNone(self.classify('export DB=' + LIVE + '; CODE=\'REMOTE=tmp/t.py; cat "$REMOTE"\'; offbox run -- "$CODE"'))
+        self.assertIsNone(self.classify('export DB=' + LIVE + '; CODE=\'DB=tmp/t.py; cat "$DB"\'; offbox run -- "$CODE"'))
+        for assignment in ["S='$DB'", r'S=\$DB', r'S="\$DB"', "export S='$DB'"]:
+            with self.subTest(literal_assignment=assignment):
+                self.assertIsNone(self.classify('DB=' + LIVE + '; ' + assignment + '; offbox run -- cat "$S"'))
+        self.assertIsNone(self.classify('DB=' + LIVE + '; S=\'$DB\'; T="$S"; offbox run -- cat "$T"'))
+        self.assertEqual(self.classify('DB=' + LIVE + '; URI="file:$DB?\\$q"; offbox run -- sqlite3 "$URI" .tables'), READ)
+
     def test_substitution_quotes_cannot_hide_later_documents(self):
         prefixes = [
             "echo \"`printf '\"'`\"",
