@@ -517,12 +517,12 @@ def busy(error):
         or any(word in str(error).lower() for word in ('locked', 'busy')))
 
 
-def db_retry(operation):
+def db_retry(operation, *, all_operational=False):
     for attempt in range(3):
         try:
             return operation()
         except sqlite3.OperationalError as error:
-            if not busy(error) or attempt == 2:
+            if (not all_operational and not busy(error)) or attempt == 2:
                 raise
             time.sleep(random.uniform(.03, .1) * (attempt + 1))
 
@@ -593,7 +593,11 @@ def _migrate(con):
 def db() -> sqlite3.Connection:
     ensure_dirs()
     # Standalone writes commit immediately. Only read/modify/write units use write(), never network work.
-    con = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None, factory=StateConnection)
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None, factory=StateConnection)
+    except sqlite3.Error as error:
+        error.add_note('local state SQL: connect')
+        raise
     con.row_factory = sqlite3.Row
     try:
         db_retry(lambda: ensure_schema(con))

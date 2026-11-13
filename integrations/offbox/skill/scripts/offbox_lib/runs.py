@@ -1092,18 +1092,27 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
-                code = settled_steps_code(row, code, locked=True, until=until)
+                code = finish(row['run_id'], code, status, until=until, run=row, bookkeeping=False, report=True)
                 if planned_steps(row):
                     status = 'infra' if code is None else ('done' if code == 0 else 'failed')
-            con.execute("UPDATE runs SET status=?,exit_code=?,end_at=?,error=NULL WHERE run_id=? "
-                        "AND status IN ('lost','running') AND exit_code IS NULL",
-                        (status, code, now() if st else None, row['run_id']))
-            event(con, box_id, 'run_reattached', f"{row['run_id']} {status} exit={code}")
+            else:
+                con.execute("UPDATE runs SET status=?,exit_code=?,end_at=?,error=NULL WHERE run_id=? "
+                            "AND status IN ('lost','running') AND exit_code IS NULL",
+                            (status, code, None, row['run_id']))
+            try:
+                event(con, box_id, 'run_reattached', f"{row['run_id']} {status} exit={code}")
+            except sqlite3.Error as error:
+                if not st:
+                    raise
+                state_warning(row['run_id'], code, error)
         con.commit()
         if st and st.get('exitCode') is not None:
-            settle_docker(con, row, status, timeout=10 if until is None else max(0, until-now()))
-            from .misc import _catch_up_finished
-            _catch_up_finished(con, row['run_id'], budget=10 if until is None else max(0, until-now()))
+            try:
+                settle_docker(con, row, status, timeout=10 if until is None else max(0, until-now()))
+                from .misc import _catch_up_finished
+                _catch_up_finished(con, row['run_id'], budget=10 if until is None else max(0, until-now()))
+            except sqlite3.Error as error:
+                state_warning(row['run_id'], code, error)
 
 
 def steps_exit(log_path: Path | None, planned: int) -> int | None:
@@ -2236,15 +2245,25 @@ def state_warning(run_id, code, error):
 
 
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
-           until: float | None = None, report: bool = False) -> int | None:
-    # Step history can reach the server; validate before reserving the SQLite writer.
-    with contextlib.closing(db()) as before:
-        prior = before.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
-    if not prior:
-        return code
-    code = settled_steps_code(prior, code, locked=True, until=until, catch_up=catch_up, report=report)
-    st = ('infra' if code is None and planned_steps(prior) else
-          status or ("lost" if code is None else ("done" if code == 0 else "failed")))
+           until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
+    incoming = code
+    st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
+    def prepare_result():
+        nonlocal code, st
+        prior = run
+        if prior is None:
+            with contextlib.closing(db()) as before:
+                prior = before.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if prior is None:
+            return
+        # History can reach the server. An unvalidated wrapper result is never saved as terminal.
+        if planned_steps(prior):
+            code = None
+        code = settled_steps_code(prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
+        if planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
+            st = 'infra' if code is None else ('done' if code == 0 else 'failed')
+        else:
+            st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def persist():
         con = db()
         try:
@@ -2252,10 +2271,10 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                 r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if r:
                     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
-                                "AND (status IN ('starting','running') OR "
+                                "AND (status IN ('starting','running') OR (status='lost' AND exit_code IS NULL AND ?='infra') OR "
                                 "(exit_code IS NULL AND ? IS NOT NULL AND (status='lost' OR "
                                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
-                                (st, code, now(), run_id, code))
+                                (st, code, now(), run_id, st, code))
                     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                     if terminal_result(r):
                         con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{run_id}',))
@@ -2263,7 +2282,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         finally:
             con.close()
     try:
-        r = db_retry(persist)
+        db_retry(prepare_result, all_operational=True)
+        r = db_retry(persist, all_operational=True)
     except sqlite3.Error as error:
         if code is not None:
             save_run_state(run_id, status=st, exit_code=code, end_at=now())
@@ -2275,7 +2295,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     if not r:
         return code
     st, code = r['status'], r['exit_code']
-    if not r["box_id"]:
+    if not r["box_id"] or not bookkeeping:
         return code
     # No transaction is open while Docker/TTL calls reach the box or boat.
     con = None
@@ -2340,10 +2360,10 @@ def _run_attempt(a, me: dict) -> int:
         log("remote runner local state failure:\n" + traceback.format_exc())
         if rn.remote_code is not None:
             if not getattr(rn, 'quarantine_pending', False):
-                finish(rn.run_id, rn.remote_code)
+                rn.remote_code = finish(rn.run_id, rn.remote_code)
             state_warning(rn.run_id, rn.remote_code, error)
             report_exit("", rn.remote_code)
-            return rn.remote_code
+            return EXIT_INFRA if rn.remote_code is None else rn.remote_code
         if not rn.started and rn.registered:
             finish(rn.run_id, EXIT_LOCAL, 'local_error')
         failure = local_error(error, run_id=rn.run_id if rn.registered else None, started=rn.started)

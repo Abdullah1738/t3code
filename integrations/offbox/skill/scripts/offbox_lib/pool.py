@@ -1142,7 +1142,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                 row = con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
                 row = runs.restore_run_state(row)
                 if runs.terminal_result(row):
-                    runs.finish(row['run_id'], row['exit_code'], row['status'])
+                    runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
                 runs.reconcile_lost(con, row['box_id'])
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
@@ -1194,7 +1194,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
                         runs.do_pulls(row['box_id'], dict(row), pulls)
                     status, code = runs.completed_result(row, {**st, 'exitCode':code})
-                    runs.finish(row['run_id'], code, status)
+                    runs.finish(row['run_id'], code, status, run=row)
         except OffboxError:
             pass
 

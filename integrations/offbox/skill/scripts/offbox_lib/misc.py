@@ -1337,7 +1337,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         if until is not None and now() >= until:
             raise _wait_timeout(r)
         code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
-        code = finish(r['run_id'], code, until=until, report=True)
+        code = finish(r['run_id'], code, until=until, report=True, run=r)
         if dict(r).get('mode') == 'bg' and not _has_data(log_path):
             settled = _run_row(r['run_id'])
             result = _catch_up_log(settled, budget=None if until is None else max(0, until-now()),
@@ -1355,7 +1355,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         _report_deps_hint(r, code, log_path)
     except sqlite3.Error as error:
         if not quarantine_pending:
-            code = finish(r['run_id'], code, until=until)
+            code = finish(r['run_id'], code, until=until, run=r)
         state_warning(r['run_id'], code, error)
     out(f"{r['run_id']}: exit={code}")
     if code is None:

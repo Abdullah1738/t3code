@@ -5,6 +5,7 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 import time
+import sqlite3
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
@@ -543,21 +544,22 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     import json
                     from .runs import do_pulls
                     do_pulls(bid, dict(run), json.loads(run['pulls']))
-                from .runs import settled_steps_code, planned_steps
-                code = settled_steps_code(run, code, locked=True)
+                from .runs import planned_steps
+                code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
                 if planned_steps(run):
                     status = 'infra' if code is None else ('done' if code == 0 else 'failed')
-                con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=?",
-                            (status, code, now(), run["run_id"]))
-                con.commit()
-                from .misc import _catch_up_finished
-                _catch_up_finished(con, run['run_id'])
-                event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
-                if state in api.LIVE_STATES:
-                    from .runs import settle_docker
-                    settle_docker(con, run, status)
-                    # The run's client died: the box still has its 30-min run ttl. Bring it to the idle window.
-                    lease.idle_ttl(bid)
+                try:
+                    from .misc import _catch_up_finished
+                    _catch_up_finished(con, run['run_id'])
+                    event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
+                    if state in api.LIVE_STATES:
+                        from .runs import settle_docker
+                        settle_docker(con, run, status)
+                        # The client died: shorten the run TTL to the idle window.
+                        lease.idle_ttl(bid)
+                except sqlite3.Error as error:
+                    from .runs import state_warning
+                    state_warning(run['run_id'], code, error)
 
 
 def print_actions(actions: list[str]) -> None:
