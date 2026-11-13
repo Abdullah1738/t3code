@@ -237,7 +237,7 @@ def eta_elapsed_due(cfg, state, now):
 def terminal_order(cfg, result, status=None):
     status = result.get('status') if status is None else status
     return (status in TERMINAL and result.get('whole_order_complete') is not False
-            and (cfg['app'] != 'amazon' or result.get('whole_order_complete') is True))
+            and (cfg['app'] not in {'amazon', 'web'} or result.get('whole_order_complete') is True))
 
 
 def part_delivered(result, state):
@@ -419,19 +419,33 @@ def run(args, timeout=12):
 def classify(text, *, web=False, order=None):
     t = text.lower().replace('’', "'")
     identifier = re.escape(order.lower()) if order is not None else r'[a-z0-9_-]+'
+    status_text = web_status_text(t, order) if web else t
+    if web and re.search(r"\b(?:not|never|cannot|couldn't|wasn't|isn't|hasn't|haven't|weren't|can't)\s+"
+                         r'(?:(?:yet|ever|been|being|be|successfully|fully|completely|actually|properly|able to)\s+)*delivered\b|'
+                         r'\b(?:could not|unable to|failed to)\s+(?:be\s+)?deliver(?:ed)?\b|'
+                         r'\bdelivery\s+(?:was\s+)?unsuccessful\b', status_text):
+        return 'problem'
+    if web and re.search(r'\b(?:if|when|once|until|after|before|will|may|might|could|should|would|can|to be)\b'
+                         r'.{0,120}\b(?:delivered|cancelled|canceled)\b', status_text):
+        return 'unknown'
     if web and re.search(r'\b(?:not|never)\s+(?:(?:been|yet|being|be)\s+)*'
-                         r'(?:cancelled|canceled|shipped|dispatched|confirmed|received|placed|out for delivery)\b', t):
+                         r'(?:cancelled|canceled|shipped|dispatched|confirmed|received|placed|out for delivery)\b', status_text):
         return 'unknown'
     # Do not interpret future promises, marketing, or negated delivery as done.
     if re.search(r'\b(cancelled|canceled)\b', t):
-        if web and (re.search(r'\b(?:if|when|once)\b', t) or not re.search(
-                r'\b(?:order|shipment|purchase)(?:\s+#?' + identifier + r')?\s*[:\-]?\s+'
+        if web and (re.search(r'\b(?:if|when|once)\b', status_text) or not re.search(
+                r'\b(?:order|shipment|package|parcel|item|purchase)(?:\s+#?' + identifier + r')?\s*[:\-]?\s+'
                 r'(?:(?:has been|was|is(?: now)?|has)\s+)?cancel(?:led|ed)\b|^cancel(?:led|ed)\b', t)):
             return 'unknown'
         return 'cancelled'
     if re.search(r'\b(delayed|delivery failed|unable to deliver|could not deliver|not delivered)\b', t):
         return 'problem'
-    if re.search(r'\b(has been delivered|was delivered|order delivered|package delivered|successfully delivered|we.ve delivered|your order is delivered)\b', t) or re.match(r'^delivered\s*[:!\-]', t):
+    numbered_delivery = web and re.search(
+        r'\b(?:order(?:[\s_-]+(?:number|no\.?|id|ref(?:erence)?\.?|confirmation))?|shipment|package|parcel|item)'
+        r'(?![a-z])\s*[:#=-]?\s*#?' + identifier +
+        r'(?![a-z0-9_-])\s*(?:[:\-]\s*)?(?:(?:has been|was|is|successfully)\s+)?delivered\b|'
+        r'\b(?:item|parcel)\s+delivered\b', t)
+    if numbered_delivery or re.search(r'\b(has been delivered|was delivered|order delivered|package delivered|successfully delivered|we.ve delivered|your order is delivered)\b', t) or re.match(r'^delivered\s*[:!\-]', t):
         full = web and bool(re.search(r'\b(?:all|both)\s+(?:[0-9]+\s+)?(?:item|package|parcel|shipment)s?\b|'
                                       r'\bdelivered in full\b', t))
         if web and (re.search(
@@ -449,7 +463,7 @@ def classify(text, *, web=False, order=None):
         return 'out for delivery' if web else 'nearby'
     if re.search(r'\b(out for delivery|rider.{0,30}on (?:their|his|the) way|order.{0,20}on (?:its|the) way)\b', t):
         return 'out for delivery'
-    if web and not re.search(r'\b(?:will|to be|not yet|not been)\b', t) and re.search(
+    if web and not re.search(r'\b(?:will|to be|not yet|not been)\b', status_text) and re.search(
             r'\b(?:has (?:been )?(?:shipped|dispatched)|(?:order|package|shipment)(?:\s+#?' + identifier + r')?\s*[:\-]?\s+(?:(?:is|has(?: been)?)\s+)?(?:shipped|dispatched))\b|^(?:shipped|dispatched)\b', t):
         return 'shipped'
     if re.search(r'\b(picked up|collected your order)\b', t):
@@ -466,6 +480,64 @@ def classify(text, *, web=False, order=None):
 def contains_id(text, order, *, web=False):
     chars = 'A-Za-z0-9_-' if web else 'A-Za-z0-9'
     return bool(re.search(r'(?<![' + chars + '])' + re.escape(order) + r'(?![' + chars + '])', text))
+
+
+def web_reference_matches(text):
+    token = r'(?P<reference>[A-Za-z0-9_-]{1,80})(?![A-Za-z0-9_-])'
+    labelled = r'(?i:\border[\s_-]+(?:number|no\.?|id|ref(?:erence)?\.?|confirmation))(?![A-Za-z])(?P<separator>\s*[:=#-]?\s*#?\s*)'
+    marked = r'(?i:\border)\b\s*(?:[:=]\s*#?\s*|#\s*|-\s+)'
+    yield from re.finditer(marked + token, text)
+    for match in re.finditer(labelled + token, text):
+        if match['separator'].strip() or any(c.isdigit() for c in match['reference']):
+            yield match
+    for match in re.finditer(r'(?i:\border)\s+' + token, text):
+        # Bare words such as "has", "not" and "confirmed" are grammar, not
+        # identifiers. Word-only IDs need an explicit marker.
+        if any(c.isdigit() for c in match['reference']):
+            yield match
+
+
+def web_order_references(text):
+    return {match['reference'] for match in web_reference_matches(text)}
+
+
+def web_status_text(text, order):
+    if order is None:
+        return text
+    # Keyword fragments in an identified reference are data, not status prose.
+    spans = {match.span('reference') for match in web_reference_matches(text)
+             if match['reference'].lower() == order.lower()}
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + '<id>' + text[end:]
+    return text
+
+
+def web_mail_scope(subject, body, order=None):
+    text = web_status_text(subject.lower(), order)
+    body = web_status_text(body, order)
+    # An order reference in a package notice does not widen that notice's scope.
+    full = r'\b(?:all|both)\s+(?:[0-9]+\s+)?(?:item|package|parcel|shipment)s?\b'
+    scoped = re.sub(full, '', text)
+    if re.search(r'\b(?:package|parcel|shipment)s?\b', scoped):
+        return 'shipment'
+    if re.search(r'\bitems?\b', scoped):
+        return 'item'
+    unit = r'(?:item|package|parcel|shipment)s?'
+    for match in re.finditer(r'\b(?:(no|zero|[0-9]+)[ \t]+)?remaining\s+(' + unit +
+                             r')(?:\s*[:=-]\s*([0-9]+))?', body, re.I):
+        count = match[3] if match[3] is not None else match[1]
+        if count is not None and (count.lower() in {'no', 'zero'} or int(count) == 0):
+            continue
+        return 'item' if match[2].lower().startswith('item') else 'shipment'
+    for match in re.finditer(r'\b(?:(' + unit + r')\s*[:#-]?\s*)?([0-9]+)\s*(?:of|/)\s*'
+                             r'([0-9]+)(?:\s*(' + unit + r'))?\b', body, re.I):
+        part = match[1] or match[4]
+        # "Shipment 2 of 2" identifies one shipment; "2 of 2 items"
+        # counts the inventory. Neither "1 of 2" form is whole-order proof.
+        inventory = part and part.lower().endswith('s')
+        if part and int(match[3]) > 1 and ((match[1] and not inventory) or int(match[2]) < int(match[3])):
+            return 'item' if part.lower().startswith('item') else 'shipment'
+    return 'order' if re.search(r'\border\b', text) else 'unknown'
 
 
 def careem_live_stage(text, merchant):
@@ -657,10 +729,25 @@ def mail_evidence(cfg, verified=None):
         mail_key = f'{h["account"]}:{h["folder"]}:{h["uid"]}'
         # Only mailsearch IMAP UIDs are stable enough to cache.
         cacheable = h.get('via') != 'himalaya'
-        if not contains_id(subject, cfg['order'], web=web) and cacheable and mail_key in verified:
+        scope = 'shipment' if cfg['app'] == 'amazon' else 'order'
+        if web:
+            refs = web_order_references(subject)
+            if refs and refs != {cfg['order']}:
+                continue
+            cached = verified.get(mail_key) if cacheable else None
+            valid_cache = isinstance(cached, dict) and cached.get('version') == 2
+            if valid_cache:
+                if not cached['matched']:
+                    continue
+                scope = cached['scope']
+            needs_body = not valid_cache
+        else:
+            needs_body = not contains_id(subject, cfg['order'])
+        if not web and needs_body and cacheable and mail_key in verified:
             if not verified[mail_key]:
                 continue
-        elif not contains_id(subject, cfg['order'], web=web):
+            needs_body = False
+        if needs_body:
             if reads >= 4:
                 errors.append('email_read_budget_exhausted')
                 break
@@ -681,20 +768,24 @@ def mail_evidence(cfg, verified=None):
                 continue
             if web:
                 body = email_body(body)
-            if not contains_id(body, cfg['order'], web=web):
+                matched = (refs | web_order_references(body)) == {cfg['order']}
+                scope = web_mail_scope(subject, body, cfg['order'])
                 if cacheable:
-                    verified[mail_key] = False
+                    verified[mail_key] = {'version': 2, 'matched': matched, 'scope': scope}
+            else:
+                matched = contains_id(body, cfg['order'])
+                if cacheable:
+                    verified[mail_key] = matched
+            if not matched:
                 continue
-            if cacheable:
-                verified[mail_key] = True
         # Only subject carries current status; bodies can include old timeline steps.
         if stage != 'unknown':
             out.append({'stage': stage, 'observed_at': stamp(sent) if web else stamp(), 'source': 'order_email',
                         'email_date': stamp(sent) if web else h.get('date'),
-                        'scope': 'shipment' if cfg['app'] == 'amazon' else 'order',
+                        'scope': scope,
                         'confidence': 'exact_order', 'evidence': 'Exact-order merchant email.' if web else subject[:300],
                         'mail_key': mail_key})
-        if len(out) >= 2:
+        if len(out) >= (10 if web else 2):
             break
     return out, errors
 
@@ -729,6 +820,13 @@ def email_body(value):
 
 
 def web_fetch(cfg, state, now):
+    if state.get('web_proof_version') != 2:
+        for key in ('mail_cache', 'mail_checked', 'mail_bodies_verified', 'web_mail_last_at'):
+            state.pop(key, None)
+        if state.get('status') in TERMINAL and not terminal_order(cfg, state.get('last_result', {})):
+            state.pop('status', None)
+            state.pop('terminal_at', None)
+        state['web_proof_version'] = 2
     if 'mail_cache' not in state or now - state.get('mail_checked', 0) >= 300:
         state['mail_checked'] = now
         try:
@@ -739,15 +837,24 @@ def web_fetch(cfg, state, now):
         except (RuntimeError, OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             state['mail_errors'] = ['email_unavailable']
     mails = state.get('mail_cache', [])
-    best = max(mails, key=lambda e: e['observed_at'], default=None)
+    order_mails = [proof for proof in mails if proof['scope'] == 'order']
+    best = max(order_mails or mails, key=lambda e: e['observed_at'], default=None)
     result = {'app': 'web', 'order': cfg['order'], 'status': best['stage'] if best else 'unknown',
               'eta': cfg.get('eta'), 'eta_source': 'checkout_supplied' if cfg.get('eta') else None,
               'rider': None, 'checked_at': stamp(now), 'source': 'order_email',
               'coverage': 'merchant_email_only', 'evidence': [best] if best else [],
               'errors': state.get('mail_errors', [])}
-    if best and best['stage'] == 'problem':
-        result['problem'] = best
-        result['status'] = 'unknown'
+    problem = max((proof for proof in mails if proof['stage'] == 'problem'),
+                  key=lambda e: e['observed_at'], default=None)
+    if problem and (best is None or problem['observed_at'] >= best['observed_at']):
+        result['problem'] = problem
+        if result['status'] == 'problem' or result['status'] in TERMINAL:
+            result['status'] = 'unknown'
+    result['whole_order_complete'] = bool(best and best['scope'] == 'order' and result['status'] in TERMINAL)
+    result['partial_evidence'] = [proof for proof in mails
+                                  if proof['scope'] in {'shipment', 'item'} and proof['stage'] in TERMINAL]
+    if best and best['stage'] in TERMINAL and not result['whole_order_complete']:
+        result.update(status='unknown', evidence=[])
     latest = max([state.get('web_mail_last_at', epoch(cfg['placed_at'])),
                   *(epoch(e['observed_at']) for e in mails)])
     state['web_mail_last_at'] = latest
@@ -1123,6 +1230,8 @@ def transition(result, state, cfg, now):
                 seen.append(key)
                 events.append({'kind': 'aftercare', 'status': proof['stage'], **proof})
     current = result['status']
+    if cfg.get('app') == 'web' and current in TERMINAL and result.get('whole_order_complete') is not True:
+        result['status'] = current = 'unknown'
     if cfg.get('app') != 'amazon' and current in TERMINAL and result.get('whole_order_complete') is False:
         result['status'] = current = 'unknown'
     if cfg.get('app') == 'amazon' and current == 'delivered' and result.get('whole_order_complete') is not True:
@@ -1467,8 +1576,8 @@ def main(argv=None, _locked=False):
     elif args.command == 'check-pending':
         _check(cfg, pending_only=True)
     elif args.command == 'status':
-        saved = read(Path.home() / '.local/share/robob-watch/watchers' / wid / 'order-tracker-state.json')
-        status_state = {key: saved[key] for key in ('status', 'web_mail_last_at') if key in saved} if app == 'web' else {}
+        saved = read(WATCHERS / wid / 'order-tracker-state.json')
+        status_state = {key: saved[key] for key in ('status', 'web_mail_last_at', 'web_proof_version') if key in saved} if app == 'web' else {}
         result = fetch(cfg, status_state, time.time())
         result['last_confirmed_status'] = saved.get('status', 'unknown')
         if result['status'] == 'pending confirmation' and result['last_confirmed_status'] == 'placed':

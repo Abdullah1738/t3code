@@ -45,8 +45,10 @@ class WebTrackerTest(unittest.TestCase):
                 'date': tracker.stamp(self.now - 60), **overrides}
 
     def mail(self, hits):
-        return mock.patch.object(tracker.subprocess, 'run', return_value=mock.Mock(
-            stdout=json.dumps({'status': {'gmail': {'ok': True}}, 'hits': hits}), returncode=0))
+        def run(args, **kwargs):
+            output = '' if args[:2] == ['mailsearch', 'read'] else json.dumps({'status': {'gmail': {'ok': True}}, 'hits': hits})
+            return mock.Mock(stdout=output, returncode=0)
+        return mock.patch.object(tracker.subprocess, 'run', side_effect=run)
 
     def cli(self, *args):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -108,10 +110,10 @@ class WebTrackerTest(unittest.TestCase):
                                  ('x@FABRIQUE.AE', True), ('x@evil-fabrique.ae', False),
                                  ('x@fabrique.ae.attacker.test', False), ('Fabrique <x@other.shop>', False)):
             with self.subTest(sender=sender), self.mail([self.hit(**{'from': sender})]), \
-                    mock.patch.object(tracker, 'run') as read:
+                    mock.patch.object(tracker, 'run', return_value='') as read:
                 evidence, errors = tracker.mail_evidence(self.cfg)
                 self.assertEqual(bool(evidence), trusted)
-                read.assert_not_called()
+                self.assertEqual(read.call_count, int(trusted))
 
     def test_stale_missing_invalid_future_dates_cannot_close_new_order(self):
         for value in (tracker.stamp(self.now - 7200), None, '', 'bad-date',
@@ -142,7 +144,7 @@ class WebTrackerTest(unittest.TestCase):
         serialized = json.dumps([result, state])
         for private in ('Private customer detail', 'secret marker', 'Your order has been delivered'):
             self.assertNotIn(private, serialized)
-        self.assertEqual(state['mail_bodies_verified'], {'icloud:Inbox:1': True})
+        self.assertEqual(state['mail_bodies_verified'], {'icloud:Inbox:1': {'version': 2, 'matched': True, 'scope': 'order'}})
 
     def test_web_stages_and_promises(self):
         rows = [('Thanks for your order #2606', 'ordered'), ('Order #2606 confirmed', 'ordered'),
@@ -155,6 +157,7 @@ class WebTrackerTest(unittest.TestCase):
         for subject, expected in rows:
             with self.subTest(subject=subject), self.mail([self.hit(subject=subject)]), \
                     mock.patch('native_orders.track', side_effect=AssertionError('native called')), \
+                    mock.patch.object(tracker, 'run', return_value='Order #2606'), \
                     mock.patch.object(store, 'evidence', side_effect=AssertionError('pushes called')):
                 self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['status'], expected)
         self.assertEqual(tracker.classify('Thanks for your order #2606'), 'placed')
@@ -244,7 +247,7 @@ class WebTrackerTest(unittest.TestCase):
         with self.mail([]), mock.patch.object(tracker, 'run', return_value=json.dumps({'envelopes': [envelope]})) as run:
             evidence, _ = tracker.mail_evidence(cfg)
         self.assertEqual(evidence[0]['stage'], 'delivered')
-        self.assertIn('from fabrique.ae and after', run.call_args.args[0][-1])
+        self.assertTrue(any('from fabrique.ae and after' in call.args[0][-1] for call in run.call_args_list))
 
     def test_no_email_for_48_hours_reports_once_and_delivery_closes(self):
         now = self.now + 48 * 3600
