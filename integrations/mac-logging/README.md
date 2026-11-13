@@ -40,7 +40,11 @@ processes if a kernel wait survives SIGKILL.
 
 `topMover1Path`/`topMover1GbDelta` show the largest absolute tracked size change,
 including shrinkage. Movers require fresh inventories in both samples and
-exclude partial totals. Changes of at least 20 GB on either volume emit one
+exclude partial totals. Confirmed missing tracked roots and database/WAL files
+are recorded as zero, so creation and deletion contribute to mover deltas.
+An unavailable backing mount, failed reads and older states without an explicit
+measurement remain unknown; an omitted path is never assumed to be zero.
+Changes of at least 20 GB on either volume emit one
 `disk.swing` event with `previousTs`, `sampleTs`, both free-space deltas and up
 to three flattened `topMover` pairs. These events never alert. The inventory is
 hourly and covers selected roots, so movers are evidence of tracked changes,
@@ -53,7 +57,8 @@ counts. Each unavailable source also emits an error-kind `disk.inventory.source`
 or `crash.source` with `source` (root path or `unified`), `failure` (`timeout`,
 `exit`, `permission`, `parse`, or `missing-total`), `exitCode` (null when no
 exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
-timeout line without launching another command. Missing inventory paths are skipped.
+timeout line without launching another command. Confirmed missing inventory
+paths retain a zero total without a source error.
 
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
@@ -70,8 +75,8 @@ only readable entries; permission grants remain an owner action.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Missing optional database/WAL files are skipped. `crash.source` errors
-leave that source's cursor unchanged so the next run retries it. The filtered
+Confirmed missing optional database/WAL files retain zero sizes. `crash.source`
+errors leave that source's cursor unchanged so the next run retries it. The filtered
 unified log query has a 60 s timeout; readable report sources advance independently.
 
 ## diskutil hangs

@@ -83,6 +83,20 @@ def source_error(component, name, source, started, exc):
          error_tag=component+'.source_unavailable', error_message=message)
 
 
+def confirmed_absent(path, exc):
+    if exc.filename is None or str(exc.filename) != str(path):
+        return False
+    try:
+        resolved = Path(path).resolve()
+        # A missing backing mount is unavailable storage, not evidence that a
+        # tracked file/root was deleted. Resolve also covers home-dir symlinks.
+        if resolved.is_relative_to('/Volumes') and len(resolved.parts) >= 3:
+            return Path('/Volumes', resolved.parts[2]).is_mount()
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
 def directory_inventory(paths=None, run=subprocess.run):
     started = time.monotonic()
     deadline = started + 300
@@ -123,7 +137,8 @@ def directory_inventory(paths=None, run=subprocess.run):
                                 bytes=total, exitCode=result.returncode,
                                 elapsedMs=(time.monotonic()-source_started)*1000))
         except FileNotFoundError as exc:
-            if exc.filename == str(path):
+            if confirmed_absent(path, exc):
+                sizes[str(path)] = 0
                 continue
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
@@ -272,8 +287,11 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     for path in paths:
         try:
             sizes[str(path)] = Path(path).stat().st_size
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as exc:
+            if confirmed_absent(path, exc):
+                sizes[str(path)] = 0
+            else:
+                errors += 1
         except OSError:
             errors += 1
     try:

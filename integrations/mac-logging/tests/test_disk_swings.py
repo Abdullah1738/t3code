@@ -1,4 +1,5 @@
 import fcntl
+import errno
 import json
 import os
 from pathlib import Path
@@ -119,6 +120,155 @@ class DiskSwingTests(unittest.TestCase):
         self.assertNotIn('topMover1Path', self.sample(737)['props'])
         self.inventory([100, 20, 10])
         self.assertNotIn('topMover1Path', self.sample()['props'])
+
+    def test_confirmed_root_creation_and_deletion_are_movers(self):
+        for created in (False, True):
+            with self.subTest(created=created):
+                root = self.root/('created-root' if created else 'deleted-root')
+                jobs.save_state('disk', {})
+                if not created:
+                    root.mkdir()
+                def run(command, **kwargs):
+                    return SimpleNamespace(returncode=0, stdout=str(95*GB//1024)+'\t'+command[-1], stderr='')
+                with patch.object(jobs, 'DIRECTORY_ROOTS', [root]):
+                    jobs.directory_inventory([root], run)
+                    before = self.sample(737 if created else 642)
+                    if created:
+                        root.mkdir()
+                    else:
+                        root.rmdir()
+                    jobs.directory_inventory([root], run)
+                    after = self.sample(642 if created else 737)
+                state = jobs.read_state('disk')
+                self.assertEqual(state['sizes'][str(root)], 95*GB if created else 0)
+                self.assertTrue(after['ok'])
+                self.assertEqual(after['props']['topMover1Path'], str(root))
+                self.assertEqual(after['props']['topMover1GbDelta'], 95 if created else -95)
+                swing = self.rows('disk.swing')[-1]['props']
+                self.assertEqual(swing['previousTs'], before['ts'])
+                self.assertEqual(swing['topMover1GbDelta'], 95 if created else -95)
+                self.assertEqual(swing['externalFreeGbDelta'], -95 if created else 95)
+                self.assertEqual(self.rows('disk.alert'), [])
+                if os.environ.get('DISK_SWING_SHOW_EVIDENCE') == '1':
+                    print(json.dumps(after, separators=(',', ':')))
+                    print(json.dumps(self.rows('disk.swing')[-1], separators=(',', ':')))
+
+    def test_confirmed_wal_creation_deletion_and_repeated_absence(self):
+        wal = self.root/'tracked.sqlite-wal'
+        self.inventory([])
+        def sample(size, free):
+            if size is None:
+                wal.unlink(missing_ok=True)
+            else:
+                with wal.open('wb') as stream:
+                    stream.truncate(size)
+            with patch.object(jobs.os, 'statvfs', return_value=SimpleNamespace(f_bavail=free*GB, f_frsize=1)), \
+                 patch.object(jobs, 'storage_probes', return_value={}):
+                jobs.disk_sample(self.root, self.root/'tmp', paths=[wal])
+            return self.rows('disk.sample')[-1]
+        self.assertEqual(sample(None, 737)['props']['baseline'], 1)
+        creation = sample(26*GB, 711)
+        self.assertEqual(creation['props']['topMover1GbDelta'], 26)
+        self.assertEqual(creation['props']['grower1DeltaGb'], 26)
+        deletion = sample(None, 737)
+        self.assertEqual(deletion['props']['topMover1Path'], str(wal))
+        self.assertEqual(deletion['props']['topMover1GbDelta'], -26)
+        self.assertEqual(jobs.read_state('disk')['sizes'][str(wal)], 0)
+        self.assertNotIn('topMover1Path', sample(None, 737)['props'])
+        self.assertEqual(len(self.rows('disk.swing')), 2)
+
+    def test_unknown_root_transitions_are_not_zero(self):
+        for failure in ('timeout', 'permission', 'parse', 'missing-du', 'missing-filename'):
+            for failed_first in (False, True):
+                with self.subTest(failure=failure, failed_first=failed_first):
+                    root = self.root/(failure+str(failed_first)); root.mkdir()
+                    jobs.save_state('disk', {})
+                    def run(command, **kwargs):
+                        if failure == 'timeout': raise subprocess.TimeoutExpired(command, 60)
+                        if failure == 'permission': raise PermissionError(errno.EACCES, 'fixture', str(root))
+                        if failure == 'missing-du': raise FileNotFoundError(errno.ENOENT, 'fixture', '/usr/bin/du')
+                        if failure == 'missing-filename': raise FileNotFoundError(errno.ENOENT, 'fixture')
+                        return SimpleNamespace(returncode=0, stdout='bad total', stderr='')
+                    def good(command, **kwargs):
+                        return SimpleNamespace(returncode=0, stdout=str(95*GB//1024)+'\t'+command[-1], stderr='')
+                    with patch.object(jobs, 'DIRECTORY_ROOTS', [root]):
+                        jobs.directory_inventory([root], run if failed_first else good)
+                        self.sample(642)
+                        jobs.directory_inventory([root], good if failed_first else run)
+                        self.assertEqual(jobs.read_state('disk-inventory')['sizes'].get(str(root)), 95*GB if failed_first else None)
+                        after = self.sample(737)
+                    self.assertNotIn('topMover1Path', after['props'])
+                    self.assertNotIn('topMover1Path', self.rows('disk.swing')[-1]['props'])
+
+    def test_unknown_wal_stat_is_not_absence_in_either_sample(self):
+        wal = self.root/'unknown.sqlite-wal'
+        for failure in (PermissionError(errno.EACCES, 'fixture', str(wal)),
+                        OSError(errno.EIO, 'fixture', str(wal)),
+                        FileNotFoundError(errno.ENOENT, 'fixture'),
+                        FileNotFoundError(errno.ENOENT, 'fixture', str(self.root/'unrelated'))):
+            for failed_first in (False, True):
+                with self.subTest(failure=failure, failed_first=failed_first):
+                    jobs.save_state('disk', {})
+                    self.inventory([])
+                    original = Path.stat
+                    failing = [failed_first]
+                    def stat(path, *args, **kwargs):
+                        if path == wal:
+                            if failing[0]: raise failure
+                            return SimpleNamespace(st_size=26*GB)
+                        return original(path, *args, **kwargs)
+                    with patch.object(Path, 'stat', stat), patch.object(jobs, 'storage_probes', return_value={}):
+                        with patch.object(jobs.os, 'statvfs', return_value=SimpleNamespace(f_bavail=711*GB, f_frsize=1)):
+                            jobs.disk_sample(self.root, self.root/'tmp', paths=[wal])
+                        failing[0] = not failed_first
+                        with patch.object(jobs.os, 'statvfs', return_value=SimpleNamespace(f_bavail=737*GB, f_frsize=1)):
+                            jobs.disk_sample(self.root, self.root/'tmp', paths=[wal])
+                    self.assertNotIn('topMover1Path', self.rows('disk.sample')[-1]['props'])
+                    self.assertNotIn('topMover1Path', self.rows('disk.swing')[-1]['props'])
+
+    def test_stale_partial_and_unrecorded_absence_cannot_claim_movers(self):
+        for status in ('stale', 'partial', 'unrecorded'):
+            for unknown_first in (False, True):
+                with self.subTest(status=status, unknown_first=unknown_first):
+                    jobs.save_state('disk', {})
+                    path = str(self.paths[0])
+                    known = dict(at=self.at, sizes={path: 95*GB})
+                    unknown = dict(at=self.at-(7201 if status == 'stale' else 0),
+                                   sizes={} if status == 'unrecorded' else {path: 0})
+                    if status == 'partial': unknown['partials'] = {path: dict(partial=True)}
+                    jobs.save_state('disk-inventory', unknown if unknown_first else known)
+                    self.sample(642)
+                    jobs.save_state('disk-inventory', known if unknown_first else unknown)
+                    self.assertNotIn('topMover1Path', self.sample(737)['props'])
+                    self.assertNotIn('topMover1Path', self.rows('disk.swing')[-1]['props'])
+
+    def test_backing_volume_availability_controls_absence(self):
+        root = self.root/'unmounted-root'
+        wal = self.root/'unmounted.sqlite-wal'
+        original = Path.resolve
+        def resolve(path, *args, **kwargs):
+            if path in (root, wal):
+                return Path('/Volumes/Unavailable')/path.name
+            return original(path, *args, **kwargs)
+        for mounted in (False, True):
+            with self.subTest(mounted=mounted), patch.object(Path, 'resolve', resolve), \
+                 patch.object(Path, 'is_mount', return_value=mounted):
+                jobs.directory_inventory([root], lambda *args, **kwargs: self.fail('must not launch du'))
+                inventory = jobs.read_state('disk-inventory')
+                self.assertEqual(inventory['sizes'].get(str(root)), 0 if mounted else None)
+                self.assertEqual(inventory['sourceErrors'], 0 if mounted else 1)
+                self.inventory([])
+                with patch.object(jobs, 'storage_probes', return_value={}):
+                    jobs.disk_sample(self.root, self.root/'tmp', volumes=(self.root, self.root), paths=[wal])
+                self.assertEqual(jobs.read_state('disk')['sizes'].get(str(wal)), 0 if mounted else None)
+                self.assertEqual(self.rows('disk.sample')[-1]['props']['sourceErrors'], 0 if mounted else 1)
+
+    def test_symlink_loop_during_absence_check_is_unknown(self):
+        root = self.root/'missing-root'
+        with patch.object(Path, 'resolve', side_effect=RuntimeError('symlink loop')):
+            jobs.directory_inventory([root], lambda *args, **kwargs: self.fail('must not launch du'))
+        self.assertNotIn(str(root), jobs.read_state('disk-inventory')['sizes'])
+        self.assertEqual(jobs.read_state('disk-inventory')['sourceErrors'], 1)
 
     def test_private_output_and_untracked_movers_cannot_enter_log(self):
         self.inventory([100, 20, 10])
