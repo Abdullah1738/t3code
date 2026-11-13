@@ -34,7 +34,6 @@ A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has 
 """
 import argparse
 import calendar
-from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr
@@ -157,35 +156,7 @@ class LookupTimeout(Exception):
     pass
 
 
-@contextmanager
-def within(deadline, error):
-    if deadline is None:
-        yield
-        return
-    remaining = deadline - time.time()
-    if remaining <= 0:
-        raise error
-    previous = signal.getitimer(signal.ITIMER_REAL)
-    # Keep an earlier enclosing deadline and its exception handler.
-    if previous[0] and previous[0] <= remaining:
-        yield
-        return
-    handler = signal.getsignal(signal.SIGALRM)
-    started = time.monotonic()
-
-    def expired(*_):
-        raise error
-
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, remaining)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, handler)
-        if previous[0]:
-            signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous[0] - (time.monotonic() - started)),
-                             previous[1])
+within = charges.within
 
 
 def lock_wait(deadline):
