@@ -26,6 +26,7 @@ import * as Option from "effect/Option";
 
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import { pullRequestSyncKey } from "../../../pullRequest/pullRequestSyncKey.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -70,7 +71,7 @@ function projectHostAndProvider(project: OrchestrationProjectShell | undefined):
   };
 }
 
-const resolveTarget = Effect.fn("PullRequestsToolkit.resolveTarget")(function* (
+export const resolveTarget = Effect.fn("PullRequestsToolkit.resolveTarget")(function* (
   input: PullRequestTargetInput,
   project: OrchestrationProjectShell | undefined,
 ) {
@@ -83,6 +84,12 @@ const resolveTarget = Effect.fn("PullRequestsToolkit.resolveTarget")(function* (
   }
   if (input.repository === undefined || input.number === undefined) {
     return yield* new PullRequestTargetIncompleteError({});
+  }
+  if (input.host === undefined && project !== undefined && project.repositoryIdentity == null) {
+    // An agent may have initialized the repository since the cached negative lookup.
+    const resolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
+    const repositoryIdentity = yield* resolver.resolve(project.workspaceRoot, { refresh: true });
+    project = { ...project, repositoryIdentity };
   }
   const projectHost = projectHostAndProvider(project);
   const host = (input.host ?? projectHost.host)?.toLowerCase();
