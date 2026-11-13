@@ -131,6 +131,12 @@ export interface KanbanStoreShape {
   readonly cardEvents: (
     cardId: KanbanCardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  /** Each card's last stage change with an id below `beforeId` (none for a card without one). */
+  readonly lastTransitions: (
+    boardId: KanbanBoardId,
+    cardIds: ReadonlyArray<KanbanCardId>,
+    beforeId: number,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   /** Every event on a board's cards with `since <= at < until`, oldest first. */
   readonly boardEvents: (
     boardId: KanbanBoardId,
@@ -595,6 +601,37 @@ const make = Effect.gen(function* () {
           ),
       ),
     );
+
+  const lastTransitions = (
+    _boardId: KanbanBoardId,
+    cardIds: ReadonlyArray<KanbanCardId>,
+    beforeId: number,
+  ) =>
+    cardIds.length === 0
+      ? Effect.succeed([] as ReadonlyArray<KanbanCardEvent>)
+      : runRead(
+          "read last stage changes",
+          Effect.flatMap(
+            sql<IdJsonRow>`
+              SELECT id, json FROM ardud_kanban_card_events
+              WHERE id IN (
+                SELECT MAX(id) FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_card
+                WHERE card_id IN ${sql.in(cardIds)} AND id < ${beforeId}
+                  AND json_extract(json, '$.toStage') IS NOT NULL
+                  AND json_extract(json, '$.toStage') IS NOT json_extract(json, '$.fromStage')
+                GROUP BY card_id
+              )
+              ORDER BY id
+            `,
+            (rows) =>
+              Effect.forEach(rows, (row) =>
+                Effect.map(
+                  CardEvent.decode(row.json),
+                  (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+                ),
+              ),
+          ),
+        );
 
   const goals = (boardId: KanbanBoardId) =>
     runRead(
@@ -1085,6 +1122,7 @@ const make = Effect.gen(function* () {
     addCardEvent,
     cardEvents,
     boardEvents,
+    lastTransitions,
     goals,
     putGoal,
     pools,

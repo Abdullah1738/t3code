@@ -506,18 +506,15 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
-        if (
-          input.compact !== true &&
-          input.eventsLimit === undefined &&
-          input.eventsBefore === undefined
-        )
-          return { card: detail.card, events: detail.events, threads: detail.threads };
-        const bounded = Activity.boundedEvents(
-          detail.events,
-          Math.min(input.eventsLimit ?? Activity.CARD_EVENTS_DEFAULT, Activity.CARD_EVENTS_MAX),
-          input.eventsBefore,
-        );
-        return { card: Activity.compactAsks(detail.card), threads: detail.threads, ...bounded };
+        return {
+          card: detail.card,
+          threads: detail.threads,
+          ...Activity.pageCardEvents(
+            { card: detail.card, threads: detail.threads },
+            detail.events,
+            input.events,
+          ),
+        };
       }),
     ),
   ),

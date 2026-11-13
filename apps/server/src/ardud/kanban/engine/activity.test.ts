@@ -256,7 +256,7 @@ describe("rollup", () => {
   it("counts review rounds and verdicts per card", () => {
     expect(result.reviews).toMatchObject({ rounds: 2, pass: 1, findings: 1 });
     expect(result.reviews.items).toEqual([
-      { card: 1, title: "Busy card", rounds: 2, pass: 1, findings: 1, totalRounds: 2 },
+      { card: 1, rounds: 2, pass: 1, findings: 1, totalRounds: 2 },
     ]);
   });
 
@@ -273,7 +273,7 @@ describe("rollup", () => {
       {
         card: 1,
         at: "2026-11-12T05:00Z",
-        reason: "Run failed: provider boom",
+        kind: "run_failed",
         until: "2026-11-12T06:00Z",
         minutes: 60,
       },
@@ -370,6 +370,118 @@ describe("rollup", () => {
     expect(alone.pools.used[Rules.poolKey(opus)]![5]).toBe(1);
   });
 
+  it("gives median, p95 and max dwell per stage from each stage's real start", () => {
+    // #1 entered todo on 10 Nov (its last move before the window).
+    const prior = [event("a", "2026-11-10T00:00:00.000Z", "moved", "working", "todo")];
+    const withPrior = Activity.rollup({ ...input, prior });
+    const todo = withPrior.stages.hours.todo!.dwell!;
+    // todo spans: 10 Nov 00:00 -> 12 Nov 01:00 (49h), 04:10->04:15, 05:00->06:01.
+    expect(todo.count).toBe(3);
+    expect(todo.maxHours).toBeCloseTo(49, 1);
+    expect(todo.medianHours).toBeCloseTo(61 / 60, 1);
+    const working = withPrior.stages.hours.working!.dwell!;
+    expect(working.count).toBe(3);
+    expect(working.maxHours).toBeCloseTo(2, 1);
+    expect(working.p95Hours).toBeCloseTo(2, 1);
+    // Without the prior move the first span's start is unknown, so it isn't a dwell.
+    expect(result.stages.hours.todo!.dwell!.count).toBe(2);
+  });
+
+  it("lists open cards over 24 hours in one stage with their stall flag and wait kind", () => {
+    const waiting = card("w", {
+      number: 11,
+      stage: "working",
+      movedAt: "2026-11-11T00:00:00.000Z",
+      wait: {
+        on: "ci",
+        script: null,
+        args: null,
+        pr: "https://example.com/pr/1",
+        card: null,
+        ask: null,
+        until: null,
+        sinceHead: null,
+        note: "CI",
+        by: { _tag: "owner" },
+        at: "2026-11-11T00:00:00.000Z",
+        wakeRole: null,
+        expiredAt: null,
+        status: null,
+        lastCheckedAt: null,
+        failures: 0,
+        problem: null,
+      },
+    });
+    const stalled = card("s", {
+      number: 12,
+      movedAt: "2026-11-10T12:00:00.000Z",
+      stalled: { reason: "secret words", by: { _tag: "owner" }, at: "2026-11-10T12:00:00.000Z" },
+    });
+    const backlog = card("k", { number: 13, priority: 5, movedAt: before });
+    const fresh = card("f", { number: 14, movedAt: t("12:00") });
+    const done = card("v", { number: 16, stage: "verified", movedAt: before });
+    const run = Activity.rollup({ ...input, cards: [waiting, stalled, backlog, fresh, done] });
+    expect(run.stages.openOver24h).toEqual({
+      count: 2,
+      byStage: { todo: 1, working: 1 },
+      items: [
+        { card: 12, stage: "todo", hours: 60, stalled: true, wait: "stalled" },
+        { card: 11, stage: "working", hours: 48, wait: "ci" },
+      ],
+    });
+    expect(JSON.stringify(run)).not.toContain("secret words");
+  });
+
+  it("lists open asks older than 6 hours and counts evaluator wakes per card", () => {
+    expect(result.asks.openOver6h).toEqual({ count: 0, items: [] });
+    const asking = card("o", {
+      number: 15,
+      asks: [ask("q1", t("10:00"), { blocking: true }), ask("q2", t("20:00"))],
+    });
+    const evaluator = (id: string, at: string) => thread(id, "o", "evaluator", opus, at);
+    const run = Activity.rollup({
+      ...input,
+      cards: [...input.cards, asking],
+      threads: [...threads, evaluator("e1", t("01:00")), evaluator("e2", t("09:00")), evaluator("e3", t("23:00")), evaluator("e0", before)],
+    });
+    // #15's q2 and #1's q3 are 4 hours old: not listed.
+    expect(run.asks.openOver6h).toEqual({
+      count: 1,
+      items: [{ card: 15, ask: "q1", askedAt: "2026-11-12T10:00Z", hours: 14, blocking: true }],
+    });
+    expect(run.threads.evaluatorWakes).toEqual({
+      count: 3,
+      cardsWith2OrMore: { items: [{ card: 15, wakes: 3 }] },
+    });
+  });
+
+  it("carries no card titles or text", () => {
+    const secret = card("x", {
+      number: 20,
+      title: "TOP SECRET TITLE",
+      prompt: "PROMPT WORDS",
+      description: "DESCRIPTION WORDS",
+      stage: "working",
+      reviewRound: 1,
+      stalled: { reason: "STALL WORDS", by: { _tag: "owner" }, at: t("01:00") },
+      asks: [ask("q1", t("01:00"), { text: "ASK WORDS" })],
+    });
+    const run = Activity.rollup({
+      window,
+      cards: [secret],
+      events: [
+        event("x", t("01:00"), "comment", null, null, "COMMENT WORDS"),
+        event("x", t("02:00"), "review", "in_review", "todo", "REVIEW WORDS"),
+        event("x", t("03:00"), "flagged", "working", "todo", "FLAG WORDS"),
+      ],
+      threads: [],
+      pools,
+    });
+    const text = JSON.stringify(run);
+    for (const words of ["SECRET", "PROMPT", "DESCRIPTION", "STALL", "ASK WORDS", "COMMENT", "REVIEW WORDS", "FLAG"])
+      expect(text).not.toContain(words);
+  });
+
   it("stays small: a busy day of 300 cards fits one call", () => {
     const cards: Array<KanbanCard> = [];
     const events: Array<KanbanCardEvent> = [];
@@ -404,49 +516,77 @@ describe("rollup", () => {
   });
 });
 
-describe("card_get bounded events", () => {
-  const events = Array.from({ length: 100 }, (_, index) =>
-    event("z", t("01:00"), "comment", null, null, index === 99 ? "b".repeat(5_000) : `c${index}`),
+describe("card_get events page", () => {
+  const events = Array.from({ length: 50 }, (_, index) =>
+    event("z", t("01:00"), "comment", null, null, `c${index}`),
   );
+  const rest = { card: card("z"), threads: [] };
 
-  it("returns the newest events with a cursor to older ones", () => {
-    const first = Activity.boundedEvents(events, 40, undefined);
-    expect(first.events).toHaveLength(40);
-    expect(first.events.at(-1)!.id).toBe(events.at(-1)!.id);
-    expect(first.events.at(-1)!.body!.length).toBe(Activity.CARD_EVENT_BODY_CHARS);
-    expect(first.events.at(-1)!.bodyChars).toBe(5_000);
-    expect(first.eventsMore).toEqual({ before: events[60]!.id, older: 60 });
-    const second = Activity.boundedEvents(events, 40, first.eventsMore!.before);
-    expect(second.events.at(-1)!.id).toBe(events[59]!.id);
-    const last = Activity.boundedEvents(events, 40, events[10]!.id);
-    expect(last.events).toHaveLength(10);
-    expect(last.eventsMore).toBeUndefined();
+  it("defaults to the newest 20 and pages back to the first with no gaps or repeats", () => {
+    const first = Activity.pageCardEvents(rest, events, undefined);
+    expect(first.events.map((entry) => entry.id)).toEqual(events.slice(-20).map((entry) => entry.id));
+    expect(first.eventsTotal).toBe(50);
+    expect(first.olderEvents).toBe(events[30]!.id);
+    const seen = [...first.events];
+    let cursor = first.olderEvents;
+    while (cursor !== null) {
+      const page = Activity.pageCardEvents(rest, events, { before: cursor });
+      seen.unshift(...page.events);
+      cursor = page.olderEvents;
+    }
+    expect(seen.map((entry) => entry.id)).toEqual(events.map((entry) => entry.id));
   });
 
-  it("stops before the character budget even when every event is big", () => {
-    const big = Array.from({ length: 60 }, () =>
-      event("z", t("01:00"), "comment", null, null, "d".repeat(1_900)),
+  it("all returns every event; limit is capped at 200", () => {
+    expect(Activity.pageCardEvents(rest, events, "all").events).toHaveLength(50);
+    expect(Activity.pageCardEvents(rest, events, { limit: 5 }).events).toHaveLength(5);
+    const many = Array.from({ length: 300 }, () => event("z", t("01:00"), "moved", "todo", "working"));
+    expect(Activity.pageCardEvents(rest, many, { limit: 1_000 }).events).toHaveLength(200);
+  });
+
+  it("keeps the whole card and drops the oldest events whole to stay under 60,000 characters", () => {
+    const big = { card: card("p", { prompt: "P".repeat(40_000) }), threads: [] };
+    const comments = Array.from({ length: 20 }, (_, index) =>
+      event("p", t("01:00"), "comment", null, null, `${index} ${"c".repeat(2_000)}`),
     );
-    const page = Activity.boundedEvents(big, 60, undefined);
-    expect(JSON.stringify(page.events).length).toBeLessThan(Activity.COMPACT_READ_CHARS / 2 + 3_000);
-    expect(page.eventsMore?.older).toBe(60 - page.events.length);
+    const page = Activity.pageCardEvents(big, comments, undefined);
+    const reply = { ...big, ...page };
+    expect(JSON.stringify(reply).length).toBeLessThanOrEqual(Activity.CARD_GET_CHARS);
+    expect(reply.card.prompt).toHaveLength(40_000);
+    expect(page.events.length).toBeGreaterThan(0);
+    expect(page.events.length).toBeLessThan(20);
+    expect(page.events.at(-1)!.id).toBe(comments.at(-1)!.id);
+    for (const entry of page.events) expect(entry.body!.length).toBeGreaterThan(2_000);
+    expect(page.olderEvents).toBe(page.events[0]!.id);
   });
 
-  it("strips closed asks to their answer and keeps open ones whole", () => {
-    const withAsks = card("y", {
-      asks: [
-        ask("q1", before, {
-          closedAt: before,
-          context: "c".repeat(10_000),
-          answer: { verdict: "approve", by: { _tag: "owner" }, at: before, text: "a".repeat(2_000) },
-        }),
-        ask("q2", before, { context: "keep me" }),
-      ],
+  it("skips one event too big to send with the card, and says so", () => {
+    const huge = [
+      event("q", t("01:00"), "comment", null, null, "small"),
+      event("q", t("02:00"), "comment", null, null, "h".repeat(70_000)),
+    ];
+    const page = Activity.pageCardEvents(rest, huge, undefined);
+    expect(page.events).toEqual([]);
+    expect(page.olderEvents).toBe(huge[1]!.id);
+    expect(page.note).toContain(`Event ${huge[1]!.id}`);
+    const next = Activity.pageCardEvents(rest, huge, { before: page.olderEvents! });
+    expect(next.events.map((entry) => entry.id)).toEqual([huge[0]!.id]);
+    expect(next.olderEvents).toBeNull();
+  });
+
+  it("a card that fills the reply alone comes back whole with no events and a note", () => {
+    const giant = { card: card("g", { prompt: "G".repeat(70_000) }), threads: [] };
+    const page = Activity.pageCardEvents(giant, events, undefined);
+    expect(page.events).toEqual([]);
+    expect(page.note).toContain('events: "all"');
+  });
+
+  it("a card with no events", () => {
+    expect(Activity.pageCardEvents(rest, [], undefined)).toEqual({
+      events: [],
+      eventsTotal: 0,
+      olderEvents: null,
     });
-    const compact = Activity.compactAsks(withAsks);
-    expect(compact.asks[0]).not.toHaveProperty("context");
-    expect(compact.asks[0]!.answer?.text?.length).toBe(500);
-    expect(compact.asks[1]!.context).toBe("keep me");
   });
 });
 

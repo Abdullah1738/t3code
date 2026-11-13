@@ -225,25 +225,29 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  "One card with its history (moves, edits, comments, review verdicts) and every thread it has had. compact (or eventsLimit/eventsBefore) bounds it: the newest events (default 40), bodies over 2,000 characters cut (bodyChars gives the length), closed asks without their blocks, and eventsMore.before to page older events.",
+  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). The card itself is never trimmed; a reply stays under 60,000 characters by leaving out its oldest events.',
   {
     card: Schema.optional(CardRef),
     boardId: BoardRef,
-    compact: Schema.optional(Schema.Boolean),
-    eventsLimit: Schema.optional(
-      describe(PositiveInt, "Newest events to return (default 40, max 200). Implies compact."),
-    ),
-    eventsBefore: Schema.optional(
-      describe(PositiveInt, "Only events with a smaller id: eventsMore.before from the last read. Implies compact."),
+    events: Schema.optional(
+      Schema.Union([
+        Schema.Literal("all"),
+        Schema.Struct({
+          before: Schema.optional(
+            describe(PositiveInt, "Only events older than this (olderEvents from the last read)."),
+          ),
+          limit: Schema.optional(describe(PositiveInt, "Events per page, default 20, max 200.")),
+        }),
+      ]),
     ),
   },
   {
     card: Record,
     events: Records,
     threads: Records,
-    eventsMore: Schema.optional(
-      Schema.Struct({ before: NonNegativeInt, older: NonNegativeInt }),
-    ),
+    eventsTotal: NonNegativeInt,
+    olderEvents: Schema.NullOr(NonNegativeInt),
+    note: Schema.optional(Schema.String),
   },
   { readonly: true },
 );

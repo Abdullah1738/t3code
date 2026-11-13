@@ -245,7 +245,7 @@ it("nightly review puts information gaps before improvements and limits proposal
     "analytics_read",
     "board_activity first",
     "board_get with since",
-    "compact: true",
+    "olderEvents",
     "limit: 40",
     "todo at P3",
     "settled cards",

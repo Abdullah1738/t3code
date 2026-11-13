@@ -655,6 +655,68 @@ it.layer(TestLayer)("kanban store", (it) => {
   );
 });
 
+it.layer(TestLayer)("kanban store: activity reads", (it) => {
+  it.effect("reads a board's events in a time window and each card's last stage change before it", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putBoard(board);
+      yield* store.putCard(card(1, "todo"));
+      yield* store.putCard(card(2, "working"));
+      const cardOne = KanbanCardId.make("card-1");
+      const cardTwo = KanbanCardId.make("card-2");
+      const add = (
+        cardId: typeof cardOne,
+        when: string,
+        kind: "created" | "moved" | "comment" | "flagged",
+        fromStage: "todo" | "working" | null,
+        toStage: "todo" | "working" | "needs_review" | null,
+      ) =>
+        store.addCardEvent({
+          cardId,
+          at: when,
+          actor: { _tag: "owner" },
+          kind,
+          fromStage,
+          toStage,
+          body: null,
+          head: null,
+        });
+      yield* add(cardOne, "2026-11-10T00:00:00.000Z", "created", null, "todo");
+      const started = yield* add(cardOne, "2026-11-11T00:00:00.000Z", "moved", "todo", "working");
+      // Not stage changes: a comment, and a flag that leaves it where it was.
+      yield* add(cardOne, "2026-11-11T06:00:00.000Z", "comment", null, null);
+      yield* add(cardOne, "2026-11-11T07:00:00.000Z", "flagged", "working", "working");
+      const inWindow = yield* add(cardOne, "2026-11-12T02:00:00.000Z", "moved", "working", "needs_review");
+      const otherCard = yield* add(cardTwo, "2026-11-12T03:00:00.000Z", "comment", null, null);
+      yield* add(cardOne, "2026-11-13T05:00:00.000Z", "comment", null, null);
+
+      const events = yield* store.boardEvents(
+        boardId,
+        "2026-11-12T00:00:00.000Z",
+        "2026-11-13T00:00:00.000Z",
+      );
+      assert.deepStrictEqual(
+        events.map((event) => event.id),
+        [inWindow.id, otherCard.id],
+      );
+      assert.deepStrictEqual(
+        yield* store.boardEvents(
+          KanbanBoardId.make("board-other"),
+          "2026-11-12T00:00:00.000Z",
+          "2026-11-13T00:00:00.000Z",
+        ),
+        [],
+      );
+      const prior = yield* store.lastTransitions(boardId, [cardOne, cardTwo], inWindow.id);
+      assert.deepStrictEqual(
+        prior.map((event) => event.id),
+        [started.id],
+      );
+      assert.deepStrictEqual(yield* store.lastTransitions(boardId, [], inWindow.id), []);
+    }),
+  );
+});
+
 it.layer(TestLayer)("kanban store: summary cards", (it) => {
   it.effect("summary cards match full-card counts without packet fields", () =>
     Effect.gen(function* () {

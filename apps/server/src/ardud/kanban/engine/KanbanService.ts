@@ -413,6 +413,8 @@ export interface KanbanServiceShape {
       readonly events: ReadonlyArray<KanbanCardEvent>;
       readonly threads: ReadonlyArray<KanbanThreadLink>;
       readonly pools: ReadonlyArray<KanbanPool>;
+      /** Each card with an event in the window: its last stage change before it. */
+      readonly prior: ReadonlyArray<KanbanCardEvent>;
     },
     KanbanError
   >;
@@ -14125,11 +14127,24 @@ const make = Effect.gen(function* () {
       ),
     activity: (boardId, window) =>
       readDb(
-        Effect.all({
-          cards: store.cards(boardId),
-          events: store.boardEvents(boardId, window.since, window.until),
-          threads: store.threadLinks({ boardId, open: false }),
-          pools: store.pools(boardId),
+        Effect.gen(function* () {
+          const read = yield* Effect.all({
+            cards: store.cards(boardId),
+            events: store.boardEvents(boardId, window.since, window.until),
+            threads: store.threadLinks({ boardId, open: false }),
+            pools: store.pools(boardId),
+          });
+          // Event ids grow with time, so the window's first id bounds "before the window".
+          const first = read.events[0];
+          const prior =
+            first === undefined
+              ? []
+              : yield* store.lastTransitions(
+                  boardId,
+                  [...new Set(read.events.map((event) => event.cardId))],
+                  first.id,
+                );
+          return { ...read, prior };
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),

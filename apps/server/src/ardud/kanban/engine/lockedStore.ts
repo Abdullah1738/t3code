@@ -56,6 +56,8 @@ export const wrap = (
     addCardEvent: (row) => card(row.cardId, store.addCardEvent(row), true),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     boardEvents: (id, since, until) => locks.access(id, store.boardEvents(id, since, until)),
+    lastTransitions: (id, cardIds, beforeId) =>
+      locks.access(id, store.lastTransitions(id, cardIds, beforeId)),
     goals: (id) => locks.access(id, store.goals(id)),
     putGoal: (row) => locks.access(row.boardId, store.putGoal(row), true),
     pools: (id) => locks.access(id, store.pools(id)),

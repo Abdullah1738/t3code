@@ -985,7 +985,7 @@ it.effect(
   },
 );
 
-it.effect("compact reads: board_get since, bounded card_get and discussion_read, board_activity", () => {
+it.effect("compact reads: board_get since, card_get pages, discussion_read limit, board_activity", () => {
   const { running, layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -1003,7 +1003,8 @@ it.effect("compact reads: board_get since, bounded card_get and discussion_read,
     yield* TestClock.adjust(Duration.hours(30));
     const busy = yield* kanban.createCard(
       board.id,
-      { prompt: "P".repeat(5_000), title: "Busy", priority: 1 },
+      // About Crpko #69's size: a 38 KB prompt and a long comment history.
+      { prompt: "P".repeat(38_000), title: "Busy", priority: 1 },
       owner,
     );
     yield* kanban.dispatchNow;
@@ -1060,34 +1061,52 @@ it.effect("compact reads: board_get since, bounded card_get and discussion_read,
     assert.isTrue(tooOld.isError);
     assert.include(tooOld.text, "at most 72 hours");
 
-    const whole = yield* call(thread, "card_get", { card: `#${busy.number}` });
-    assert.isAbove(whole.text.length, 150_000);
-    const bounded = yield* call(thread, "card_get", { card: `#${busy.number}`, compact: true });
-    assert.isFalse(bounded.isError, bounded.text);
-    assert.isBelow(bounded.text.length, 60_000);
-    const events = bounded.structured.events as Array<{ id: number }>;
-    assert.isAtMost(events.length, 40);
-    const more = bounded.structured.eventsMore as { before: number; older: number };
-    assert.isAbove(more.older, 0);
-    assert.strictEqual(more.before, events[0]!.id);
-    assert.strictEqual((bounded.structured.card as { prompt: string }).prompt.length, 5_000);
-    const older = yield* call(thread, "card_get", {
-      card: `#${busy.number}`,
-      eventsBefore: more.before,
-      eventsLimit: 5,
-    });
-    const olderEvents = older.structured.events as Array<{ id: number }>;
-    assert.lengthOf(olderEvents, 5);
-    assert.isBelow(olderEvents.at(-1)!.id, more.before);
+    const all = yield* call(thread, "card_get", { card: `#${busy.number}`, events: "all" });
+    assert.isFalse(all.isError, all.text);
+    const allEvents = all.structured.events as Array<{ id: number }>;
+    assert.isAbove(JSON.stringify(all.structured).length, 150_000);
+    assert.strictEqual(all.structured.eventsTotal, allEvents.length);
+    assert.isNull(all.structured.olderEvents);
+
+    const latest = yield* call(thread, "card_get", { card: `#${busy.number}` });
+    assert.isFalse(latest.isError, latest.text);
+    assert.isAtMost(JSON.stringify(latest.structured).length, 60_000);
+    assert.strictEqual((latest.structured.card as { prompt: string }).prompt.length, 38_000);
+    assert.strictEqual(latest.structured.eventsTotal, allEvents.length);
+    const page = latest.structured.events as Array<{ id: number; body: string | null }>;
+    assert.isAbove(page.length, 0);
+    assert.isAtMost(page.length, 20);
+    assert.strictEqual(page.at(-1)!.id, allEvents.at(-1)!.id);
+    assert.strictEqual(latest.structured.olderEvents, page[0]!.id);
+    // Walk the cursor back to the first event: every event once, in order.
+    const walked = [...page];
+    let cursor = latest.structured.olderEvents as number | null;
+    while (cursor !== null) {
+      const older = yield* call(thread, "card_get", {
+        card: `#${busy.number}`,
+        events: { before: cursor, limit: 50 },
+      });
+      assert.isFalse(older.isError, older.text);
+      assert.isAtMost(JSON.stringify(older.structured).length, 60_000);
+      walked.unshift(...(older.structured.events as typeof page));
+      cursor = older.structured.olderEvents as number | null;
+    }
+    assert.deepStrictEqual(
+      walked.map((entry) => entry.id),
+      allEvents.map((entry) => entry.id),
+    );
 
     const allMessages = yield* call(thread, "discussion_read", { card: `#${busy.number}` });
     assert.isAbove(allMessages.text.length, 120_000);
-    const page = yield* call(thread, "discussion_read", { card: `#${busy.number}`, limit: 40 });
-    assert.isFalse(page.isError, page.text);
-    assert.isBelow(page.text.length, 60_000);
-    const messages = page.structured.messages as Array<{ seq: number }>;
+    const messagePage = yield* call(thread, "discussion_read", {
+      card: `#${busy.number}`,
+      limit: 40,
+    });
+    assert.isFalse(messagePage.isError, messagePage.text);
+    assert.isBelow(messagePage.text.length, 60_000);
+    const messages = messagePage.structured.messages as Array<{ seq: number }>;
     assert.isAtMost(messages.length, 40);
-    assert.strictEqual(page.structured.earlierBefore, messages[0]!.seq);
+    assert.strictEqual(messagePage.structured.earlierBefore, messages[0]!.seq);
 
     const rollup = yield* call(thread, "board_activity", {});
     assert.isFalse(rollup.isError, rollup.text);
