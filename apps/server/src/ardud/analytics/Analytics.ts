@@ -142,7 +142,6 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   let accepting = true;
   let lastMaintenanceDay: string | undefined;
   let retryAt = 0;
-  const incompleteDays = new Set<string>();
   const dirtyDays = new Set<string>();
   // Only recently read views are resident. Each owns bounded groups and 500 samples, never the day log.
   const views = new Map<
@@ -365,12 +364,26 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }
   });
 
+  const unterminatedTail = Effect.fn("Analytics.unterminatedTail")(function* (
+    target: string,
+    size: number,
+  ) {
+    if (size === 0) return false;
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(target, { flag: "r" });
+        yield* file.seek(BigInt(size - 1), "start");
+        const last = new Uint8Array(1);
+        return (yield* file.read(last)) === 1 && last[0] !== 10;
+      }),
+    );
+  });
+
   const drain = Effect.fn("Analytics.drain")(function* (force = false) {
     if (pending.length === 0) return;
     const now = yield* Clock.currentTimeMillis;
     if (!force && now < retryAt) return;
     const cutoff = oldestDay(now, options.retentionDays);
-    for (const day of incompleteDays) if (day < cutoff) incompleteDays.delete(day);
     let remaining = pending.length;
     while (remaining > 0 && pending.length > 0) {
       const first = pending[0]!;
@@ -402,19 +415,17 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
             () => Effect.succeed(0),
           ),
         );
-        const separatorBytes = incompleteDays.has(first.day) && size > 0 ? 1 : 0;
-        if (size + separatorBytes + first.bytes > options.maxFileBytes) {
+        let separate = yield* unterminatedTail(target, size);
+        if (size + (separate ? 1 : 0) + first.bytes > options.maxFileBytes) {
           yield* rotate(first.day);
           size = 0;
+          separate = false;
         }
-        if (incompleteDays.has(first.day)) {
-          // An append can write a prefix before failing. Replay is at least once;
-          // a separator prevents a torn suffix from swallowing the next complete event.
-          if (size > 0) {
-            yield* fileSystem.writeFileString(target, "\n", { flag: "a", mode: 0o600 });
-            size++;
-          }
-          incompleteDays.delete(first.day);
+        if (separate) {
+          // Disk is authoritative after restart or an ambiguous append. One byte is enough
+          // to keep a torn suffix from swallowing the next complete event.
+          yield* fileSystem.writeFileString(target, "\n", { flag: "a", mode: 0o600 });
+          size++;
         }
         bytes = 0;
         let count = 0;
@@ -453,7 +464,6 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         Effect.onError(() =>
           Effect.gen(function* () {
             if (appending) {
-              incompleteDays.add(first.day);
               invalidate(first.day);
               yield* Metric.update(ambiguousAppends, 1);
             }

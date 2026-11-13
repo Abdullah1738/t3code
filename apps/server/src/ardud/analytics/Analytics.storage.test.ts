@@ -469,3 +469,68 @@ describe("Analytics storage failures", () => {
     },
   );
 });
+
+const seedLine = JSON.stringify(event("seed"));
+const restartTails = [
+  { name: "empty", contents: "", total: 1, invalid: 0 },
+  { name: "LF", contents: `${seedLine}\n`, total: 2, invalid: 0 },
+  { name: "CRLF", contents: `${seedLine}\r\n`, total: 2, invalid: 0 },
+  { name: "CR only", contents: `${seedLine}\r`, total: 2, invalid: 0 },
+  { name: "complete JSON without LF", contents: seedLine, total: 2, invalid: 0 },
+  { name: "partial JSON", contents: `${seedLine}\n{"ts":`, total: 2, invalid: 1 },
+  { name: "garbage", contents: `${seedLine}\nbroken`, total: 2, invalid: 1 },
+  { name: "oversized partial", contents: `${seedLine}\n${"x".repeat(9000)}`, total: 2, invalid: 1 },
+];
+it.effect.each(restartTails)(
+  "restart tail $name keeps warm and cold counts equal after append",
+  (row) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      yield* setup.fs.writeFileString(setup.active, row.contents);
+      const warm = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const analytics = yield* open(setup);
+          yield* analytics.read({ day });
+          yield* analytics.record(event("appended"));
+          return yield* analytics.read({ day });
+        }),
+      );
+      const cold = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const analytics = yield* open(setup);
+          return yield* analytics.read({ day });
+        }),
+      );
+      assert.equal(warm.rollup.total, row.total);
+      assert.equal(cold.rollup.total, row.total);
+      assert.deepEqual(cold.rollup.kindCounts, warm.rollup.kindCounts);
+      assert.equal(cold.rollup.invalidLines, row.invalid);
+      assert.equal(warm.rollup.invalidLines, row.invalid);
+      assert.equal(cold.rollup.kindCounts.appended, 1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([1, 2])(
+  "rotates an unterminated tail with %s retained segments at the exact event size",
+  (maxSegmentsPerDay) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      yield* setup.fs.writeFileString(setup.active, seedLine);
+      const appended = event("appended");
+      const maxFileBytes = new TextEncoder().encode(`${JSON.stringify(appended)}\n`).byteLength;
+      const analytics = yield* open(setup, setup.fs, { maxSegmentsPerDay, maxFileBytes });
+      yield* analytics.record(appended);
+      const result = yield* analytics.read({ day });
+      assert.equal(result.rollup.total, maxSegmentsPerDay);
+      assert.equal(result.rollup.kindCounts.appended, 1);
+      assert.equal(result.rollup.invalidLines, 0);
+      for (const file of (yield* setup.fs.readDirectory(setup.directory)).filter((name) =>
+        name.endsWith(".ndjson"),
+      )) {
+        assert.isAtMost(
+          Number((yield* setup.fs.stat(`${setup.directory}/${file}`)).size),
+          maxFileBytes,
+        );
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+);

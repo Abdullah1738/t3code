@@ -19,6 +19,7 @@ import {
   DeviceBootError,
   DeviceHostId,
   DeviceId,
+  KanbanError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -76,6 +77,7 @@ const client = McpSchema.McpServerClient.of({
 });
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
+  KanbanError,
   PreviewAutomationError,
   McpCapabilityUnavailableError,
   PreviewControlRequiredError,
@@ -105,9 +107,19 @@ const probe = (name: string) =>
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const failure = (code: OrchestratorMcpFailure["code"], message = "private error text") =>
   Effect.fail(new OrchestratorMcpFailure({ code, message }));
+const boardBusy = new KanbanError({
+  code: "conflict",
+  detail: "Board busy: not written (held 2m by private-operation). Safe to retry once.",
+  saved: false,
+});
 
 const outcomes = [
   ["ok", Effect.succeed({ privateResult: "secret body" }), { outcome: "ok", saved: "unknown" }],
+  [
+    "successful-error-like-message",
+    Effect.succeed({ message: "Board busy: not written" }),
+    { outcome: "ok", saved: "unknown" },
+  ],
   [
     "error",
     failure("orchestration_error"),
@@ -124,6 +136,21 @@ const outcomes = [
     failure("invalid_request", "Board busy: not written (held 2m). Safe to retry once."),
     { outcome: "refused", errorTag: "board_busy", saved: false },
   ],
+  ...(
+    [
+      ["encoded", failure("invalid_request", boardBusy.message)],
+      ["typed", Effect.fail(boardBusy)],
+      ["defect", Effect.die(boardBusy)],
+      ["legacy", failure("invalid_request", "Not saved (board busy). Safe to retry once.")],
+    ] as const
+  ).map(
+    ([name, handle]) =>
+      [
+        `board-busy-${name}`,
+        handle,
+        { outcome: "refused", errorTag: "board_busy", saved: false },
+      ] as const,
+  ),
   [
     "partial",
     Effect.succeed({ partial: true, taskId: "task" }),
@@ -284,14 +311,19 @@ const outcomeCases = [
     expected: { outcome: "error", errorPhase: "handler" },
     input: { ...args, timeoutMs: value },
   })),
-  ...["timeoutMs must be valid", "The text says timed out", "timeout in a parameter value"].map(
-    (message) => ({
-      name: `diagnostic-${message}`,
-      handle: failure("invalid_request", message),
-      expected: { outcome: "error", errorTag: "invalid_request" },
-      input: args,
-    }),
-  ),
+  ...[
+    "timeoutMs must be valid",
+    "The text says timed out",
+    "timeout in a parameter value",
+    "User said Board busy: not written",
+    "Board busy: may have applied",
+    "Missions board conflict: Board changed during this operation",
+  ].map((message) => ({
+    name: `diagnostic-${message}`,
+    handle: failure("invalid_request", message),
+    expected: { outcome: "error", errorTag: "invalid_request" },
+    input: args,
+  })),
   ...phases.map(({ stage, phase }) => ({
     name: `phase-${stage}`,
     handle: McpDeadline.withDeadline(failure("model_unavailable"), {
@@ -378,6 +410,7 @@ it.effect.each(outcomeCases)(
         expect(generic.props?.code).toBe(row.props?.code);
         if (name.startsWith("invalid-timeout-"))
           expect(generic.props?.code).toBe("invalid_request");
+        if (name.startsWith("board-busy-")) expect(generic.props?.code).toBe("board_busy");
         expect(generic.props?.saved).toBe(row.saved);
         if ("errorTag" in expected && expected.errorTag === "orchestration_error")
           expect(generic.props?.code).toBe("orchestration_error");

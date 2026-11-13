@@ -5171,3 +5171,156 @@ it.effect(
     }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
   },
 );
+
+it.effect(
+  "discussion target attribution for explicit read/seq/post across caller, board and discussion kinds",
+  () => {
+    const fake = fakeThreads();
+    let pending:
+      | {
+          tool: string;
+          ledger: Deferred.Deferred<AnalyticsEvent>;
+          generic: Deferred.Deferred<AnalyticsEvent>;
+        }
+      | undefined;
+    const sink = Layer.mock(Analytics.Analytics)({
+      record: (event) => {
+        if (!pending) return Effect.void;
+        if (event.kind === "mcp.call" && event.tool === pending.tool)
+          return Deferred.succeed(pending.ledger, event).pipe(Effect.asVoid);
+        if (
+          (event.kind === "server.mcp" || event.kind === "server.mcp.error") &&
+          event.props?.method === pending.tool
+        )
+          return Deferred.succeed(pending.generic, event).pipe(Effect.asVoid);
+        return Effect.void;
+      },
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const source = yield* kanban.ensureBoard({
+        slug: "discussion-source",
+        name: "Source",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(source.id, source.defaultCardModel, 1);
+      const work = yield* kanban.createCard(source.id, { title: "Work", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+      fake.running.add(worker);
+      const other = yield* kanban.ensureBoard({
+        slug: "discussion-target",
+        name: "Target",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      for (const board of [source, other]) {
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Discuss", prompt: "Task" },
+          owner,
+        );
+        const attached = yield* kanban.cardDiscussion(card.id);
+        const standalone = yield* kanban.createDiscussion(board.id, "Stand-alone", owner);
+        yield* kanban.askOwner(
+          card.id,
+          { question: "private-question", blocking: false },
+          owner,
+          "owner",
+        );
+        for (const discussion of [attached, standalone]) {
+          const seed = yield* kanban.post(discussion.id, owner, [
+            { _tag: "md", text: "private-seed" },
+          ]);
+          for (const caller of [worker, ThreadId.make("outside-discussion-reader")]) {
+            for (const operation of [
+              "read",
+              "seq",
+              "post",
+              ...(discussion.cardId ? (["ask"] as const) : []),
+            ] as const) {
+              const tool =
+                operation === "post" || operation === "ask" ? "discussion_post" : "discussion_read";
+              pending = {
+                tool,
+                ledger: yield* Deferred.make<AnalyticsEvent>(),
+                generic: yield* Deferred.make<AnalyticsEvent>(),
+              };
+              const result = yield* call(caller, tool, {
+                discussionId: discussion.id,
+                ...(operation === "ask"
+                  ? { boardId: board.id, card: card.id, ask: "q1", text: "private-reply" }
+                  : operation === "post"
+                    ? { text: "private-post" }
+                    : operation === "seq"
+                      ? { seq: seed.seq }
+                      : {}),
+              });
+              assert.equal(result.isError, operation === "ask" && caller === worker, result.text);
+              for (const row of [
+                yield* Deferred.await(pending.ledger),
+                yield* Deferred.await(pending.generic),
+              ]) {
+                assert.equal(row.boardId, board.id);
+                assert.equal(row.props?.boardId, board.id);
+                assert.equal(row.cardId, discussion.cardId ?? undefined);
+                assert.equal(row.props?.cardNumber, discussion.cardId ? card.number : undefined);
+                assert.notInclude(JSON.stringify(row), "private-seed");
+                assert.notInclude(JSON.stringify(row), "private-post");
+                assert.notInclude(JSON.stringify(row), "private-question");
+                assert.notInclude(JSON.stringify(row), "private-reply");
+              }
+            }
+          }
+        }
+      }
+    }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+  },
+);
+
+it.effect(
+  "real board-busy KanbanError keeps its analytics refusal through card_update encoding",
+  () => {
+    const fake = fakeThreads(
+      undefined,
+      new KanbanError({
+        code: "conflict",
+        detail: "Board busy: not written (held 2m by private-operation). Safe to retry once.",
+        saved: false,
+      }),
+    );
+    return Effect.gen(function* () {
+      const ledger = yield* Deferred.make<AnalyticsEvent>();
+      const generic = yield* Deferred.make<AnalyticsEvent>();
+      const sink = Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          event.kind === "mcp.call" && event.tool === "card_update"
+            ? Deferred.succeed(ledger, event).pipe(Effect.asVoid)
+            : event.kind === "server.mcp.error" && event.props?.method === "card_update"
+              ? Deferred.succeed(generic, event).pipe(Effect.asVoid)
+              : Effect.void,
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "busy-analytics",
+          name: "Busy",
+          defaultProjectId: null,
+        });
+        const card = yield* kanban.createCard(board.id, { title: "Busy", prompt: "Task" }, owner);
+        const result = yield* call(ThreadId.make("outside"), "card_update", {
+          card: card.id,
+          comment: "private-comment",
+        });
+        assert.isTrue(result.isError, result.text);
+        const row = yield* Deferred.await(ledger);
+        assert.equal(row.outcome, "refused");
+        assert.equal(row.saved, false);
+        for (const event of [row, yield* Deferred.await(generic)]) {
+          assert.equal(event.props?.code, "board_busy");
+          assert.equal(event.props?.saved, false);
+          assert.notInclude(JSON.stringify(event), "private");
+        }
+      }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+    });
+  },
+);

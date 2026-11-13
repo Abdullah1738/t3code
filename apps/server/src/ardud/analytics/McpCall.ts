@@ -38,6 +38,8 @@ const label = (value: unknown, max = 160): string | undefined =>
     ? value
     : undefined;
 const isFailureCode = Schema.is(OrchestratorMcpFailure.fields.code);
+const BOARD_BUSY =
+  /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
@@ -52,6 +54,16 @@ const TYPED_OUTCOMES = {
 } as const;
 
 function classifyFailure(error: Record<string, unknown>) {
+  if (
+    (error._tag === "KanbanError" &&
+      error.code === "conflict" &&
+      typeof error.detail === "string" &&
+      BOARD_BUSY.test(error.detail)) ||
+    (isFailureCode(error.code) &&
+      typeof error.message === "string" &&
+      BOARD_BUSY.test(error.message))
+  )
+    return { tag: "board_busy", outcome: "refused" as const };
   if (isFailureCode(error.code)) return { tag: error.code };
   if (error.code === -32602 || error._tag === "InvalidParams" || error._tag === "SchemaError")
     return { tag: "invalid_request" };
@@ -185,7 +197,7 @@ export function callOutcome(
     code === "delegation_timeout" ||
     code === "send_timeout" ||
     (exit._tag === "Failure" && Cause.hasInterrupts(exit.cause));
-  const busy = /^(?:Board busy: not written|Not saved \(board busy\))/.test(text);
+  const busy = code === "board_busy" || BOARD_BUSY.test(text);
   const refused =
     typedOutcome === "refused" ||
     inputRequired ||
