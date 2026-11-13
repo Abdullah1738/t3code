@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsError, type AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsError, LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -109,6 +109,42 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("keeps a minute summary delivered after midnight in the task's UTC day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      yield* TestClock.setTime(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-14T00:00:01.000Z")),
+      );
+      yield* analytics.ingest({
+        events: [
+          event({
+            ts: "2026-11-13T23:59:00.000Z",
+            kind: "performance.long-task-summary",
+            surface: "desktop",
+            route: "board",
+            props: {
+              count: 1,
+              totalMs: 500,
+              maxMs: 500,
+              wallTimeMs: 60_000,
+              histogram: [[Math.ceil(Math.log(500) / Math.log(LONG_TASK_HISTOGRAM_RATIO)), 1]],
+            },
+          }),
+        ],
+      });
+      const previous = yield* analytics.read({ day });
+      assert.deepInclude(previous.rollup.longTasksByRoute[0], {
+        route: "board",
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        p95Ms: 500,
+        wallTimeShare: 500 / 60_000,
+      });
+      assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>
