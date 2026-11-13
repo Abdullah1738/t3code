@@ -229,7 +229,10 @@ def _python_touches_live(source, directory, replica=False):
                 ambiguous.add(name)
                 pending.append(name)
     bindings = {name: value for name, value in bindings.items() if name not in ambiguous}
-    opaque = any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names) or
+    # Object writes can reach imported readers/builders through aliases whose
+    # identity this path evaluator cannot establish.
+    opaque = any(isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)) or
+                 isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names) or
                  _name(n) in {'globals', 'locals', 'vars', 'setattr', 'delattr'} or
                  aliases.get(_name(n)) == 'sys.modules' or
                  isinstance(n, ast.Attribute) and (n.attr in {'__dict__', '__globals__', 'f_globals', 'f_locals', '__getattribute__', '__setattr__'} or

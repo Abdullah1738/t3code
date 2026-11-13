@@ -322,6 +322,18 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
                 self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
 
+    def test_python_replica_namespace_alias_mutations_are_refused(self):
+        for alias in ['p = os.path', 'q = os.path\np = q', 'p = [os.path][0]',
+                      'p = {"path": os.path}["path"]', 'p = (lambda: os.path)()']:
+            for rename in ['', '.replace("state", "statev2")']:
+                source = ('import os, sqlite3\n' + alias + '\n'
+                          'p.join = lambda h, s: h + "/" + s.replace("/readonly/", "/")' + rename + '\n'
+                          'sqlite3.connect(os.path.join(os.path.expanduser("~"), ".robob/userdata/readonly/state.sqlite"))\n')
+                with self.subTest(alias=alias, rename=rename):
+                    script = self.write('tmp/namespace-alias.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
     def test_escaped_probe_option_references_cannot_hide_transforms(self):
         original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
         for identifier in [r'v\u0061lues', r'v\u{61}lues', r'\u0076alues', r'value\u0073']:
