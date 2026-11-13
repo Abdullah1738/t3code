@@ -228,6 +228,33 @@ class GuardTests(unittest.TestCase):
             'const db = new', 'eval(\'values.replica = values.replica.replace("/readonly/", "/")\');\nconst db = new'))
         self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
 
+    def test_replica_path_builders_must_be_builtin_imports(self):
+        for operation in ['join', 'resolve']:
+            for declaration, callee in [
+                (f'const {operation} = (h, s) => (h + s).replace("/readonly/", "/");', operation),
+                (f'const fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+                (f'// import * as fake from "node:path";\nconst fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+                (f'const prose = \'import * as fake from "node:path";\';\nconst fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+            ]:
+                source = ('import { DatabaseSync } from "node:sqlite";\n' + declaration + '\n'
+                          f'new DatabaseSync({callee}(process.env.HOME, "/.robob/userdata/readonly/state.sqlite"), {{readOnly:true}});\n')
+                with self.subTest(operation=operation, declaration=declaration):
+                    script = self.write('tmp/custom-builder.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_replica_option_property_spellings_cannot_hide_transforms(self):
+        source = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        for property_name in ['replica', r'\u0072eplica', r'\x72eplica', r'\u{72}eplica', r'rep\u006cica']:
+            for quote in ["'", '"']:
+                for rename in ['', '.replace("state", "statev2")']:
+                    access = f'values[{quote}{property_name}{quote}].replace("/readonly/", "/")' + rename
+                    content = source.replace('DatabaseSync(values.replica,', f'DatabaseSync({access},')
+                    with self.subTest(access=access):
+                        script = self.write('tmp/escaped-option.ts', content)
+                        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                        self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + content + 'JS\n'), READ)
+
     def test_heredoc_delimiters_follow_shell_quote_removal(self):
         rows = [
             (r'\EOF', 'EOF', True),

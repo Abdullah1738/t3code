@@ -1070,9 +1070,24 @@ def _replica_reader_source(source):
     code = strings.sub(lambda m: ' ' * len(m[0]), source)
     if re.search(r'\b(?:eval|Function|Reflect|Proxy)\b', code):
         return source
+
+    def namespace(module, operations):
+        names = []
+        pattern = r'''\bimport\s+\*\s+as\s+(''' + identifier + r''')\s+from\s*(['"])node:''' + module + r'''\2'''
+        for imported in re.finditer(pattern, source):
+            if not code.startswith('import', imported.start()):
+                continue
+            uses = [m for m in re.finditer(r'(?<![\w$])' + re.escape(imported[1]) + r'(?![\w$])', code)
+                    if m.span() != imported.span(1)]
+            if all(re.match(r'\s*\.\s*(?:' + operations + r')\s*\(', code[m.end():]) for m in uses):
+                names.append(re.escape(imported[1]))
+        return '(?:' + '|'.join(names) + ')' if names else r'(?!)'
+
+    paths = namespace('path', 'join|resolve')
+    os_module = namespace('os', 'homedir')
     literal = r'''(?:'[^'\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?'|"[^"\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?")'''
-    home = r'(?:process\.env\.HOME|(?:' + identifier + r'\.)*homedir\(\s*\))'
-    seed = re.compile(r'(?:' + identifier + r'\.)*(?:join|resolve)\(\s*' + home + r'\s*,\s*' + literal + r'\s*\)|' + home + r'\s*\+\s*' + literal + '|' + literal)
+    home = r'(?:process\.env\.HOME|' + os_module + r'\.homedir\(\s*\))'
+    seed = re.compile(paths + r'\.(?:join|resolve)\(\s*' + home + r'\s*,\s*' + literal + r'\s*\)|' + home + r'\s*\+\s*' + literal + '|' + literal)
 
     def reader_use(start, end):
         return reader.search(code[:start]) and re.match(r'\s*[,)]', code[end:])
@@ -1114,7 +1129,7 @@ def _replica_reader_source(source):
             options = code[parser.start():close]
             uses = code
             for access in re.finditer(r'''\bvalues\s*\[\s*(['"])([^'"\n]+)\1\s*\]''', source):
-                if access[2] != 'replica' and not re.match(r'\s*(?:[+*/%&|?^-]*=(?!=)|\+\+|--)', code[access.end():]):
+                if access[2] != 'replica' and '\\' not in access[2] and not re.match(r'\s*(?:[+*/%&|?^-]*=(?!=)|\+\+|--)', code[access.end():]):
                     uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
             for access in re.finditer(r'\bvalues\.replica\b', code):
                 if reader_use(access.start(), access.end()):
