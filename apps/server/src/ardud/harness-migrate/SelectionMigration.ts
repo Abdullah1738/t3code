@@ -812,140 +812,212 @@ export const make = Effect.gen(function* () {
    * The owner's current value for one ledger row. `undefined` means the record is gone. Board and
    * card rows are not read here: a board is restored as a whole, by `restoreBoard`.
    */
-  const currentValue = (
+  const currentValue = Effect.fn("SelectionMigration.currentValue")(function* (
     scope: LedgerScope,
     ref: string,
     includeDormant = false,
-  ): Effect.Effect<unknown, SelectionMigrationError> =>
-    Effect.gen(function* () {
-      switch (scope) {
-        case "settings": {
-          const current = yield* readSettings;
-          return readSettingsPath(current, ref);
-        }
-        case "project": {
-          const project = yield* projects
-            .getById(ProjectIdSchema.make(ref))
-            .pipe(Effect.mapError((cause) => migrationError("read project", cause)));
-          return project._tag === "Some" ? project.value.defaultModelSelection : undefined;
-        }
-        case "schedule": {
-          const listed = yield* scheduled
-            .list()
-            .pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
-          return listed.tasks.find((task) => task.id === ref)?.modelSelection;
-        }
-        case "schedule-fallbacks": {
-          const listed = yield* scheduled.list().pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
-          const { id, createdAt } = readFallbackRef(ref);
-          const task = listed.tasks.find((item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt));
-          if (task === undefined) return undefined;
-          return (yield* readBlockRetry(sql, task).pipe(Effect.mapError((cause) => migrationError("read fallbacks", cause))))?.fallbacks;
-        }
-        case "queued-run": {
-          const [encodedThread, encodedRun] = ref.split(":");
-          if (!encodedThread || !encodedRun) return undefined;
-          const projection = yield* readOwnerProjection(ThreadIdSchema.make(decodeURIComponent(encodedThread)));
-          if (projection === null) return undefined;
-          const run = projection.runs.find((item) => item.id === decodeURIComponent(encodedRun));
-          const liveThread = projection.thread.archivedAt === null && projection.thread.deletedAt === null && projection.thread.settledAt === null;
-          return run !== undefined && (includeDormant || (liveThread && run.status === "queued")) ? run.modelSelection : undefined;
-        }
-        case "thread":
-        case "thread-runtime": {
-          const projection = yield* readOwnerProjection(ThreadIdSchema.make(ref));
-          if (projection === null) return undefined;
-          if (!includeDormant && (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null || projection.thread.settledAt !== null)) return undefined;
-          return scope === "thread" ? projection.thread.modelSelection : projection.thread.runtimeMode;
-        }
-        case "board":
-          return undefined;
+  ): Effect.fn.Return<unknown, SelectionMigrationError> {
+    switch (scope) {
+      case "settings": {
+        const current = yield* readSettings;
+        return readSettingsPath(current, ref);
       }
-    });
+      case "project": {
+        const project = yield* projects
+          .getById(ProjectIdSchema.make(ref))
+          .pipe(Effect.mapError((cause) => migrationError("read project", cause)));
+        return project._tag === "Some" ? project.value.defaultModelSelection : undefined;
+      }
+      case "schedule": {
+        const listed = yield* scheduled
+          .list()
+          .pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
+        return listed.tasks.find((task) => task.id === ref)?.modelSelection;
+      }
+      case "schedule-fallbacks": {
+        const listed = yield* scheduled
+          .list()
+          .pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
+        const { id, createdAt } = readFallbackRef(ref);
+        const task = listed.tasks.find(
+          (item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt),
+        );
+        if (task === undefined) return undefined;
+        return (yield* readBlockRetry(sql, task).pipe(
+          Effect.mapError((cause) => migrationError("read fallbacks", cause)),
+        ))?.fallbacks;
+      }
+      case "queued-run": {
+        const [encodedThread, encodedRun] = ref.split(":");
+        if (!encodedThread || !encodedRun) return undefined;
+        const projection = yield* readOwnerProjection(
+          ThreadIdSchema.make(decodeURIComponent(encodedThread)),
+        );
+        if (projection === null) return undefined;
+        const run = projection.runs.find((item) => item.id === decodeURIComponent(encodedRun));
+        const liveThread =
+          projection.thread.archivedAt === null &&
+          projection.thread.deletedAt === null &&
+          projection.thread.settledAt === null;
+        return run !== undefined && (includeDormant || (liveThread && run.status === "queued"))
+          ? run.modelSelection
+          : undefined;
+      }
+      case "thread":
+      case "thread-runtime": {
+        const projection = yield* readOwnerProjection(ThreadIdSchema.make(ref));
+        if (projection === null) return undefined;
+        if (
+          !includeDormant &&
+          (projection.thread.archivedAt !== null ||
+            projection.thread.deletedAt !== null ||
+            projection.thread.settledAt !== null)
+        )
+          return undefined;
+        return scope === "thread"
+          ? projection.thread.modelSelection
+          : projection.thread.runtimeMode;
+      }
+      case "board":
+        return undefined;
+    }
+  });
 
   /** Puts one ledger row back through its owner, or returns the reason it was not restored. */
-  const writeValue = (
+  const writeValue = Effect.fn("SelectionMigration.writeValue")(function* (
     scope: LedgerScope,
     ref: string,
     before: unknown,
     after: unknown,
-  ): Effect.Effect<string | null, SelectionMigrationError> =>
-    Effect.gen(function* () {
-      switch (scope) {
-        case "settings": {
-          const wrote = yield* settings
-            .updateSettingsIf((current) => sameValue(readSettingsPath(current, ref), after)
+  ): Effect.fn.Return<string | null, SelectionMigrationError> {
+    switch (scope) {
+      case "settings": {
+        const wrote = yield* settings
+          .updateSettingsIf((current) =>
+            sameValue(readSettingsPath(current, ref), after)
               ? settingsPatchFor(current, ref, before)
-              : null)
-            .pipe(Effect.mapError((cause) => migrationError("restore settings", cause)));
-          return wrote ? null : "settings changed after apply";
-        }
-        case "project": {
-          const commandId = yield* newCommandId(`rollback-project:${ref}`);
-          yield* projects
-            .update({
-              projectId: ProjectIdSchema.make(ref),
-              commandId,
-              defaultModelSelection: before as ModelSelection,
-              expectedDefaultModelSelection: after as ModelSelection,
-            })
-            .pipe(Effect.mapError((cause) => migrationError("restore project", cause)));
-          return null;
-        }
-        case "schedule": {
-          const wrote = yield* scheduled
-            .migrateModelSelection({
-              id: ScheduledTaskIdSchema.make(ref),
-              expected: after as ModelSelection,
-              next: before as ModelSelection,
-            })
-            .pipe(Effect.mapError((cause) => migrationError("restore schedule", cause)));
-          return wrote ? null : "schedule changed after apply";
-        }
-        case "schedule-fallbacks": {
-          const listed = yield* scheduled.list().pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
-          const { id, createdAt } = readFallbackRef(ref);
-          const task = listed.tasks.find((item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt));
-          if (task === undefined) return "schedule is gone";
-          return yield* sql.withTransaction(Effect.gen(function* () {
-            const value = yield* readBlockRetry(sql, task);
-            if (value === null || !sameValue(value.fallbacks, after)) return "fallbacks changed after apply";
-            yield* writeBlockRetry(sql, task, { ...value, fallbacks: before as ReadonlyArray<ModelSelection> });
-            return null;
-          })).pipe(Effect.mapError((cause) => migrationError("restore fallbacks", cause)));
-        }
-        case "queued-run": {
-          const [encodedThread, encodedRun] = ref.split(":");
-          if (!encodedThread || !encodedRun) return "queued run ref is missing its thread";
-          yield* orchestrator.dispatch({ type: "queued-run.rebind-selection", commandId: yield* newCommandId(`rollback-queued:${ref}`), threadId: ThreadIdSchema.make(decodeURIComponent(encodedThread)), runId: RunIdSchema.make(decodeURIComponent(encodedRun)), modelSelection: before as ModelSelection, expectedModelSelection: after as ModelSelection })
-            .pipe(Effect.mapError((cause) => migrationError("restore queued run", cause)));
-          return null;
-        }
-        case "thread": {
-          const from = after as ModelSelection;
-          const to = before as ModelSelection;
-          yield* orchestrator.dispatch({ type: from.instanceId === to.instanceId ? "thread.model-selection.set" : "provider.switch", commandId: yield* newCommandId(`rollback-thread:${ref}`), threadId: ThreadIdSchema.make(ref), modelSelection: to, expectedModelSelection: from })
-            .pipe(Effect.mapError((cause) => migrationError("restore thread", cause)));
-          return null;
-        }
-        case "thread-runtime": {
-          const related = yield* sql<{ after_json: string }>`SELECT after_json FROM ardud_harness_selection_migration
-            WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${ref}
-            AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`
-            .pipe(Effect.mapError((cause) => migrationError("read runtime selection", cause)));
-          if (related[0] === undefined) return "runtime selection intent is missing";
-          const expectedModelSelection = yield* decodeLedgerValue(related[0].after_json)
-            .pipe(Effect.mapError((cause) => migrationError("decode runtime selection", cause)));
-          const current = yield* currentValue("thread", ref);
-          if (!sameValue(current, expectedModelSelection)) return "thread selection changed after apply";
-          yield* orchestrator.dispatch({ type: "thread.runtime-mode.set", commandId: yield* newCommandId(`rollback-runtime:${ref}`), threadId: ThreadIdSchema.make(ref), runtimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedRuntimeMode: after as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedModelSelection: expectedModelSelection as ModelSelection })
-            .pipe(Effect.mapError((cause) => migrationError("restore runtime mode", cause)));
-          return null;
-        }
-        case "board":
-          return "board rows restore together";
+              : null,
+          )
+          .pipe(Effect.mapError((cause) => migrationError("restore settings", cause)));
+        return wrote ? null : "settings changed after apply";
       }
-    });
+      case "project": {
+        const commandId = yield* newCommandId(`rollback-project:${ref}`);
+        yield* projects
+          .update({
+            projectId: ProjectIdSchema.make(ref),
+            commandId,
+            defaultModelSelection: before as ModelSelection,
+            expectedDefaultModelSelection: after as ModelSelection,
+          })
+          .pipe(Effect.mapError((cause) => migrationError("restore project", cause)));
+        return null;
+      }
+      case "schedule": {
+        const wrote = yield* scheduled
+          .migrateModelSelection({
+            id: ScheduledTaskIdSchema.make(ref),
+            expected: after as ModelSelection,
+            next: before as ModelSelection,
+          })
+          .pipe(Effect.mapError((cause) => migrationError("restore schedule", cause)));
+        return wrote ? null : "schedule changed after apply";
+      }
+      case "schedule-fallbacks": {
+        const listed = yield* scheduled
+          .list()
+          .pipe(Effect.mapError((cause) => migrationError("read schedule", cause)));
+        const { id, createdAt } = readFallbackRef(ref);
+        const task = listed.tasks.find(
+          (item) => item.id === id && (createdAt === undefined || item.createdAt === createdAt),
+        );
+        if (task === undefined) return "schedule is gone";
+        return yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const value = yield* readBlockRetry(sql, task);
+              if (value === null || !sameValue(value.fallbacks, after))
+                return "fallbacks changed after apply";
+              yield* writeBlockRetry(sql, task, {
+                ...value,
+                fallbacks: before as ReadonlyArray<ModelSelection>,
+              });
+              return null;
+            }),
+          )
+          .pipe(Effect.mapError((cause) => migrationError("restore fallbacks", cause)));
+      }
+      case "queued-run": {
+        const [encodedThread, encodedRun] = ref.split(":");
+        if (!encodedThread || !encodedRun) return "queued run ref is missing its thread";
+        yield* orchestrator
+          .dispatch({
+            type: "queued-run.rebind-selection",
+            commandId: yield* newCommandId(`rollback-queued:${ref}`),
+            threadId: ThreadIdSchema.make(decodeURIComponent(encodedThread)),
+            runId: RunIdSchema.make(decodeURIComponent(encodedRun)),
+            modelSelection: before as ModelSelection,
+            expectedModelSelection: after as ModelSelection,
+          })
+          .pipe(Effect.mapError((cause) => migrationError("restore queued run", cause)));
+        return null;
+      }
+      case "thread": {
+        const from = after as ModelSelection;
+        const to = before as ModelSelection;
+        yield* orchestrator
+          .dispatch({
+            type:
+              from.instanceId === to.instanceId
+                ? "thread.model-selection.set"
+                : "provider.switch",
+            commandId: yield* newCommandId(`rollback-thread:${ref}`),
+            threadId: ThreadIdSchema.make(ref),
+            modelSelection: to,
+            expectedModelSelection: from,
+          })
+          .pipe(Effect.mapError((cause) => migrationError("restore thread", cause)));
+        return null;
+      }
+      case "thread-runtime": {
+        const related = yield* sql<{
+          after_json: string;
+        }>`SELECT after_json FROM ardud_harness_selection_migration
+            WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${ref}
+            AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`.pipe(
+          Effect.mapError((cause) => migrationError("read runtime selection", cause)),
+        );
+        if (related[0] === undefined) return "runtime selection intent is missing";
+        const expectedModelSelection = yield* decodeLedgerValue(related[0].after_json).pipe(
+          Effect.mapError((cause) => migrationError("decode runtime selection", cause)),
+        );
+        const current = yield* currentValue("thread", ref);
+        if (!sameValue(current, expectedModelSelection))
+          return "thread selection changed after apply";
+        yield* orchestrator
+          .dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: yield* newCommandId(`rollback-runtime:${ref}`),
+            threadId: ThreadIdSchema.make(ref),
+            runtimeMode: before as
+              | "approval-required"
+              | "auto"
+              | "auto-accept-edits"
+              | "full-access",
+            expectedRuntimeMode: after as
+              | "approval-required"
+              | "auto"
+              | "auto-accept-edits"
+              | "full-access",
+            expectedModelSelection: expectedModelSelection as ModelSelection,
+          })
+          .pipe(Effect.mapError((cause) => migrationError("restore runtime mode", cause)));
+        return null;
+      }
+      case "board":
+        return "board rows restore together";
+    }
+  });
 
   /** Board ids this migration wrote, read from the ledger's board rows for one version. */
   /** The record id in a board-scoped ref: the segment after the board, or the whole id for a board. */

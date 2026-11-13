@@ -29,15 +29,17 @@ export async function runMigrationCheck(directory: string) {
     }
   }
   const state = NodePath.join(root, "statev2.sqlite");
-  const timed = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
-    Effect.gen(function* () {
-      const start = performance.now();
-      const result = yield* effect;
-      const durationMs = performance.now() - start;
-      console.log(JSON.stringify({ phase: "migration", name, durationMs }));
-      if (durationMs > 20_000) throw new Error(`Migration ${name} exceeded 20 seconds`);
-      return result;
-    });
+  const timed = Effect.fn("MigrationCheck.timed")(function* <A, E, R>(
+    name: string,
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    const start = performance.now();
+    const result = yield* effect;
+    const durationMs = performance.now() - start;
+    console.log(JSON.stringify({ phase: "migration", name, durationMs }));
+    if (durationMs > 20_000) throw new Error(`Migration ${name} exceeded 20 seconds`);
+    return result;
+  });
   await Effect.runPromise(
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
