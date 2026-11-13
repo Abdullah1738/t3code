@@ -353,14 +353,31 @@ class FakeDiskutil:
 
 
 class DiskProbeTests(unittest.TestCase):
-    setUp = LoggingTests.setUp
     rows = LoggingTests.rows
 
-    def runner(self, absent=False, sample_fail=False, notify_fail=False):
+    def setUp(self):
+        LoggingTests.setUp(self)
+        self.commands = []
+        self.addCleanup(self.assert_read_only_commands)
+
+    def assert_read_only_commands(self):
+        for cmd in self.commands:
+            self.assertNotIn(Path(cmd[0]).name, ('sudo', 'kill', 'killall'))
+
+    def runner(self, absent=False, sample_fail=False, notify_fail=False, ps_form='present'):
         from types import SimpleNamespace
         def run(cmd, **kwargs):
+            self.commands.append(cmd)
             if cmd[0] == '/bin/ps':
-                self.assertEqual(kwargs['timeout'], 5)
+                self.assertEqual(kwargs['timeout'], 3)
+                if ps_form == 'timeout':
+                    raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+                if ps_form == 'unreadable':
+                    raise OSError('ps unavailable')
+                if ps_form == 'nonzero':
+                    return SimpleNamespace(returncode=1, stdout='')
+                if ps_form == 'malformed':
+                    return SimpleNamespace(returncode=0, stdout='80846 invalid Ss /usr/libexec/storagekitd')
                 return SimpleNamespace(returncode=0, stdout='' if absent else
                     ' PID ELAPSED STAT COMM\n 80846 1-02:03:04 Ss /usr/libexec/storagekitd\n'
                     ' 137 03:04 S /usr/libexec/diskarbitrationd\n')
@@ -398,8 +415,12 @@ class DiskProbeTests(unittest.TestCase):
                 self.assertEqual(row['props']['diskCount'], 2)
                 self.assertFalse(row['props']['timedOut'])
                 self.assertEqual(row['props']['exitCode'], 0)
-                self.assertEqual(row['props']['storagekitdPid'], None if absent else 80846)
-                self.assertEqual(row['props']['storagekitdUptimeS'], None if absent else 93784)
+                if absent:
+                    self.assertNotIn('storagekitdPid', row['props'])
+                    self.assertNotIn('storagekitdUptimeS', row['props'])
+                else:
+                    self.assertEqual(row['props']['storagekitdPid'], 80846)
+                    self.assertEqual(row['props']['storagekitdUptimeS'], 93784)
                 self.assertEqual(row['props']['storagekitdStat'], None if absent else 'Ss')
                 self.assertEqual(row['props']['diskarbitrationdUptimeS'], None if absent else 184)
                 self.assertTrue(row['props']['hdiutilOk'])
@@ -423,6 +444,65 @@ class DiskProbeTests(unittest.TestCase):
         self.assertTrue(self.child.reaped)
         self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
         self.assertNotIn('private stack', str(self.rows()))
+
+    def test_sleeping_diskutil_alert_and_numeric_process_metadata(self):
+        sleeper = self.root / 'diskutil.py'
+        sleeper.write_text('import time\ntime.sleep(60)\n')
+        self.notifications = []
+        spawned = []
+        real_popen = subprocess.Popen
+        def popen(cmd, **kwargs):
+            self.assertEqual(cmd, ['/usr/sbin/diskutil', 'list', '-plist'])
+            self.child = child = real_popen([sys.executable, '-I', str(sleeper)], **kwargs)
+            spawned.append(child)
+            child.killed = False
+            communicate = child.communicate
+            def bounded_communicate(timeout):
+                # Exercise a real sleeping child without waiting the production 20 s.
+                return communicate(timeout=0.05 if timeout == 20 else timeout)
+            child.communicate = bounded_communicate
+            return child
+        with patch.object(subprocess, 'Popen', wraps=real_popen) as subprocesses:
+            try:
+                # Use the spy for fixture launches as well as any accidental subprocess.
+                real_popen = subprocesses
+                for _ in range(2):
+                    collector.disk_tooling_probe(self.runner(), popen, lambda pid: False)
+                self.assertEqual(len(spawned), 2)
+                self.assertTrue(all(child.poll() == -9 for child in spawned))
+            finally:
+                for child in spawned:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
+        for call in subprocesses.call_args_list:
+            self.assertNotIn(Path(call.args[0][0]).name, ('sudo', 'kill', 'killall'))
+        self.assertEqual(len(self.notifications), 1)
+        cmd = self.notifications[0]
+        text = cmd[cmd.index('--text')+1]
+        self.assertIn('sudo killall storagekitd', text)
+        self.assertIn('If diskutil list still times out after 10 s, run: sudo kill -9 80846', text)
+        self.assertIn('(pid 80846, up 26.1h)', text)
+        row = self.rows()[-1]
+        self.assertTrue(row['props']['timedOut'])
+        for key, value in [('storagekitdPid', 80846), ('storagekitdUptimeS', 93784)]:
+            self.assertEqual(row['props'][key], value)
+            self.assertIs(type(row['props'][key]), int)
+
+    def test_unavailable_ps_omits_numeric_storagekitd_fields(self):
+        for form in ('absent', 'nonzero', 'timeout', 'unreadable', 'malformed'):
+            with self.subTest(form=form):
+                self.probe('timeout', absent=form == 'absent', ps_form=form)
+                row = self.rows()[-1]
+                self.assertTrue(row['props']['timedOut'])
+                self.assertNotIn('storagekitdPid', row['props'])
+                self.assertNotIn('storagekitdUptimeS', row['props'])
+                self.assertNotIn('probeError', row['props'])
+        cmd = self.notifications[0]
+        text = cmd[cmd.index('--text')+1]
+        self.assertIn('(pid unknown, up unknown)', text)
+        self.assertIn('sudo kill -9 <pid>', text)
+        self.assertNotIn('sudo kill -9 None', text)
 
     def test_probe_previous_child_and_overlapping_collector_skip(self):
         import fcntl
@@ -556,7 +636,7 @@ class DiskProbeTests(unittest.TestCase):
                         if form == 'nonzero':
                             return SimpleNamespace(returncode=1, stdout='')
                         if form == 'timeout':
-                            raise subprocess.TimeoutExpired(cmd, 5)
+                            raise subprocess.TimeoutExpired(cmd, 3)
                         if form == 'restarted':
                             return SimpleNamespace(returncode=0, stdout='88888 00:02 Ss /usr/libexec/storagekitd')
                     return base(cmd, **kwargs)

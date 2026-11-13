@@ -153,11 +153,11 @@ def elapsed_seconds(value):
 
 
 def daemon_state(run):
-    props = {name + suffix: None for name in ('storagekitd', 'diskarbitrationd')
-             for suffix in ('Pid', 'UptimeS', 'Stat')}
+    props = dict(storagekitdStat=None, diskarbitrationdPid=None,
+                 diskarbitrationdUptimeS=None, diskarbitrationdStat=None)
     try:
         result = run(['/bin/ps', '-axo', 'pid,etime,stat,comm'], capture_output=True,
-                     text=True, timeout=5)
+                     text=True, timeout=3)
         if result.returncode:
             return props
         for line in result.stdout.splitlines():
@@ -239,7 +239,7 @@ def notify(text, key, run):
 
 def alert(props, run, advance=True):
     state = read_state('disk-tooling-alert')
-    pid = props['storagekitdPid']
+    pid = props.get('storagekitdPid')
     if not advance and pid is None:
         # Missing daemon metadata on a skipped probe is not a recovery signal.
         pid = state.get('pid')
@@ -250,10 +250,14 @@ def alert(props, run, advance=True):
     state.update(pid=pid, consecutiveTimeouts=count)
     if count >= 2 and state.get('alertedKey') != key:
         if state.get('pendingKey') != key:
-            uptime = props['storagekitdUptimeS']
+            uptime = props.get('storagekitdUptimeS')
             up = 'unknown' if uptime is None else '%.1fh' % (uptime/3600)
             state.update(pendingKey=key, pendingText=
-                         "diskutil is hanging: storagekitd (pid %s, up %s) isn't answering. Fix: sudo killall storagekitd" % (pid, up))
+                         "diskutil is hanging: storagekitd (pid %s, up %s) isn't answering. "
+                         "First run: sudo killall storagekitd. If diskutil list still times out "
+                         "after 10 s, run: sudo kill -9 %s." %
+                         (pid if pid is not None else 'unknown', up,
+                          pid if pid is not None else '<pid>'))
         # A timeout may occur after durable queueing. The bridge requires the
         # same key AND text on retry, even though daemon uptime has increased.
         save_state('disk-tooling-alert', state)
