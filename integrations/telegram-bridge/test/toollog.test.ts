@@ -73,7 +73,7 @@ test("rollup counts fixture names/kinds, rates, percentiles and top error tags, 
   expect(statSync(join(dir, `rollup-${day()}.json`)).mode & 0o777).toBe(0o600);
   expect(await rollup("../../secret")).toBeUndefined();
   expect(await rollup("2026-02-30")).toBeUndefined();
-  expect(await rollup("2000-01-01")).toBeUndefined();
+  expect(await rollup("2000-01-01")).toMatchObject({ day: "2000-01-01", total: 0 });
 });
 
 

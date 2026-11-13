@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rollup, toolLog, toolError } from "../src/toollog.ts";
@@ -73,7 +73,70 @@ test("rollup counts fixture names/kinds, rates, percentiles and top error tags, 
   expect(statSync(join(dir, `rollup-${day()}.json`)).mode & 0o777).toBe(0o600);
   expect(await rollup("../../secret")).toBeUndefined();
   expect(await rollup("2026-02-30")).toBeUndefined();
-  expect(await rollup("2000-01-01")).toBeUndefined();
+});
+
+test("a missing day writes and prints an empty rollup with exit 0", async () => {
+  const dir = fixture(), emptyDay = "2000-01-01";
+  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [] };
+  expect(await rollup(emptyDay)).toEqual(expected);
+  const target = join(dir, `rollup-${emptyDay}.json`);
+  expect(JSON.parse(readFileSync(target, "utf8"))).toEqual(expected);
+  expect(statSync(target).mode & 0o777).toBe(0o600);
+  const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", "2000-01-02"], {
+    env: { ...process.env, ROBOB_WATCH_ROOT: join(dir, "watchers-root") },
+  });
+  expect(child.exitCode).toBe(0);
+  const cliExpected = { ...expected, day: "2000-01-02" };
+  expect(JSON.parse(child.stdout.toString())).toEqual(cliExpected);
+  expect(JSON.parse(readFileSync(join(dir, "rollup-2000-01-02.json"), "utf8"))).toEqual(cliExpected);
+  expect(statSync(join(dir, "rollup-2000-01-02.json")).mode & 0o777).toBe(0o600);
+  expect(existsSync(join(dir, `${emptyDay}.ndjson`))).toBe(false);
+  expect(existsSync(join(dir, "2000-01-02.ndjson"))).toBe(false);
+});
+
+test.each(["../../secret", "2026-02-30", "2026-13-01"])("invalid day %s still fails", async invalidDay => {
+  const dir = fixture();
+  expect(await rollup(invalidDay)).toBeUndefined();
+  const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", invalidDay], {
+    env: { ...process.env, ROBOB_WATCH_ROOT: join(dir, "watchers-root") },
+  });
+  expect(child.exitCode).not.toBe(0);
+  expect(child.stderr.toString()).toContain("Could not roll up UTC day");
+  expect(readdirSync(dir).some(name => name.startsWith("rollup-"))).toBe(false);
+});
+
+test.each(["empty file", "dangling symlink"])("a day with an %s gives an empty rollup", async source => {
+  const dir = fixture(), fixtureDay = "2000-01-01", file = join(dir, `${fixtureDay}.ndjson`);
+  if (source === "empty file") writeFileSync(file, "");
+  else symlinkSync(join(dir, "missing.ndjson"), file);
+  expect(await rollup(fixtureDay)).toMatchObject({ day: fixtureDay, total: 0, counts: {}, kinds: {}, durations: {}, errors: [] });
+  expect(statSync(join(dir, `rollup-${fixtureDay}.json`)).mode & 0o777).toBe(0o600);
+});
+
+test.each(["read", "write", "symlink loop", "non-directory parent"])("rollup %s errors still fail", async operation => {
+  const dir = fixture(), fixtureDay = "2000-01-01";
+  const logDir = operation === "non-directory parent" ? join(dir, "blocked") : dir;
+  if (operation === "read") mkdirSync(join(dir, `${fixtureDay}.ndjson`));
+  else if (operation === "write") mkdirSync(join(dir, `rollup-${fixtureDay}.json`));
+  else if (operation === "symlink loop") symlinkSync(`${fixtureDay}.ndjson`, join(dir, `${fixtureDay}.ndjson`));
+  else writeFileSync(logDir, "file");
+  expect(await rollup(fixtureDay, logDir)).toBeUndefined();
+  const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", fixtureDay], {
+    env: { ...process.env, TOOLLOG_DIR: logDir, ROBOB_WATCH_ROOT: join(dir, "watchers-root") },
+  });
+  expect(child.exitCode).not.toBe(0);
+  expect(child.stderr.toString()).toContain("Could not roll up UTC day");
+});
+
+test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", async () => {
+  const dir = fixture(), fixtureDay = "2000-01-01", file = join(dir, `${fixtureDay}.ndjson`);
+  writeFileSync(file, ""); chmodSync(file, 0o000);
+  expect(await rollup(fixtureDay)).toBeUndefined();
+  const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", fixtureDay], {
+    env: { ...process.env, ROBOB_WATCH_ROOT: join(dir, "watchers-root") },
+  });
+  expect(child.exitCode).not.toBe(0);
+  expect(child.stderr.toString()).toContain("Could not roll up UTC day");
 });
 
 
