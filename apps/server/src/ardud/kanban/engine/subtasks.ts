@@ -90,6 +90,7 @@ const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
   task: string,
+  others: readonly string[],
 ): boolean => {
   const words = label
     .trim()
@@ -128,13 +129,28 @@ const approvesGate = (
   }
   const operation = action !== command ? normalized : action;
   const matched = verb.exec(operation)?.[0];
-  if (!matched) return false;
-  const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
-  if (suffix !== null && action === command && normalized === target)
-    return harmlessFollowup(task, target);
+  if (matched) {
+    const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
+    if (suffix !== null && action === command && normalized === target) {
+      if (harmlessFollowup(task, target)) return true;
+    } else if (
+      /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
+      (suffix !== null && harmlessFollowup(task, target))
+    ) {
+      return true;
+    }
+  }
+  if (gate === "secret") return false;
+  const choiceVerb =
+    gate === "deploy"
+      ? /\b(?:deploy\w*|release|install|restart|ship)\b/i
+      : /\b(?:pay|purchase|buy|charge|refund|transfer)\b/i;
   return (
-    /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
-    (suffix !== null && harmlessFollowup(task, target))
+    choiceVerb.test(command) &&
+    !/\b(?:not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead|partial|dry[- ]?run|draft|plan|preview|prepare)\b/i.test(
+      command,
+    ) &&
+    others.some((other) => isNegativeOption(other) || !choiceVerb.test(other))
   );
 };
 
@@ -170,13 +186,20 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
+  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
+  const others =
+    answer?.optionIds?.length === 1
+      ? (latest?.options ?? [])
+          .filter((option) => !answer.optionIds!.includes(option.id))
+          .map((option) => option.label)
+      : [];
   const approved =
     answer?.verdict === "approved" ||
     (answer?.verdict === "picked" &&
       Boolean(answer.optionIds?.length) &&
       answer.optionIds!.every((id) => {
         const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && approvesGate(option.label, gate, subtask.text);
+        return option !== undefined && approvesGate(option.label, gate, subtask.text, others);
       }));
   if (approved) return null;
   let reason: string;
