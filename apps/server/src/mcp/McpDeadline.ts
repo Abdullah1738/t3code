@@ -32,6 +32,9 @@ export const withDeadline = <A, E, R>(
             code: input.code,
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
+              (input.code === "caller_unresolved" && input.stage === "caller"
+                ? " Nothing was saved; retry the same call."
+                : "") +
               (input.stage === "dispatch" ? " Creation may still complete." : "") +
               (input.taskId === undefined
                 ? ""

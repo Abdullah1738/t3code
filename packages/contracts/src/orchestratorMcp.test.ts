@@ -44,6 +44,11 @@ describe("orchestrator MCP contracts", () => {
       latestTerminalStatus: "cancelled",
     };
     expect(decode(partial)).toEqual(partial);
+    expect(decode({ taskId: "node:task", partial: true, callerResolved: true })).toEqual({
+      taskId: "node:task",
+      partial: true,
+      callerResolved: true,
+    });
     expect(decode({ taskId: "node:task", partial: true })).toEqual({
       taskId: "node:task",
       partial: true,

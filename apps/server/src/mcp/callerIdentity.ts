@@ -1,0 +1,29 @@
+import type { OrchestrationV2ThreadShell, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Effect from "effect/Effect";
+import type { CallerActiveRow } from "../orchestration-v2/ProjectionStore.ts";
+import type * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
+
+export type CallerIdentity = CallerActiveRow &
+  Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">;
+
+export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* (
+  threads: ThreadManagement.ThreadManagementService["Service"],
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId | undefined,
+): Effect.fn.Return<CallerIdentity | null, OrchestratorV2Error> {
+  // Bounded point reads gate every tool call, like foreground control thread detail.
+  const row = yield* threads.getCallerRow(threadId).pipe(NodeSqliteClient.foregroundReads);
+  if (row === null || row.deletedAt !== null) return null;
+  if (
+    row.archivedAt === null &&
+    row.providerInstanceId === providerInstanceId &&
+    row.forkedFrom === null &&
+    row.activeRunId !== null
+  ) {
+    return { ...row, pendingBackgroundTasks: [] } satisfies CallerIdentity;
+  }
+  // Background subagents and all uncertain cases retain the full shell's exact liveness policy.
+  return yield* threads.getThreadShell(threadId).pipe(NodeSqliteClient.backgroundReads);
+});

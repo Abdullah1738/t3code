@@ -139,6 +139,7 @@ import {
   emptyProjection,
   threadShellFromProjection,
   ProjectionStoreV2,
+  type CallerActiveRow,
   type ProjectionRecordField,
   type ProjectionTimelinePage,
   type ProjectionTimelinePageOptions,
@@ -430,6 +431,9 @@ export interface OrchestratorV2Shape {
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, OrchestratorV2Error>,
     OrchestratorV2Error
   >;
+  readonly getCallerRow: (
+    threadId: ThreadId,
+  ) => Effect.Effect<CallerActiveRow | null, OrchestratorV2Error>;
   readonly getThreadShell: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadShell | null, OrchestratorV2Error>;
@@ -13394,6 +13398,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.mapError(shellProjectionError),
           Effect.map(Effect.mapError(shellProjectionError)),
         ),
+    getCallerRow: (threadId) =>
+      projectionStore.getCallerRow(threadId).pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      ),
     getThreadShell: (threadId) =>
       projectionStore.getThreadShell(threadId).pipe(
         NodeSqliteClient.readOnly,
@@ -13539,6 +13548,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
       Effect.fail(
         new OrchestratorProjectionError({
           threadId: ThreadId.make("thread:shell"),
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    getCallerRow: (threadId) =>
+      Effect.fail(
+        new OrchestratorProjectionError({
+          threadId,
           cause: "Orchestration V2 live runtime is not configured.",
         }),
       ),

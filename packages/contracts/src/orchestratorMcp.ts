@@ -278,6 +278,7 @@ export const OrchestratorMcpTaskStatusResult = Schema.Union([
     ...Struct.map(fields, Schema.optionalKey),
     taskId: NodeId,
     partial: Schema.Literal(true),
+    callerResolved: Schema.optional(Schema.Literal(true)),
   })),
 ]);
 export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;

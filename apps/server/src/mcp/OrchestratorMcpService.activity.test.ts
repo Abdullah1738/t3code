@@ -151,6 +151,12 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
             threadId === parentThreadId
               ? Effect.succeed(projection)
               : Effect.die(`unexpected thread ${threadId}`),
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === parentThreadId
+                ? (projection.thread as unknown as OrchestrationV2ThreadShell)
+                : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -224,6 +230,12 @@ it("readThread prefers waiting activity status over a newer cancelled queued run
             threadId === parentThreadId
               ? Effect.succeed(projection)
               : Effect.die(`unexpected thread ${threadId}`),
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === parentThreadId
+                ? (projection.thread as unknown as OrchestrationV2ThreadShell)
+                : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -424,6 +436,7 @@ it.each([
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           delegatedTaskResultPending: () => Effect.succeed(false),
           getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
@@ -548,6 +561,22 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));
             return Effect.die(`unexpected thread ${threadId}`);
           },
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === foreignThreadId
+                ? ({
+                    ...liveThreadShell(threadId),
+                    ...foreignProjection(threadId).thread,
+                  } as OrchestrationV2ThreadShell)
+                : threadId === parentThreadId
+                  ? (parentShell ?? {
+                      ...liveThreadShell(parentThreadId, {
+                        activeRunId: parentRuns.length > 0 ? RunId.make("run-parent-live") : null,
+                      }),
+                      ...parentProjection.thread,
+                    })
+                  : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
@@ -771,6 +800,12 @@ it.each(["missing-session", "capability", "replay"] as const)(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              Effect.succeed(
+                threadId === targetThreadId
+                  ? (targetProjection.thread as unknown as OrchestrationV2ThreadShell)
+                  : liveThreadShell(parentThreadId),
+              ),
             getThreadShell: (threadId) =>
               Effect.succeed(
                 threadId === targetThreadId
@@ -892,6 +927,7 @@ it("readThread exposes the stored sender thread only for thread-sent messages", 
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: () => Effect.succeed(shell),
           getThreadShell: () => Effect.succeed(shell),
           getThreadRecords: () => Effect.succeed(projection),
           getProjectThreadRecords: () => Effect.succeed(projection),

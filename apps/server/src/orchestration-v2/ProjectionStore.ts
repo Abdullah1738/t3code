@@ -105,6 +105,23 @@ import {
   THREAD_HISTORY_PAGE_POLICY,
 } from "./threadHistoryPaging.ts";
 
+export type CallerRow = Pick<
+  OrchestrationV2AppThread,
+  | "id"
+  | "projectId"
+  | "deletedAt"
+  | "archivedAt"
+  | "runtimeMode"
+  | "interactionMode"
+  | "providerInstanceId"
+  | "forkedFrom"
+  | "modelSelection"
+  | "title"
+  | "branch"
+  | "worktreePath"
+>;
+export type CallerActiveRow = CallerRow & { readonly activeRunId: RunId | null };
+
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
   {
@@ -499,6 +516,9 @@ export interface ProjectionStoreV2Shape {
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, ProjectionStoreV2Error>,
     ProjectionStoreV2Error
   >;
+  readonly getCallerRow: (
+    threadId: ThreadId,
+  ) => Effect.Effect<CallerActiveRow | null, ProjectionStoreV2Error>;
   readonly getThreadShell: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadShell | null, ProjectionStoreV2Error>;
@@ -6849,6 +6869,32 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         .withTransaction(readShellSnapshotRows(options))
         .pipe(Effect.mapError(shellSnapshotReadError), Effect.flatMap(decodeShellSnapshot));
 
+    const getCallerRow: ProjectionStoreV2Shape["getCallerRow"] = Effect.fn(
+      "ProjectionStore.getCallerRow",
+    )(function* (threadId) {
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<PayloadRow>`
+              SELECT payload_json FROM orchestration_v2_projection_threads
+              WHERE thread_id = ${threadId} AND deleted_at IS NULL
+            `;
+            if (rows[0] === undefined) return null;
+            const thread = yield* decodeThreadPayload(rows[0].payload_json);
+            const active = yield* sql<{ readonly run_id: string }>`
+              SELECT run_id FROM orchestration_v2_projection_runs INDEXED BY ardud_caller_active_run_idx
+              WHERE thread_id = ${threadId} AND status IN ('preparing', 'starting', 'running')
+              ORDER BY ordinal DESC, run_id DESC LIMIT 1
+            `;
+            return {
+              ...thread,
+              activeRunId: active[0] === undefined ? null : RunId.make(active[0].run_id),
+            };
+          }),
+        )
+        .pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })));
+    });
+
     const getThreadShell: ProjectionStoreV2Shape["getThreadShell"] = (threadId) =>
       sql
         .withTransaction(
@@ -6928,6 +6974,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       apply,
       getShellSnapshot,
       readShellSnapshot,
+      getCallerRow,
       getThreadShell,
       getThread,
       listCutoverCandidates,
@@ -7061,6 +7108,14 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       }),
       readShellSnapshot: (options) =>
         service.getShellSnapshot(options).pipe(Effect.map(Effect.succeed)),
+      getCallerRow: Effect.fn("ProjectionStore.getCallerRow")(function* (threadId) {
+        const projection = (yield* Ref.get(replayState)).projections.get(threadId);
+        if (projection === undefined || projection.thread.deletedAt !== null) return null;
+        const active = projection.runs
+          .filter(isInterruptibleRunForShell)
+          .toSorted((a, b) => b.ordinal - a.ordinal || String(b.id).localeCompare(String(a.id)))[0];
+        return { ...projection.thread, activeRunId: active?.id ?? null };
+      }),
       getThreadShell: Effect.fn("ProjectionStore.getThreadShell")(function* (threadId) {
         const existing = (yield* Ref.get(replayState)).projections;
         if (!existing.has(threadId)) {
