@@ -21,6 +21,7 @@ import {
   pendingWakeNote,
   subtaskLines,
   withPacketStep,
+  workAfterReview,
 } from "./subtasks.ts";
 
 const owner = { _tag: "owner" } as const;
@@ -1426,6 +1427,32 @@ describe("subtask ids stay unique for the life of a card", () => {
 });
 
 describe("marking subtasks", () => {
+  it.each(["work", "evaluator", "script"] as const)(
+    "passes the first open review step behind an unfinished %s step",
+    (firstOwner) => {
+      const plan = planSubtasks(
+        [],
+        [
+          { text: "Earlier task", owner: firstOwner, step: 1 },
+          { text: "First review", owner: "review", step: 2 },
+          { text: "Same review step", owner: "review", step: 2 },
+          { text: "Later review", owner: "review", step: 4 },
+        ],
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      const subtasks = passReview({ subtasks: plan.subtasks }, owner, at);
+      expect(subtasks.map((subtask) => subtask.state)).toEqual(["open", "done", "done", "open"]);
+      expect(workAfterReview({ subtasks })).toBe(firstOwner === "work");
+      const finishedEarlier = markSubtask(subtasks, "s1", "done", null, owner, at);
+      expect(kanbanOpenStep({ subtasks: finishedEarlier })).toBe(4);
+    },
+  );
+
+  it("leaves a plan without an open review unchanged", () => {
+    const subtasks = planned().filter((subtask) => subtask.owner !== "review");
+    expect(passReview({ subtasks }, owner, at)).toEqual(subtasks);
+  });
+
   it("lets each role mark only its own kind, in the step the card is on", () => {
     const card = { number: 3, subtasks: planned() };
     expect(checkMark(card, "s1", "done", "work", null)).toEqual({ ok: true });

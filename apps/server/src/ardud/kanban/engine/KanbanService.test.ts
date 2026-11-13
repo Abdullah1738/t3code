@@ -5617,6 +5617,121 @@ const startReplayReview = Effect.gen(function* () {
   return { kanban, card, worker, reviewThread: reviewing.activeThreadId! };
 });
 
+const reviewWithEarlierTask = Effect.fn("reviewWithEarlierTask")(function* (
+  firstOwner: "work" | "evaluator" | "script",
+) {
+  const started = yield* startReplayReview;
+  const store = yield* KanbanStore.KanbanStore;
+  const current = (yield* started.kanban.card(started.card.id)).card;
+  yield* store.putCard({
+    ...current,
+    subtasks: [
+      { id: "s1", step: 1, text: "Finish work", owner: firstOwner, gate: "secret" as const },
+      { id: "s2", step: 2, text: "Review", owner: "review" as const, gate: "secret" as const },
+      { id: "s3", step: 3, text: "Merge", owner: "evaluator" as const },
+    ].map((subtask) => ({
+      ...subtask,
+      state: "open" as const,
+      note: null,
+      doneAt: null,
+      doneBy: null,
+    })),
+    subtaskSeq: 3,
+  });
+  return started;
+});
+
+it.effect.each(["ae3303eb5b", "bbbbbbb222", null])(
+  "#1390 passes the later review step but conservatively reviews a handback note at %s",
+  (head) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker, reviewThread } = yield* reviewWithEarlierTask("work");
+        const result = yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        assert.strictEqual(result.card.stage, "todo");
+        assert.strictEqual(result.card.reviewStep, 1);
+        assert.deepStrictEqual(
+          result.card.subtasks.map((s) => s.state),
+          ["open", "done", "open"],
+        );
+        assert.include(result.card.wakeNote!, "The review at ae3303eb5b passed");
+        assert.include(result.card.wakeNote!, "s1");
+        assert.include(result.card.wakeNote!, "card_move to needs_review");
+        assert.include(result.card.wakeNote!, "Don't change code");
+        assert.strictEqual((yield* kanban.card(card.id)).events.at(-1)?.head, "ae3303eb5b");
+
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, worker.threadId);
+        const marked = yield* kanban.markSubtask(card.id, "s1", "done", "Checked", worker, "work");
+        assert.strictEqual(marked.subtasks[0]?.state, "done");
+        assert.strictEqual(marked.reviewStep, 1);
+        const reviewMessages = (yield* Ref.get(fake.threads)).get(reviewThread)!.messages.length;
+        // Move notes have no structured current head, even when they name a commit.
+        const moved = yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker, {
+          note: head === null ? "Subtasks done" : `Subtasks done at ${head}`,
+        });
+        assert.strictEqual(moved.reviewStep, 0);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(reviewing.stage, "in_review");
+        assert.isNotNull(reviewing.activeThreadId);
+        assert.strictEqual(reviewing.activeRole, "review");
+        assert.isAbove(
+          (yield* Ref.get(fake.threads)).get(reviewing.activeThreadId!)!.messages.length,
+          reviewMessages,
+        );
+        assert.strictEqual(reviewing.subtasks[1]?.state, "done");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["evaluator", "script"] as const)(
+  "#1390 an earlier %s task does not send a passed review to the worker",
+  (firstOwner) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, reviewThread } = yield* reviewWithEarlierTask(firstOwner);
+        const result = yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        assert.strictEqual(result.card.stage, "completed");
+        assert.strictEqual(result.card.reviewStep, 1);
+        assert.isNull(result.card.wakeNote);
+        assert.deepStrictEqual(
+          result.card.subtasks.map((s) => s.state),
+          ["open", "done", "open"],
+        );
+        yield* kanban.dispatchNow;
+        assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["clear", "findings"] as const)(
+  "#1390 only a passing last-chain verdict ticks the later review step: %s",
+  (verdict) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, reviewThread } = yield* reviewWithEarlierTask("work");
+        const board = (yield* kanban.boards).find((entry) => entry.id === card.boardId)!;
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [{ name: "Two", steps: [board.evaluatorModel, board.defaultCardModel] }],
+          defaultReviewChain: "Two",
+        });
+        const midway = yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        assert.strictEqual(midway.card.stage, "needs_review");
+        assert.strictEqual(midway.card.subtasks[1]?.state, "open");
+        yield* kanban.dispatchNow;
+        const second = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const result = yield* kanban.reviewResult(second, verdict, ["Fix it"], "ae3303eb5b");
+        assert.strictEqual(result.card.stage, "todo");
+        assert.strictEqual(result.card.reviewStep, verdict === "clear" ? 2 : 0);
+        assert.strictEqual(result.card.subtasks[1]?.state, verdict === "clear" ? "done" : "open");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect.each([
   "clear waiting to land",
   "findings",
@@ -10377,6 +10492,8 @@ it.effect("a passed review hands the card back to its worker when the next step 
       yield* kanban.reviewResult(reviewThread, "clear", []);
       const back = (yield* kanban.card(card.id)).card;
       assert.strictEqual(back.stage, "todo");
+      assert.strictEqual(back.reviewStep, 0);
+      assert.notInclude(back.wakeNote ?? "", "Don't change code");
       assert.notInclude(back.wakeNote ?? "", "Subtasks (");
       yield* kanban.dispatchNow;
       assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, workThread);

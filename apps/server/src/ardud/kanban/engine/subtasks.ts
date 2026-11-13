@@ -683,13 +683,21 @@ export const markSubtask = (
         : { ...subtask, state, note: note?.trim() || null, doneBy: by, doneAt: at },
   );
 
-/** A passed review marks the review subtasks of the step the card is on. */
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
+  const open = card.subtasks.filter(
+    (subtask) => subtask.owner === "review" && subtask.state === "open",
+  );
+  const step = Math.min(...open.map((subtask) => subtask.step));
+  return open.filter((subtask) => subtask.step === step);
+}
+
+/** Earlier unfinished work must not hide the review step that just passed. */
 export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(kanbanStepSubtasks(card, "review").map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }
