@@ -1,6 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { CommandId, RunId, ThreadId } from "@t3tools/contracts";
+import { CommandId, RunId, ThreadId, type ServerSettingsError } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
@@ -29,7 +29,7 @@ const harness = <E = never>(
 ) => {
   const resolvedSettings: Layer.Layer<
     ServerSettings.ServerSettingsService,
-    E | ServerSettings.ServerSettingsError
+    E | ServerSettingsError
   > = settingsLayer ?? ServerSettings.layerTest({ restartPacing: options });
   const running = new Set<string>();
   const priorities = new Map<string, number>();
@@ -246,8 +246,9 @@ it.effect(
         },
       ]);
       yield* worker.drain();
-      while (starts === 0) {
+      for (;;) {
         const held = Option.getOrThrow(yield* outbox.get("effect:held"));
+        if (held.status === "succeeded") break;
         assert.equal(h.reads.sources, 1);
         const now = yield* Clock.currentTimeMillis;
         const next = Date.parse(held.availableAt);
