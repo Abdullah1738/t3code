@@ -1076,7 +1076,7 @@ def main(argv=None, _locked=False):
     parser.add_argument('--placed-at', help='ISO timestamp with timezone; defaults to registration time')
     parser.add_argument('--eta', help='Latest promised arrival, ISO timestamp with timezone')
     parser.add_argument('--label', default='')
-    parser.add_argument('--single-active-order', action='store_true', help='Use ID-less app pushes as unconfirmed candidates. Only when this is the only active order in that app.')
+    parser.add_argument('--single-active-order', action='store_true', help='Use matching Careem Food/Quik live notifications as status; other ID-less pushes remain unconfirmed candidates. Requires the only active order in that app.')
     parser.add_argument('--session', default=SESSION)
     parser.add_argument('--source',choices=('cli','phone','email'),default='cli')
     parser.add_argument('--expires', default='7d')
