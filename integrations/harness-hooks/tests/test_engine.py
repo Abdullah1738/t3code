@@ -113,6 +113,7 @@ class EngineTests(unittest.TestCase):
             "HARNESS_HOOKS_COORD_CONFIG": str(self.coord_config),
             "HARNESS_HOOKS_COORD_ALLOW": str(self.allow),
             "OFFBOX_STATE_DIR": str(self.root / "offbox-state"),
+            "OFFBOX_TOOL_LOG_DIR": str(self.root / "shared-logs"),
             "OFFBOX_GATE_MODE": "enforce",
             engine.COMMAND_IDENTITY_ENV: "",
             "AGENT_GUARD_APPROVED": "",
@@ -670,6 +671,20 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.decide(event, "claude")["decision"], "deny")
         event["tool_name"] = "mcp__test_server__apply_patch"
         self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
+
+    def test_shared_offbox_logs_for_native_harnesses_and_classifier_failure(self):
+        for harness in ("claude", "codex"):
+            engine.decide(self.event("echo private-message", session="root", agent=None), harness)
+            engine.decide(self.event("npm ci", session="root", agent=None), harness)
+            with patch.object(engine, "_classify_offbox", side_effect=ValueError("private-token")):
+                engine.decide(self.event("echo private-message", session="root", agent=None), harness)
+        text = "".join(p.read_text() for p in (self.root / "shared-logs").glob("*.ndjson"))
+        rows = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual({r["props"]["harness"] for r in rows}, {"claudeAgent", "codex"})
+        self.assertEqual({r["props"]["decision"] for r in rows}, {"allowed", "denied"})
+        self.assertEqual({r["ok"] for r in rows}, {True, False})
+        self.assertNotIn("private-message", text)
+        self.assertNotIn("private-token", text)
 
     def test_native_and_mcp_shell_aliases_enforce_offbox_and_coord(self):
         self.actor()

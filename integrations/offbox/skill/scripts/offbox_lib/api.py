@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from datetime import datetime
 import http.client
 import json
+import math
 import re
 import os
 import socket
@@ -862,6 +864,88 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
 
 # ---------------------------------------------------------------- commands
 
+# Only retain durations observed in responses already needed by the caller. Logging never fetches a status.
+_COMMAND_DURATIONS = {}
+
+
+def execution_ms(status):
+    try:
+        if not isinstance(status, dict) or status.get('running') or status.get('status') in ('queued', 'running'):
+            return None
+        start, end = status.get('startedAt'), status.get('endedAt')
+        # Interrupted/lost commands and kill markers may end at reconciliation, long after execution stopped.
+        unmeasured_end = status.get('status') in ('interrupted', 'lost') or status.get('signal')
+        if not unmeasured_end and isinstance(start, str) and isinstance(end, str):
+            try:
+                start, end = (datetime.fromisoformat(value.replace('Z', '+00:00')) for value in (start, end))
+                if start.tzinfo is not None and end.tzinfo is not None and end >= start:
+                    return (end-start).total_seconds()*1000
+            except ValueError:
+                pass
+        wall = (status.get('metrics') or {}).get('wall_s')
+        if type(wall) in (int, float) and math.isfinite(wall) and wall >= 0 and math.isfinite(wall*1000):
+            return wall*1000
+    except Exception:
+        pass
+    return None
+
+
+def remember_execution(box_id, status, *, pid=None, command_id=None):
+    try:
+        data = status['command'] if isinstance(status, dict) and isinstance(status.get('command'), dict) else status
+        if isinstance(data, dict) and (data.get('running') or data.get('status') in ('queued', 'running')):
+            _forget_execution(box_id, pid if pid is not None else data.get('processId'), command_id or data.get('commandId'))
+        duration = execution_ms(data)
+        if duration is None:
+            return
+        pid = pid if pid is not None else data.get('processId')
+        command_id = command_id or data.get('commandId')
+        if pid is not None:
+            _COMMAND_DURATIONS[(box_id, 'pid', pid)] = (command_id, duration)
+        if command_id:
+            _COMMAND_DURATIONS[(box_id, 'command', command_id)] = (command_id, duration)
+        while len(_COMMAND_DURATIONS) > 256:
+            _COMMAND_DURATIONS.pop(next(iter(_COMMAND_DURATIONS)))
+    except Exception:
+        pass
+
+
+def _forget_execution(box_id, pid, command_id=None):
+    try:
+        prior = _COMMAND_DURATIONS.pop((box_id, 'pid', pid), None)
+        for identity in (command_id, prior[0] if prior else None):
+            if identity:
+                _COMMAND_DURATIONS.pop((box_id, 'command', identity), None)
+    except Exception:
+        pass
+
+
+def command_execution_ms(box_id, pid, command_id):
+    try:
+        if not command_id:
+            return None  # A recovered OS wrapper PID is not an API process identity.
+        found = (_COMMAND_DURATIONS.get((box_id, 'command', command_id)) or
+                 _COMMAND_DURATIONS.get((box_id, 'pid', pid)))
+        if found and found[0] in (None, command_id):
+            return found[1]
+    except Exception:
+        pass
+    return None
+
+
+def _execution_frames(box_id, pid, frames):
+    try:
+        for frame in frames:
+            if isinstance(frame, dict) and frame.get('type') == 'attempt':
+                _forget_execution(box_id, pid)
+            if isinstance(frame, dict) and frame.get('type') == 'exit':
+                remember_execution(box_id, frame, pid=pid)
+            yield frame
+    finally:
+        close = getattr(frames, 'close', None)
+        if close:
+            close()
+
 def cmd_sync(box_id: str, command: str, timeout: int = 60, cwd: str | None = None) -> dict:
     body = {"command": command, "timeoutSeconds": max(1, min(600, timeout))}
     if cwd:
@@ -881,13 +965,18 @@ def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | No
             body["meta"] = meta
         body["retry_interrupted"] = bool(retry_interrupted)
     # Every run ID is submitted once; ambiguous proxy errors are settled by the wrapper claim over SSH.
-    return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0, connect_retries=0)
+    result = call("POST", f"/sandboxes/{box_id}/commands", body, retries=0, connect_retries=0)
+    if isinstance(result, dict):
+        _forget_execution(box_id, result.get('processId'), result.get('commandId'))
+    return result
 
 
 def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2,
                deadline: float | None = None) -> dict | None:
-    return call("GET", f"/sandboxes/{box_id}/commands/{pid}?tailBytes=4096", timeout=timeout, retries=retries,
-                ok404=True, connect_retries=0 if deadline is not None else None, deadline=deadline)
+    result = call("GET", f"/sandboxes/{box_id}/commands/{pid}?tailBytes=4096", timeout=timeout, retries=retries,
+                  ok404=True, connect_retries=0 if deadline is not None else None, deadline=deadline)
+    remember_execution(box_id, result, pid=pid)
+    return result
 
 
 def cmd_kill(box_id: str, pid: int) -> dict | None:
@@ -898,8 +987,9 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
                deadline: float | None = None):
     # `timeout` is the socket read timeout: a quiet stream returns control to follow() after at most this long.
     # `deadline` (absolute) additionally ends the stream the moment it passes, even while lines keep arriving.
-    return stream(f"/sandboxes/{box_id}/commands/{pid}/stream?stdoutOffset={out_off}&stderrOffset={err_off}",
-                  timeout=timeout, deadline=deadline)
+    frames = stream(f"/sandboxes/{box_id}/commands/{pid}/stream?stdoutOffset={out_off}&stderrOffset={err_off}",
+                    timeout=timeout, deadline=deadline)
+    return _execution_frames(box_id, pid, frames)
 
 
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
@@ -909,4 +999,6 @@ def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
 
 
 def history_get(box_id: str, command_id: str) -> dict:
-    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}")
+    result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}")
+    remember_execution(box_id, result, command_id=command_id)
+    return result

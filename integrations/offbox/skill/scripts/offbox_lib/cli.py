@@ -9,6 +9,8 @@ import sqlite3
 import sys
 import time
 
+import toollog
+
 from . import common
 from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, local_error, log, new_id, now,
                      say)
@@ -58,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--step", action="append", default=[], metavar="CMD",
                    help="repeatable: run each CMD in order with pipefail; reports per-step rc and exits with the first nonzero rc")
     r.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
+    lr.add_argument("--day", metavar="YYYY-MM-DD")
 
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
@@ -150,7 +155,31 @@ def _outage_wait_applies(a, e: OffboxError) -> bool:
     return not fallback.allowed(a.cmd, e, os.getcwd())
 
 
+def _log_request(a, me):
+    backend = "home" if common.backend() == "server" else "boat"
+    reason = "unreachable" if os.environ.get("OFFBOX_FAILOVER") else "pinned" if common.backend_pinned() else "home_up" if backend == "home" else "home_down" if common.standby() else "boat_only"
+    props = dict(repo=toollog.repo_id(me.get("repo_key", me["repo_root"])), backend=backend, reason=reason,
+                 size=a.size, sizeGiven=bool(a.size), baseGiven=bool(a.base), templateGiven=bool(a.template), bg=a.bg, noSync=a.no_sync, git=a.git, noFallback=a.no_fallback, noRetry=getattr(a, "no_retry", False),
+                 remote=a.remote, fresh=a.fresh, envCount=len(a.env), pullCount=len(a.pull),
+                 includeCount=len(getattr(a, "include", []) or []), stepCount=len(a.step), flagsCount=sum(bool(getattr(a, key, False)) for key in ("size", "base", "template", "bg", "no_sync", "git", "no_fallback", "no_retry", "remote", "fresh", "env", "pull", "include", "step")))
+    toollog.emit("run", "run.request", ids={"thread": me.get("thread")}, props=props)
+
+
 def cmd_run(a, me) -> int:
+    if not getattr(a, "log_requested", False):
+        _log_request(a, me)
+    a.log_fallback = False
+    with toollog.span("run", "run.invocation", ids={"thread": me.get("thread")}) as data:
+        code = _cmd_run(a, me)
+        data["ok"] = code == 0
+        data["props"].update(exitCode=code, fallback=a.log_fallback)
+        if code in (90, 91, 92, 93):
+            toollog.emit("run", "run.error", kind="error", ok=False, tag="exit_" + str(code),
+                         props={"exitCode": code, "reason": {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]})
+        return code
+
+
+def _cmd_run(a, me) -> int:
     from . import capacity, fallback, runs
     if a.cmd and a.cmd[0] == "--":
         a.cmd = a.cmd[1:]
@@ -168,6 +197,7 @@ def cmd_run(a, me) -> int:
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
     from . import home
+    home.WAIT_STARTED = time.monotonic()
     if home.may_fail_over():
         # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.
         down = home.probe()
@@ -175,6 +205,7 @@ def cmd_run(a, me) -> int:
             home.fail_over(down, getattr(a, "argv", None) or sys.argv[1:])
     elif home.on_standby() and not os.environ.get(home.FAILOVER_ENV):
         st = common.home_state()
+        toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
         say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
             "this run is on Boat")
     from . import api, outage, pool
@@ -265,13 +296,14 @@ def cmd_run(a, me) -> int:
                      " ".join(a.cmd)[:4000], now()))
         con.commit()
         why = {EXIT_CAP: "spend cap", EXIT_BUSY: "repository pool busy"}.get(e.code, "boat infra failure")
+        a.log_fallback = True
         code = fallback.run_local(a.cmd, f"{why}: {e}", rid)
         say(f"local fallback exit {code}")
         return code
 
 
 # Commands that never talk to a box: they work for a person's lease even while the home server is down.
-LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases")
+LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup")
 
 
 def _reap_other_backend(dry_run: bool) -> None:
@@ -293,6 +325,18 @@ def _reap_other_backend(dry_run: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    name = argv[0] if argv else "help"
+    if name not in {"wait", "logs", "kill", "save", "status", "ssh", "reap", "local", "log-rollup"}:
+        return _main(argv)
+    with toollog.span("cli", "cli." + name, tag="cli_failed") as data:
+        code = _main(argv)
+        data["ok"] = code == 0
+        data["props"]["exitCode"] = code
+        return code
+
+
+def _main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     p = build_parser()
     a = p.parse_args(argv)
     if not a.sub:
@@ -302,9 +346,17 @@ def main(argv: list[str] | None = None) -> int:
     from .identity import whoami
     from .redact import redact_argv, warn_env_values
     try:
+        if a.sub == "log-rollup":
+            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            return 0
+        if a.sub == "reap":
+            toollog.rollup_previous()
         me = whoami()
         log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()} "
             f"argv={redact_argv(argv)[:12]}")
+        if a.sub == "run":
+            _log_request(a, me)
+            a.log_requested = True
         if a.sub not in LOCAL_ONLY:
             home.person_gate()   # a person's box lives on the home server only: stop here while it is down
         if a.sub == "run":
@@ -362,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(bases.build_template(a.name), indent=1))
         return 0
     except OffboxError as e:
+        if e.code in (90, 91, 92, 93):
+            toollog.emit("cli", "run.error", kind="error", ok=False, tag="exit_" + str(e.code), props={"exitCode": e.code})
         say(str(e))
         return e.code
     except sqlite3.Error as error:

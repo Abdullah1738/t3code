@@ -81,6 +81,9 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
              "repo_root": me.get("repo_root"), "pid": os.getppid()}
         cur.append(e)
         atomic_write_json(EXEMPTIONS, cur)
+    import toollog
+    toollog.emit("gate", "local.override", ids={"thread": me.get("thread")},
+                 props={"ttlSeconds": secs, "reasonLength": len(reason.strip())})
     event(db(), None, "exemption_add", f"session={ses} thread={me.get('thread')} ttl={secs}s reason={reason[:200]}")
     print(f"exempt until {iso(e['expires_at'])} (session {ses}). Heavy work still competes with Abdullah's Mac: "
           f"prefer offbox run when you can.")

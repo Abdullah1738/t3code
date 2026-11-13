@@ -663,6 +663,18 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
 # ---------------------------------------------------------------- one tick
 
 def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None):
+    import toollog
+    if configured_url(Path(sdir) if sdir is not None else state_dir()) is not None:
+        toollog.rollup_previous()
+    def checked(url):
+        with toollog.span("monitor", "home.probe", tag="home_probe") as data:
+            result = check(url)
+            data["ok"] = result["ok"]
+            return result
+    return _tick(sdir, dry_run, clock, checked, mac, effects)
+
+
+def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_online, effects=None):
     sdir = Path(sdir) if sdir is not None else state_dir()
     url = configured_url(sdir)
     if url is None:

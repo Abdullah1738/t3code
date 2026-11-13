@@ -46,6 +46,12 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+try:
+    import toollog
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
+    import toollog
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
@@ -966,6 +972,13 @@ ADMIT_LOCK = VAR / "admit.lock"
 
 
 def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
+    with toollog.span("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home"}, tag="queue_failed") as data:
+        queued = _admit(con, box_id, pid, kind, errf)
+        data["props"].update(queued=queued > 1, waitMs=queued*1000)
+        return queued
+
+
+def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     """Wait until the host has room for this run's predicted peak. Returns seconds queued."""
     need = predicted_peak(con, kind)
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
@@ -988,6 +1001,12 @@ def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                             "WHERE box_id=? AND pid=?", (now(), now() - t0, boot_id(), box_id, pid))
                 return now() - t0
         if not said:
+            try:
+                position = con.execute("SELECT COUNT(*) FROM commands WHERE status='queued' AND created_at <= (SELECT created_at FROM commands WHERE box_id=? AND pid=?)", (box_id, pid)).fetchone()[0]
+            except Exception:
+                position = None
+            toollog.emit("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home", "queued": True,
+                         "waitMs": (now()-t0)*1000, "position": position})
             why = "for earlier runs in the queue" if not (mine and room) else \
                 (f"for memory (this kind peaks ~{need / 2**30:.1f} GB, {max(0, free) / 2**30:.1f} GB free "
                  "after reserve)")
@@ -1079,6 +1098,10 @@ def run_cmd(box_id: str, pid: int) -> int:
         errf.write(f"\noffbox-server: command failed to start: {e}\n".encode())
         code = 125
     t1 = now()
+    toollog.emit("boatd", "run.command", kind="perf" if code == 0 else "error", duration_ms=max(0, t1-t0)*1000,
+                 ok=code == 0, ids={"box": box_id, "run": r["run_id"]},
+                 props={"exitCode": code, "timeoutHit": code == 124, "attempt": attempt, "backend": "home"},
+                 tag="command_failed" if code != 0 else None)
     kill = (d / f"{pid}.kill").read_text() if (d / f"{pid}.kill").exists() else None
     if kill and code in (137, 143, 255, None):
         sig = sig or ("SIGKILL" if code == 137 else "SIGTERM")
@@ -1333,7 +1356,9 @@ def ssh_sessions(box_id: str) -> int:
     return n
 
 
+@toollog.observed("boatd", "reaper.pass", "reaper_failed")
 def reap_once(con) -> None:
+    toollog.rollup_previous()
     t = now()
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
@@ -1346,7 +1371,9 @@ def reap_once(con) -> None:
             if r["ttl"] and t > (r["last_active"] or r["updated_at"]) + r["ttl"]:
                 try:
                     stop_box(con, bid, "idle ttl")
+                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "stop"})
                 except Exception as e:  # noqa: BLE001
+                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "stop"}, tag="reaper_stop")
                     log(f"idle stop {bid} failed: {e}")
         elif r["state"] == "archived" and not r["pinned"] and r["owner"] not in (CFG.get("person_owners") or []):
             # A person's box is never deleted for being unused: it is where her data lives.
@@ -1354,12 +1381,16 @@ def reap_once(con) -> None:
             if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
                 try:
                     delete_box(con, bid)
+                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
                 except Exception as e:  # noqa: BLE001
+                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                     log(f"prune {bid} failed: {e}")
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
                 delete_box(con, bid)
+                toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
             except Exception as e:  # noqa: BLE001
+                toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                 log(f"prune {bid} failed: {e}")
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
@@ -1798,7 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
                             sent = True
                 if sent:
                     continue
-                r = con.execute("SELECT status, exit_code, signal, attempt FROM commands WHERE box_id=? AND pid=?",
+                r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
@@ -1814,7 +1845,8 @@ class Handler(BaseHTTPRequestHandler):
                             emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which]})
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
-                              "status": r["status"], "attempt": attempt})
+                              "status": r["status"], "attempt": attempt, "commandId": r["command_id"],
+                              "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"])})
                         break
                     continue
                 if now() - started > 600:

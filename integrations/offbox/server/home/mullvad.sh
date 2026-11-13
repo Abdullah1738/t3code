@@ -225,7 +225,7 @@ probe_exit() { curl -4 -sL --max-time 15 -r 0-99 -o /dev/null -w '%{http_code}' 
 # A refused exit breaks every box's Go and Android setup, so changing relay is worth the dropped connections.
 # No answer at all (000) is not this check's business: the tunnel or the line is down and lockdown handles that.
 cmd_exit_check() {
-  local try code st
+  local try code
   [ -e "$ENABLED" ] || return 0
   # "Connected" without Mullvad's routing rule means something removed it (3.40): a reconnect puts it back.
   st=$(mullvad status 2>/dev/null || true)
@@ -296,7 +296,7 @@ cmd_check() {
   no() { echo "FAIL vpn: $*"; bad=1; }
   systemctl is-active -q mullvad-daemon && ok "mullvad-daemon is running" || no "mullvad-daemon is not running"
   # Outputs go into variables first: with pipefail, "mullvad ... | grep -q" fails when grep closes the pipe early.
-  local st lock auto
+  local lock auto
   st=$(mullvad status 2>&1 || true); st=${st%%$'\n'*}
   lock=$(mullvad lockdown-mode get 2>&1 || true); auto=$(mullvad auto-connect get 2>&1 || true)
   case $st in Connected*) ok "$st" ;; *) no "tunnel is not up: $st" ;; esac
@@ -332,6 +332,16 @@ cmd_check() {
   [ "$ts" = "Running True" ] && ok "tailscale Running and online" || no "tailscale is not online (state: ${ts:-none}); from the LAN: ssh root@offbox-server.local"
   return $bad
 }
+
+# An EXIT trap also records failures from set -e. No extra network calls for logging.
+log_check() {
+  local rc=$? helper=/opt/boatd/toollog.py link=unknown
+  [ -f "$helper" ] || helper="$(dirname "$(readlink -f "$0")")/../../skill/scripts/toollog.py"
+  case ${st:-} in Connected*) link=wireguard ;; *) link=down ;; esac
+  if systemctl is-active -q offbox-exit-proxy.service 2>/dev/null && [ ! -e /run/offbox-exit-proxy.bypass ]; then link=residential; fi
+  python3 "$helper" mullvad "$rc" "${st:-}" "$link" "$(( (SECONDS - log_start) * 1000 ))" >/dev/null 2>&1 || true
+}
+case "${1:-}" in check|exit-check) log_start=$SECONDS; trap log_check EXIT ;; esac
 
 case "${1:-}" in
   install) cmd_install ;;
