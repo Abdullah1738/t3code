@@ -15,7 +15,7 @@ if not (REDACT_HELPERS / 'redact.py').is_file():
 sys.path.insert(0, str(REDACT_HELPERS))
 from redact import redact
 
-WAKE_BUDGET = 5500  # robob-watch clips events at 6000 characters.
+WAKE_BUDGET = 5500  # UTF-16 units; robob-watch clips JavaScript strings at 6000.
 
 STAMP = re.compile(r"^(?:- )?(\d{4}-\d{2}-\d{2}) ~?(\d{2}:[0-9x]{2})")
 
@@ -65,7 +65,7 @@ def main():
         return
     Path(sys.argv[1]).write_text(digest)
     # Never send counts whose entries would be clipped out of the wake.
-    if len(digest) <= WAKE_BUDGET:
+    if len(digest.encode('utf-16-le')) // 2 <= WAKE_BUDGET:
         print(digest, end='')
     else:
         print(f'Activity digest: {sys.argv[1]}')

@@ -98,6 +98,84 @@ class ProblemNoticeTests(unittest.TestCase):
         self.check()
         self.assertEqual(len(self.sends), 1)
 
+    def test_first_scheduled_problem_survives_missing_or_unprimed_state_then_recovery(self):
+        self.cfg['total'] = 'AED 500'
+        for initial in [None, {'primed': False}]:
+            with self.subTest(initial=initial):
+                self.path.unlink(missing_ok=True)
+                if initial is not None:
+                    t.write(self.path, initial)
+                self.sends.clear()
+                self.result = {'status': 'unknown', 'errors': ['native_auth_expired']}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    t.check(self.cfg)
+                saved = t.read(self.path)
+                self.assertEqual(len(saved.get('problem_notices', {})), 1)
+                key = next(iter(saved['problem_notices']))
+                self.assertEqual(saved['problem_notices'][key]['status'], 'pending')
+                self.assertEqual(self.sends, [])
+                self.state = saved
+                self.result = {'status': 'preparing', 'errors': []}
+                self.check()
+                self.check()
+                self.assertEqual(len(self.sends), 1)
+                self.assertEqual(self.sends[0][self.sends[0].index('--key') + 1], key)
+
+    def test_prime_retains_problem_without_sending_before_healthy_poll(self):
+        cases = [('source', {'status': 'unknown', 'errors': ['native_auth_expired']}),
+                 ('quiet_source', {'status': 'unknown', 'errors': ['native_status_unknown']}),
+                 ('problem', {'status': 'preparing', 'errors': [], 'problem': {'stage': 'delivery_failed'}}),
+                 ('problem_status', {'status': 'failed', 'errors': []}),
+                 ('overdue', {'status': 'preparing', 'errors': []}),
+                 ('card_link', {'status': 'preparing', 'errors': []})]
+        for total in ['AED 500', 'AED 499.99']:
+            for name, result in cases:
+                with self.subTest(total=total, problem=name):
+                    self.cfg['total'] = total
+                    self.cfg['eta'] = t.stamp(self.clock - 600 if name == 'overdue' else self.clock + 3600)
+                    self.state, self.result = {}, result
+                    self.sends.clear()
+                    card = {'link_health': 'needs_repair'} if name == 'card_link' else {}
+                    with mock.patch.dict(os.environ, WATCH_RUN='prime-fixture'), \
+                            mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card):
+                        self.check()
+                    self.assertEqual(self.sends, [])
+                    queued = self.state.get('problem_notices', {})
+                    expected = int(total == 'AED 500')
+                    self.assertEqual(len(queued), expected)
+                    retained = json.loads(json.dumps(queued))
+                    self.result = {'status': 'preparing', 'errors': []}
+                    self.check()
+                    self.check()
+                    self.assertEqual(len(self.sends), expected)
+                    for key, notice in retained.items():
+                        self.assertEqual(self.state['problem_notices'][key]['text'], notice['text'])
+                        self.assertEqual(self.state['problem_notices'][key]['status'], 'sent')
+
+    def test_first_scheduled_overdue_problem_survives_baseline_then_delivery(self):
+        self.cfg.update(total='AED 500', eta=t.stamp(self.clock - 600))
+        self.state = {}
+        self.result = {'status': 'preparing', 'errors': []}
+        with contextlib.redirect_stdout(io.StringIO()):
+            t.check(self.cfg)
+        self.state = t.read(self.path)
+        self.assertEqual(len(self.state.get('problem_notices', {})), 1)
+        self.assertEqual(self.sends, [])
+        self.result = {'status': 'delivered', 'errors': [], 'whole_order_complete': True}
+        self.check()
+        self.assertEqual(len(self.sends), 1)
+        self.assertIn('ETA passed', self.sends[0][-1])
+
+    def test_problem_only_poll_retains_problem_before_baseline(self):
+        self.state = {'primed': False}
+        self.result = {'status': 'unknown', 'errors': ['native_auth_expired']}
+        self.assertEqual(self.check(pending_only=True), '')
+        self.assertFalse(self.state['primed'])
+        self.assertEqual(len(self.sends), 1)
+        self.result = {'status': 'preparing', 'errors': []}
+        self.check()
+        self.assertEqual(len(self.sends), 1)
+
     def test_error_families_ignore_accounts_order_and_recovery(self):
         self.result['errors'] = ['email_account_unavailable:gmail', 'native_status_unknown']
         self.check()
@@ -153,7 +231,8 @@ class ProblemNoticeTests(unittest.TestCase):
 
     def test_no_prime_or_scratch_sends_and_moni_problems_go_only_to_owner(self):
         self.state = {}
-        self.assertEqual(self.check(), '')
+        with mock.patch.dict(os.environ, WATCH_RUN='prime-fixture'):
+            self.assertEqual(self.check(), '')
         self.assertEqual(self.sends, [])
         self.cfg.update({'for': 'moni', 'chat': 'group-fixture'})
         with mock.patch.object(t, 'WATCHERS', self.root / 'elsewhere'):

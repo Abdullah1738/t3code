@@ -138,7 +138,7 @@ def order_total_aed(cfg, result, state):
     return Decimal(state.get('known_total_aed', '0'))
 
 
-def queue_problem_notices(cfg, result, state, events):
+def queue_problem_notices(cfg, result, state, events, now=None):
     total = order_total_aed(cfg, result, state)
     state['known_total_aed'] = str(total)
     if total < 500:
@@ -146,27 +146,27 @@ def queue_problem_notices(cfg, result, state, events):
     # A direct, keyed owner send cannot be dropped by an agent's NO_REPLY or
     # held by the watcher's quiet hours. Ordinary stage updates keep their route.
     problems = []
-    if state.get('primed'):
-        errors = (result.get('errors') or []) if state.get('status') not in TERMINAL else []
-        if (not errors and result.get('status') == 'unknown' and not result.get('status_evidence_available')
-                and not result.get('candidate') and not result.get('aftercare_evidence')
-                and state.get('status') not in TERMINAL):
-            errors = ['no_order_status_evidence']
-        problems.extend(('tracking_problem:' + family, 'Tracking unavailable (' + family + ')')
-                        for family in sorted({error_family(e) for e in errors}))
-        if result.get('problem'):
-            stage = result['problem']['stage']
-            problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
-        if result.get('status') in {'problem', 'failed', 'error'}:
-            stage = result['status']
-            problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
-        for event in events:
-            if event['kind'] in {'eta_elapsed', 'card_link_problem'}:
-                problems.append((event['kind'], event['message']))
-        if state.get('delay_sent') and state.get('status') not in TERMINAL:
-            problems.append(('eta_elapsed', 'Checkout ETA passed; delivery is unconfirmed'))
-        if state.get('card_link_problem_sent'):
-            problems.append(('card_link_problem', 'The delivery card link needs repair'))
+    errors = (result.get('errors') or []) if state.get('status') not in TERMINAL else []
+    if (not errors and result.get('status') == 'unknown' and not result.get('status_evidence_available')
+            and not result.get('candidate') and not result.get('aftercare_evidence')
+            and state.get('status') not in TERMINAL):
+        errors = ['no_order_status_evidence']
+    problems.extend(('tracking_problem:' + family, 'Tracking unavailable (' + family + ')')
+                    for family in sorted({error_family(e) for e in errors}))
+    if result.get('problem'):
+        stage = result['problem']['stage']
+        problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
+    if result.get('status') in {'problem', 'failed', 'error'}:
+        stage = result['status']
+        problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
+    for event in events:
+        if event['kind'] in {'eta_elapsed', 'card_link_problem'}:
+            problems.append((event['kind'], event['message']))
+    if state.get('status') not in TERMINAL and (state.get('delay_sent') or
+            (now is not None and eta_elapsed_due(cfg, state, now))):
+        problems.append(('eta_elapsed', 'Checkout ETA passed; delivery is unconfirmed'))
+    if state.get('card_link_problem_sent'):
+        problems.append(('card_link_problem', 'The delivery card link needs repair'))
     notices = state.setdefault('problem_notices', {})
     for problem, description in problems:
         key = 'order-problem:' + hashlib.sha256(
@@ -1017,7 +1017,6 @@ def _check(cfg, pending_only=False):
                     'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
         now = time.time()
         result = fetch(cfg, deepcopy(state) if pending_only else state, now)
-        primed = state.get('primed', False)
         state['known_total_aed'] = str(order_total_aed(cfg, result, state))
         if pending_only:
             # Leave stage/delivery cursors untouched: their ordinary wake is still
@@ -1031,7 +1030,7 @@ def _check(cfg, pending_only=False):
                 card = delivery_cards.safe_sync(cfg, result, send=False)
                 if card.get('link_health') == 'needs_repair':
                     events.append({'kind': 'card_link_problem', 'message': 'The delivery card link needs repair'})
-            queue_problem_notices(cfg, result, alert_state, events)
+            queue_problem_notices(cfg, result, alert_state, events, now)
             state['problem_notices'] = alert_state.get('problem_notices', {})
             write(path, state)
             send_problem_notices(cfg, state, path, folder)
@@ -1068,8 +1067,9 @@ def _check(cfg, pending_only=False):
                 state['card_link_problem_sent'] = True
             elif card.get('link_health') == 'ok':
                 state.pop('card_link_problem_sent', None)
-        if primed:
-            events = queue_problem_notices(cfg, result, state, events)
+        # Priming suppresses sends, but must retain problems that could recover
+        # before the first scheduled poll.
+        events = queue_problem_notices(cfg, result, state, events, now)
         write(path, state)
         if events:
             print(json.dumps({'app': cfg['app'], 'order': cfg['order'], 'for': cfg['for'],
