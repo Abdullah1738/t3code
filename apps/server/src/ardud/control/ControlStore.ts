@@ -3,7 +3,13 @@
  * contract (tmp/memory/shared-contracts.md): identical in every fork module
  * that touches these tables, created idempotently, never a numbered migration.
  */
-import type { ThreadId } from "@t3tools/contracts";
+import {
+  OrchestrationV2RuntimeRequestJson,
+  OrchestrationV2TurnItemJson,
+  type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2TurnItem,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -69,6 +75,14 @@ export interface ControlStoreShape {
   readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
+  readonly pendingRequestRecords: (threadIds: ReadonlyArray<string>) => Effect.Effect<
+    ReadonlyArray<{
+      readonly threadId: string;
+      readonly request: OrchestrationV2RuntimeRequest;
+      readonly item: OrchestrationV2TurnItem | null;
+    }>,
+    ControlStoreError
+  >;
   /**
    * Undeleted threads whose updated_at sorts after `sinceIso`, newest first (ties by thread id, as the full listing orders them), with the fields
    * listings filter on, from ardud_v2_threads_updated_idx: no shell is built. A string range,
@@ -96,6 +110,7 @@ export class ControlStore extends Context.Service<ControlStore, ControlStoreShap
 ) {}
 
 const CHUNK = 400;
+const encodeIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 const chunks = <A>(values: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> => {
   const out: Array<ReadonlyArray<A>> = [];
@@ -274,6 +289,60 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-pending-request-threads")),
     );
 
+  const decodeRequest = Schema.decodeUnknownEffect(
+    Schema.fromJsonString(OrchestrationV2RuntimeRequestJson),
+  );
+  const decodeItem = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestrationV2TurnItemJson));
+  const pendingRequestRecords: ControlStoreShape["pendingRequestRecords"] = Effect.fn(
+    "ControlStore.pendingRequestRecords",
+  )(function* (threadIds) {
+    const pages = yield* Effect.forEach(
+      chunks([...new Set(threadIds)]),
+      (ids) =>
+        sql<{
+          readonly thread_id: string;
+          readonly payload_json: string;
+        }>`
+        SELECT thread_id, payload_json FROM orchestration_v2_projection_runtime_requests
+        WHERE status = 'pending' AND thread_id IN ${sql.in(ids)}
+        ORDER BY thread_id ASC, created_at ASC, runtime_request_id ASC
+      `,
+    ).pipe(NodeSqliteClient.readOnly, Effect.mapError(fail("read-pending-request-records")));
+    const requests = yield* Effect.forEach(pages.flat(), (row) =>
+      decodeRequest(row.payload_json).pipe(
+        Effect.map((request) => ({ threadId: row.thread_id, request })),
+      ),
+    ).pipe(Effect.mapError(fail("decode-pending-request-records")));
+    if (requests.length === 0) return [];
+    // Constant ID sets push into every history-union branch. A correlated
+    // subquery instead materializes the entire archive before filtering.
+    const itemRows = yield* sql<{ readonly thread_id: string; readonly payload_json: string }>`
+      SELECT thread_id, payload_json FROM ardud_history_turn_items
+      WHERE node_id IN (SELECT value FROM json_each(${encodeIds([...new Set(requests.map(({ request }) => request.nodeId))])}))
+        AND thread_id IN (SELECT value FROM json_each(${encodeIds([...new Set(requests.map(({ threadId }) => threadId))])}))
+        AND type IN ('approval_request', 'user_input_request')
+        AND json_extract(payload_json, '$.requestId') IN (SELECT value FROM json_each(${encodeIds(requests.map(({ request }) => request.id))}))
+      ORDER BY +ordinal ASC, turn_item_id ASC
+    `.pipe(NodeSqliteClient.readOnly, Effect.mapError(fail("read-pending-request-items")));
+    // Unary + prevents a thread-wide ordinal-index walk in place of the
+    // selective node lookup; only the matching items need sorting.
+    const items = new Map<string, Map<string, OrchestrationV2TurnItem>>();
+    yield* Effect.forEach(itemRows, (row) =>
+      Effect.gen(function* () {
+        const item = yield* decodeItem(row.payload_json);
+        if (item.type !== "approval_request" && item.type !== "user_input_request") return;
+        const byRequest = items.get(row.thread_id) ?? new Map<string, OrchestrationV2TurnItem>();
+        if (!byRequest.has(item.requestId)) byRequest.set(item.requestId, item);
+        items.set(row.thread_id, byRequest);
+      }),
+    ).pipe(Effect.mapError(fail("decode-pending-request-items")));
+    return requests.map(({ threadId, request }) => ({
+      threadId,
+      request,
+      item: items.get(threadId)?.get(request.id) ?? null,
+    }));
+  });
+
   const threadsUpdatedSince: ControlStoreShape["threadsUpdatedSince"] = (sinceIso) =>
     sql<{
       readonly thread_id: string;
@@ -321,6 +390,7 @@ export const make = Effect.gen(function* () {
     nativeBindings,
     liveThreadIds,
     pendingRequestThreadIds,
+    pendingRequestRecords,
   });
 });
 

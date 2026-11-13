@@ -1733,43 +1733,39 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   /** Every pending approval and question across active threads, oldest first. */
-  const listRequests = Effect.gen(function* () {
+  const listRequests = Effect.fn("ArdudControl.listRequests")(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
-    const candidates = yield* shellsFor(
-      yield* store
-        .pendingRequestThreadIds()
-        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
-      "active",
-    );
+    const candidateIds = yield* store
+      .pendingRequestThreadIds()
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    yield* Effect.annotateCurrentSpan("control.candidate_thread_count", candidateIds.length);
+    const candidates = yield* shellsFor(candidateIds, "active").pipe(NodeSqliteClient.readOnly);
     const waiting = candidates.filter((shell) => shell.pendingRuntimeRequest !== null);
     const summaries = yield* summarize(waiting);
     const origin = params.get("origin");
-    const rows = yield* Effect.forEach(
-      summaries.filter(
-        (summary) =>
-          origin === null ||
-          (origin === "none" ? summary.origin === null : summary.origin === origin),
-      ),
+    const selected = summaries.filter(
       (summary) =>
-        readRecords(summary.threadId).pipe(
-          Effect.map((records) =>
-            records.runtimeRequests
-              .filter((request) => request.status === "pending")
-              .map((request) => ({
-                threadId: summary.threadId,
-                title: summary.title,
-                origin: summary.origin,
-                rootThreadId: summary.rootThreadId,
-                ...pendingRequestSummary(request, records.turnItems),
-              })),
-          ),
-        ),
-      { concurrency: 4 },
+        origin === null ||
+        (origin === "none" ? summary.origin === null : summary.origin === origin),
     );
-    const requests = rows
-      .flat()
+    const records = yield* store
+      .pendingRequestRecords(selected.map((summary) => summary.threadId))
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    yield* Effect.annotateCurrentSpan("control.pending_count", records.length);
+    const byThread = Map.groupBy(records, (record) => record.threadId);
+    const requests = selected
+      .flatMap((summary) =>
+        (byThread.get(summary.threadId) ?? []).map(({ request, item }) => ({
+          threadId: summary.threadId,
+          title: summary.title,
+          origin: summary.origin,
+          rootThreadId: summary.rootThreadId,
+          ...pendingRequestSummary(request, item === null ? [] : [item]),
+        })),
+      )
       .toSorted((left, right) => (left.createdAt ?? "").localeCompare(right.createdAt ?? ""));
+    yield* Effect.annotateCurrentSpan("control.returned_count", requests.length);
     return json({ ok: true, requests });
   });
 
@@ -1884,7 +1880,7 @@ const makeRoutes = Effect.gen(function* () {
         }),
       ),
     ),
-    HttpRouter.route("GET", `${p}/requests`, handle(listRequests)),
+    HttpRouter.route("GET", `${p}/requests`, handle(listRequests())),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
     HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
