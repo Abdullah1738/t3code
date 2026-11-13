@@ -30,7 +30,6 @@ import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
-const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "test-model" };
 
@@ -43,7 +42,17 @@ const stopEarlierBackgroundWork = ({
   backgroundWorkAfterStop,
   stalledRun,
   workflowMember = false,
+  processOwned = false,
+  cancelLastQueued = false,
+  latestStarting = false,
+  retryDuringStop,
+  nativeOnly = false,
 }: {
+  readonly processOwned?: boolean;
+  readonly nativeOnly?: boolean;
+  readonly latestStarting?: boolean;
+  readonly retryDuringStop?: "starting" | "completed";
+  readonly cancelLastQueued?: boolean;
   readonly wakeAfterStop?: boolean;
   readonly lateWorkAfterStop?: "provider-wake" | "context-reset";
   readonly failedStart?: boolean;
@@ -60,9 +69,14 @@ const stopEarlierBackgroundWork = ({
 }) =>
   Effect.scoped(
     Effect.gen(function* () {
+      const driver = processOwned
+        ? ProviderDriverKind.make("claudeAgent")
+        : ProviderDriverKind.make("codex");
       const cwd = yield* checkpointWorkspace("background-work-stop");
       const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
       const started: ProviderAdapter.ProviderAdapterV2TurnInput[] = [];
+      let closed = false;
+      let interruptHook: Effect.Effect<void> = Effect.void;
       const interrupts: ProviderAdapter.ProviderAdapterV2InterruptInput[] = [];
       const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
         instanceId,
@@ -72,7 +86,13 @@ const stopEarlierBackgroundWork = ({
         openSession: (input) =>
           Effect.gen(function* () {
             const now = yield* DateTime.now;
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                closed = true;
+              }),
+            );
             return {
+              ...(processOwned ? { backgroundTasksEndWithProcess: true as const } : {}),
               instanceId,
               driver,
               providerSessionId: input.providerSessionId,
@@ -91,9 +111,11 @@ const stopEarlierBackgroundWork = ({
               events: Stream.fromQueue(events),
               ...(failedStart
                 ? {
-                    hasPendingBackgroundWorkForThread: (providerThread) =>
+                    hasPendingBackgroundWorkForThread: (providerThread, options) =>
                       Effect.gen(function* () {
+                        if (nativeOnly && options?.includeSubagents !== true) return false;
                         if (
+                          !processOwned &&
                           !interrupts.some((input) => input.providerThread.id === providerThread.id)
                         ) {
                           return false;
@@ -151,7 +173,7 @@ const stopEarlierBackgroundWork = ({
               interruptTurn: (interrupt) =>
                 Effect.sync(() => {
                   interrupts.push(interrupt);
-                }),
+                }).pipe(Effect.andThen(Effect.suspend(() => interruptHook))),
               respondToRuntimeRequest: () => Effect.die("unused"),
               readThreadSnapshot: () => Effect.die("unused"),
               rollbackThread: () => Effect.die("unused"),
@@ -509,10 +531,12 @@ const stopEarlierBackgroundWork = ({
 
         const codexProviderThread = (yield* orchestrator.getThreadProjection(threadId))
           .providerThreads[0]!;
-        const backgroundTasks = [
-          { taskId: "sleep", description: "Wait before the recheck", kind: "command" as const },
-        ];
-        const otherBackgroundTasks = [{ ...backgroundTasks[0]!, taskId: "other-sleep" }];
+        const backgroundTasks = nativeOnly
+          ? []
+          : [{ taskId: "sleep", description: "Wait before the recheck", kind: "command" as const }];
+        const otherBackgroundTasks = nativeOnly
+          ? []
+          : [{ ...backgroundTasks[0]!, taskId: "other-sleep" }];
         const subagentThread = (name: string) =>
           Effect.gen(function* () {
             const subagentThreadId = ThreadId.make(`thread:${name}`);
@@ -977,36 +1001,134 @@ const stopEarlierBackgroundWork = ({
           });
         }
 
-        yield* orchestrator.dispatch(
-          stopWithQueue === "thread.stop"
-            ? {
-                type: "thread.stop",
-                commandId: CommandId.make("stop-background-work"),
+        if (latestStarting) {
+          const starting = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === failedRun.runId,
+          )!;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("latest-starting"),
+                type: "run.updated",
                 threadId,
-              }
-            : {
-                type: "run.interrupt",
-                commandId: CommandId.make("stop-background-work"),
-                threadId,
-                runId: olderStart
-                  ? watcherRun.runId
-                  : failedStart
-                    ? failedRun.runId
-                    : latestRun.runId,
-                ...(stopWithQueue === undefined ? {} : { holdQueue: true }),
+                occurredAt: now,
+                payload: { ...starting, status: "starting", completedAt: null },
               },
+            ],
+          });
+        }
+        if (cancelLastQueued) {
+          const starting = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === failedRun.runId,
+          )!;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("cancel-starting"),
+                type: "run.updated",
+                threadId,
+                runId: starting.id,
+                occurredAt: now,
+                payload: {
+                  ...starting,
+                  status: "starting",
+                  providerThreadId: null,
+                  completedAt: null,
+                },
+              },
+            ],
+          });
+          yield* orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("cancel-starting"),
+            threadId,
+            runId: starting.id,
+          });
+          yield* worker.drain();
+          assert.isFalse(closed);
+        }
+        if (retryDuringStop) {
+          const original = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === failedRun.runId,
+          )!;
+          interruptHook = sink
+            .write({
+              events: [
+                {
+                  id: EventId.make("retry-during-stop"),
+                  type: "run.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    ...original,
+                    activeAttemptId: RunAttemptId.make("attempt:replacement"),
+                    status: retryDuringStop,
+                  },
+                },
+              ],
+            })
+            .pipe(Effect.asVoid, Effect.orDie);
+        }
+        yield* orchestrator.dispatch(
+          cancelLastQueued
+            ? {
+                type: "queued-run.cancel",
+                commandId: CommandId.make("cancel-last"),
+                threadId,
+                runId: (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!.id,
+              }
+            : stopWithQueue === "thread.stop"
+              ? {
+                  type: "thread.stop",
+                  commandId: CommandId.make("stop-background-work"),
+                  threadId,
+                }
+              : {
+                  type: "run.interrupt",
+                  commandId: CommandId.make("stop-background-work"),
+                  threadId,
+                  runId: olderStart
+                    ? watcherRun.runId
+                    : failedStart
+                      ? failedRun.runId
+                      : latestRun.runId,
+                  ...(stopWithQueue === undefined ? {} : { holdQueue: true }),
+                },
         );
         yield* worker.drain();
 
-        assert.sameDeepMembers(
-          interrupts.map((interrupt) => [interrupt.providerThread.id, interrupt.providerTurnId]),
-          [
-            ...(olderStart || failedStart
-              ? []
-              : [[otherProviderThreadId, latestRun.providerTurnId]]),
-            [codexProviderThread.id, reviewerRun.providerTurnId],
-          ],
-        );
+        if (processOwned) {
+          assert.equal(
+            closed,
+            !retryDuringStop && (stopWithQueue === "thread.stop" || cancelLastQueued),
+          );
+        }
+        if (retryDuringStop) {
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNotEmpty(
+            after.providerThreads.flatMap((thread) => thread.pendingBackgroundTasks ?? []),
+          );
+          return;
+        }
+        if (cancelLastQueued) {
+          const cancelled = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(cancelled.runs.at(-1)?.status, "cancelled");
+          assert.isEmpty(
+            cancelled.providerThreads.flatMap((thread) => thread.pendingBackgroundTasks ?? []),
+          );
+          assert.equal(cancelled.subagents[0]?.status, "interrupted");
+          return;
+        }
+        if (!processOwned)
+          assert.sameDeepMembers(
+            interrupts.map((interrupt) => [interrupt.providerThread.id, interrupt.providerTurnId]),
+            [
+              ...(olderStart || failedStart
+                ? []
+                : [[otherProviderThreadId, latestRun.providerTurnId]]),
+              [codexProviderThread.id, reviewerRun.providerTurnId],
+            ],
+          );
         const after = yield* orchestrator.getThreadProjection(threadId);
         if (olderStart) {
           assert.equal(
@@ -1049,12 +1171,15 @@ const stopEarlierBackgroundWork = ({
           assert.deepEqual(
             after.providerThreads.find((candidate) => candidate.id === codexProviderThread.id)
               ?.pendingBackgroundTasks,
-            backgroundWorkAfterStop === undefined ? [] : backgroundTasks,
+            backgroundWorkAfterStop === undefined ||
+              (processOwned && stopWithQueue === "thread.stop")
+              ? []
+              : backgroundTasks,
           );
           assert.deepEqual(
             after.providerThreads.find((candidate) => candidate.id === otherProviderThreadId)
               ?.pendingBackgroundTasks,
-            otherBackgroundTasks,
+            processOwned && stopWithQueue === "thread.stop" ? [] : otherBackgroundTasks,
           );
         }
       }).pipe(
@@ -1117,4 +1242,64 @@ it.effect("Stop holds a provider wake that queues before the stopped turn ends",
 it.effect.each(["provider-wake", "context-reset"] as const)(
   "Stop with an empty queue holds a %s that queues before the stopped turn ends",
   (lateWorkAfterStop) => stopEarlierBackgroundWork({ lateWorkAfterStop }),
+);
+
+it.effect("Stop closes process-owned background work that survives the interrupt", () =>
+  stopEarlierBackgroundWork({
+    failedStart: true,
+    backgroundWorkAfterStop: "running",
+    processOwned: true,
+    stopWithQueue: "thread.stop",
+  }),
+);
+it.effect("a plain interrupt keeps process-owned background work alive", () =>
+  stopEarlierBackgroundWork({
+    failedStart: true,
+    backgroundWorkAfterStop: "running",
+    processOwned: true,
+  }),
+);
+it.effect(
+  "cancelling a starting run and the last queued run closes process-owned background work",
+  () =>
+    stopEarlierBackgroundWork({
+      failedStart: true,
+      backgroundWorkAfterStop: "running",
+      processOwned: true,
+      stopWithQueue: "run.interrupt",
+      cancelLastQueued: true,
+    }),
+);
+
+it.effect("Stop closes Claude background work while its latest run is still starting", () =>
+  stopEarlierBackgroundWork({
+    failedStart: true,
+    backgroundWorkAfterStop: "running",
+    processOwned: true,
+    stopWithQueue: "thread.stop",
+    latestStarting: true,
+  }),
+);
+
+it.effect.each(["starting", "completed"] as const)(
+  "Stop keeps a replacement attempt that is %s",
+  (retryDuringStop) =>
+    stopEarlierBackgroundWork({
+      failedStart: true,
+      backgroundWorkAfterStop: "running",
+      processOwned: true,
+      stopWithQueue: "thread.stop",
+      retryDuringStop,
+    }),
+);
+
+it.effect("last queued cancellation closes a Claude native subagent with no task roster", () =>
+  stopEarlierBackgroundWork({
+    failedStart: true,
+    backgroundWorkAfterStop: "running",
+    processOwned: true,
+    stopWithQueue: "run.interrupt",
+    cancelLastQueued: true,
+    nativeOnly: true,
+  }),
 );

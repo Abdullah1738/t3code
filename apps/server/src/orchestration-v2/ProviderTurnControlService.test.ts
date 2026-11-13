@@ -278,6 +278,7 @@ it.effect(
       const layerSessionManager = Layer.succeed(
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
+          stopBackgroundWork: () => Effect.succeed([]),
           shutdown: Effect.void,
           sweepOrphanedThreads: () => Effect.void,
           observeThreadSessionUpdates: () => Effect.void,

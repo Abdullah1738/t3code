@@ -10171,7 +10171,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (run) =>
             run.id !== stoppedRun.id &&
             (run.status === "preparing" || run.status === "starting" || run.status === "running"),
-        )
+        ) &&
+        (stopped.providerThread?.driver !== "claudeAgent" ||
+          stopped.providerThread.providerSessionId == null ||
+          (yield* providerSessions.isLive(stopped.providerThread.providerSessionId)))
       ) {
         return;
       }
@@ -12601,6 +12604,77 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       default:
         return yield* dispatchUnsupported(command);
+    }
+    if (
+      command.type === "thread.stop" ||
+      (command.type === "run.interrupt" && command.holdQueue === true) ||
+      command.type === "queued-run.cancel"
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs", "providerThreads", "providerTurns"])
+        .pipe(mapDispatchError(command));
+      const throughRunOrdinal = Math.max(
+        0,
+        ...projection.runs.map((run) => run.ordinal),
+        ...(yield* Ref.get(events)).flatMap((event) =>
+          event.type === "run.created" || event.type === "run.updated"
+            ? [event.payload.ordinal]
+            : [],
+        ),
+      );
+      const runAttempts = projection.runs
+        .filter((run) => run.status !== "queued")
+        .map((run) => ({ runId: run.id, attemptId: run.activeAttemptId }));
+      const planned = yield* Ref.get(effects);
+      const hasInterrupt = planned.some(
+        (effect) => effect.request.type === "provider-turn.interrupt",
+      );
+      yield* Ref.set(
+        effects,
+        planned.map((effect) =>
+          effect.request.type === "provider-turn.interrupt" && effect.request.subagent === undefined
+            ? {
+                ...effect,
+                request: {
+                  ...effect.request,
+                  stopThroughRunOrdinal: throughRunOrdinal,
+                  stopRunAttempts: runAttempts,
+                },
+              }
+            : effect,
+        ),
+      );
+      if (!hasInterrupt)
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:provider-session.stop-background-work`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-session.stop-background-work",
+              throughRunOrdinal,
+              runAttempts,
+              backgroundThreads: projection.providerThreads.flatMap((thread) => {
+                const turn = projection.providerTurns.findLast(
+                  (turn) => turn.providerThreadId === thread.id,
+                );
+                return thread.driver === "claudeAgent" &&
+                  thread.providerSessionId !== null &&
+                  turn !== undefined
+                  ? [
+                      {
+                        providerSessionId: thread.providerSessionId,
+                        providerThreadId: thread.id,
+                        providerTurnId: turn.id,
+                      },
+                    ]
+                  : [];
+              }),
+              onlyIfCancelled: command.type === "queued-run.cancel",
+            },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
     }
     return {
       events: yield* Ref.get(events),

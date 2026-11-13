@@ -4583,6 +4583,7 @@ it.effect("ProviderSessionManagerV2 defers idle release while background work is
         layerTest({
           state,
           idleTimeoutMs: 1000,
+          backgroundTasksEndWithProcess: true,
           hasPendingBackgroundWork: Ref.get(pendingWork),
         }),
       ),
@@ -8035,4 +8036,124 @@ it.effect.each([false, true, "session"] as const)(
         ),
       );
     }),
+);
+
+it.effect.each(["shared Claude", "muse", "codex"] as const)(
+  "stopping background work keeps a %s session",
+  (kind) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, kind === "shared Claude" ? 2 : 1);
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId: f.threadIds[0]! }),
+              type: "provider-thread.updated",
+              threadId: f.threadIds[0]!,
+              occurredAt: f.now,
+              payload: f.providerThreadOf(f.threadIds[0]!),
+            },
+          ],
+        });
+        if (kind === "shared Claude") yield* f.start(f.threadIds[1]!);
+        yield* f.manager.stopBackgroundWork({
+          threadId: f.threadIds[0]!,
+          throughRunOrdinal: 0,
+          onlyIfCancelled: false,
+        });
+        assert.isTrue(Option.isSome(yield* f.manager.get(f.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            driver: ProviderDriverKind.make(kind === "shared Claude" ? "claudeAgent" : kind),
+            backgroundTasksEndWithProcess: true,
+            hasPendingBackgroundWork: Effect.succeed(true),
+            hasPendingBackgroundWorkForThread: Effect.succeed(true),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  { change: "new start", releases: false },
+  { change: "new start and finish", releases: false },
+  { change: "same turn finishes", releases: true },
+  { change: "old thread errors", releases: true },
+  { change: "starting cancellation", releases: true },
+] as const)("Stop revalidates $change during its background probe", ({ change, releases }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const probing = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const startEntered = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      yield* f.eventSink.write({
+        events: [
+          {
+            id: yield* f.idAllocator.allocate.event({ threadId: f.threadIds[0]! }),
+            type: "provider-thread.updated",
+            threadId: f.threadIds[0]!,
+            occurredAt: f.now,
+            payload: f.providerThreadOf(f.threadIds[0]!),
+          },
+        ],
+      });
+      const starting =
+        change === "starting cancellation"
+          ? yield* f.start(f.threadIds[0]!, 1).pipe(Effect.forkScoped)
+          : null;
+      if (starting === null) yield* f.start(f.threadIds[0]!, 1);
+      else yield* Deferred.await(startEntered);
+      const stopping = yield* f.manager
+        .stopBackgroundWork({
+          threadId: f.threadIds[0]!,
+          throughRunOrdinal: 1,
+          onlyIfCancelled: false,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(probing);
+      if (starting !== null) yield* Fiber.interrupt(starting);
+      else if (change === "same turn finishes" || change === "old thread errors") {
+        yield* f.finish(f.threadIds[0]!, 1);
+        if (change === "old thread errors")
+          yield* f.publish({
+            type: "provider_thread.updated",
+            driver: f.runtime.driver,
+            providerThread: { ...f.providerThreadOf(f.threadIds[0]!), status: "error" },
+          });
+      } else {
+        yield* f.start(f.threadIds[0]!, 2);
+        if (change === "new start and finish") yield* f.finish(f.threadIds[0]!, 2);
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const released = yield* Fiber.join(stopping);
+      assert.equal(released.length, releases ? 1 : 0);
+      assert.equal(Option.isNone(yield* f.manager.get(f.providerSessionId)), releases);
+      assert.equal((yield* Ref.get(state)).closeCount, releases ? 1 : 0);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          backgroundTasksEndWithProcess: true,
+          ...(change === "starting cancellation"
+            ? {
+                startTurn: Deferred.succeed(startEntered, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                ),
+              }
+            : {}),
+          hasPendingBackgroundWorkForThread: Deferred.succeed(probing, undefined).pipe(
+            Effect.andThen(Deferred.await(resume)),
+            Effect.as(true),
+          ),
+        }),
+      ),
+    );
+  }),
 );

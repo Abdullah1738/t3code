@@ -13,6 +13,8 @@ import {
   ProviderSessionId,
   ThreadId,
   type ProviderThreadId,
+  type RunId,
+  type RunAttemptId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -215,6 +217,15 @@ export interface ProviderSessionManagerV2Shape {
     readonly reason: ProviderSessionReleaseReason;
     readonly detail?: string;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
+  readonly stopBackgroundWork: (input: {
+    readonly threadId: ThreadId;
+    readonly throughRunOrdinal: number;
+    readonly runAttempts?: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly attemptId: RunAttemptId | null;
+    }>;
+    readonly onlyIfCancelled: boolean;
+  }) => Effect.Effect<ReadonlyArray<ProviderSessionId>, ProviderSessionManagerV2Error>;
   readonly detach: (input: {
     readonly providerSessionId: ProviderSessionId;
     readonly threadId: ThreadId;
@@ -251,6 +262,8 @@ interface LiveSessionEntry {
   readonly requestEventPermit: Semaphore.Semaphore;
   readonly scope: Scope.Closeable;
   readonly idleGeneration: number;
+  // Stop permits old work to finish, but must yield to a new start or load.
+  readonly workGeneration: number;
   readonly busyTurns: ReadonlyMap<
     string,
     { readonly threadId: ThreadId; readonly nativeThreadKey: string }
@@ -1048,6 +1061,7 @@ export const layerWithOptions = (
         function* (input: {
           readonly providerSessionId: ProviderSessionId;
           readonly onlyIfIdleGeneration?: number;
+          readonly onlyIfEntry?: LiveSessionEntry;
         }): Effect.fn.Return<readonly [Option.Option<LiveSessionEntry>, DateTime.Utc]> {
           const key = sessionKey(input.providerSessionId);
           const candidate = (yield* Ref.get(sessions)).get(key);
@@ -1057,6 +1071,14 @@ export const layerWithOptions = (
           const removed = yield* Effect.zip(
             Ref.modify(sessions, (current) => {
               const existing = current.get(key);
+              if (
+                input.onlyIfEntry !== undefined &&
+                (existing?.runtime !== input.onlyIfEntry.runtime ||
+                  existing.workGeneration !== input.onlyIfEntry.workGeneration ||
+                  existing.attachedThreadIds !== input.onlyIfEntry.attachedThreadIds)
+              ) {
+                return ["kept", current] as const;
+              }
               if (existing !== candidate) {
                 return [existing === undefined ? "gone" : "changed", current] as const;
               }
@@ -1138,6 +1160,7 @@ export const layerWithOptions = (
         readonly detachedThreadId?: ThreadId;
         readonly cancelIdleFiber?: boolean;
         readonly onlyIfIdleGeneration?: number;
+        readonly onlyIfEntry?: LiveSessionEntry;
         readonly gracefulSubscribers?: boolean;
       }) =>
         Effect.acquireUseRelease(
@@ -1504,7 +1527,11 @@ export const layerWithOptions = (
             loaded: true,
           });
           const updated = new Map(current);
-          updated.set(key, { ...entry, providerThreadLoadsByThread });
+          updated.set(key, {
+            ...entry,
+            providerThreadLoadsByThread,
+            workGeneration: entry.workGeneration + 1,
+          });
           return updated;
         });
 
@@ -1622,6 +1649,7 @@ export const layerWithOptions = (
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
+                workGeneration: entry.workGeneration + 1,
                 busyTurns: new Map(entry.busyTurns).set(turnKey, { threadId, nativeThreadKey }),
                 idleFiber: null,
                 lastActivityAtMs: now,
@@ -2848,6 +2876,7 @@ export const layerWithOptions = (
                 requestEventPermit: yield* Semaphore.make(1),
                 scope: sessionScope,
                 idleGeneration: 0,
+                workGeneration: 0,
                 busyTurns: new Map(),
                 lastActivityAtMs: now,
                 idleFiber: null,
@@ -2979,6 +3008,78 @@ export const layerWithOptions = (
             ),
         ),
         release: releaseEntry,
+        stopBackgroundWork: Effect.fn("ProviderSessionManager.stopBackgroundWork")(
+          function* (input) {
+            const expectedAttempts = new Map(
+              input.runAttempts?.map((run) => [run.runId, run.attemptId]),
+            );
+            const released: ProviderSessionId[] = [];
+            const entries = [...(yield* Ref.get(sessions)).values()];
+            for (const entry of entries) {
+              if (
+                entry.runtime.driver !== "claudeAgent" ||
+                entry.runtime.backgroundTasksEndWithProcess !== true ||
+                entry.attachedThreadIds.size !== 1 ||
+                !entry.attachedThreadIds.has(input.threadId) ||
+                entry.runtime.hasPendingBackgroundWorkForThread === undefined
+              )
+                continue;
+              const projection = yield* projectionStore.getThreadRecords(input.threadId, [
+                "runs",
+                "providerThreads",
+              ]);
+              const owned = projection.providerThreads.filter(
+                (thread) => thread.providerSessionId === entry.runtime.providerSessionId,
+              );
+              const probe = entry.runtime.hasPendingBackgroundWorkForThread;
+              const pending = yield* Effect.findFirst(owned, (thread) =>
+                probe(thread, { includeSubagents: true }),
+              );
+              if (Option.isNone(pending)) continue;
+              // The probe yields to the adapter. Re-read the queue before closing,
+              // and remove only this entry so a new turn/replacement wins the race.
+              const current = yield* projectionStore.getThreadRecords(input.threadId, ["runs"]);
+              if (
+                current.runs.some(
+                  (run) =>
+                    run.ordinal > input.throughRunOrdinal ||
+                    (expectedAttempts.has(run.id) &&
+                      expectedAttempts.get(run.id) !== run.activeAttemptId) ||
+                    (["preparing", "starting", "running"].includes(run.status) &&
+                      !expectedAttempts.has(run.id)) ||
+                    (input.onlyIfCancelled &&
+                      ["queued", "preparing", "starting", "running", "waiting"].includes(
+                        run.status,
+                      )),
+                )
+              )
+                continue;
+              if (input.onlyIfCancelled && current.runs.at(-1)?.status !== "cancelled") continue;
+              yield* releaseEntry({
+                providerSessionId: entry.runtime.providerSessionId,
+                reason: "manual_shutdown",
+                detail: "The thread stopped its background work.",
+                onlyIfEntry: entry,
+              });
+              if (!(yield* Ref.get(sessions)).has(sessionKey(entry.runtime.providerSessionId))) {
+                released.push(entry.runtime.providerSessionId);
+              }
+            }
+            return released;
+          },
+          (effect, input) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderSessionCloseError({
+                    providerSessionId: ProviderSessionId.make(
+                      `provider-session:thread:${input.threadId}`,
+                    ),
+                    cause,
+                  }),
+              ),
+            ),
+        ),
         detach: Effect.fn("ProviderSessionManager.detach")(
           function* (input) {
             const key = sessionKey(input.providerSessionId);
