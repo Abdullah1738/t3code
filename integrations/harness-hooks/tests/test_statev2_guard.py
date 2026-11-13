@@ -255,6 +255,54 @@ class GuardTests(unittest.TestCase):
                         self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
                         self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + content + 'JS\n'), READ)
 
+    def test_replica_readers_must_be_builtin_imports(self):
+        for declaration, reader in [
+            ('class DatabaseSync { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } }', 'DatabaseSync'),
+            ('const fake = { DatabaseSync: class { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } } };', 'fake.DatabaseSync'),
+            ('// import { DatabaseSync } from "node:sqlite";\nclass DatabaseSync { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } }', 'DatabaseSync'),
+        ]:
+            source = ('import * as Sqlite from "node:sqlite";\n' + declaration + '\n'
+                      f'new {reader}(process.env.HOME + "/.robob/userdata/readonly/state.sqlite", {{readOnly:true}});\n')
+            with self.subTest(reader=reader, declaration=declaration):
+                script = self.write('tmp/custom-reader.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        source = ('from pathlib import Path\nimport sqlite3\nfrom custom import connect_legacy\n'
+                  'class sqlite3:\n    connect = connect_legacy\n'
+                  'path = Path.home() / ".robob/userdata/readonly/state.sqlite"\n'
+                  'sqlite3.connect(f"file:{path}?mode=ro", uri=True)\n')
+        script = self.write('tmp/custom-reader.py', source)
+        self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+        self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
+    def test_escaped_identifiers_cannot_hide_replica_transforms(self):
+        for parameter in [r'Node\u0050ath', r'Node\u{50}ath', r'\u004eodePath', r'NodePat\u0068']:
+            source = ('import * as NodePath from "node:path";\n'
+                      'import { DatabaseSync } from "node:sqlite";\n'
+                      f'function probe({parameter}) {{\n'
+                      '  new DatabaseSync(NodePath.join(process.env.HOME, "/.robob/userdata/readonly/state.sqlite"));\n'
+                      '}\nprobe({join: (h, s) => (h + s).replace("/readonly/", "/")});\n')
+            with self.subTest(parameter=parameter):
+                script = self.write('tmp/escaped-shadow.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        for identifier in [r'v\u0061lues', r'v\u{61}lues', r'\u0076alues', r'value\u0073']:
+            for rename in ['', '.replace("state", "statev2")']:
+                expression = identifier + '.replica.replace("/readonly/", "/")' + rename
+                source = original.replace('DatabaseSync(values.replica,', f'DatabaseSync({expression},')
+                with self.subTest(identifier=identifier, rename=rename):
+                    script = self.write('tmp/escaped-values.ts', source)
+                    self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for line_end in ['\r', '\r\n', '\u2028', '\u2029']:
+            source = original.replace('const db = new', '// comment' + line_end +
+                                      'values.replica = values.replica.replace("/readonly/", "/");\nconst db = new')
+            with self.subTest(line_end=repr(line_end)):
+                script = self.write('tmp/comment-option.ts', source)
+                self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
     def test_heredoc_delimiters_follow_shell_quote_removal(self):
         rows = [
             (r'\EOF', 'EOF', True),

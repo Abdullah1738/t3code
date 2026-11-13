@@ -224,7 +224,7 @@ def _python_touches_live(source, directory, replica=False):
         if not replica or original_live or not isinstance(node, ast.Call) or not node.args:
             continue
         root, *rest = _name(node.func).split('.')
-        if '.'.join([aliases.get(root, root), *rest]) != 'sqlite3.connect':
+        if root not in aliases or stores.get(root) or '.'.join([aliases[root], *rest]) != 'sqlite3.connect':
             continue
         value = uri_value(node.args[0])
         if value is None:
@@ -1065,10 +1065,17 @@ def _replica_reader_source(source):
     # A literal is discounted only at a reader, or in an immutable binding whose
     # every use is a reader argument. Unknown transformations retain the name.
     identifier = r'[A-Za-z_$][\w$]*'
-    reader = re.compile(r'\bnew\s+(?:' + identifier + r'\s*\.\s*)*(?:DatabaseSync|Database)\s*\(\s*$')
-    strings = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"''')
+    strings = re.compile(r'''//[^\r\n\u2028\u2029]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"''')
     code = strings.sub(lambda m: ' ' * len(m[0]), source)
-    if re.search(r'\b(?:eval|Function|Reflect|Proxy)\b', code):
+    discounted = []
+    for command in re.finditer(r'(?m)^\s*sqlite3\s+-readonly\s+([^\s;|&]+)', source):
+        if (replica := REPLICA.search(command[1])) and replica.end() == len(command[1]):
+            start, end = command.span(1)
+            discounted.append((start, end))
+            code = code[:start] + ' ' * (end - start) + code[end:]
+    # Escaped identifiers, templates and regex literals need lexical parsing to
+    # prove that the textual reference list is complete. Keep them conservative.
+    if any(token in code for token in ('\\', '`', '/')) or re.search(r'\b(?:eval|Function|Reflect|Proxy)\b', code):
         return source
 
     def namespace(module, operations):
@@ -1085,6 +1092,17 @@ def _replica_reader_source(source):
 
     paths = namespace('path', 'join|resolve')
     os_module = namespace('os', 'homedir')
+    constructors = [namespace('sqlite', 'DatabaseSync') + r'\.DatabaseSync']
+    named_reader = r'''\bimport\s*\{\s*(DatabaseSync)(?:\s+as\s+(''' + identifier + r'''))?\s*\}\s*from\s*(['"])node:sqlite\3'''
+    for imported in re.finditer(named_reader, source):
+        if not code.startswith('import', imported.start()):
+            continue
+        group = 2 if imported[2] else 1
+        uses = [m for m in re.finditer(r'(?<![\w$])' + re.escape(imported[group]) + r'(?![\w$])', code)
+                if m.span() != imported.span(group)]
+        if all(re.search(r'\bnew\s*$', code[:m.start()]) and re.match(r'\s*\(', code[m.end():]) for m in uses):
+            constructors.append(re.escape(imported[group]))
+    reader = re.compile(r'\bnew\s+(?:' + '|'.join(constructors) + r')\s*\(\s*$')
     literal = r'''(?:'[^'\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?'|"[^"\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?")'''
     home = r'(?:process\.env\.HOME|' + os_module + r'\.homedir\(\s*\))'
     seed = re.compile(paths + r'\.(?:join|resolve)\(\s*' + home + r'\s*,\s*' + literal + r'\s*\)|' + home + r'\s*\+\s*' + literal + '|' + literal)
@@ -1097,10 +1115,6 @@ def _replica_reader_source(source):
         reads = [m for m in uses if m.span() != declaration]
         return bool(reads) and all(reader_use(m.start(), m.end()) for m in reads)
 
-    discounted = []
-    for command in re.finditer(r'(?m)^\s*sqlite3\s+-readonly\s+([^\s;|&]+)', source):
-        if (replica := REPLICA.search(command[1])) and replica.end() == len(command[1]):
-            discounted.append(command.span(1))
     for match in seed.finditer(source):
         if not REPLICA.search(match[0]):
             continue
