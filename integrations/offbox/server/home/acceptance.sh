@@ -12,6 +12,7 @@
 #   --after-rtc-wake / --after-watchdog   verdict of the destructive test that ran before the restart
 #   --kvm-steps          only print the steps that are driven with the network KVM (power and reset buttons on
 #                        its ATX board, the screen), with the expected result of each
+#   --userns / --userns-only   only test user namespaces in a fresh offbox box (after host bootstrap)
 #
 # Every line starts with PASS, FAIL, WARN or INFO. Exit code 1 if anything FAILed.
 # One thing no script can check: pull the power cable for 30 s and plug it back in. The machine must start by
@@ -25,6 +26,28 @@ warn() { echo "WARN $*"; }
 info() { echo "INFO $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
+
+# A host-root probe passes even with Ubuntu's restriction enabled. Exercise the ordinary box runner.
+userns_check() (
+  local box
+  box=offbox-acceptance-userns-$(cat /proc/sys/kernel/random/uuid)
+  # Over SSH this script arrives on stdin; Incus init otherwise treats the remaining script as YAML.
+  incus init offbox-base "$box" --ephemeral -p default -p offbox </dev/null || return 1
+  trap 'rc=$?; incus delete --force "$box" || rc=1; exit "$rc"' EXIT
+  incus start "$box" || return 1
+  incus exec "$box" --user 1000 --group 1000 --cwd / -- sh -c \
+    '[ "$(id -u)" = 1000 ] && exec unshare --user --map-root-user --net --mount true' </dev/null
+)
+userns_verdict() {
+  if userns_check; then
+    pass "box uid 1000: user, network and mount namespaces"
+  else
+    fail "box uid 1000 cannot create user, network and mount namespaces (or probe box cleanup failed)"
+  fi
+}
+case ${1:-} in
+  --userns | --userns-only) userns_verdict; exit "$FAILS" ;;
+esac
 mkdir -p "$STATE"
 
 # ---------------------------------------------------------------- steps driven with the network KVM
@@ -235,6 +258,13 @@ if [ -x /usr/local/sbin/offbox-exit-proxy ]; then
   while IFS= read -r line; do
     case $line in PASS*) pass "${line#PASS }" ;; FAIL*) fail "${line#FAIL }" ;; *) echo "$line" ;; esac
   done < <(/usr/local/sbin/offbox-exit-proxy check || true)
+fi
+
+# The initial hardware acceptance also runs before bootstrap, when Incus and the base do not exist yet.
+if have incus; then
+  userns_verdict
+else
+  info "box user namespaces: not checked before host bootstrap (run acceptance.sh --userns afterwards)"
 fi
 
 # ---------------------------------------------------------------- never-stays-off settings on the real hardware
