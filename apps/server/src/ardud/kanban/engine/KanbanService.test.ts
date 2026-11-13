@@ -1061,6 +1061,148 @@ it.effect.each(["reuse", "launch"] as const)(
     }),
 );
 
+it.effect.each(
+  (["work", "review"] as const).flatMap((role) =>
+    (["read", "launch", "wake"] as const).map((phase) => ({ role, phase })),
+  ),
+)("#1298 $role dispatch preserves a discussion created during $phase", ({ role, phase }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let armed = false;
+    let target: ThreadId | null = null;
+    const gate = Effect.suspend(() => {
+      if (!armed) return Effect.void;
+      armed = false;
+      return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)));
+    });
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            (phase === "launch" ? gate : Effect.void).pipe(Effect.andThen(threads.launch(input))),
+          send: (input) =>
+            (phase === "wake" && input.threadId === target ? gate : Effect.void).pipe(
+              Effect.andThen(threads.send(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.evaluatorModel, 1);
+      const card = yield* kanban.createCard(board.id, { prompt: "Work", title: "Work" }, owner);
+      if (role === "review" || phase !== "launch") {
+        yield* kanban.dispatchNow;
+        target = (yield* kanban.card(card.id)).card.activeThreadId!;
+        if (role === "review") {
+          yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: target,
+          });
+          yield* kanban.turnEnded(target);
+          if (phase !== "launch") {
+            yield* kanban.dispatchNow;
+            target = (yield* kanban.card(card.id)).card.activeThreadId!;
+            yield* kanban.moveCard(card.id, "needs_review", "owner", owner);
+          }
+        } else yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      }
+      assert.isNull((yield* kanban.card(card.id)).card.discussionId);
+      if (phase === "read")
+        fake.findControl.beforeRead = (id) => (id === target ? gate : Effect.void);
+      const sent = fake.sends.length;
+      const interrupts = fake.interrupted.length;
+      armed = true;
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(dispatch).pipe(
+          Effect.andThen(Effect.die("Dispatch missed the discussion gate")),
+        ),
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(dispatch);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, role === "work" ? "working" : "in_review");
+      assert.isNotNull(after.activeThreadId);
+      if (phase !== "launch") assert.strictEqual(after.activeThreadId, target);
+      assert.strictEqual(after.discussionId, discussion.id);
+      assert.strictEqual((yield* kanban.discussion(discussion.id)).cardId, card.id);
+      assert.lengthOf(fake.sends.slice(sent), phase === "launch" ? 0 : 1);
+      assert.lengthOf(fake.interrupted, interrupts);
+      assert.strictEqual((yield* kanban.cardDiscussion(card.id)).id, discussion.id);
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
+
+it.effect.each(
+  (["read", "model"] as const).flatMap((phase) =>
+    (["reject", "unchanged", "read-fails"] as const).map((mode) => ({ phase, mode })),
+  ),
+)("#1298 a discussion survives a $mode model failure during $phase", ({ phase, mode }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let armed = false;
+    let target: ThreadId | null = null;
+    const gate = Effect.suspend(() => {
+      if (!armed) return Effect.void;
+      armed = false;
+      return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)));
+    });
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          model: (id, activeRun) =>
+            (phase === "model" && id === target ? gate : Effect.void).pipe(
+              Effect.andThen(threads.model(id, activeRun)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId } = yield* parkedWork;
+      target = threadId;
+      yield* Ref.update(fake.threads, (all) => {
+        all.set(threadId, { ...all.get(threadId)!, model: astraXhigh });
+        return all;
+      });
+      fake.modelControl.rejectSwitch = mode === "reject";
+      fake.modelControl.ignoreSwitch = mode === "unchanged";
+      fake.modelControl.failRead = mode === "read-fails";
+      if (phase === "read")
+        fake.findControl.beforeRead = (id) => (id === target ? gate : Effect.void);
+      assert.isNull((yield* kanban.card(card.id)).card.discussionId);
+      const sent = fake.sends.filter((send) => send.threadId === threadId).length;
+      armed = true;
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(dispatch).pipe(Effect.andThen(Effect.die("Dispatch missed the model gate"))),
+      );
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(dispatch);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "todo");
+      assert.isNull(after.activeThreadId);
+      assert.match(after.stalled!.reason, /^Thread model differs from card model/);
+      assert.strictEqual(after.discussionId, discussion.id);
+      assert.strictEqual((yield* kanban.cardDiscussion(card.id)).id, discussion.id);
+      assert.lengthOf((yield* kanban.discussions(board.id)).filter((d) => d.cardId === card.id), 1);
+      assert.lengthOf(fake.sends.filter((send) => send.threadId === threadId), sent);
+    }).pipe(Effect.provide(testLayer(delayed)));
+  }),
+);
+
 it.effect("a late dispatch PR read retains a newer metadata refresh", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

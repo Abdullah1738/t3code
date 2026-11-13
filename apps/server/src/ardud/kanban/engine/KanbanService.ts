@@ -3285,7 +3285,8 @@ const make = Effect.gen(function* () {
         component: "kanban",
       },
     );
-    yield* saveCard({ ...card, discussionId: discussion.id });
+    // Opening the discussion changes no assignment input.
+    yield* saveCard({ ...card, discussionId: discussion.id }, undefined, true);
     return discussion;
   });
 
@@ -6346,7 +6347,12 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
   ) {
     const current = yield* cardOf(card.id);
-    const saved = { ...card, links: current.links, updatedAt: yield* nowIso };
+    const saved = {
+      ...card,
+      links: current.links,
+      discussionId: current.discussionId,
+      updatedAt: yield* nowIso,
+    };
     yield* saveCard(saved);
     return saved;
   });
@@ -6432,7 +6438,7 @@ const make = Effect.gen(function* () {
         if (reason !== null) {
           const next = { ...card, stalled: { reason, by: system, at }, updatedAt: at };
           yield* logEvent(next, system, "flagged", { body: reason });
-          yield* saveCard(next);
+          destination.expectedCard = yield* saveDispatchCard(next);
           yield* noteDiscussion(card, Briefs.threadModelDiffersText(card, reason)).pipe(
             Effect.catchCause((cause) => Effect.logWarning("kanban model note failed", { cause })),
           );
@@ -6858,6 +6864,7 @@ const make = Effect.gen(function* () {
                       const assignmentState = ({
                         links,
                         updatedAt: _updatedAt,
+                        discussionId: _discussionId,
                         ...card
                       }: KanbanCard) => ({
                         ...card,
