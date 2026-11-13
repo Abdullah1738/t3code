@@ -10594,12 +10594,12 @@ const make = Effect.gen(function* () {
         yield* checkText([["note", text]]);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         const at = yield* nowIso;
-        const wakeNote = kanbanWorkStep(card)
-          ? text.trim() || card.wakeNote
-          : Subtasks.pendingWakeNote({
-              ...card,
-              wakeNote: [card.wakeNote, text.trim()].filter(Boolean).join("\n\n") || null,
-            });
+        // Eligibility controls when the note is delivered, never whether newer
+        // wake/reset text can discard context that has not reached the worker.
+        const wakeNote = Subtasks.pendingWakeNote({
+          ...card,
+          wakeNote: [card.wakeNote, text.trim()].filter(Boolean).join("\n\n") || null,
+        });
         if (
           (action === "steer" || (action === "wake" && card.activeThreadId !== null)) &&
           card.activeRole !== "review" &&

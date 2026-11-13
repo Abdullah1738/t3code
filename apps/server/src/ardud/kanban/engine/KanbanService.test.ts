@@ -4108,10 +4108,12 @@ it.effect.each(["todo", "needs_review"] as const)(
           _tag: "evaluator",
           threadId: ThreadId.make("evaluator-wake"),
         };
+        const notes: string[] = [];
         for (const text of ["Please check this", "Latest context"]) {
+          notes.push(text);
           const result = yield* kanban.cardThread(woken.id, "wake", text, evaluator);
           assert.strictEqual(result.movedAt, woken.movedAt);
-          assert.strictEqual(result.wakeNote, text);
+          assert.strictEqual(result.wakeNote, notes.join("\n\n"));
           assert.strictEqual(result.updatedAt, "2026-10-25T04:00:00.000Z");
         }
         const detail = yield* kanban.card(woken.id);
@@ -20560,5 +20562,97 @@ it.effect.each(["comment", "work edit"] as const)(
         yield* kanban.dispatchNow;
         assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
       }).pipe(Effect.provide(testLayer(launch)));
+    }),
+);
+
+const pendingContextActions = [
+  { action: "wake", text: "Continue now that QA replied", input: "text" },
+  { action: "wake", text: "  ", input: "blank" },
+  { action: "reset", text: "Use a fresh thread", input: "text" },
+  { action: "reset", text: "", input: "blank" },
+] as const;
+
+it.effect.each(pendingContextActions)(
+  "card835 review: queued owner context survives $action with $input after the gate opens",
+  ({ action, text }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Queued owner decision",
+            prompt: "Follow the plan",
+            subtasks: [
+              { text: "Wait for QA", owner: "evaluator", step: 1 },
+              { text: "Implement agreed rate", owner: "work", step: 2 },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.cardThread(card.id, "wake", "Owner says use 2%", owner);
+        yield* kanban.markSubtask(card.id, "s1", "done", "QA replied", owner, "evaluator");
+        yield* kanban.cardThread(card.id, action, text, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(running.stage, "working");
+        const delivered = (yield* Ref.get(fake.threads))
+          .get(running.activeThreadId!)!
+          .messages.at(-1)!;
+        assert.include(delivered, "Owner says use 2%");
+        if (text.trim()) assert.include(delivered, text.trim());
+        assert.include(delivered, "worker (now): Implement agreed rate");
+        assert.notInclude(delivered, "Do this step's work subtasks");
+        assert.isNull(running.wakeNote);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(pendingContextActions)(
+  "card835 review: $action with $input preserves actual pending findings on the review-only step",
+  ({ action, text }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Review fixes",
+            prompt: "Build the feature",
+            subtasks: [
+              { text: "Build", owner: "work", step: 1 },
+              { text: "Review", owner: "review", step: 2 },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const actor: KanbanActor = { _tag: "thread", threadId: worker };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", actor);
+        yield* kanban.dispatchNow;
+        const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* kanban.reviewResult(reviewer, "findings", ["Reject negative rates before saving"]);
+        yield* setRunning(fake, worker, false);
+        yield* TestClock.adjust(1);
+        yield* kanban.cardThread(card.id, action, text, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(running.stage, "working");
+        assert.isTrue(running.reviewFindingsPending);
+        if (action === "reset") assert.notStrictEqual(running.activeThreadId, worker);
+        else assert.strictEqual(running.activeThreadId, worker);
+        const delivered = (yield* Ref.get(fake.threads))
+          .get(running.activeThreadId!)!
+          .messages.at(-1)!;
+        assert.include(delivered, "Reject negative rates before saving");
+        if (text.trim()) assert.include(delivered, text.trim());
+        assert.include(delivered, "reviewer (now): Review");
+        assert.isNull(running.wakeNote);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
