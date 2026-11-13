@@ -121,8 +121,11 @@ def config_lines(text):
         if pending is not None and line.strip() and not line.lstrip().startswith('#'):
             parent_indent, prefix = pending
             pending = None
-            if indent > parent_indent and not re.match(rf"^\s*(?:-\s+|{KEY}\s*:)", line):
+            if indent > parent_indent and not re.match(rf"^\s*(?:-(?:\s|$)|{KEY}\s*:)", line):
                 value = line.strip()
+                if re.match(r"^(?:['\"]?\$\{\{|[*&!])", value):
+                    lines.append(prefix + value)
+                    continue
                 if value[0] in '{[':
                     clean = without_comments(value)
                     if flow_end(clean) is None:
@@ -134,7 +137,7 @@ def config_lines(text):
                 if value[0] in ("'", '"') and quote_end(value, value[0], 1) is None:
                     quote = value[0]
                 scalar_indent = parent_indent
-                lines.append('')
+                lines.append(prefix + value)
                 continue
         lines.append(line)
         mapping = re.match(rf"^\s*(?:-\s+)?{KEY}\s*:\s*(.*)$", line)
@@ -143,7 +146,8 @@ def config_lines(text):
         value = mapping[1]
         dash = re.match(r"^\s*-\s+", line)
         key_indent = dash.end() if dash else indent
-        if not value or value.startswith('#'):
+        # An anchor alone decorates a nested mapping; it is not a plain scalar body.
+        if not value or value.startswith('#') or re.fullmatch(r"&[^\s]+\s*(?:#.*)?", value):
             pending = (key_indent, line[:mapping.start(1)])
             continue
         if value[0] in ("'", '"'):
@@ -199,23 +203,170 @@ def version_note(root):
         return f" packageManager declares {pin[1]} with a non-numeric descriptor; inspect its version and CI install flags before running."
     if pin and pin[1] in {"npm", "bun"}:
         return f" Use {pin[1]} {pin[2]} from package.json packageManager (check {pin[1]} --version first)."
+    if not pin and (Path(root) / 'pnpm-lock.yaml').is_file() and ci_pnpm_selection(root)[1]:
+        return " CI pnpm version is ambiguous; inspect the setup version expressions and CI pins before choosing <repo-install>."
     return ""
 
 
 def ci_pnpm_version(root):
-    """Only unambiguous literal pins; expressions/matrices need human inspection."""
+    return ci_pnpm_selection(root)[0]
+
+
+def ci_lines(text):
+    """Expose flow step/env keys to the same scan used for block mappings."""
+    def entries(value):
+        end = flow_end(value)
+        return [field.strip() for field in flow_fields(value[1:end]) if field.strip()] if end is not None else []
+
+    out = []
+    pending_step = None
+    empty_step = None
+    for line in config_lines(text):
+        if re.fullmatch(r"\s*-\s*(?:#.*)?", line):
+            empty_step = len(line) - len(line.lstrip())
+            continue
+        if empty_step is not None:
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent > empty_step:
+                line = ' ' * empty_step + '-' + ' ' * (indent - empty_step - 1) + line.lstrip()
+            empty_step = None
+        if pending_step:
+            indent, value = pending_step
+            value = without_comments(value + '\n' + line)
+            if flow_end(value) is None:
+                pending_step = (indent, value)
+                continue
+            line = indent + '- ' + value.replace('\n', ' ')
+            pending_step = None
+        step = re.match(r"^(\s*)-\s+(\{.*)$", line)
+        if step and flow_end(step[2]) is None:
+            pending_step = (step[1], step[2])
+            continue
+        fields = entries(step[2]) if step and flow_mapping(step[2]) is not None else []
+        if fields:
+            indent = step[1]
+            expanded = [indent + '- ' + fields[0]] + [indent + '  ' + field for field in fields[1:]]
+        else:
+            expanded = [line]
+        for item in expanded:
+            env = re.match(r"^(\s*(?:-\s+)?)(['\"]?env['\"]?)\s*:\s*(\{.*)$", item)
+            fields = entries(env[3]) if env and flow_mapping(env[3]) is not None else []
+            if fields:
+                out.append(env[1] + env[2] + ':')
+                out.extend(' ' * (len(env[1]) + 2) + field for field in fields)
+            else:
+                out.append(item)
+    return out
+
+
+def flow_mapping(value):
+    value = re.sub(r"^(?:[&!][^\s]+\s+)+", '', value.strip())
+    if not value.startswith('{'):
+        return None
+    end = flow_end(value)
+    if end is None:
+        return None
+    pairs = []
+    for field in flow_fields(value[1:end]):
+        if not field.strip():
+            continue
+        match = re.fullmatch(rf"\s*({KEY})\s*:\s*(.*)", field)
+        if not match or '\\' in match[1]:
+            return None
+        pairs.append((match[1].strip('\"\''), match[2]))
+    return pairs
+
+
+def flow_env_needs_inspection(value):
+    env = flow_mapping(value)
+    return env is None or any(name == 'PNPM_VERSION' for name, _ in env)
+
+
+def flow_job_needs_inspection(value):
+    pairs = flow_mapping(value)
+    if pairs is None:
+        return True
+    for key, setting in pairs:
+        if key == 'env':
+            if flow_env_needs_inspection(setting):
+                return True
+        if key == 'steps':
+            if not setting.startswith('[') or flow_end(setting) is None:
+                return True
+            for step in flow_fields(setting[1:flow_end(setting)]):
+                fields = flow_mapping(step)
+                if fields is None or any(name == 'uses' or
+                                         name == 'env' and flow_env_needs_inspection(value)
+                                         for name, value in fields):
+                    return True
+    return False
+
+
+def env_scope(path):
+    return (not path or path == ['steps'] or
+            len(path) == 2 and path[0] == 'jobs' or
+            len(path) == 3 and path[0] == 'jobs' and path[2] == 'steps')
+
+
+def ci_pnpm_selection(root):
+    """(literal version, needs inspection). GitHub expressions are never evaluated here."""
     versions = set()
+
+    def record(value):
+        literal = re.fullmatch(rf"\s*['\"]?({VERSION})['\"]?\s*", value)
+        # An unresolved expression must not disappear while an unrelated literal survives.
+        versions.add(literal[1] if literal else None)
+
     workflows = root / ".github/workflows"
     for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
-        lines = config_lines(read(path))
-        text = "\n".join(lines)
-        for match in re.finditer(rf"(?m)^\s*['\"]?PNPM_VERSION['\"]?\s*:\s*['\"]?({VERSION})['\"]?\s*(?:#.*)?$", text):
-            versions.add(match[1])
+        lines = [without_comments(line) for line in ci_lines(read(path))]
+        steps_indent = sequence_indent = None
+        parents = []
         for i, line in enumerate(lines):
-            step = re.match(r"^(\s*)-\s+", line)
-            if not step:
+            if not line.strip():
                 continue
-            indent = len(step[1])
+            mapping = re.match(rf"^(\s*)(?:-\s+)?({KEY})\s*:\s*(.*)", line)
+            if mapping:
+                column, key, value = mapping.start(2), mapping[2].strip('\"\''), mapping[3]
+                while parents and parents[-1][0] >= column:
+                    parents.pop()
+                path = [name for _, name in parents]
+                if '\\' in mapping[2]:
+                    record('unsupported escaped configuration key')
+                if key == 'PNPM_VERSION' and path and path[-1] == 'env' and env_scope(path[:-1]):
+                    record(value)
+                if key == 'env' and env_scope(path) and value and (
+                    not value.startswith('{') or flow_env_needs_inspection(value)
+                ):
+                    record('unresolved env mapping')
+                if key == 'jobs' and not path and value:
+                    jobs = flow_mapping(value)
+                    if jobs is None or any(flow_job_needs_inspection(job) for _, job in jobs):
+                        record('unresolved flow jobs')
+                if path == ['jobs'] and value and flow_job_needs_inspection(value):
+                    record('unresolved flow job')
+                if key == 'steps' and (not path or len(path) == 2 and path[0] == 'jobs'):
+                    if value and value != '[]':
+                        record('unresolved steps container')
+                    else:
+                        steps_indent, sequence_indent = column, None
+                    parents.append((column, key))
+                    continue
+                parents.append((column, key))
+            step = re.match(r"^(\s*)-\s+", line)
+            indent = len(line) - len(line.lstrip())
+            if steps_indent is not None and (indent < steps_indent or (indent == steps_indent and not step)):
+                steps_indent = sequence_indent = None
+            if not step or steps_indent is None:
+                continue
+            sequence_indent = indent if sequence_indent is None else sequence_indent
+            if indent != sequence_indent:
+                continue
+            if re.match(r"[*&!{]", line[step.end():]):
+                record('unresolved step properties')
+                continue
             key_indent = step.end()
             # YAML mapping order is irrelevant: inspect the whole step, including with before uses.
             block = [" " * key_indent + line[step.end():]]
@@ -226,19 +377,32 @@ def ci_pnpm_version(root):
                     break
                 block.append(following)
             action = rf"^ {{{key_indent}}}['\"]?uses['\"]?\s*:\s*(['\"]?)pnpm/action-setup@[^\s'\"]+\1\s*(?:#.*)?$"
+            for item in block:
+                uses = re.match(rf" {{{key_indent}}}['\"]?uses['\"]?\s*:\s*(.*)", item)
+                if uses:
+                    value = uses[1].strip()
+                    literal = re.fullmatch(r"(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)", value)
+                    if not literal or '\\' in value or re.match(r"(?:[*&!|>]|['\"]?\$\{\{)", value):
+                        record('unresolved setup action')
             if not any(re.fullmatch(action, item) for item in block):
                 continue
             in_with = False
             with_child_indent = None
             for item in block:
+                mapping = re.fullmatch(rf" {{{key_indent}}}['\"]?with['\"]?\s*:\s*(.*)", item)
+                if mapping:
+                    value = without_comments(mapping[1]).strip()
+                    if value and not value.startswith('{'):
+                        record('unresolved setup mapping')
                 inline = re.match(rf" {{{key_indent}}}['\"]?with['\"]?\s*:\s*(\{{.*)", item)
                 if inline:
-                    end = flow_end(inline[1])
-                    fields = inline[1][1:end] if end is not None else ''
-                    for field in flow_fields(fields):
-                        literal = re.fullmatch(rf"\s*['\"]?version['\"]?\s*:\s*['\"]?({VERSION})['\"]?\s*", field)
-                        if literal:
-                            versions.add(literal[1])
+                    settings = flow_mapping(inline[1])
+                    if settings is None:
+                        record('unsupported setup mapping')
+                    else:
+                        for name, value in settings:
+                            if name == 'version':
+                                record(value)
                 if re.fullmatch(rf" {{{key_indent}}}['\"]?with['\"]?\s*:\s*(?:#.*)?", item):
                     in_with = True
                     with_child_indent = None
@@ -249,10 +413,12 @@ def ci_pnpm_version(root):
                     in_with = False
                 if in_with and item.strip() and not item.lstrip().startswith('#'):
                     with_child_indent = with_child_indent or len(item) - len(item.lstrip())
-                    match = re.fullmatch(rf" {{{with_child_indent}}}['\"]?version['\"]?\s*:\s*['\"]?({VERSION})['\"]?\s*(?:#.*)?", item)
+                    match = re.fullmatch(rf" {{{with_child_indent}}}['\"]?version['\"]?\s*:\s*(.*)", item)
                     if match:
-                        versions.add(match[1])
-    return next(iter(versions)) if len(versions) == 1 else None
+                        record(without_comments(match[1]))
+    needs_inspection = None in versions or len(versions) > 1
+    return (next(iter(versions)) if len(versions) == 1 and not needs_inspection else None,
+            needs_inspection)
 
 
 def install_command(root):
@@ -274,7 +440,10 @@ def install_command(root):
             (("package-lock.json", "npm-shrinkwrap.json"), "npm"),
         ) if any((root / name).is_file() for name in names)), "npm")
     if manager == "pnpm":
-        version = version or (ci_pnpm_version(root) if not declaration else None)
+        if not declaration:
+            version, needs_inspection = ci_pnpm_selection(root)
+            if needs_inspection:
+                return '<repo-install>'
         return f"corepack pnpm{'@' + version if version else ''} install --frozen-lockfile"
     if manager == "yarn":
         modern = int(re.match(r'\d+', version)[0]) >= 2 if version else (
@@ -289,6 +458,8 @@ def install_command(root):
 
 def hint_command(root):
     command = install_command(root)
+    if command == '<repo-install>':
+        return command
     # This repository's vp bootstrap also sets up its toolchain. Keep the established hint.
     try:
         manifest = json.loads(read(Path(root) / "package.json"))
