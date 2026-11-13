@@ -1106,3 +1106,175 @@ it.effect("slot event windows and open slots keep board, pool and thread identit
     assert.deepStrictEqual(yield* store.slotEvents({ boardId: "b", from: "", to: at }), []);
   }).pipe(Effect.provide(TestLayer)),
 );
+
+// Event counts use ledger order; boundary samples use the last count at that
+// instant, so a release on the hour cannot carry the previous hour's peak in.
+const hourlySlotQuery = `
+WITH RECURSIVE bounds(board,from_at,to_at) AS (VALUES (?,?,?)), hours(at) AS (SELECT from_at FROM bounds WHERE from_at<to_at UNION ALL SELECT strftime('%Y-%m-%dT%H:00:00.000Z',at,'+1 hour') FROM hours,bounds WHERE strftime('%Y-%m-%dT%H:00:00.000Z',at,'+1 hour')<to_at), counts AS (SELECT id,pool_key,at,SUM(CASE kind WHEN 'take' THEN 1 ELSE -1 END) OVER (PARTITION BY pool_key ORDER BY id ROWS UNBOUNDED PRECEDING) AS used FROM ardud_kanban_slot_events,bounds WHERE board_id=board AND at<to_at), samples AS (SELECT pool_key,at,used FROM counts,bounds WHERE at>=from_at UNION ALL SELECT p.pool_key,h.at,COALESCE((SELECT c.used FROM counts c WHERE c.pool_key=p.pool_key AND c.at<=h.at ORDER BY c.id DESC LIMIT 1),0) FROM (SELECT DISTINCT pool_key FROM counts) p CROSS JOIN hours h)
+SELECT strftime('%Y-%m-%dT%H:00:00.000Z',at) AS hour,pool_key,MAX(used) AS peak_slots FROM samples GROUP BY hour,pool_key ORDER BY hour,pool_key;
+`;
+
+const hourlySlotCases = [
+  {
+    name: "take before release at the same millisecond preserves peak two",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.001"],
+      ["release", "t1", "00:00:00.001"],
+    ],
+    expected: [
+      [0, "p", 2],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "release before take at the same millisecond stays at peak one",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["release", "t1", "00:00:00.001"],
+      ["take", "t2", "00:00:00.001"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "take and release at one instant still count in that hour",
+    events: [
+      ["take", "t1", "01:30:00.000"],
+      ["release", "t1", "01:30:00.000"],
+    ],
+    expected: [
+      [0, "p", 0],
+      [1, "p", 1],
+      [2, "p", 0],
+      [3, "p", 0],
+    ],
+  },
+  {
+    name: "multiple takes and releases sharing an hour boundary preserve every intermediate count",
+    events: [
+      ["take", "t1", "00:30:00.000"],
+      ["take", "t2", "01:00:00.000"],
+      ["take", "t3", "01:00:00.000"],
+      ["release", "t1", "01:00:00.000"],
+      ["release", "t2", "01:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 3],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "releases on an hour boundary do not carry the previous peak into the new hour",
+    events: [
+      ["take", "t1", "00:30:00.000"],
+      ["take", "t2", "00:30:00.001"],
+      ["release", "t1", "01:00:00.000"],
+      ["release", "t2", "01:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 2],
+      [1, "p", 1],
+      [2, "p", 0],
+      [3, "p", 0],
+    ],
+  },
+  {
+    name: "carry-in uses the final event before the range and includes unchanged hours",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.000"],
+      ["release", "t1", "00:00:00.000"],
+    ],
+    from: "01:00:00.000",
+    expected: [
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "range start is inclusive and end is exclusive",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "04:00:00.000"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [1, "p", 1],
+      [2, "p", 1],
+      [3, "p", 1],
+    ],
+  },
+  {
+    name: "pools stay separate and other boards do not affect carry-in or peaks",
+    events: [
+      ["take", "t1", "00:00:00.000"],
+      ["take", "t2", "00:00:00.000", "q"],
+      ["take", "t3", "00:00:00.000", "p", "other"],
+      ["take", "t4", "00:00:00.000", "unrelated", "other"],
+    ],
+    expected: [
+      [0, "p", 1],
+      [0, "q", 1],
+      [1, "p", 1],
+      [1, "q", 1],
+      [2, "p", 1],
+      [2, "q", 1],
+      [3, "p", 1],
+      [3, "q", 1],
+    ],
+  },
+  { name: "an empty ledger has no pools", events: [], expected: [] },
+] satisfies ReadonlyArray<{
+  readonly name: string;
+  readonly events: ReadonlyArray<
+    readonly [
+      kind: "take" | "release",
+      threadId: string,
+      at: string,
+      poolKey?: string,
+      boardId?: string,
+    ]
+  >;
+  readonly from?: string;
+  readonly expected: ReadonlyArray<readonly [hour: number, poolKey: string, peak: number]>;
+}>;
+
+it.effect.each(hourlySlotCases)("hourly slot peaks: $name", ({ events, expected, from }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* BoardsDatabase.client;
+    for (const [kind, threadId, time, poolKey = "p", boardId = "b"] of events) {
+      yield* store.addSlotEvent({
+        kind,
+        threadId,
+        at: `2026-11-13T${time}Z`,
+        poolKey,
+        boardId,
+        cardId: null,
+        why: kind === "take" ? "start" : "card_left",
+      });
+    }
+    const rows = yield* sql.unsafe<{ hour: string; pool_key: string; peak_slots: number }>(
+      hourlySlotQuery,
+      ["b", `2026-11-13T${from ?? "00:00:00.000"}Z`, "2026-11-13T04:00:00.000Z"],
+    );
+    assert.deepStrictEqual(
+      rows,
+      expected.map(([hour, pool_key, peak_slots]) => ({
+        hour: `2026-11-13T${String(hour).padStart(2, "0")}:00:00.000Z`,
+        pool_key,
+        peak_slots,
+      })),
+    );
+  }).pipe(Effect.provide(TestLayer)),
+);
