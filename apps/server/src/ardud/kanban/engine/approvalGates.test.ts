@@ -240,7 +240,7 @@ it.effect.each(
         yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
         yield* kanban.askOwner(
           card.id,
-          { question: `${task}?`, blocking: false, options: [label, "No"] },
+          { question: `${task} (s1)?`, blocking: false, options: [label, "No"] },
           evaluator,
           "evaluator",
         );
@@ -286,7 +286,7 @@ it.effect.each([
   { task: "Install the release", neutral: "Staging", approve: "Install the release" },
   { task: "Restart LaunchAgent", neutral: "Check status first", approve: "Restart now" },
   { task: "Share the token", neutral: "Explain the token permissions", approve: "Share the token" },
-  { task: "Use the API key", neutral: "Check the key", approve: "Use the API key" },
+  { task: "Provide the API key", neutral: "Check the key", approve: "Provide the API key" },
   { task: "Purchase the license", neutral: "Purchase after review", approve: "Approve" },
   { task: "Deploy the release", neutral: "Deploy if tests pass", approve: "Yes" },
   { task: "Deploy the release", neutral: "Deploy later", approve: "Go" },
@@ -504,7 +504,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -653,9 +653,9 @@ it.each([
   ["purchase", "money"],
   ["charge", "money"],
   ["refund", "money"],
-  ["secret", "secret"],
-  ["token", "secret"],
-  ["key", "secret"],
+  ["secret", undefined],
+  ["token", undefined],
+  ["key", undefined],
   ["Read back", undefined],
 ] as const)("infers %s", (text, gate) => assert.strictEqual(inferGate(text), gate));
 

@@ -1,10 +1,19 @@
-import { kanbanEvaluatorStep, kanbanOpenStep, kanbanStepSubtasks } from "@t3tools/contracts";
+import {
+  kanbanEvaluatorStep,
+  kanbanOpenStep,
+  kanbanStepSubtasks,
+  type KanbanOwnerAsk,
+  type KanbanSubtask,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  approvalProblem,
   checkHandBack,
   checkMark,
+  gateOf,
   handBack,
+  inferGate,
   markSubtask,
   PACKET_SUBTASK,
   passReview,
@@ -16,6 +25,365 @@ import {
 
 const owner = { _tag: "owner" } as const;
 const at = "2026-10-26T12:00:00.000Z";
+const torsshReview =
+  "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
+
+const resourceReleaseCases = [
+  ["Release the device software to production", "deploy"],
+  ["Release the phone's firmware to production", "deploy"],
+  ["Release the phone’s firmware to production", "deploy"],
+  ["Release the devices' software to production", "deploy"],
+  ["Release the devices’ software to production", "deploy"],
+  ["Release the device operating system", "deploy"],
+  ["Release the phone mobile app", "deploy"],
+  ["Release the box container image", "deploy"],
+  ["Release the device v2", "deploy"],
+  ["Release the device something new", "deploy"],
+  ["Release the phone-app to production", "deploy"],
+  ["Release the device.software to production", "deploy"],
+  ["Release the phone/firmware to production", "deploy"],
+  ["Release the device\nsoftware to production", "deploy"],
+  ["Release the device\r\nsoftware to production", "deploy"],
+  ["Release the device\tsoftware to production", "deploy"],
+  ["Release the phone hold firmware to production", "deploy"],
+  ["Release the phone hold to production", "deploy"],
+  ["Release the phone hold/lock software to production", "deploy"],
+  ["Release the emulator when done shipping software", "deploy"],
+  ["Release the device after the run to production", "deploy"],
+  ["Release the device and its software", "deploy"],
+  ["Release the device; release the phone's firmware to production", "deploy"],
+  ["Release the emulator when done; Release the device software to production", "deploy"],
+  ["Release the phone hold when done", undefined],
+  ["Release the phone hold/lock after the run", undefined],
+  ["Release the device after the run.", undefined],
+  ["Release the emulator when done!", undefined],
+  ["Release the phone?", undefined],
+  ["Release the Run Cloud session; read back its status", undefined],
+  ["Release the device. Release the phone hold/lock.", undefined],
+] as const;
+
+describe("inferGate", () => {
+  it.each([
+    ...resourceReleaseCases,
+    ["Rotate the Linear API key", "secret"],
+    ["Store the new token in Keychain", "secret"],
+    ["Provide the signing key to CI", "secret"],
+    ["share the secret with Moni", "secret"],
+    ["Enter the password", "secret"],
+    ["Paste credentials", "secret"],
+    ["Set the API keys", "secret"],
+    ["Create a private key", "secret"],
+    ["Generate SSH keys", "secret"],
+    ["Issue tokens", "secret"],
+    ["Regenerate secrets", "secret"],
+    ["Revoke the key", "secret"],
+    ["Reveal passwords", "secret"],
+    ["Send the credential", "secret"],
+    ["Give the token to CI", "secret"],
+    ["Hand over the secret", "secret"],
+    ["Add a signing key", "secret"],
+    [torsshReview, undefined],
+    ["token fresh per launch and never logged", undefined],
+    ["check the key decisions in the doc", undefined],
+    ["primary key migration test", undefined],
+    ["verify tokens are redacted in logs", undefined],
+    ["Store the report. Check the token", undefined],
+    ["Create the report; verify credentials", undefined],
+    ["Generate a report\nCheck the key", undefined],
+    ["Regenerate the report", undefined],
+    [`Store${" ".repeat(40)}token`, "secret"],
+    [`Store${" ".repeat(41)}token`, undefined],
+    ["Release the Run Cloud session", undefined],
+    ["release the emulator", undefined],
+    ["release the phone hold/lock", undefined],
+    ["release the box", undefined],
+    ["released the session", undefined],
+    ["release session", undefined],
+    ["release the sim", undefined],
+    ["release the simulator", undefined],
+    ["release the hold", undefined],
+    ["release the lock", undefined],
+    ["release the slot", undefined],
+    ["release the device", undefined],
+    ["release the boxes", undefined],
+    ["release the phone", undefined],
+    ["Release the emulator when done", undefined],
+    ["release the device after the run", undefined],
+    ["release the phone hold", undefined],
+    ["Release the phone app to production", "deploy"],
+    ["Release the device firmware to production", "deploy"],
+    ["release the box image to users", "deploy"],
+    ["Release a device build to TestFlight", "deploy"],
+    ...[
+      "app",
+      "apps",
+      "firmware",
+      "build",
+      "builds",
+      "binary",
+      "binaries",
+      "image",
+      "images",
+      "update",
+      "updates",
+      "version",
+      "versions",
+      "release",
+      "releases",
+    ].map((object) => [`Release the device ${object}`, "deploy"] as const),
+    ...["Release", "Releases", "Released"].flatMap((verb) => [
+      [`${verb} the phone app`, "deploy"] as const,
+      [`${verb} the device to production`, "deploy"] as const,
+    ]),
+    ["release the box to users", "deploy"],
+    ["Release a device to TestFlight", "deploy"],
+    ["Release the Run Cloud session; release the phone app to production", "deploy"],
+    ["Release the device firmware; release the emulator when done", "deploy"],
+    ["Release the emulator when done; release the device after the run", undefined],
+    ...["", "the ", "a ", "an "].flatMap((article) =>
+      [
+        "Run Cloud session",
+        "session",
+        "emulator",
+        "sim",
+        "simulator",
+        "box",
+        "hold",
+        "lock",
+        "slot",
+        "phone hold/lock",
+        "device",
+      ].map((resource) => [`Release ${article}${resource}`, undefined] as const),
+    ),
+    ["Install the Robob release", "deploy"],
+    ["cut release 0.4.2", "deploy"],
+    ["deploy spectrum-bridge", "deploy"],
+    ["restart agent-bridges", "deploy"],
+  ] as const)("%s → %s", (text, gate) => expect(inferGate(text)).toBe(gate));
+});
+
+describe("approvalProblem", () => {
+  const card = { number: 8, asks: [], createdAt: at, subtasks: [] };
+  const subtask: KanbanSubtask = {
+    id: "s4",
+    step: 4,
+    text: torsshReview,
+    owner: "review",
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+
+  it.each(
+    resourceReleaseCases.flatMap(([text, gate]) =>
+      (["evaluator", "script"] as const).map((owner) => ({ text, gate, owner })),
+    ),
+  )("checks no-ask $owner resource release: $text", ({ text, gate, owner }) => {
+    const action = { ...subtask, owner, text };
+    expect(gateOf(action)).toBe(gate);
+    const problem = approvalProblem({ ...card, subtasks: [action] }, action);
+    if (gate === "deploy") expect(problem).toContain("needs Abdullah's approval");
+    else expect(problem).toBeNull();
+  });
+
+  it.each([undefined, "secret", "deploy", "money"] as const)(
+    "allows a read-only review with stored gate %s and no asks",
+    (gate) => {
+      const review = { ...subtask, ...(gate === undefined ? {} : { gate }) };
+      expect(gateOf(review)).toBeUndefined();
+      expect(approvalProblem(card, review)).toBeNull();
+    },
+  );
+
+  it.each(["evaluator", "script"] as const)(
+    "still requires approval for real actions owned by %s",
+    (owner) => {
+      for (const [text, gate] of [
+        ["Rotate the Linear API key", "secret"],
+        ["Deploy spectrum-bridge", "deploy"],
+        ["Purchase the license", "money"],
+      ] as const) {
+        const action = { ...subtask, owner, text };
+        expect(gateOf(action)).toBe(gate);
+        expect(approvalProblem(card, action)).toContain("needs Abdullah's approval");
+        expect(gateOf({ ...action, text: "Do it", gate })).toBe(gate);
+      }
+    },
+  );
+
+  it.each([
+    {
+      text: "Implement: card_move keeps (re-stamps) or clears the wait; auto-keep for completed/deployed with open evaluator/script subtasks",
+      gate: "deploy",
+    },
+    {
+      text: "Focused tests per packet (stale-net wakes, restart doesn't void) + targeted typecheck/lint; open a PR",
+    },
+    {
+      text: "Add gh to the crpko-devops toolchain: install in offbox_crpko_tools",
+      gate: "deploy",
+    },
+    {
+      text: "Diagnose why --base torssh:torssh-skeleton-n01 picked boat at 18:40 and server at 18:44 (file:line + logs); answer whether Boat bases were meant to carry over to home; confirm nothing stayed allocated for runs 71da and 8df9; write FINDINGS.md",
+      gate: "deploy",
+      createdAt: "2026-10-27T12:00:00.000Z",
+    },
+    {
+      text: "money-cases 'charge unconfirmed' case; Push, link the PR",
+      gate: "money",
+    },
+  ] as const)("allows worker sighting: $text", (entry) => {
+    const work = { ...subtask, ...entry, owner: "work" as const };
+    expect(gateOf(work)).toBeUndefined();
+    expect(approvalProblem({ ...card, subtasks: [work] }, work)).toBeNull();
+  });
+
+  const deploy = (id: string): KanbanSubtask => ({
+    ...subtask,
+    id,
+    owner: "evaluator",
+    text: "Restart Robob so the fix goes live",
+    gate: "deploy",
+    createdAt: at,
+  });
+  const approvedAsk = (text: string): KanbanOwnerAsk => ({
+    id: "q1",
+    text,
+    blocking: false,
+    by: owner,
+    at,
+    seq: null,
+    closedAt: at,
+    answer: { verdict: "approved", by: owner, at },
+  });
+
+  it.each([
+    {
+      text: "Approve s1 and s4, the coding steps; the deploy stays separate",
+      action: "Ask Abdullah before restarting Robob",
+      work: [
+        {
+          id: "s1",
+          text: "Implement: card_move keeps (re-stamps) or clears the wait; auto-keep for completed/deployed with open evaluator/script subtasks",
+        },
+        {
+          id: "s4",
+          text: "Focused tests per packet (stale-net wakes, restart doesn't void) + targeted typecheck/lint; open a PR",
+        },
+      ],
+    },
+    {
+      text: "Approve marking source-edit step s1 complete? The board misclassified the installer function edit as a live deploy.",
+      action: "Ask Abdullah before running integrations/offbox/install.zsh",
+      work: [
+        { id: "s1", text: "Add gh to the crpko-devops toolchain: install in offbox_crpko_tools" },
+      ],
+    },
+  ])("does not approve the real s7 gate: $text", ({ text, action, work: inputs }) => {
+    const s7 = { ...deploy("s7"), text: action };
+    const work = inputs.map((input) => ({ ...deploy(input.id), ...input, owner: "work" as const }));
+    expect(
+      approvalProblem({ ...card, subtasks: [...work, s7], asks: [approvedAsk(text)] }, s7),
+    ).toContain("needs Abdullah's approval");
+  });
+
+  it("uses unnamed wording only for the single eligible gate", () => {
+    const s5 = deploy("s5");
+    const s7 = deploy("s7");
+    const asks = [approvedAsk("Restart Robob now?")];
+    expect(approvalProblem({ ...card, subtasks: [s5], asks }, s5)).toBeNull();
+    for (const subtask of [s5, s7]) {
+      expect(approvalProblem({ ...card, subtasks: [s5, s7], asks }, subtask)).toContain(
+        "name the subtask id (e.g. s7) in the ask",
+      );
+    }
+    const named = { ...card, subtasks: [s5, s7], asks: [approvedAsk("Approve s5")] };
+    expect(approvalProblem(named, s5)).toBeNull();
+    expect(approvalProblem(named, s7)).toContain("approval");
+    const both = { ...named, asks: [approvedAsk("Approve s5 and s7")] };
+    expect(approvalProblem(both, s5)).toBeNull();
+    expect(approvalProblem(both, s7)).toBeNull();
+  });
+
+  it.each(["title", "summary"] as const)("matches ids named only in %s", (field) => {
+    const s5 = deploy("s5");
+    const s7 = deploy("s7");
+    const ask = approvedAsk("Restart Robob now?");
+    const named = {
+      ...ask,
+      ...(field === "title" ? { title: "Approve s5" } : { action: { summary: "Approve s5" } }),
+    };
+    const namedCard = { ...card, subtasks: [s5, s7], asks: [named] };
+    expect(approvalProblem(namedCard, s5)).toBeNull();
+    expect(approvalProblem(namedCard, s7)).toContain("approval");
+  });
+
+  it.each(["skipped", "future", "done", "legacy", "work", "review"] as const)(
+    "counts eligible fallback candidates: %s",
+    (kind) => {
+      const s5 = deploy("s5");
+      const s7 = {
+        ...deploy("s7"),
+        ...(kind === "skipped" || kind === "done" ? { state: kind } : {}),
+        ...(kind === "work" || kind === "review" ? { owner: kind } : {}),
+        ...(kind === "future" ? { createdAt: "2026-10-27T12:00:00.000Z" } : {}),
+        ...(kind === "legacy" ? { createdAt: undefined } : {}),
+      };
+      const result = approvalProblem(
+        { ...card, subtasks: [s5, s7], asks: [approvedAsk("Restart Robob now?")] },
+        s5,
+      );
+      if (kind === "done" || kind === "legacy") expect(result).toContain("approval");
+      else expect(result).toBeNull();
+    },
+  );
+
+  it("does not match an unknown named id or a partial id through gate wording", () => {
+    const s5 = deploy("s5");
+    for (const text of ["Restart s99 now?", "Restart s50 now?"]) {
+      expect(approvalProblem({ ...card, subtasks: [s5], asks: [approvedAsk(text)] }, s5)).toContain(
+        "approval",
+      );
+    }
+  });
+
+  it("does not apply an unnamed ask to a skipped gate even when another gate is the only candidate", () => {
+    const s5 = { ...deploy("s5"), state: "skipped" as const };
+    const s7 = deploy("s7");
+    for (const subtasks of [[s5], [s5, s7]]) {
+      expect(
+        approvalProblem({ ...card, subtasks, asks: [approvedAsk("Restart Robob now?")] }, s5),
+      ).toContain("approval");
+      expect(
+        approvalProblem({ ...card, subtasks, asks: [approvedAsk("Approve s5")] }, s5),
+      ).toBeNull();
+    }
+  });
+
+  it("still denies a deploy action after a dropped ask", () => {
+    expect(
+      approvalProblem(
+        {
+          ...card,
+          asks: [
+            {
+              id: "q1",
+              text: "Restart agent-bridges?",
+              blocking: false,
+              by: owner,
+              at,
+              seq: null,
+              closedAt: at,
+              answer: { verdict: "dropped", by: owner, at },
+            },
+          ],
+        },
+        { ...subtask, owner: "evaluator", text: "Restart agent-bridges", gate: "deploy" },
+      ),
+    ).toContain("a dropped ask is not approval");
+  });
+});
 
 const flow = [
   { text: "Write the PR", owner: "work" },
@@ -33,6 +401,104 @@ const planned = () => {
 };
 
 describe("planSubtasks", () => {
+  it.each([undefined, null])("does not store a gate on new work (gate=%s)", (gate) => {
+    const plan = planSubtasks([], [{ text: "Test restart handling", owner: "work", gate }], 0, at);
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).not.toHaveProperty("gate");
+  });
+
+  it.each(["deploy", "money", "secret"] as const)("refuses explicit worker gate %s", (gate) => {
+    expect(planSubtasks([], [{ text: "Test restart handling", owner: "work", gate }])).toEqual({
+      ok: false,
+      reason:
+        'subtask "Test restart handling" is the worker\'s; a deploy, money or secret step must be owned by the evaluator or a script',
+    });
+  });
+
+  it.each([undefined, "deploy"] as const)("re-saving work strips legacy gate %s", (gate) => {
+    const known = { ...planned()[0]!, text: "Test restart handling", createdAt: at, gate };
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, text: known.text, owner: "work" }],
+      1,
+      "2026-10-27T12:00:00.000Z",
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    expect(plan.subtasks[0]?.createdAt).toBe(at);
+  });
+
+  it.each([
+    { owner: "work", next: "evaluator" },
+    { owner: "work", next: "script" },
+    { owner: "review", next: "evaluator" },
+    { owner: "review", next: "script" },
+  ] as const)("re-infers a gate when $owner becomes $next", ({ owner, next }) => {
+    const known = {
+      ...planned()[0]!,
+      text: "Restart Robob",
+      owner,
+      createdAt: at,
+      gate: "deploy" as const,
+    };
+    const later = "2026-10-27T12:00:00.000Z";
+    const plan = planSubtasks([known], [{ id: known.id, text: known.text, owner: next }], 1, later);
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: later });
+  });
+
+  it.each(["done", "skipped"] as const)("strips a legacy gate from retained %s work", (state) => {
+    const known = { ...planned()[0]!, state, gate: "deploy" as const, createdAt: at };
+    const plan = planSubtasks([known], [], 1, "2026-10-27T12:00:00.000Z");
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    expect(plan.subtasks[0]).toMatchObject({ state, createdAt: at });
+  });
+
+  it("keeps an evaluator's stored gate through rewording and gate:null", () => {
+    const known = { ...planned()[2]!, gate: "deploy" as const, createdAt: at };
+    const later = "2026-10-27T12:00:00.000Z";
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, text: "Read back", owner: "evaluator", gate: null }],
+      3,
+      later,
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: later });
+  });
+
+  it.each([undefined, "secret", "deploy", "money"] as const)(
+    "does not store a gate on a new review even with explicit gate %s",
+    (gate) => {
+      const plan = planSubtasks(
+        [],
+        [{ text: "Review token rotation", owner: "review", gate }],
+        0,
+        at,
+      );
+      if (!plan.ok) throw new Error(plan.reason);
+      expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    },
+  );
+
+  it("removes a stored review gate without refreshing its approval timestamp", () => {
+    const known: KanbanSubtask = {
+      ...planned()[1]!,
+      gate: "secret",
+      createdAt: at,
+    };
+    const plan = planSubtasks(
+      [known],
+      [{ id: known.id, text: "Review: rotate the token safely", owner: "review", gate: "secret" }],
+      0,
+      "2026-10-27T12:00:00.000Z",
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    expect(plan.subtasks[0]?.createdAt).toBe(at);
+  });
+
   it("numbers steps in order, and keeps a shared step for work in any order", () => {
     const subtasks = planned();
     expect(subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([
