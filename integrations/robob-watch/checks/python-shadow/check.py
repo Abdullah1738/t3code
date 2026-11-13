@@ -100,6 +100,19 @@ def save(path, state):
     temporary.replace(path)
 
 
+def runner_state(watch_dir):
+    try:
+        state = json.loads((watch_dir / "state.json").read_text())
+    except FileNotFoundError:
+        return {"fires": 0}
+    if not isinstance(state, dict):
+        raise ValueError("runner state must be an object")
+    fires = state.get("fires", 0)
+    if type(fires) is not int or fires < 0:
+        raise ValueError("runner delivery counter must be a nonnegative integer")
+    return {**state, "fires": fires}
+
+
 def check(watch_dir, report, run_id):
     path = watch_dir / "shadow-seen.json"
     current = {item["key"] for item in report["findings"]}
@@ -107,10 +120,17 @@ def check(watch_dir, report, run_id):
         save(path, {"seen": sorted(current)})
         return ""
     state = json.loads(path.read_text())
+    runner = runner_state(watch_dir)
     pending = state.get("pending")
     if pending:
         ack = watch_dir / ".run-ok"
-        if ack.exists() and ack.read_text().strip() == pending["run"]:
+        acknowledged = ack.exists() and ack.read_text().strip() == pending["run"]
+        owned = (runner.get("pending") or {}).get("event") == pending["event"]
+        # The runner can crash after persisting pending but before writing .run-ok,
+        # then deliver before it calls this check again. This watcher's fires counter
+        # only advances on delivery; retain its original value across outbox replays.
+        delivered = type(pending.get("fires")) is int and runner["fires"] > pending["fires"]
+        if acknowledged or owned or delivered:
             state["seen"] = sorted(set(state["seen"]) | set(pending["keys"]))
             del state["pending"]
         else:
@@ -131,7 +151,7 @@ def check(watch_dir, report, run_id):
         keys.append(item["key"])
     event = "\n".join(lines) if keys else ""
     if keys:
-        state["pending"] = {"run": run_id, "keys": keys, "event": event}
+        state["pending"] = {"run": run_id, "keys": keys, "event": event, "fires": runner["fires"]}
     save(path, state)
     return event
 

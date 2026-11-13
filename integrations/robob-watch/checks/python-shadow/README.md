@@ -45,9 +45,12 @@ records a silent baseline, as required by the watcher contract. Run
 
 The runner supplies `WATCH_DIR` and `WATCH_RUN`. New or changed candidates alert
 once per path/device/inode/size/mtime fingerprint. The outbox replays until the
-runner's `.run-ok` acknowledges acceptance; the runner owns delivery retries after
-that. Batches stay below 4,000 characters and remaining candidates follow on later
-runs. State lives only in `WATCH_DIR`; findings are never deleted, renamed or moved.
+runner's `.run-ok` acknowledges acceptance, its persisted pending event matches,
+or its `fires` counter advances beyond the value saved with the outbox. Those last
+two signals cover a crash between saving the runner's event and writing its ack;
+the runner owns delivery retries after acceptance. Batches stay below 4,000
+characters and remaining candidates follow on later runs. State lives only in
+`WATCH_DIR`; findings are never deleted, renamed or moved.
 `robob-watch test` supplies a scratch `WATCH_DIR` without `WATCH_RUN`; that path
 gets a unique manual run identifier and never acknowledges the live state.
 This is detection, not an execution guard, and it is not a substitute for `-I` on

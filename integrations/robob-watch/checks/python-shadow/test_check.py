@@ -71,6 +71,87 @@ class ShadowCheckTests(unittest.TestCase):
         self.assertIn("requests.py", self.run_check("r4"))
         self.assertTrue((self.root / "queue.py").exists())
 
+    def test_runner_acceptance_and_crash_windows(self):
+        cases = [
+            ("no-runner-state", None, None, None, True),
+            ("unchanged-fires", 7, {"fires": 7}, None, True),
+            ("old-delivery", 7, {"fires": 7, "last_fire_at": "2026-11-12T12:00:00Z"}, None, True),
+            ("check-failed", 7, {"fires": 7, "consecutive_failures": 5}, None, True),
+            ("unrelated-pending", 7, {"fires": 7, "pending": {"event": "another event"}}, None, True),
+            ("stale-ack", 7, {"fires": 7}, "older-run", True),
+            ("accepted-ack", 7, {"fires": 7}, "r1", False),
+            ("accepted-before-ack", 7, {"fires": 7, "pending": {"event": "MATCH"}}, None, False),
+            ("first-delivery-before-ack", None, {"fires": 1, "last_fire_at": "2026-11-13T00:01:00Z"}, None, False),
+            ("delivered-before-ack", 7, {"fires": 8, "last_fire_at": "2026-11-13T00:01:00Z"}, None, False),
+        ]
+        for name, initial_fires, runner_after, ack, replay in cases:
+            with self.subTest(name=name):
+                watch_dir = self.base / name
+                watch_dir.mkdir()
+                root = watch_dir / "scratch"
+                root.mkdir()
+                runner_file = watch_dir / "state.json"
+                if initial_fires is not None:
+                    runner_file.write_text(json.dumps({"fires": initial_fires}))
+                self.assertEqual(check.check(watch_dir, check.scan([root]), "r0"), "")
+                (root / "queue.py").write_text("must never execute")
+                first = check.check(watch_dir, check.scan([root]), "r1")
+                self.assertIn("queue.py", first)
+                if runner_after is not None:
+                    if name == "accepted-before-ack":
+                        runner_after["pending"]["event"] = first
+                    runner_file.write_text(json.dumps(runner_after))
+                if ack is not None:
+                    (watch_dir / ".run-ok").write_text(ack)
+                self.assertEqual(check.check(watch_dir, check.scan([root]), "r2"), first if replay else "")
+                if replay:
+                    (watch_dir / ".run-ok").write_text("r2")
+                self.assertEqual(check.check(watch_dir, check.scan([root]), "r3"), "")
+                # Acceptance of the old batch must not swallow a later finding.
+                (root / "requests.py").write_text("must never execute")
+                next_event = check.check(watch_dir, check.scan([root]), "r4")
+                self.assertIn("requests.py", next_event)
+                self.assertNotIn("queue.py", next_event)
+
+    def test_delivery_after_replayed_output_without_ack(self):
+        runner_file = self.state / "state.json"
+        runner_file.write_text(json.dumps({"fires": 3}))
+        self.assertEqual(self.run_check("r0"), "")
+        self.touch("queue.py")
+        first = self.run_check("r1")
+        self.assertEqual(self.run_check("r2"), first)
+        runner_file.write_text(json.dumps({"fires": 4, "last_fire_at": "2026-11-13T00:01:00Z"}))
+        self.assertEqual(self.run_check("r3"), "")
+        self.assertEqual(self.run_check("r4"), "")
+
+    def test_invalid_runner_state_does_not_advance_outbox(self):
+        self.assertEqual(self.run_check("r0"), "")
+        self.touch("queue.py")
+        first = self.run_check("r1")
+        outbox = (self.state / "shadow-seen.json").read_bytes()
+        for runner in ["not json", "[]", '{"fires": "1"}', '{"fires": true}', '{"fires": -1}']:
+            with self.subTest(runner=runner):
+                (self.state / "state.json").write_text(runner)
+                with self.assertRaises(ValueError):
+                    self.run_check("r2")
+                self.assertEqual((self.state / "shadow-seen.json").read_bytes(), outbox)
+        (self.state / "state.json").write_text('{"fires": 0}')
+        self.assertEqual(self.run_check("r3"), first)
+
+    def test_legacy_outbox_without_counter_needs_acceptance_evidence(self):
+        self.assertEqual(self.run_check("r0"), "")
+        self.touch("queue.py")
+        first = self.run_check("r1")
+        path = self.state / "shadow-seen.json"
+        outbox = json.loads(path.read_text())
+        del outbox["pending"]["fires"]
+        path.write_text(json.dumps(outbox))
+        runner_file = self.state / "state.json"
+        runner_file.write_text('{"fires": 7}')
+        self.assertEqual(self.run_check("r2"), first)
+        runner_file.write_text(json.dumps({"fires": 7, "pending": {"event": first}}))
+        self.assertEqual(self.run_check("r3"), "")
+
     def test_changed_file_alerts_again_and_unreadable_root_does_not_advance(self):
         self.assertEqual(self.run_check("r0"), "")
         file = self.touch("inspect.py")
