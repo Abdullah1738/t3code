@@ -140,6 +140,13 @@ class ShellJobsTests(unittest.TestCase):
    def check():
     return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=15).returncode
    self.assertEqual(check(),0)
+   if installer == HERE/'install-jobs.zsh':
+    for name in ('backup_control.py','redact_lock.py'):
+     guard=home/'.local/share/memory-system/src'/name
+     original=guard.read_text()
+     guard.chmod(0o755);self.assertNotEqual(check(),0);guard.chmod(0o644)
+     guard.write_text('stale guard');self.assertNotEqual(check(),0)
+     guard.write_text(original);self.assertEqual(check(),0)
    for relative in files:
     with self.subTest(installer=str(installer),file=relative):
      path=home/relative

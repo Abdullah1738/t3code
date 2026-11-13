@@ -129,7 +129,8 @@ class LoggingTests(unittest.TestCase):
         a,b=self.rows()
         self.assertEqual(a['props']['bytes'],123)
         self.assertEqual(a['props']['files'],4)
-        self.assertEqual(b['props']['snapshotAgeS'],11)
+        self.assertEqual(a['props']['snapshotAgeS'],1)
+        self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
         self.assertNotIn('password',str(self.rows()))
 
