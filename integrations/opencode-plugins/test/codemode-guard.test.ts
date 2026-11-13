@@ -113,7 +113,7 @@ test("the registered hook rewrites only execute, preserving the rest of its inpu
   expect(() => new Function(bad.input.code!)()).toThrow("Code Mode has no timers");
   expect(records).toHaveLength(1);
   expect(records[0]).toMatchObject({ event: "deny", session: "ses_test" });
-  expect(String(records[0].code)).toHaveLength(300);
+  expect(records[0].code).toBeUndefined();
 });
 
 test("off mode leaves invalid waits alone", async () => {

@@ -10,7 +10,7 @@ case "${1:-}" in
   *) print -u2 'usage: install.zsh [--dry-run]'; exit 2 ;;
 esac
 (( $# <= 1 )) || { print -u2 'usage: install.zsh [--dry-run]'; exit 2; }
-rsync "${flags[@]}" \
+rsync --copy-unsafe-links "${flags[@]}" \
   --exclude __pycache__ --exclude '*.pyc' --exclude tests --exclude .gitignore \
   "$pkg/" "$dst/"
 # The hooks call Robob's control API with their own component credential. Without it every

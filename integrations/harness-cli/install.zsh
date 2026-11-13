@@ -55,7 +55,7 @@ fi
 (cd "$pkg" && "$py" -m unittest discover -s tests >/dev/null)
 
 mkdir -p "$dst" "$HOME/.robob/harness-cli/logs"
-rsync -a --itemize-changes \
+rsync --copy-unsafe-links -a --itemize-changes \
   --exclude __pycache__ --exclude tests --exclude README.md --exclude install.zsh \
   --exclude launchd --exclude '*.bak*' \
   "$pkg/" "$dst/"

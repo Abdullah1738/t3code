@@ -64,14 +64,77 @@
     {"harness": "codex", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
   ],
   "paritySources": {
-    "hook-adapters": ["../harness-hooks/src/claude.py", "../harness-hooks/src/codex.py"],
-    "rootwide-search": ["../harness-hooks/src/rootwide_search_guard.py", "../harness-hooks/src/engine.py", {"source": "../opencode-plugins/plugin/rootwide-search-guard.ts", "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"}],
-    "live-database": ["../harness-hooks/src/statev2_guard.py", "../harness-hooks/src/engine.py"],
-    "offbox": ["../harness-hooks/src/engine.py", "../harness-hooks/src/offbox_toollog.py", {"source": "../offbox/skill/scripts/toollog.py", "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.py"}, {"source": "../offbox/skill/scripts/toollog.ts", "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.ts"}, {"source": "../offbox/plugin/offbox-gate.ts", "installed": "~/.config/opencode/plugin/offbox-gate.ts"}, {"source": "../offbox/skill/scripts/classify.py", "installed": "~/.config/opencode/skills/remote-compute/scripts/classify.py"}, {"source": "../offbox/skill/heavy-rules.json", "installed": "~/.config/opencode/skills/remote-compute/heavy-rules.json"}],
-    "betterstack-scope": ["../harness-hooks/src/engine.py"],
-    "coord-haiku": ["../harness-hooks/src/engine.py", "../harness-hooks/src/coord_shim.py"],
-    "desktop-lease": ["../harness-hooks/src/desktop_lease.py"],
-    "recall": ["../memory-system/hooks/recall_hook.py"]
+    "hook-adapters": [
+      "../harness-hooks/src/claude.py",
+      "../harness-hooks/src/codex.py"
+    ],
+    "rootwide-search": [
+      "../harness-hooks/src/rootwide_search_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/rootwide-search-guard.ts",
+        "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"
+      }
+    ],
+    "live-database": [
+      "../harness-hooks/src/statev2_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/statev2-guard.ts",
+        "installed": "~/.config/opencode/plugin/statev2-guard.ts"
+      }
+    ],
+    "offbox": [
+      "../harness-hooks/src/engine.py",
+      "../harness-hooks/src/offbox_toollog.py",
+      {
+        "source": "../offbox/skill/scripts/toollog.py",
+        "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.py"
+      },
+      {
+        "source": "../offbox/skill/scripts/toollog.ts",
+        "installed": "~/.config/opencode/skills/remote-compute/scripts/toollog.ts"
+      },
+      {
+        "source": "../offbox/skill/scripts/classify.py",
+        "installed": "~/.config/opencode/skills/remote-compute/scripts/classify.py"
+      },
+      {
+        "source": "../offbox/skill/heavy-rules.json",
+        "installed": "~/.config/opencode/skills/remote-compute/heavy-rules.json"
+      },
+      {
+        "source": "../offbox/plugin/offbox-gate.ts",
+        "installed": "~/.config/opencode/plugin/offbox-gate.ts"
+      }
+    ],
+    "betterstack-scope": [
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/betterstack-scope.ts",
+        "installed": "~/.config/opencode/plugin/betterstack-scope.ts"
+      }
+    ],
+    "coord-haiku": [
+      "../harness-hooks/src/engine.py",
+      "../harness-hooks/src/coord_shim.py"
+    ],
+    "desktop-lease": [
+      "../harness-hooks/src/desktop_lease.py"
+    ],
+    "recall": [
+      "../memory-system/hooks/recall_hook.py"
+    ],
+    "toollog": [
+      {
+        "source": "../local-helpers/libexec/toollog/toollog.py",
+        "installed": "~/.local/libexec/toollog/toollog.py"
+      },
+      {
+        "source": "../opencode-plugins/lib/toollog.ts",
+        "installed": "~/.config/opencode/lib/toollog.ts"
+      }
+    ]
   },
   "codexModels": {
     "catalogSource": "vendor/codex-models-0.166.0.json",

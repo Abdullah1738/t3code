@@ -123,7 +123,7 @@ elif command == 'bootstrap':
  marker.write_text(Path(sys.argv[3]).read_text())
 else: raise SystemExit(2)
 ''', executable=True)
-        self.env = {**os.environ, "HOME": str(self.home), "TMPDIR": str(root),
+        self.env = {**os.environ, "HARNESS_HOMES_PYTHON": sys.executable, "HOME": str(self.home), "TMPDIR": str(root),
                     "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
                     "FAILURE": failure, "FAKE_LAUNCHD": str(self.state),
                     "LAUNCHCTL_LOG": str(self.log), "SLEEP_LOG": str(self.sleeps),
@@ -172,7 +172,7 @@ class SharedInstallTests(unittest.TestCase):
                   "import os, subprocess, sys\nfrom pathlib import Path\n" +
                   "with Path(os.environ['RSYNC_LOG']).open('a') as log: log.write(repr(sys.argv[1:])+'\\n')\n" +
                   f"raise SystemExit(subprocess.call([{shutil.which('rsync')!r}, *sys.argv[1:]]))\n", executable=True)
-            env = {**os.environ, "HOME": str(home), "TMPDIR": str(root), "RSYNC_LOG": str(rsync_log),
+            env = {**os.environ, "HARNESS_HOMES_PYTHON": sys.executable, "HOME": str(home), "TMPDIR": str(root), "RSYNC_LOG": str(rsync_log),
                    "LAUNCHCTL_LOG": str(launchctl_log),
                    "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
 

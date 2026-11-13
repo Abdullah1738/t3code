@@ -98,5 +98,5 @@ test.skipIf(!hasZsh)("installed plugin loads its helper, logs a denial and reloa
   const records = result.output.trim().split("\n").map(line => JSON.parse(line));
   expect(records.filter(row => row.event === "deny")).toHaveLength(3);
   expect(records.filter(row => row.event === "hook-error")).toHaveLength(1);
-  expect(records[0]).toMatchObject({ session: "ses_fixture", code: "await new Promise(r=>r)" });
+  expect(records[0]).toMatchObject({ session: "ses_fixture" });
 });

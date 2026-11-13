@@ -138,6 +138,7 @@ exit 0
         self.assertEqual(rc, 0, err)
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
+                    ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     "Library/LaunchAgents/com.ardud.9router-log-poll.plist",

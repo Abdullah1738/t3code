@@ -3,14 +3,39 @@
 import json
 import re
 import sys
+import time
+from functools import wraps
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import generate_homes as gh
+import toollog
 from opencode import SHARED_IDS
 
 
+def logged_probe(fn):
+    @wraps(fn)
+    def run(url, name):
+        started = time.perf_counter()
+        ok = False
+        tag = None
+        try:
+            result = fn(url, name)
+            ok = True
+            return result
+        except Exception as exc:
+            tag = 'mcp.timeout' if isinstance(exc, TimeoutError) or isinstance(getattr(exc, 'reason', None), TimeoutError) else 'mcp.start_failed'
+            raise
+        finally:
+            toollog.emit('mcp', 'perf' if ok else 'error', 'mcp.probe', ok=ok,
+                         duration_ms=(time.perf_counter() - started) * 1000,
+                         ids={'home': 'shared', 'serverId': name}, error_tag=tag,
+                         props={'toolCount': len(result) if ok else 0})
+    return run
+
+
+@logged_probe
 def probe(url, name):
     def rpc(method, params, request_id=None):
         message = {"jsonrpc": "2.0", "method": method, "params": params}

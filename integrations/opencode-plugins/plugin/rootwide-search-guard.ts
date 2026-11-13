@@ -1,15 +1,16 @@
+import { hook as toolLogHook } from "../lib/toollog";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const classifier = join(homedir(), ".local/share/harness-hooks/src/rootwide_search_guard.py");
 type Input = { command?: unknown; cmd?: unknown; workdir?: string; cwd?: string; [key: string]: unknown };
-type Event = { tool: string; input?: Input };
+type Event = { tool: string; sessionID?: string; input?: Input };
 type Verdict = { root: string | null; reason: string | null };
 
-export function classify(command: string, cwd: string, script = classifier): Promise<Verdict> {
+export function classify(command: string, cwd: string, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
   return new Promise((resolve, reject) => {
-    const child = spawn("/opt/homebrew/bin/python3", [script], { stdio: ["pipe", "pipe", "ignore"] });
+    const child = spawn(python, [script], { stdio: ["pipe", "pipe", "ignore"] });
     let output = "";
     const timer = setTimeout(() => { child.kill(); reject(new Error("rootwide search classifier timed out")); }, 2000);
     child.stdout.setEncoding("utf8");
@@ -37,9 +38,11 @@ export function createGuardHook(directory: string, check = classify) {
     if (!input || typeof command !== "string" || !command) return;
     // Like the existing OpenCode DB guard, rewrite before the shell executes.
     // The native hooks and this adapter share the exact operand parser.
+    const started = performance.now();
     let verdict: Verdict;
     try { verdict = await check(command, input.workdir ?? input.cwd ?? directory); }
-    catch { return; }
+    catch { toolLogHook("rootwide-search", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}); return; }
+    toolLogHook("rootwide-search", verdict.root && verdict.reason ? "denied" : "allowed", "rootwide-search", started, command, undefined, {sessionId:event.sessionID});
     if (verdict.root && verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 3`, background: false };
     }

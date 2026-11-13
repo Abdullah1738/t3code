@@ -11,8 +11,9 @@ const cases: { command: string; cwd: string; root: string | null; approved?: str
 
 for (const row of cases) test(`shared corpus: ${row.command} [${row.cwd}]`, async () => {
   const check = async (command: string, cwd: string) => {
-    const result = spawnSync("/opt/homebrew/bin/python3", [source], {
+    const result = spawnSync(process.env.HARNESS_TEST_PYTHON ?? "/opt/homebrew/bin/python3", [source], {
       input: JSON.stringify({ command, cwd, approved: row.approved ?? "" }), encoding: "utf8",
+      env: {...process.env, HOME: "/Users/ardud"},
     });
     expect(result.status).toBe(0);
     return JSON.parse(result.stdout);
@@ -51,12 +52,13 @@ test("registration, cwd fallback, cmd shape and non-shell text", async () => {
 
 
 test("async Python transport returns refusals and allowed verdicts", async () => {
-  const refusal = await classify("rg --files /Volumes/ExternalSSD", "/tmp", source);
+  const refusal = await classify("rg --files /Volumes/ExternalSSD", "/tmp", source, process.env.HARNESS_TEST_PYTHON);
   expect(refusal.root).toBe("/Volumes/ExternalSSD");
   expect(refusal.reason).not.toContain("ovnfs");
   expect(refusal.reason).not.toContain("/Users/ardud/checkouts");
-  expect((await classify("rg --files /Users/ardud/checkouts", "/tmp", source)).root).toBeNull();
-  expect((await classify("rg foo /Volumes/ExternalSSD/t3code-fork-wt/task-1", "/tmp", source)).root).toBeNull();
+  expect((await classify("rg --files /Users/ardud/checkouts", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
+  expect((await classify("rg foo /Users/ardud/checkouts/task-1", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
+  expect((await classify("rg foo /Volumes/ExternalSSD/t3code-fork-wt/task-1", "/tmp", source, process.env.HARNESS_TEST_PYTHON)).root).toBeNull();
 });
 
 test("a classifier error does not turn non-search commands into refusals", async () => {
