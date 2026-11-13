@@ -502,6 +502,8 @@ export function layerWithRegistry<Error>(
     Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
+        layerStores,
+        layerEventSinkProvided,
         layerRunFinalizationServiceProvided,
         McpSessionRegistryTestkit.layer,
         layerCheckpointRollbackServiceProvided,

@@ -73,6 +73,51 @@ const countEntries = (sql: SqlClient.SqlClient) =>
 const layer = it.layer(SqliteClient.layer({ filename: ":memory:" }));
 
 layer("NodeSqliteClient", (it) => {
+  it.effect(
+    "observes only successful outer commits and keeps observer errors out of SQL results",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        let commits = 0;
+        yield* sql`CREATE TABLE observed_commits(value TEXT)`;
+        const observe = () => {
+          commits += 1;
+        };
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO observed_commits VALUES ('outer')`;
+              yield* sql.withTransaction(sql`INSERT INTO observed_commits VALUES ('nested')`);
+              assert.equal(commits, 0);
+            }),
+          )
+          .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observe));
+        assert.equal(commits, 1);
+        yield* sql
+          .withTransaction(
+            sql`INSERT INTO observed_commits VALUES ('rolled back')`.pipe(
+              Effect.andThen(Effect.fail("rollback")),
+            ),
+          )
+          .pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
+            Effect.result,
+          );
+        assert.equal(commits, 1);
+        yield* sql
+          .withTransaction(sql`INSERT INTO observed_commits VALUES ('observer throws')`)
+          .pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+              throw new Error("observer");
+            }),
+          );
+        assert.deepEqual(yield* sql`SELECT value FROM observed_commits`, [
+          { value: "outer" },
+          { value: "nested" },
+          { value: "observer throws" },
+        ]);
+      }),
+  );
   it.effect("retries preparing a query after the missing schema becomes available", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

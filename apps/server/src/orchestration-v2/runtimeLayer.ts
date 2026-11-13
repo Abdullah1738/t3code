@@ -346,6 +346,8 @@ const layerRestartPacingProvided = RestartPacing.layer.pipe(
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerEventSinkProvided,
+      ProjectionStore.layer,
       layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,

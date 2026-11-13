@@ -57,6 +57,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
+    // Accepted input only needs replay-safe mailbox bookkeeping on later attempts.
+    providerAccepted: Schema.optional(Schema.Boolean),
     activeTurnOnly: Schema.optional(Schema.Boolean),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
@@ -276,6 +278,7 @@ export interface EffectOutboxV2Shape {
     readonly workerId: string;
     readonly error: string;
     readonly delayMs: number;
+    readonly steerAccepted?: boolean;
     readonly refundAttempt?: boolean;
   }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly fail: (input: {
@@ -529,6 +532,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE thread_id = ${threadId}
               AND status IN ('pending', 'running')
               AND effect_type IN ${sql.in(effectTypes)}
+              AND NOT (effect_type = 'provider-turn.steer'
+                AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) = 1)
             RETURNING effect_id
           `;
           return rows.map(({ effect_id }) => effect_id);
@@ -575,6 +580,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             last_error = 'Cancelled because the server process ended before the effect completed.'
           WHERE status IN ('pending', 'running')
             AND effect_type IN ${sql.in(PROCESS_BOUND_EFFECT_TYPES)}
+            AND NOT (effect_type = 'provider-turn.steer'
+              AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) = 1)
           RETURNING effect_id
         `;
         const requeuedRows = yield* sql<{ readonly effect_id: string }>`
@@ -587,7 +594,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             updated_at = ${now},
             last_error = 'Requeued after the previous server process ended.'
           WHERE status = 'running'
-            AND effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)}
+            AND (effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)}
+              OR (effect_type = 'provider-turn.steer'
+                AND json_extract(payload_json, '$.providerAccepted') = 1))
           RETURNING effect_id
         `;
         if (requeuedRows.length > 0) yield* notifyAvailable(requeuedRows.length);
@@ -732,7 +741,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           ),
       ),
       retry: Effect.fn("EffectOutbox.retry")(
-        function* ({ effectId, workerId, error, delayMs, refundAttempt }) {
+        function* ({ effectId, workerId, error, delayMs, steerAccepted, refundAttempt }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           const availableAt = DateTime.formatIso(
@@ -747,6 +756,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               lease_owner = NULL,
               lease_expires_at = NULL,
               updated_at = ${nowIso},
+              payload_json = CASE
+                WHEN ${steerAccepted === true} AND effect_type = 'provider-turn.steer'
+                THEN json_set(payload_json, '$.providerAccepted', json('true'))
+                ELSE payload_json END,
               last_error = ${error}
             WHERE effect_id = ${effectId}
               AND status = 'running'
