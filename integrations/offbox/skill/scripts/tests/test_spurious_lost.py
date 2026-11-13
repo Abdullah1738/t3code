@@ -5,6 +5,7 @@ import subprocess
 from unittest.mock import patch
 
 from test_capacity import Isolated
+from tests._env import clean_env
 from offbox_lib import api, common, lease, misc, pool, reap, runs
 
 CATCH_UP_LOG = misc._catch_up_log
@@ -206,7 +207,7 @@ class SpuriousLostTests(Isolated):
             base = Path(home)/'.offbox/exit'
             base.mkdir(parents=True)
             def ssh(box,command,**kwargs):
-                return subprocess.run(['bash','-c',command],env={**os.environ,'HOME':home},capture_output=True,timeout=5)
+                return subprocess.run(['bash','-c',command],env=clean_env(HOME=home),capture_output=True,timeout=5)
             with patch.object(runs.ssh_sync,'ssh',side_effect=ssh):
                 self.assertIsNone(runs.remote_alive('bx','run-t'))
                 (base/'run-t.pid').write_text(str(os.getpid()))

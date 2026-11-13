@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import api, cli, common, lease, pool, prune, runs, ssh_sync
 from test_capacity import Isolated
 
@@ -428,7 +429,7 @@ class ProbeScriptTests(Isolated):
             if command.startswith('docker info'):
                 return completed(out=(str(root) + '\n').encode())
             return subprocess.run(['bash', '-c', command], capture_output=True,
-                                  env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH']))
+                                  env=clean_env(PATH=str(bindir) + ':' + os.environ['PATH']))
         with patch.object(ssh_sync, 'ssh', side_effect=ssh):
             self.assertIsNotNone(ssh_sync.probe_docker_root('box'))
         self.assertEqual(list(root.iterdir()), [])
@@ -437,7 +438,7 @@ class ProbeScriptTests(Isolated):
         home = Path(self.tmp.name) / 'home'
         home.mkdir()
         def ssh(bid, command, **kwargs):
-            return subprocess.run(['bash', '-c', command], env=dict(os.environ, HOME=str(home)), capture_output=True)
+            return subprocess.run(['bash', '-c', command], env=clean_env(HOME=str(home)), capture_output=True)
         with patch.object(ssh_sync, 'ssh', side_effect=ssh):
             reason, duration = ssh_sync.probe_home('box', measure_write=True)
         self.assertIsNone(reason)

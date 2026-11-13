@@ -150,8 +150,10 @@ class EngineTests(unittest.TestCase):
             db.commit()
 
     def run_adapter(self, harness, event, **env):
+        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        child_env.update(env)
         run = subprocess.run([sys.executable, str(SRC / (harness + ".py"))], input=json.dumps(event),
-                             text=True, capture_output=True, env={**os.environ, **env}, timeout=5, check=True)
+                             text=True, capture_output=True, env=child_env, timeout=5, check=True)
         self.assertEqual(run.stderr, "")
         return json.loads(run.stdout) if run.stdout else None
 
@@ -303,7 +305,8 @@ class EngineTests(unittest.TestCase):
         command = result["context"].get("updatedInput", {}).get("command", "")
         # Read the token through the shell exactly as offbox does, including the
         # wrapper's per-command export and restoration of inherited context.
-        env = {**os.environ, "CLAUDE_CODE_SESSION_ID": session}
+        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        env["CLAUDE_CODE_SESSION_ID"] = session
         run = subprocess.run(["/bin/bash", "-c", command], env=env, text=True, capture_output=True, check=True)
         return run.stdout.strip()
 
@@ -909,7 +912,8 @@ class EngineTests(unittest.TestCase):
         real_psql.write_text("#!/bin/sh\nprintf 'real-psql\\n'\n")
         real_psql.chmod(0o755)
         env = dict(os.environ)
-        for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
+        # Agent shells export the repo-node pin; fake HOMEs make its startup noisy.
+        for name in ("BASH_ENV", "ENV", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
                      "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED", engine.COMMAND_IDENTITY_ENV):
             env.pop(name, None)
         blockers = self.root / "harness-hooks/coord-blockers"

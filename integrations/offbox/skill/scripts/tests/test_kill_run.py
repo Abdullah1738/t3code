@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import ANY, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import api, cli, common, home, identity, lease, misc, pool, reap, runs, ssh_sync, start_check  # noqa: E402
 from offbox_lib.common import now  # noqa: E402
 
@@ -656,7 +657,7 @@ while True:
         rid = 'run-pending-start'
         remote_home = Path(self.tmp.name) / 'remote-home'
         remote_home.mkdir()
-        remote_env = dict(os.environ, HOME=str(remote_home))
+        remote_env = clean_env(HOME=str(remote_home))
         pending = []
         def deliver_later(box, command, **kw):
             pending.append(command)

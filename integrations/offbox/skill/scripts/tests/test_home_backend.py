@@ -324,6 +324,9 @@ class Failover(HomeFiles):
 
 
 class BoxReadinessFailover(Isolated):
+    # This fixture exercises real failover with synthetic config and a trapped execve.
+    guard_home_failover = False
+
     Exec = Failover.Exec
     run_cmd = Failover.run_cmd
     failures = Failover.failures

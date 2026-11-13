@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import runs
 from offbox_lib.runs import DOCKER_REPAIR, remote_script
 
@@ -60,7 +61,7 @@ class DockerHookFixture:
         self.tool('timeout', FAKE_TIMEOUT)
         self.script = DOCKER_REPAIR.replace('/etc/systemd/system/docker.service.d', str(self.dropin)).replace(
             '/usr/local/bin', str(self.bindir)) + '\necho USER_COMMAND\n'
-        self.env = dict(os.environ, HOME=str(self.home), CALLS=str(self.calls), STATE=str(self.state),
+        self.env = clean_env(HOME=str(self.home), CALLS=str(self.calls), STATE=str(self.state),
                         PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin')
         if start_fails:
             self.env['START_FAILS'] = '1'

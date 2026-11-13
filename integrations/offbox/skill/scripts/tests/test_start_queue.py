@@ -12,6 +12,7 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import allocation, api, capacity, cli, common, fallback, lease, outage, pool, runs
 from test_capacity import Isolated
 from test_exit_and_queue import FakeClock
@@ -57,7 +58,7 @@ class AllocationWaitTests(Isolated):
         holder = subprocess.Popen([sys.executable, '-c',
             'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); '
             'print("home held",flush=True); sys.stdin.read()', str(path)],
-            env=dict(os.environ, OFFBOX_BACKEND='server'),
+            env=clean_env(OFFBOX_BACKEND='server'),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         code = """
 import sys
@@ -77,7 +78,7 @@ with allocation.scope('repo'), allocation.guard():
             self.assertEqual(holder.stdout.readline().strip(),'home held')
             waiter = subprocess.Popen([sys.executable, '-c', code,
                 str(Path(__file__).resolve().parents[1]), self.tmp.name],
-                env=dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_POOL_WAIT_SECONDS='5'),
+                env=clean_env(OFFBOX_BACKEND='boat', OFFBOX_POOL_WAIT_SECONDS='5'),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 status = waiter.stderr.readline()
