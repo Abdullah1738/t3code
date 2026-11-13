@@ -954,13 +954,17 @@ class Questions(Base):
                           find=finder(), said=nobody, item='imsg:1')
         self.assertEqual(again['verdict'], 'explained')
 
-    def test_the_check_keeps_twice_asked_questions_awaiting_an_answer(self):
+    def test_the_check_keeps_twice_asked_questions_awaiting_in_one_unmatched_case(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
         self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
         for now in ('2026-10-25T12:00', '2026-10-25T20:30', '2026-11-25T21:00'):
             self.assertEqual(self.follow(now, finder()), '')
             self.assertEqual(self.questions()[0]['status'], 'awaiting_answer')
-            self.assertEqual(mc.load(self.data)['cases'], [])
+            self.assertEqual(len(mc.load(self.data)['cases']), 1)
+            case = mc.load(self.data)['cases'][0]
+            self.assertEqual(case['status'], 'awaiting_answer')
+            self.assertEqual(len(case['asks']), 2)
+            self.assertEqual(self.questions()[0]['case_opened'], case['id'])
 
     def test_a_wait_with_no_receipt_is_raised_once(self):
         r = mc.screen(ALERT, BANK, at('2026-10-23T23:47'), at('2026-10-24T00:37'), data=self.data,
@@ -1006,7 +1010,9 @@ class Questions(Base):
         # A never-raised charge still joins the daily list after the receipt wait.
         held = self.screen(ALERT.replace('12.34', '5.55'), BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:2')
         event = self.follow('2026-10-31T09:00', finder())
-        self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'open')
+        q = mc.find_question(mc.load_questions(self.data), held['id'])
+        self.assertEqual(q['status'], 'open')
+        self.assertEqual(q['case_opened'], mc.load(self.data)['cases'][0]['id'])
         self.assertIn('money-cases unasked --ask', event)
 
     def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
@@ -1115,6 +1121,152 @@ class Questions(Base):
         code, msg = self.ask('2026-10-24T09:00', finder())
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('settled (his order)', msg)
+
+
+class UnmatchedCharges(Base):
+    def setUp(self):
+        super().setUp()
+        source = patch.object(mc.charges, 'show', read)
+        source.start()
+        self.addCleanup(source.stop)
+
+    def follow(self, now, find, run='r1'):
+        event = mc.run_check(self.wd, run, self.data, self.root, at(now), find, nobody)
+        if event:
+            (self.wd / '.run-ok').write_text(run)
+            self.deliver(now)
+        return event
+
+    def seed_charge(self, text=ALERT, when='2026-10-24T08:00', item='imsg:auto'):
+        return mc.screen(text, BANK, at(when), at(when), data=self.data,
+                         find=finder(), said=nobody, item=item)['id']
+
+    def question(self, qid):
+        return mc.find_question(mc.load_questions(self.data), qid)
+
+    def test_two_hours_opens_one_unmatched_case_without_an_ask(self):
+        qid = self.seed_charge()
+        self.assertEqual(self.follow('2026-10-24T10:00', finder()), '')
+        q = self.question(qid)
+        case = mc.find(mc.load(self.data), q['case_opened'])
+        self.assertEqual((case['merchant'], case['state'], case['next'], case['who']),
+                         ('unmatched', 'charge with no matching order or receipt',
+                          'owner: which order is this?', 'Abdullah'))
+        self.assertEqual((case['amount'], case['currency'], case['charged'], case['deadline']),
+                         ('12.34', 'EUR', '2026-10-24', '2026-10-26'))
+        self.assertEqual(case['reference'], 'card ending 1111')
+        self.assertEqual(case['alert_at'], q['at'])
+        self.assertEqual((q['status'], q['asks'], case['asks']), ('open', [], []))
+        self.assertEqual(self.follow('2026-10-24T10:15', finder(), 'r2'), '')
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+
+    def test_wait_receipt_owner_and_unreadable_sources_never_open_a_case(self):
+        for evidence in ('wait', 'receipt', 'owner', 'unreadable'):
+            with self.subTest(evidence=evidence):
+                self.data = self.tmp / evidence
+                qid = self.seed_charge()
+                found = finder(HISTORY) if evidence == 'wait' else finder(RECEIPT) if evidence == 'receipt' else finder()
+                said = nobody
+                if evidence == 'owner':
+                    said = lambda *a, **kw: [(mc.stamp(at('2026-10-24T08:01')), 'I paid Acme', 'app')]
+                if evidence == 'unreadable':
+                    def found(*a, **kw):
+                        raise mc.charges.Lookup('receipt unavailable')
+                mc.run_check(self.wd, evidence, self.data, self.root, at('2026-10-24T11:00'), found, said)
+                self.assertEqual(mc.load(self.data)['cases'], [])
+                self.assertNotIn('case_opened', self.question(qid))
+                if evidence == 'wait':
+                    self.assertEqual(self.question(qid)['wait_until'], '2026-10-25T20:00:00+04:00')
+
+    def test_declines_moni_young_and_active_waits_are_unchanged(self):
+        decline = 'Transaction of EUR 12.34 on your Card 1111 at ACME was declined'
+        for label, text, when, wait in (
+                ('decline', decline, '2026-10-24T08:00', None),
+                ('moni', ALERT.replace('1111', '2792'), '2026-10-24T08:00', None),
+                ('young', ALERT, '2026-10-24T09:01', None),
+                ('wait', ALERT, '2026-10-24T08:00', '2026-10-25T20:00:00+04:00')):
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                qid = self.seed_charge(text, when)
+                if wait:
+                    with mc.Locked(self.data, 'questions') as book:
+                        book['questions'][0]['wait_until'] = wait
+                self.follow('2026-10-24T11:00' if label != 'young' else '2026-10-24T11:00:59', finder())
+                q = self.question(qid)
+                self.assertEqual(mc.load(self.data)['cases'], [])
+                self.assertNotIn('case_opened', q)
+                self.assertEqual((q['status'], q['asks']), ('open', []))
+
+    def test_daily_list_asks_the_linked_charge_once_without_case_prompts(self):
+        qid = self.seed_charge()
+        self.follow('2026-10-24T10:00', finder())
+        event = self.follow('2026-10-25T09:00', finder())
+        self.assertIn('1 unasked charges older than 24 h', event)
+        cid = self.question(qid)['case_opened']
+        self.assertNotIn(cid, event)
+        self.assertEqual([r['id'] for r in mc.unasked_candidates(self.data, at('2026-10-25T09:00'))], [qid])
+        text = mc.unasked(self.data, at('2026-10-25T09:00'), finder(), nobody)
+        self.assertEqual(text.count(qid + ':'), 1)
+        self.assertEqual(mc.unasked(self.data, at('2026-10-25T09:15'), finder(), nobody),
+                         'No charges ready to ask about.')
+        self.assertEqual(len(self.question(qid)['asks']), 1)
+        self.assertEqual(len(mc.find(mc.load(self.data), cid)['asks']), 1)
+        self.assertEqual(self.follow('2026-10-27T09:00', finder()), '')
+        mc.answered(self.data, qid, 'not my order', now=at('2026-10-27T10:00'))
+        self.assertEqual(self.question(qid)['status'], 'closed')
+        self.assertTrue(mc.find(mc.load(self.data), cid)['history'][-1]['owner'])
+
+    def test_case_write_before_question_write_recovers_without_a_duplicate(self):
+        qid = self.seed_charge()
+        replace = mc.os.replace
+        def interrupted(src, dst):
+            replace(src, dst)
+            if Path(dst).name == 'cases.json':
+                raise mc.CheckTimeout('after saving case')
+        with patch.object(mc.os, 'replace', interrupted):
+            with self.assertRaises(mc.CheckTimeout):
+                mc.follow(self.data, at('2026-10-24T10:00'), self.root, find=finder(), said=nobody)
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+        self.assertNotIn('case_opened', self.question(qid))
+        self.follow('2026-10-24T10:15', finder())
+        self.assertEqual(len(mc.load(self.data)['cases']), 1)
+        self.assertEqual(self.question(qid)['case_opened'], mc.load(self.data)['cases'][0]['id'])
+
+    def test_alert_key_ignores_merchant_and_channel_but_separates_charge_times(self):
+        qid = self.seed_charge()
+        self.seed_charge(ALERT.replace('ACME * EATS PENDING', 'OTHER'), item='mail:auto')
+        self.seed_charge(when='2026-10-24T08:05', item='imsg:second')
+        self.follow('2026-10-24T11:00', finder())
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
+        qs = mc.load_questions(self.data)['questions']
+        self.assertEqual(qs[0]['case_opened'], qs[1]['case_opened'])
+        self.assertNotEqual(self.question(qid)['case_opened'], qs[2]['case_opened'])
+        candidates = mc.unasked_candidates(self.data, at('2026-10-25T11:00'))
+        self.assertEqual(len(candidates), 2)
+
+    def test_alert_key_normalizes_amount_currency_and_time_but_keeps_distinct_charges(self):
+        q = dict(card='1111', amount='12.34', currency='EUR', at='2026-10-24T08:00:00+04:00')
+        key = mc.unmatched_id(q)
+        for changes in (dict(amount='12.3400'), dict(currency='eur'), dict(at='2026-10-24T04:00:00Z'),
+                        dict(at='2026-10-24T08:00')):
+            with self.subTest(changes=changes):
+                self.assertEqual(mc.unmatched_id(q | changes), key)
+        for changes in (dict(card='2222'), dict(amount='12.35'), dict(currency='USD'),
+                        dict(at='2026-10-24T08:00:01+04:00')):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(mc.unmatched_id(q | changes), key)
+
+    def test_later_receipt_closes_the_unmatched_case_and_a_reopen_does_not_reuse_its_question(self):
+        qid = self.seed_charge()
+        self.follow('2026-10-24T10:00', finder())
+        cid = self.question(qid)['case_opened']
+        self.follow('2026-10-24T11:00', finder(RECEIPT))
+        self.assertEqual((self.question(qid)['status'], mc.find(mc.load(self.data), cid)['status']),
+                         ('closed', 'closed'))
+        mc.reopen(self.data, cid, '2026-11-01', 'check again', at('2026-10-25T09:00'))
+        self.follow('2026-10-25T10:00', finder(RECEIPT))
+        self.assertEqual(self.question(qid)['case_cycle'], 0)
+        self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open')
 
 
 class CheckBudget(Base):
