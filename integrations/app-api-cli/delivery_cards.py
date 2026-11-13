@@ -325,7 +325,7 @@ def lane(cfg, meta):
     return 'same-day' if app == 'amazon' else ''
 
 
-def stage(data, food=False):
+def stage(data, food=False, nearby_label=None):
     steps = ['Confirmed', 'Preparing', 'Picked up', 'On the way', 'Delivered'] if food else [
         'Confirmed', 'Packed', 'Out for delivery', 'Delivered']
     current = str(data.get('status') or 'unknown').lower().replace('_', ' ')
@@ -353,6 +353,8 @@ def stage(data, food=False):
     if current == 'picked up' and not food:
         steps.insert(2, 'In transit')
         idx, label = 2, 'In transit'
+    if current == 'nearby' and nearby_label:
+        steps[idx] = label = nearby_label
     return steps, idx, label, current in ('delivered', 'cancelled')
 
 
@@ -373,6 +375,8 @@ def eta(data, cfg):
         if hours or mins:
             minutes = (int(hours[1])*60 if hours else 0) + (int(mins[2] or mins[1]) if mins else 0)
     at = checked + dt.timedelta(minutes=minutes) if checked and minutes is not None and 0 <= minutes < 2880 else None
+    if data.get('eta_source') == 'careem_notification':
+        at = instant(data.get('eta')) or at
     at = at or instant(data.get('eta')) or instant(cfg.get('eta'))
     if not at:
         return raw or 'No estimate yet', '', None
@@ -385,7 +389,8 @@ def eta(data, cfg):
 def view(cfg, data, meta):
     vertical = lane(cfg, meta)
     food = vertical in ('food', 'restaurants')
-    steps, idx, label, terminal = stage(data, food)
+    nearby_label = 'Almost here' if cfg['app'] == 'careem' and vertical in ('food', 'quik') else None
+    steps, idx, label, terminal = stage(data, food, nearby_label)
     big, sub, at = eta(data, cfg)
     if terminal:
         big, sub, at = label, '', None
@@ -420,7 +425,7 @@ def view(cfg, data, meta):
             'order': cfg['order'], 'big': big, 'sub': sub, 'eta': at, 'stage': label,
             'word': at is None, 'summary': names(rows),
             'steps': steps, 'index': idx, 'terminal': terminal, 'partial': partial,
-            'checked_at': data.get('checked_at'), 'unavailable': bool(data.get('errors')),
+            'checked_at': data.get('checked_at'), 'unavailable': bool(data.get('errors')) and not data.get('live_source_ok'),
             'items': rows, 'count': sum(i['qty'] for i in rows) if rows else data.get('manifest_item_count'),
             'total': total, 'currency': text(meta.get('currency') or 'AED', 5),
             'theme': THEMES[app], 'sample': bool(meta.get('sample'))}

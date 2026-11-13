@@ -19,6 +19,11 @@ LIVE = re.compile(
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
 )
 DATABASE_NAME = re.compile(r"statev2(?:[.-][\w-]+)?\.sqlite|state\.sqlite|opencode\.db")
+# Preserve the existing hidden-home fixture; new subpaths use plain segments.
+SHELL_FIXTURE_DATABASE = (r"(?:\.robob/userdata/|(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)+)"
+                          r"statev2(?:\.sqlite)?(?:-(?:wal|shm|journal))?")
+SHELL_HIDDEN_FIXTURE_DATABASE = r"\.robob/userdata/statev2(?:\.sqlite)?(?:-(?:wal|shm|journal))?"
+SHELL_FIXTURE_WORD = re.compile(r'''(?<![^ \t\n;&|(){}])\#[^\n]*|(?:[^ \t\n;&|<>()"'\\]+|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|\\[\s\S])+''')
 READER = re.compile(
     r"(?:^|[\s;&|('\"`])(?:\S*/)?(?:sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|"
     r"datasette|uv|cp|rsync|ditto|dd|cat|strings|grep|rg|jq|xxd|hexdump|tar|zip|restic)"
@@ -251,7 +256,103 @@ def _trusted_fixture_tool(executable, name, directory):
     return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
 
 
-def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads=False, data_helpers=False):
+def _fixture_python_paths(tree, aliases, local_module):
+    """File reads must derive from the invocation's confined path arguments."""
+    definitions, stores = {}, {}
+
+    def define(target, mode, value, indexes=()):
+        if isinstance(target, ast.Name):
+            definitions.setdefault(target.id, []).append((id(target), mode, value, indexes))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for index, part in enumerate(target.elts):
+                define(part, mode, value, (*indexes, index))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            stores.setdefault(node.id, set()).add(id(node))
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                define(target, 'assign', node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            define(node.target, 'assign', node.value)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            define(node.target, 'iterate', node.iter)
+
+    def called(node):
+        root, *rest = _name(node.func).split('.')
+        return '.'.join([aliases.get(root, root), *rest])
+
+    def item(value):
+        if value == 'paths':
+            return 'path'
+        if value == 'relatives':
+            return 'relative'
+        if value == 'walk':
+            return ('path', 'relatives', 'relatives')
+        if value == 'items':
+            return ('relative', None)
+        return None
+
+    def kind(node, seen=frozenset()):
+        if isinstance(node, ast.Name):
+            if node.id in seen:
+                return None
+            entries = definitions.get(node.id, [])
+            if not entries or stores.get(node.id) != {entry[0] for entry in entries}:
+                return None
+            values = []
+            for _, mode, value, indexes in entries:
+                value = kind(value, seen | {node.id})
+                if mode == 'iterate':
+                    value = item(value)
+                for index in indexes:
+                    value = value[index] if isinstance(value, tuple) and index < len(value) else item(value)
+                values.append(value)
+            return values[0] if values[0] is not None and all(value == values[0] for value in values) else None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return 'relative' if not os.path.isabs(node.value) and '..' not in node.value.split('/') and '\\' not in node.value else None
+        if isinstance(node, ast.Dict) and all(key is not None and kind(key, seen) == 'relative' for key in node.keys):
+            return 'dictionary'
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = kind(node.left, seen), kind(node.right, seen)
+            return left if left == right and left in {'paths', 'relatives'} else None
+        if isinstance(node, ast.Subscript):
+            if _name(node.value) == 'sys.argv':
+                minimum = 2 if local_module == 'transcript_backup_manifest' else 1
+                index = node.slice.lower if isinstance(node.slice, ast.Slice) else node.slice
+                if isinstance(index, ast.Constant) and type(index.value) is int and index.value >= minimum:
+                    return 'paths' if isinstance(node.slice, ast.Slice) and node.slice.step is None else 'path' if not isinstance(node.slice, ast.Slice) else None
+            value = kind(node.value, seen)
+            return value if isinstance(node.slice, ast.Slice) and value in {'paths', 'relatives'} else item(value) if not isinstance(node.slice, ast.Slice) else None
+        if isinstance(node, ast.ListComp):
+            value = kind(node.elt, seen)
+            return {'path': 'paths', 'relative': 'relatives'}.get(value)
+        if isinstance(node, ast.Call):
+            name = called(node)
+            values = [kind(arg, seen) for arg in node.args]
+            if name == 'os.path.join' and values and values[0] == 'path' and all(value == 'relative' for value in values[1:]) and not node.keywords:
+                return 'path'
+            if name == 'os.path.basename' and len(values) == 1 and values[0] in {'path', 'relative'} and not node.keywords:
+                return 'relative'
+            if name in {'glob.glob', 'os.walk'} and values == ['path'] and not node.keywords:
+                return 'paths' if name == 'glob.glob' else 'walk'
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'items' and kind(node.func.value, seen) == 'dictionary':
+                return 'items'
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = called(node)
+        if _name(node.func).split('.')[-1] == 'open' or name in {'glob.glob', 'os.walk'}:
+            if not node.args or kind(node.args[0]) != 'path':
+                return False
+        if name == 'transcript_backup_manifest.verify' and (len(node.args) != 2 or kind(node.args[1]) != 'path'):
+            return False
+    return True
+
+
+def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads=False, data_helpers=False, database_fixture=False):
     """The fixture's Python helpers may inspect files, not change its tree."""
     try:
         if tree is None:
@@ -261,6 +362,42 @@ def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads
                 tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return False
+    if database_fixture:
+        _, aliases, bindings = _python_tree(source)
+        if not _fixture_python_paths(tree, aliases, local_module):
+            return False
+        walk_targets = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Call) and _name(node.iter.func) == 'os.walk' and isinstance(node.target, ast.Tuple) and len(node.target.elts) == 3:
+                for part in node.target.elts[1:]:
+                    if isinstance(part, ast.Name):
+                        walk_targets.setdefault(part.id, set()).add(id(part))
+        # Only unchanged os.walk list bindings justify addition. A later
+        # assignment could otherwise turn the same names into path strings.
+        walk_lists = {name for name, targets in walk_targets.items()
+                      if all(id(node) in targets for node in ast.walk(tree)
+                             if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store))}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AugAssign):
+                return False
+            value = _path_expression(node, bindings, aliases, partial=True)
+            if value is not None and LIVE.search(value):
+                return False
+            literal = (node.value.decode('latin-1') if isinstance(node, ast.Constant) and isinstance(node.value, bytes) else
+                       node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else _name(node))
+            if re.search(r'statev2|opencode|robob|\.sqlite|\.db|userdata', literal, re.I):
+                return False
+            if local_module != 'transcript_backup_manifest' and literal.split('.')[-1] in {'glob', 'listdir', 'scandir', 'walk', 'iterdir', 'rglob'}:
+                return False
+            if isinstance(node, ast.JoinedStr) or isinstance(node, ast.BinOp) and (
+                    isinstance(node.op, ast.Mod) or isinstance(node.op, ast.Add) and not
+                    all(isinstance(part, ast.Name) and part.id in walk_lists for part in (node.left, node.right))):
+                return False
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'join':
+                name = _name(node.func)
+                root, *rest = name.split('.')
+                if '.'.join([aliases.get(root, root), *rest]) != 'os.path.join':
+                    return False
     modules = {'json', 'sys', 'os', 'glob', 'hashlib'}
     if pathlib_reads:
         modules.add('pathlib')
@@ -335,6 +472,7 @@ def _fixture_setup(source):
         return False
     shell, bodies = _heredocs(source)
     python_bodies = set()
+    python_modules = {}
     for key, (body, _) in bodies.items():
         # Non-Python fixture data is checked by the shell source scan. A
         # parseable Python helper must satisfy the read-only grammar too.
@@ -354,9 +492,10 @@ def _fixture_setup(source):
             if not re.search(r'cp "\$R/src/run_limited\.py" "\$R/src/fixture_run_limited\.py"\ncat > "\$R/src/run_limited\.py" << ' + key + r'\b', shell) or source.count('$R/src/fixture_run_limited.py') != 1:
                 return False
             local_module = 'fixture_run_limited'
-        if not _fixture_python_readonly(body, tree, local_module):
+        if not _fixture_python_readonly(body, tree, local_module, database_fixture=True):
             return False
         python_bodies.add(key)
+        python_modules[key] = local_module
     confined = re.sub(r'\$(?:' + re.escape(root) + r'\b|\{' + re.escape(root) + r'\})/\.robob', 'guard_fixture_home', shell)
     if '.robob' in confined:
         return False
@@ -376,12 +515,23 @@ def _fixture_setup(source):
             return False
         if re.search(r'\b(?:for|select|getopts)\s+' + re.escape(name) + r'\b', shell):
             return False
-    # Link targets and their sources must stay inside the temporary tree.
-    # Track only literal descendants; no path traversal or computed suffixes.
+    # Repeated root expansions in a snapshot path stay inside the first root
+    # only when the inherited temp prefix cannot insert parent segments.
+    temp_prefix = os.environ.get('TMPDIR') or '/tmp'
+    if not os.path.isabs(temp_prefix) or '..' in temp_prefix.split('/') or re.search(r'\bTMPDIR(?:\[[^\]\n]*\])?\+?=|\b(?:for|select|getopts)\s+TMPDIR\b', shell):
+        return False
+    # Descendants contain only known temp roots and literal path pieces.
     descendants = {root, parent}
+
+    def confined_path(value):
+        value = value.replace('\\\n', '')
+        roots = r'\$(?:' + '|'.join(map(re.escape, descendants)) + r')\b'
+        return bool(re.match(roots + r'(?:/|$)', value) and
+                    not re.search(r'[$`\\\'"]', re.sub(roots, 'guard_fixture_root', value)) and '..' not in value.split('/'))
+
     for line in shell.splitlines():
-        assignment = re.fullmatch(r'\s*([A-Za-z_]\w*)="\$([A-Za-z_]\w*)/([^"$`]+)"\s*', line)
-        if assignment and assignment[2] in descendants and '..' not in assignment[3].split('/'):
+        assignment = re.fullmatch(r'\s*([A-Za-z_]\w*)="([^"`\n]+)"\s*', line)
+        if assignment and confined_path(assignment[2]):
             descendants.add(assignment[1])
     derived = descendants - {root, parent}
     if derived and re.search(r'\b(?:' + '|'.join(map(re.escape, derived)) + r')(?:\[[^\]\n]*\]\+?=|\+=)', shell):
@@ -389,7 +539,7 @@ def _fixture_setup(source):
     assignments = re.finditer(r'\b(' + '|'.join(map(re.escape, derived)) + r')=("[^"\n]*"|[^\s;]+)', shell) if derived else ()
     for assignment in assignments:
         value = assignment[2].strip('"')
-        if not re.fullmatch(r'\$(?:' + '|'.join(map(re.escape, descendants)) + r')/[^$`]+', value) or '..' in value.split('/'):
+        if not confined_path(value):
             return False
     if re.search(r'\b(?:for|select|getopts)\s+(?:' + '|'.join(map(re.escape, descendants)) + r')\b', shell):
         return False
@@ -449,10 +599,7 @@ def _fixture_setup(source):
         return False
     active, branches, cases, defining, pending = False, [], [], None, None
     declared, runners, conditional_call = set(), set(), False
-    fixture = re.compile(r'\$\{?' + re.escape(root) + r'\}?/\.robob/userdata/statev2')
-
-    def confined_path(value):
-        return bool(re.fullmatch(r'\$(?:' + '|'.join(map(re.escape, descendants)) + r')(?:/[^$`]+)?', value) and '..' not in value.split('/'))
+    fixture = re.compile(r'\$\{?' + re.escape(root) + r'\}?/' + SHELL_FIXTURE_DATABASE + r'\b')
 
     # Imported modules come from the repo. Fixture output must never rewrite
     # that source tree, including through a temporary alias for its directory.
@@ -540,6 +687,31 @@ def _fixture_setup(source):
                 return False
         if binary == 'ln' and (any(word.startswith('-') and word not in {'-s', '--'} for word in args) or len([word for word in args if not word.startswith('-')]) != 2 or any(not confined_path(word) for word in args if not word.startswith('-'))):
             return False
+        # A fixture's database names cannot excuse a reader whose operand is
+        # assembled from unrelated shell state, even if no live name is literal.
+        if binary == 'cat':
+            index = 0
+            while index < len(args):
+                word = args[index]
+                if word in {'>', '>>', '<', '<<'}:
+                    if index + 1 >= len(args):
+                        return False
+                    target = args[index + 1]
+                    if not (target in bodies if word == '<<' else target == '/dev/null' or confined_path(target)):
+                        return False
+                    index += 2
+                    continue
+                if word != '--' and not confined_path(word):
+                    return False
+                index += 1
+        if binary == 'grep':
+            operands = list(args)
+            while operands and operands[0] in {'-q', '-c', '--'}:
+                operands.pop(0)
+            if not operands or operands[0].startswith('-'):
+                return False
+            if any(not confined_path(word) for word in operands[1:]):
+                return False
         if binary in {'bash', 'sh'} and '-c' in args:
             code = args[args.index('-c') + 1:]
             return bool(code and re.fullmatch(r'sleep [0-9]+; :', code[0]))
@@ -557,11 +729,18 @@ def _fixture_setup(source):
             return False
         if binary == 'python3':
             if args[:1] == ['-c']:
-                return len(args) >= 2 and _fixture_python_readonly(args[1]) and not any('<' in word for word in args[2:])
+                return len(args) >= 2 and _fixture_python_readonly(args[1], database_fixture=True) and all(confined_path(word) for word in args[2:])
             if args[:1] != ['-'] or args.count('<<') != 1:
                 return False
             index = args.index('<<')
-            return index + 2 == len(args) and args[index + 1] in python_bodies and not any('<' in word for word in args[:index])
+            if index + 2 != len(args) or args[index + 1] not in python_bodies or any('<' in word for word in args[:index]):
+                return False
+            paths = args[1:index]
+            if python_modules[args[index + 1]] == 'transcript_backup_manifest':
+                if paths[:1] != ['$HERE/src']:
+                    return False
+                paths = paths[1:]
+            return all(confined_path(word) for word in paths)
         if binary == 'trap':
             return args == ['rm -rf "$' + parent + '"', 'EXIT']
         if binary == 'cd':
@@ -657,8 +836,8 @@ def _shell_fixture_source(source, directory):
     if any(value and STARTUP_ENV.fullmatch(name) for name, value in os.environ.items()):
         return source
     try:
-        shell, _ = _heredocs(source)
-        shell, quoted = _quoted_punctuation(shell)
+        stripped, _ = _heredocs(source)
+        shell, quoted = _quoted_punctuation(stripped)
         lexer = shlex.shlex(shell, posix=True, punctuation_chars=";&|(){}\n")
         lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
@@ -749,23 +928,101 @@ def _shell_fixture_source(source, directory):
             # root before reading it. Only the system reader preserves it.
             if not _trusted_fixture_tool(executable, 'cat', directory):
                 return source
-            fixture = re.fullmatch(r'\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/\.robob/userdata/statev2\.sqlite(?:-(?:wal|shm|journal))?', value)
+            fixture = re.fullmatch(r'\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/' + SHELL_FIXTURE_DATABASE, value)
             if not fixture or (fixture[1] or fixture[2]) not in assigned:
                 return source
-    for name in proven:
-        fixture = r"(?<![\w/.$-])\$(?:" + re.escape(name) + r"\b|\{" + re.escape(name) + r"\})/\.robob/userdata/statev2(?:\.sqlite)?"
+    # A heredoc body may become a child script that never inherits the mktemp
+    # root, so an empty root turns a plain subpath into an absolute path. Bodies
+    # keep only the hidden-home shape, which stays fixture-only from /.
+    body_lines, offset = [], 0
+    for line, kept in zip(source.splitlines(keepends=True), stripped.splitlines(keepends=True)):
+        if line.strip() and not kept.strip():
+            body_lines.append((offset, offset + len(line)))
+        offset += len(line)
+
+    def in_body(position):
+        return any(start <= position < end for start, end in body_lines)
+
+    roots = []
+    for name in sorted(proven):
+        root = r"\$(?:" + re.escape(name) + r"\b|\{" + re.escape(name) + r"\})/"
         assignment = re.search(r'(?m)^[ \t]*' + re.escape(name) + r'="?\$\(mktemp ', source)
-        if not reset_fixture and assignment and any(match.start() < assignment.start() for match in re.finditer(fixture, source)):
+        if not reset_fixture and assignment and any(match.start() < assignment.start() for match in re.finditer(root + SHELL_FIXTURE_DATABASE, source)):
             continue
-        source = re.sub(fixture, 'guard_isolated_fixture', source)
-    return source
+        roots.append(root)
+    if not roots:
+        return source
+    root = '(?:' + '|'.join(roots) + ')'
+    fixture, body_fixture = root + SHELL_FIXTURE_DATABASE, root + SHELL_HIDDEN_FIXTURE_DATABASE
+
+    def discount_word(match):
+        word = match[0]
+        binding = re.match(r'[A-Za-z_]\w*=', word)
+        prefix = binding[0] if binding else ''
+        value = word[len(prefix):]
+        # Single quotes preserve a literal dollar sign, not a mktemp root.
+        quote = '"' if value.startswith('"') and value.endswith('"') else ''
+        if quote:
+            value = value[1:-1]
+        if not re.fullmatch(body_fixture if in_body(match.start()) else fixture, value):
+            return word
+        return prefix + quote + 'guard_isolated_fixture' + quote
+
+    # One pass over the original text, so heredoc offsets stay valid. Match
+    # complete raw shell words, retaining adjacent quoted pieces; punctuation
+    # or whitespace inside quotes cannot terminate a path.
+    return SHELL_FIXTURE_WORD.sub(discount_word, source)
+
+
+def _fixture_shell_live(text, depth=0):
+    if depth >= MAX_SHELL_DEPTH:
+        return True
+    # Bash removes continuations before parsing words. Its ANSI-C and locale
+    # quoting are outside shlex's grammar, so neither can prove isolation.
+    text = text.replace('\\\n', '')
+    if "$'" in text or '$"' in text:
+        return True
+    for body in _substitutions(text, shell=True):
+        if _fixture_shell_live(body, depth + 1):
+            return True
+    text, quoted = _quoted_punctuation(text)
+    for value in quoted.values():
+        if value.startswith('${') and value.endswith('}') and _fixture_shell_live(value[2:-1], depth + 1):
+            return True
+    # Keep literal hashes inside words. shlex's default comments would hide
+    # later operands; only comments identified as whole shell words are data.
+    text = SHELL_FIXTURE_WORD.sub(lambda match: '' if match[0].startswith('#') else match[0], text)
+    text = re.sub(r'\$\(\([^()\n]*\)\)', 'guard_arithmetic', text)
+    # An unmasked substitution may have escaped the bounded parser. It cannot
+    # establish that discarding the fixture's database names is safe.
+    if '$(' in text or '`' in text:
+        return True
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|(){}\n')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    for token in lexer:
+        for key, literal in quoted.items():
+            token = token.replace(key, literal)
+        if LIVE.search(token):
+            return True
+    return False
 
 
 def _source_hit(source, directory, python=False, shell=False):
     if python:
         return _python_touches_live(source, directory)
     if shell:
+        original = source
         source = _shell_fixture_source(source, directory)
+        # Discounting a fixture must not hide a separate live path assembled
+        # from adjacent quoted pieces of a shell word.
+        if source != original:
+            try:
+                text, _ = _heredocs(source)
+                if _fixture_shell_live(text):
+                    return True
+            except (ValueError, AmbiguousScript):
+                return True
     if source_touches_live(source) or _relative_source_live(source, directory):
         return True
     def isolated_literal(match):
@@ -1456,7 +1713,7 @@ def _quoted_punctuation(source, script_literals=False):
     return "".join(output), quoted
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     written = {}
@@ -1472,7 +1729,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         variable_written.update(prior_variable)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
-    shell_values = {"HOME": str(Path.home())}
+    inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
+    shell_values = {"HOME": str(Path.home()), **inherited_values}
     path_values = {}
     live_assignments = set()
     # Script bindings keep unknown branch values, unlike the reader's lexical
@@ -1485,7 +1743,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invocation_reader_literals = set()
     invocation_quoted = set()
     uncertain_write = 0
-    unsafe_bindings = False
+    unsafe_bindings = inherited_unsafe
     # Opaque paths need a fresh, unmodified root; existing files cannot be
     # assumed replaced when a write fails or is skipped.
     fresh_variables = set()
@@ -1807,15 +2065,18 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if path not in paths:
             paths.append(path)
         try:
-            redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', command)
+            proof_command = command if caller_command is None else caller_command
+            redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', proof_command)
             destination = shlex.split(redirect[1]) if redirect else []
             if redirect and (len(destination) != 1 or _direct_read(['cat', destination[0]], directory)):
                 raise LiveRead('live-database-script')
-            plain = command[:redirect.start()] if redirect else command
+            plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = shlex.split(plain, comments=True)
             if invocation[:2] == ['offbox', 'run']:
                 if invocation[2:3] == ['--']:
                     invocation = invocation[3:]
+                elif invocation[2:4] == ['--bg', '--']:
+                    invocation = invocation[4:]
                 elif invocation[2:5] == ['--remote', '--no-fallback', '--']:
                     invocation = invocation[5:]
         except ValueError:
@@ -1823,7 +2084,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
                  os.path.basename(invocation[0]) == binary and invocation[1] == value and
                  _trusted_fixture_tool(invocation[0], binary, directory) and
-                 not value.startswith(('~', '$')) and '\\\n' not in command and '\\\r\n' not in command and
+                 not value.startswith(('~', '$')) and '\\\n' not in proof_command and '\\\r\n' not in proof_command and
                  not any(os.environ.get(name) or name in shell_values for name in ('BASH_ENV', 'ENV')) and
                  not any(name.startswith('BASH_FUNC_') for name in os.environ))
         if path in written:
@@ -1882,12 +2143,20 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def scan_remote(source, directory, depth, input_words=(), input_bodies=None):
+    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
+        # offbox may fall back to running locally, so its payload keeps the
+        # caller's startup and lookup bindings (BASH_ENV, PATH, ...), and the
+        # exact-invocation proof still reads the caller's whole command.
+        environment = None
+        if inherit_environment:
+            environment = ({name: value for name, value in shell_values.items()
+                            if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
+                           unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written),
-                                  _stdin=(input_words, input_bodies or {}))
+                                  _stdin=(input_words, input_bodies or {}), _environment=environment)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
             raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
@@ -2092,7 +2361,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if words:
                     for argv in caller_argv(len(words)):
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
-                                    remote_input, remote_bodies)
+                                    remote_input, remote_bodies, inherit_environment=True)
                     if may_change_scripts(words, directory, documents):
                         changed_sources.update(written)
                         fresh_variables.clear()

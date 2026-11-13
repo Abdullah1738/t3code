@@ -71,7 +71,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
     owner: "+15555550123", timezone: "Asia/Dubai", chatGuid: ctx.chat.key,
     skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md",
     alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config",
-    context: ctx, ...overrides,
+    context: ctx, medsFold: false, ...overrides,
   });
   const input = (id: string, text: string, sender: string, extra: Partial<NormalizedInbound> = {}) =>
     store.acceptInbound(id, { id, text, sender, attachments: [], isAudioMessage: false, receivedAt: Date.now(), ...extra } satisfies NormalizedInbound);
@@ -1700,4 +1700,53 @@ test("router logs batch, turn start and terminal success/failure without prompt 
   expect(logs.filter(l => l.name === "turn.start")).toHaveLength(2);
   expect(logs.filter(l => l.name === "turn.end").map(l => l.props?.outcome)).toEqual(["replied", "failed"]);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test.each(["dm", "group"].flatMap(kind => [false, true].flatMap(modelError => ["empty", "tools"].map(finalKind => ({ kind: kind as "dm" | "group", modelError, finalKind })))))("earlier successful reply survives $finalKind final failure in $kind (modelError=$modelError)", async ({ kind, modelError, finalKind }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(_id: string, _dir: string, messageId: string, text: string) {
+    steers.push({ messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original question", "+971585933213");
+  await h.router.tick();
+  h.input("second", "robob second question", "+971585933213");
+  h.input("second-member", "robob another successful part", "+447700900123");
+  await h.router.tick();
+  h.input("third", "robob third question", "+971585933213");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, messageId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && messageId === steers[0]!.messageId) {
+      exposed = true;
+      const accepted = [...new Map(steers.map(call => [call.messageId, call])).values()];
+      for (const [index, call] of accepted.entries()) {
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (index === 0) h.backend.final("Second successful answer");
+        else {
+          if (finalKind === "tools") h.backend.records.push({
+            id: "failed-tools", type: "assistant", finish: "tool-calls",
+            content: [{ type: "tool", id: "tool_1", name: "read", state: { status: "completed" } }],
+            time: { created: Date.now(), completed: Date.now() },
+          });
+          h.backend.records.push({ id: "failed-idle", type: "idle", outcome: "failed", modelError, time: { created: Date.now() } });
+        }
+      }
+    }
+    return read(id, dir, messageId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Second successful answer", "second"],
+  ]);
+  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });

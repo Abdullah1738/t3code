@@ -117,6 +117,8 @@ def _quiesced(box_id: str, run_id: str, remaining_s: float) -> bool:
         p = ssh_sync.ssh(box_id, f'for i in $(seq 1 {polls}); do [ -f "$HOME/.offbox/done/{run_id}" ] && exit 0; '
                                  f'sleep 0.5; done; exit 1', timeout=remaining_s)
         return p.returncode == 0
+    except common.SshHostKeyMismatch:
+        raise
     except Exception:  # noqa: BLE001 - an unknown worker state is treated as not quiesced
         return False
 
@@ -141,6 +143,8 @@ def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 
                    'rm -f -- "$started" "$done_file" "$done_file.busy" || exit 2; exit 0')
         p = ssh_sync.ssh(box_id, command, timeout=timeout_s)
         return {0: True, 1: False}.get(p.returncode)
+    except common.SshHostKeyMismatch:
+        raise
     except Exception:  # noqa: BLE001 - housekeeping must keep the hold on every unknown outcome
         return None
 
@@ -207,6 +211,8 @@ def recheck(con, box_id: str, run_id: str, budget_s: float) -> bool:
             if cur.rowcount:
                 log(f'prune {box_id} hold released: {state}')
                 return True
+    except common.SshHostKeyMismatch:
+        raise
     except Exception:  # noqa: BLE001 - unknown worker state must keep the hold and never fail allocation
         pass
     return False
@@ -233,7 +239,7 @@ class Result(NamedTuple):
 
 
 def run(con, box_id: str, current: str) -> Result:
-    """Move old checkouts out of ~/w; report the count and this pass's SSH timeout. Never raises."""
+    """Move old checkouts out of ~/w; only an SSH identity failure interrupts the caller."""
     timed_out = False
     try:
         key = f"prune:{box_id}"
@@ -296,6 +302,8 @@ def run(con, box_id: str, current: str) -> Result:
             event(con, box_id, "box_prune", f"{len(done)} of {len(dirs)} stale: " + " ".join(done))
             say(f"pruned {len(done)} old checkout(s) on {box_id} (OFFBOX_PRUNE_KEEP / OFFBOX_PRUNE_DAYS)")
         return Result(len(done), timed_out)
+    except common.SshHostKeyMismatch:
+        raise
     except Exception as e:  # noqa: BLE001 - housekeeping must never fail a run
         log(f"prune {box_id} skipped: {e}")
         return Result(0, timed_out)

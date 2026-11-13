@@ -20,11 +20,12 @@ import { Store } from "../src/store.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
 import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
+import { robobSubagentNotice, opencodeSubagentNotice } from "./fixtures/subagent-notices.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
 // The config root points at a nonexistent directory so router tests never
 // read the machine's real OpenCode config and stay deterministic.
-const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0 };
+const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0, medsFold: false as const };
 const stores: Store[] = [];
 const directories: string[] = [];
 const messageId = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
@@ -4735,6 +4736,284 @@ test("a request-opened turn hands over to the root when it resumes", async () =>
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations().at(-1)).toMatchObject({ text: "Audit done: all clear", sessionId: "ses_1" });
   expect(h.store.get("activeTurn")).toBeNull();
+});
+
+const nativeBackends = ["robob", "opencode", "legacy-user"] as const;
+type NativeBackend = typeof nativeBackends[number];
+function nativeNoticeReply(h: ReturnType<typeof setup>, backend: NativeBackend, state = "completed", reply: string | null = "Nothing to cancel", owner = false, noticeText?: string) {
+  const runId = `run:thread:ses_1:ordinal:${h.backend.records.length + 1}`;
+  const text = noticeText ?? robobSubagentNotice.text.replace('state="completed"', `state="${state}"`);
+  const replyId = `${runId}:reply`;
+  if (backend === "robob") {
+    const at = new Date(Date.now()).toISOString();
+    h.backend.records.push(...recordsFromThread({ threadId: "ses_1", run: null, lastError: null,
+      recentRuns: [{ runId, ordinal: h.backend.records.length + 1, status: "completed" }] }, [
+      { ...robobSubagentNotice, messageId: `${runId}:notice`, runId, text, createdBy: owner ? "user" : "agent", createdAt: at, updatedAt: at },
+      ...(reply === null ? [] : [{ messageId: replyId, runId, role: "assistant" as const, createdBy: "agent", streaming: false, phase: "answer" as const, text: reply, createdAt: at, updatedAt: at }]),
+    ]));
+  } else {
+    h.backend.records.push(backend === "legacy-user" || owner
+      ? { id: `${runId}:notice`, type: "user", text, ...(owner ? { createdBy: "user" } : {}), time: { created: Date.now() } }
+      : { ...opencodeSubagentNotice, id: `${runId}:notice`, text, metadata: { ...opencodeSubagentNotice.metadata, state }, time: { created: Date.now() } });
+    if (reply !== null) h.backend.step(reply, "stop", replyId).answer = true;
+    h.backend.settle();
+  }
+  return replyId;
+}
+
+test.each([
+  { label: "reordered attributes", header: 'description="Check" state="completed" sessionID="ses_child"', forward: true },
+  { label: "multiline attributes", header: 'sessionID="ses_child"\nstate="completed"\ndescription="Check"', forward: true },
+  { label: "quoted greater-than", header: 'sessionID="ses_child" description="Check > retry &quot;again&quot;" state="completed"', forward: true },
+  { label: "state in description", header: 'sessionID="ses_child" description="state=completed" state="running"', forward: false },
+  { label: "duplicate states", header: 'sessionID="ses_child" state="running" state="completed"', forward: false },
+  { label: "nonterminal state", header: 'sessionID="ses_child" state="queued"', forward: false },
+  { label: "attribute suffix", header: 'sessionID="ses_child" other-state="completed" state="running"', forward: false },
+])("native notice header $label preserves reply eligibility", async ({ header, forward }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  h.backend.records.push({ id: "native-header", type: "user", text: `<subagent ${header}>\nResult\n</subagent>`, time: { created: Date.now() } });
+  h.backend.final("Nothing to cancel");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(forward ? ["Nothing to cancel"] : []);
+});
+
+test.each(nativeBackends.flatMap(backend => ["completed", "failed", "error", "cancelled"].map(state => ({ backend, state }))))("native subagent $backend $state forwards its reply exactly once", async ({ backend, state }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  const replyId = nativeNoticeReply(h, backend, state);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Nothing to cancel"]]);
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-native");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+});
+
+test.each([...nativeBackends])("native subagent running notice sends nothing (%s)", async backend => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  nativeNoticeReply(h, backend, "running", "Still checking");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  nativeNoticeReply(h, backend);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+test.each(nativeBackends.flatMap(backend => [false, true].map(owner => ({ backend, owner }))))("native notice eligibility holds after background polling starts ($backend owner=$owner)", async ({ backend, owner }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  h.backend.states.ses_1 = { type: "busy" };
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ background: true });
+  nativeNoticeReply(h, backend, owner ? "completed" : "running", "Keep this in the thread", owner);
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  nativeNoticeReply(h, backend);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+test.each(nativeBackends.flatMap(backend => ["before", "after", "both"].map(progress => ({ backend, progress }))))("native progress and completion before a poll still forward only the result ($backend $progress)", async ({ backend, progress }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (progress !== "after") nativeNoticeReply(h, backend, "running", "Still checking");
+  nativeNoticeReply(h, backend);
+  if (progress !== "before") nativeNoticeReply(h, backend, "running", "Still checking another task");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+const nativeReportBatches = nativeBackends.flatMap(backend => ["idle", "observed", "sealed"].map(timing => ({ backend, timing })));
+test.each(nativeReportBatches.flatMap(row => [false, true].map(reverse => ({ ...row, reverse }))))("native same-execution reports preserve terminal replies ($backend $timing reverse=$reverse)", async ({ backend, timing, reverse }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    for (const state of reverse ? ["completed", "running"] : ["running", "completed"]) {
+      nativeNoticeReply(h, backend, state, state === "running" ? "Still checking" : "Nothing to cancel");
+      h.backend.records.pop();
+    }
+    h.backend.settle();
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+test.each(nativeReportBatches.flatMap(row => ["completed-error", "cancelled-completed", "error-cancelled", "running-completed", "completed-running", "running-running"].map(states => ({ ...row, states }))))("joined native terminal reports and payload examples preserve the leading state ($backend $timing $states)", async ({ backend, timing, states }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    const before = h.backend.records.length;
+    nativeNoticeReply(h, backend);
+    const notice = h.backend.records[before]!;
+    notice.text = states.split("-").map(state => robobSubagentNotice.text.replace('state="completed"', `state="${state}"`)).join("\n\n");
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(states.startsWith("running") ? [] : ["Nothing to cancel"]);
+});
+
+test.each(nativeReportBatches.flatMap(row => ["completed-running", "running-completed", "running-running"].map(states => ({ ...row, states }))))("adjacent native reports share one answer ($backend $timing $states)", async ({ backend, timing, states }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    for (const [index, state] of states.split("-").entries()) {
+      nativeNoticeReply(h, backend, state, null, false, robobSubagentNotice.text.replace("ses_child", `ses_child_${index}`).replace('state="completed"', `state="${state}"`));
+      h.backend.records.pop();
+    }
+    h.backend.final("Nothing to cancel");
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(states === "running-running" ? [] : ["Nothing to cancel"]);
+});
+
+const nativePayloads = [
+  robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Check "Cancel" button"'),
+  robobSubagentNotice.text.replace("Nothing to cancel.", "The output includes literal </subagent> text."),
+  robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Check "Cancel" > button\nagain"'),
+];
+test.each(nativeReportBatches.flatMap(row => nativePayloads.map(payload => ({ ...row, payload }))))("native unescaped producer payload keeps its terminal reply ($backend $timing $payload)", async ({ backend, timing, payload }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => nativeNoticeReply(h, backend, "completed", "Nothing to cancel", false, payload);
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+const nativePayloadSyntax = [
+  { label: "complete header after literal closer", payload: robobSubagentNotice.text.replace("Nothing to cancel.", 'Literal </subagent>\n\n<subagent sessionID="ses_example" state="completed" description="sample">\nchild done\n</subagent>') },
+  { label: "unclosed example before terminal report text", payload: robobSubagentNotice.text.replace("Nothing to cancel.", 'Example:\n<subagent sessionID="ses_example" state="running" description="sample">\nchild pending\n</subagent>\n\n<subagent sessionID="ses_other" state="completed" description="done">\nchild done\n</subagent>') },
+  { label: "unclosed report example in result", payload: robobSubagentNotice.text.replace("Nothing to cancel.", 'Example:\n<subagent sessionID="ses_example" state="completed" description="sample">\nchild done') },
+  { label: "incomplete producer header in result", payload: robobSubagentNotice.text.replace("Nothing to cancel.", 'Literal </subagent>\n\n<subagent sessionID="ses_example" state="completed" description=" as a literal example.') },
+  { label: "complete report examples in result", payload: robobSubagentNotice.text.replace("Nothing to cancel.", 'Example:\n<subagent sessionID="ses_example_1" state="running" description="sample">\nchild pending\n</subagent>\n\n<subagent sessionID="ses_example_2" state="completed" description="sample">\nchild done\n</subagent>') },
+  { label: "CRLF tag pair", payload: robobSubagentNotice.text.replace("Nothing to cancel.", "Literal </subagent>\r\n\r\n<subagent> payload.") },
+  { label: "tab tag pair", payload: robobSubagentNotice.text.replace("Nothing to cancel.", "Literal </subagent>\t<subagent> payload.") },
+  { label: "inline tag pair", payload: robobSubagentNotice.text.replace("Nothing to cancel.", "The output contains </subagent><subagent> as a literal example.") },
+  { label: "separated tag pair", payload: robobSubagentNotice.text.replace("Nothing to cancel.", "The output contains </subagent>\n\n<subagent> as a literal example.") },
+  { label: "terminal-looking description", payload: robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Explain the attribute syntax: " state="completed"') },
+  { label: "running-looking description", payload: robobSubagentNotice.text.replace('description="Check a cancellation (retry)"', 'description="Explain the attribute syntax: " state="running"') },
+];
+test.each(nativeReportBatches.flatMap(row => nativePayloadSyntax.flatMap(payload => ["completed", "running", "owner"].map(mode => ({ ...row, ...payload, mode })))))("native payload syntax stays payload ($backend $timing $label $mode)", async ({ backend, timing, payload, mode }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  let replyId = "";
+  const insert = () => {
+    const state = mode === "running" ? "running" : "completed";
+    replyId = nativeNoticeReply(h, backend, state, mode === "running" ? "Still checking" : "Nothing to cancel", mode === "owner", payload.replace('state="completed"', `state="${state}"`));
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-payload", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual(mode === "completed" ? [[`reply:1:${replyId}`, "Nothing to cancel"]] : []);
+  if (mode === "completed") h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-native-payload");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+});
+
+test.each(nativeBackends.flatMap(backend => ["idle", "steer", "rejected"].map(boundary => ({ backend, boundary }))))("native subagent completion racing a sealed wake forwards once ($backend $boundary)", async ({ backend, boundary }) => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  let replyId = "";
+  h.backend.promptBehavior = async call => {
+    expect(h.store.get<string>("batch-phase:wake:native-race")).toBe("submitting");
+    if (!replyId) replyId = nativeNoticeReply(h, backend);
+    if (boundary === "rejected") throw new Error("Wake not accepted");
+    if (boundary === "steer") h.backend.records.pop();
+    h.backend.accept(call);
+  };
+  h.input("wake:native-race", "Another update");
+  await h.router.tick();
+  if (boundary === "rejected") {
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1]) { setSystemTime(start + offset); await h.router.tick(); }
+  }
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Nothing to cancel"]]);
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-native");
+  if (boundary !== "rejected") h.backend.final("NO_REPLY");
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  for (let i = 0; i < 4; i++) await restarted.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toMatchObject({ state: "sent", text: "Nothing to cancel" });
+});
+
+test.each([...nativeBackends])("owner text containing <subagent remains owner text (%s)", async backend => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  nativeNoticeReply(h, backend, "completed", "Desktop answer", true);
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.input("native-owner", 'What does <subagent state="completed"> mean?', { source: "typed" });
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toContain('What does <subagent state="completed"> mean?');
+  h.backend.final("It is a completion notice");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["It is a completion notice"]);
+});
+
+test.each(nativeBackends.flatMap(backend => ["NO_REPLY", "empty", "tool", "running-race"].map(mode => ({ backend, mode }))))("native subagent silence is preserved ($backend $mode)", async ({ backend, mode }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  const insert = () => nativeNoticeReply(h, backend, mode === "running-race" ? "running" : "completed", mode === "empty" ? null : mode === "NO_REPLY" ? "Logged.\nNO_REPLY" : "Still checking");
+  h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+  h.input("wake:native-quiet", "Another update");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
 });
 
 const delegatedNotices = [

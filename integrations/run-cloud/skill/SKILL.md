@@ -34,7 +34,9 @@ After a `brew upgrade --cask android-commandlinetools`, re-point the two
 
 ## Setup (done)
 
-- CLI: `~/.run-cloud/bin/runcloud` (0.2.0, Bun binary). Always call it through
+- CLI: `~/.run-cloud/bin/runcloud` (npm 0.2.183 in
+  `~/.run-cloud/lib/runcloud-0.2.183`, run by node; the old 0.2.0 Bun binary
+  is kept at `~/.run-cloud/bin/runcloud-0.2.0` for rollback). Always call it through
   the wrapper `~/.local/bin/runcloud`. The wrapper unsets `BUN_INSPECT` (OpenCode
   shells inherit it and every Bun binary then dies with "Failed to start
   server. Is port 49398 in use?"), loads the API key from Keychain
@@ -55,6 +57,7 @@ viewer link on Telegram.
 rcsim create ios --name "crpko login flow" --purpose "QA CRP-123 login screen"
 rcsim create android --name "wallet apk" --purpose "smoke test" --install app.apk
 rcsim launch ios --build <xcode-build-id> --name "..." --purpose "..."
+rcsim launch ios --asset <asset-id> --idempotency-key <stable-key> --name "..." --purpose "..."
 rcsim heartbeat              # every <=15 min while you still need it
 rcsim release <id>           # or: rcsim release --mine
 rcsim list [--all]           # registered sessions, owners, last heartbeat
@@ -69,6 +72,9 @@ rcsim list [--all]           # registered sessions, owners, last heartbeat
 - `--name` is the label Abdullah sees. Make it say what it is.
 - Short id prefixes work for `heartbeat/release/claim/link`.
 - `rcsim whoami` shows the owner thread and manager it resolved.
+- If caller resolution is refused, nothing reached Run Cloud. Do not report an
+  outage or bypass ownership. Follow the diagnostic; a Claude shared-session
+  refusal requires a resolved Codex/OpenCode child (`robob-dispatch`).
 
 ### Heartbeats and the monitor
 
@@ -160,16 +166,31 @@ rcsim launch ios --build "$BUILD_ID" --name "App preview" --purpose "..."
   Abdullah's iPhone path is still `ios-ota-tailscale` (local device build, no
   simulator needed).
 
-Android: Run Cloud has no remote Gradle build. Build the APK locally
-(`./gradlew assembleDebug` or `npx expo prebuild` + gradle; no emulator needed),
+Android: Run Cloud has no remote Gradle build. Build the APK through `offbox`
+(`remote-compute` skill; no local emulator),
 then `rcsim create android --install app/build/outputs/apk/debug/app-debug.apk`.
 To reuse a build across sessions: `runcloud asset push app.apk -n name --json`
 and `rcsim create android --install-asset <id>`; delete assets you no longer
 need (`runcloud asset delete`).
 
-Live reload: `runcloud ios tunnel` needs the "Newly sidecar" on
-127.0.0.1:4500, which isn't installed, and Android has no tunnel. Iterate with
-rebuild/rebundle + a fresh session instead of local Metro.
+Live reload: there is no private route from a Run Cloud sim to a local
+server yet (#453, 13 Nov 2026). `runcloud ios tunnel` needs a sidecar on
+127.0.0.1:4500 that no public channel ships, and both CLI channels (npm
+0.2.183, standalone 0.2.0-cd7800d) fail with "This version of the CLI asked
+for something the server doesn't have". Android has no CLI tunnel, and the
+SDK's openMetroTunnel needs a transport we don't have. A sim can reach a
+throwaway demo server through a temporary Cloudflare link (the
+t3code-upstream-pr recipe, 13 Oct), only with Abdullah's OK for that run,
+torn down right after; never point one at his real server. Otherwise iterate
+with rebuild/rebundle + a fresh session, and test against a local server on a
+real device: the USB-plugged Nothing Phone over home Wi-Fi (android-phone
+skill; the server listens on the Mac's LAN address), or the iPhone/iPad over
+Tailscale (ios-ota-tailscale + `vp run dev --share`).
+
+`test-t3-mobile` saying "Agent device access is turned off for this
+environment." is expected under the Run Cloud-only rule. Verify through
+`rcsim` instead; never enable the device hub or local simulators. #188 tracks
+Run Cloud in the Device panel.
 
 ## Cost discipline
 
@@ -181,6 +202,56 @@ rebuild/rebundle + a fresh session instead of local Metro.
   aren't actively using.
 
 ## Troubleshooting
+
+### Create or install failures: isolate before declaring an outage
+
+`502 api_origin_unavailable` / `stage: public_api_origin` describes the failed
+request boundary, not its root cause. It can mask an app-specific install or
+launch failure. An upload marked `ready` proves storage, not installability.
+
+1. Save the exact operation, platform, UTC time, elapsed time, CLI version,
+   asset/build ID, request ID and error. Check `rcsim whoami` for local ownership
+   failures. Redact signed viewer URLs and credentials.
+2. Reconcile `runcloud ios|android list --json` (redact URLs) and any returned
+   session/launch ID before retrying. A failed call can still allocate a session.
+   Release only your sessions; use a short hard timeout for probes.
+3. Try one bare create on the SAME platform and release it. If it works, compare
+   one known-good app through the same install route and current device/runtime.
+   Use `asset list` to find retained working artifacts before searching disk or
+   rebuilding. Android success alone does not establish iOS health.
+   If the bare create also fails, check account/quota/capacity errors and
+   read-only API responses. Report the observed session-allocation failure.
+   A broader outage claim needs corroboration, such as a provider incident or
+   contemporaneous failures across independent controls; name only the scope
+   supported by that evidence.
+4. If only the candidate fails, compare its archive layout, executable modes,
+   bundle metadata, every embedded binary's simulator platform/architecture and
+   minimum OS, and code-signing entitlements. A successful compile or
+   `codesign --verify` does not establish remote install/launch compatibility.
+   Change one factor per diagnostic copy and retain the original.
+5. Use current help/docs before declaring a workaround unavailable. `rcsim launch
+   ios --asset ASSET_ID --idempotency-key KEY` needs no rebuild. Always choose
+   and save an explicit key before a launch: rcsim's default changes with time
+   and is not reliably printed on failure. Inspect a returned operation with
+   `runcloud mobile get LAUNCH_ID --json`. A 502/timeout alone is an unknown
+   outcome, not a terminal operation status. Reconcile sessions and replay the
+   same launch input/key to recover it. Only a retained terminal failed status
+   justifies a new operation key, with corrected input or evidence of recovery.
+   The SDK also has `cloud.ios.installAsset(sessionId, assetId)` for a separately
+   allocated, rcsim-owned session; CLI absence does not imply API absence.
+   SDK calls do not pass through the wrapper heartbeat hook: explicitly
+   `rcsim heartbeat SESSION_ID` while using them, and release when finished.
+6. Do not blindly repeat a failed create-with-install. Apart from idempotent
+   recovery of an unknown launch outcome, each additional request must test a
+   stated hypothesis or follow evidence of recovery. Report the narrow failure
+   and what remains unverified. A diagnostic entitlement change is not proof of the original
+   app's universal links, passkeys, signing or other entitlement-dependent flows.
+
+For the verified Crpko entitlement failure and controlled-probe results, read
+[the iOS install diagnosis](references/ios-install-diagnosis.md). Do not turn
+one app's result into a rule to strip entitlements from all builds.
+
+### Local wrapper and monitor
 
 - `Failed to start server. Is port ... in use?`: you called the raw binary.
   Use `~/.local/bin/runcloud`.

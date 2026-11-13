@@ -101,33 +101,37 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get to keep it; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
         ),
       ),
       step: Schema.optional(
         describe(
           PositiveInt,
-          "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
+          "Subtasks with the same step go in any order. Leave out to keep an existing id's step, or for the step after the previous entry on a new subtask. Done and skipped subtasks keep their step.",
         ),
       ),
-      text: describe(
-        RawBoardText.check(Schema.isMaxLength(MAX_TEXT)),
-        `Subtask text, at most ${MAX_TEXT} characters.`,
+      text: Schema.optional(
+        describe(
+          RawBoardText.check(Schema.isMaxLength(MAX_TEXT)),
+          `Subtask text, at most ${MAX_TEXT} characters. Required for a new subtask; for an existing open id, sent text replaces it. Done and skipped subtasks keep their text.`,
+        ),
       ),
-      owner: describe(
-        Schema.Literals(["work", "review", "evaluator", "script"]),
-        "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
+      owner: Schema.optional(
+        describe(
+          Schema.Literals(["work", "review", "evaluator", "script"]),
+          "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back). Required for a new subtask; omitted on an existing open id, keeps its owner. Done and skipped subtasks keep their owner.",
+        ),
       ),
       gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
       script: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "For a script's subtask: the name of the board script that does it. Left out, any script on the board can.",
+          "For a script's subtask: the name of the board script that does it. Left out on a new or edited entry, any script on the board can. An id alone keeps its stored binding; done and skipped subtasks keep theirs.",
         ),
       ),
     }),
   ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: listed ids keep their state, open ones left out go, done ones stay.`,
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
