@@ -9,7 +9,10 @@ mode=${1:-install}
 if [[ $mode != --dry-run ]]; then
   [[ -z $(git -C "$repo" status --porcelain -- integrations/ovnfs-recovery integrations/deploy.zsh) ]] || { print -u2 'commit recovery files before installation'; exit 1; }
   remote=$(git -C "$repo" ls-remote origin refs/heads/main | cut -f1)
-  [[ -n $remote ]] && git -C "$repo" merge-base --is-ancestor HEAD "$remote" || { print -u2 'HEAD must be pushed on origin/main'; exit 1; }
+  if [[ -z $remote ]] || ! git -C "$repo" merge-base --is-ancestor HEAD "$remote"; then
+    print -u2 'HEAD must be pushed on origin/main'
+    exit 1
+  fi
 fi
 if [[ $mode == --dry-run ]]; then
   print "copy recovery.py -> $live/recovery.py (internal disk)"

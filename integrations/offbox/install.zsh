@@ -58,7 +58,9 @@ if [[ $mode == check ]]; then
   cmp -s "$here/launchd/$label.plist" "$plist" || { print -u2 "offbox: $plist differs"; rc=1 }
   cmp -s "$here/launchd/$home_label.plist" "$home_plist" || { print -u2 "offbox: $home_plist differs"; rc=1 }
   [[ "$(readlink "$link" 2>/dev/null)" == "$skill/scripts/offbox.py" ]] || { print -u2 "offbox: $link is not a link to the skill"; rc=1 }
-  (( rc == 0 )) && print "offbox: live copy matches $(git -C "$repo" rev-parse --short HEAD) and it is on origin"
+  if (( rc == 0 )); then
+    print "offbox: live copy matches $(git -C "$repo" rev-parse --short HEAD) and it is on origin"
+  fi
   exit $rc
 fi
 
@@ -74,16 +76,22 @@ for pair in "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.pli
             "launchd/$home_label.plist:$home_plist"; do
   src="$here/${pair%%:*}"
   dst="${pair#*:}"
-  cmp -s "$src" "$dst" && continue
+  if cmp -s "$src" "$dst"; then
+    continue
+  fi
   print "update $dst"
-  [[ "$dst" == "$home_plist" ]] && home_plist_changed=1
+  if [[ "$dst" == "$home_plist" ]]; then
+    home_plist_changed=1
+  fi
   (( ${#dry} )) || { mkdir -p "${dst:h}"; cp -p "$src" "$dst" }
 done
 if [[ "$(readlink "$link" 2>/dev/null)" != "$skill/scripts/offbox.py" ]]; then
   print "link $link"
   (( ${#dry} )) || ln -sfn "$skill/scripts/offbox.py" "$link"
 fi
-(( ${#dry} )) && exit 0
+if (( ${#dry} )); then
+  exit 0
+fi
 
 # The monitor imports the skill's scripts, so restart it to pick up new code.
 if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
@@ -99,7 +107,9 @@ elif (( home_plist_changed )); then
   launchctl bootout "gui/$(id -u)/$home_label" || true
   # bootout returns before the job is gone; bootstrap answers "Input/output error" until it is.
   for try in 1 2 3 4 5; do
-    launchctl bootstrap "gui/$(id -u)" "$home_plist" 2>/dev/null && break
+    if launchctl bootstrap "gui/$(id -u)" "$home_plist" 2>/dev/null; then
+      break
+    fi
     sleep 1
   done
   launchctl print "gui/$(id -u)/$home_label" >/dev/null 2>&1 || { print -u2 "offbox: could not reload $home_label"; exit 1 }
