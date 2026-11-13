@@ -4079,6 +4079,7 @@ const make = Effect.gen(function* () {
     purpose: Briefs.EvaluatorPurpose,
     extra: {
       readonly text?: string | undefined;
+      readonly coalesce?: string;
       readonly cardId?: KanbanCard["id"] | null;
       readonly key?: string;
       readonly note?: boolean;
@@ -4109,7 +4110,12 @@ const make = Effect.gen(function* () {
               !(yield* liveEvaluator(link.threadId))
             )
               continue;
-            if (extra.text) yield* threads.send({ threadId: link.threadId, text: extra.text });
+            if (extra.text)
+              yield* threads.send({
+                threadId: link.threadId,
+                text: extra.text,
+                ...(extra.coalesce === undefined ? {} : { coalesce: extra.coalesce }),
+              });
             return link.threadId;
           }
         }
@@ -4354,6 +4360,7 @@ const make = Effect.gen(function* () {
     text: string,
     note = false,
     deliveryKey?: string,
+    coalesce?: string,
   ) {
     const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
     const deliverSaved = Effect.fn("KanbanService.deliverDiscussionEvaluator")(function* (
@@ -4367,6 +4374,7 @@ const make = Effect.gen(function* () {
           threadId,
           text,
           ...(deliveryKey === undefined ? {} : { key: deliveryKey, keyAcrossThreads: true }),
+          ...(coalesce === undefined ? {} : { coalesce }),
         }),
         undefined,
         false,
@@ -4569,6 +4577,7 @@ const make = Effect.gen(function* () {
     authorThreadId?: ThreadId,
     deliveryKey?: string,
     canRoute?: Effect.Effect<boolean, E>,
+    coalesce?: string,
   ) =>
     serial(
       routing,
@@ -4586,7 +4595,7 @@ const make = Effect.gen(function* () {
         ) {
           current = yield* saveDiscussion({ ...current, evaluatorThreadId: null });
         }
-        return yield* routeEvaluator(current, text, note, deliveryKey);
+        return yield* routeEvaluator(current, text, note, deliveryKey, coalesce);
       }),
     );
 
@@ -4668,6 +4677,10 @@ const make = Effect.gen(function* () {
         discussion,
         Briefs.evaluatorStepFromOtherText(after, actor.threadId),
         true,
+        undefined,
+        undefined,
+        undefined,
+        `step:${after.id}`,
       );
       return;
     }
@@ -4679,14 +4692,18 @@ const make = Effect.gen(function* () {
       for (const link of open.toReversed()) {
         if (link.role !== "evaluator" || link.purpose !== "packets") continue;
         if (!(yield* liveEvaluator(link.threadId))) continue;
-        yield* threads.send({ threadId: link.threadId, text });
+        yield* threads.send({ threadId: link.threadId, text, coalesce: `step:${after.id}` });
         return;
       }
-      yield* startEvaluatorUnlocked(yield* boardOf(after.boardId), { kind: "packets" }, { text });
+      yield* startEvaluatorUnlocked(
+        yield* boardOf(after.boardId),
+        { kind: "packets" },
+        { text, coalesce: `step:${after.id}` },
+      );
       return;
     }
     const discussion = yield* cardDiscussionUnlocked(after.id);
-    yield* toEvaluator(discussion, text, true);
+    yield* toEvaluator(discussion, text, true, undefined, undefined, undefined, `step:${after.id}`);
   });
   const evaluatorTurn = (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) =>
     evaluatorTurnStrict(before, after, actor).pipe(
@@ -5428,7 +5445,12 @@ const make = Effect.gen(function* () {
     const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
     if (card.activeThreadId !== threadId || (card.activeRole === "work" && !kanbanWorkStep(card)))
       return;
-    yield* threads.send({ threadId, text: Briefs.planChangedText(card), ...(key ? { key } : {}) });
+    yield* threads.send({
+      threadId,
+      text: Briefs.planChangedText(card),
+      coalesce: `plan:${card.id}`,
+      ...(key ? { key } : {}),
+    });
   });
 
   /**
@@ -7459,7 +7481,7 @@ const make = Effect.gen(function* () {
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
     // like discussion delivery, so a concurrent edit cannot replay the same nudge.
     const sent = yield* locks.outside(
-      threads.send({ threadId, text }).pipe(
+      threads.send({ threadId, text, coalesce: "nudge" }).pipe(
         Effect.as(true),
         Effect.catchCause(() => Effect.succeed(false)),
       ),
@@ -9630,6 +9652,10 @@ const make = Effect.gen(function* () {
                             discussion,
                             Briefs.evaluatorStepWaitingText(current, minutes),
                             true,
+                            undefined,
+                            undefined,
+                            undefined,
+                            `step:${current.id}`,
                           ).pipe(Effect.as(true)),
                     ),
                     Effect.catchCause((cause) =>

@@ -148,6 +148,8 @@ const makeFake = Effect.gen(function* () {
     threadId: string;
     model: ModelSelection | undefined;
     key: string | undefined;
+    coalesce: string | undefined;
+    text: string;
   }> = [];
   const modelSwitches: Array<{ threadId: string; model: ModelSelection }> = [];
   const activeModels = new Map<string, ModelSelection>();
@@ -279,7 +281,13 @@ const makeFake = Effect.gen(function* () {
             }
             if (input.key && acceptedKeys.has(input.key)) {
               // An accepted key is idempotent: record the attempt, deliver nothing.
-              sends.push({ threadId: input.threadId, model: input.model, key: input.key });
+              sends.push({
+                threadId: input.threadId,
+                model: input.model,
+                key: input.key,
+                coalesce: input.coalesce,
+                text: input.text,
+              });
               return Effect.void;
             }
             if (conclusiveReject.delete(input.threadId)) {
@@ -299,7 +307,13 @@ const makeFake = Effect.gen(function* () {
               };
               lastRuns.set(input.threadId, run);
               runHistory.set(run.runId, run);
-              sends.push({ threadId: input.threadId, model: input.model, key: input.key });
+              sends.push({
+                threadId: input.threadId,
+                model: input.model,
+                key: input.key,
+                coalesce: input.coalesce,
+                text: input.text,
+              });
               return Effect.succeed(run.runId);
             } else if (thread?.running) {
               lastRuns.set(input.threadId, {
@@ -309,7 +323,13 @@ const makeFake = Effect.gen(function* () {
               });
             }
             if (thread && runOnSend.has(input.threadId)) thread.running = true;
-            sends.push({ threadId: input.threadId, model: input.model, key: input.key });
+            sends.push({
+              threadId: input.threadId,
+              model: input.model,
+              key: input.key,
+              coalesce: input.coalesce,
+              text: input.text,
+            });
             const version = (inputVersions.get(input.threadId) ?? 0) + 1;
             inputVersions.set(input.threadId, version);
             if (input.key) {
@@ -28903,4 +28923,102 @@ it.effect.each(["scheduled", "scheduled-null", "manual"] as const)(
         assert.strictEqual((yield* Ref.get(fake.threads)).size, origin === "manual" ? 1 : 0);
       }).pipe(Effect.provide(testLayer(wrapped)));
     }),
+);
+
+it.effect("board step wakes share a card scope while owner relays do not coalesce", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const hidePackets = { once: false };
+    const racingStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          threadLinks: (input) =>
+            real.threadLinks(input).pipe(
+              Effect.map((links) => {
+                if (
+                  !hidePackets.once ||
+                  input === undefined ||
+                  !("open" in input) ||
+                  input.open !== true ||
+                  !links.some((link) => link.purpose === "packets")
+                )
+                  return links;
+                hidePackets.once = false;
+                // The serialized start finds an evaluator admitted after the preliminary scan.
+                return links.filter((link) => link.purpose !== "packets");
+              }),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const plan = [
+        { step: 1, owner: "evaluator" as const, text: "Packet" },
+        { step: 2, owner: "work" as const, text: "Build" },
+      ];
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "First", title: "First", subtasks: plan },
+        { _tag: "thread", threadId: ThreadId.make("reporter") },
+      );
+      hidePackets.once = true;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Second", title: "Second", subtasks: plan },
+        { _tag: "thread", threadId: ThreadId.make("reporter") },
+      );
+      const step = fake.sends.find(
+        (send) =>
+          send.text.includes("waiting on your subtasks") && send.coalesce === `step:${card.id}`,
+      );
+      assert.isFalse(hidePackets.once);
+      assert.isDefined(step);
+
+      // Owner discussion replies remain separate from board snapshots.
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(discussion.id, owner, [
+        { _tag: "md", text: "Please check the current packet" },
+      ]);
+      yield* kanban.post(discussion.id, owner, [
+        { _tag: "md", text: "Keep the owner message separate" },
+      ]);
+      const relayed = fake.sends.find((send) =>
+        send.text.includes("Keep the owner message separate"),
+      );
+      assert.isDefined(relayed);
+      assert.isUndefined(relayed!.coalesce);
+      const evaluator: KanbanActor = {
+        _tag: "evaluator",
+        threadId: (yield* kanban.discussion(discussion.id)).evaluatorThreadId!,
+      };
+      const waitingCard = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Waiting packet",
+          title: "Waiting packet",
+          priority: 1,
+          subtasks: plan,
+        },
+        evaluator,
+      );
+      const waitingTalk = yield* kanban.cardDiscussion(waitingCard.id);
+      yield* kanban.post(waitingTalk.id, evaluator, [{ _tag: "md", text: "Checking the packet" }]);
+      yield* kanban.tick;
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      const waiting = fake.sends.find(
+        (send) => send.text.includes("has waited") && send.text.includes(`#${waitingCard.number}`),
+      );
+      assert.isDefined(waiting);
+      assert.strictEqual(waiting!.coalesce, `step:${waitingCard.id}`);
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer, KanbanModels.layerTest(null), [opencodeTestProvider()], racingStore),
+      ),
+    );
+  }),
 );
