@@ -77,13 +77,13 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual(self.rows('crash.source')[-1]['props']['chunksDone'], 3)
         self.cost = 12
         self.assertTrue(self.collect(17200))
-        self.assertEqual(self.calls[-1][:2], (9100,10000))
-        self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+        self.assertEqual(self.calls[4][:2], (9100,10000))
+        self.assertEqual(jobs.read_state('crashes')['unified'], 17200)
         observed = self.rows('crash.observed')
         self.assertEqual([r['props']['observedAt'] for r in observed], list(self.boots))
         self.assertEqual(sum(r['props']['count'] for r in observed), 4)
         self.assertTrue(self.collect(20800))
-        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 7200)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 0)
 
     def test_completed_chunk_is_checkpointed_before_next_command(self):
         run = self.log_command
@@ -113,19 +113,21 @@ class UnifiedChunkTests(unittest.TestCase):
                 self.assertEqual(state['unified'], cursor)
                 self.assertEqual(state['unifiedRetry']['skippedS'], 82800)
                 self.assertTrue(self.collect(17200))
-                self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+                self.assertEqual(jobs.read_state('crashes')['unified'], 17200)
                 self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
                 rows = [r for p in (self.logs/str(completed_chunks)).glob('*.ndjson')
                         for r in map(json.loads, p.read_text().splitlines())]
                 sources = [r for r in rows if r['name'] == 'crash.source']
                 summaries = [r for r in rows if r['name'] == 'crash.collect']
-                self.assertEqual(len(sources), 1)
+                self.assertEqual(len(sources), 2)
                 self.assertEqual(sources[0]['props']['skippedS'], 82800)
-                self.assertEqual(summaries[0]['props']['skippedS'], 82800)
+                self.assertEqual(sources[1]['props']['skippedS'],3600)
+                self.assertEqual(summaries[0]['props']['skippedS'], 86400)
                 observed = [r['props']['observedAt'] for r in rows if r['name'] == 'crash.observed']
                 self.assertEqual(observed, list(self.boots))
                 self.assertEqual([(a,b) for a,b,_ in self.calls],
-                                 [(6400,7300),(7300,8200),(8200,9100),(9100,10000)])
+                                 [(6400,7300),(7300,8200),(8200,9100),(9100,10000),
+                                  (13600,14500),(14500,15400),(15400,16300),(16300,17200)])
 
     def test_reported_coverage_gap_is_cleared_before_normal_suffix_retry(self):
         jobs.save_state('crashes', {'unified':10000-86400, 'rollupDay':'1969-12-31'})
@@ -136,7 +138,8 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual(jobs.read_state('crashes')['unifiedRetry']['skippedS'], 0)
         self.cost = 12
         self.assertTrue(self.collect(17200))
-        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 0)
+        self.assertEqual(self.rows('crash.source')[-2]['props']['skippedS'], 0)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 3600)
 
     def test_absolute_deadline_shortens_shared_budget_and_keeps_suffix(self):
         self.cost = 28

@@ -48,6 +48,14 @@ class DiskSwingTests(unittest.TestCase):
             jobs.disk_sample(self.root, self.root/'tmp', paths=[])
         return self.rows('disk.sample')[-1]
 
+    def make_children_due(self):
+        state = jobs.read_state('disk-inventory')
+        for cache in state.get('childState',{}).values():
+            for value in cache.values():
+                if 'at' in value:
+                    value['at'] -= 3600
+        jobs.save_state('disk-inventory',state)
+
     def test_baseline_small_positive_and_negative_swings(self):
         self.inventory([100, 20, 10])
         baseline = self.sample()
@@ -128,6 +136,7 @@ class DiskSwingTests(unittest.TestCase):
                 jobs.save_state('disk', {})
                 if not created:
                     root.mkdir()
+                    (root/'child').mkdir()
                 def run(command, **kwargs):
                     return SimpleNamespace(returncode=0, stdout=str(95*GB//1024)+'\t'+command[-1], stderr='')
                 with patch.object(jobs, 'DIRECTORY_ROOTS', [root]):
@@ -135,7 +144,9 @@ class DiskSwingTests(unittest.TestCase):
                     before = self.sample(737 if created else 642)
                     if created:
                         root.mkdir()
+                        (root/'child').mkdir()
                     else:
+                        (root/'child').rmdir()
                         root.rmdir()
                     jobs.directory_inventory([root], run)
                     after = self.sample(642 if created else 737)
@@ -182,6 +193,7 @@ class DiskSwingTests(unittest.TestCase):
             for failed_first in (False, True):
                 with self.subTest(failure=failure, failed_first=failed_first):
                     root = self.root/(failure+str(failed_first)); root.mkdir()
+                    (root/'child').mkdir()
                     jobs.save_state('disk', {})
                     def run(command, **kwargs):
                         if failure == 'timeout': raise subprocess.TimeoutExpired(command, 60)
@@ -194,8 +206,14 @@ class DiskSwingTests(unittest.TestCase):
                     with patch.object(jobs, 'DIRECTORY_ROOTS', [root]):
                         jobs.directory_inventory([root], run if failed_first else good)
                         self.sample(642)
+                        self.make_children_due()
                         jobs.directory_inventory([root], good if failed_first else run)
-                        self.assertEqual(jobs.read_state('disk-inventory')['sizes'].get(str(root)), 95*GB if failed_first else None)
+                        # A full 60 s timeout remains hourly-limited until a deep
+                        # measurement replaces it; other failures retry normally.
+                        expected = None if failed_first and failure == 'timeout' else 95*GB
+                        self.assertEqual(jobs.read_state('disk-inventory')['sizes'].get(str(root)), expected)
+                        if not failed_first:
+                            self.assertTrue(jobs.read_state('disk-inventory')['partials'][str(root)]['partial'])
                         after = self.sample(737)
                     self.assertNotIn('topMover1Path', after['props'])
                     self.assertNotIn('topMover1Path', self.rows('disk.swing')[-1]['props'])
@@ -300,14 +318,21 @@ class DiskSwingTests(unittest.TestCase):
             jobs.directory_inventory([root], run)
             self.sample(642)
             mode[0] = 'partial'
+            self.make_children_due()
             jobs.directory_inventory([root], run)
             inventory = jobs.read_state('disk-inventory')
-            self.assertEqual(inventory['children'][str(root)], {str(fast): GB})
+            self.assertEqual(inventory['children'][str(root)], {str(fast): GB,str(slow):95*GB})
             self.assertTrue(inventory['partials'][str(root)]['partial'])
             after = self.sample(737)
             self.assertNotIn('topMover1Path', after['props'])
             self.assertNotIn('grower1Path', after['props'])
             mode[0] = 'low'
+            # A later deep pass replaces an hourly-limited entry with its
+            # independently measured last-good total, using the shared schema.
+            state=jobs.read_state('disk-inventory')
+            state['childState'][str(root)][str(slow)]=dict(bytes=GB,at=time.time(),
+                attemptedAt=time.time(),partial=False,isDirectory=True)
+            jobs.save_state('disk-inventory',state)
             jobs.directory_inventory([root], run)
             recovered = self.sample(737)
             self.assertNotIn('topMover1Path', recovered['props'])

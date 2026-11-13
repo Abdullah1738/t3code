@@ -15,7 +15,8 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
-NUMBERS.update(('unreadableCount', 'turn', 'cachedCount'))
+NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
+                'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
@@ -105,6 +106,8 @@ def safe_fields(values, event=None):
             if key != 'trigger' or value != 'agent':
                 result[key] = value
         elif key == 'lastGoodSnapshotError' and value in ('password_unavailable', 'timeout', 'exit', 'parse', 'unavailable', 'no_snapshots'):
+            result[key] = value
+        elif key == 'duMode' and value == 'links':
             result[key] = value
         elif key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
             result[key] = value

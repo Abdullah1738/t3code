@@ -198,43 +198,63 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     save_state('crashes', state)
     source_started = time.monotonic()
     since = state.get('unified', now-3600)
-    window = state.get('unifiedRetry') or dict(windowStart=max(since, now-UNIFIED_WINDOW_S),
-                                             windowEnd=now, skippedS=max(0, now-UNIFIED_WINDOW_S-since))
-    window = dict(window, windowS=window['windowEnd']-window['windowStart'])
-    window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
-    cursor = window['windowStart']
+    def fresh_window(cursor):
+        return dict(windowStart=max(cursor, now-UNIFIED_WINDOW_S), windowEnd=now,
+                    skippedS=max(0, now-UNIFIED_WINDOW_S-cursor))
+
+    window = state.get('unifiedRetry') or fresh_window(since)
     unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
+    skipped = 0
+    def lag():
+        return max(0, now+time.monotonic()-started-state.get('unified', since))
+
     try:
-        if time.monotonic() >= unified_deadline:
-            raise SourceFailure('timeout', 'collector budget exhausted')
-        while cursor < window['windowEnd']:
-            end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
-            remaining = min(60, unified_deadline-time.monotonic())
-            if remaining <= 0:
-                raise SourceFailure('timeout', 'unified log budget exhausted')
-            if log_reader is None:
-                observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
-            else:
-                observed = deadline_call(unified_deadline, log_reader, cursor, end)
-            counts.update(observed)
-            crash_observations(observed)
-            cursor = end
-            state['unified'] = cursor
-            window['chunksDone'] += 1
-            # The gap remains pending until the source result reports it.
-            state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
-                                         skippedS=window['skippedS'])
+        while True:
+            window = dict(window, windowS=window['windowEnd']-window['windowStart'])
+            window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
+            cursor = window['windowStart']
+            while cursor < window['windowEnd']:
+                end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
+                remaining = min(60, unified_deadline-time.monotonic())
+                if remaining <= 0:
+                    raise SourceFailure('timeout', 'unified log budget exhausted')
+                if log_reader is None:
+                    observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
+                else:
+                    observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                counts.update(observed)
+                crash_observations(observed)
+                cursor = end
+                state['unified'] = cursor
+                window['chunksDone'] += 1
+                # Keep the gap pending until the source result reports it,
+                # including an interruption after the last chunk checkpoint.
+                state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                             skippedS=window['skippedS'])
+                save_state('crashes', state)
+            state['unified'] = window['windowEnd']
+            state.pop('unifiedRetry', None)
+            emit('crashes', 'event', 'crash.source', ok=True,
+                 props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
+                            lagS=lag(), **window))
+            skipped += window['skippedS']
+            # Persist the reported gap's retirement before a fresh command can
+            # be interrupted; otherwise the next run would report it again.
             save_state('crashes', state)
-        state['unified'] = window['windowEnd']
-        state.pop('unifiedRetry', None)
-        emit('crashes', 'event', 'crash.source', ok=True,
-             props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000, **window))
+            if cursor >= now:
+                break
+            # A retry owns a frozen end, but finishing it must not waste the
+            # rest of this run's share. Apply the cap again to the fresh window.
+            window = fresh_window(cursor)
     except Exception as exc:
         errors += 1
         state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
                                      skippedS=window['skippedS'])
-        source_error('crashes', 'crash.source', 'unified', source_started, exc, window)
+        source_error('crashes', 'crash.source', 'unified', source_started, exc,
+                     dict(window, lagS=lag()))
+        skipped += window['skippedS']
         state['unifiedRetry']['skippedS'] = 0
+    window = dict(window, skippedS=skipped, lagS=lag())
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},

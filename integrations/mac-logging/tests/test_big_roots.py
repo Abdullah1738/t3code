@@ -88,6 +88,7 @@ class BigRootTests(unittest.TestCase):
         for i in range(9):
             root = self.root/str(i)
             root.mkdir()
+            (root/'slow').mkdir()
             roots.append(root)
         for i in range(100):
             (self.big/str(i)).mkdir()
@@ -181,11 +182,12 @@ class BigRootTests(unittest.TestCase):
             return {}
         self.assertTrue(collector.collect(now+7200, [], success))
         self.assertEqual(windows[0], windows[1])
-        self.assertEqual(jobs.read_state('crashes')['unified'], now)
+        self.assertEqual(jobs.read_state('crashes')['unified'], now+7200)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],3600)
         self.assertTrue(collector.collect(now+10800, [], success))
         self.assertEqual(jobs.read_state('crashes')['unified'], now+10800)
         row = self.rows('crash.source')[-1]
-        self.assertEqual(row['props']['skippedS'], 7200)
+        self.assertEqual(row['props']['skippedS'], 0)
         self.assertEqual(row['props']['windowS'], 3600)
 
     def test_direct_unified_call_is_also_capped(self):
