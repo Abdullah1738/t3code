@@ -31,6 +31,10 @@ class Base(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
+        environment = patch.dict(os.environ, {'HOME': str(self.tmp),
+                                             'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'tool-logs')})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.data, self.root, self.wd = self.tmp / 'data', self.tmp / 'watch', self.tmp / 'wd'
         self.wd.mkdir()
         registry = patch.object(mc, 'merchant_dead', return_value=[])
@@ -1323,12 +1327,23 @@ class CheckBudget(Base):
         def buffered(fd, *_args, **_kw):
             return io.TextIOWrapper(io.BufferedWriter(SlowRaw(fd, 'w')))
         write = mc.os.write
+        mkstemp = mc.tempfile.mkstemp
+        pings_inode = []
+        def pings_temp(*args, **kw):
+            fd, name = mkstemp(*args, **kw)
+            if kw.get('prefix') == '.pings.json.':
+                stat = mc.os.fstat(fd)
+                pings_inode.append((stat.st_dev, stat.st_ino))
+            return fd, name
         def slow_raw(fd, data):
-            calls.append('write')
-            time.sleep(3)
+            stat = mc.os.fstat(fd)
+            if (stat.st_dev, stat.st_ino) in pings_inode:
+                calls.append('write')
+                time.sleep(3)
             return write(fd, data)
         started = time.monotonic()
         with patch.object(mc, 'CHECK_BUDGET', 0.3), patch.object(mc.os, 'fdopen', buffered), \
+                patch.object(mc.tempfile, 'mkstemp', pings_temp), \
                 patch.object(mc.os, 'write', slow_raw), redirect_stderr(io.StringIO()):
             event = mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
         self.assertLess(time.monotonic() - started, 0.8)

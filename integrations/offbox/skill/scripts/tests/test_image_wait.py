@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import cli, runs
 from test_capacity import Isolated
 
@@ -63,7 +64,7 @@ class ImageWaitFixture:
         self.tool('lslocks', '#!/bin/bash\nprintf \'{"locks": []}\\n\'\n')
         self.tool('zstd', '#!/bin/bash\necho zstd >> "$CALLS"\n'
                           '[ "$HANG" = zstd ] && exec sleep 30\nprintf image\n')
-        self.env = dict(os.environ, PATH=f'{self.bins}:/usr/bin:/bin', CALLS=str(self.calls),
+        self.env = clean_env(PATH=f'{self.bins}:/usr/bin:/bin', CALLS=str(self.calls),
                         HANG=hang, PRESENT='0', FLOCK_TIMEOUT='0', OFFBOX_IMAGE_WAIT_SECONDS='1' if hang else '5')
 
     def tool(self, name, script):
@@ -113,13 +114,16 @@ class ImageWaitTests(unittest.TestCase):
     def test_restore_loading_past_deadline_and_unresponsive_docker_never_runs_command(self):
         with tempfile.TemporaryDirectory() as d:
             fx = ImageWaitFixture(d, 'load')
+            # Reach load before timing out, including the fake timeout interpreter's startup.
+            fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '5'
             fx.env['SEEN_INFO'] = str(fx.root / 'seen-info')
             # Docker answers before loading starts, then stalls when checked after the restore deadline.
             fx.tool('docker', DOCKER.replace("'info ')", "'info ') if [ -e \"$SEEN_INFO\" ]; then exec sleep 30; fi; "
                                             'touch "$SEEN_INFO";'))
             start = time.monotonic()
-            result = fx.run(timeout=18)
-            self.assertLess(time.monotonic() - start, 16)
+            result = fx.run(timeout=23)
+            # Restore 5s + Docker probe 11s + ps/lslocks 2s each + 1.5s startup margin.
+            self.assertLess(time.monotonic() - start, 5 + 11 + 2 + 2 + 1.5)
             self.assertEqual(result.returncode, 97, result.stderr)
             self.assertNotIn('USER_COMMAND', result.stdout)
             self.assertIn('docker load', fx.invoked())
@@ -254,10 +258,10 @@ class ImageWaitTests(unittest.TestCase):
                 try:
                     start = time.monotonic()
                     result = subprocess.run(['bash', '-c', script], env=fx.env,
-                                            capture_output=True, text=True, timeout=5)
+                                            capture_output=True, text=True, timeout=7)
                     self.assertEqual(result.returncode, 97)
-                    # A stuck mkdir spends both 2s budgets: the PID marker, then the exit writer.
-                    self.assertLess(time.monotonic() - start, 4.8)
+                    # Two 2s deadlines (PID marker + exit writer) plus 1.5s for shell/Python startup.
+                    self.assertLess(time.monotonic() - start, 5.5)
                     expected = 'run marker setup failed' if stage == 'mkdir' else 'diagnostic'
                     self.assertIn(expected, result.stderr)
                 finally:

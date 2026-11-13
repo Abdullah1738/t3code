@@ -39,6 +39,11 @@ import * as RpcSession from "./session.ts";
 import { makeEnvironmentServerConfigState } from "../state/server.ts";
 import { applyServerConfigProjection } from "../state/serverConfigProjection.ts";
 import { NETWORK_BLOCKING_HINT } from "../errors/network.ts";
+import {
+  createAnalyticsCollector,
+  registerEnvironmentAnalytics,
+  type ClientAnalyticsEvent,
+} from "../ardud/analytics.ts";
 
 type SocketEventType = "open" | "message" | "close" | "error";
 type SocketEvent = {
@@ -290,6 +295,54 @@ const publishConfigEvents = Effect.fn("TestRpcSessionFactory.publishConfigEvents
 });
 
 describe("RpcSessionFactory", () => {
+  it.effect("reports stream bytes and disconnect failures in the original entity context", () =>
+    Effect.gen(function* () {
+      const events: ClientAnalyticsEvent[] = [];
+      const analytics = createAnalyticsCollector({
+        surface: "mobile",
+        send: async (batch) => {
+          events.push(...batch);
+        },
+      });
+      analytics.setRoute({ route: "board", boardId: "board-a" });
+      const unregister = registerEnvironmentAnalytics(PREPARED.environmentId, analytics);
+      yield* Effect.addFinalizer(() => Effect.sync(unregister));
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect(PREPARED);
+      const ready = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(ready);
+      analytics.setRoute({ route: "board", boardId: "board-b" });
+      yield* Effect.promise(() => analytics.flush());
+      expect(events.filter((event) => event.kind === "rpc.summary")).toMatchObject([
+        {
+          surface: "mobile",
+          boardId: "board-a",
+          props: { method: WS_METHODS.subscribeServerConfig, phase: "stream", count: 1 },
+        },
+      ]);
+      expect(events.find((event) => event.kind === "rpc.summary")!.props!.bytes).toBeGreaterThan(0);
+      socket.close(1012, "private server reason");
+      yield* Effect.flip(session.closed);
+      yield* Effect.promise(() => analytics.flush());
+      expect(events.filter((event) => event.props?.errorTag)).toMatchObject([
+        {
+          surface: "mobile",
+          boardId: "board-a",
+          props: {
+            method: WS_METHODS.subscribeServerConfig,
+            phase: "stream",
+            errorTag: "RpcClientError",
+            count: 1,
+          },
+        },
+      ]);
+      expect(JSON.stringify(events)).not.toContain("private");
+    }),
+  );
+
   it.effect("owns one scoped websocket attempt and exposes readiness and closure", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();

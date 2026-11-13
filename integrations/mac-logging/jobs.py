@@ -9,7 +9,7 @@ import sys
 import subprocess
 import tempfile
 import time
-from toollog import emit, directory, private_dir
+from toollog import emit, directory, private_dir, SKIP_REASONS
 
 
 def state_path(name):
@@ -177,26 +177,105 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     save_state('disk', dict(sizes=sizes))
 
 
-def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary):
+def backup_restic_exit(executable, exit_code, output):
+    # nice and the timeout wrapper can fail before restic starts. Their status
+    # still controls the job, but is not evidence of a restic exit.
+    if int(exit_code) == 0:
+        return '0'
+    if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+        return ''
+    if int(exit_code) in (126, 127) or re.search(
+            r'(?m)^(?:[^\n]*[/])?nice:|^(?:FileNotFoundError|PermissionError|OSError):'
+            r'|^Traceback \(most recent call last\):'
+            r'|^(?:usage: )?(?:[^\n]*[/])?run_limited\.py(?:\s|: error:)', output):
+        return ''
+    return str(int(exit_code))
+
+
+def backup_reason(stage, restic_rc, output):
+    # Inspect errors locally; only a fixed enum crosses into the log.
+    if str(restic_rc) == '12' or re.search(r'password command failed|unable to (?:read|get) (?:the )?password|wrong password|no key found', output, re.I):
+        return 'password_unavailable'
+    if stage == 'repo' or str(restic_rc) == '10' or (stage == 'restic' and re.search(
+            r'\b(?:unable to|failed to|cannot) (?:open|read|load) (?:the )?(?:config(?:uration)? file|repository)\b',
+            output, re.I)):
+        return 'no_repo_access'
+    if stage == 'vault':
+        return 'source_missing'
+    if stage == 'replica' and 'not found; waiting for owner export' in output:
+        return 'source_missing'
+    return 'other'
+
+
+def backup_snapshot_age(target, snapshot_at):
+    if float(snapshot_at) > 0:
+        return max(0, time.time()-float(snapshot_at))
+    # Never run a password command, read a password file or open an interactive
+    # prompt for instrumentation. A caller-supplied password allows a bounded,
+    # lock-free read; otherwise the age is unknown, not a cached success time.
+    if not os.environ.get('RESTIC_PASSWORD') or not os.environ.get('RESTIC_REPOSITORY'):
+        return None
+    env = dict(os.environ)
+    for key in ('RESTIC_PASSWORD_COMMAND', 'RESTIC_PASSWORD_FILE'):
+        env.pop(key, None)
+    tag = {'memory': 'memory-live', 'health': 'health-data'}[target]
+    result = subprocess.run([os.environ.get('MAC_LOG_RESTIC', '/opt/homebrew/bin/restic'),
+                             '--no-lock', 'snapshots', '--host', 'ardud-mac', '--tag', tag,
+                             '--latest', '1', '--json'], env=env, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        return None
+    import datetime as dt
+    snapshots = json.loads(result.stdout)
+    newest = max(dt.datetime.fromisoformat(s['time'].replace('Z', '+00:00')).timestamp() for s in snapshots)
+    return max(0, time.time()-newest)
+
+
+def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_reason='', lock_path=''):
     now = time.time()
-    previous = read_state('backup-' + target)
-    last = float(snapshot_at) if float(snapshot_at) > 0 else previous.get('snapshotAt')
-    if last:
-        save_state('backup-' + target, dict(snapshotAt=last))
+    if target not in ('health', 'memory', 'other'):
+        return
     try:
         summary = json.loads(summary)
     except ValueError:
         summary = {}
-    props = dict(target=target, resticExitCode=int(restic_rc), exitCode=int(exit_code), skipped=int(int(restic_rc) == -1 and int(exit_code) == 0))
+    ran = str(restic_rc) not in ('', '-1')
+    if not ran and not skip_reason:
+        skip_reason = 'other'
+    if skip_reason and skip_reason not in SKIP_REASONS:
+        skip_reason = 'other'
+    props = dict(target=target, exitCode=int(exit_code), skipped=int(bool(skip_reason)))
+    if ran:
+        props['resticExitCode'] = int(restic_rc)
+    ok = int(exit_code) == 0
+    tag = None if ok else 'backup.failed'
+    if skip_reason:
+        props['skipReason'] = skip_reason
+        ok, tag = False, 'backup.skipped_' + skip_reason
+        if skip_reason == 'lock_held':
+            try:
+                lock = Path(lock_path)
+                props['lockAgeS'] = max(0, int(now-lock.stat().st_mtime))
+                holder = (lock/'pid').read_text().strip()
+                props['lockPid'] = int(holder) if re.fullmatch(r'[0-9]{1,10}', holder) else 0
+            except (OSError, ValueError):
+                props.setdefault('lockPid', 0)
+            # An unreadable age cannot prove that this is a healthy skip.
+            ok = int(exit_code) == 0 and 'lockAgeS' in props and props['lockAgeS'] < 7200
+            tag = (None if ok else 'backup.skip_stale_lock' if props.get('lockAgeS', -1) >= 7200
+                   else 'backup.skipped_lock_held')
     # Only counters are copied from restic's summary, never paths/errors or command output.
     for key, source in [('bytes', 'total_bytes_processed'), ('files', 'total_files_processed')]:
         if type(summary.get(source)) is int:
             props[key] = summary[source]
-    if last:
-        props['snapshotAgeS'] = max(0, now-last)
-    emit('backup', 'error' if int(exit_code) else 'perf', 'backup.run',
-         duration_ms=max(0, (now-float(start))*1000), ok=int(exit_code)==0, props=props,
-         error_tag='backup.failed' if int(exit_code) else None)
+    try:
+        age = backup_snapshot_age(target, snapshot_at)
+        if age is not None:
+            props['snapshotAgeS'] = age
+    except Exception:
+        pass
+    emit('backup', 'perf' if ok else 'error', 'backup.run',
+         duration_ms=max(0, (now-float(start))*1000), ok=ok, props=props, error_tag=tag)
 
 
 def main(argv):
@@ -208,7 +287,11 @@ def main(argv):
             emit('disk', 'event' if ok else 'error', 'disk.alert', ok=ok,
                  props={'exitCode': int(argv[1])}, error_tag=None if ok else 'disk.alert_failed')
         elif argv[0] == 'backup':
-            backup_run(*argv[1:6], sys.stdin.read(16384))
+            backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:8])
+        elif argv[0] == 'backup-reason':
+            print(backup_reason(*argv[1:3], sys.stdin.read(16384)))
+        elif argv[0] == 'backup-restic-exit':
+            print(backup_restic_exit(*argv[1:3], sys.stdin.read(16384)))
     except Exception:
         pass
 

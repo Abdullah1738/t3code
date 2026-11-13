@@ -40,11 +40,15 @@ import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
 import { AskToastBar, BarButton, OfflineBand, OwnerBand, Pill, UnreadableLine } from "./ui";
 import { useQueue } from "./useQueue";
+import { useAnalyticsSearch } from "../../useAnalytics";
+import { useAskEnvironmentId } from "./askStore";
+import { analyticsForEnvironment } from "@t3tools/client-runtime/ardud/analytics";
 
 const ALL_BOARDS = "";
 
 /** Every ask that waits on him, across boards: the list he works down. */
 export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueueParams | undefined>) {
+  const analyticsEnvironmentId = useAskEnvironmentId();
   const asks = useAsks();
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
@@ -77,6 +81,13 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     queue.hidden,
   );
   const rows = queueRows(sections, openBatches);
+  useAnalyticsSearch(
+    analyticsEnvironmentId,
+    "needs-owner",
+    query.length,
+    rows.length,
+    boardId ?? undefined,
+  );
   // An ask whose answer is on its way no longer counts.
   const owed = queue.needsYou.items.filter((item) => !queue.hidden.has(item.key));
   const chips = boardChips(queue.open, owed);
@@ -90,6 +101,9 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     setQuery("");
   };
   const refresh = () => {
+    analyticsForEnvironment(analyticsEnvironmentId)?.record("client.refresh", {
+      props: { reason: "refresh" },
+    });
     setRefreshing(true);
     void asks.refreshAsks().then(
       () => setRefreshing(false),
@@ -201,7 +215,15 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
         alert
         title="Couldn't load asks"
         detail={queue.error ?? undefined}
-        action={{ label: "Retry", onPress: () => void asks.refreshAsks() }}
+        action={{
+          label: "Retry",
+          onPress: () => {
+            analyticsForEnvironment(analyticsEnvironmentId)?.record("client.retry", {
+              props: { reason: "retry" },
+            });
+            void asks.refreshAsks();
+          },
+        }}
       />
     ) : (
       <LoadingLine />

@@ -27,7 +27,8 @@ SHELLS = ("/bin/bash", "/bin/zsh")
 
 class ShellFollowupTests(unittest.TestCase):
     def run_shell(self, shell, script, env):
-        return subprocess.run([shell, "-c", script], env={**os.environ, **env},
+        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        return subprocess.run([shell, "-c", script], env={**child_env, **env},
                               text=True, capture_output=True, timeout=5)
 
     def test_return_to_same_function_keeps_export_attribute_untouched(self):

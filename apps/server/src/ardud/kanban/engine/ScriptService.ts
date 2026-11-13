@@ -20,6 +20,7 @@ import * as NodeURL from "node:url";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
+  KanbanCardId,
   KanbanDiscussionId,
   KanbanError,
   KanbanScriptId,
@@ -1258,6 +1259,17 @@ const make = Effect.gen(function* () {
     }
     const done = yield* Deferred.make<void>();
     const byId = new Map(cards.map((card) => [card.id as string, card]));
+    // Script inputs include named settled dependencies, without scanning board history.
+    for (const id of new Set(
+      batch.flatMap((card) => [
+        ...(card.wait?.card == null ? [] : [card.wait.card]),
+        ...card.blockedBy,
+      ]),
+    )) {
+      if (byId.has(id)) continue;
+      const dependency = yield* io(store.card(KanbanCardId.make(id)));
+      if (dependency?.boardId === board.id) byId.set(id, dependency);
+    }
     const links = batch.flatMap((card) =>
       card.links.flatMap((link) =>
         link.kind === "pr" && link.state !== null
@@ -1293,7 +1305,7 @@ const make = Effect.gen(function* () {
     const now = DateTime.toEpochMillis(yield* DateTime.now);
     for (const board of yield* io(store.boards)) {
       if (board.archivedAt !== null) continue;
-      const cards = yield* io(store.cards(board.id));
+      const cards = yield* io(store.openCards(board.id));
       const names = new Set(
         cards.flatMap((card) =>
           kanbanWaiting(card) && card.wait?.on === "script" ? [card.wait.script ?? ""] : [],

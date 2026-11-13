@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import { activeAnalytics, recordSettingsKeys } from "@t3tools/client-runtime/ardud/analytics";
 import { AsyncResult, Atom } from "effect/reactivity";
 
 import * as MobilePreferences from "../persistence/mobile-preferences";
@@ -71,6 +72,7 @@ export function createMobilePreferencesState(
               )
             : update;
         const version = ++nextPatchVersion;
+        const analytics = activeAnalytics();
         const current = get(optimisticPatchAtom);
         const versions = { ...current.versions };
         for (const key of Object.keys(patch) as Array<keyof MobilePreferences.Preferences>) {
@@ -86,6 +88,7 @@ export function createMobilePreferencesState(
           ),
           Effect.tap((saved) =>
             Effect.sync(() => {
+              recordSettingsKeys(analytics, patch);
               get.set(confirmedPreferencesAtom, saved);
               const optimistic = get(optimisticPatchAtom);
               const values = { ...optimistic.values } as Record<string, unknown>;

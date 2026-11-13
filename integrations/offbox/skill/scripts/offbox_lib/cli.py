@@ -199,10 +199,7 @@ def _cmd_run(a, me) -> int:
     from . import home
     home.WAIT_STARTED = time.monotonic()
     if home.may_fail_over():
-        # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.
-        down = home.probe()
-        if down:
-            home.fail_over(down, getattr(a, "argv", None) or sys.argv[1:])
+        home.before_run(getattr(a, "argv", None) or sys.argv[1:])
     elif home.on_standby() and not os.environ.get(home.FAILOVER_ENV):
         st = common.home_state()
         toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
@@ -213,6 +210,7 @@ def _cmd_run(a, me) -> int:
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
+    reprobed = False
     try:
         while True:
             try:
@@ -239,6 +237,10 @@ def _cmd_run(a, me) -> int:
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
                     if home.may_fail_over():
+                        if not reprobed and not home.recent_failure() and home.network_failure(e):
+                            reprobed = True
+                            if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
+                                continue
                         home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "

@@ -1,4 +1,5 @@
 import { useNavigation } from "@react-navigation/native";
+import { activeAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import type { EnvironmentThreadSearchMatch } from "@t3tools/client-runtime/state/thread-search";
 import { THREAD_JUMP_KEYBINDING_COMMANDS } from "@t3tools/contracts";
 import { threadPullRequestSearchTerms } from "@t3tools/shared/threadPullRequests";
@@ -139,6 +140,9 @@ export function CommandPalette(props: {
   readonly onCommand: (command: HardwareKeyboardCommand) => void;
 }) {
   const navigation = useNavigation();
+  useEffect(() => {
+    activeAnalytics()?.record("command.palette", { props: { phase: "start" } });
+  }, []);
   const { themeVariables } = useAppearancePreferences();
   const { selectThread } = useAdaptiveWorkspaceLayout();
   const runCommand = props.onCommand;
@@ -391,6 +395,7 @@ export function CommandPalette(props: {
 
   function close(run?: () => void) {
     if (closing.current) return;
+    if (run) activeAnalytics()?.record("command.palette", { props: { phase: "complete" } });
     closing.current = true;
     pendingAction.current = run ?? null;
     setVisible(false);

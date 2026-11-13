@@ -152,15 +152,26 @@ class OrderProof(unittest.TestCase):
     def test_delivered_prime_replays_drops_before_retiring(self):
         folder = self.root / 'check'
         folder.mkdir()
+        cfg = dict(self.cfg, total='AED 600.00')
         result = {'status': 'delivered', 'items_complete': True, 'items': []}
         with patch.dict('os.environ', {'WATCH_DIR': str(folder), 'WATCH_RUN': 'prime-fixture'}), \
                 patch.object(tracker, 'fetch', return_value=dict(result)), \
                 contextlib.redirect_stdout(io.StringIO()):
-            tracker.check(self.cfg)
+            tracker.check(cfg)
+        # Large-order pending callbacks have no ordinary wake destination.
+        # They must leave item drops for the normal check and keep it alive.
+        with patch.dict('os.environ', {'WATCH_DIR': str(folder), 'WATCH_RUN': 'pending-fixture'}), \
+                patch.object(tracker, 'fetch') as fetch, patch.object(tracker, 'retire_terminal') as retire, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            tracker._check(cfg, pending_only=True)
+            self.assertEqual(output.getvalue(), '')
+            self.assertEqual(len(tracker.read(folder / 'order-tracker-state.json')['pending_item_drops']), 2)
+            fetch.assert_not_called()
+            retire.assert_not_called()
         with patch.dict('os.environ', {'WATCH_DIR': str(folder), 'WATCH_RUN': 'real-fixture'}), \
                 patch.object(tracker, 'fetch') as fetch, patch.object(tracker, 'retire_terminal') as retire, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            tracker.check(self.cfg)
+            tracker.check(cfg)
             self.assertEqual(len(json.loads(output.getvalue())['events']), 2)
             fetch.assert_not_called()
             retire.assert_not_called()
@@ -280,6 +291,23 @@ class OrderProof(unittest.TestCase):
             self.assertEqual(tracker.main(argv), 0)
         self.assertEqual(len(calls), 1)
         self.assertIn('--merchant Acme --order-id ORD-123', calls[0][calls[0].index('--check') + 1])
+
+    def test_native_problem_check_configuration_preserves_receipt_watchers(self):
+        for mode in ('email_receipt', 'untrackable'):
+            cfg = dict(self.cfg, mode=mode, watcher='order-acme-' + mode)
+            tracker.write(tracker.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
+            tracker.write(tracker.WATCHERS / cfg['watcher'] / 'watcher.json',
+                          {'id': cfg['watcher'], 'check': 'receipt check'})
+        native = dict(self.cfg, app='noon', mode=None, order='N123', watcher='order-noon-n123')
+        tracker.write(tracker.ROOT / 'orders' / (native['watcher'] + '.json'), native)
+        tracker.write(tracker.WATCHERS / native['watcher'] / 'watcher.json',
+                      {'id': native['watcher'], 'check': 'native check'})
+        self.assertEqual(tracker.main(['configure-problem-checks']), 0)
+        for mode in ('email_receipt', 'untrackable'):
+            definition = tracker.read(tracker.WATCHERS / ('order-acme-' + mode) / 'watcher.json')
+            self.assertNotIn('pending_check', definition)
+        definition = tracker.read(tracker.WATCHERS / native['watcher'] / 'watcher.json')
+        self.assertIn('check-pending --app noon --order N123', definition['pending_check'])
 
     def test_amazon_cancelled_item_uses_requester_drop_path(self):
         import amazon_email_orders as amazon

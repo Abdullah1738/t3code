@@ -1,4 +1,9 @@
 import { PermissionUpdateNotice } from "./features/connection/PermissionUpdateNotice";
+import {
+  AnalyticsCoordinator,
+  analyticsNavigationRef,
+  noteAnalyticsNavigation,
+} from "./ardud/AnalyticsCoordinator";
 import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
 import { useEffect } from "react";
@@ -76,6 +81,7 @@ function AppContent() {
   return (
     <>
       <SplashScreenCoordinator />
+      <AnalyticsCoordinator />
       <SubscriptionUsageCoordinator />
       <PermissionUpdateNotice />
       <GestureHandlerRootView className="flex-1">
@@ -91,7 +97,13 @@ function AppContent() {
               <GlobalVoiceInputControl>
                 <NativeLayoutMetricsProvider>
                   <IncomingShareProvider>
-                    <Navigation linking={appLinking} theme={navigationTheme} />
+                    <Navigation
+                      ref={analyticsNavigationRef}
+                      onReady={noteAnalyticsNavigation}
+                      onStateChange={noteAnalyticsNavigation}
+                      linking={appLinking}
+                      theme={navigationTheme}
+                    />
                   </IncomingShareProvider>
                   <Dialog.Host />
                   <ThreadArrangementHost />

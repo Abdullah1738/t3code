@@ -23,18 +23,32 @@ _NAMES = {
     'flow.release', 'flow.abandon', 'track.add', 'track.poll', 'track.transition',
     'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
+    'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
+    'question.ask', 'check.run',
 }
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'careem', 'uber'},
     'merchant': {'noon', 'careem', 'amazon', 'uber', 'other'},
     'source': {'cli', 'phone', 'email'},
-    'outcome': {'success', 'failure', 'refused'},
+    'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
+    'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
+             'payment_deadline', 'autopay_expected', 'merchant_card'},
+    'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
-_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit'}
-_NUMBERS = {'exitCode', 'amountMinor', 'count'}
+_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered'}
+_NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired'}
+_CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
+                'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
+_MONEY_PROPS = {
+    'case.open': {'kind', 'unmatched'},
+    'case.update': {'fields', 'deadlineMoved', 'answered'},
+    'case.close': {'kind', 'ageDays'},
+    'question.ask': {'outcome'},
+    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase'},
+}
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
              'close-food-captured', 'track', 'track-exact', 'order-details', 'order-status',
@@ -124,6 +138,7 @@ OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
 PAYMENT_WAIT_TIMEOUT PAYMENT_WAIT_UNCONFIRMED
+DEADLINE_REASON_REQUIRED CHARGE_DUPLICATE_CANDIDATE CORROBORATE_MISMATCH
 """.split())
 
 
@@ -146,6 +161,9 @@ def _fields(props):
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12:
             result[key] = value
+        elif key == 'fields' and type(value) is str and (value == '' or all(
+                field in _CASE_FIELDS for field in value.split(','))):
+            result[key] = value
         elif key == 'last4' and type(value) is str and re.fullmatch(r'[0-9]{4}', value):
             result[key] = value
     return result
@@ -160,10 +178,14 @@ def _ids(values):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
+        if component == 'money-cases':
+            props = {key: value for key, value in (props or {}).items()
+                     if key in _MONEY_PROPS.get(name, set())}
+            ids = {key: value for key, value in (ids or {}).items() if key == 'caseId'}
         now = dt.datetime.now(dt.timezone.utc)
         row = {'ts': now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
                'tool': 'orders', 'component': component, 'kind': kind, 'name': name}

@@ -15,12 +15,13 @@ set -u
 mac_log() { :; }
 . "${MAC_LOG_HOME:-$HOME/.local/lib/mac-logging}/toollog.sh" 2>/dev/null || :
 TL_START=$(date +%s)
-TL_RESTIC_RC=-1
+TL_RESTIC_RC=""
 TL_SNAPSHOT_AT=0
+TL_SKIP_REASON=other
 summary=""
 backup_log_exit() {
   local status=$?
-  printf '%s' "$summary" | mac_log backup health "$TL_START" "$TL_RESTIC_RC" "$status" "$TL_SNAPSHOT_AT"
+  printf '%s' "$summary" | mac_log backup health "$TL_START" "$TL_RESTIC_RC" "$status" "$TL_SNAPSHOT_AT" "$TL_SKIP_REASON" "${LOCK:-}"
 }
 trap backup_log_exit EXIT
 VAULT="${HEALTH_VAULT:-$HOME/health-data/abdullah}"
@@ -47,6 +48,7 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 if ! mkdir "$LOCK" 2>/dev/null; then
   holder=$(cat "$LOCK/pid" 2>/dev/null)
   if [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q health_backup.sh; then
+    TL_SKIP_REASON=lock_held
     log "skip: backup $holder still running"; exit 0
   fi
   log "removing stale lock (holder ${holder:-?} gone)"; rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
@@ -71,6 +73,10 @@ json.dump(st, open(path + ".tmp", "w"), indent=1); os.replace(path + ".tmp", pat
 PY
 }
 fail() {
+  if [ "$TL_SNAPSHOT_AT" = 0 ] && { [ "$TL_SKIP_REASON" = other ] || [ -z "$TL_SKIP_REASON" ]; }; then
+    TL_SKIP_REASON=$(printf '%s' "$2" | mac_log backup-reason "$1" "$TL_RESTIC_RC")
+    TL_SKIP_REASON=${TL_SKIP_REASON:-other}
+  fi
   log "FAIL [$1] $2"; write_status 0 "$1" "$2" "" ""
   # one Telegram alert per failing stage per day
   nout=$($NOTIFY notify --source "health-data backup" --severity attention \
@@ -88,7 +94,14 @@ for p in db files files-extra meta meta-pet-records.SKILL.md; do
 done
 [ -d "$VAULT" ] || fail vault "vault missing: $VAULT"
 if [ ! -f "$RESTIC_REPOSITORY/config" ]; then
-  "$RESTIC" init >>"$LOG" 2>&1 || fail repo "restic init failed"
+  out=$("$RESTIC" init 2>&1)
+  rc=$?
+  TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
+  printf '%s\n' "$out" >>"$LOG"
+  if [ "$rc" != 0 ]; then
+    TL_SKIP_REASON=$(printf '%s' "$out" | mac_log backup-reason repo "$TL_RESTIC_RC")
+    fail repo "restic init failed"
+  fi
   log "initialised repo $RESTIC_REPOSITORY"
 fi
 
@@ -117,7 +130,11 @@ for ex in "${EXTRA_DIRS[@]}"; do
   mkdir -p "$STAGE/files-extra"
   xout=$("$PY" "$VAULT/backup/snapshot_extra.py" "$ex" "$STAGE/db/_extra/$name" "$STAGE/files-extra/$name" $req 2>&1)
   xrc=$?
-  [ $xrc -eq 0 ] || fail snapshot "extra $name: $(printf '%s' "$xout" | tail -c 300)"
+  if [ $xrc -ne 0 ]; then
+    [ -d "$ex" ] || TL_SKIP_REASON=source_missing
+    [ -z "$req" ] || [ -f "$ex/$req" ] || TL_SKIP_REASON=source_missing
+    fail snapshot "extra $name: $(printf '%s' "$xout" | tail -c 300)"
+  fi
   [ "$xout" -gt 0 ] 2>/dev/null || fail snapshot "extra $name: no databases found"
   log "snapshotted $xout databases from $ex"
   ndb=$((ndb+xout))
@@ -141,11 +158,13 @@ done
 # 3. snapshot
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag health-data --json --quiet "$STAGE" 2>&1)
 rc=$?
-TL_RESTIC_RC=$rc
+TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
+TL_SKIP_REASON=""
 summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 400)"
 snap=$(printf '%s' "$summary" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["snapshot_id"][:8])')
 TL_SNAPSHOT_AT=$(date +%s)
+TL_SKIP_REASON=""
 log "snapshot $snap"
 
 # 4. retention, daily

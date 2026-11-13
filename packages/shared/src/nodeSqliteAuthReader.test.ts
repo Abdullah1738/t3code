@@ -39,6 +39,36 @@ const withLaneClient = <A, E>(
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
+it.effect("observes auth and identity reads without replacing their reserved lane", () =>
+  withLaneClient((sql) =>
+    Effect.gen(function* () {
+      const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const observer: SqliteClient.SqliteStatementObserver = {
+        slowThresholdMs: 0,
+        record: (entry) =>
+          Effect.sync(() => {
+            observed.push(entry);
+          }),
+      };
+      for (const lane of [SqliteClient.authReadOnly, SqliteClient.identityReadOnly]) {
+        const rows = yield* sql`SELECT revoked FROM sessions`.pipe(
+          lane,
+          Effect.provideService(SqliteClient.StatementObserver, observer),
+        );
+        assert.deepEqual(rows, [{ revoked: 0 }]);
+      }
+      assert.deepEqual(
+        observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [
+          ["read", "reader", "auth"],
+          ["read", "reader", "identity"],
+        ],
+      );
+      assert.isFalse(JSON.stringify(observed).includes("sessions"));
+    }),
+  ),
+);
+
 // Ported from 4a15b49745 (origin/main): identity lookups get their own reserved lane.
 it.effect(
   "keeps identity reads read-only on their own lane and preserves an enclosing writer transaction",

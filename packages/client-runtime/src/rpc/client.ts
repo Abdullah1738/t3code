@@ -13,11 +13,13 @@ import {
   type ClientGuardedRpcTag,
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
+  KANBAN_WS_METHODS,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -27,6 +29,13 @@ import { RpcClientError } from "effect/rpc";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import {
+  analyticsForEnvironment,
+  analyticsCauseTag,
+  analyticsOwnerAction,
+  recordSettingsKeys,
+  recordAnalyticsSearch,
+} from "../ardud/analytics.ts";
 
 export class EnvironmentRpcUnavailableError extends Schema.TaggedError<EnvironmentRpcUnavailableError>()(
   "EnvironmentRpcUnavailableError",
@@ -202,25 +211,52 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
     "environment.id": supervisor.target.environmentId,
     "rpc.method": tag,
   });
-  const session = yield* currentSession();
-  yield* authorizeRequest(tag, input);
-  const observer = yield* EnvironmentRpcRequestObserver;
-  const method = session.client[tag] as (
-    input: EnvironmentRpcInput<TTag>,
-  ) => Effect.Effect<EnvironmentRpcSuccess<TTag>, EnvironmentRpcFailure<TTag>>;
-  const completeObservation = yield* observer.observe({
-    environmentId: supervisor.target.environmentId,
-    method: tag,
-  });
-  const action = (yield* CurrentAction) ?? (yield* allocateAction(tag));
-  return yield* withAction(method(input), action).pipe(
-    Effect.tap((value) =>
+  const analytics =
+    tag === WS_METHODS.analyticsIngest
+      ? undefined
+      : analyticsForEnvironment(supervisor.target.environmentId);
+  const started = performance.now();
+  const context = analytics?.context();
+  const complete = analytics?.beginRpc(tag);
+  return yield* Effect.gen(function* () {
+    const session = yield* currentSession();
+    yield* authorizeRequest(tag, input);
+    const observer = yield* EnvironmentRpcRequestObserver;
+    const method = session.client[tag] as (
+      input: EnvironmentRpcInput<TTag>,
+    ) => Effect.Effect<EnvironmentRpcSuccess<TTag>, EnvironmentRpcFailure<TTag>>;
+    const completeObservation = yield* observer.observe({
+      environmentId: supervisor.target.environmentId,
+      method: tag,
+    });
+    const action =
+      (yield* CurrentAction) ?? (yield* allocateAction(tag, supervisor.target.environmentId));
+    return yield* withAction(method(input), action).pipe(
+      Effect.tap((value) =>
+        Effect.sync(() => {
+          bindActionValue(value, action);
+          markAction(action, "state-ready");
+          const ownerAction = analyticsOwnerAction(tag, input);
+          if (ownerAction) analytics?.record("owner.action", { ...context, ...ownerAction });
+          recordAnalyticsSearch(analytics, tag, input, value);
+          if (tag === KANBAN_WS_METHODS.messagePost)
+            analytics?.record("discussion.post", { ...context, ...ownerAction });
+          if (tag === WS_METHODS.serverUpdateSettings)
+            recordSettingsKeys(analytics, (input as { patch?: unknown }).patch);
+        }),
+      ),
+      Effect.ensuring(completeObservation),
+    );
+  }).pipe(
+    Effect.onExit((exit) =>
       Effect.sync(() => {
-        bindActionValue(value, action);
-        markAction(action, "state-ready");
+        complete?.(
+          performance.now() - started,
+          0,
+          Exit.isFailure(exit) ? analyticsCauseTag(exit.cause) : undefined,
+        );
       }),
     ),
-    Effect.ensuring(completeObservation),
   );
 });
 
@@ -316,7 +352,19 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                         method: tag,
                         input,
                       });
-                      const stream = mapStream(session, method(input)).pipe(
+                      const source = method(input);
+                      const analytics = analyticsForEnvironment(supervisor.target.environmentId);
+                      const observed =
+                        tag === ORCHESTRATION_V2_WS_METHODS.searchThreadStream
+                          ? source.pipe(
+                              Stream.tap((value) =>
+                                Effect.sync(() =>
+                                  recordAnalyticsSearch(analytics, tag, input, value),
+                                ),
+                              ),
+                            )
+                          : source;
+                      const stream = mapStream(session, observed).pipe(
                         Stream.onFirst(() =>
                           Effect.sync(() => {
                             expectedFailureRetries = 0;

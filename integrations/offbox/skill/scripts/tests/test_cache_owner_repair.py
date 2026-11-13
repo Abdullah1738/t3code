@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import runs
 
 
@@ -50,7 +51,7 @@ class Fixture:
             p.write_text(FAKE_TOOL.replace('__PYTHON__', sys.executable))
             p.chmod(0o755)
         (self.fix / 'owners.json').write_text('{}')
-        self.env = dict(os.environ, HOME=str(self.home), FIX=str(self.fix),
+        self.env = clean_env(HOME=str(self.home), FIX=str(self.fix),
                         SUDO_OK='1', PATH=f'{bins}:/usr/bin:/bin')
         self.user = subprocess.check_output(['id', '-un'], text=True).strip()
         self.group = subprocess.check_output(['id', '-gn'], text=True).strip()

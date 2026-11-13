@@ -190,6 +190,14 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+/** A queued review keeps its thread identity, including between chain steps. */
+export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
+  card.settledAt === null &&
+  card.stage === "needs_review" &&
+  !reviewFinished(card, chainFor(board, card)?.steps.length ?? 1)
+    ? card.reviewThreadId
+    : null;
+
 /** Why a card can't be completed or deployed yet, or null. */
 export function reviewGate(card: KanbanCard, chainLength: number): string | null {
   const open = card.subtasks.filter((s) => s.owner === "review" && s.state === "open");

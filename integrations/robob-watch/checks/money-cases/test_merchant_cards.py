@@ -30,7 +30,8 @@ class MerchantCases(unittest.TestCase):
         wrapper = self.root / 'card-status'
         wrapper.write_text('#!/bin/sh\nexec ' + sys.executable + ' ' + str(Path(cs.__file__)) + ' "$@"\n')
         wrapper.chmod(0o700)
-        env = patch.dict(os.environ, {'CARD_STATUS_FILE': str(self.root / 'status.json'), 'CARD_STATUS_CLI': str(wrapper)})
+        env = patch.dict(os.environ, {'CARD_STATUS_FILE': str(self.root / 'status.json'), 'CARD_STATUS_CLI': str(wrapper),
+                                     'ROBOB_TOOL_LOG_DIR': str(self.root / 'tool-logs')})
         env.start()
         self.addCleanup(env.stop)
         self.now = dt.datetime(2026, 11, 13, 9, tzinfo=mc.TZ)

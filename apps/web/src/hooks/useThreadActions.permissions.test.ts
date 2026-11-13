@@ -9,14 +9,23 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
-import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import {
+  createAnalyticsCollector,
+  registerEnvironmentAnalytics,
+  setActiveAnalyticsEnvironment,
+  type ClientAnalyticsEvent,
+} from "@t3tools/client-runtime/ardud/analytics";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { prepareShortcutRecording } from "../ardud/keybindingAnalytics";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((complete) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((complete, fail) => {
     resolve = complete;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 const state = vi.hoisted(() => ({
@@ -29,6 +38,7 @@ const state = vi.hoisted(() => ({
     worktreePath: string | null;
     session: { status: "ready" | "stopped" } | null;
     latestTurn: null;
+    pinnedAt: string | null;
   }[],
   requests: [] as { action: string; environmentId: string; input: { threadId?: string } }[],
   localEffects: [] as string[],
@@ -36,6 +46,10 @@ const state = vi.hoisted(() => ({
   toasts: [] as string[],
   afterRequest: undefined as ((action: string) => void) | undefined,
   sessionLookupFails: false,
+  failedMutations: new Set<string>(),
+  mutationBarrier: undefined as ((action: string) => Promise<void>) | undefined,
+  dialogAvailable: true,
+  confirmThreadUnpin: true,
 }));
 
 vi.mock("react", () => ({
@@ -61,7 +75,18 @@ vi.mock("../state/use-atom-command", () => ({
       if (!state.scopes.get(request.environmentId)?.has(scope)) {
         return AsyncResult.failure(Cause.fail(new Error("Server denied the request")));
       }
+      if (state.mutationBarrier) await state.mutationBarrier(action);
+      if (state.failedMutations.has(action)) {
+        return AsyncResult.failure(Cause.fail(new Error("Mutation failed")));
+      }
       state.afterRequest?.(action);
+      if (action === "unpin") {
+        const thread = state.threads.find(
+          (thread) =>
+            thread.environmentId === request.environmentId && thread.id === request.input.threadId,
+        );
+        if (thread) thread.pinnedAt = null;
+      }
       return AsyncResult.success(undefined);
     },
 }));
@@ -141,7 +166,7 @@ vi.mock("../lib/composerDraftUploads", () => ({
   releaseComposerDraftUploads: () => state.localEffects.push("release-uploads"),
 }));
 vi.mock("../localApi", () => ({
-  readLocalApi: () => ({ dialogs: { confirm: state.confirm } }),
+  readLocalApi: () => (state.dialogAvailable ? { dialogs: { confirm: state.confirm } } : null),
 }));
 vi.mock("../threadRoutes", () => ({
   resolveThreadRouteRef: () => null,
@@ -161,7 +186,7 @@ vi.mock("./useSettings", () => ({
     select({
       sidebarThreadSortOrder: "createdAt",
       confirmThreadDelete: true,
-      confirmThreadUnpin: true,
+      confirmThreadUnpin: state.confirmThreadUnpin,
     }),
 }));
 
@@ -222,6 +247,7 @@ beforeEach(() => {
       worktreePath: null,
       session: null,
       latestTurn: null,
+      pinnedAt: null,
     },
   ];
   state.requests = [];
@@ -230,6 +256,133 @@ beforeEach(() => {
   state.toasts = [];
   state.afterRequest = undefined;
   state.sessionLookupFails = false;
+  state.failedMutations.clear();
+  state.mutationBarrier = undefined;
+  state.dialogAvailable = true;
+  state.confirmThreadUnpin = true;
+});
+
+describe("unpin shortcut confirmation analytics", () => {
+  const pinnedAt = "2026-11-13T00:00:00.000Z";
+  const events: ClientAnalyticsEvent[] = [];
+  let collector: ReturnType<typeof createAnalyticsCollector>;
+  let unregister: () => void;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    events.length = 0;
+    state.scopes.get(secondary)!.add(AuthOrchestrationOperateScope);
+    state.threads[0]!.pinnedAt = pinnedAt;
+    collector = createAnalyticsCollector({
+      surface: "web",
+      now: () => 0,
+      send: async (batch) => {
+        events.push(...batch);
+      },
+    });
+    unregister = registerEnvironmentAnalytics(secondary, collector);
+    setActiveAnalyticsEnvironment(secondary);
+  });
+  afterEach(() => {
+    unregister();
+    setActiveAnalyticsEnvironment(null);
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  const unpinFromShortcut = () =>
+    useThreadActions().confirmAndUnpinThread(target, {
+      onUnpinned: prepareShortcutRecording(
+        { key: "p", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
+        "thread.pin",
+      ),
+    });
+  const expectAnalytics = async (count: number) => {
+    await collector.flush();
+    expect(events).toHaveLength(count);
+    if (count)
+      expect(events).toMatchObject([
+        { kind: "command.keybinding", surface: "web", props: { key: "thread.pin" } },
+      ]);
+  };
+
+  it.each([
+    { outcome: "cancelled", result: "Success", mutations: 0, records: 0 },
+    { outcome: "rejected", result: "Failure", mutations: 0, records: 0 },
+    { outcome: "confirmed", result: "Success", mutations: 1, records: 1 },
+    { outcome: "revoked", result: "Failure", mutations: 0, records: 0 },
+    { outcome: "mutation failed", result: "Failure", mutations: 1, records: 0 },
+  ] as const)(
+    "records only the completed unpin when $outcome",
+    async ({ outcome, result, mutations, records }) => {
+      const confirmation = deferred<boolean>();
+      state.confirm.mockReturnValue(confirmation.promise);
+      const pending = unpinFromShortcut();
+      expect(state.confirm).toHaveBeenCalledOnce();
+      expect(state.requests).toEqual([]);
+      expect(state.threads[0]!.pinnedAt).toBe(pinnedAt);
+      await expectAnalytics(0);
+
+      if (outcome === "revoked") state.scopes.get(secondary)!.clear();
+      if (outcome === "mutation failed") state.failedMutations.add("unpin");
+      if (outcome === "rejected") confirmation.reject(new Error("Dialog unavailable"));
+      else confirmation.resolve(outcome !== "cancelled");
+      const settled = await pending;
+
+      expect(settled._tag).toBe(result);
+      expect(state.requests).toHaveLength(mutations);
+      if (mutations)
+        expect(state.requests).toEqual([
+          { action: "unpin", environmentId: secondary, input: { threadId: target.threadId } },
+        ]);
+      expect(state.threads[0]!.pinnedAt).toBe(records ? null : pinnedAt);
+      expect(state.localEffects).toEqual([]);
+      await expectAnalytics(records);
+    },
+  );
+
+  it("waits for mutation success after confirmation before recording", async () => {
+    const started = deferred<void>();
+    const mutation = deferred<void>();
+    state.mutationBarrier = (action) => {
+      if (action !== "unpin") throw new Error("Unexpected mutation");
+      started.resolve();
+      return mutation.promise;
+    };
+    const pending = unpinFromShortcut();
+    await started.promise;
+    expect(state.requests).toHaveLength(1);
+    expect(state.threads[0]!.pinnedAt).toBe(pinnedAt);
+    await expectAnalytics(0);
+    mutation.resolve();
+    expect((await pending)._tag).toBe("Success");
+    expect(state.threads[0]!.pinnedAt).toBeNull();
+    await expectAnalytics(1);
+  });
+
+  it("does not record or open a dialog without the target permission", async () => {
+    state.scopes.get(secondary)!.clear();
+    expect((await unpinFromShortcut())._tag).toBe("Failure");
+    expect(state.confirm).not.toHaveBeenCalled();
+    expect(state.requests).toEqual([]);
+    expect(state.threads[0]!.pinnedAt).toBe(pinnedAt);
+    await expectAnalytics(0);
+  });
+
+  it.each([
+    { reason: "unavailable dialog API", dialogAvailable: false, confirmationEnabled: true },
+    { reason: "disabled confirmation", dialogAvailable: true, confirmationEnabled: false },
+  ])("records the actual unpin with $reason", async ({ dialogAvailable, confirmationEnabled }) => {
+    state.dialogAvailable = dialogAvailable;
+    state.confirmThreadUnpin = confirmationEnabled;
+    expect((await unpinFromShortcut())._tag).toBe("Success");
+    expect(state.confirm).not.toHaveBeenCalled();
+    expect(state.requests).toEqual([
+      { action: "unpin", environmentId: secondary, input: { threadId: target.threadId } },
+    ]);
+    expect(state.threads[0]!.pinnedAt).toBeNull();
+    await expectAnalytics(1);
+  });
 });
 
 describe("thread action permissions", () => {

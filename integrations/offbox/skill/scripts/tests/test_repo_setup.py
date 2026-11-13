@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import runs
 from offbox_lib import common, misc, pool, reap
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from test_capacity import Isolated
 
 TEMPLATES = runs.REPO_RECIPES_DIR.parent
@@ -58,7 +59,7 @@ class RepoSetupTests(unittest.TestCase):
         flock.chmod(0o755)
         python = bins / 'python3'
         python.symlink_to(sys.executable)
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bins}:/usr/bin:/bin:/usr/sbin:/sbin')
+        self.env = clean_env(HOME=str(self.home), PATH=f'{bins}:/usr/bin:/bin:/usr/sbin:/sbin')
         self.stamp = self.home / f'.offbox/repo-setup-{KEY}.stamp'
 
     def script(self, key=KEY):
