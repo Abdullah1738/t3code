@@ -277,6 +277,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
       (chat, input) => { void acknowledgeReceived(chat.store, chat.context, input).catch(() => { toolError("sb-main", "sb-main.catch7"); return log("receipt-ack-failed"); }); }), log,
+    notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 
   async function tick(): Promise<void> {
