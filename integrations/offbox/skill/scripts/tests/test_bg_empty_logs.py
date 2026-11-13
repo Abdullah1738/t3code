@@ -118,6 +118,41 @@ class BackgroundOutputTests(Isolated):
                     self.assertIn('no stream checkpoint', err)
                     remote.unlink()
 
+    def test_remote_log_pid_namespace_matrix(self):
+        home = Path(self.tmp.name) / 'remote-home'
+        for process_id, wrapper_pid, log_pid in ((1001, None, 1001), (None, 4242, 4242),
+                                                 (4242, None, 4242), (1001, 4242, 4242),
+                                                 (1001, 1002, 1002), (None, None, None)):
+            for history_error in (False, True):
+                with self.subTest(process_id=process_id, wrapper_pid=wrapper_pid, history_error=history_error):
+                    self.path.unlink(missing_ok=True)
+                    self.con.execute('UPDATE runs SET process_id=?,wrapper_pid=? WHERE run_id=?',
+                                     (process_id, wrapper_pid, 'run-x'))
+                    self.con.commit()
+                    self.history.side_effect = common.OffboxError('history failed') if history_error else self.empty
+                    remote = home / f'.ascii/processes/{log_pid}.log' if log_pid else None
+                    if remote:
+                        remote.parent.mkdir(parents=True, exist_ok=True)
+                        remote.write_bytes(b'wrapper output retained\n')
+                    self.box_get.return_value = dict(state='running')
+                    real_run = subprocess.run
+                    commands = []
+                    def ssh(argv, **kw):
+                        commands.append(argv[-1])
+                        return real_run(['bash', '-c', argv[-1]], env=dict(os.environ, HOME=str(home)), **kw)
+                    with patch.object(ssh_sync, 'ssh_base', return_value=['ssh']), \
+                            patch.object(misc.subprocess, 'run', side_effect=ssh):
+                        code, out, _ = self.invoke()
+                    self.assertEqual(code, 0 if remote else 1)
+                    self.assertEqual(out, remote.read_text() if remote else '')
+                    if remote:
+                        self.assertIn(f'.ascii/processes/{log_pid}.log', commands[0])
+                        if process_id and process_id != log_pid:
+                            self.assertNotIn(f'.ascii/processes/{process_id}.log', commands[0])
+                        remote.unlink()
+                    else:
+                        self.assertNotIn('.ascii/processes/', commands[0])
+
     def test_stuck_empty_page_falls_back_without_looping(self):
         self.history.side_effect = lambda *a, **kw: dict(data='', nextOffset=0, size=6, done=False)
         code, out, err = self.invoke()

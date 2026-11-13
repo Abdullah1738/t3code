@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 from pathlib import Path
 import time
@@ -839,11 +840,12 @@ def _claim(con, me, row, run_id):
 
 def _refresh_background(con, key, pull_artifacts=True):
     """Detached runs have no lock holder; reclaim completed slots without waiting for the reaper."""
-    from . import api, runs
+    from . import api, runs, start_check
     from .misc import _catch_up_finished
     rows = con.execute(f"""SELECT r.* FROM runs r JOIN leases l USING(box_id)
-        WHERE l.repo_key=? AND {token_mine('l')} AND r.mode='bg' AND r.status IN ('running','lost')
-        AND r.process_id IS NOT NULL""", (key,)).fetchall()
+        WHERE l.repo_key=? AND {token_mine('l')} AND r.mode='bg' AND (r.status IN ('running','lost') OR (r.status='infra' AND EXISTS
+        (SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id)))
+        """, (key,)).fetchall()
     for row in rows:
         if api.left() is not None and api.left() <= 0:
             break
@@ -851,12 +853,31 @@ def _refresh_background(con, key, pull_artifacts=True):
             with file_lock('box-'+row['box_id'], timeout=0):
                 runs.reconcile_lost(con, row['box_id'])
                 row = con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
-                if row['status'] != 'running':
+                if row['status'] != 'running' and not (
+                        row['status'] == 'infra' and start_check.recovery_marked(con, row)):
                     _catch_up_finished(con, row['run_id'])
+                    continue
+                pid = start_check.api_pid(con, row)
+                if not pid:
+                    if start_check.recovery_marked(con, row):
+                        result = start_check.check(row['box_id'], row['run_id'],
+                                                   claim=start_check.claims_enabled(con, row['run_id']),
+                                                   timeout=min(10, api.left() or 10))
+                        if result.code is not None and not pull_artifacts and json.loads(row['pulls'] or '[]'):
+                            # Affinity waits leave artifact-bearing runs reserved for a later full refresh.
+                            start_check.remember_wrapper(con, row, result.pid)
+                            con.commit()
+                            continue
+                        if result.code is not None or result.verdict == 'fenced':
+                            start_check.settle(con, row, result, 'pool checked an unattached start',
+                                               until=None if api.left() is None else time.time() + api.left())
+                        else:
+                            start_check.remember_wrapper(con, row, result.pid)
+                            con.commit()
                     continue
                 left = api.left()
                 options = {} if left is None else {"deadline": time.time() + left, "retries": 0}
-                st = api.cmd_status(row['box_id'], row['process_id'], **options)
+                st = api.cmd_status(row['box_id'], pid, **options)
                 if st and not st.get('running') and st.get('status') in ('exited', 'lost'):
                     if st.get('status') == 'lost':
                         confirmed = runs.confirmed_lost(row['box_id'], row['run_id'], timeout=min(20, api.left() or 20))
@@ -874,7 +895,6 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if wedged:
                         say(runs.wedged_message(row['box_id'], *wedged))
                         continue
-                    import json
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:
                         if not pull_artifacts:

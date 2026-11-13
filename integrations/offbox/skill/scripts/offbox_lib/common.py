@@ -418,7 +418,7 @@ CREATE INDEX IF NOT EXISTS leases_owner ON leases(owner, repo_root, state);
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, box_id TEXT, owner TEXT, session_id TEXT, thread_id TEXT,
   repo_root TEXT, cwd TEXT, cmd TEXT, size TEXT, mode TEXT,   -- fg | bg | local
-  process_id INTEGER, command_id TEXT,
+  process_id INTEGER, command_id TEXT, wrapper_pid INTEGER,
   status TEXT,                     -- starting | running | done | failed | killed | lost | infra
   exit_code INTEGER, start_at REAL, end_at REAL,
   sync_s REAL, setup_s REAL, sent_bytes INTEGER, log_path TEXT, error TEXT,
@@ -450,9 +450,15 @@ def db() -> sqlite3.Connection:
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER"):
+                "client_pid INTEGER", "wrapper_pid INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    if 'wrapper_pid' not in have:
+        # Recovery used to copy the wrapper's OS PID into the API ID column. A command_id proves API provenance.
+        con.execute("UPDATE runs SET wrapper_pid=process_id,process_id=NULL WHERE process_id IS NOT NULL "
+                    "AND command_id IS NULL AND EXISTS (SELECT 1 FROM kv WHERE k IN "
+                    "('start_unattached:' || runs.run_id, 'start_unknown:' || runs.run_id))")
+        con.commit()
     # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
     for table in ("templates", "bases"):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}

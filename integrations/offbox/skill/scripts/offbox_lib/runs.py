@@ -1325,8 +1325,8 @@ class Runner:
                 time.sleep(start_check.GRACE_S)
                 result = start_check.check(self.box, self.run_id)
                 if result.code is not None:
-                    self.pid, self.recovered_code = result.pid, result.code
-                    self.record(process_id=self.pid, status='running')
+                    self.recovered_code = result.code
+                    self.record(wrapper_pid=result.pid, status='running')
                     say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
                         + start_check.hint(self.box, self.run_id))
                     return row
@@ -1626,6 +1626,13 @@ def _status_code(st: dict) -> int | None:
 def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None) -> dict | None:
     """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
     request, no retries, never past the caller's deadline; any error counts as not ended."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            return None
     try:
         left = 60.0 if until is None else max(1.0, min(60.0, until - now()))
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
@@ -1693,12 +1700,24 @@ def run_kind(cmd_text: str) -> str:
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
-           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0) -> int | None:
+           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
+           receipt_locked: bool = False) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
     The per-stream offsets are saved beside the local log after every chunk, so a waiter that takes over a dead
     holder's follow resumes from them (see offsets_path) instead of replaying output."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            from .misc import _wait_start_receipt
+            row = _wait_start_receipt(row, until, locked=receipt_locked)
+            if row['status'] not in ('starting', 'running'):
+                return row['exit_code']
+            pid = row['process_id']
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -2152,7 +2171,7 @@ def _run_remote(a, rn) -> int:
             from . import start_check
             con = db()
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
-            start_check.settle(con, row, start_check.Result('started', rn.recovered_code, rn.pid),
+            start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
                                'start receipt recovered')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
