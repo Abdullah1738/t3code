@@ -64,9 +64,62 @@ class BackupDiagnosticsTests(unittest.TestCase):
 
     def run_backup(self, target='memory', reason='lock_held', rc='', code=0, snapshot_at=0):
         self.target_tag = 'memory-live' if target == 'memory' else 'health-data'
+        before = len(self.rows())
         with patch.object(jobs.sys, 'stdin', io.StringIO('')):
             jobs.main(['backup', target, str(time.time()), str(rc), str(code), str(snapshot_at), reason, str(self.lock)])
-        return self.rows()[-1]
+        rows = self.rows()
+        self.assertEqual(len(rows), before+1)
+        return rows[-1]
+
+    def test_lock_pid_input_class_keeps_skipped_run_and_snapshot_age(self):
+        cases = [('12345', 12345), (' 12345\n', 12345), ('0000012345', 12345),
+                 ('1', 1), ('2147483647', 2147483647),
+                 ('0', 0), ('0000000000', 0), ('', 0), (' \n', 0),
+                 ('-1', 0), ('+12345', 0), ('abc', 0), ('12.3', 0),
+                 ('1e3', 0), ('0x10', 0), ('12 345', 0), ('12\n345', 0), ('１２３４５', 0),
+                 ('2147483648', 0), ('9999999999', 0), ('10000000000', 0),
+                 ('00000012345', 0), ('9'*1000, 0)]
+        for target in ('memory', 'health'):
+            for value, expected in cases:
+                with self.subTest(target=target, value=value), patch.object(jobs.os, 'kill') as kill:
+                    (self.lock/'pid').write_text(value)
+                    row = self.run_backup(target)
+                    self.assertEqual(row['props']['lockPid'], expected)
+                    self.assertEqual(row['props']['skipped'], 1)
+                    self.assertEqual(row['props']['skipReason'], 'lock_held')
+                    self.assertAlmostEqual(row['props']['lastGoodSnapshotAgeS'], 3600, delta=5)
+                    if expected:
+                        kill.assert_called_once_with(expected, 0)
+                    else:
+                        kill.assert_not_called()
+
+    def test_missing_unreadable_or_overflowing_holder_still_emits(self):
+        for target in ('memory', 'health'):
+            pidfile = self.lock/'pid'
+            for shape in ('missing', 'directory', 'overflow', 'gone', 'permission'):
+                with self.subTest(target=target, shape=shape):
+                    if shape == 'directory':
+                        pidfile.mkdir()
+                    elif shape != 'missing':
+                        pidfile.write_text('12345')
+                    error = {'overflow': OverflowError, 'gone': ProcessLookupError,
+                             'permission': PermissionError}.get(shape)
+                    try:
+                        with patch.object(jobs.os, 'kill', side_effect=error) as kill:
+                            row = self.run_backup(target)
+                            if shape in ('missing', 'directory'):
+                                kill.assert_not_called()
+                            else:
+                                kill.assert_called_once_with(12345, 0)
+                        self.assertEqual(row['props']['skipped'], 1)
+                        self.assertEqual(row['props']['skipReason'], 'stale_lock' if shape == 'gone' else 'lock_held')
+                        self.assertIsNone(row['props']['lockHolderCmd'])
+                        self.assertAlmostEqual(row['props']['lastGoodSnapshotAgeS'], 3600, delta=5)
+                    finally:
+                        if shape == 'directory':
+                            pidfile.rmdir()
+                        else:
+                            pidfile.unlink(missing_ok=True)
 
     def test_live_holder_and_trigger_on_both_targets(self):
         child = subprocess.Popen(['/bin/sleep', '30'])

@@ -540,7 +540,9 @@ def backup_lock(lock_path, now):
         lock = Path(lock_path)
         props['lockAgeS'] = max(0, int(now-lock.stat().st_mtime))
         holder = (lock/'pid').read_text().strip()
-        props['lockPid'] = int(holder) if re.fullmatch(r'[0-9]{1,10}', holder) else 0
+        holder = int(holder) if re.fullmatch(r'[0-9]{1,10}', holder) else 0
+        # Darwin/Linux pid_t is signed 32-bit; corrupt metadata must not drop the log.
+        props['lockPid'] = holder if 0 < holder <= 2**31-1 else 0
     except (OSError, ValueError):
         props.setdefault('lockPid', 0)
     gone = False
@@ -549,7 +551,7 @@ def backup_lock(lock_path, now):
             os.kill(props['lockPid'], 0)
         except ProcessLookupError:
             gone = True
-        except OSError:
+        except (OSError, OverflowError):
             pass
     return props, gone
 
