@@ -126,6 +126,13 @@
     "seconds": 60.1020188331604,
     "start": "2026-11-13T17:13:46.691057+00:00"
   },
+  "driverCallsPerMinute": {
+    "boardGet": 0,
+    "kanbanToolsRead": 9,
+    "providerTurnEnd": 13,
+    "readOpenCards": 17
+  },
+  "driverCallsSource": "Exact .9 profile minute:13turnEndedUnlocked spans;0board_get MCP calls;17open-card SQL reads withKanbanStore.read root,9withKanbanTools.withCaller root. Sanctioned evaluator correction after diagnostic6.",
   "earlierEstimatesNotUsedAsExactMinuteTargets": {
     "boardCount": 260,
     "discussionMissesPerSecond": 536,
@@ -134,6 +141,52 @@
     "writerTransactionsPerMinute": 800
   },
   "evaluatorClarification": "13 Nov ~17:50Z: exact-minute targets accepted; logical work equivalence excludes physical cost reductions. Total cache rates use cumulative snapshots; see PASS-LINE.md.",
+  "eventWriteBatches": {
+    "all": {
+      "message.updated": 31,
+      "node.updated": 186,
+      "plan.updated": 5,
+      "provider-session.attached": 4,
+      "provider-session.updated": 17,
+      "provider-turn.updated": 48,
+      "turn-item.updated": 340
+    },
+    "batchSizes": {
+      "1": 631
+    },
+    "byRootCaller": {
+      "(no parent)": {
+        "message.updated": 20,
+        "node.updated": 112,
+        "plan.updated": 4,
+        "provider-turn.updated": 30,
+        "turn-item.updated": 191
+      },
+      "ProviderSessionManager.persistProviderSessionUpdate": {
+        "provider-session.updated": 4
+      },
+      "ProviderSessionManager.releaseIfStillIdle": {
+        "provider-session.updated": 8
+      },
+      "ProviderTurnStartService.start": {
+        "message.updated": 11,
+        "node.updated": 74,
+        "plan.updated": 1,
+        "provider-session.attached": 4,
+        "provider-session.updated": 5,
+        "provider-turn.updated": 18,
+        "turn-item.updated": 149
+      }
+    },
+    "parentless": {
+      "message.updated": 20,
+      "node.updated": 112,
+      "plan.updated": 4,
+      "provider-turn.updated": 30,
+      "turn-item.updated": 191
+    },
+    "source": "EventSink.write span orchestration_v2.event_types/count attributes, exact .9 profile minute"
+  },
   "httpRoutes": [
     {
       "caller": "/api/ardud/control/threads/:threadId",
@@ -395,6 +448,24 @@
     }
   ],
   "tickSteps": {
+    "byKind": {
+      "evaluatorStep": 2,
+      "landing": 99,
+      "localWait": 2,
+      "missingThread": 73,
+      "nativeQuestion": 8,
+      "ownerReminder": 13,
+      "reconcileHeldDiscussions": 2,
+      "reviewerBackstop": 5,
+      "scribe": 27,
+      "settleDiscussion": 179,
+      "silentRunBackstop": 91,
+      "typing": 8,
+      "unlistedPools": 31,
+      "wakeBoardNudges": 20,
+      "wakeDiscussionNudges": 11,
+      "workerBackstop": 83
+    },
     "count": 654,
     "perSecond": 10.9,
     "seconds": 60
