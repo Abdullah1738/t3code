@@ -139,13 +139,36 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
 
 
 def close_master(box_id: str) -> None:
+    path = None
+    try:
+        if not cfg_path(box_id).exists():
+            return
+        left = api.left()
+        timeout = 2 if left is None else min(2, max(0, left))
+        if timeout > 0:
+            # Resolve %C before exit can exhaust the budget, without connecting to the remote machine.
+            config = subprocess.run(ssh_base(box_id) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
+            if config.returncode == 0:
+                for line in config.stdout.splitlines():
+                    if line.startswith("controlpath "):
+                        candidate = Path(line.split(" ", 1)[1])
+                        if candidate.parent.resolve() == CM_DIR.resolve():
+                            path = candidate
+                        break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     try:
         left = api.left()
         timeout = 10 if left is None else min(10, max(0, left))
-        if timeout > 0 and cfg_path(box_id).exists():
+        if timeout > 0:
             subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         pass  # closing a cached connection must not undo a confirmed box stop
+    try:
+        if path is not None and path.is_socket():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)

@@ -81,6 +81,17 @@ const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
+const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+
+const activeTurnRefusal = (
+  error: unknown,
+): ProviderAdapter.ProviderAdapterProtocolError | undefined =>
+  isProtocolError(error) && error.reason === "previous_turn_active"
+    ? error
+    : Predicate.hasProperty(error, "cause")
+      ? activeTurnRefusal(error.cause)
+      : undefined;
+
 const codexHistoryNotSent = (error: unknown): boolean =>
   error instanceof CodexHistoryNotSentError ||
   (Predicate.hasProperty(error, "cause") && codexHistoryNotSent(error.cause));
@@ -207,6 +218,63 @@ export const layer: Layer.Layer<
               }),
             )
             .pipe(Effect.catchCause(() => Effect.succeed(false))),
+      };
+    };
+
+    const makeRecoverySession = (
+      liveSession: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      isIncomingRunCurrent: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>,
+    ) => {
+      const startWithRecovery = Effect.fn("ProviderTurnStartService.startWithRecovery")(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        compact = false,
+      ) {
+        const start = compact ? liveSession.compactThread! : liveSession.startTurn;
+        const result = yield* Effect.result(start(turnInput));
+        if (result._tag === "Success") return;
+        const stale = activeTurnRefusal(result.failure)?.activeTurn;
+        if (stale === undefined || stale.providerThreadId !== turnInput.providerThread.id) {
+          return yield* result.failure;
+        }
+        const readFailure = (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver: liveSession.driver,
+            threadId: turnInput.threadId,
+            providerThreadId: turnInput.providerThread.id,
+            runId: turnInput.runId,
+            cause,
+          });
+        const incomingIsCurrent = isIncomingRunCurrent().pipe(Effect.mapError(readFailure));
+        const owner = yield* projectionStore
+          .getRunControlState(turnInput.threadId, stale.runId)
+          .pipe(Effect.mapError(readFailure));
+        // A different incoming run is not proof that the old turn lost ownership.
+        // Missing projection state is also inconclusive; leave that turn alone.
+        const terminal =
+          owner !== null &&
+          ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(owner.status);
+        if (owner === null || (!terminal && owner.activeAttemptId === stale.attemptId)) {
+          return yield* result.failure;
+        }
+        if (!(yield* incomingIsCurrent)) return;
+        yield* liveSession.interruptTurn({
+          providerThread: turnInput.providerThread,
+          providerTurnId: stale.providerTurnId,
+        });
+        if (!(yield* incomingIsCurrent)) return;
+        // Exactly one retry: another refusal belongs to normal start-failure handling.
+        yield* start(turnInput);
+      });
+      return {
+        ...liveSession,
+        startTurn: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+          startWithRecovery(turnInput),
+        ...(liveSession.compactThread === undefined
+          ? {}
+          : {
+              compactThread: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                startWithRecovery(turnInput, true),
+            }),
       };
     };
 
@@ -644,7 +712,9 @@ export const layer: Layer.Layer<
         });
         return;
       }
-      const session = sessionResult.success;
+      const session = makeRecoverySession(sessionResult.success, () =>
+        isCurrentAttemptInStatus("running"),
+      );
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
         load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,

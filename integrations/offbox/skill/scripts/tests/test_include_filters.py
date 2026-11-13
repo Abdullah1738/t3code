@@ -122,8 +122,7 @@ def test_tracked_excluded_ancestor_refuses_before_box_work(unignored_repo, ances
     assert repr(directory) in str(refused.value)
     assert "can't send only the named path there" in str(refused.value)
     args = cli.build_parser().parse_args(["run", "--include", included, "--", "echo", "ok"])
-    with patch("offbox_lib.localfirst.decide", return_value="test"), \
-            patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+    with patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
             patch.object(cli, "log"), patch.object(cli, "say"), \
             patch("offbox_lib.fallback.run_local") as fallback, \
             patch("offbox_lib.fallback.note_infra_failure") as infra:
@@ -252,7 +251,6 @@ def test_refusal_reaches_cli_as_usage_error_without_fallback(repo):
 
     args = cli.build_parser().parse_args(["run", "--include", "tmp/cards/x/f.tar", "--", "echo", "ok"])
     with patch.object(ssh_sync.subprocess, "run", side_effect=fail), \
-            patch("offbox_lib.localfirst.decide", return_value="test"), \
             patch.object(runs.pool, "acquire") as acquire, \
             patch.object(cli, "log"), patch.object(cli, "say"), \
             patch("offbox_lib.fallback.run_local") as fallback, \
@@ -318,8 +316,7 @@ def test_tracked_file_in_ignored_ancestor_refuses_before_box_work(repo, tracked,
     assert "argv" in str(refused.value) and "--step" in str(refused.value)
     assert "move it out of the excluded directory" in str(refused.value)
     args = cli.build_parser().parse_args(["run", "--include", includes[0], "--", "echo", "ok"])
-    with patch("offbox_lib.localfirst.decide", return_value="test"), \
-            patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+    with patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
             patch.object(cli, "log"), patch.object(cli, "say") as say, \
             patch("offbox_lib.fallback.run_local") as fallback, \
             patch("offbox_lib.fallback.note_infra_failure") as infra:

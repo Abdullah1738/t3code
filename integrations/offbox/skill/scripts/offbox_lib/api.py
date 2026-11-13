@@ -1,4 +1,5 @@
-"""boat.dev HTTP API client (stdlib). The key is read from Keychain at runtime and never printed or stored."""
+"""HTTP API client (stdlib) for boat.dev and for our own offbox server (boatd answers the same calls).
+The key is read from Keychain at runtime and never printed or stored."""
 
 from __future__ import annotations
 
@@ -17,25 +18,43 @@ import urllib.parse
 import urllib.request
 import weakref
 
-from .common import OffboxError, EXIT_INFRA, db, iso_ts, log
+from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, owner_scoped, require_mine,
+                     token_owner)
 from . import capacity
 
-API = os.environ.get("OFFBOX_BOAT_API", "https://boat.dev/api/v1")
+BACKEND = backend()
+NAME = "offbox server" if BACKEND == "server" else "boat"
+
+
+def _server_url() -> str:
+    try:
+        return json.loads(SERVER_CFG.read_text())["url"].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        return "http://offbox-server:8443/api/v1"
+
+
+# Our own server (boatd) answers the same REST calls as boat.dev; see integrations/offbox/server/boatd.py.
+API = os.environ.get("OFFBOX_BOAT_API") or (_server_url() if BACKEND == "server" else "https://boat.dev/api/v1")
+KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
+# On our server every owner has their own token (Keychain account = owner): person-box work uses that person's,
+# everything else ours. A token only opens its owner's boxes there. boat.dev has the one account.
+KEY_ACCOUNT = token_owner() if BACKEND == "server" else "ardud"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
+STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
 def _key() -> str:
     global _KEY
     if _KEY is None:
-        p = subprocess.run(["security", "find-generic-password", "-s", "boat-api", "-a", "ardud", "-w"],
+        p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", KEY_ACCOUNT, "-w"],
                            capture_output=True, text=True)
         k = p.stdout.strip()
         if p.returncode != 0 or not k:
-            raise OffboxError("boat API key missing from Keychain (boat-api/ardud)")
+            raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/{KEY_ACCOUNT})")
         _KEY = k
     return _KEY
 
@@ -60,7 +79,9 @@ class ApiError(OffboxError):
     def __init__(self, status: int, code: str, message: str, retryable: bool = False):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
-        super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
+        # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
+        super().__init__(f"{NAME} API {status} {code}: {message}", EXIT_INFRA,
+                         outage=status in CF_OUTAGE or code == "server_not_ready")
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
 
@@ -311,7 +332,7 @@ def _read_response(response, deadline):
 
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
-    from . import allocation
+    from . import allocation, pool
     if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
         return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
     box_id = path.split("/")[2] if path != "/sandboxes" else None
@@ -334,12 +355,13 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
         except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
             # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
-            if pending:
+            if pending and not isinstance(e, pool.PoolBusyError):
                 raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
                                             "Retry its original source and size later") from e
-            with contextlib.closing(db()) as con:
-                con.execute("DELETE FROM kv WHERE k=?", (key,))
-                con.commit()
+            if not pending:
+                with contextlib.closing(db()) as con:
+                    con.execute("DELETE FROM kv WHERE k=?", (key,))
+                    con.commit()
             raise
         except OffboxError as e:
             raise allocation.Unresolved(str(e)) from e
@@ -349,8 +371,27 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
         return result
 
 
+_OWN_BOXES: set[tuple[str, str]] = set()   # (token owner, box) pairs already checked in this process
+
+
+def _own_box(path: str) -> None:
+    """Last line of defence on the home server: no request is sent for a box our records give to another owner.
+    Her box answers 404 to our token, and callers read a 404 as "the box is gone" (common.require_mine). Selection
+    already leaves such leases out; this covers a box id that reaches the API some other way."""
+    if not owner_scoped() or not path.startswith("/sandboxes/"):
+        return
+    box_id = path.split("/")[2].split("?")[0]
+    seen = (token_owner(), box_id)
+    if not box_id or seen in _OWN_BOXES:
+        return
+    with contextlib.closing(db()) as con:
+        require_mine(con, box_id)
+    _OWN_BOXES.add(seen)
+
+
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    _own_box(path)
     scope = _REQUEST_SCOPE.get()
     with scope.request() if scope is not None else contextlib.nullcontext():
         return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
@@ -380,7 +421,23 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
     uncertain_start = False
+
+    def check_start_queue(request_id=None):
+        if not is_start:
+            return
+        from . import allocation
+        try:
+            allocation.check_queue()
+        except capacity.CapacityError as error:
+            if request_id:
+                capacity.complete(request_id, "not_sent")
+            if uncertain_start:
+                raise allocation.Unresolved("a previous machine start was unanswered before queue expiry; "
+                                            "its retained request still needs reconciliation; nothing ran") from error
+            raise
+
     while True:
+        check_start_queue()
         attempt += 1
         req_timeout = timeout
         # During an outage allocation retry, bound network calls only until a machine is accepted. Bring-up
@@ -412,6 +469,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 raise OffboxError("a previous create/fork was unanswered before the local start limit; "
                                   "nothing ran. Retry its retained key later") from e
             raise
+        check_start_queue(request_id)
         if _DEADLINE is not None:
             # capacity.reserve may wait on SQLite (BEGIN IMMEDIATE, 30 s busy timeout): recompute what is left now,
             # and never send a request whose budget is already gone.
@@ -431,6 +489,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
         try:
             if scope is not None:
                 scope.check()
+            check_start_queue(request_id)
             with _open(req, timeout=req_timeout) as r:
                 raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
@@ -519,7 +578,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
                 raise NetworkError(f"deadline passed during {method} {path}: {e}")
             log(f"api {method} {path} -> network {e}")
-            raise NetworkError(f"boat API unreachable ({method} {path}): {e}")
+            raise NetworkError(f"{NAME} API unreachable ({method} {path}): {e}")
 
 
 def probe(timeout: float = 15) -> str | None:
@@ -573,6 +632,7 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
     """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): the
     socket is shut at that moment (see _shut_at) and every line is checked against it, so no read, keepalive or
     partial line outlives it; the stream then raises StreamDeadline."""
+    _own_box(path)
     req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + _key(),
                                                       "Accept": "application/x-ndjson"})
     if deadline is not None:
@@ -794,10 +854,17 @@ def cmd_sync(box_id: str, command: str, timeout: int = 60, cwd: str | None = Non
     return call("POST", f"/sandboxes/{box_id}/commands", body, timeout=timeout + 30, retries=0)
 
 
-def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
+def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | None = None,
+              retry_interrupted: bool = False) -> dict:
+    """meta (repo, kind, run_id) lets the server group per-run resource numbers. retry_interrupted: if our
+    server loses power under the run, it queues the run again once by itself. Neither is sent to boat.dev."""
     body = {"command": command, "detached": True}
     if cwd:
         body["cwd"] = cwd
+    if BACKEND == "server":
+        if meta:
+            body["meta"] = meta
+        body["retry_interrupted"] = bool(retry_interrupted)
     # Every run ID is submitted once; ambiguous proxy errors are settled by the wrapper claim over SSH.
     return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0, connect_retries=0)
 

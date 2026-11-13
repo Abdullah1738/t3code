@@ -3040,6 +3040,7 @@ export const OrchestrationV2Command = Schema.Union([
     holdQueue: Schema.optional(Schema.Boolean),
     delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
     expectedAttemptId: Schema.optional(RunAttemptId),
+    expectedLastInputMessageId: Schema.optional(MessageId),
     fenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({

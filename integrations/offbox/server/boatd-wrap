@@ -1,0 +1,24 @@
+#!/bin/bash
+# boatd-wrap <pid> <cwd>: runs inside a box (as root, via `incus exec`) for one boatd command.
+# Puts itself in its own cgroup (/sys/fs/cgroup/boatd/<pid>) so the host can measure and kill exactly this run,
+# then runs /run/boatd/<pid>.sh as `user` through bash, like boat.dev did. stdout/stderr pass straight through.
+set -u
+pid="$1"; cwd="${2:-/home/user}"
+cg=/sys/fs/cgroup/boatd
+if [ -w /sys/fs/cgroup ]; then
+  mkdir -p "$cg" 2>/dev/null && {
+    # Children of boatd/ get the controllers we measure. Harmless if one isn't delegated.
+    for c in memory cpu io pids; do echo "+$c" > "$cg/cgroup.subtree_control" 2>/dev/null; done
+    mkdir -p "$cg/$pid" 2>/dev/null && echo $$ > "$cg/$pid/cgroup.procs" 2>/dev/null
+  }
+fi
+[ -d "$cwd" ] || cwd=/home/user
+cd "$cwd" || cd /home/user
+# /etc/environment (offbox cache env etc.), as PAM would have read it; PATH stays ours.
+envs=()
+while IFS= read -r l; do
+  case "$l" in PATH=*|\#*|'') ;; [A-Za-z_]*=*) k=${l%%=*}; v=${l#*=}; v=${v#\"}; v=${v%\"}; envs+=("$k=$v");; esac
+done < /etc/environment 2>/dev/null
+exec env -i "${envs[@]}" HOME=/home/user USER=user LOGNAME=user SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
+  PATH=/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/home/user/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  setpriv --reuid=1000 --regid=1000 --init-groups -- /bin/bash -c "$(cat /run/boatd/$pid.sh)"

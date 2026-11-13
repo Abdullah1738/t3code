@@ -2420,12 +2420,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         // ardud: archive-if-idle needs one read covering both sides of a
         // running -> handoff move; separate Ref reads can miss work in transit.
-        const threadHoldsWorkUnsafe = (providerThreadId: string) => {
+        const threadHoldsWorkUnsafe = (providerThreadId: string, nativeThreadId?: string) => {
           if (Ref.getUnsafe(continuationHandoffs).has(providerThreadId)) return true;
           const active = Ref.getUnsafe(activeTurns);
           const contexts = [...active.values(), ...Ref.getUnsafe(settledTurns).values()];
           const roots = contexts.filter(
-            (context) => context.providerThread.id === providerThreadId,
+            (context) =>
+              context.providerThread.id === providerThreadId &&
+              (nativeThreadId === undefined ||
+                context.providerThread.nativeThreadRef?.nativeId === nativeThreadId),
           );
           const commands = Ref.getUnsafe(runningCommandItemsByTurn);
           const captures = Ref.getUnsafe(pendingMcpAppCaptures);
@@ -6906,7 +6909,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         const unsubscribeAfterFailedLoad = (threadId: string) =>
           client.request("thread/unsubscribe", { threadId }).pipe(
-            Effect.timeout("10 seconds"),
+            Effect.timeout("3 seconds"),
+            // Retain the allocated ID across transient cleanup failures.
+            Effect.catchCause(Effect.fail),
+            Effect.retry({ times: 2 }),
+            Effect.catch(Effect.failCause),
             Effect.catchCause((cause) =>
               Effect.logWarning("codex.failed-load-unsubscribe", { threadId, cause }),
             ),
@@ -7066,7 +7073,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...(yield* Ref.get(settledTurns)).values(),
             ];
             const roots = contexts.filter(
-              (context) => context.providerThread.id === providerThread.id,
+              (context) =>
+                context.providerThread.id === providerThread.id &&
+                (providerThread.nativeThreadRef === null ||
+                  context.providerThread.nativeThreadRef?.nativeId ===
+                    providerThread.nativeThreadRef.nativeId),
             );
             for (const context of contexts) {
               if (!roots.some((root) => context === root || isDescendantCodexTurn(context, root)))
@@ -7081,7 +7092,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             return false;
           }),
           holdsWorkForThread: (providerThread) =>
-            Effect.sync(() => threadHoldsWorkUnsafe(providerThread.id)),
+            Effect.sync(() =>
+              threadHoldsWorkUnsafe(
+                providerThread.id,
+                providerThread.nativeThreadRef?.nativeId ?? undefined,
+              ),
+            ),
           ensureThread: (threadInput) =>
             Effect.suspend(() => {
               let loadedNativeId: string | undefined;
@@ -7414,6 +7430,38 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               ),
+          ),
+          listLoadedNativeThreads: Effect.fn("CodexAdapterV2.listLoadedNativeThreads")(
+            function* () {
+              const ids = new Set<string>();
+              const cursors = new Set<string>();
+              let cursor: string | undefined;
+              do {
+                const page = yield* client.request("thread/loaded/list", {
+                  limit: 100,
+                  ...(cursor === undefined ? {} : { cursor }),
+                });
+                for (const id of page.data) ids.add(id);
+                cursor = page.nextCursor ?? undefined;
+                if (cursor !== undefined && cursors.has(cursor)) {
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Codex loaded-thread listing repeated a cursor",
+                  });
+                }
+                if (cursor !== undefined) cursors.add(cursor);
+              } while (cursor !== undefined);
+              return [...ids];
+            },
+            Effect.mapError((cause) =>
+              cause._tag === "ProviderAdapterProtocolError"
+                ? cause
+                : new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Failed to list loaded Codex threads",
+                    cause: normalizeCodexCause(cause),
+                  }),
+            ),
           ),
           // Dropping this connection's subscription lets the shared app-server
           // shut the native thread (and its MCP servers) down once it is idle.

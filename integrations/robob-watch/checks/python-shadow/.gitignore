@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+shadow-seen.json
+shadow-seen.new
+shadow-check.lock
+.run-ok

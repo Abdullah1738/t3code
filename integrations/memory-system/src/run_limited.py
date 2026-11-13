@@ -253,7 +253,65 @@ def replay_capture(capture, stream):
     stream.flush()
 
 
-def run(command, seconds):
+class LoadThrottle:
+    def __init__(self, tree, maximum):
+        self.tree, self.maximum = tree, maximum
+        self.high = float(os.environ.get('MEMORY_BACKUP_LOAD_HIGH', 1.5))
+        self.low = float(os.environ.get('MEMORY_BACKUP_LOAD_LOW', 0.8))
+        self.interval = float(os.environ.get('MEMORY_BACKUP_LOAD_INTERVAL_S', 15))
+        if not 0 <= self.low < self.high or self.interval <= 0:
+            raise ValueError('load thresholds require 0 <= LOW < HIGH and interval > 0')
+        self.demoted = False
+        self.total = 0.0
+        self.since = self.next_sample = time.monotonic()
+        self.applied = {}
+
+    def sample(self, now):
+        if now < self.next_sample:
+            return
+        self.next_sample = now + self.interval
+        source = os.environ.get('MEMORY_BACKUP_LOAD_FILE')
+        if source:
+            with open(source) as f:
+                load = float(f.read())
+        else:
+            from backup_control import load_per_core
+            load = load_per_core()
+        desired = True if load > self.high else False if load < self.low else self.demoted
+        if desired != self.demoted:
+            if self.demoted:
+                self.total += now - self.since
+            self.demoted, self.since = desired, now
+            print(time.strftime('%F %T') + f' run_limited: {"demoted" if desired else "promoted"} load {load:.2f}/core',
+                  file=sys.stderr, flush=True)
+        # Reapply to new descendants, including children outside the group.
+        for member in self.tree.refresh():
+            key = (member.pid, member.identity)
+            if self.applied.get(key) == desired:
+                continue
+            current = process_table(member.pid).get(member.pid)
+            if current is None or current.identity != member.identity:
+                continue
+            result = subprocess.run(['/usr/sbin/taskpolicy', '-b' if desired else '-B', '-p', str(member.pid)],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode:
+                current = process_table(member.pid).get(member.pid)
+                if current is not None and current.identity == member.identity and not current.state.startswith('Z'):
+                    raise RuntimeError('cannot change child I/O priority: ' + result.stderr.strip())
+            else:
+                self.applied[key] = desired
+
+    def extra(self, now):
+        return min(self.maximum, self.total + (now - self.since if self.demoted else 0))
+
+    def finish(self):
+        now = time.monotonic()
+        total = self.total + (now - self.since if self.demoted else 0)
+        print(time.strftime('%F %T') + f' run_limited: demoted_seconds={total:.1f}', file=sys.stderr)
+
+
+def run(command, seconds, *, load_aware=False, max_seconds_under_load=10800, pass_fds=()):
+    throttle = LoadThrottle(None, max_seconds_under_load) if load_aware else None
     received_signal = None
     killed = False
     verified = True
@@ -287,6 +345,7 @@ def run(command, seconds):
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             try:
                 process = subprocess.Popen(command, start_new_session=True, stdout=stdout, stderr=stderr,
+                                           pass_fds=pass_fds,
                                            env={**os.environ, "_RUN_LIMITED_TREE": marker.split("=", 1)[1]})
             except OSError as exc:
                 if received_signal is not None:
@@ -294,6 +353,8 @@ def run(command, seconds):
                 print(f"cannot start {command[0]}: {exc}", file=sys.stderr)
                 return 127 if isinstance(exc, FileNotFoundError) else 126
             tree = ChildTree(process.pid, marker.encode())
+            if throttle:
+                throttle.tree = tree
             deadline = time.monotonic() + seconds
             timed_out = False
             try:
@@ -304,13 +365,18 @@ def run(command, seconds):
                         # before cleanup, or when the unreaped leader exits.
                         if child_exited_unreaped(process) and not tree.refresh():
                             break
-                        remaining = deadline - time.monotonic()
+                        now = time.monotonic()
+                        if throttle:
+                            throttle.sample(now)
+                        remaining = deadline + (throttle.extra(now) if throttle else 0) - now
                         if remaining <= 0:
                             timed_out = True
                             break
                         time.sleep(min(0.1, remaining))
-                except (OSError, RuntimeError, subprocess.SubprocessError):
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                    diagnostics.append(f'run_limited: supervision failed: {exc}')
                     stop_tree()
+                    verified = False
                 if not killed and (timed_out or received_signal is not None):
                     stop_tree()
                 try:
@@ -339,6 +405,8 @@ def run(command, seconds):
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                     for message in [*diagnostics, *tree.diagnostics]:
                         print(message, file=sys.stderr)
+                    if throttle:
+                        throttle.finish()
             if not verified:
                 return 125
             if received_signal is not None:
@@ -355,6 +423,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=positive_seconds, required=True)
     parser.add_argument("--background", action="store_true")
+    parser.add_argument("--load-aware", action="store_true")
+    parser.add_argument("--max-seconds-under-load", type=positive_seconds, default=10800)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -363,13 +433,13 @@ def main():
     if not command:
         parser.error("a command is required after --")
     if args.background:
-        # Not `taskpolicy -b` (PRIO_DARWIN_BG): darwin-background I/O to the USB
-        # ExternalSSD is throttled to ~0.02-0.1 MB/s whenever anything else uses
-        # the disk, so the 107 GB sqlite3_rsync replica hashed for 3 h and timed
-        # out on every run from 2026-11-03 to 11-06 (unthrottled: 20 min). Lower
-        # CPU priority only, and lift launchd's LowPriorityIO (IOPOL_THROTTLE),
-        # which children inherit, to IOPOL_DEFAULT.
-        command = ["/usr/sbin/taskpolicy", "-d", "default", "/usr/bin/nice", "-n", "10", *command]
+        # Persistent Darwin-background I/O starves replicas on the USB SSD.
+        # Start with normal I/O; load-aware jobs retain utility CPU QoS while
+        # the supervisor toggles the running tree's background flag.
+        policy = ["-c", "utility"] if args.load_aware else []
+        command = ["/usr/sbin/taskpolicy", *policy, "-d", "default", "/usr/bin/nice", "-n", "10", *command]
+    if args.load_aware:
+        return run(command, args.seconds, load_aware=True, max_seconds_under_load=args.max_seconds_under_load)
     return run(command, args.seconds)
 
 

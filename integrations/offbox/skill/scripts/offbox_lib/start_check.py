@@ -94,4 +94,7 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
                 "WHERE run_id=? AND status IN ('starting','running')",
                 (status, result.code, now(), error, result.pid, rid))
     con.commit()
+    if result.code is not None and row['mode'] == 'bg':
+        from .misc import _catch_up_finished
+        _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
     event(con, box, 'start_settled', f'{rid} {status} exit={result.code}: {error or reason}')

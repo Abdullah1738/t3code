@@ -17,8 +17,9 @@ from pathlib import Path
 
 from . import api, capacity, lease, ssh_sync
 from .identity import require_proven
-from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError, ago,
-                     db, event, file_lock, iso, iso_ts, kv_get, kv_set, new_id, now, say)
+from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, DEFAULT_OWNER, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError,
+                     ago, db, event, file_lock, iso, iso_ts, kv_get, kv_set, mine, new_id, now, owner_scoped, say,
+                     token_owner)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
 
@@ -48,6 +49,7 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
         raise OffboxError("base name: lowercase letters, digits, . _ - (max 41 chars)", code=2)
     con, row = _caller_lease(me)
     full = f"{me['repo_key']}:{name}"
+    _refuse_other_owner(con, "bases", full)
     src = row["box_id"]
     s = api.get(src)
     if not s:
@@ -85,12 +87,12 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
     with file_lock("bases"):
         old = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
         if make_default:
-            con.execute("UPDATE bases SET is_default=0 WHERE repo_key=?", (me["repo_key"],))
+            con.execute(f"UPDATE bases SET is_default=0 WHERE repo_key=? AND {mine()}", (me["repo_key"],))
         is_def = 1 if (make_default or (old and old["is_default"])) else 0
         con.execute("""INSERT OR REPLACE INTO bases (name, repo_key, short, box_id, from_box, size, remote_dir, is_default,
-                       note, created_at, created_by, size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       note, created_at, created_by, size_bytes, token_owner) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (full, me["repo_key"], name, bid, src, row["size"], row["remote_dir"], is_def, note, now(),
-                     me["owner"], snap.get("sizeBytes")))
+                     me["owner"], snap.get("sizeBytes"), token_owner()))
         con.commit()
     event(con, bid, "base_save", f"{full} from={src} default={is_def} {round(now() - t)}s")
     keep_saved(con, "bases", full, bid, (old and old["saved"]) or saved_name("base", full))
@@ -244,6 +246,10 @@ def _add_status(rows: list[dict]) -> None:
     failed = None
     for r in rows:
         box = None
+        if _other_owner(r):
+            # Not ours to ask about: to our token the box does not exist, which would read as GONE.
+            r["status"], r["data_until"] = "other", None
+            continue
         if not r["saved"] and not r["expired_at"]:
             if failed is None:
                 try:
@@ -253,6 +259,22 @@ def _add_status(rows: list[dict]) -> None:
             if failed is not None:
                 box = failed
         r["status"], r["data_until"] = keep_status(r, box)
+
+
+def _other_owner(row) -> str | None:
+    """The owner of a base or template that another owner's token made on the home server, else None."""
+    who = (row["token_owner"] if "token_owner" in row.keys() else None) or DEFAULT_OWNER
+    return who if owner_scoped() and who != token_owner() else None
+
+
+def _refuse_other_owner(con, table: str, name: str) -> None:
+    """Base and template names are shared by every owner on the home server, while each box and saved snapshot
+    belongs to one. Replacing or removing another owner's entry would point it at a box their token cannot open."""
+    r = con.execute(f"SELECT * FROM {table} WHERE name=?", (name,)).fetchone()
+    who = _other_owner(r) if r else None
+    if who:
+        raise OffboxError(f"{table[:-1]} {name} belongs to {who} on the offbox server; this call uses "
+                          f"{token_owner()}'s token. Nothing was changed.", code=2)
 
 
 def keep_status(row, box) -> tuple[str, float | None]:
@@ -275,6 +297,7 @@ def _status_text(st: str, until: float | None, fix: str) -> str:
             "box": f"box only, boat deletes it {iso(until)} unless used" if until else "box only (running)",
             "expired": f"EXPIRED: boat deleted its data {iso(until)}; {fix}",
             "gone": f"GONE: box deleted; {fix}",
+            "other": "another owner's (not checked with this token)",
             "unknown": "status unknown (boat API failed)"}[st]
 
 
@@ -304,6 +327,7 @@ def rm_base(me: dict, name: str) -> None:
     r = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
     if not r:
         raise OffboxError(f"no base {full}", code=2)
+    _refuse_other_owner(con, "bases", full)
     busy = con.execute("SELECT COUNT(*) FROM leases WHERE state IN ('running','stopped') AND source=?",
                        (f"base:{full}",)).fetchone()[0]
     api.delete(r["box_id"])
@@ -367,6 +391,7 @@ def build_template(name: str) -> dict:
     lease.cap_check()
     script, sha = recipe(name)
     con = db()
+    _refuse_other_owner(con, "templates", name)
     size = template_size(name)
     t = now()
     s = api.create(size, 3 * 3600, f"offbox template {name}", new_id(f"tpl-{name}"))
@@ -400,9 +425,10 @@ def build_template(name: str) -> dict:
     api.wait_state(bid, api.STOPPED_STATES, timeout=900)
     snap = api.latest_snapshot(bid) or {}
     old = con.execute("SELECT * FROM templates WHERE name=?", (name,)).fetchone()
-    con.execute("INSERT OR REPLACE INTO templates (name, box_id, size, built_at, recipe_sha, note) VALUES (?,?,?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO templates (name, box_id, size, built_at, recipe_sha, note, token_owner) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (name, bid, size, now(), sha, json.dumps({"sizeBytes": snap.get("sizeBytes"),
-                                                          "build_s": round(now() - t)})))
+                                                          "build_s": round(now() - t)}), token_owner()))
     con.commit()
     event(con, bid, "template_build_done", f"{name} {round(now() - t)}s")
     keep_saved(con, "templates", name, bid, (old and old["saved"]) or saved_name("template", name))
@@ -478,8 +504,10 @@ def _upkeep(con, live: dict, dry: bool, actions: list[str], act) -> None:
     from .common import KEEPALIVE_S
     # At most 1 save and 1 refresh per pass, and only while the budget lasts.
     saves, refreshes = 1, 1
-    rows = [("templates", r) for r in con.execute("SELECT * FROM templates")]
-    rows += [("bases", r) for r in con.execute("SELECT * FROM bases")]
+    # Only this token owner's templates and bases: `live` and the saved-snapshot list below are what this token
+    # sees, and another owner's box or snapshot missing from them is not gone (mine()).
+    rows = [("templates", r) for r in con.execute(f"SELECT * FROM templates WHERE {mine()}")]
+    rows += [("bases", r) for r in con.execute(f"SELECT * FROM bases WHERE {mine()}")]
     if not rows:
         return
     if not dry and kv_get(con, "saved_upkeep", max_age=3600) is None:

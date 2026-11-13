@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ardud.offbox-home-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ardud/.config/opencode/skills/remote-compute/scripts/home_monitor.py</string>
+    <string>tick</string>
+  </array>
+  <!-- One short check per run, every minute. No KeepAlive: a run that fails just waits for the next one. -->
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/ardud/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/ardud</string>
+  <!-- A normal tick prints nothing. stderr shares the load monitor's file, which already exists, so this
+       agent creates no file at all while the home server is not configured. Events: home-monitor.log. -->
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ardud/.local/share/offbox/launchd.err.log</string>
+</dict>
+</plist>

@@ -42,6 +42,7 @@ import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
 import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as DatabaseDiagnostics from "./persistence/DatabaseDiagnostics.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as PullRequestFilesViewed from "./persistence/PullRequestFilesViewed.ts";
 import * as PullRequestReviewGuides from "./persistence/PullRequestReviewGuides.ts";
@@ -252,9 +253,13 @@ const layerSecrets = ServerSecretStore.layer.pipe(
   StartupPhaseLog.withStartupLayer("server.secrets"),
 );
 
+const layerSqlitePersistence = SqlitePersistence.layerConfig.pipe(
+  Layer.provideMerge(DatabaseDiagnostics.layer),
+);
+
 const layerServerSettings = ServerSettings.layer.pipe(
   Layer.provide(layerSecrets),
-  Layer.provideMerge(SqlitePersistence.layerConfig),
+  Layer.provideMerge(layerSqlitePersistence),
   StartupPhaseLog.withStartupLayer("server.settings"),
 );
 
@@ -339,7 +344,7 @@ const layerHttpServer = Layer.unwrap(
 const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = BoardsDatabase.layerConfig.pipe(
-  Layer.provideMerge(SqlitePersistence.layerConfig),
+  Layer.provideMerge(layerSqlitePersistence),
 );
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));

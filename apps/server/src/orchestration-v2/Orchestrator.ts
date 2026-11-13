@@ -10202,6 +10202,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : {},
     );
     let run = projection.runs.find((candidate) => candidate.id === command.runId);
+    // Native steering preserves the attempt; compare its accepted input while owning the command lock.
+    if (command.expectedLastInputMessageId !== undefined && run !== undefined) {
+      const inputs = yield* loadProjectionForCommand(command, ["turnItems"], {
+        turnItemTypes: ["user_message"],
+        turnItemRunId: run.id,
+      });
+      const latest = inputs.turnItems.findLast((item) => item.type === "user_message");
+      if (latest?.messageId !== command.expectedLastInputMessageId) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${run.id} accepted another input before interruption.`,
+        });
+      }
+    }
     if (command.fenced === true && run !== undefined) {
       const cause =
         run.status === "completed" ||
@@ -10502,6 +10517,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Run ${command.runId} has no active attempt to interrupt.`,
         });
       }
+      // Attachment can precede persistence of the first provider event. Stop
+      // that exact attempt before publishing its terminal state.
+      let stoppedStartingRun = false;
+      if (providerThread.providerSessionId !== null) {
+        const live = yield* providerSessions
+          .get(providerThread.providerSessionId)
+          .pipe(mapDispatchError(command));
+        if (Option.isSome(live) && live.value.interruptStartingRun !== undefined) {
+          yield* live.value
+            .interruptStartingRun({ providerThread, runId: run.id, attemptId: attempt.id })
+            .pipe(mapDispatchError(command));
+          stoppedStartingRun = true;
+        }
+      }
+      const latest = stoppedStartingRun
+        ? yield* projectionStore
+            .getThreadRecords(command.threadId, ["runs", "attempts", "nodes"])
+            .pipe(mapDispatchError(command))
+        : projection;
+      const latestRun = latest.runs.find((candidate) => candidate.id === command.runId) ?? run;
+      const latestAttempt =
+        latest.attempts.find((candidate) => candidate.id === attempt.id) ?? attempt;
+      const latestRoot = latest.nodes.find((candidate) => candidate.id === rootNode.id) ?? rootNode;
+      const stillStarting =
+        latestRun.activeAttemptId === attempt.id &&
+        (latestRun.status === "preparing" ||
+          latestRun.status === "starting" ||
+          latestRun.status === "running");
       const interruptResultItem: OrchestrationV2TurnItem = {
         id: idAllocator.derive.runSignalTurnItem({
           runId: run.id,
@@ -10568,33 +10611,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         });
       }
-      yield* emitEvent({
-        type: "run-attempt.updated",
-        threadId: command.threadId,
-        runId: run.id,
-        nodeId: rootNode.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: now,
-        payload: { ...attempt, status: "interrupted", completedAt: now },
-      });
-      yield* emitEvent({
-        type: "node.updated",
-        threadId: command.threadId,
-        runId: run.id,
-        nodeId: rootNode.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: now,
-        payload: { ...rootNode, status: "interrupted", completedAt: now },
-      });
-      yield* emitEvent({
-        type: "run.updated",
-        threadId: command.threadId,
-        runId: run.id,
-        nodeId: rootNode.id,
-        providerInstanceId: run.providerInstanceId,
-        occurredAt: now,
-        payload: { ...run, status: "interrupted", completedAt: now },
-      });
+      if (stillStarting) {
+        yield* emitEvent({
+          type: "run-attempt.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: rootNode.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { ...latestAttempt, status: "interrupted", completedAt: now },
+        });
+        yield* emitEvent({
+          type: "node.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: rootNode.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { ...latestRoot, status: "interrupted", completedAt: now },
+        });
+        yield* emitEvent({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: rootNode.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { ...latestRun, status: "interrupted", completedAt: now },
+        });
+      }
       yield* stopRemainingWork();
       yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
       return {

@@ -520,6 +520,7 @@ describe("pull request detail decoding", () => {
               nodes: [
                 {
                   commit: {
+                    oid: "abc123",
                     statusCheckRollup: {
                       contexts: { nodes: rollup, pageInfo: { hasNextPage: false } },
                     },
@@ -616,6 +617,21 @@ describe("pull request detail decoding", () => {
       ),
       commits: page.commits ?? [],
     }));
+
+  it.each([
+    [{ id: "REF", target: { __typename: "Commit", oid: "branch-tip" } }, "branch-tip"],
+    [null, null],
+    [{ id: "REF", target: null }, null],
+  ])("maps the source branch tip independently of the PR record: %j", (headRef, expected) => {
+    const result = detailOf([], { headRef });
+    expect(result.headSha).toBe("abc123");
+    expect(result.headBranchSha).toBe(expected);
+    expect(result.checksHeadSha).toBe("abc123");
+  });
+
+  it("keeps an absent checks commit unknown", () => {
+    expect(detailOf([], { commits: { nodes: [] } }).checksHeadSha).toBeNull();
+  });
 
   it("keeps the base SHA reported by the existing core read", () => {
     const result = decodePullRequestCoreJson(coreJson([], { baseRefOid: "f77c1992e5e9" }));

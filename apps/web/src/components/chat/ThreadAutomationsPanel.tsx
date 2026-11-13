@@ -35,6 +35,7 @@ const STATUS_DOT_CLASS: Record<ScheduledTask["lastRunStatus"], string> = {
   running: "bg-sky-500",
   succeeded: "bg-emerald-500",
   failed: "bg-destructive",
+  missed: "bg-destructive",
 };
 
 function taskScheduleLine(task: ScheduledTask, timeZone: string | undefined) {

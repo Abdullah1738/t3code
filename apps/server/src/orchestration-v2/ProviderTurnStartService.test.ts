@@ -596,6 +596,9 @@ function makeLocalCommandHarness(input: {
   const nativeStartTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(
     () => Effect.void,
   );
+  const nativeInterruptTurn = vi.fn<
+    ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]
+  >(() => Effect.void);
   const injectHistory = vi.fn<
     NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["injectHistory"]>
   >(() => Effect.succeed(true));
@@ -639,6 +642,7 @@ function makeLocalCommandHarness(input: {
                   resumeThread,
                   startTurn: nativeStartTurn,
                   compactThread: nativeStartTurn,
+                  interruptTurn: nativeInterruptTurn,
                   injectHistory,
                 } as never)
               : Effect.die("A local command must not open a native session."),
@@ -820,6 +824,7 @@ function makeLocalCommandHarness(input: {
     writeIfProviderThreadUnchanged,
     retryableEnsureThread,
     nativeStartTurn,
+    nativeInterruptTurn,
     injectHistory,
     startRootRun,
     tryHandlePromptCommand,
@@ -863,20 +868,111 @@ const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2St
     runtimePolicy: controls.runtimePolicy,
   });
 
-effectIt.effect("attributes a recovered original queue run only at its actual provider request", () =>
+effectIt.effect.each([
+  "failed",
+  "cancelled",
+  "interrupted",
+  "completed",
+  "replaced_attempt",
+  "live",
+  "missing",
+  "no_identity",
+  "retry_refused",
+] as const)("recovers previous_turn_active only with stale ownership proof: %s", (state) =>
   Effect.gen(function* () {
-    const harness = makeLocalCommandHarness({ text: "Continue queued work", nativeDelivery: true });
-    const run = harness.projection().runs.at(-1)!;
-    expect(run.restartContinuationOfRunId).toBeUndefined();
-    const before = continuationReport().firstResumedProviderRequestAt;
-    markQueuedRunRecovered(run.id);
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
     yield* harness.start;
-    expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
-    expect(harness.nativeStartTurn).not.toHaveBeenCalled();
-    yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
-    expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
-    expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const oldRunId = RunId.make("stale-claude-run");
+    const oldAttempt = RunAttemptId.make("stale-claude-attempt");
+    const staleTurn = ProviderTurnId.make("stale-claude-turn");
+    if (state !== "missing") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...controls.run,
+            id: oldRunId,
+            ordinal: 1,
+            activeAttemptId:
+              state === "replaced_attempt" ? RunAttemptId.make("replacement-attempt") : oldAttempt,
+            status:
+              state === "live" ||
+              state === "replaced_attempt" ||
+              state === "no_identity" ||
+              state === "retry_refused"
+                ? "running"
+                : state,
+          },
+        ],
+      });
+    }
+    const refusal = new ProviderAdapter.ProviderAdapterTurnStartError({
+      driver: controls.session.driver,
+      threadId: controls.run.threadId,
+      providerThreadId: controls.providerThread.id,
+      runId: controls.run.id,
+      cause: new ProviderAdapter.ProviderAdapterProtocolError({
+        driver: controls.session.driver,
+        reason: "previous_turn_active",
+        detail: "still active",
+        ...(state === "no_identity"
+          ? {}
+          : {
+              activeTurn: {
+                runId: oldRunId,
+                attemptId: oldAttempt,
+                providerThreadId: controls.providerThread.id,
+                providerTurnId: staleTurn,
+              },
+            }),
+      }),
+    });
+    harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    if (state === "retry_refused") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: projection.runs.map((run) =>
+          run.id === oldRunId ? { ...run, status: "failed" } : run,
+        ),
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    }
+    const outcome = yield* startPreparedTurn(controls).pipe(Effect.result);
+    const healed = !["live", "missing", "no_identity"].includes(state);
+    expect(harness.nativeInterruptTurn).toHaveBeenCalledTimes(healed ? 1 : 0);
+    expect(harness.nativeStartTurn).toHaveBeenCalledTimes(healed ? 2 : 1);
+    expect(outcome._tag).toBe(healed && state !== "retry_refused" ? "Success" : "Failure");
+    if (healed)
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledWith({
+        providerThread: controls.providerThread,
+        providerTurnId: staleTurn,
+      });
   }),
+);
+
+effectIt.effect(
+  "attributes a recovered original queue run only at its actual provider request",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue queued work",
+        nativeDelivery: true,
+      });
+      const run = harness.projection().runs.at(-1)!;
+      expect(run.restartContinuationOfRunId).toBeUndefined();
+      const before = continuationReport().firstResumedProviderRequestAt;
+      markQueuedRunRecovered(run.id);
+      yield* harness.start;
+      expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
+      expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+      expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+    }),
 );
 
 effectIt.effect(

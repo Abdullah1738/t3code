@@ -35,6 +35,33 @@ DIRECT = re.compile(
 MAX_SOURCE_BYTES = 2_000_000
 MAX_SCRIPTS = 32
 MAX_SHELL_DEPTH = 12
+NODE_SCRIPT_OPTIONS = {'-r', '--require', '--import', '--loader', '--experimental-loader', '--test-global-setup'}
+NODE_FILE_OPTIONS = {
+    '--env-file', '--env-file-if-exists', '--experimental-config-file', '--build-snapshot-config',
+    '--experimental-package-map', '--experimental-sea-config', '--openssl-config',
+    '--snapshot-blob', '--localstorage-file', '--test-rerun-failures',
+}
+NODE_VALUE_OPTIONS = {
+    '-C', '--conditions', '--input-type', '--title', '--inspect-port', '--debug-port',
+    '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config', '--cpu-prof-dir',
+    '--cpu-prof-interval', '--cpu-prof-name', '--diagnostic-dir', '--disable-proto',
+    '--disable-warning', '--dns-result-order', '--env-file', '--env-file-if-exists',
+    '--experimental-config-file', '--experimental-package-map', '--experimental-sea-config',
+    '--experimental-test-tag-filter', '--heap-prof-dir', '--heap-prof-interval', '--heap-prof-name',
+    '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--icu-data-dir',
+    '--inspect-publish-uid', '--localstorage-file', '--max-http-header-size',
+    '--max-old-space-size', '--max-semi-space-size', '--max-old-space-size-percentage',
+    '--network-family-autoselection-attempt-timeout', '--openssl-config', '--redirect-warnings',
+    '--report-directory', '--report-dir', '--report-filename', '--report-signal', '--run',
+    '--secure-heap', '--secure-heap-min', '--snapshot-blob', '--test-concurrency',
+    '--test-coverage-branches', '--test-coverage-exclude', '--test-coverage-functions',
+    '--test-coverage-include', '--test-coverage-lines', '--experimental-test-isolation',
+    '--test-isolation', '--test-name-pattern', '--test-random-seed', '--test-reporter',
+    '--test-reporter-destination', '--test-rerun-failures', '--test-shard',
+    '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog',
+    '--trace-event-categories', '--trace-event-file-pattern', '--trace-require-module',
+    '--unhandled-rejections', '--use-largepages', '--v8-pool-size', '--watch-kill-signal', '--watch-path',
+}
 # Only this inspected implementation uses --source for every source DB read.
 # A changed script falls back to source inspection until reviewed again.
 MIGRATE_SOURCE_SHA256 = "65998cc5a8ed461fc03c8ca1acbf6dad50958a6cfbef978d9009e815237e151b"
@@ -47,11 +74,6 @@ REASON = (
     "or server traces instead. Work on an existing isolated copy. Creating a copy or VACUUM INTO "
     "also reads the live file and needs Abdullah's approval first.\n"
     "If only the database can answer, report the exact queries and stop."
-)
-UNRESOLVED_REASON = (
-    "statev2 guard: this command was NOT run. The effective directory or path of an explicit "
-    "script invocation could not be established, so its live-database access cannot be checked. "
-    "Use a literal absolute script path and an explicit workdir; do not bypass the guard."
 )
 
 
@@ -368,12 +390,38 @@ class AmbiguousScript(Exception):
 
 
 class LiveRead(Exception):
-    def __init__(self, rule):
+    def __init__(self, rule, detail=None):
         self.rule = rule
+        self.detail = detail
 
 
 def _token(value):
-    return repr(value[:80]).replace("\n", " ")
+    return repr(value)
+
+
+def _database_reference(source):
+    # Report the operand, never the surrounding source or JSON payload.
+    protected = LIVE.search(source)
+    if protected:
+        for match in re.finditer(r"(?:~|\$\{?HOME\}?|/)[^\s'\"\\<>]*?(?:statev2\.sqlite|opencode\.db)(?:-(?:wal|shm|journal))?", source):
+            if match.start() <= protected.start() < match.end():
+                return match
+        return protected
+    return re.search(r"statev2\.sqlite|opencode\.db", source)
+
+
+def refusal_reason(rule, cause, cwd):
+    if rule == "live-database-script-unresolved":
+        fix = "Use a literal absolute script path."
+        if cause and "unbalanced quote" in cause:
+            fix = "Close the shell quote before running the command."
+        elif cause and ("MAX_SCRIPTS" in cause or "MAX_SHELL_DEPTH" in cause):
+            fix = "Split the steps into separate shell calls."
+        return ("statev2 guard: this command was NOT run.\n"
+                f"Could not check {cause or 'the script path'}. Resolved workdir: {cwd}.\n{fix}")
+    if cause:
+        return "statev2 guard: this command was NOT run.\n" + cause
+    return REASON
 
 
 def _substitutions(text, shell=False, spans=False):
@@ -541,15 +589,82 @@ def _jq_read_words(words):
     return result + inputs
 
 
+def _rg_lists_files(words):
+    if not words or os.path.basename(words[0]) != 'rg':
+        return False
+    index = 1
+    listing = False
+    while index < len(words):
+        word = words[index]
+        if word == '--':
+            return listing
+        if word == '--files':
+            listing = True
+            index += 1
+            continue
+        if word in {'-l', '--files-with-matches', '--files-without-match', '-c', '--count', '--count-matches', '-q', '--quiet', '--json'}:
+            # Ripgrep's last mode flag wins, including flags after --files.
+            listing = False
+            index += 1
+            continue
+        flag, equal, _ = word.partition('=')
+        if flag in {'-g', '--glob', '--iglob', '-e', '--regexp', '-f', '--file', '-t', '--type', '-T', '--type-not'}:
+            index += 1 if equal else 2
+        elif word in {'--hidden', '--no-hidden', '--no-ignore', '--no-ignore-vcs', '-uu', '-uuu', '-u', '-L', '--follow'} or not word.startswith('-'):
+            index += 1
+        else:
+            return False
+    return listing
+
+
+def _fd_lists_files(words):
+    index = 1
+    operands = {'--max-depth', '--min-depth', '--exact-depth', '--exclude', '--type', '--extension', '--size', '--owner', '--format', '--threads', '--max-results', '--base-directory', '--path-separator', '--search-path', '--batch-size', '--changed-within', '--changed-before', '--and', '--color', '--ignore-contain'}
+    while index < len(words):
+        word = words[index]
+        if word == '--':
+            return True
+        flag, equal, _ = word.partition('=')
+        if flag in {'--exec', '--exec-batch', '--ignore-file'}:
+            return False
+        if flag in operands:
+            index += 1 if equal else 2
+            continue
+        if word.startswith('-') and not word.startswith('--'):
+            for offset, letter in enumerate(word[1:], 1):
+                if letter in 'xX':
+                    return False
+                if letter in 'dEteSocjC':
+                    # Remaining characters are one attached operand, not flags.
+                    if offset == len(word) - 1:
+                        index += 1
+                    break
+        index += 1
+    return True
+
+
+def _listing_only(words):
+    if not words:
+        return False
+    binary = os.path.basename(words[0])
+    if binary == 'rg':
+        return _rg_lists_files(words)
+    if binary in {'fd', 'fdfind'}:
+        return _fd_lists_files(words)
+    if binary == 'find':
+        return not any(w in {'-exec', '-execdir', '-ok', '-okdir', '-delete', '-fls', '-files0-from'} or w.startswith('-fprint') for w in words[1:])
+    return binary == 'ls'
+
+
 def _read_words(words):
     if not words:
         return words
     binary = os.path.basename(words[0])
     if binary == "jq":
         return _jq_read_words(words)
-    listing = binary == "rg" and "--files" in words
-    fd_listing = binary in {"fd", "fdfind"} and not any(w in {"-x", "-X", "--exec", "--exec-batch"} or w.startswith(("--exec=", "--exec-batch=")) for w in words)
-    find_listing = binary == "find" and not any(w in {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls"} or w.startswith("-fprint") for w in words)
+    listing = _rg_lists_files(words)
+    fd_listing = binary in {"fd", "fdfind"} and _listing_only(words)
+    find_listing = binary == "find" and _listing_only(words)
     result, index, fd_pattern = [], 0, False
     while index < len(words):
         word = words[index]
@@ -585,7 +700,11 @@ def _read_words(words):
 
 
 def _direct_read(words, directory):
+    listing = _listing_only(words)
     words = _read_words(words)
+    if listing:
+        # Stdin redirection is checked separately; discovery only lists names.
+        return False
     if not words or not READER.search(" ".join(words)) and os.path.basename(words[0]) not in {"find", "fd", "fdfind"}:
         return False
     roots = [str(directory)] if directory is not None else []
@@ -635,6 +754,31 @@ def _interpreter_args(binary, args):
         if flag not in operands:
             result.append(flag)
     return result
+
+
+def _node_arguments(args):
+    result, inputs, test_mode, runtime_options = [], [], False, False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {'--', '-', '-e', '--eval', '-p', '--print'} or not arg.startswith('-'):
+            return result + args[index:], inputs, test_mode, runtime_options
+        flag, equal, value = arg.partition('=')
+        if flag in NODE_SCRIPT_OPTIONS | NODE_VALUE_OPTIONS:
+            runtime_options = True
+            if not equal:
+                index += 1
+                value = args[index] if index < len(args) else ''
+            if flag in NODE_SCRIPT_OPTIONS | NODE_FILE_OPTIONS and value:
+                inputs.append(value)
+        else:
+            if arg == '--test':
+                test_mode = True
+            elif arg == '--no-test':
+                test_mode = False
+            result.append(arg)
+        index += 1
+    return result, inputs, test_mode, runtime_options
 
 
 def _concurrent_group(tokens, index):
@@ -766,8 +910,14 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 # bindings rather than letting a later assignment erase them.
                 live_assignments.add(str(path) if path is not None else candidate)
 
-    def check_source(source, directory, python=False, rule="live-database-script", shell=False):
+    def check_source(source, directory, python=False, rule="live-database-script", shell=False, test_target=None, location=None):
         if _source_hit(source, directory, python, shell):
+            if test_target is not None:
+                match = _database_reference(source)
+                if match:
+                    line = source.count("\n", 0, match.start()) + 1
+                    raise LiveRead(rule, f"{location}:{line} names {_token(match[0])}.\n"
+                                   f"Run tests through the repo runner: vp test run {shlex.quote(test_target)}.")
             raise LiveRead(rule)
 
     def migration_source(args, directory):
@@ -817,12 +967,16 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 '\\\n' in command or '\\\r\n' in command):
             raise AmbiguousScript("run migrate-dev-db alone without runtime options; split preparation into a separate call")
 
-    def add(value, directory, binary="script", migration_args=None):
+    def script_path(value, directory, binary):
         path = _literal_path(value, directory)
         if path is None:
             cause = (f"relative script {_token(value)} after {unknown_cause}" if directory is None and not os.path.isabs(value)
                      else f"non-literal script path {_token(value)} ({binary})")
             raise AmbiguousScript(cause)
+        return path
+
+    def add(value, directory, binary="script", migration_args=None, test_target=None):
+        path = script_path(value, directory, binary)
         if len(paths) >= MAX_SCRIPTS:
             raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
         if LIVE.search(str(path)) or LIVE.search(os.path.realpath(path)):
@@ -841,7 +995,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                  not any(name.startswith('BASH_FUNC_') for name in os.environ))
         if path in written:
             body, replaced = written[path]
-            check_source(body, directory, path.suffix == ".py", shell=shell)
+            check_source(body, directory, path.suffix == ".py", shell=shell, test_target=test_target, location=path)
             if replaced:
                 return
         try:
@@ -857,7 +1011,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 if migration_args is not None and hashlib.sha256(source).hexdigest() == MIGRATE_SOURCE_SHA256:
                     migration_source(migration_args, directory)
                     return
-                check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell)
+                check_source(source.decode("utf-8", errors="replace"), directory, path.suffix == ".py", shell=shell, test_target=test_target, location=path)
         except OSError:
             pass
 
@@ -997,8 +1151,13 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
-        if python or binary in shells | {"node", "bun", "deno"}:
+        if python or binary in shells | {"bun", "deno"}:
             args = _interpreter_args(binary, args)
+        node_test = False
+        node_inputs = []
+        node_runtime_options = False
+        if binary == 'node':
+            args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
         if documents:
             stdin_code = not args or args[0] == "-" or all(arg.startswith("-") for arg in args)
             if binary in shells and any(re.fullmatch(r"-[a-z]*s[a-z]*", arg) for arg in args) and not any(re.fullmatch(r"-[a-z]*c[a-z]*", arg) for arg in args):
@@ -1028,12 +1187,55 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     del read_words[i + 1]
                     break
         assignment_reads = [] if binary == "jq" else list(live_assignments)
+        listing_reads = assignment_reads
+        if binary == 'rg':
+            config = shell_values.get('RIPGREP_CONFIG_PATH', os.environ.get('RIPGREP_CONFIG_PATH', ''))
+            if config:
+                listing_reads = [*listing_reads, config]
+        if (binary in {'rg', 'fd', 'fdfind', 'find'} and _listing_only(read_words) and
+                _direct_read(['cat', *listing_reads], directory)):
+            # Environment-selected config files are read even in listing mode.
+            raise LiveRead('live-database-read')
         if any(_direct_read(values + assignment_reads, directory)
                for values in variants(read_words)):
+            if python and any(flag in words for flag in {"-c", "-e"}) and any(".write_text(" in word or ".write_bytes(" in word for word in words):
+                match = _database_reference(" ".join(read_words[1:]))
+                if match:
+                    raise LiveRead("live-database-read", f"Inline-code argument names {_token(match[0])}; it cannot be verified as data only.\n"
+                                   "Use apply_patch to write report data containing protected database paths.")
             raise LiveRead("live-database-read")
         if any(_direct_read(["cat", *values], directory)
                for values in variants([v for op, v in redirects if op == "<"])):
             raise LiveRead("live-database-read")
+        for source in node_inputs:
+            add(source, directory, 'node')
+        # Node can load runtime hooks even during --check. Only a plain parse
+        # invocation gets this exception; substitutions were checked above.
+        node_parse = False
+        node_target = None
+        if binary == 'node':
+            for index, arg in enumerate(args):
+                if arg in {'--check', '-c'}:
+                    node_parse = True
+                elif arg == '--no-warnings':
+                    continue
+                elif arg == '--':
+                    node_target = args[index + 1] if index + 1 < len(args) else None
+                    break
+                elif not arg.startswith('-') or arg == '-':
+                    node_target = arg
+                    break
+                else:
+                    node_parse = False
+                    break
+        if node_parse and not node_test and not node_runtime_options and not os.environ.get("NODE_OPTIONS") and "NODE_OPTIONS" not in shell_values:
+            if node_target is not None and node_target != '-':
+                # Parsing still opens the operand. Resolve aliases so an
+                # unknown token cannot stand for the live database itself.
+                path = script_path(node_target, directory, binary)
+                if LIVE.search(str(path)):
+                    raise LiveRead('live-database-read')
+            return after
         if binary in shells:
             if any(re.fullmatch(r"-[a-z]*n[a-z]*", arg) for arg in args):
                 return after
@@ -1077,14 +1279,14 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 if flag == "--":
                     break
             if args and args[0] != "-":
-                targets = args if binary == "node" and "--test" in words else args[:1]
+                targets = args if node_test else args[:1]
                 for target in targets:
                     if not target.startswith("-"):
                         migration_args = (args[1:] if binary == "node" and len(words) > 1 and words[1] == target and
                                           Path(target).name == "migrate-dev-db.ts" else None)
                         if migration_args is not None:
                             migration_context(words)
-                        add(target, directory, binary, migration_args)
+                        add(target, directory, binary, migration_args, target if node_test else None)
         elif words[0].startswith(("/", "./", "../", "~/", "$HOME/", "${HOME}/")) and re.search(r"\.(?:py|mjs|cjs|js|ts|sh)$", words[0]):
             add(words[0], directory, binary)
         return after
@@ -1247,7 +1449,7 @@ def classify_detail(command: str, cwd: str) -> tuple[str | None, str | None]:
     except AmbiguousScript as error:
         return "live-database-script-unresolved", str(error)
     except LiveRead as error:
-        return error.rule, None
+        return error.rule, error.detail
     return None, None
 
 
