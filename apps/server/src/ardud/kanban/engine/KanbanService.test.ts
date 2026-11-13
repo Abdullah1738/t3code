@@ -15746,11 +15746,23 @@ it.effect.each([
           owner,
         );
         assert.deepStrictEqual(editable.model, pool);
-        yield* kanban.editCard(editable.id, { model: requested }, owner);
+        if (legacy) {
+          for (const patch of [
+            { model: requested },
+            { models: [{ model: requested, weight: 1 }] },
+          ]) {
+            const error = yield* kanban.editCard(editable.id, patch, owner).pipe(Effect.flip);
+            assert.include(error.detail, `Asked for opencode/${source}#xhigh`);
+            assert.include(error.detail, `selection routing rewrites it to ${Rules.poolKey(pool)}`);
+            assert.include(error.detail, `Card keeps ${Rules.poolKey(pool)}`);
+            assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, pool);
+          }
+        }
+        yield* kanban.editCard(editable.id, { model: expected }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
         yield* kanban.editCard(editable.id, { model: pool }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, pool);
-        yield* kanban.editCard(editable.id, { models: [{ model: requested, weight: 1 }] }, owner);
+        yield* kanban.editCard(editable.id, { models: [{ model: expected, weight: 1 }] }, owner);
         assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
         yield* kanban.dispatchNow;
         assert.deepStrictEqual(

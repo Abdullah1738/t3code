@@ -9,6 +9,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
+  type ModelSelection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
@@ -105,6 +106,7 @@ const fakeThreads = (
   const missing = new Set<ThreadId>();
   const deleted = new Set<ThreadId>();
   const unreadable = new Set<ThreadId>();
+  const models = new Map<ThreadId, ModelSelection>();
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
@@ -144,7 +146,9 @@ const fakeThreads = (
       launch: (input) => {
         const launch = Effect.sync(() => {
           launches.push(input.text);
-          return ThreadId.make(`thread-${++launched}`);
+          const threadId = ThreadId.make(`thread-${++launched}`);
+          models.set(threadId, input.model);
+          return threadId;
         });
         return launchGate
           ? Deferred.succeed(launchGate.held, undefined).pipe(
@@ -159,8 +163,11 @@ const fakeThreads = (
           rejectSends.has(input.threadId)
             ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "send failed" }))
             : Effect.void),
-      model: () => Effect.succeed(null),
-      setModel: () => Effect.void,
+      model: (threadId) => Effect.sync(() => models.get(threadId) ?? null),
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          models.set(threadId, model);
+        }),
       withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
@@ -2414,6 +2421,8 @@ it.effect.each(["id", "number", "implicit", "board", "edit", "noop", "comment", 
       );
       yield* kanban.dispatchNow;
       const current = (yield* kanban.card(card.id)).card;
+      assert.isNotNull(current.workThreadId);
+      assert.isNull(current.stalled);
       const thread = current.workThreadId!;
       yield* store.putCard({
         ...current,
