@@ -106,11 +106,14 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
             do_pulls(box, dict(row), pulls, until=until)
         from .runs import settled_steps_code
         code = settled_steps_code(row, code, locked=True, until=until)
-    from .runs import save_run_state, state_warning, terminal_result
+    from .runs import claim_terminal_log, emit_terminal, save_run_state, state_warning, terminal_result
+    log_row = None
     def persist():
+        nonlocal log_row
         with write(con):
             current = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
             if terminal_result(current):
+                log_row = claim_terminal_log(con, current)
                 con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
                 return current['status'], current['exit_code'], current['error']
             remember_wrapper(con, current, result.pid)
@@ -130,6 +133,7 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
                         (status, code, now(), error, rid))
             if result.code is not None or result.verdict == 'fenced':
                 con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
+            log_row = claim_terminal_log(con, con.execute("SELECT * FROM runs WHERE run_id=?", (rid,)).fetchone())
             return status, code, error
     try:
         status, code, error = db_retry(persist)
@@ -140,6 +144,8 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
                        known_exit_code=result.code, exit_code=code, end_at=now())
         state_warning(rid, code, error)
         return
+    if log_row is not None:
+        emit_terminal(log_row)
     try:
         if code is not None and row['mode'] == 'bg':
             from .misc import _catch_up_finished

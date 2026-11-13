@@ -14,6 +14,7 @@ import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
+import { gateLog } from "../skills/remote-compute/scripts/toollog.ts"
 import { classify, loadRules } from "../skills/remote-compute/scripts/classify.ts"
 
 const HOME = homedir()
@@ -129,7 +130,7 @@ export function denial(cmd: string, v: any): string {
 export default {
   id: "offbox-gate",
   setup: async (ctx: any) => {
-    try { ensureRules() } catch (e) { log({ event: "rules-load-error", error: String(e) }) }
+    try { ensureRules() } catch (e) { log({ event: "rules-load-error", errorTag: "rules_load_failed" }) }
 
     await ctx.tool.hook("execute.before", async (e: any) => {
       try {
@@ -138,13 +139,17 @@ export default {
         const cmd = input?.command
         if (typeof cmd !== "string" || !cmd) return
         const m = mode()
-        if (m === "off") return
+        if (m === "off") { gateLog("allowed", "unknown", 0); return }
         const t0 = performance.now()
         ensureRules()
         const v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null)
         const ms = +(performance.now() - t0).toFixed(3)
-        if (v.error) log({ event: "classify-error", session: e.sessionID, error: v.error })
-        if (!v.heavy) return
+        if (v.error) {
+          gateLog("allowed", "unknown", ms, true)
+          log({ event: "classify-error", session: e.sessionID, errorTag: "classify_failed" })
+          return
+        }
+        if (!v.heavy) { gateLog("allowed", "light", ms); return }
         const ids = [e.sessionID]
         let ex = exempt(ids)
         if (!ex && m === "enforce") {
@@ -156,11 +161,13 @@ export default {
         log({
           event: deny ? "deny" : "allow", mode: m, session: e.sessionID, rule: v.rule, class: v.class, size: v.size,
           would_deny: !ex, allow_reason: reason, cmd_hash: createHash("sha1").update(cmd).digest("hex").slice(0, 12),
-          cmd: cmd.slice(0, 300), cwd: input.workdir ?? null, ms,
+          ms,
         })
+        gateLog(ex ? "local-override" : deny ? "denied" : "allowed", v.class, ms)
         if (deny) e.input = { ...input, command: denial(cmd, v), background: false }
       } catch (err) {
-        log({ event: "hook-error", session: e?.sessionID, error: String(err) })
+        gateLog("allowed", "unknown", 0, true)
+        log({ event: "hook-error", session: e?.sessionID, errorTag: "hook_failed" })
       }
     })
 
@@ -179,7 +186,7 @@ export default {
         if (!path.split(":").includes(BLOCKERS)) env.PATH = `${BLOCKERS}:${path}`
         env.OFFBOX_GATE = "1"
       } catch (err) {
-        log({ event: "shell-hook-error", error: String(err) })
+        log({ event: "shell-hook-error", errorTag: "hook_failed" })
       }
     })
 

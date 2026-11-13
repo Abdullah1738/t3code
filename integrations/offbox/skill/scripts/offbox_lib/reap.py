@@ -46,6 +46,21 @@ def _recheck_prune_holds(con, actions: list[str]) -> None:
 
 
 def reap(dry: bool = False) -> list[str]:
+    import toollog
+    with toollog.span("reaper", "reaper.pass", props={"dryRun": dry}, tag="reaper_failed") as data:
+        actions = _reap_logged(dry)
+        data["props"]["count"] = len(actions)
+        data["ok"] = not any("(FAILED:" in action or " list failed:" in action for action in actions)
+        for action in actions:
+            word = action.removeprefix("would ").split(" ", 1)[0]
+            failed = "(FAILED:" in action or " list failed:" in action
+            toollog.emit("reaper", "reaper.action", kind="error" if failed else "event", ok=not failed,
+                         tag="reaper_action" if failed else None,
+                         props={"dryRun": dry, "action": word if word in {"stop", "delete", "forget", "settle", "keep"} else "other"})
+        return actions
+
+
+def _reap_logged(dry: bool = False) -> list[str]:
     actions: list[str] = []
     con = db()
     try:

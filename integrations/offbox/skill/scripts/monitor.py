@@ -171,6 +171,8 @@ def tick(con, dry_run=False):
 
 
 def main():
+    import toollog
+    toollog.rollup_previous()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", choices=["loop"])
     parser.add_argument("--once", action="store_true")

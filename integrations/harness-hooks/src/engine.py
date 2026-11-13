@@ -32,6 +32,17 @@ import statev2_guard
 import rootwide_search_guard
 
 
+def _tool_log(**fields):
+    try:
+        from offbox_toollog import emit
+        props = fields.get("props", {})
+        if props.get("harness") == "claude":
+            props["harness"] = "claudeAgent"
+        emit("gate", "gate.decision", **fields)
+    except Exception:
+        pass
+
+
 HOME = Path.home()
 BETTERSTACK_REASON = "Better Stack is restricted to CRPKO work. Open the relevant CRPKO project before using this MCP."
 COORD_REASON = "coord Haiku lane: this changes dev or reads a secret; hand the exact command to your Opus lead, who runs it under a coord claim."
@@ -1179,9 +1190,13 @@ def decide(event, harness):
                 approval_allowed = bool(shell_field and not tool.startswith("mcp__"))
                 cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
                 mode = _offbox_mode()
+                if mode == "off":
+                    _tool_log(ok=True, props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
                 if mode != "off":
                     try:
+                        started = time.monotonic()
                         verdict = _classify_offbox(command, cwd)
+                        gate_decision = "allowed"
                         if verdict["heavy"]:
                             cap = _read_json(_offbox_state() / "cap.json", {})
                             available = _offbox_available() and not (isinstance(cap, dict) and cap.get("capped") is True)
@@ -1189,12 +1204,19 @@ def decide(event, harness):
                                 raise ValueError("identity-unresolved")
                             exempt = _exempt(identity, lineage=lineage) if mode == "enforce" and available else False
                             if mode == "enforce" and available and not exempt:
+                                gate_decision = "denied"
                                 result = {"decision": "deny", "reason": _offbox_denial(verdict), "context": {"rule": verdict["rule"]}}
                             else:
+                                gate_decision = "local-override" if exempt else "allowed"
                                 result["context"]["rule"] = "offbox-observe" if mode == "observe" else "offbox-exempt" if exempt else "offbox-unavailable"
+                        _tool_log(kind="perf", ok=True, duration_ms=(time.monotonic()-started)*1000,
+                                  props={"harness": harness, "decision": gate_decision,
+                                         "commandClass": verdict.get("class", "heavy") if verdict["heavy"] else "light"})
                     except Exception as error:
                         error_type = type(error).__name__
                         result["context"].update(rule="offbox-unresolved")
+                        _tool_log(kind="error", ok=False, tag="gate_failed",
+                                  props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
