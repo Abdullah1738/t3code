@@ -1328,6 +1328,10 @@ class Questions(Base):
                  'Your refund was processed by Example Inc. Have you received it?',
                  'We have initiated refund. Have you received it?',
                  'We confirm that your refund was processed.',
+                 'Kindly note that your refund was processed.',
+                 'We can confirm that your refund was processed.',
+                 'We have initiated refund. The amount should be credited back to your card within a few days.',
+                 'Your refund was processed. We will send a confirmation email.',
                  'Your refund was processed by Mr. Smith. Is there anything else we can help with?')
         for i, body in enumerate(forms):
             with self.subTest(body=body):
@@ -1404,6 +1408,77 @@ class Questions(Base):
             with self.subTest(row=i):
                 self.data = self.tmp / f'question-{i}'
                 self.wd = self.tmp / f'question-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_confirmation_requests_leave_case_and_notice_unchanged(self):
+        requests = (
+            'Kindly confirm that your refund was processed.',
+            'Confirm that your refund was processed.',
+            'Please kindly confirm that your refund was processed.',
+            'Kindly verify that your refund was processed.',
+            'Kindly\nverify that your refund was processed.',
+            'Verify that your refund was processed.',
+            'Check that your refund was processed.',
+            'Dear customer, kindly confirm that your refund was processed.',
+            'Dear customer,\nKindly confirm that your refund was processed.',
+            'Kindly provide confirmation that your refund was processed.',
+            'Send confirmation that your refund was processed.',
+            'Share confirmation that your refund was processed.',
+            'We ask you to please confirm that your refund was processed.',
+            'We ask you to confirm that your refund was processed.',
+            'You are requested to verify that your refund was processed.',
+            'Please just confirm that your refund was processed.',
+            'Kindly urgently confirm that your refund was processed.',
+            'Please let us know that your refund was processed.',
+            'Please can you confirm that your refund was processed.',
+            'Reconfirm that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(requests, 'request')
+
+    def test_future_or_conditional_refund_leaves_case_and_notice_unchanged(self):
+        bodies = (
+            'We will send a confirmation email once your refund is processed.',
+            'Once your refund is processed, a confirmation email will follow.',
+            'We send a confirmation email when your refund is processed.',
+            'After your refund has been issued, you will receive a confirmation email.',
+            'If approved, your refund is processed.',
+            'Your refund is processed only if the request is approved.',
+            'Your refund is processed provided that approval is received.',
+            'Your refund is processed provided\nthat approval is received.',
+            'Your refund is processed as long as approval is received.',
+            'Your refund is processed subject to approval.',
+            'We would confirm that your refund was processed.',
+            'We may confirm that your refund was processed.',
+            'We might confirm that your refund was processed.',
+            "We'll ensure that your refund is processed.",
+            "We'd confirm that your refund was processed.",
+            'We are going to ensure that your refund is processed.',
+            'We are about to ensure that your refund is processed.',
+            'We can get your refund processed.',
+            'We can ensure that your refund is processed.',
+            'We are working to ensure that your refund is processed.',
+            'We are trying to ensure that your refund is processed.',
+            'We are hoping that your refund was processed.',
+            'We expect that your refund was processed.',
+            'We hope that your refund was processed.',
+            'The amount should be credited back to your card within a few days.',
+            'The amount will be credited back to your card.',
+            'Your refund is processed tomorrow.',
+            'Your refund is processed next week.',
+            'Your refund is processed next\nweek.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'future')
+
+    def assert_refund_mail_ignored(self, bodies, label):
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'{label}-{i}'
+                self.wd = self.tmp / f'{label}-wd-{i}'
                 self.wd.mkdir()
                 self.refund_case()
                 before = mc.load(self.data)

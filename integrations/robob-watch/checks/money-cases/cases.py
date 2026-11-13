@@ -111,9 +111,23 @@ REFUND_DONE = re.compile(
     r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
     r'|\b(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
 REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
+_REFUND_REQUEST = (r'(?:(?:re)?confirm|verify|check|advise|tell|inform|ensure|let)\b'
+                   r'|(?:provide|send|share)\s+(?:(?:a|the|your)\s+)?confirmation\b')
+_REFUND_MODIFIERS = r'(?:(?:please|kindly|just|simply|also|again|now|do|[a-z]+ly)\s+)*'
 REFUND_QUERY = re.compile(
-    r'(?:^|[\n.!?;:,])\s*(?:am|is|are|was|were|do|does|did|has|have|had|can|could|may|might|will|would|shall|should|who|what|when|where|why|how|which)\b'
-    r'|\bwhether\b|\b(?:please\s+(?:confirm|check)|(?:confirm|check|know|advise|ask(?:s|ing)?|wonder(?:s|ing)?)\s+if)\b', re.I)
+    rf'(?:^|[\n.!?;:,])\s*{_REFUND_MODIFIERS}(?:(?:am|is|are|was|were|do|does|did|has|have|had|can|could|may|might|will|would|shall|should|who|what|when|where|why|how|which)\b|{_REFUND_REQUEST})'
+    rf'|\b(?:please|kindly)\s+{_REFUND_MODIFIERS}(?:{_REFUND_REQUEST})'
+    r'|\bwhether\b|\b(?:confirm|check|know|advise|ask(?:s|ing)?|wonder(?:s|ing)?)\s+if\b'
+    r'|\b(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?|need(?:s|ed)?|want(?:s|ed)?)\s+(?:that\s+)?you\b'
+    r'|\b(?:asked|requested|required)\s+to\s+(?:confirm|verify|check)\b', re.I)
+REFUND_UNCERTAIN = re.compile(
+    r'\b(?:if|once|when|unless|until|before|after|upon|pending|provided|providing|assuming|tomorrow|later|soon)\b'
+    r'|\b(?:in\s+case|as\s+long\s+as|so\s+long\s+as|subject\s+to|next\s+(?:day|week|month|year))\b', re.I)
+REFUND_FUTURE = re.compile(
+    r'\b(?:will|would|shall|should|may|might|could|can(?!\s+confirm\b)|expect(?:s|ed|ing)?|hop(?:e[sd]?|ing)|plan(?:s|ned|ning)?|'
+    r'anticipat(?:e|es|ed|ing)|intend(?:s|ed|ing)?|aim(?:s|ed|ing)?|scheduled|await(?:s|ing)?|'
+    r'(?:going|about|trying|attempting)\s+to|working\s+(?:to|on))\b'
+    r"|['’](?:ll|d)\b", re.I)
 REFUND_FOLLOWUP = re.compile(
     r'(?<=[.!])\s+(?:have you received (?:it|the refund|the credit)|is there anything else we can help with)\?\s*$', re.I)
 QUOTED_REPLY = re.compile(r'^\s*>|^.*Original Message.*$|^.*\bOn\b.+\bwrote:.*$', re.I | re.M)
@@ -2873,7 +2887,12 @@ def refund_mails(data, now, deadline, find=None, read=None):
                     # Abbreviations can look like sentence endings inside a question. Only
                     # a neutral trailing follow-up may be ignored; other questions block a hold.
                     confirmation = REFUND_FOLLOWUP.sub('', text)
-                    if '?' in confirmation or REFUND_QUERY.search(confirmation) or not REFUND_DONE.search(confirmation):
+                    if '?' in confirmation or REFUND_QUERY.search(confirmation) or REFUND_UNCERTAIN.search(confirmation):
+                        continue
+                    # A completed initiation may precede an estimate for the card credit.
+                    future = REFUND_FUTURE.search(confirmation)
+                    evidence = confirmation[:future.start()] if future else confirmation
+                    if not REFUND_DONE.search(evidence):
                         continue
                     changes = {'state': f'refund promised: {merchant} mail {mailed:%a %d %b %H:%M} says it was processed'}
                     due = mailed + dt.timedelta(days=7)
