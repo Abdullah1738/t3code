@@ -1,3 +1,4 @@
+import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthAdministrativeScopes,
@@ -37,10 +38,19 @@ const layerEnvironmentAuth = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(ServerEnvironment.layerIdentity),
   Layer.provide(layerConfig),
 );
-const makeLayerRoutes = (capture: (auth: EnvironmentAuth.EnvironmentAuth["Service"]) => void) =>
+const makeLayerRoutes = (
+  capture: (
+    auth: EnvironmentAuth.EnvironmentAuth["Service"],
+    origins: SessionOrigins.SessionOrigins["Service"],
+  ) => void,
+) =>
   Layer.mergeAll(
     Layer.effectDiscard(
-      EnvironmentAuth.EnvironmentAuth.pipe(Effect.tap((auth) => Effect.sync(() => capture(auth)))),
+      Effect.gen(function* () {
+        const auth = yield* EnvironmentAuth.EnvironmentAuth;
+        const origins = yield* SessionOrigins.SessionOrigins;
+        capture(auth, origins);
+      }),
     ),
     HttpApiBuilder.layer(AuthTestApi).pipe(
       Layer.provide(AuthHttp.layer),
@@ -79,14 +89,20 @@ const form = (body: Record<string, string>) => ({
 type Handler = (request: Request) => Effect.Effect<Response>;
 
 const withRoutes = <A, E>(
-  use: (handler: Handler, auth: EnvironmentAuth.EnvironmentAuth["Service"]) => Effect.Effect<A, E>,
+  use: (
+    handler: Handler,
+    auth: EnvironmentAuth.EnvironmentAuth["Service"],
+    origins: SessionOrigins.SessionOrigins["Service"],
+  ) => Effect.Effect<A, E>,
 ) =>
   Effect.gen(function* () {
     const crypto = yield* Crypto.Crypto;
     const context = Context.make(Crypto.Crypto, crypto);
     let routerAuth: EnvironmentAuth.EnvironmentAuth["Service"] | undefined;
-    const layerRoutes = makeLayerRoutes((auth) => {
+    let routerOrigins: SessionOrigins.SessionOrigins["Service"] | undefined;
+    const layerRoutes = makeLayerRoutes((auth, origins) => {
       routerAuth = auth;
+      routerOrigins = origins;
     });
     return yield* Effect.acquireUseRelease(
       Effect.sync(() => HttpRouter.toWebHandler(layerRoutes, { disableLogger: true })),
@@ -94,7 +110,7 @@ const withRoutes = <A, E>(
         Effect.gen(function* () {
           const handler: Handler = (request) => Effect.promise(() => web.handler(request, context));
           yield* handler(at("/.well-known/oauth-authorization-server"));
-          return yield* use(handler, routerAuth!);
+          return yield* use(handler, routerAuth!, routerOrigins!);
         }),
       (web) => Effect.promise(() => web.dispose()),
     );
@@ -564,3 +580,81 @@ it("matches loopback redirects on everything but the port, and https redirects e
   expect(matches("https://bot.example/cb", "https://bot.example/cb?x=1")).toBe(false);
   expect(matches("https://bot.example/cb", "https://evil.example/cb")).toBe(false);
 });
+
+it.live.each([
+  "owner",
+  "nonowner",
+  "lower-access",
+  "pairing-code",
+  "revoked-owner",
+  "owner-without-maintain",
+])("MCP maintenance permission requires a live owner browser full-access approval (%s)", (kind) =>
+  withRoutes((handler, auth, origins) =>
+    Effect.gen(function* () {
+      const clientId = yield* registeredClientId(handler);
+      const params = authorizeParams(clientId);
+      const issuer = yield* auth.issueSession({ subject: "fixture-owner" });
+      if (kind !== "nonowner")
+        yield* origins.record(issuer.sessionId, { _tag: "owner", source: "desktop" });
+      const pairing = yield* auth.issuePairingCredential(
+        {
+          scopes: AuthAdministrativeScopes.filter(
+            (scope) => kind !== "owner-without-maintain" || scope !== "environment:maintain",
+          ),
+        },
+        { sessionId: issuer.sessionId },
+      );
+      const browser = yield* handler(
+        postJson("/api/auth/browser-session", { credential: pairing.credential }),
+      );
+      const cookie = browser.headers.getSetCookie()[0]!.split(";", 1)[0]!;
+      const details = yield* handler(postJson("/oauth/mcp/approval", params, cookie)).pipe(
+        Effect.flatMap(json<{ csrfToken: string }>),
+      );
+      const access = kind === "lower-access" ? "auto" : "full-access";
+      const approval =
+        kind === "pairing-code"
+          ? yield* decide(handler, params, {
+              _tag: "pairing-code",
+              access,
+              code: (yield* auth.issuePairingCredential()).credential,
+            })
+          : yield* decide(
+              handler,
+              params,
+              { _tag: "browser-session", access, csrfToken: details.csrfToken },
+              cookie,
+            );
+      expect(approval.status).toBe(200);
+      if (kind === "revoked-owner") {
+        const session = yield* auth.authenticateBrowserSession(
+          HttpServerRequest.fromWeb(at("/", { headers: { cookie } })),
+        );
+        yield* auth.revokeSession(session.sessionId);
+      }
+      const code = new URL(approval.redirectTo!).searchParams.get("code")!;
+      const response = yield* handler(
+        at(
+          "/oauth/mcp/token",
+          form({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: params.redirect_uri,
+            client_id: clientId,
+            code_verifier: verifier,
+            resource: params.resource,
+          }),
+        ),
+      );
+      expect(response.status).toBe(200);
+      const token = yield* json<{ access_token: string; scope: string }>(response);
+      expect(token.scope.split(" ").includes("environment:maintain")).toBe(kind === "owner");
+      const client = yield* auth.authenticateMcpClient(
+        HttpServerRequest.fromWeb(
+          at("/mcp", { headers: { authorization: `Bearer ${token.access_token}` } }),
+        ),
+      );
+      expect(client.maintenanceAuthorized).toBe(kind === "owner");
+    }),
+  ),
+);

@@ -1223,3 +1223,35 @@ it.effect("releases consumed application replay pages", () =>
     assert.equal(count, 1501);
   }).pipe(Effect.provide(layerTest)),
 );
+
+layer("shell redaction invalidation", (it) => {
+  it.effect("retains redaction sequences when a later event coalesces the affected thread", () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const baseline = yield* store.latestApplicationSequence;
+      const id = ThreadId.make("closed-redacted-thread");
+      let version = 0;
+      const append = (type: string) =>
+        sql<{
+          sequence: number;
+        }>`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,actor_kind,payload_json,metadata_json,application_event_version) VALUES (${type},'thread',${id},${version++},${type},'2026-01-01','server','{}','{}',2) RETURNING sequence`;
+      const [audit] = yield* append("thread.item-redacted");
+      const [later] = yield* append("thread.metadata-updated");
+      assert.deepEqual(
+        yield* store.getShellChanges({
+          afterSequence: baseline,
+          throughSequence: later!.sequence,
+          maxThreads: 10,
+        }),
+        {
+          complete: true,
+          threads: [
+            { threadId: id, sequence: later!.sequence, redactionSequence: audit!.sequence },
+          ],
+          projects: [],
+        },
+      );
+    }),
+  );
+});
