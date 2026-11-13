@@ -10328,6 +10328,48 @@ const stopping = {
   message: "OpenCode is still stopping the previous turn. Send the message again in a moment.",
 } as never;
 
+it.effect.each([false, true])(
+  "an exhausted direct turn-end conflict is recovered by the tick once (committed=%s)",
+  (committed) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const channel = yield* kanban.createDiscussion(board.id, "Fees", owner);
+        yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Round fees up" }]);
+        const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+        fake.failures.set(evaluator, stopping);
+        let conflicts = 0;
+        fake.viewControl.beforeRead = (id) =>
+          id === evaluator
+            ? Effect.sync(() => {
+                conflicts += 1;
+              }).pipe(Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(committed))))
+            : Effect.void;
+        const failed = yield* kanban.turnEnded(evaluator).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(failed));
+        if (committed) assert.strictEqual(conflicts, 1);
+        else assert.isAbove(conflicts, 1);
+        const retryMessages = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map((all) =>
+              all.get(evaluator)!.messages.filter((text) => text.includes("one automatic retry")),
+            ),
+          );
+        assert.lengthOf(yield* retryMessages(), 0);
+        delete fake.viewControl.beforeRead;
+        yield* kanban.tick;
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        assert.lengthOf(yield* retryMessages(), 1);
+        yield* kanban.tick;
+        yield* kanban.turnEnded(evaluator);
+        yield* kanban.tick;
+        assert.lengthOf(yield* retryMessages(), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a stale turn end while the retry waits on input does not clear the failure streak", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

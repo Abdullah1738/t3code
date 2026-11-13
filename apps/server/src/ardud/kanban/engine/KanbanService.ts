@@ -6804,6 +6804,13 @@ const make = Effect.gen(function* () {
 
   const turnEndedUnlocked = (threadId: ThreadId, runId?: string, retry = false) =>
     serial(turnEnding, threadId, finishTurn(threadId, runId, retry)).pipe(
+      Effect.catchDefect((defect) =>
+        Effect.gen(function* () {
+          if (defect instanceof BoardLocks.BoardStateChanged)
+            yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+          return yield* Effect.die(defect);
+        }),
+      ),
       Effect.tap(() => turnEndRecovered(threadId)),
     );
 
