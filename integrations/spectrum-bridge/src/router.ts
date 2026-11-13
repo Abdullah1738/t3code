@@ -4068,7 +4068,10 @@ export class Router {
           }
         }
         // The terminal failed idle is outside scope; its open run must never contribute a partial reply.
-        const completedEarlier = earlier.filter(reply => successfulReplies.has(reply.id));
+        // An empty failed run leaves the last assistant in an earlier successful run.
+        const completedEarlier = replies.filter(reply => successfulReplies.has(reply.id)
+          && (earlier.includes(reply) || reply === final && reply.answer !== false && !reply.error)
+          && reply.id !== turn!.earlySent && !quiet.has(reply.id));
         const failAfterEarlier = async (text: string, reason: DropReason, immediate = false) => {
           const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) }))
             .filter(item => item.text && !this.store.getOperation(`reply:${turn!.generation}:${item.reply.id}`));
