@@ -1,9 +1,14 @@
 #!/usr/bin/python3
 """Shell adapters. All instrumentation, including measurement, fails open."""
 import json
+import datetime as dt
 import errno
+import fcntl
+import math
 import os
+import plistlib
 import re
+import signal
 from pathlib import Path
 import sys
 import subprocess
@@ -20,7 +25,8 @@ def state_path(name):
 
 def read_state(name):
     try:
-        return json.loads(state_path(name).read_text())
+        value = json.loads(state_path(name).read_text())
+        return value if isinstance(value, dict) else {}
     except Exception:
         return {}
 
@@ -76,6 +82,20 @@ def source_error(component, name, source, started, exc, props=None):
          props=dict(source=str(source), failure=failure, exitCode=code,
                     elapsedMs=max(0, (time.monotonic()-started)*1000), **(props or {})),
          error_tag=component+'.source_unavailable', error_message=message)
+
+
+def confirmed_absent(path, exc):
+    if exc.filename is None or str(exc.filename) != str(path):
+        return False
+    try:
+        resolved = Path(path).resolve()
+        # A missing backing mount is unavailable storage, not evidence that a
+        # tracked file/root was deleted. Resolve also covers home-dir symlinks.
+        if resolved.is_relative_to('/Volumes') and len(resolved.parts) >= 3:
+            return Path('/Volumes', resolved.parts[2]).is_mount()
+        return True
+    except (OSError, RuntimeError):
+        return False
 
 
 def du_total(path, run, timeout):
@@ -172,7 +192,8 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
                                 bytes=total, exitCode=code,
                                 elapsedMs=(time.monotonic()-source_started)*1000))
         except FileNotFoundError as exc:
-            if exc.filename == str(path):
+            if confirmed_absent(path, exc):
+                sizes[str(path)] = 0
                 continue
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
@@ -186,8 +207,120 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
          error_tag='disk.inventory_failed' if errors else None)
 
 
+def number(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def storage_value(output, snapshot=False):
+    if snapshot:
+        lines = output.decode('utf-8').splitlines()
+        if not lines or not lines[0].startswith('Snapshots for '):
+            raise ValueError('invalid snapshot list')
+        snapshots = [line.strip() for line in lines[1:] if line.strip()]
+        if any(not re.fullmatch(r'com\.apple\.TimeMachine\.\d{4}-\d{2}-\d{2}-\d{6}(?:\.local)?', line)
+               for line in snapshots):
+            raise ValueError('invalid snapshot list')
+        return len(snapshots)
+    info = plistlib.loads(output)
+    for key in ('PurgeableSpace', 'PurgeableSize'):
+        if key in info:
+            if not number(info[key]):
+                raise ValueError('invalid purgeable size')
+            return round(info[key] / 1024**3, 3)
+    return None
+
+
+def storage_probes(volumes, sample_started, popen=subprocess.Popen):
+    props, children = {}, []
+    started = time.monotonic()
+    slow = started-sample_started > 8
+    try:
+        # Children inherit this flock. Even an unkillable kernel wait keeps the
+        # next guard from accumulating more probes, without PID-reuse hazards.
+        with (state_path('disk').parent / 'disk-space-probes.lock').open('a') as lock:
+            os.chmod(lock.name, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {'internalPurgeableError': 'busy', 'externalPurgeableError': 'busy'}
+            if slow:
+                return {}
+            # Reserve time for kill/close; no communicate/wait may extend the cap.
+            deadline = min(started + 4.8, sample_started + 8)
+            for prefix, volume in zip(('internal', 'external'), volumes):
+                for snapshot in (False, True):
+                    field = prefix + ('LocalSnapshotCount' if snapshot else 'PurgeableGb')
+                    error = prefix + ('SnapshotError' if snapshot else 'PurgeableError')
+                    if time.monotonic() >= deadline:
+                        props[error] = 'timeout'
+                        slow = True
+                        continue
+                    command = (['/usr/bin/tmutil', 'listlocalsnapshots', '/' if prefix == 'internal' else str(volume)]
+                               if snapshot else ['/usr/sbin/diskutil', 'info', '-plist', str(volume)])
+                    output = tempfile.TemporaryFile()
+                    try:
+                        child = popen(command, stdout=output, stderr=subprocess.DEVNULL,
+                                      start_new_session=True, pass_fds=(lock.fileno(),),
+                                      env={**os.environ, 'LC_ALL': 'C'})
+                    except OSError:
+                        output.close()
+                        props[error] = 'unavailable'
+                        continue
+                    children.append((child, output, field, error, snapshot))
+            pending = list(children)
+            while pending:
+                for entry in list(pending):
+                    child, output, field, error, snapshot = entry
+                    code = child.poll()
+                    if code is None:
+                        continue
+                    pending.remove(entry)
+                    if code:
+                        props[error] = 'exit'
+                        continue
+                    try:
+                        output.seek(0)
+                        value = storage_value(output.read(65537), snapshot)
+                        if value is None:
+                            props[error] = 'unsupported'
+                        else:
+                            props[field] = value
+                    except Exception:
+                        props[error] = 'parse'
+                if not pending:
+                    break
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    slow = True
+                    for _, _, _, error, _ in pending:
+                        props[error] = 'timeout'
+                    break
+                time.sleep(min(0.01, remaining))
+    except Exception:
+        # Optional instrumentation must never prevent free-space samples.
+        pass
+    finally:
+        for child, output, _, _, _ in children:
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                child.poll()
+            output.close()
+        if time.monotonic()-sample_started > 8:
+            slow = True
+            props = {key: value for key, value in props.items() if key.endswith('Error')}
+        if slow:
+            emit('disk', 'event', 'disk.probe_slow', props={'elapsedMs': (time.monotonic()-started)*1000})
+    return props
+
+
 def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/ExternalSSD'), paths=None):
     started = time.monotonic()
+    sampled_at = dt.datetime.now(dt.timezone.utc)
+    stamp = sampled_at.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    previous = read_state('disk')
     props, errors = {}, 0
     for key, volume in zip(('internalFreeGb', 'externalFreeGb'), volumes):
         try:
@@ -195,6 +328,9 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
             props[key] = round(st.f_bavail * st.f_frsize / 1024**3, 3)
         except OSError:
             errors += 1
+        old_free = previous.get('free', {})
+        old_value = old_free.get(key) if isinstance(old_free, dict) else None
+        props[key+'Delta'] = round(props[key]-old_value, 3) if key in props and number(old_value) else None
     home = Path.home()
     # stat only: never open live databases, traverse private content or run du in the guard.
     paths = paths if paths is not None else [
@@ -207,8 +343,11 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     for path in paths:
         try:
             sizes[str(path)] = Path(path).stat().st_size
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as exc:
+            if confirmed_absent(path, exc):
+                sizes[str(path)] = 0
+            else:
+                errors += 1
         except OSError:
             errors += 1
     try:
@@ -218,21 +357,48 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     inventory = read_state('disk-inventory')
     props.update(inventorySourceErrors=inventory.get('sourceErrors', 0),
                  inventoryAgeS=None, inventoryStale=True)
-    if inventory.get('at'):
+    if number(inventory.get('at')):
         props['inventoryAgeS'] = max(0, time.time()-inventory['at'])
-        props['inventoryStale'] = props['inventoryAgeS'] > 7200
-        sizes.update(inventory.get('sizes', {}))
-    previous_state = read_state('disk')
-    previous = previous_state.get('sizes', {})
-    incomplete = set(inventory.get('partials', {})) | set(previous_state.get('partials', {}))
-    growers = sorted(((path, size - previous[path]) for path, size in sizes.items() if path in previous and path not in incomplete and size > previous[path]), key=lambda x: x[1], reverse=True)[:5]
+        props['inventoryStale'] = props['inventoryAgeS'] > 7200 or inventory['at'] > time.time()
+        cached = inventory.get('sizes', {})
+        if isinstance(cached, dict):
+            sizes.update({path: size for path, size in cached.items() if number(size)})
+    old_sizes = previous.get('sizes', {})
+    if not isinstance(old_sizes, dict):
+        old_sizes = {}
+    partials = inventory.get('partials', {})
+    # Older samples store coverage flags under inventoryPartials.
+    old_partials = previous.get('partials', previous.get('inventoryPartials', {}))
+    uncertain = set(partials if isinstance(partials, dict) else {}) | set(old_partials if isinstance(old_partials, dict) else {})
+    deltas = [(path, size-old_sizes[path]) for path, size in sizes.items()
+              if path in old_sizes and number(old_sizes[path]) and path not in uncertain]
+    growers = sorted(((path, delta) for path, delta in deltas if delta > 0), key=lambda x: x[1], reverse=True)[:5]
     for i, (path, delta) in enumerate(growers, 1):
         props['grower%dPath' % i] = path
         props['grower%dDeltaGb' % i] = round(delta / 1024**3, 6)
-    props.update(count=len(growers), baseline=int(not previous), sourceErrors=errors)
+    movers = []
+    if (not props['inventoryStale'] and number(previous.get('inventoryAt'))
+            and 0 <= time.time()-previous['inventoryAt'] <= 7200):
+        tracked = {str(path) for path in paths} | {str(path) for path in DIRECTORY_ROOTS} | {str(temp_dir)}
+        movers = sorted(((path, delta) for path, delta in deltas if delta and path in tracked),
+                        key=lambda item: (-abs(item[1]), item[0]))[:3]
+        if movers:
+            props.update(topMover1Path=movers[0][0], topMover1GbDelta=round(movers[0][1]/1024**3, 6))
+    props.update(count=len(growers), baseline=int(not old_sizes), sourceErrors=errors)
+    props.update(storage_probes(volumes, started))
     emit('disk', 'error' if errors else 'perf', 'disk.sample', duration_ms=(time.monotonic()-started)*1000,
-         ok=not errors, props=props, error_tag='disk.source_unavailable' if errors else None)
-    save_state('disk', dict(sizes=sizes, partials=inventory.get('partials', {})))
+         ok=not errors, props=props, error_tag='disk.source_unavailable' if errors else None, now=sampled_at)
+    if any(abs(props[key+'Delta'] or 0) >= 20 for key in ('internalFreeGb', 'externalFreeGb')):
+        swing = {key: props[key] for key in ('internalFreeGbDelta', 'externalFreeGbDelta')}
+        swing.update(previousTs=previous.get('ts'), sampleTs=stamp)
+        for i, (path, delta) in enumerate(movers, 1):
+            swing['topMover%dPath' % i] = path
+            swing['topMover%dGbDelta' % i] = round(delta/1024**3, 6)
+        emit('disk', 'event', 'disk.swing', props=swing, now=sampled_at)
+    save_state('disk', dict(sizes=sizes, ts=stamp,
+                           free={key: props[key] for key in ('internalFreeGb', 'externalFreeGb') if key in props},
+                           partials=inventory.get('partials', {}),
+                           inventoryAt=inventory.get('at') if not props['inventoryStale'] else None))
 
 
 def backup_restic_exit(executable, exit_code, output):
