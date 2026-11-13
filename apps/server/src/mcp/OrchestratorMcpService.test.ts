@@ -71,6 +71,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { McpCall } from "../ardud/analytics/McpCall.ts";
 
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
@@ -1394,6 +1395,69 @@ describe("OrchestratorMcpService provider resolution", () => {
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
 
+  it.effect.each(["none", "rejected"] as const)(
+    "a %s receipt does not report a rejected delegation as saved",
+    (receipt) =>
+      Effect.gen(function* () {
+        const state: McpCall["Service"] = {
+          callerResolved: false,
+          callerResolveMs: 0,
+          readerLane: "background",
+          phase: "handler",
+          saved: "unknown",
+        };
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (id) =>
+              Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
+            getThreadRecords: () => Effect.succeed(parentProjection([])),
+            hasReceipt: () => Effect.succeed(receipt === "rejected"),
+            dispatch: (command) =>
+              Effect.fail(
+                receipt === "rejected"
+                  ? new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      detail: "Rejected before task creation.",
+                    })
+                  : new Orchestrator.OrchestratorCommandRejectedError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                    }),
+              ),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const error = yield* service
+            .delegateTask(scope, {
+              task: "Check the diff",
+              mode: "async",
+              clientRequestId: "rejected-retry",
+            })
+            .pipe(Effect.flip);
+          assert.equal(error.code, "orchestration_error");
+          assert.isFalse(state.saved);
+        }).pipe(
+          Effect.provideService(McpCall, state),
+          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+        );
+      }),
+  );
+
   it.effect.each(["caller", "catalog", "receipt", "selection", "dispatch"] as const)(
     "delegateTask bounds a stalled %s phase and never dispatches after a preflight timeout",
     (stage) =>
@@ -1471,6 +1535,13 @@ describe("OrchestratorMcpService provider resolution", () => {
     "delegateTask recovers an accepted task when %s I/O stalls",
     (stage) =>
       Effect.gen(function* () {
+        const state: McpCall["Service"] = {
+          callerResolved: false,
+          callerResolveMs: 0,
+          readerLane: "background",
+          phase: "handler",
+          saved: "unknown",
+        };
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const finished = yield* Deferred.make<void>();
@@ -1563,6 +1634,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           yield* Deferred.await(finished);
           assert.isDefined(completed);
           const outcome = yield* Fiber.join(pending);
+          assert.isTrue(state.saved);
           assert.isTrue(Exit.isSuccess(outcome));
           if (Exit.isSuccess(outcome)) {
             assert.equal(outcome.value.taskId, taskId);
@@ -1573,7 +1645,10 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(retry.taskId, taskId);
           assert.equal(commandIds.length, 2);
           assert.equal(commandIds[0], commandIds[1]);
-        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+        }).pipe(
+          Effect.provideService(McpCall, state),
+          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+        );
       }),
   );
 

@@ -126,12 +126,11 @@ it.effect("records MCP failures as metadata without exporting the tool's text", 
       expect(result.isError).toBe(true);
       const event = yield* Deferred.await(recorded);
       expect(event).toMatchObject({
-        kind: "server.mcp.error",
-        props: {
-          method: "local_failure_probe",
-          originKind: "mcp-client",
-          errorTag: "McpToolError",
-        },
+        kind: "mcp.call",
+        tool: "local_failure_probe",
+        outcome: "refused",
+        errorTag: "capability_denied",
+        saved: false,
       });
       expect(JSON.stringify(event)).not.toMatch(/private|token|prompt/);
     }).pipe(Effect.provide(registration.pipe(Layer.provideMerge(scope(true)))));

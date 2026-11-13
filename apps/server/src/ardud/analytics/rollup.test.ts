@@ -13,6 +13,63 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
+    const accumulator = makeAccumulator();
+    const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>
+      event({
+        kind: "mcp.call",
+        tool: "card_update",
+        build: "old",
+        callerThreadId: "caller",
+        clientRequestId: "a".repeat(64),
+        durationMs: 10,
+        outcome: "error",
+        saved: false,
+        errorTag: "caller_unresolved",
+        errorPhase: "caller",
+        ...input,
+      });
+    // Emission can complete out of order. A different caller/tool must never count as a retry.
+    for (const row of [
+      call({ ts: "2026-11-13T13:01:00.000Z", build: "new", outcome: "ok", durationMs: 40 }),
+      call({ ts: "2026-11-13T12:02:00.000Z", outcome: "timeout", durationMs: 30 }),
+      call({ ts: "2026-11-13T12:01:00.000Z", durationMs: 20 }),
+      call({ callerThreadId: "other", outcome: "ok" }),
+      call({ tool: "card_move", outcome: "ok" }),
+      call({
+        clientRequestId: "b".repeat(64),
+        outcome: "refused",
+        errorTag: "board_busy",
+        errorPhase: "handler",
+      }),
+    ])
+      accumulate(accumulator, row);
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    const old = rollup.mcpCalls.find(
+      (group) => group.tool === "card_update" && group.build === "old",
+    )!;
+    assert.deepInclude(old, {
+      count: 4,
+      failures: 3,
+      failureRate: 0.75,
+      p50Ms: 10,
+      p95Ms: 30,
+      maxMs: 30,
+      failedThenRetried: 2,
+      retrySucceeded: 1,
+    });
+    assert.deepEqual(old.outcomes, { error: 1, timeout: 1, ok: 1, refused: 1 });
+    assert.deepEqual(old.errors, [
+      { errorTag: "caller_unresolved", errorPhase: "caller", count: 2 },
+      { errorTag: "board_busy", errorPhase: "handler", count: 1 },
+    ]);
+    assert.equal(
+      rollup.mcpCalls.find((group) => group.build === "new")!.hour,
+      "2026-11-13T13:00:00.000Z",
+    );
+    assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0 });
+    assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
+  });
   it("counts kinds and errors, ranks real RPC timings, and measures answered asks", () => {
     const accumulator = makeAccumulator();
     for (const durationMs of [10, 20, 30, 40, 100]) {

@@ -174,7 +174,12 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   ) {
     const full = makeAccumulator();
     const filtered =
-      filter?.kind !== undefined || filter?.boardId !== undefined ? makeAccumulator() : full;
+      filter?.kind !== undefined ||
+      filter?.boardId !== undefined ||
+      filter?.tool !== undefined ||
+      filter?.outcome !== undefined
+        ? makeAccumulator()
+        : full;
     const samples: AnalyticsEvent[] = [];
     const limit = filter?.limit ?? 100;
     let cursor = 0;
@@ -200,7 +205,9 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       accumulate(full, event);
       if (
         (filter?.kind !== undefined && filter.kind !== event.kind) ||
-        (filter?.boardId !== undefined && filter.boardId !== event.boardId)
+        (filter?.boardId !== undefined && filter.boardId !== event.boardId) ||
+        (filter?.tool !== undefined && filter.tool !== event.tool) ||
+        (filter?.outcome !== undefined && filter.outcome !== event.outcome)
       )
         return;
       if (filtered !== full) accumulate(filtered, event);

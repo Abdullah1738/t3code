@@ -21,6 +21,8 @@ const Id = Schema.String.check(
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
+const McpOutcome = Schema.Literals(["ok", "error", "timeout", "refused"]);
+const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
 export const AnalyticsEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label,
@@ -31,6 +33,18 @@ export const AnalyticsEvent = Schema.Struct({
   discussionId: Schema.optionalKey(Id),
   threadId: Schema.optionalKey(Id),
   durationMs: Schema.optionalKey(Measurement),
+  tool: Schema.optionalKey(Label),
+  build: Schema.optionalKey(Label),
+  callerThreadId: Schema.optionalKey(Id),
+  callerResolved: Schema.optionalKey(Schema.Boolean),
+  callerResolveMs: Schema.optionalKey(Measurement),
+  clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
+  outcome: Schema.optionalKey(McpOutcome),
+  errorTag: Schema.optionalKey(Label),
+  errorPhase: Schema.optionalKey(McpPhase),
+  saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  readerLane: Schema.optionalKey(Label),
+  writerWaitMs: Schema.optionalKey(Measurement),
   props: Schema.optionalKey(
     Schema.Struct({
       method: Schema.optionalKey(Label),
@@ -77,6 +91,8 @@ export const AnalyticsReadInput = Schema.Struct({
   day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   kind: Schema.optionalKey(Label),
   boardId: Schema.optionalKey(Id),
+  tool: Schema.optionalKey(Label),
+  outcome: Schema.optionalKey(McpOutcome),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
 });
 export type AnalyticsReadInput = typeof AnalyticsReadInput.Type;
@@ -97,6 +113,24 @@ export const AnalyticsRollup = Schema.Struct({
   errorCounts: Schema.Record(Label, Measurement),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
+  mcpCalls: Schema.Array(
+    Schema.Struct({
+      tool: Label,
+      hour: Label,
+      build: Label,
+      ...LatencyFields,
+      failures: Measurement,
+      failureRate: Measurement,
+      outcomes: Schema.Record(Label, Measurement),
+      savedCounts: Schema.Record(Label, Measurement),
+      errors: Schema.Array(
+        Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
+      ),
+      failedThenRetried: Measurement,
+      retrySucceeded: Measurement,
+    }),
+  ),
+  mcpOverflow: Schema.Struct({ groups: Measurement, retryAttempts: Measurement }),
 });
 export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({
