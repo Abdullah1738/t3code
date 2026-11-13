@@ -180,7 +180,7 @@ export type OrchestrationEffectStatusV2 = typeof OrchestrationEffectStatusV2.Typ
  * cleanup keeps a deleted thread's worktree while any of its effects failed.
  */
 export const SETTLED_EFFECT_RETENTION = Duration.days(7);
-const PRUNE_BATCH_SIZE = 500;
+const PRUNE_BATCH_SIZE = 200;
 
 export interface OrchestrationEffectV2 {
   readonly id: string;
@@ -815,12 +815,13 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           DateTime.subtractDuration(yield* DateTime.now, SETTLED_EFFECT_RETENTION),
         );
         // Each batch is its own statement, so a large backlog never holds the
-        // write lock for long and writers can commit between batches.
+        // write lock for long. SQLite otherwise prefers the claim index and
+        // scans retained settled rows even when nothing has expired.
         const deleteBatch = sql<{ readonly effect_id: string }>`
           DELETE FROM orchestration_v2_effect_outbox
           WHERE rowid IN (
             SELECT rowid
-            FROM orchestration_v2_effect_outbox
+            FROM orchestration_v2_effect_outbox INDEXED BY orchestration_v2_effect_outbox_settled_idx
             WHERE status IN ('succeeded', 'cancelled')
               AND completed_at < ${cutoff}
             LIMIT ${PRUNE_BATCH_SIZE}
@@ -832,7 +833,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           const deleted = (yield* deleteBatch).length;
           pruned += deleted;
           if (deleted < PRUNE_BATCH_SIZE) return pruned;
-          yield* Effect.yieldNow;
+          yield* Effect.sleep(Duration.millis(50));
         }
       }).pipe(
         Effect.mapError((cause) => new EffectOutboxError({ operation: "prune-settled", cause })),
