@@ -48,10 +48,11 @@ def stamp(at):
     return at.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
-def read_days(root, day):
+def read_days(root, first_day, last_day):
     rows, missing, errors = [], [], []
     malformed = 0
-    for date in (day - dt.timedelta(days=1), day):
+    for offset in range((last_day - first_day).days + 1):
+        date = first_day + dt.timedelta(days=offset)
         filename = date.isoformat() + '.ndjson'
         try:
             with (root / filename).open('rb') as stream:
@@ -65,7 +66,7 @@ def read_days(root, day):
                                 or ('ok' in row and type(row['ok']) is not bool)):
                             raise ValueError('invalid row')
                         rows.append((timestamp(row.get('ts')), row))
-                    except (ValueError, TypeError, UnicodeError, RecursionError):
+                    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
                         malformed += 1
         except FileNotFoundError:
             missing.append(filename)
@@ -78,11 +79,14 @@ def report(now=None, root=None, *, day=None):
     try:
         now = dt.datetime.now(UTC) if now is None else timestamp(now) if isinstance(now, str) else now.astimezone(UTC)
         day = now.date() if day is None else day
-        rows, missing, errors, malformed = read_days(Path(root) if root is not None else directory(), day)
+        window_start = now - dt.timedelta(hours=36)
+        # Before noon UTC the 36-hour window spans three day files.
+        rows, missing, errors, malformed = read_days(
+            Path(root) if root is not None else directory(), window_start.date(), day)
         jobs = {}
         for key, cadence in CADENCES.items():
             since = dt.datetime.combine(dt.date.fromisoformat(cadence['since']), dt.time(), UTC)
-            cutoff = max(since, now - dt.timedelta(hours=36))
+            cutoff = max(since, window_start)
             matching = [(at, row) for at, row in rows
                         if since <= at <= now and row['name'] == cadence['name']
                         and (cadence['target'] is None or row.get('props', {}).get('target') == cadence['target'])]

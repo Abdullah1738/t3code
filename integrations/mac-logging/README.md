@@ -10,10 +10,11 @@ Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
 clock (include `Z` or an explicit UTC offset). The command always exits 0,
 including invalid arguments or unreadable input; inspect the report for errors.
-It only reads today's and yesterday's UTC day files. Missing and unreadable
-files are listed separately; malformed rows (including invalid timestamps) are
-skipped and counted. Future timestamps are ignored. It makes no network calls
-and creates no files or locks.
+It reads the UTC day files covering the last 36 hours (three files before noon
+UTC, two from noon onward). Missing and unreadable files are listed separately.
+Malformed rows, including invalid timestamps and dates that overflow when
+converted to UTC, are skipped and counted. Future timestamps are ignored.
+It makes no network calls and creates no files or locks.
 
 The single cadence table is `CADENCES` in `status.py`, with schedule sources
 beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two

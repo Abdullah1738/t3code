@@ -121,6 +121,93 @@ class StatusTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     status.timestamp(value)
 
+    def test_window_crosses_utc_dates_before_and_after_noon(self):
+        # now, sweep timestamp, oldest UTC file needed for the 36-hour window
+        cases = [
+            ('2026-11-15T00:00:00Z', '2026-11-13T23:45:00Z', '2026-11-13'),
+            ('2026-11-15T00:30:00Z', '2026-11-13T23:45:00Z', '2026-11-13'),
+            ('2026-11-15T11:59:59Z', '2026-11-14T11:45:00Z', '2026-11-13'),
+            ('2026-11-15T12:00:00Z', '2026-11-14T11:45:00Z', '2026-11-14'),
+            ('2026-11-15T12:00:01Z', '2026-11-14T11:45:00Z', '2026-11-14'),
+            ('2026-11-15T23:59:59Z', '2026-11-14T23:45:00Z', '2026-11-14'),
+            ('2026-11-15T04:30:00+04:00', '2026-11-13T23:45:00Z', '2026-11-13'),
+            ('2026-11-15T04:30:00+0400', '2026-11-13T23:45:00Z', '2026-11-13'),
+            ('2026-11-15T00:30:00+04:00', '2026-11-13T19:45:00Z', '2026-11-13'),
+            ('2026-12-01T00:30:00Z', '2026-11-29T23:45:00Z', '2026-11-29'),
+            ('2027-01-01T00:30:00Z', '2026-12-30T23:45:00Z', '2026-12-30'),
+            ('2028-03-01T00:30:00Z', '2028-02-28T23:45:00Z', '2028-02-28'),
+        ]
+        for index, (now_text, sweep_text, first_day) in enumerate(cases):
+            with self.subTest(now=now_text):
+                root = self.root / str(index)
+                root.mkdir()
+                now, sweep = status.timestamp(now_text), status.timestamp(sweep_text)
+                with patch.object(self, 'root', root):
+                    for key in status.CADENCES:
+                        self.write(key, sweep if key == 'sweep.run' else now)
+                    result = self.report(now_text)
+                self.assertEqual(result['missingJobs'], [])
+                row = result['jobs']['sweep.run']
+                self.assertEqual(row['status'], 'OK')
+                self.assertEqual(row['lastSeen'], status.stamp(sweep))
+                self.assertEqual(row['ageMin'], round((now - sweep).total_seconds() / 60, 3))
+                self.assertEqual(row['lines'], 1)
+                first = dt.date.fromisoformat(first_day)
+                dates = [first + dt.timedelta(days=i) for i in range((now.date() - first).days + 1)]
+                self.assertEqual(result['missingFiles'], [date.isoformat() + '.ndjson' for date in dates
+                                                         if not (root / (date.isoformat() + '.ndjson')).exists()])
+
+    def test_early_morning_silence_boundary_in_third_file(self):
+        now = status.timestamp('2026-11-15T00:30:00Z')
+        for index, (age_hours, expected) in enumerate([(26, 'OK'), (27, 'LATE'),
+                                                     (36, 'LATE'), (36.001, 'SILENT')]):
+            with self.subTest(age_hours=age_hours):
+                root = self.root / str(index)
+                root.mkdir()
+                at = now - dt.timedelta(hours=age_hours)
+                with patch.object(self, 'root', root):
+                    self.write('sweep.run', at)
+                    result = self.report(now)
+                row = result['jobs']['sweep.run']
+                self.assertEqual(row['status'], expected)
+                self.assertEqual(row['lastSeen'], status.stamp(at))
+                self.assertEqual(row['lines'], 0 if expected == 'SILENT' else 1)
+
+    def test_utc_conversion_overflow_skips_rows_and_preserves_jobs_and_rollup(self):
+        # Local dates can parse successfully but overflow when converted to UTC.
+        overflowing = [
+            '0001-01-01T00:00:00+04:00', '0001-01-01T00:00:00+0400',
+            '0001-01-01 00:00:00+2359',
+            '9999-12-31T23:59:59-04:00', '9999-12-31T23:59:59-0400',
+            '9999-12-31 23:59:59-2359',
+        ]
+        representable = ['0001-01-01T04:00:00+04:00', '0001-01-01T00:00:00Z',
+                         '9999-12-31T19:59:59-04:00', '9999-12-31T23:59:59Z']
+        for key in status.CADENCES:
+            self.write(key, NOW.replace(hour=23, minute=45))
+        end = NOW + dt.timedelta(hours=12)
+        baseline = status.report(end, self.root, day=NOW.date())
+        for index, value in enumerate(overflowing + representable):
+            with self.subTest(timestamp=value):
+                self.write('disk.sample', ts=value)
+                result = status.report(end, self.root, day=NOW.date())
+                self.assertNotIn('error', result)
+                self.assertEqual(result['malformed'], min(index + 1, len(overflowing)))
+                self.assertEqual(result['jobs'], baseline['jobs'])
+                self.assertEqual(result['missingJobs'], [])
+                daily = rollup('2026-11-15', self.root)
+                self.assertEqual(daily['jobs'], baseline['jobs'])
+                self.assertEqual(daily['missingJobs'], [])
+                self.assertEqual(json.loads((self.root / 'rollup-2026-11-15.json').read_text())['jobs'], baseline['jobs'])
+
+        cli = subprocess.run([sys.executable, str(HERE / 'status.py'), '--json',
+                              '--now', '2026-11-15T23:59:00Z'], capture_output=True, text=True)
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        result = json.loads(cli.stdout)
+        self.assertEqual(result['malformed'], len(overflowing))
+        self.assertEqual(len(result['jobs']), 7)
+        self.assertEqual(result['missingJobs'], [])
+
     def test_malformed_inputs_are_counted_and_skipped(self):
         self.seed()
         bad = ['{broken', 'null', '[]', '42', '"text"',
