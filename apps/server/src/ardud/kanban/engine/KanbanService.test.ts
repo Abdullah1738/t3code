@@ -48,9 +48,11 @@ import {
   type ModelSelection,
   type OrchestrationV2ProviderFailure,
   type ServerProvider,
+  type AnalyticsEvent,
 } from "@t3tools/contracts";
 
 import * as ServerConfig from "../../../config.ts";
+import * as Analytics from "../../analytics/Analytics.ts";
 import { RPC_REQUIRED_SCOPES } from "../../../auth/RpcAuthorization.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
@@ -512,6 +514,78 @@ const OWNER_APP_SESSION = {
   subject: "one-time-token",
   origin: { _tag: "owner", source: "paired-client" },
 } as const;
+
+it.effect(
+  "records tick queues, throttles exact pool waits, and times todo dispatch without card text",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "analytics",
+          name: "Private board",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Private card", prompt: "Private prompt" },
+          owner,
+        );
+        yield* kanban.createCard(
+          board.id,
+          { title: "Private blocked card", prompt: "Private blocked prompt", blockedBy: [card.id] },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        yield* kanban.dispatchNow;
+        const waits = () => events.filter((event) => event.kind === "kanban.waiting_for_pool");
+        assert.equal(waits().length, 1);
+        assert.equal(waits()[0]?.cardId, card.id);
+        assert.equal(waits()[0]?.props?.poolKey, Rules.poolKey(board.defaultCardModel));
+        yield* kanban.tick;
+        assert.isTrue(
+          events.some((event) => event.kind === "kanban.tick" && event.durationMs !== undefined),
+        );
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.kind === "kanban.queue_depth" &&
+              event.props?.phase === "todo" &&
+              event.props.depth === 2,
+          ),
+        );
+        assert.equal(waits().length, 1);
+        yield* TestClock.adjust("1 minute");
+        yield* kanban.dispatchNow;
+        assert.equal(waits().length, 2);
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        yield* kanban.dispatchNow;
+        const dispatched = events.find(
+          (event) => event.kind === "kanban.dispatch" && event.cardId === card.id,
+        );
+        assert.equal(dispatched?.props?.poolKey, Rules.poolKey(board.defaultCardModel));
+        assert.equal(dispatched?.durationMs, 60_000);
+        assert.isDefined(dispatched?.threadId);
+        assert.isFalse(JSON.stringify(events).includes("Private"));
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
 
 it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
   Effect.gen(function* () {

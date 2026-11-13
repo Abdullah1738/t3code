@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./state/analytics": {
+      "types": "./src/state/analytics.ts",
+      "default": "./src/state/analytics.ts"
+    },
+    "./ardud/analytics": {
+      "types": "./src/ardud/analytics.ts",
+      "default": "./src/ardud/analytics.ts"
+    },
     "./composerThreadItems": {
       "types": "./src/composerThreadItems.ts",
       "default": "./src/composerThreadItems.ts"

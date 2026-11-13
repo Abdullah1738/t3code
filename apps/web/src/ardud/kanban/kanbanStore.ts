@@ -24,6 +24,8 @@ import { toastManager } from "../../components/ui/toast";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 
 export const kanban = createKanbanClient(
   createAtomKanbanTransport({
@@ -42,14 +44,26 @@ function useStore<T>(store: SnapshotStore<T>): T | undefined {
 
 // Two frames cross a browser paint opportunity; cleanup cancels stale commits.
 function usePaint(value: unknown, phase: "board-painted" | "discussion-painted") {
-  useEffect(() => paintActionValue(value, phase, (callback) => {
-    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
-    return () => cancelAnimationFrame(frame);
-  }), [value, phase]);
-  useEffect(() => paintActionValue(value, "authoritative-paint", (callback) => {
-    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
-    return () => cancelAnimationFrame(frame);
-  }), [value]);
+  useEffect(
+    () =>
+      paintActionValue(value, phase, (callback) => {
+        let frame = requestAnimationFrame(() => {
+          frame = requestAnimationFrame(callback);
+        });
+        return () => cancelAnimationFrame(frame);
+      }),
+    [value, phase],
+  );
+  useEffect(
+    () =>
+      paintActionValue(value, "authoritative-paint", (callback) => {
+        let frame = requestAnimationFrame(() => {
+          frame = requestAnimationFrame(callback);
+        });
+        return () => cancelAnimationFrame(frame);
+      }),
+    [value],
+  );
 }
 
 /** Every board with its list counts; no board feed opens for them. */
@@ -158,8 +172,15 @@ export interface FeedState {
 }
 
 export function useFeed(store: SnapshotStore<unknown>): FeedState {
+  const environmentId = usePrimaryEnvironmentId();
   const failure = useSyncExternalStore(store.subscribe, store.failure);
-  return { failure, retry: store.retry };
+  return {
+    failure,
+    retry: () => {
+      recordAnalytics(environmentId, "client.retry", { props: { reason: "retry" } });
+      store.retry();
+    },
+  };
 }
 
 /** The server's code for a refused call ("not-found", "denied"), when it sent one. */

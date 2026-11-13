@@ -1,3 +1,5 @@
+import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
+import { makeAnalyticsLogger } from "./observability/AnalyticsLogger.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
 import * as Cause from "effect/Cause";
@@ -50,6 +52,9 @@ function prettyCauseFields(value: unknown): unknown {
 
 export const layer = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
+  const analytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
+  const localAnalyticsLoggers =
+    analytics._tag === "Some" ? [makeAnalyticsLogger(analytics.value)] : [];
   const hostName = yield* HostProcess.Hostname;
   const layerMinimumLogLevel = Layer.succeed(References.MinimumLogLevel, config.logLevel);
 
@@ -73,8 +78,8 @@ export const layer = Effect.gen(function* () {
   // superset: keeping both would export every in-span message twice.
   const layerLogger = Logger.layer(
     otlpLogger === undefined
-      ? [consolePretty(), Logger.tracerLogger]
-      : [consolePretty(), otlpLogger],
+      ? [consolePretty(), Logger.tracerLogger, ...localAnalyticsLoggers]
+      : [consolePretty(), otlpLogger, ...localAnalyticsLoggers],
     { mergeWithExisting: false },
   ).pipe(
     Layer.provide(OtlpExporter.layerFlusher),

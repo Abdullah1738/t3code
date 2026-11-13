@@ -5,11 +5,17 @@ import {
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as DateTime from "effect/DateTime";
 
 import { AskApiError, type AskApi, type AskFeedRead, type AskUnreadable } from "./askApi.ts";
 import { askHistoryFigures, askQueueFigures } from "./askFigures.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { ASK_UNDO_MS } from "./askSendQueue.ts";
+import {
+  createAnalyticsCollector,
+  registerEnvironmentAnalytics,
+  type ClientAnalyticsEvent,
+} from "../analytics.ts";
 import {
   ASK_AUTO_RETRY_MAX,
   ASK_CLOSED_CHECK_MS,
@@ -75,7 +81,7 @@ const lost = (number: number, patch: Partial<AskUnreadable> = {}): AskUnreadable
   ...patch,
 });
 
-function harness() {
+function harness(analyticsEnvironmentId?: string) {
   let feed: AskFeedRead = feedOf([]);
   const boards = new Set<() => void>();
   const foreground = new Set<() => void>();
@@ -108,6 +114,7 @@ function harness() {
   } as unknown as AskApi;
   const cell = createAskStateCell();
   const store = createAskStore({
+    ...(analyticsEnvironmentId ? { analyticsEnvironmentId: () => analyticsEnvironmentId } : {}),
     api,
     cell,
     watch: {
@@ -1288,6 +1295,91 @@ describe("the feed", () => {
 });
 
 describe("batches, hand-over and snooze", () => {
+  it("records actual creation-to-answer latency once for each accepted batch ref", async () => {
+    vi.setSystemTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-13T12:00:00.000Z")));
+    const events: ClientAnalyticsEvent[] = [];
+    const collector = createAnalyticsCollector({
+      surface: "mobile",
+      send: async (batch) => {
+        events.push(...batch);
+      },
+    });
+    const unregister = registerEnvironmentAnalytics("latency-test", collector);
+    const h = harness("latency-test");
+    const asks = [
+      entry(1, { at: "2026-11-13T11:59:00.000Z" }),
+      entry(2),
+      entry(3, { at: "2026-11-13T11:58:00.000Z" }),
+    ];
+    try {
+      h.setFeed(asks);
+      await h.store.refreshAsks();
+      h.results.answerBatch = {
+        answered: 2,
+        results: [
+          { card: asks[0]!.cardRef, askId: "q1", ok: true, stage: "ready" },
+          {
+            card: asks[1]!.cardRef,
+            askId: "q1",
+            ok: false,
+            error: { code: "conflict", message: "private refusal", revision: 1 },
+          },
+          { card: asks[2]!.cardRef, askId: "q1", ok: true, stage: "ready" },
+        ],
+      };
+      h.store.answerAskBatch(
+        asks,
+        "batch:b1:k",
+        { verdict: "approved", note: "private answer" },
+        "Approved",
+        "Private title",
+      );
+      await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+      await collector.flush();
+      const answered = events.filter((event) => event.kind === "ask.answered");
+      expect(answered).toHaveLength(2);
+      expect(
+        answered.map((event) => [event.cardId, event.durationMs, event.props?.createdAt]),
+      ).toEqual([
+        ["c1", 60_000 + ASK_UNDO_MS, asks[0]!.ask.at],
+        ["c3", 120_000 + ASK_UNDO_MS, asks[2]!.ask.at],
+      ]);
+      expect(
+        answered.every((event) => event.props?.phase === "ask" && event.surface === "mobile"),
+      ).toBe(true);
+      expect(JSON.stringify(events)).not.toContain("private");
+    } finally {
+      h.store.dispose();
+      unregister();
+    }
+  });
+
+  it("records a confirmed secret answer through the same store boundary", async () => {
+    const events: ClientAnalyticsEvent[] = [];
+    const collector = createAnalyticsCollector({
+      surface: "web",
+      send: async (batch) => {
+        events.push(...batch);
+      },
+    });
+    const unregister = registerEnvironmentAnalytics("secret-latency-test", collector);
+    const h = harness("secret-latency-test");
+    const ask = entry(1);
+    try {
+      h.store.noteAskAnswered(ask, { verdict: "approved" }, "Approved");
+      await collector.flush();
+      expect(events.filter((event) => event.kind === "ask.answered")).toEqual([
+        expect.objectContaining({
+          cardId: "c1",
+          durationMs: expect.any(Number),
+          props: expect.objectContaining({ createdAt: ask.ask.at, phase: "ask" }),
+        }),
+      ]);
+    } finally {
+      h.store.dispose();
+      unregister();
+    }
+  });
   it("a batch gives back the asks the server refused, each for its own reason", async () => {
     const h = harness();
     const asks = [entry(1), entry(2), entry(3)];

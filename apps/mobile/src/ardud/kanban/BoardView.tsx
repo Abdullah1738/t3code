@@ -30,6 +30,8 @@ import { ageView } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 import { WorkspacePaneDivider } from "../../features/layout/workspace-pane-divider";
+import { useAnalyticsSearch } from "../useAnalytics";
+import { usePairedEnvironmentId } from "../common/environment";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Menu } from "../../components/ui/Menu";
@@ -201,6 +203,7 @@ export function BoardView(props: {
   useEffect(() => publishBoardFilter(boardId, filter), [boardId, filter]);
   const pickedGoalIds = filter.goalIds ?? [];
   const board = stageBoard(props.state, props.nowMs, filter);
+  useAnalyticsSearch(usePairedEnvironmentId(), "board", query.length, board.total, boardId);
   const picked = activeFilterCount(prefs);
   // The route measures the board and passes its layout; columns need the saved prefs too.
   const columnsLayout = boardLayout(props.width, columnPrefs);

@@ -1,3 +1,4 @@
+import { prepareShortcutRecording } from "../ardud/keybindingAnalytics";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
@@ -3136,6 +3137,7 @@ export default function ChatView(props: ChatViewProps) {
     }
     if (activeThreadRef) {
       useRightPanelStore.getState().toggle(activeThreadRef, "diff");
+      return true;
     }
   };
   const onToggleDiffStable = useStableCallback(onToggleDiff);
@@ -3411,14 +3413,17 @@ export default function ChatView(props: ChatViewProps) {
         activeServerOrderedTerminalIds.find((id) => !panelTerminalIds.has(id));
       if (existingTerminalId !== undefined) {
         storeEnsureTerminal(activeThreadRef, existingTerminalId, { open: true, active: true });
-        return;
+        return true;
       }
-      void terminalActions.launchTerminal({
+      const launched = terminalActions.launchTerminal({
         place: (terminalId) => storeEnsureTerminal(activeThreadRef, terminalId, { open: true }),
-      })?.result;
+      });
+      void launched?.result;
+      if (launched) return true;
       return;
     }
     setTerminalOpen(nextOpen);
+    return true;
   };
   const toggleTerminalVisibilityStable = useStableCallback(toggleTerminalVisibility);
   const splitTerminal = (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -3432,6 +3437,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!launched) return;
     setTerminalFocusRequestId((value) => value + 1);
     void launched.result;
+    return true;
   };
   const splitTerminalStable = useStableCallback(splitTerminal);
   const createNewTerminal = () => {
@@ -3442,6 +3448,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!launched) return;
     setTerminalFocusRequestId((value) => value + 1);
     void launched.result;
+    return true;
   };
   const createNewTerminalStable = useStableCallback(createNewTerminal);
   const closeTerminal = (terminalId: string) => {
@@ -3449,6 +3456,7 @@ export default function ChatView(props: ChatViewProps) {
     terminalActions.closeTerminalSession(terminalId);
     storeCloseTerminal(activeThreadRef, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
+    return true;
   };
   const runProjectScript = async (
     script: ProjectScript,
@@ -3459,6 +3467,7 @@ export default function ChatView(props: ChatViewProps) {
       preferNewTerminal?: boolean;
       rememberAsLastInvoked?: boolean;
       shellHistory?: "preserve" | "suppress";
+      onExecute?: () => void;
     },
   ) => {
     if (!hasTerminalWriteAccess() || !activeThreadId || !activeProject || !activeThread) return;
@@ -3510,6 +3519,7 @@ export default function ChatView(props: ChatViewProps) {
       ...(options?.env ? { extraEnv: options.env } : {}),
     });
     if (!launched) return;
+    options?.onExecute?.();
     const targetTerminalId = launched.terminalId;
     const openResult = await launched.result;
     if (openResult._tag === "Failure") {
@@ -3644,6 +3654,7 @@ export default function ChatView(props: ChatViewProps) {
         );
       }
     });
+    return true;
   };
   const createBrowserSurfaceStable = useStableCallback(createBrowserSurface);
   const addDiffSurface = () => {
@@ -3767,14 +3778,15 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThreadRef || !browserAvailable) return;
     if (previewPanelOpen) {
       closePreviewPanel();
-      return;
+      return true;
     }
     if (!canOperatePreview) return;
     const activeTabId = activePreviewState.activeTabId;
     if (activeTabId) {
       useRightPanelStore.getState().openBrowser(activeThreadRef, activeTabId);
+      return true;
     } else {
-      createBrowserSurface();
+      return createBrowserSurface();
     }
   };
   const togglePreviewPanelStable = useStableCallback(togglePreviewPanel);
@@ -3787,6 +3799,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!launched) return;
     setTerminalFocusRequestId((value) => value + 1);
     void launched.result;
+    return true;
   };
   const addTerminalSurfaceStable = useStableCallback(addTerminalSurface);
   const splitPanelTerminal = (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -3807,6 +3820,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!launched) return;
     setTerminalFocusRequestId((value) => value + 1);
     void launched.result;
+    return true;
   };
   const splitPanelTerminalStable = useStableCallback(splitPanelTerminal);
   const splitPanelTerminalVertical = () => {
@@ -3834,24 +3848,25 @@ export default function ChatView(props: ChatViewProps) {
       .getState()
       .closeTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
+    return true;
   };
   const closePanelTerminalStable = useStableCallback(closePanelTerminal);
-  const requestCloseTerminal = (terminalId: string) => {
+  const requestCloseTerminal = (terminalId: string, onClosed?: () => void) => {
     if (!hasTerminalWriteAccess()) return;
     const label = activeTerminalLabelsById.get(terminalId) ?? getTerminalLabel(terminalId);
     void confirmTerminalClose([label]).then((confirmed) => {
       if (confirmed && !readOnly && readEnvironmentScope(environmentId, AuthTerminalOperateScope)) {
-        closeTerminal(terminalId);
+        if (closeTerminal(terminalId)) onClosed?.();
       }
     });
   };
   const requestCloseTerminalStable = useStableCallback(requestCloseTerminal);
-  const requestClosePanelTerminal = (terminalId: string) => {
+  const requestClosePanelTerminal = (terminalId: string, onClosed?: () => void) => {
     if (!hasTerminalWriteAccess()) return;
     const label = activeTerminalLabelsById.get(terminalId) ?? getTerminalLabel(terminalId);
     void confirmTerminalClose([label]).then((confirmed) => {
       if (confirmed && !readOnly && readEnvironmentScope(environmentId, AuthTerminalOperateScope)) {
-        closePanelTerminal(terminalId);
+        if (closePanelTerminal(terminalId)) onClosed?.();
       }
     });
   };
@@ -3879,14 +3894,16 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThreadRef) return;
     if (rightPanelOpen) {
       closePreviewPanel();
-      return;
+      return true;
     }
     useRightPanelStore.getState().toggleVisibility(activeThreadRef);
+    return true;
   };
   const toggleRightPanelStable = useStableCallback(toggleRightPanel);
   const toggleThreadPanel = () => {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().toggleThreadPanel(activeThreadRef, threadPanelPresentation);
+    return true;
   };
   const toggleThreadPanelStable = useStableCallback(toggleThreadPanel);
   useEffect(() => {
@@ -3898,6 +3915,7 @@ export default function ChatView(props: ChatViewProps) {
   const toggleRightPanelMaximized = () => {
     if (!canMaximizeRightPanel || !activeThreadRef) return;
     useRightPanelStore.getState().setMaximized(activeThreadRef, !rightPanelMaximized);
+    return true;
   };
   const toggleRightPanelMaximizedStable = useStableCallback(toggleRightPanelMaximized);
   const {
@@ -3950,7 +3968,7 @@ export default function ChatView(props: ChatViewProps) {
   useEffect(
     () =>
       subscribePreviewAction((action) => {
-        if (action === "toggle-panel") togglePreviewPanelStable();
+        if (action === "toggle-panel") return togglePreviewPanelStable();
       }),
     [togglePreviewPanelStable],
   );
@@ -4810,6 +4828,7 @@ export default function ChatView(props: ChatViewProps) {
         );
       },
     );
+    return true;
   };
   const copyActiveThreadReferenceStable = useStableCallback(copyActiveThreadReference);
   const pullRequestPanelTarget = activeThread
@@ -5594,7 +5613,7 @@ export default function ChatView(props: ChatViewProps) {
   };
   const openComposerControl = (command: Parameters<ChatComposerHandle["openControl"]>[0]) =>
     (({ event }) => {
-      if (!event.repeat) composerRef.current?.openControl(command);
+      if (!event.repeat && composerRef.current?.openControl(command) === true) return true;
     }) satisfies ChatShortcutHandler;
   useChatShortcuts({
     enabled: activeThreadId !== null,
@@ -5609,7 +5628,7 @@ export default function ChatView(props: ChatViewProps) {
     },
     commands: {
       "thread.copyReference": ({ event }) => {
-        if (!event.repeat) copyActiveThreadReferenceStable();
+        if (!event.repeat) return copyActiveThreadReferenceStable();
       },
       "thread.settle": () => {
         if (readOnly || !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope))
@@ -5617,74 +5636,96 @@ export default function ChatView(props: ChatViewProps) {
         if (!isServerThread || !activeThreadRef || !supportsSettlement) return;
         if (activeThreadSettled) {
           void handleUnsettleActiveThreadStable();
-          return;
+          return true;
         }
-        if (settleAndAdvance(activeThreadRef)) return;
+        if (settleAndAdvance(activeThreadRef)) return true;
         void settleThread(activeThreadRef).then(toastPinFailure("Failed to settle thread"));
+        return true;
       },
-      "thread.pin": () => {
+      "thread.pin": ({ event }) => {
         if (readOnly || !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope))
           return false;
         if (!isServerThread || !activeThreadRef || !supportsPinning) return;
-        void (
-          activeThreadPinned ? confirmAndUnpinThread(activeThreadRef) : pinThread(activeThreadRef)
-        ).then(
-          toastPinFailure(activeThreadPinned ? "Failed to unpin thread" : "Failed to pin thread"),
-        );
+        const record = prepareShortcutRecording(event, "thread.pin");
+        if (activeThreadPinned) {
+          void confirmAndUnpinThread(activeThreadRef, { onUnpinned: record }).then(
+            toastPinFailure("Failed to unpin thread"),
+          );
+        } else {
+          void pinThread(activeThreadRef).then((result) => {
+            if (result._tag === "Success") record();
+            toastPinFailure("Failed to pin thread")(result);
+          });
+        }
       },
       "terminal.toggle": () => {
         if (!terminalUiState.terminalOpen && !canReadTerminal && !canOperateTerminal) return false;
-        toggleTerminalVisibilityStable();
+        return toggleTerminalVisibilityStable();
       },
       "chat.find": () => {
         if (!isServerThread || serverConfig?.threadFind !== true) return false;
         openThreadFindStable();
+        if (threadFindControlsRef.current && !isThreadFindActive) return true;
       },
       "rightPanel.toggle": () => toggleRightPanelStable(),
       "rightPanel.toggleMaximized": ({ event }) => {
-        if (!event.repeat) toggleRightPanelMaximizedStable();
+        if (!event.repeat) return toggleRightPanelMaximizedStable();
       },
       "threadPanel.toggle": () => toggleThreadPanelStable(),
       "rightPanel.close": ({ event }) => {
         if (!activeRightPanelSurface) return false;
-        if (!event.repeat) closeRightPanelSurfaceStable(activeRightPanelSurface);
+        if (!event.repeat) {
+          closeRightPanelSurfaceStable(
+            activeRightPanelSurface,
+            prepareShortcutRecording(event, "rightPanel.close"),
+          );
+        }
       },
       "terminal.split": ({ terminalFocusOwner }) => {
         if (!canOperateTerminal) return false;
-        if (terminalFocusOwner === "right-panel") return void splitPanelTerminalStable();
+        if (terminalFocusOwner === "right-panel") return splitPanelTerminalStable();
         openTerminalIfClosed();
-        splitTerminalStable();
+        return splitTerminalStable();
       },
       "terminal.splitVertical": ({ terminalFocusOwner }) => {
         if (!canOperateTerminal) return false;
-        if (terminalFocusOwner === "right-panel") return void splitPanelTerminalStable("vertical");
+        if (terminalFocusOwner === "right-panel") return splitPanelTerminalStable("vertical");
         openTerminalIfClosed();
-        splitTerminalStable("vertical");
+        return splitTerminalStable("vertical");
       },
-      "terminal.close": ({ terminalFocusOwner }) => {
+      "terminal.close": ({ event, terminalFocusOwner }) => {
         if (!canOperateTerminal) return false;
         if (terminalFocusOwner === "right-panel" && activeRightPanelSurface?.kind === "terminal") {
-          requestClosePanelTerminalStable(activeRightPanelSurface.activeTerminalId);
+          requestClosePanelTerminalStable(
+            activeRightPanelSurface.activeTerminalId,
+            prepareShortcutRecording(event, "terminal.close"),
+          );
           return;
         }
         if (terminalUiState.terminalOpen)
-          requestCloseTerminalStable(terminalUiState.activeTerminalId);
+          requestCloseTerminalStable(
+            terminalUiState.activeTerminalId,
+            prepareShortcutRecording(event, "terminal.close"),
+          );
       },
       "terminal.new": ({ terminalFocusOwner }) => {
         if (!canOperateTerminal) return false;
-        if (terminalFocusOwner === "right-panel") return void addTerminalSurfaceStable();
+        if (terminalFocusOwner === "right-panel") return addTerminalSurfaceStable();
         openTerminalIfClosed();
-        createNewTerminalStable();
+        return createNewTerminalStable();
       },
       "diff.toggle": () => onToggleDiffStable(),
       "modelPicker.toggle": ({ event }) => {
-        if (!event.repeat) composerRef.current?.toggleModelPicker();
+        if (!event.repeat && composerRef.current) {
+          composerRef.current.toggleModelPicker();
+          return true;
+        }
       },
       "composer.increaseEffort": ({ event }) => {
-        if (!event.repeat) composerRef.current?.stepReasoningEffort(1);
+        if (!event.repeat && composerRef.current?.stepReasoningEffort(1) === true) return true;
       },
       "composer.decreaseEffort": ({ event }) => {
-        if (!event.repeat) composerRef.current?.stepReasoningEffort(-1);
+        if (!event.repeat && composerRef.current?.stepReasoningEffort(-1) === true) return true;
       },
       "composer.host": openComposerControl("composer.host"),
       "composer.effort": openComposerControl("composer.effort"),
@@ -5698,13 +5739,16 @@ export default function ChatView(props: ChatViewProps) {
           (env) => env.environmentId === currentId,
         );
         const next = logicalProjectEnvironments[(index + 1) % logicalProjectEnvironments.length];
-        if (next) onEnvironmentChangeStable(next.environmentId);
+        if (next) {
+          onEnvironmentChangeStable(next.environmentId);
+          if (next.environmentId !== currentId) return true;
+        }
       },
       "composer.branch": ({ event }) => {
-        if (!event.repeat) branchToolbarRef.current?.openBranchPicker();
+        if (!event.repeat && branchToolbarRef.current?.openBranchPicker() === true) return true;
       },
       "composer.previousWorktree": ({ event }) => {
-        if (!event.repeat) branchToolbarRef.current?.usePreviousWorktree();
+        if (!event.repeat && branchToolbarRef.current?.usePreviousWorktree() === true) return true;
       },
       "thread.steerQueuedMessage": ({ event }) =>
         routeKind !== "draft" && queuedRunsControlRef.current?.steerNext(event.repeat) === true,
@@ -5714,14 +5758,22 @@ export default function ChatView(props: ChatViewProps) {
         queuedRunsControlRef.current?.editLatest(event.repeat) === true,
       "thread.stop": ({ event }) => {
         if (!canInterruptRunningThread) return false;
-        if (!event.repeat) void onInterruptStable();
+        if (!event.repeat) {
+          void onInterruptStable();
+          return true;
+        }
       },
     },
     fallback: (command) => {
       const scriptId = projectScriptIdFromCommand(command);
       if (!scriptId || !activeProject || !canOperateTerminal) return undefined;
       const script = activeProjectScripts.find((entry) => entry.id === scriptId);
-      return script ? () => void runProjectScriptStable(script) : undefined;
+      return script
+        ? ({ event }) =>
+            void runProjectScriptStable(script, {
+              onExecute: prepareShortcutRecording(event, command),
+            })
+        : undefined;
     },
   });
 

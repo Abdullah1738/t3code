@@ -307,8 +307,14 @@ export function PreviewView({
   };
 
   const handleRefresh = () => {
-    if (isServerTab) serverSurfaceRef.current?.reload();
-    else if (previewBridge && runtimeTabId) void previewBridge.refresh(runtimeTabId);
+    if (isServerTab) {
+      const surface = serverSurfaceRef.current;
+      surface?.reload();
+      if (surface) return true;
+    } else if (previewBridge && runtimeTabId) {
+      void previewBridge.refresh(runtimeTabId);
+      return true;
+    }
   };
 
   const adjustServerTab = async (change: Omit<PreviewAdjustInput, "threadId" | "tabId">) => {
@@ -341,22 +347,34 @@ export function PreviewView({
               PREVIEW_ZOOM_LEVELS.length - 1,
             )
           ]!;
-    if (next !== serverZoomFactor) void adjustServerTab({ zoomFactor: next });
+    if (next !== serverZoomFactor) {
+      void adjustServerTab({ zoomFactor: next });
+      if (tabId) return true;
+    }
   };
 
   const handleZoomIn = () => {
-    if (serverOwnsRendering) stepServerZoom(1);
-    else if (previewBridge && runtimeTabId) void previewBridge.zoomIn(runtimeTabId);
+    if (serverOwnsRendering) return stepServerZoom(1);
+    else if (previewBridge && runtimeTabId) {
+      void previewBridge.zoomIn(runtimeTabId);
+      return true;
+    }
   };
 
   const handleZoomOut = () => {
-    if (serverOwnsRendering) stepServerZoom(-1);
-    else if (previewBridge && runtimeTabId) void previewBridge.zoomOut(runtimeTabId);
+    if (serverOwnsRendering) return stepServerZoom(-1);
+    else if (previewBridge && runtimeTabId) {
+      void previewBridge.zoomOut(runtimeTabId);
+      return true;
+    }
   };
 
   const handleResetZoom = () => {
-    if (serverOwnsRendering) stepServerZoom(0);
-    else if (previewBridge && runtimeTabId) void previewBridge.resetZoom(runtimeTabId);
+    if (serverOwnsRendering) return stepServerZoom(0);
+    else if (previewBridge && runtimeTabId) {
+      void previewBridge.resetZoom(runtimeTabId);
+      if ((desktopOverlay?.zoomFactor ?? 1) !== DEFAULT_PREVIEW_ZOOM_FACTOR) return true;
+    }
   };
 
   const handleViewportChange = async (nextViewport: PreviewViewportSetting) => {
@@ -885,20 +903,16 @@ export function PreviewView({
     (action: Parameters<Parameters<typeof subscribePreviewAction>[0]>[0]) => {
       switch (action) {
         case "refresh":
-          handleRefresh();
-          return;
+          return handleRefresh();
         case "focus-url":
           setFocusUrlNonce((value) => (value ?? 0) + 1);
-          return;
+          return true;
         case "zoom-in":
-          handleZoomIn();
-          return;
+          return handleZoomIn();
         case "zoom-out":
-          handleZoomOut();
-          return;
+          return handleZoomOut();
         case "reset-zoom":
-          handleResetZoom();
-          return;
+          return handleResetZoom();
         case "toggle-panel":
           return;
       }

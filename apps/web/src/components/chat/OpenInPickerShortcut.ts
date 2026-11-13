@@ -1,4 +1,11 @@
-import type { EditorId, EnvironmentId, ResolvedKeybindingsConfig } from "@t3tools/contracts";
+import { recordConsumedShortcut } from "../../ardud/keybindingAnalytics";
+import {
+  AuthOrchestrationOperateScope,
+  type EditorId,
+  type EnvironmentId,
+  type ResolvedKeybindingsConfig,
+} from "@t3tools/contracts";
+import { readEnvironmentScope } from "../../state/session";
 import { useEffect } from "react";
 
 import { usePreferredEditor } from "../../editorPreferences";
@@ -38,6 +45,8 @@ export function useOpenFavoriteEditorShortcut({
           editor: preferredEditor,
         },
       });
+      if (readEnvironmentScope(environmentId, AuthOrchestrationOperateScope))
+        recordConsumedShortcut(event, "editor.openFavorite");
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

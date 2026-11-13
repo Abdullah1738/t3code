@@ -41,6 +41,7 @@ import {
   withoutEnvironmentThemes,
 } from "../state/serverConfigProjection.ts";
 import { environmentMismatchError } from "../connection/errors.ts";
+import { analyticsRpcSerialization } from "../ardud/analytics.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
@@ -221,7 +222,10 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
       Layer.provide(
         Layer.mergeAll(
           layerSocket,
-          RpcSerialization.layerJson,
+          Layer.succeed(
+            RpcSerialization.RpcSerialization,
+            analyticsRpcSerialization(connection.environmentId),
+          ),
           Layer.succeed(RpcClient.ConnectionHooks, hooks),
         ),
       ),

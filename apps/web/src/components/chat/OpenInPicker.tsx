@@ -1,3 +1,4 @@
+import { prepareShortcutRecording } from "../../ardud/keybindingAnalytics";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import {
   AuthOrchestrationOperateScope,
@@ -243,7 +244,7 @@ export const OpenInPicker = memo(function OpenInPicker({
   const effectiveEditors = remote.mode === "local-exec" ? availableEditors : remoteCapableEditors;
   const [preferredEditor, setPreferredEditor] = usePreferredEditor(effectiveEditors);
 
-  const openInEditor = (editorId: EditorId | null) => {
+  const openInEditor = (editorId: EditorId | null, onExecute?: () => void) => {
     if (!openInCwd) return;
     const editor = editorId ?? preferredEditor;
     if (!editor) return;
@@ -260,6 +261,7 @@ export const OpenInPicker = memo(function OpenInPicker({
       // the URL (an older desktop build can refuse the editor scheme).
       void openRemoteEditorUrl(url).then((opened) => {
         if (!opened) return;
+        onExecute?.();
         markRemoteHintSeen();
         setPreferredEditor(editor);
       });
@@ -275,6 +277,7 @@ export const OpenInPicker = memo(function OpenInPicker({
       },
     });
     setPreferredEditor(editor);
+    onExecute?.();
     return result;
   };
 
@@ -296,7 +299,7 @@ export const OpenInPicker = memo(function OpenInPicker({
         return;
 
       e.preventDefault();
-      void openInEditor(preferredEditor);
+      void openInEditor(preferredEditor, prepareShortcutRecording(e, "editor.openFavorite"));
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);

@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import { useAtomValue } from "@effect/atom-react";
 import * as Schema from "effect/Schema";
 import {
@@ -158,6 +159,7 @@ function SidebarControl() {
       event.preventDefault();
       event.stopPropagation();
       toggleSidebar();
+      recordConsumedShortcut(event, "sidebar.toggle");
     };
 
     window.addEventListener("keydown", onKeyDown, true);
@@ -236,6 +238,7 @@ function NavigationHistoryShortcuts() {
       event.stopPropagation();
       if (command === "navigation.back") window.history.back();
       else window.history.forward();
+      recordConsumedShortcut(event, command);
     };
 
     window.addEventListener("keydown", onKeyDown);

@@ -1,3 +1,4 @@
+import { AnalyticsToolkit } from "./analytics/tools.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -96,6 +97,7 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
 it("publishes unique tool names with reference-free object-root inputs", () => {
   const names = new Set<string>();
   for (const toolkit of [
+    AnalyticsToolkit,
     OrchestratorToolkit,
     PreviewToolkit,
     WorktreeToolkit,

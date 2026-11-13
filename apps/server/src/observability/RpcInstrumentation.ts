@@ -6,13 +6,25 @@ import {
   WS_METHODS,
   type WsRpcGroup,
 } from "@t3tools/contracts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as ErrorReporter from "effect/ErrorReporter";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as References from "effect/References";
+import * as Tracer from "effect/Tracer";
 import type * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
+import * as RpcSchema from "effect/rpc/RpcSchema";
+import type * as RpcSerialization from "effect/rpc/RpcSerialization";
 
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { rpcRequestDuration, rpcRequestsTotal, withMetrics } from "./Metrics.ts";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
@@ -40,6 +52,7 @@ const RPC_AGGREGATES = {
   [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: "orchestrationV2",
   [WS_METHODS.projectsMutate]: "orchestration",
   [WS_METHODS.serverProbe]: "server",
+  [WS_METHODS.analyticsIngest]: "analytics",
   [WS_METHODS.serverGetConfig]: "server",
   [WS_METHODS.serverRefreshProviders]: "server",
   [WS_METHODS.serverUpdateProvider]: "server",
@@ -242,12 +255,217 @@ export class RpcInstrumentation extends RpcMiddleware.Service<RpcInstrumentation
   "t3/server/RpcInstrumentation",
 ) {}
 
+export const AnalyticsOriginKind = Context.Reference<"owner" | "component" | "unknown">(
+  "t3/observability/AnalyticsOriginKind",
+  { defaultValue: () => "unknown" },
+);
+
+const recordingAnalytics = Context.Reference("t3/observability/RecordingAnalytics", {
+  defaultValue: () => false,
+});
+
+export const safeAnalyticsLabel = (value: string, fallback: string): string =>
+  value.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]*$/.test(value) ? value : fallback;
+
+export const analyticsErrorTag = (cause: Cause.Cause<unknown>): string => {
+  for (const reason of cause.reasons) {
+    if (reason._tag === "Interrupt") continue;
+    const error = reason._tag === "Fail" ? reason.error : reason.defect;
+    if (typeof error === "object" && error !== null && "_tag" in error) {
+      const tag = error._tag;
+      if (typeof tag === "string" && /^[A-Z][a-zA-Z0-9]{0,79}Error$/.test(tag)) return tag;
+    }
+  }
+  return Cause.hasDies(cause) ? "Defect" : Cause.hasInterrupts(cause) ? "Interrupted" : "Failure";
+};
+
+// Observation shares the request span and must never replace its exit, including defects.
+export const recordServerAnalytics = (
+  analytics: Analytics.Analytics["Service"],
+  event: AnalyticsEvent,
+) =>
+  Effect.suspend(() => analytics.record(event)).pipe(
+    Effect.provideService(recordingAnalytics, true),
+    Effect.catchCause(() => Effect.void),
+  );
+
+/** Measures the already encoded envelope. The transport owns the callback's runtime. */
+export const rpcAnalyticsSerialization = (
+  serialization: RpcSerialization.RpcSerialization["Service"],
+  record: (method: string, bytes: number) => void,
+): RpcSerialization.RpcSerialization["Service"] => ({
+  ...serialization,
+  makeUnsafe: () => {
+    const parser = serialization.makeUnsafe();
+    const pending = new Map<string | number, { method: string; bytes: number }>();
+    const report = (entry: { method: string; bytes: number }) => {
+      try {
+        record(entry.method, entry.bytes);
+      } catch {
+        /* Observers cannot change transport state. */
+      }
+    };
+    return {
+      decode: (data) => {
+        const messages = parser.decode(data);
+        for (const message of messages) {
+          if (typeof message !== "object" || message === null || !("_tag" in message)) continue;
+          if (
+            message._tag === "Request" &&
+            "id" in message &&
+            "tag" in message &&
+            (typeof message.id === "string" || typeof message.id === "number") &&
+            typeof message.tag === "string" &&
+            Object.hasOwn(RPC_AGGREGATES, message.tag) &&
+            message.tag !== WS_METHODS.analyticsIngest
+          ) {
+            if (!pending.has(message.id) && pending.size >= 4096) {
+              const oldest = pending.keys().next().value;
+              if (oldest !== undefined) pending.delete(oldest);
+            }
+            pending.set(message.id, { method: message.tag, bytes: 0 });
+          } else if (
+            message._tag === "Interrupt" &&
+            "requestId" in message &&
+            (typeof message.requestId === "string" || typeof message.requestId === "number")
+          ) {
+            const entry = pending.get(message.requestId);
+            pending.delete(message.requestId);
+            if (entry !== undefined) report(entry);
+          }
+        }
+        return messages;
+      },
+      encode: (response) => {
+        const encoded = parser.encode(response);
+        try {
+          if (
+            typeof response !== "object" ||
+            response === null ||
+            !("requestId" in response) ||
+            !("_tag" in response) ||
+            (typeof response.requestId !== "string" && typeof response.requestId !== "number")
+          )
+            return encoded;
+          const entry = pending.get(response.requestId);
+          if (entry !== undefined) {
+            if (encoded !== undefined)
+              entry.bytes = Math.min(
+                Number.MAX_SAFE_INTEGER,
+                entry.bytes +
+                  (typeof encoded === "string"
+                    ? Buffer.byteLength(encoded, "utf8")
+                    : encoded.byteLength),
+              );
+            if (response._tag === "Exit") {
+              pending.delete(response.requestId);
+              report(entry);
+            }
+          }
+        } catch {
+          // Metadata observers cannot change a response or interrupt its stream.
+        }
+        return encoded;
+      },
+    };
+  },
+});
+
+/** Captures unhandled defects; expected failures and log events have separate owners. */
+export const layerServerAnalyticsErrors = Layer.unwrap(
+  Effect.gen(function* () {
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+    if (Option.isNone(analytics)) return Layer.empty;
+    const capture = (
+      kind: string,
+      cause: Cause.Cause<unknown>,
+      fiber: import("effect/Fiber").Fiber<unknown, unknown>,
+    ) => {
+      if (fiber.getRef(recordingAnalytics)) return;
+      const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+      const event: AnalyticsEvent = {
+        ts: DateTime.formatIso(
+          DateTime.makeUnsafe(fiber.getRef(Clock.Clock).currentTimeMillisUnsafe()),
+        ),
+        kind,
+        surface: "server",
+        route: "server",
+        props: {
+          errorTag: analyticsErrorTag(cause),
+          span: span?._tag === "Span" ? safeAnalyticsLabel(span.name, "unknown") : "unknown",
+          originKind: fiber.getRef(AnalyticsOriginKind),
+        },
+      };
+      Effect.runForkWith(fiber.context)(recordServerAnalytics(analytics.value, event));
+    };
+    return ErrorReporter.layer(
+      [
+        {
+          [ErrorReporter.TypeId]: ErrorReporter.TypeId,
+          report: ({ cause, fiber }) => {
+            const defects = cause.reasons.filter(
+              (reason) => reason._tag === "Die" && !ErrorReporter.isIgnored(reason.defect),
+            );
+            if (defects.length > 0) capture("server.error", Cause.fromReasons(defects), fiber);
+          },
+        },
+      ],
+      { mergeWithExisting: true },
+    );
+  }),
+);
+
 export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((
   effect,
-  { rpc, headers },
+  { rpc, headers, payload },
 ) => {
   const method = rpc._tag;
-  const measured = effect.pipe(
+  const observed =
+    method === WS_METHODS.analyticsIngest
+      ? effect
+      : Effect.gen(function* () {
+          const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+          if (Option.isNone(analytics)) return yield* effect;
+          const clock = yield* Clock.Clock;
+          const started = clock.monotonicTimeNanosUnsafe();
+          const originKind = yield* AnalyticsOriginKind;
+          const entityIds: Partial<
+            Record<"boardId" | "cardId" | "discussionId" | "threadId", string>
+          > = {};
+          if (typeof payload === "object" && payload !== null) {
+            for (const key of ["boardId", "cardId", "discussionId", "threadId"] as const) {
+              const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+              const value: unknown =
+                descriptor && "value" in descriptor ? descriptor.value : undefined;
+              if (typeof value === "string" && /^[a-zA-Z0-9_.:/#@%+-]{1,512}$/.test(value))
+                entityIds[key] = value;
+            }
+          }
+          return yield* effect.pipe(
+            Effect.onExit((exit) =>
+              Effect.gen(function* () {
+                yield* recordServerAnalytics(analytics.value, {
+                  ts: DateTime.formatIso(yield* DateTime.now),
+                  kind: "rpc.request",
+                  ...entityIds,
+                  surface: "server",
+                  route: method,
+                  durationMs: Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6),
+                  props: {
+                    method,
+                    phase: RpcSchema.isStreamSchema(rpc.successSchema)
+                      ? "stream-lifetime"
+                      : "unary",
+                    span: `${RPC_SPAN_PREFIX}.${method}`,
+                    originKind,
+                    ...(Exit.isFailure(exit) ? { errorTag: analyticsErrorTag(exit.cause) } : {}),
+                  },
+                });
+              }),
+            ),
+          );
+        });
+  const measured = observed.pipe(
     withMetrics({ counter: rpcRequestsTotal, timer: rpcRequestDuration, attributes: { method } }),
     // ardud: WS RPCs come from the owner's clients (shell, thread, board and
     // discussion views, their actions): their reads use the foreground reader lane.

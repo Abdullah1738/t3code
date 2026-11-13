@@ -30,6 +30,8 @@ import {
   useSyncExternalStore,
 } from "react";
 import { FlatList, Pressable, View } from "react-native";
+import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
+import type { FlatListProps } from "react-native";
 import { WebView, type WebViewNavigation } from "react-native-webview";
 
 import { FilePreviewModal } from "../../components/FilePreviewModal";
@@ -85,6 +87,7 @@ import {
   createHistoryGesture,
   createRowStateStore,
   followingNewest,
+  newestEndVisible,
   invertedAnswerOffset,
   nearHistoryEnd,
   newestFirst,
@@ -116,9 +119,9 @@ interface AnswerScroll {
 type AnswerRow = ComponentRef<typeof View>;
 
 const AnswerScrollContext = createContext<AnswerScroll | null>(null);
-const ChoiceDraftContext = createContext<ReturnType<typeof createRowStateStore<ChoiceDraft>> | null>(
-  null,
-);
+const ChoiceDraftContext = createContext<ReturnType<
+  typeof createRowStateStore<ChoiceDraft>
+> | null>(null);
 const ExpandedBlocksContext = createContext<ReturnType<typeof createRowStateStore<boolean>> | null>(
   null,
 );
@@ -156,6 +159,8 @@ export function Chat(props: {
   readonly onOpenCard: (cardId: string) => void;
 }) {
   const { boardId, discussionId, state } = props;
+  const environmentId = usePairedEnvironmentId();
+  const focused = useIsFocused();
   const messages = useKanbanMessages(boardId, discussionId);
   const feed = useKanbanMessagesFeed(boardId, discussionId);
   const discussion = discussionId === null ? undefined : state.discussions.get(discussionId);
@@ -166,6 +171,46 @@ export function Chat(props: {
       ? discussionPresence(discussion, messages, Math.max(clock, props.nowMs))
       : null;
   const lastOwnSeq = messages?.findLast((message) => message.author._tag === "owner")?.seq ?? null;
+  const latestSeq = messages?.at(-1)?.seq ?? 0;
+  const readEnd = useRef("");
+  const readEndContext = useRef({ environmentId, boardId, discussionId, focused, latestSeq });
+  useEffect(() => {
+    readEndContext.current = { environmentId, boardId, discussionId, focused, latestSeq };
+  }, [environmentId, boardId, discussionId, focused, latestSeq]);
+  const readEndGeometry = useRef({ offset: NaN, viewport: 0, discussionId, latestSeq });
+  const newestRowVisible = useRef(false);
+  const noteReadEnd = useRef(() => {
+    const context = readEndContext.current;
+    const geometry = readEndGeometry.current;
+    if (
+      geometry.discussionId !== context.discussionId ||
+      geometry.latestSeq !== context.latestSeq ||
+      !context.focused ||
+      !context.discussionId ||
+      !context.latestSeq ||
+      !newestRowVisible.current ||
+      !newestEndVisible(geometry.offset, geometry.viewport)
+    )
+      return;
+    const key = `${context.environmentId}:${context.discussionId}:${context.latestSeq}`;
+    if (readEnd.current === key) return;
+    readEnd.current = key;
+    recordAnalytics(context.environmentId, "discussion.read-end", {
+      boardId: context.boardId,
+      discussionId: context.discussionId,
+      props: { count: context.latestSeq },
+    });
+  }).current;
+  const viewability = useRef(
+    ({
+      viewableItems,
+    }: Parameters<NonNullable<FlatListProps<KanbanMessage>["onViewableItemsChanged"]>>[0]) => {
+      newestRowVisible.current = viewableItems.some(
+        (item) => item.isViewable && item.item.seq === readEndContext.current.latestSeq,
+      );
+      noteReadEnd();
+    },
+  ).current;
 
   useMarkRead(boardId, discussionId, state, messages);
 
@@ -273,6 +318,7 @@ export function Chat(props: {
           <ChoiceDraftContext.Provider value={choiceDrafts}>
             <ExpandedBlocksContext.Provider value={expandedBlocks}>
               <FlatList
+                onViewableItemsChanged={viewability}
                 ref={scroll}
                 className="flex-1"
                 contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 20 }}
@@ -291,11 +337,7 @@ export function Chat(props: {
                   const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
                   scrollY.current = contentOffset.y;
                   historyGesture.begin(
-                    nearHistoryEnd(
-                      contentOffset.y,
-                      contentSize.height,
-                      layoutMeasurement.height,
-                    ),
+                    nearHistoryEnd(contentOffset.y, contentSize.height, layoutMeasurement.height),
                   );
                   needsPlacement.current = false;
                 }}
@@ -313,7 +355,14 @@ export function Chat(props: {
                   }
                 }}
                 onScroll={(event) => {
-                  const { contentOffset } = event.nativeEvent;
+                  const { contentOffset, layoutMeasurement } = event.nativeEvent;
+                  readEndGeometry.current = {
+                    offset: contentOffset.y,
+                    viewport: layoutMeasurement.height,
+                    discussionId,
+                    latestSeq,
+                  };
+                  noteReadEnd();
                   const previousOffset = scrollY.current;
                   scrollY.current = contentOffset.y;
                   historyGesture.scroll(previousOffset, contentOffset.y);
@@ -388,7 +437,12 @@ export function Chat(props: {
                         className="-mt-1.5 flex-row justify-end gap-[3px]"
                       >
                         {presence.seenBy.map((face) => (
-                          <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
+                          <Avatar
+                            key={face.key}
+                            kind={face.kind}
+                            letter={face.letter}
+                            size="small"
+                          />
                         ))}
                       </View>
                     ) : null}
@@ -529,13 +583,7 @@ function Blocks(props: {
     run.kind === "attachments" ? (
       <AttachmentRun key={run.index} attachments={run.attachments} />
     ) : (
-      <BlockView
-        // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
-        key={run.index}
-        block={run.block}
-        blockIndex={run.index}
-        {...props}
-      />
+      <BlockView key={run.index} block={run.block} blockIndex={run.index} {...props} />
     ),
   );
 }
@@ -593,7 +641,12 @@ function BlockView(props: {
       );
     case "html":
       return (
-        <HtmlBlock html={block.html} title={block.title} height={block.height} stateKey={stateKey} />
+        <HtmlBlock
+          html={block.html}
+          title={block.title}
+          height={block.height}
+          stateKey={stateKey}
+        />
       );
     case "choice":
       return (
@@ -958,6 +1011,7 @@ function ChoiceBlock(props: {
           block.id,
           [...choice],
           words.trim() || null,
+          { createdAt: message.createdAt, phase: block.style },
         ),
       )
       .then((ok) => {
@@ -1072,9 +1126,7 @@ function ChoiceBlock(props: {
               <SymbolView
                 name="arrow.up"
                 size={15}
-                tintColorClassName={
-                  !canSend || pending ? "accent-icon-muted" : "accent-screen"
-                }
+                tintColorClassName={!canSend || pending ? "accent-icon-muted" : "accent-screen"}
                 type="monochrome"
               />
             </Pressable>
@@ -1430,7 +1482,9 @@ export function Composer(props: {
           accessibilityLabel={canPost ? "Message" : "Your connection can't post here"}
           value={text}
           onChangeText={setText}
-          placeholder={canPost ? (props.placeholder ?? "Message") : "Your connection can't post here"}
+          placeholder={
+            canPost ? (props.placeholder ?? "Message") : "Your connection can't post here"
+          }
           placeholderTextColorClassName="accent-foreground-muted"
           className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
         />
