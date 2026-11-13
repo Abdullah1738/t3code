@@ -2257,6 +2257,24 @@ const make = Effect.gen(function* () {
       activePool: null,
     }) satisfies KanbanCard;
 
+  const settleDetachedSteer = Effect.fn("KanbanService.settleDetachedSteer")(function* (
+    card: KanbanCard | null,
+    view: KanbanThreadView | null,
+    fence: number | undefined,
+  ) {
+    if (
+      card?.detachedSteerAt !== undefined &&
+      view?.state === "idle" &&
+      card.workThreadId === view.threadId &&
+      fence === (threadFences.get(view.threadId) ?? 0)
+    ) {
+      const next = { ...withoutDetachedSteer(card), updatedAt: yield* nowIso };
+      yield* saveCard(next);
+      return next;
+    }
+    return card;
+  });
+
   const releaseStalled = (card: KanbanCard, at: string): KanbanCard => ({
     ...release(card),
     stage:
@@ -6285,6 +6303,7 @@ const make = Effect.gen(function* () {
     // as finished even when the dispatcher leaves the card as it is (a worker that
     // moved to needs_owner, a one-shot evaluator, and so on).
     // The turn has ended, so the run is not running: the provider's view can lag this event.
+    const viewFence = threadFences.get(threadId) ?? 0;
     const view = yield* threads.view(threadId);
     yield* publish(link.boardId, {
       _tag: "thread",
@@ -6296,22 +6315,11 @@ const make = Effect.gen(function* () {
         lastActivityAt: at,
       },
     });
-    const settleDetachedSteer = Effect.fn("KanbanService.settleDetachedSteer")(function* (
-      card: KanbanCard | null,
-    ) {
-      if (
-        card?.detachedSteerAt !== undefined &&
-        card.workThreadId === threadId &&
-        view?.state === "idle" &&
-        Date.parse(view.quietSince) >= Date.parse(card.detachedSteerAt)
-      ) {
-        const next = { ...withoutDetachedSteer(card), updatedAt: at };
-        yield* saveCard(next);
-        return next;
-      }
-      return card;
-    });
-    let card = yield* settleDetachedSteer(link.cardId ? yield* store.card(link.cardId) : null);
+    let card = yield* settleDetachedSteer(
+      link.cardId ? yield* store.card(link.cardId) : null,
+      view,
+      viewFence,
+    );
     const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
     if (link.role !== "evaluator") {
@@ -6342,7 +6350,8 @@ const make = Effect.gen(function* () {
     if (link.discussionId) discussionIds.add(link.discussionId);
     if (card?.discussionId) discussionIds.add(card.discussionId);
     for (const id of carriedIds) {
-      const other = id === card?.id ? card : yield* settleDetachedSteer(yield* store.card(id));
+      const other =
+        id === card?.id ? card : yield* settleDetachedSteer(yield* store.card(id), view, viewFence);
       if (other?.discussionId) discussionIds.add(other.discussionId);
     }
     // A run that failed (the provider refused the model or variant, or a route is gone)
@@ -6915,6 +6924,8 @@ const make = Effect.gen(function* () {
     // successful absence, and nothing survives this invocation of the tick.
     const makeViews = () => {
       const views = new Map<ThreadId, KanbanThreadView | null>();
+      // Cleanup must not use an idle reading taken before a concurrent wake.
+      const viewFences = new Map<ThreadId, number>();
       const freshFind = (threadId: ThreadId) =>
         threads.find(threadId).pipe(
           Effect.map((view) => Option.some(view)),
@@ -6926,27 +6937,37 @@ const make = Effect.gen(function* () {
           ),
         );
       const confirmFind = (threadId: ThreadId) =>
-        freshFind(threadId).pipe(
-          Effect.tap((found) =>
-            Effect.sync(() => {
-              if (Option.isSome(found)) views.set(threadId, found.value);
-            }),
-          ),
-        );
-      const planFind = (threadId: ThreadId) =>
         Effect.suspend(() => {
-          if (views.has(threadId)) return Effect.succeed(Option.some(views.get(threadId)!));
+          const fence = threadFences.get(threadId) ?? 0;
           return freshFind(threadId).pipe(
             Effect.tap((found) =>
               Effect.sync(() => {
-                if (Option.isSome(found)) views.set(threadId, found.value);
+                if (Option.isSome(found)) {
+                  views.set(threadId, found.value);
+                  viewFences.set(threadId, fence);
+                }
+              }),
+            ),
+          );
+        });
+      const planFind = (threadId: ThreadId) =>
+        Effect.suspend(() => {
+          if (views.has(threadId)) return Effect.succeed(Option.some(views.get(threadId)!));
+          const fence = threadFences.get(threadId) ?? 0;
+          return freshFind(threadId).pipe(
+            Effect.tap((found) =>
+              Effect.sync(() => {
+                if (Option.isSome(found)) {
+                  views.set(threadId, found.value);
+                  viewFences.set(threadId, fence);
+                }
               }),
             ),
           );
         });
       const planView = (threadId: ThreadId) =>
         planFind(threadId).pipe(Effect.map((found) => Option.getOrNull(found)));
-      return { views, freshFind, confirmFind, planFind, planView };
+      return { views, viewFences, freshFind, confirmFind, planFind, planView };
     };
     const { views, freshFind, planFind, planView } = makeViews();
     // A hold lasts for the turn; a missed turn end or a thread stuck waiting
@@ -7028,7 +7049,7 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             let board = yield* boardOf(candidate.id);
             if (board.archivedAt !== null) return;
-            const { views, freshFind, confirmFind, planFind, planView } = makeViews();
+            const { views, viewFences, freshFind, confirmFind, planFind, planView } = makeViews();
             const step = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>, cardId?: string) =>
               tickStep(
                 candidate.id,
@@ -7262,6 +7283,17 @@ const make = Effect.gen(function* () {
                 "silentRunBackstop",
                 Effect.gen(function* () {
                   const view = yield* planView(threadId);
+                  if (view?.state === "idle" && initial.detachedSteerAt !== undefined) {
+                    const card = yield* store.card(initial.id);
+                    if (card?.detachedSteerAt !== initial.detachedSteerAt) return;
+                    const settled = yield* settleDetachedSteer(
+                      card,
+                      view,
+                      viewFences.get(threadId),
+                    );
+                    if (settled && settled !== card) updateCard(settled);
+                    return;
+                  }
                   if (view?.state !== "running") return;
                   const card = yield* store.card(initial.id);
                   if (!card || card.stalled !== null || threadFor(card) !== threadId) return;
@@ -10812,7 +10844,8 @@ const make = Effect.gen(function* () {
             };
           }
           yield* logEvent(next, actor, "thread", { body: `Steered: ${text}` });
-          if (next !== current) yield* saveCard(next);
+          // Recording delivery supersedes idle reads taken before the signal was saved.
+          if (next !== current) yield* touching(threadId, saveCard(next));
           return next;
         }
         if (action === "stop") {

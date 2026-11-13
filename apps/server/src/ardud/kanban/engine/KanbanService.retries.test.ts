@@ -1223,3 +1223,164 @@ it.effect("a verdict ends the review's retry: the next step starts with a clean 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect.each(["tick", "turn end"] as const)(
+  "an idle %s read cannot retire a detached steer after its successor starts",
+  (edge) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      const entered = yield* Deferred.make<void>();
+      const returned = yield* Deferred.make<void>();
+      let gateNext = false;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) => {
+          const afterRead = (kind: "view" | "find", view: KanbanThreadView | null) => {
+            if (!gateNext || view?.state !== "idle" || kind !== (edge === "tick" ? "find" : "view"))
+              return Effect.succeed(view);
+            gateNext = false;
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(returned)),
+              Effect.as(view),
+            );
+          };
+          return KanbanThreads.of({
+            ...real,
+            view: (id) => real.view(id).pipe(Effect.flatMap((view) => afterRead("view", view))),
+            find: (id) => real.find(id).pipe(Effect.flatMap((view) => afterRead("find", view))),
+          });
+        }),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now } = yield* workingCard;
+        yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        yield* kanban.cardThread(card.id, "steer", "Carry on now", owner);
+        yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: "2026-11-12T10:00:00.000Z", note: "Later" },
+          owner,
+        );
+        yield* fake.start(thread);
+        yield* TestClock.adjust("1 second");
+        fake.finish(thread);
+        gateNext = true;
+        const reading = yield* Effect.forkChild(
+          edge === "tick" ? kanban.tick : kanban.turnEnded(thread),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("1 second");
+        yield* fake.start(thread);
+        yield* kanban.threadEvent(thread);
+        yield* Deferred.succeed(returned, undefined);
+        yield* Fiber.join(reading);
+        assert.isDefined((yield* now).card.detachedSteerAt);
+        assert.isTrue(kanbanWaiting((yield* now).card));
+        yield* TestClock.adjust(Rules.RUN_SILENT_MS + 1);
+        yield* kanban.tick;
+        assert.deepStrictEqual(fake.interrupted, [thread]);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(returned, undefined)),
+        Effect.provide(testLayer(gated)),
+      );
+    }),
+);
+
+it.effect.each(["stale terminal view", "finished before send returned"] as const)(
+  "an idle parked worker returns to zero reads after %s",
+  (edge) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      const entered = yield* Deferred.make<void>();
+      const delivered = yield* Deferred.make<void>();
+      let lagNext = false;
+      let finishedAt: string | null = null;
+      const idleTime = (view: KanbanThreadView | null) =>
+        view?.state === "idle" && finishedAt !== null ? { ...view, quietSince: finishedAt } : view;
+      const lagged = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            view: (id) =>
+              real.view(id).pipe(
+                Effect.map((view) => {
+                  const current = idleTime(view);
+                  if (!lagNext || current === null) return current;
+                  lagNext = false;
+                  return { ...current, state: "running" as const };
+                }),
+              ),
+            find: (id) => real.find(id).pipe(Effect.map(idleTime)),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      if (edge === "finished before send returned") {
+        fake.sendControl.beforeSend = (text) =>
+          text === "Carry on now"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(delivered)))
+            : Effect.void;
+      }
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now } = yield* workingCard;
+        yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        if (edge === "finished before send returned") {
+          yield* kanban.waitCard(
+            card.id,
+            { on: "time", until: "2026-11-11T10:00:00.000Z", note: "Tomorrow" },
+            owner,
+          );
+          const steering = yield* Effect.forkChild(
+            kanban.cardThread(card.id, "steer", "Carry on now", owner),
+          );
+          yield* Deferred.await(entered);
+          yield* fake.start(thread);
+          yield* TestClock.adjust("1 second");
+          fake.finish(thread);
+          finishedAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+          yield* kanban.turnEnded(thread);
+          yield* TestClock.adjust("1 second");
+          yield* kanban.waitCard(
+            card.id,
+            { on: "time", until: "2026-11-12T10:00:00.000Z", note: "Later" },
+            owner,
+          );
+          yield* Deferred.succeed(delivered, undefined);
+          yield* Fiber.join(steering);
+        } else {
+          yield* kanban.cardThread(card.id, "steer", "Carry on now", owner);
+          yield* fake.start(thread);
+          yield* kanban.waitCard(
+            card.id,
+            { on: "time", until: "2026-11-12T10:00:00.000Z", note: "Later" },
+            owner,
+          );
+          yield* TestClock.adjust("1 second");
+          fake.finish(thread);
+          finishedAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+          lagNext = true;
+          yield* kanban.turnEnded(thread);
+        }
+        const parked = (yield* now).card;
+        assert.isTrue(kanbanWaiting(parked));
+        assert.isDefined(parked.detachedSteerAt);
+        if (edge === "finished before send returned")
+          assert.isBelow(Date.parse(finishedAt!), Date.parse(parked.detachedSteerAt!));
+        // Allow one tick to observe confirmed idle and reconcile the signal.
+        yield* kanban.tick;
+        const reconciled = (yield* now).card;
+        assert.isUndefined(reconciled.detachedSteerAt);
+        assert.deepStrictEqual(reconciled.wait, parked.wait);
+        const reads = fake.readsOf(thread);
+        for (let tick = 0; tick < 3; tick += 1) {
+          yield* TestClock.adjust("15 seconds");
+          yield* kanban.tick;
+        }
+        assert.strictEqual(fake.readsOf(thread), reads);
+        assert.deepStrictEqual((yield* now).card, reconciled);
+        assert.deepStrictEqual(fake.interrupted, []);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(delivered, undefined)),
+        Effect.provide(testLayer(lagged)),
+      );
+    }),
+);
