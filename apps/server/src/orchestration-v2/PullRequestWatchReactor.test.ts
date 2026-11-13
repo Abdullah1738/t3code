@@ -20,6 +20,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
+import greenRollups from "./fixtures/crpko-green-rollups.json" with { type: "json" };
 
 type WatchCommand = Extract<
   OrchestrationV2ServerCommand,
@@ -27,7 +28,10 @@ type WatchCommand = Extract<
 >;
 
 const makeHarness = Effect.fn("makeWatchFailureHarness")(function* (
-  reads: Pick<PullRequestService.PullRequestService["Service"], "detail" | "activity">,
+  reads: Pick<PullRequestService.PullRequestService["Service"], "detail" | "activity"> &
+    Partial<
+      Pick<PullRequestService.PullRequestService["Service"], "watchFingerprint" | "invalidate">
+    >,
   initial: Partial<ThreadPullRequestWatch> = {},
 ) {
   const commands: WatchCommand[] = [];
@@ -156,12 +160,21 @@ const greenDetail = (): PullRequestDetail & {
   mergeCapabilities: { merge: true, squash: true, rebase: true },
 });
 
-const makeHeadHarness = (initial: Partial<ThreadPullRequestWatch> = {}) => {
+const makeHeadHarness = (
+  initial: Partial<ThreadPullRequestWatch> = {},
+  withFingerprint = false,
+) => {
   let detail = greenDetail();
   let comments: PullRequestComment[] = [];
   let reads = 0;
   return makeHarness(
     {
+      ...(withFingerprint
+        ? {
+            watchFingerprint: () => Effect.succeed({ status: "head", remarks: "unchanged" }),
+            invalidate: () => Effect.void,
+          }
+        : {}),
       detail: () =>
         Effect.sync(() => {
           reads++;
@@ -190,6 +203,87 @@ const makeHeadHarness = (initial: Partial<ThreadPullRequestWatch> = {}) => {
     })),
   );
 };
+
+// GitHub head rollups read on 13 Nov 2026; every context had isRequired=false.
+it.effect.each(
+  greenRollups.flatMap((rollup) =>
+    [false, true].map((withFingerprint) => ({ ...rollup, withFingerprint })),
+  ),
+)(
+  "confirms PR $number's optional green checks on the next sweep (fingerprint=$withFingerprint)",
+  (rollup) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ headSha: rollup.headSha }, rollup.withFingerprint);
+      const detail = {
+        ...greenDetail(),
+        headSha: rollup.headSha,
+        headBranchSha: rollup.headSha,
+        checksHeadSha: rollup.headSha,
+        checks: rollup.checks.map(([name, conclusion]) => ({
+          name: name!,
+          status: conclusion === "skipped" ? ("skipped" as const) : ("success" as const),
+          required: false,
+          description: null,
+          url: null,
+        })),
+      };
+      harness.setDetail({
+        ...detail,
+        checks: detail.checks.map((check) =>
+          check.name === "Static Terraform checks" ? { ...check, status: "pending" } : check,
+        ),
+      });
+      yield* harness.reactor.sweep;
+      assert.deepStrictEqual(harness.commands, []);
+      harness.setDetail(detail);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.filter((command) => command.wake).length, 0);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.reads(), 3);
+      const wakes = harness.commands.filter((command) => command.wake);
+      assert.strictEqual(wakes.length, 1);
+      assert.include(wakes[0]!.wake!.text, `All ${rollup.checks.length} checks passed`);
+      assert.include(wakes[0]!.wake!.text, rollup.headSha.slice(0, 7));
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.filter((command) => command.wake).length, 1);
+    }),
+);
+
+it.effect(
+  "confirms an already-green optional head after boot without waiting for a quiet reread",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ headSha: null }, true);
+      harness.setDetail({
+        ...greenDetail(),
+        headBranchSha: OLD_HEAD,
+        checks: [
+          { name: "lint", status: "neutral", required: false, description: null, url: null },
+        ],
+      });
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.filter((command) => command.wake).length, 0);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.filter((command) => command.wake).length, 1);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.filter((command) => command.wake).length, 1);
+    }),
+);
+
+it.effect("confirms a persisted optional green read immediately after a reactor restart", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHeadHarness({ passedPending: ["lint"] });
+    harness.setDetail({
+      ...greenDetail(),
+      headBranchSha: OLD_HEAD,
+      checks: [{ name: "lint", status: "success", required: false, description: null, url: null }],
+    });
+    yield* harness.reactor.sweep;
+    assert.strictEqual(harness.commands.filter((command) => command.wake).length, 1);
+    yield* harness.reactor.sweep;
+    assert.strictEqual(harness.commands.filter((command) => command.wake).length, 1);
+  }),
+);
 
 it.effect.each(["success", "failure"] as const)(
   "holds %s checks while the PR head lags the branch, then reports the new head once",
@@ -310,21 +404,73 @@ it.effect("retries transient host failures eight times and reports the last erro
   }),
 );
 
-it.effect("keeps rate-limited watches without counting them as failed reads", () =>
+const rateLimit = () =>
+  new PullRequestOperationError({
+    operation: "detail",
+    detail: "Rate limited",
+    cause: new PullRequestProviderError({
+      provider: SourceControlProviderKind.make("forgejo"),
+      operation: "detail",
+      reason: "rate-limited",
+      detail: "Rate limited",
+    }),
+  });
+
+it.effect("delays on short rate limits, then ends visibly after eight unsuccessful reads", () =>
   Effect.gen(function* () {
-    const { reactor, commands } = yield* makeFailureHarness(
-      new PullRequestOperationError({
-        operation: "detail",
-        detail: "Rate limited",
-        cause: new PullRequestProviderError({
-          provider: SourceControlProviderKind.make("forgejo"),
-          operation: "detail",
-          reason: "rate-limited",
-          detail: "Rate limited",
-        }),
-      }),
-    );
-    for (let attempt = 0; attempt < 9; attempt++) yield* reactor.sweep;
+    const { reactor, commands } = yield* makeFailureHarness(rateLimit());
+    for (let attempt = 0; attempt < 7; attempt++) yield* reactor.sweep;
     assert.deepStrictEqual(commands, []);
+    yield* reactor.sweep;
+    assert.strictEqual(commands.length, 1);
+    assert.isNull(commands[0]!.watch);
+    assert.include(commands[0]!.wake?.text ?? "", "Rate limited");
+    yield* reactor.sweep;
+    assert.strictEqual(commands.length, 1);
+  }),
+);
+
+it.effect("ends visibly when the fingerprint stays rate limited", () =>
+  Effect.gen(function* () {
+    const { reactor, commands } = yield* makeHarness({
+      watchFingerprint: () => Effect.fail(rateLimit()),
+      detail: () => Effect.die("A paused fingerprint must not read detail"),
+      activity: () => Effect.die("A paused fingerprint must not read activity"),
+    });
+    for (let attempt = 0; attempt < 8; attempt++) yield* reactor.sweep;
+    assert.strictEqual(commands.length, 1);
+    assert.isNull(commands[0]!.watch);
+    assert.include(commands[0]!.wake?.text ?? "", "rate limit");
+  }),
+);
+
+it.effect("ends visibly when the PR head never settles, without giving a stale verdict", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHeadHarness();
+    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
+    assert.deepStrictEqual(harness.commands, []);
+    yield* harness.reactor.sweep;
+    assert.strictEqual(harness.commands.length, 1);
+    assert.isNull(harness.commands[0]!.watch);
+    assert.include(harness.commands[0]!.wake?.text ?? "", "head");
+    assert.notInclude(harness.commands[0]!.wake?.text ?? "", "checks passed");
+  }),
+);
+
+it.effect("clears the unsuccessful-read count once a settled head can be evaluated", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHeadHarness();
+    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
+    harness.setDetail({
+      ...greenDetail(),
+      headBranchSha: OLD_HEAD,
+      checks: [{ name: "lint", status: "pending", required: false, description: null, url: null }],
+    });
+    yield* harness.reactor.sweep;
+    harness.setDetail(greenDetail());
+    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
+    assert.deepStrictEqual(harness.commands, []);
+    yield* harness.reactor.sweep;
+    assert.isNull(harness.commands[0]!.watch);
   }),
 );
