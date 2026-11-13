@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -170,6 +171,56 @@ class OrderProof(unittest.TestCase):
         cfg = dict(self.cfg, placed_items=[{'name': 'Gift', 'price': 0}])
         result = {'status': 'placed', 'items': [{'name': 'Gift', 'price': 0}]}
         self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
+
+    def test_marketplace_manifest_fallback_cannot_join_name_only_card_basket(self):
+        cfg = dict(self.cfg, app='noon', order='N123', mode=None,
+                   card_meta={'items': self.cfg['placed_items']})
+        cfg.pop('placed_items')
+        native = {'status': 'placed', 'coverage': 'exact_native_marketplace_manifest',
+                  'whole_order_complete': False, 'manifest_complete': True,
+                  'manifest_items': [{'item_id': 'N123-1', 'quantity': 1, 'status': 'placed'},
+                                     {'item_id': 'N123-2', 'quantity': 1, 'status': 'placed'}]}
+        def unavailable(*args, **kwargs):
+            raise RuntimeError('fixture details unavailable')
+        with patch.dict(sys.modules, {
+                'native_orders': SimpleNamespace(track=lambda *a, **kw: native, OrderError=RuntimeError),
+                'noon_order_details': SimpleNamespace(details=unavailable)}):
+            result = tracker.fetch(cfg, {}, self.now)
+        self.assertTrue(result['item_details_unavailable'])
+        self.assertTrue(result['manifest_complete'])
+        state = {'primed': True, 'status': 'placed'}
+        self.assertEqual(tracker.transition(result, state, cfg, self.now), [])
+        self.assertEqual(state['dropped_items_seen'], [])
+        # A later joinable snapshot can still report a real removal once.
+        result = {'status': 'placed', 'items_complete': True,
+                  'items': [{'name': 'Black sesame', 'price': '7.50'}]}
+        state = json.loads(json.dumps(state))
+        events = tracker.transition(result, state, cfg, self.now + 60)
+        self.assertEqual([event['item'] for event in events], ['Fresh mint'])
+        self.assertEqual(tracker.transition(result, state, cfg, self.now + 120), [])
+
+    def test_removal_identity_projection_class(self):
+        # A complete snapshot proves absence only in an identifier namespace
+        # shared with the placed basket; anonymous rows may hide the item.
+        cases = [
+            ('names', {'name': 'Mint'}, [{'name': 'Sesame'}], True, True),
+            ('name to ids', {'name': 'Mint'}, [{'item_id': 'one'}], True, False),
+            ('mixed rows', {'name': 'Mint'}, [{'name': 'Sesame'}, {'item_id': 'two'}], True, False),
+            ('item ids', {'item_id': 'one'}, [{'item_id': 'two'}], True, True),
+            ('sku ids', {'sku': 'one'}, [{'sku': 'two'}], True, True),
+            ('different namespaces', {'item_id': 'one'}, [{'sku': 'two'}], True, False),
+            ('ids to names', {'item_id': 'one'}, [{'name': 'Sesame'}], True, False),
+            ('shared name fallback', {'item_id': 'one', 'name': 'Mint'}, [{'name': 'Sesame'}], True, True),
+            ('empty complete', {'name': 'Mint'}, [], True, True),
+            ('empty partial', {'name': 'Mint'}, [], False, False),
+            ('unresolved name', {'name': 'Mint'}, [{'name': 'Item details pending', 'unresolved': True}], True, False),
+        ]
+        for label, original, rows, complete, removed in cases:
+            with self.subTest(projection=label):
+                cfg = dict(self.cfg, placed_items=[dict(original, price='1.00')])
+                result = {'status': 'placed', 'items': rows, 'items_complete': complete}
+                events = tracker.transition(result, {}, cfg, self.now)
+                self.assertEqual(bool(events), removed)
 
     def test_email_explicit_drops_share_the_common_dedupe(self):
         raw = self.mail(body='ORD-123\nBlack sesame: removed\nFresh mint: AED 0.00')

@@ -40,7 +40,7 @@ def matching_charge(cfg, now, source, read, deadline, charges, peers=()):
             observed = dt.datetime.fromtimestamp(row['ts'], now.tzinfo) if isinstance(row.get('ts'), (float, int)) else dt.datetime.fromisoformat(str(row.get('at') or row.get('date')).replace('Z', '+00:00'))
         except (TypeError, ValueError):
             continue
-        if not observed.tzinfo or not placed - dt.timedelta(minutes=5) <= observed <= min(now, placed + dt.timedelta(hours=36)):
+        if not observed.tzinfo or not placed - dt.timedelta(minutes=5) <= observed <= now:
             continue
         text = row.get('body') or row.get('text') or charges.alert_text(read(row, deadline=deadline))
         charge = charges.parse(text, sender)
@@ -56,7 +56,7 @@ def matching_charge(cfg, now, source, read, deadline, charges, peers=()):
                          and other.get('currency', 'AED') == cfg.get('currency', 'AED')
                          and set(charges.words(other.get('merchant') or other['app'])) & set(charges.words(charge['merchant']))
                          and dt.datetime.fromisoformat(other['placed_at'].replace('Z', '+00:00')) - dt.timedelta(minutes=5)
-                         <= observed <= dt.datetime.fromisoformat(other['placed_at'].replace('Z', '+00:00')) + dt.timedelta(hours=36)]
+                         <= observed]
             if competing:
                 continue
             return {'source': ('mail:' if row['source'] in ('mail', 'email') else 'sms:') + str(row['id']),

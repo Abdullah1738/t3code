@@ -50,7 +50,7 @@ mode early. Registration alone is not bank payment confirmation.
 Pass a placed basket with `--items-file` (an item array, or an object containing
 `items`, with name/price). Tracker snapshots emit `item_dropped` once per placed
 line for an explicit removal or a formerly paid line becoming zero. Missing
-lines require a complete snapshot; partial shipment inventories cannot remove
+lines require a complete snapshot with comparable item identities; partial shipment inventories cannot remove
 the rest of the order. The existing watcher wake carries the requester chat and
 a stable bridge notice key. Amazon cancellation evidence uses the same path.
 

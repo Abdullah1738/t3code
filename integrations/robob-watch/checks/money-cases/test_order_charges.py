@@ -111,6 +111,30 @@ class OrderCharges(unittest.TestCase):
         self.assertIn('fixture archive unavailable', errors[0])
         self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
 
+    def test_delayed_bank_charge_closes_unresolved_case(self):
+        for minutes in (36 * 60 - 1, 36 * 60, 36 * 60 + 1, 48 * 60, 7 * 24 * 60, 30 * 24 * 60):
+            for source in ('email', 'imessage'):
+                with self.subTest(delay_minutes=minutes, source=source):
+                    self.data = self.root / f'money-{minutes}-{source}'
+                    self.follow(15)
+                    self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
+                    alert = self.alert(source=source, ts=(self.placed + dt.timedelta(minutes=minutes)).timestamp())
+                    self.follow(minutes + 1, [alert])
+                    case = mc.load(self.data)['cases'][0]
+                    self.assertEqual((case['status'], case['outcome']), ('closed', 'bank charge confirmed'))
+                    self.follow(minutes + 2, [alert])
+                    self.assertEqual(len(mc.load(self.data)['cases'][0]['history']), 2)
+
+    def test_delayed_alert_cannot_confirm_two_unresolved_orders(self):
+        other = dict(self.cfg, watcher='order-acme-456', order='456',
+                     placed_at=(self.placed + dt.timedelta(minutes=20)).isoformat())
+        (self.registry / 'orders' / 'other.json').write_text(json.dumps(other))
+        self.follow(35)
+        alert = self.alert(ts=(self.placed + dt.timedelta(hours=48)).timestamp())
+        self.follow(48 * 60 + 1, [alert])
+        self.assertEqual(len(mc.load(self.data)['cases']), 2)
+        self.assertTrue(all(case['status'] == 'open' for case in mc.load(self.data)['cases']))
+
 
 if __name__ == '__main__':
     unittest.main()

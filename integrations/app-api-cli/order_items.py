@@ -11,6 +11,21 @@ def identity(item):
     return str(item.get('item_id') or item.get('sku') or item.get('sku_config') or name(item).casefold())
 
 
+def match_fields(item):
+    fields = {field: str(item[field]) for field in ('item_id', 'sku', 'sku_config') if item.get(field)}
+    if name(item) and not item.get('unresolved'):
+        fields['name'] = name(item).casefold()
+    return fields
+
+
+def same_item(original, current):
+    old, new = match_fields(original), match_fields(current)
+    for field in ('item_id', 'sku', 'sku_config', 'name'):
+        if field in old and field in new:
+            return old[field] == new[field]
+    return False
+
+
 def price(item):
     try:
         value = item.get('line_total') if item.get('line_total') is not None else item.get('price', item.get('unit_price'))
@@ -33,11 +48,13 @@ def dropped(result, state, cfg):
     seen = state.setdefault('dropped_items_seen', [])
     candidates = list(result.get('dropped_items') or [])
     if rows is not None:
-        by_id = {identity(item): item for item in rows}
-        by_name = {name(item).casefold(): item for item in rows if name(item)}
         for original in baseline:
-            current = by_id.get(identity(original)) or by_name.get(name(original).casefold())
-            removed = current is None and complete
+            matches = [item for item in rows if same_item(original, item)]
+            current = matches[0] if len(matches) == 1 else None
+            # Completeness cannot prove absence when an ID-only manifest might
+            # contain a line from the name-only card basket (or vice versa).
+            comparable = any(all(field in match_fields(item) for item in rows) for field in match_fields(original))
+            removed = not matches and complete and comparable
             if current is not None:
                 removed = (str(current.get('status', '')).lower() in ('removed', 'cancelled', 'canceled', 'unavailable')
                            or (price(current) == 0 and price(original) is not None and price(original) > 0))
@@ -45,8 +62,7 @@ def dropped(result, state, cfg):
                 candidates.append(original)
     events = []
     for item in candidates:
-        original = next((old for old in baseline if identity(old) == identity(item) or
-                         (name(old) and name(old).casefold() == name(item).casefold())), item)
+        original = next((old for old in baseline if same_item(old, item)), item)
         key = identity(original)
         if not key or key in seen:
             continue
