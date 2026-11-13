@@ -10,7 +10,7 @@ The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour; subsequent runs cover since the last successful read.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
-its own cursors, day logs and rollups, and never changes crash evidence.
+its own state, day logs, rollups and probe samples, and never changes crash evidence.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
@@ -23,6 +23,24 @@ including one whose subsequent Dropbox mirror failed; unknown counters/age
 are omitted rather than reported as zero. A restic exit code of -1 means it
 was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
+
+## diskutil hangs
+
+Each hourly collector run emits `disk.tooling_probe`: a 20 s `diskutil list
+-plist` check, daemon PID/uptime/state, and a 10 s `hdiutil info` control.
+A timeout records `blockedIn` and a private sample path under the log's
+`state/diskutil-samples/` (retained for 7 days). Sampling has a separate
+15 s budget before the child is killed and reaped. A PID marker and a run lock
+prevent overlapping probes; a surviving child produces a skipped event.
+Daily rollups include `diskTooling` probe/timeout counts, max duration and the
+latest blocking frame. Skipped events do not count as attempted probes.
+
+Two consecutive timeouts for the same storagekitd PID trigger one Telegram
+attention alert; failed sends retry on the next timeout or surviving-child
+skip using the same key and message. Success resets
+the consecutive count. A StorageKit wait means storagekitd isn't answering.
+The owner can run `sudo killall storagekitd`; launchd respawns it on demand.
+The collector never restarts daemons or changes mounts.
 
 ## Install after review and owner approval
 
