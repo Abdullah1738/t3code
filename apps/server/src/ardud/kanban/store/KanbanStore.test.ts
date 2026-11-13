@@ -106,6 +106,53 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   movedAt: at,
 });
 
+it.effect("loads open review links with their cards, including missing cards, in one read", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const current = card(1, "in_review");
+    yield* store.putCard(current);
+    const link: KanbanThreadLink = {
+      threadId: ThreadId.make("review-1"),
+      boardId,
+      cardId: current.id,
+      role: "review",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    };
+    yield* store.putThreadLink(link);
+    const missing = {
+      ...link,
+      threadId: ThreadId.make("missing"),
+      cardId: KanbanCardId.make("missing"),
+    };
+    yield* store.putThreadLink(missing);
+    yield* store.putThreadLink({ ...link, threadId: ThreadId.make("work"), role: "work" });
+    yield* store.putThreadLink({ ...link, threadId: ThreadId.make("ended"), endedAt: at });
+    yield* store.putThreadLink({
+      ...link,
+      threadId: ThreadId.make("other-board"),
+      boardId: KanbanBoardId.make("other"),
+    });
+    const queries: string[] = [];
+    const observe: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    const joined = yield* store
+      .openReviewLinks(boardId)
+      .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+    assert.lengthOf(queries, 1);
+    assert.deepStrictEqual(joined, [
+      { link, card: current },
+      { link: missing, card: null },
+    ]);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 const withFileStore = <A, E>(
   effect: Effect.Effect<A, E, KanbanStore.KanbanStore | SqlClient.SqlClient>,
 ) =>
