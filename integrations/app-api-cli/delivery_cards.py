@@ -819,7 +819,7 @@ def share_days(cfg):
 def sync(cfg, data, *, send=False, recover=False):
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
-        return {'status': 'legacy_not_enrolled'}
+        return {'status': 'legacy_not_enrolled', 'rendered': False}
     key = cfg['watcher']
     statepath = ROOT / 'cards' / (key + '.json')
     statepath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -839,7 +839,7 @@ def sync(cfg, data, *, send=False, recover=False):
             if extras:
                 state.update(status='failed:public_directory_has_extra_files')
                 atomic(statepath, state)
-                return {'status': state['status'], 'slug': public_slug}
+                return {'status': state['status'], 'slug': public_slug, 'rendered': False}
         rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner')
         state.update(rendered)
         if rendered['stage'] in ('Delivered', 'Cancelled'):
@@ -924,7 +924,8 @@ def sync(cfg, data, *, send=False, recover=False):
             state['link_checked_at'] = time.time()
         atomic(statepath, state)
         statepath.chmod(0o600)
-        return {k: state.get(k) for k in ('status', 'slug', 'url', 'link_health')}
+        # Placement failures remain retryable even when this refresh rendered successfully.
+        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health')}, 'rendered': True}
 
 
 def repair_link(cfg, data):
@@ -980,7 +981,7 @@ def safe_sync(cfg, data, *, send=False, recover=False):
     except Exception as exc:
         # Card failures must not suppress tracker evidence or financial receipts.
         traceback.print_exc()
-        return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc)}
+        return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc), 'rendered': False}
 
 
 def main(argv=None):

@@ -46,7 +46,9 @@ stay in Keychain; no raw notification dumps or mail bodies are stored.
   The terminal event is handed to robob-watch first, then the next scheduled check archives
   the watcher without reading providers. Registration primes, direct checks and
   pending wake deliveries cannot retire it. Failed final card refreshes retry
-  from the saved terminal result before retirement, without provider reads. Removing during the event check would
+  from the saved terminal result before retirement, without provider reads.
+  Placement publish/send failures remain in the card retry record and do not
+  block retirement once the terminal render succeeds. Removing during the event check would
   make the runner discard that event. The order registration and archived state
   remain available. Amazon requires explicit whole-order completion; package
   events do not retire a tracker.

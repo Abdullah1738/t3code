@@ -348,6 +348,7 @@ class CardTests(unittest.TestCase):
         with patch.object(c, 'sync', side_effect=ModuleNotFoundError("No module named 'PIL'")), contextlib.redirect_stderr(stderr):
             result = c.safe_sync(self.cfg, self.data)
         self.assertEqual(result['status'], "failed:ModuleNotFoundError:No module named 'PIL'")
+        self.assertIs(result['rendered'], False)
         self.assertIn('Traceback', stderr.getvalue())
         self.assertIn("No module named 'PIL'", stderr.getvalue())
 
@@ -707,6 +708,7 @@ class CardTests(unittest.TestCase):
         (folder/'items.json').write_text('{"store":"private metadata"}')
         result=c.sync(self.cfg,{**self.data,'status':'delivered'},send=False)
         self.assertEqual(result['status'],'failed:public_directory_has_extra_files')
+        self.assertIs(result['rendered'], False)
         self.assertEqual(before,(folder/'index.html').read_bytes())
 
     def test_now_now_native_total_and_minutes_price_omission(self):

@@ -4,7 +4,7 @@ import time
 import unittest
 import json
 import io
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import order_tracker as t
@@ -770,7 +770,7 @@ class RetireTest(unittest.TestCase):
              mock.patch.object(t.time, 'time', return_value=self.now), \
              mock.patch.object(t, 'fetch', return_value=result) as fetch, \
              mock.patch.object(t.store, 'reconcile') as reconcile, \
-             mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card or {'status': 'ready', 'link_health': 'ok'}) as sync, \
+             mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
              mock.patch.object(t, 'run', run), \
              redirect_stdout(output):
             t.check(self.cfg)
@@ -944,28 +944,6 @@ class RetireTest(unittest.TestCase):
             remove.assert_not_called()
             self.assertEqual(t.read(folder / 'state.json'), runner_state)
 
-    def test_failed_final_card_retries_saved_terminal_result_before_retirement(self):
-        self.cfg['delivery_card'] = {'ready': True}
-        for failure in ('failed:render', 'failed:publish'):
-            with self.subTest(failure=failure):
-                state = {'primed': True, 'status': 'out for delivery'}
-                delivered = {'status': 'delivered', 'errors': [], 'whole_order_complete': True}
-                run, _, out = self.check(state, delivered, card={'status': failure})
-                self.assertEqual(json.loads(out)['events'], [{'kind': 'stage_change', 'status': 'delivered'}])
-                self.assertEqual(state['card_error'], failure)
-                run.assert_not_called()
-                # Failed local renders keep retrying without another provider poll.
-                run, _, out = self.check(state, {}, card={'status': failure})
-                self.fetch.assert_not_called()
-                self.sync.assert_called_once_with(self.cfg, delivered, send=False)
-                run.assert_not_called()
-                self.assertEqual(out, '')
-                run, _, _ = self.check(state, {}, card={'status': 'ready', 'link_health': 'ok'})
-                self.fetch.assert_not_called()
-                self.sync.assert_called_once_with(self.cfg, delivered, send=False)
-                self.assertNotIn('card_error', state)
-                run.assert_called_once_with(['robob-watch', 'remove', self.wid])
-
     def test_remove_command_still_retires(self):
         cfg = dict(self.cfg, active=True)
         output = io.StringIO()
@@ -979,6 +957,94 @@ class RetireTest(unittest.TestCase):
         self.assertIs(cfg['active'], False)
         self.assertIs(write.call_args.args[1], cfg)
         self.assertEqual(output.getvalue().strip(), f'Removed {self.wid}')
+
+
+class TerminalCardRenderTest(unittest.TestCase):
+    def scenario(self, failure, *, fail_render=False):
+        import tempfile
+        cards = t.delivery_cards
+        with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+            root = Path(scratch)
+            watchers = root / 'watchers'
+            cfg = {'app': 'noon', 'order': 'IAEFIXTURE', 'for': 'owner', 'chat': 'owner',
+                   'watcher': 'order-noon-fixture', 'registered_at': t.stamp(time.time() - 60),
+                   'delivery_card': {'ready': True}, 'card_meta': {'items': [{'name': 'Fixture', 'qty': 1}]},
+                   'active': True}
+            folder = watchers / cfg['watcher']
+            folder.mkdir(parents=True)
+            record = root / 'orders' / (cfg['watcher'] + '.json')
+            t.write(record, cfg)
+            t.write(folder / 'state.json', {'status': 'active'})
+            t.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+            for obj, name, value in ((t, 'ROOT', root), (t, 'WATCHERS', watchers),
+                                     (cards, 'ROOT', root), (cards, 'APPS', root / 'apps')):
+                stack.enter_context(mock.patch.object(obj, name, value))
+            stack.enter_context(mock.patch.object(t.toollog, 'root', return_value=root / 'logs'))
+            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'))
+            stack.enter_context(mock.patch.object(cards, 'preview', return_value=False))
+            stack.enter_context(mock.patch.object(cards, 'route', return_value='fixture-session'))
+            def bridge(args, **kwargs):
+                if args[0] == 'publish':
+                    return {} if failure == 'publish_ack' else {'url': 'https://fixture.example/card/'}
+                if args[0] == 'app':
+                    if failure == 'send_error':
+                        raise cards.BridgeError('fixture transport failure')
+                    return {}
+                raise AssertionError('unexpected bridge operation')
+            transport = stack.enter_context(mock.patch.object(cards, 'bridge', side_effect=bridge))
+            preparing = {'status': 'preparing', 'errors': []}
+            placed = cards.safe_sync(cfg, preparing, send=True)
+            expected = {'publish_ack': 'failed:card_publish_bad_ack', 'send_ack': 'failed:card_send_bad_ack',
+                        'send_error': 'failed:bridge_request_failed'}[failure]
+            self.assertEqual(placed['status'], expected)
+            self.assertIs(placed['rendered'], True)
+            card_path = root / 'cards' / (cfg['watcher'] + '.json')
+            placement = cards.read(card_path)
+            retry_fields = {k: placement[k] for k in ('status', 'send_args', 'open', 'attempted_at') if k in placement}
+            transport.reset_mock()
+            delivered = {'status': 'delivered', 'errors': [], 'whole_order_complete': True}
+            fetch = stack.enter_context(mock.patch.object(t, 'fetch', return_value=delivered))
+            archive = root / 'archive'
+            def remove(args):
+                self.assertEqual(args, ['robob-watch', 'remove', cfg['watcher']])
+                folder.rename(archive)
+            removal = stack.enter_context(mock.patch.object(t, 'run', side_effect=remove))
+            status_path = root / 'apps' / placement['slug'] / 'status.json'
+            before_status = status_path.read_bytes()
+            real_atomic = cards.atomic
+            def atomic(path, data):
+                if Path(path) == status_path:
+                    raise OSError('fixture render write failed')
+                return real_atomic(path, data)
+            output, errors = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                if fail_render:
+                    with mock.patch.object(cards, 'atomic', side_effect=atomic):
+                        t.check(cfg)
+                        t.check(cfg)
+                    removal.assert_not_called()
+                    self.assertEqual(status_path.read_bytes(), before_status)
+                else:
+                    t.check(cfg)
+                    removal.assert_not_called()
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                t.check(cfg)
+            fetch.assert_called_once()
+            transport.assert_not_called()
+            removal.assert_called_once()
+            self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+            self.assertIs(t.read(record)['active'], False)
+            self.assertEqual(t.read(archive / 'order-tracker-state.json')['status'], 'delivered')
+            retained = cards.read(card_path)
+            self.assertEqual({k: retained[k] for k in retry_fields}, retry_fields)
+
+    def test_placement_failures_do_not_block_terminal_retirement_after_real_sync(self):
+        for failure in ('publish_ack', 'send_ack', 'send_error'):
+            with self.subTest(failure=failure):
+                self.scenario(failure)
+
+    def test_terminal_render_failure_retries_before_retiring_despite_placement_failure(self):
+        self.scenario('publish_ack', fail_render=True)
 
 
 if __name__ == '__main__':
