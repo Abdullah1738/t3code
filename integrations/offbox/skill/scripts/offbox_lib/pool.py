@@ -75,6 +75,13 @@ def _unreserve(con, token):
     con.commit()
 
 
+def _unreserve_and_release(con, token, guard):
+    try:
+        _unreserve(con, token)
+    finally:
+        guard.__exit__(None, None, None)
+
+
 def _waiters(con, key):
     with write(con):
         key = _queue_key(key)
@@ -489,13 +496,13 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     require_proven(me, "run")
     lease.cap_check()
     key = me["repo_key"]
-    allocation.recover_resumes(con, key)
     source = _source(key, template, base, fresh)
     queue = allocation._QUEUE.get()
     wait = queue['wait']
     deadline = queue['end']
     poll = _QueuePoll(con, wait, run_id, deadline=deadline)
     poll.call(lambda: capacity.schema(con))
+    poll.call(lambda: allocation.recover_resumes(con, key))
     started = deadline - wait
     said, last_error = False, None
     next_refresh = 0
@@ -592,8 +599,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                       "WHERE l.box_id=? AND l.state IN ('running','stopped') "
                                       "AND COALESCE(l.note,'') NOT LIKE ?", (bid, WEDGED_LIKE)).fetchone()
                 if not pending:
-                    guard.__exit__(None, None, None)
-                    _unreserve(con, waiter)
+                    _unreserve_and_release(con, waiter, guard)
                     continue
                 if lease.active_runs(con, bid):
                     raise lease.ResumeUnresolved(f"{bid} has an active run and an unanswered resume; nothing ran")
@@ -601,14 +607,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     got = _reuse_prepared(con, pending, size, skip_archiving=True)
                 except lease.BoxNotReady as e:
                     readiness_failed(pending, e)
-                    guard.__exit__(None, None, None)
-                    _unreserve(con, waiter)
+                    _unreserve_and_release(con, waiter, guard)
                     continue
                 except (lease.ArchivingSkip, allocation.Busy, allocation.Fenced) as e:
                     if isinstance(e, lease.ResumeStopped) or getattr(e, 'resume_retry_box', None) == bid:
                         pending_retries.add(bid)
-                    guard.__exit__(None, None, None)
-                    _unreserve(con, waiter)
+                    _unreserve_and_release(con, waiter, guard)
                     say(str(e))
                     pending_busy[bid] = time.monotonic() + 2
                     continue
@@ -617,13 +621,11 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     con.commit()
                     prepare.move_once(e)
                     resume_stall, create_first = e, True
-                    guard.__exit__(None, None, None)
-                    _unreserve(con, waiter)
+                    _unreserve_and_release(con, waiter, guard)
                     say(str(e))
                     continue
                 if got is None:
-                    guard.__exit__(None, None, None)
-                    _unreserve(con, waiter)
+                    _unreserve_and_release(con, waiter, guard)
                     continue
                 if source and (pending["source"] or "").replace("recipe:", "template:", 1) != source:
                     raise lease.ResumeUnresolved(f"{bid} had an unanswered resume; it was checked, "
@@ -633,8 +635,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 got["_guard"] = guard
                 return got
             except BaseException:
-                guard.__exit__(None, None, None)
-                _unreserve(con, waiter)
+                _unreserve_and_release(con, waiter, guard)
                 raise
         # Only the latest pass decides whether a timeout was a start limit (90) or plain busy (92).
         last_error = None
@@ -888,8 +889,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     continue
                 finally:
                     if guard is not None:
-                        guard.__exit__(None, None, None)
-                        _unreserve(con, waiter)
+                        _unreserve_and_release(con, waiter, guard)
             if token is not None:
                 try:
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)

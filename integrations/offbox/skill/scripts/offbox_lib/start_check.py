@@ -4,11 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+import sqlite3
 import shlex
 import subprocess
 
 from . import ssh_sync
-from .common import OffboxError, event, now
+from .common import OffboxError, db_retry, event, local_error, now, write
 
 SSH_TIMEOUT_S = 10
 GRACE_S = 5
@@ -102,24 +103,43 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
             do_pulls(box, dict(row), pulls, until=until)
-    remember_wrapper(con, row, result.pid)
-    if result.code is not None:
-        status, error = ('done' if result.code == 0 else 'failed'), None
-    elif result.verdict == 'fenced':
-        status, error = 'lost', f'{reason}; never started, nothing ran'
-        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
-    else:
-        status = 'infra'
-        error = f'{rid} on {box}: start unknown: {reason}; ssh check failed or command may still be running; {hint(box, rid)}'
-        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_unknown:{rid}', box))
-    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=? "
-                "WHERE run_id=? AND (status IN ('starting','running') OR "
-                "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
-                (status, result.code, now(), error, rid))
-    if result.code is not None or result.verdict == 'fenced':
-        con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
-    con.commit()
-    if result.code is not None and row['mode'] == 'bg':
-        from .misc import _catch_up_finished
-        _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
-    event(con, box, 'start_settled', f'{rid} {status} exit={result.code}: {error or reason}')
+    from .runs import save_run_state, state_warning, terminal_result
+    def persist():
+        with write(con):
+            current = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+            if terminal_result(current):
+                con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
+                return current['status'], current['exit_code'], current['error']
+            remember_wrapper(con, current, result.pid)
+            if result.code is not None:
+                status, error = ('done' if result.code == 0 else 'failed'), None
+            elif result.verdict == 'fenced':
+                status, error = 'lost', f'{reason}; never started, nothing ran'
+                con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
+            else:
+                status = 'infra'
+                error = f'{rid} on {box}: start unknown: {reason}; ssh check failed or command may still be running; {hint(box, rid)}'
+                con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_unknown:{rid}', box))
+            con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=? "
+                        "WHERE run_id=? AND (status IN ('starting','running') OR "
+                        "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                        (status, result.code, now(), error, rid))
+            if result.code is not None or result.verdict == 'fenced':
+                con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{rid}',))
+            return status, result.code, error
+    try:
+        status, code, error = db_retry(persist)
+    except sqlite3.Error as error:
+        if result.code is None:
+            raise local_error(error, run_id=rid, started=result.verdict != 'fenced') from error
+        save_run_state(rid, wrapper_pid=result.pid, status='done' if result.code == 0 else 'failed',
+                       exit_code=result.code, end_at=now())
+        state_warning(rid, result.code, error)
+        return
+    try:
+        if code is not None and row['mode'] == 'bg':
+            from .misc import _catch_up_finished
+            _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
+        event(con, box, 'start_settled', f'{rid} {status} exit={code}: {error or reason}')
+    except sqlite3.Error as error:
+        state_warning(rid, code, error)

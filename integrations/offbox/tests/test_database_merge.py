@@ -10,11 +10,58 @@ from types import SimpleNamespace
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
 sys.path[:0] = [str(SCRIPTS), str(SCRIPTS / 'tests')]
-from offbox_lib import api, common, containers, home, lease, misc, pool, reap, runs
+from offbox_lib import api, common, containers, home, lease, misc, pool, reap, runs, start_check
 from test_capacity import Isolated
 
 
 class DatabaseMerge(Isolated):
+    def test_saved_receipt_repairs_infra_reservation_for_all_readers(self):
+        for reader in ('wait','pool','reaper'):
+            for code in (0,17):
+                with self.subTest(reader=reader,code=code):
+                    rid,bid=f'unknown-{reader}-{code}',f'unknown-box-{reader}-{code}'
+                    self.box(bid,member=True,used=common.now())
+                    self.con.execute("INSERT INTO runs(run_id,box_id,status,mode) VALUES (?,?,'infra','bg')",(rid,bid))
+                    self.con.execute('INSERT INTO kv(k,v) VALUES (?,?)',(f'start_unknown:{rid}',bid))
+                    runs.save_run_state(rid,status='done' if code==0 else 'failed',exit_code=code,wrapper_pid=321)
+                    with patch.object(api,'_request',side_effect=AssertionError('unexpected transport')), \
+                            patch.object(lease,'touch'),patch.object(lease,'idle_ttl'),patch.object(misc,'_catch_up_finished'), \
+                            patch.object(api,'list_boxes',side_effect=lambda: [
+                                dict(id=r['box_id'],state='running',type='large',
+                                     archiveAfter=common.iso(common.now()+common.RUN_TTL_S))
+                                for r in self.con.execute('SELECT box_id FROM leases')]):
+                        if reader=='wait':
+                            self.assertEqual(misc._run_row(rid)['exit_code'],code)
+                        elif reader=='pool':
+                            pool._refresh_background(self.con,'repo')
+                        else:
+                            reap._reap(self.con,False,[])
+                    self.assertEqual(self.con.execute('SELECT exit_code FROM runs WHERE run_id=?',(rid,)).fetchone()[0],code)
+                    self.assertFalse(self.con.execute('SELECT 1 FROM kv WHERE k=?',(f'start_unknown:{rid}',)).fetchone())
+                    self.assertEqual(lease.active_runs(self.con,bid),0)
+
+    def test_receipt_result_survives_writer_and_keeps_wrapper_separate(self):
+        for code in (0,17):
+            with self.subTest(code=code):
+                rid = f'receipt-{code}'
+                self.con.execute("INSERT INTO runs(run_id,box_id,status,mode) VALUES (?,'box','starting','fg')", (rid,))
+                row = self.con.execute('SELECT * FROM runs WHERE run_id=?',(rid,)).fetchone()
+                with contextlib.closing(common.db()) as other:
+                    self.con.execute('BEGIN IMMEDIATE')
+                    other.execute('PRAGMA busy_timeout=1')
+                    try:
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            start_check.settle(other,row,start_check.Result('started',code,321),'receipt')
+                    finally:
+                        self.con.rollback()
+                saved = runs.restore_run_state(row)
+                self.assertEqual(saved['exit_code'],code)
+                self.assertEqual(saved['wrapper_pid'],321)
+                self.assertIsNone(saved['process_id'])
+                with patch.object(lease,'touch'),patch.object(lease,'idle_ttl'),patch.object(misc,'_catch_up_finished'):
+                    runs.finish(rid,code,saved['status'],catch_up=False)
+                self.assertEqual(self.con.execute('SELECT exit_code FROM runs WHERE run_id=?',(rid,)).fetchone()[0],code)
+
     def test_version_two_upgrade_adds_fifo_and_preserves_wrapper_namespace(self):
         path = Path(self.tmp.name) / 'version-two.sqlite'
         with contextlib.closing(sqlite3.connect(path)) as old:

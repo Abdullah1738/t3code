@@ -109,7 +109,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     recovered, unowned = set(), set()
     owned = f"(r.box_id IS NULL OR (l.box_id IS NOT NULL AND {mine('l')}))" if owner_scoped() else '1=1'
     for run in con.execute("SELECT r.* FROM runs r LEFT JOIN leases l USING(box_id) "
-                           "WHERE (r.status IN ('starting','running') OR (r.status='lost' AND r.exit_code IS NULL)) "
+                           "WHERE (r.status IN ('starting','running') OR (r.status='lost' AND r.exit_code IS NULL) OR "
+                           "(r.status='infra' AND r.exit_code IS NULL AND EXISTS "
+                           "(SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id))) "
                            f"AND {owned}").fetchall():
         if owner_scoped() and not run['box_id']:
             owner = run['owner'] or ''

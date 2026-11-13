@@ -2172,9 +2172,12 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                 if r:
                     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
                                 "AND (status IN ('starting','running') OR "
-                                "(status='lost' AND exit_code IS NULL AND ? IS NOT NULL))",
+                                "(exit_code IS NULL AND ? IS NOT NULL AND (status='lost' OR "
+                                "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
                                 (st, code, now(), run_id, code))
                     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                    if terminal_result(r):
+                        con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{run_id}',))
             return r
         finally:
             con.close()

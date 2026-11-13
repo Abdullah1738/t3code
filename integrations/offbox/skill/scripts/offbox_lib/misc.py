@@ -535,10 +535,12 @@ def _run_row(run_id: str):
         raise OffboxError(f"no run {run_id}", code=2)
     _require_my_run(r)
     from .runs import finish, restore_run_state, terminal_result
+    from . import start_check
     recovered = restore_run_state(r)
     _require_my_run(recovered)
     if terminal_result(recovered) and (r['status'] in ('starting','running') or
-                                     (r['status'] == 'lost' and r['exit_code'] is None)):
+                                     (r['exit_code'] is None and (r['status'] == 'lost' or
+                                      (r['status'] == 'infra' and start_check.recovery_marked(con, r))))):
         finish(r['run_id'], recovered['exit_code'], recovered['status'], catch_up=False)
     return recovered
 

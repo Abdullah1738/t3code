@@ -32,6 +32,19 @@ class QueueDatabaseContention(Isolated):
         if self.clock == 0:
             self.con.execute('BEGIN IMMEDIATE')
 
+    def test_failed_unreserve_releases_guard_and_cleans_fifo_caller(self):
+        self.con.execute("UPDATE runs SET status='done' WHERE run_id='run-busy'")
+        with patch.object(lease,'_reuse',return_value=None), \
+                patch.object(pool,'_unreserve',side_effect=sqlite3.OperationalError('database is locked')), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(common.OffboxError) as error:
+            pool.acquire(self.me,base='repo:base')
+        self.assertEqual(error.exception.code,96)
+        self.assertTrue(pool_lock_free())
+        with common.file_lock('box-busy',timeout=0):
+            pass
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_waiters').fetchone())
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_cap_callers').fetchone())
+
     def test_writer_lock_across_one_poll_keeps_waiter_queued(self):
         sleeps = []
         def pause(seconds):
@@ -94,7 +107,7 @@ class QueueDatabaseContention(Isolated):
         self.assertFalse(self.con.execute('SELECT 1 FROM pool_cap_callers').fetchone())
         diagnostic = common.LOG_PATH.read_text()
         self.assertIn('Traceback (most recent call last)', diagnostic)
-        self.assertIn('BEGIN IMMEDIATE', diagnostic)
+        self.assertIn('UPDATE pool_waiters SET reserved=0', diagnostic)
         reuse.assert_not_called()
         create.assert_not_called()
         local.assert_not_called()
