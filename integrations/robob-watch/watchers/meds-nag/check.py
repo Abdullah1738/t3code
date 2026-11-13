@@ -15,7 +15,9 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
     import json, os, datetime as dt
     from zoneinfo import ZoneInfo
     D = os.environ.get("WATCH_DIR", os.path.dirname(os.path.abspath(__file__)))
-    now = dt.datetime.now(ZoneInfo("Asia/Dubai"))
+    DUBAI = ZoneInfo("Asia/Dubai")
+    now = (dt.datetime.fromisoformat(os.environ["MEDS_NOW"]).astimezone(DUBAI)
+           if os.environ.get("MEDS_NOW") else dt.datetime.now(DUBAI))
     today = now.date()
     def due(d):
         items = ["Dutasteride 0.5mg", "Tadalafil 5mg"]
@@ -63,6 +65,13 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
     def load(p, default):
         try: return json.load(open(os.path.join(D,p)))
         except Exception: return default
+    def active_snoozes():
+        active = {}
+        for name, until in load("snooze.json", {}).items():
+            try:
+                if dt.datetime.fromisoformat(until) > now: active[name] = until
+            except (ValueError, TypeError): pass
+        return active
     import sqlite3, subprocess, time
     def awake():
         # Mac in use in last 15 min, or owner sent an iMessage (not to Moni chat 45, where robob also sends) in last 20 min
@@ -88,12 +97,25 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
       if not left:
           if _tl is not None: _tl.emit('meds-nag', 'nag.stopped', props={'count': 0})
           raise SystemExit(0)
+      snoozed = active_snoozes()
+      left = [i for i in left if "all" not in snoozed and key(i) not in snoozed]
+      if not left:
+          if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': 0})
+          raise SystemExit(0)
+      seen = sorted(taken.get(str(day), []))
+      count = st.get("count", 0)
+      if st.get("day") != str(day) or set(seen) - set(st.get("seen", [])): count = 0
+      if count >= 3:
+          if _tl is not None: _tl.emit('meds-nag', 'nag.stopped', props={'count': len(left)})
+          raise SystemExit(0)
       last = st.get("last")
       gap = 3600 if now.hour >= 9 else 1800
       if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
           if _tl is not None: _tl.emit('meds-nag', 'nag.snoozed', props={'count': len(left)})
           raise SystemExit(0)
-      st["last"] = now.isoformat(); json.dump(st, open(os.path.join(D,"nagstate.json"),"w"))
+      count += 1
+      st.update(last=now.isoformat(), day=str(day), count=count, seen=seen)
+      json.dump(st, open(os.path.join(D,"nagstate.json"),"w"))
       def site_hint():
           # last Test E pin side: health.db (hlog.py) first, then sites.json
           last = None
@@ -110,6 +132,7 @@ with (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
           where = "subQ glute (upper-outer)" if day.isoformat() >= "2026-11-06" else "VG"
           return " (pin %s %s, last was %s on %s)" % ({"L": "left", "R": "right"}[nxt], where, {"L": "left", "R": "right"}[last[1]], last[0])
       left = [i + site_hint() if i.lower().startswith("test") else i for i in left]
+      ending = " Last reminder today; text me when you take it." if count == 3 else " Text me when done and I'll stop."
+      print("💊 Meds check: still need to take " + ", ".join(left) + "." + ending)
       if _tl is not None: _tl.emit('meds-nag', 'nag.sent', props={'count': len(left)})
-      print("💊 Meds check: still need to take " + ", ".join(left) + ". Text me when done and I'll stop.")
     if __name__ == "__main__": main()
