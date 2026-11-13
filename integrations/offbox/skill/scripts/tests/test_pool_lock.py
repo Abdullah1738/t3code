@@ -284,20 +284,24 @@ class PruneQueueTests(Isolated):
         self.box('busy', member=True)
         self.busy('busy')
         calls = []
-        def gone(bid, *args):
+        def gone(con, bid, rid, budget):
             self.assertTrue(pool_lock_free(), 'worker probe must not hold the pool lock')
             calls.append(bid)
-            return bid == 'held1'
+            if bid == 'held3':
+                con.execute('DELETE FROM prune_holds WHERE box_id=?', (bid,))
+                con.commit()
+                return True
+            return False
         with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4'}), \
                 patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', side_effect=gone), \
+                patch.object(prune, 'recheck', side_effect=gone), \
                 patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
                 patch.object(lease, 'acquire_private') as new, contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(pool.queue_state(self.con, 'repo'), (1, 4, 0, 3))
             row = pool.acquire(self.me)
             pool.release_guard(row)
-        self.assertEqual(row['box_id'], 'held1')
-        self.assertCountEqual(calls, ['held1', 'held2', 'held3'])
+        self.assertEqual(row['box_id'], 'held3')
+        self.assertEqual(calls, ['held3', 'held2'])
         new.assert_not_called()
 
     def test_rechecks_throttled_across_callers_per_box_and_pool(self):
@@ -306,12 +310,12 @@ class PruneQueueTests(Isolated):
         self.hold('other', key='other-repo')
         t = common.now()
         with patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', return_value=False) as probe:
+                patch.object(prune, 'recheck', return_value=False) as probe:
             for age, count in ((0, 2), (1, 2), (59, 2), (60, 4), (61, 4), (120, 6)):
                 with self.subTest(age=age), patch.object(pool, 'now', return_value=t + age):
                     self.assertFalse(pool._recheck_prune_holds(self.con, 'repo'))
                     self.assertEqual(probe.call_count, count)
-        self.assertNotIn('other', [call.args[0] for call in probe.call_args_list])
+        self.assertNotIn('other', [call.args[1] for call in probe.call_args_list])
 
     def test_concurrent_caller_cannot_repeat_probe(self):
         self.hold('one')
@@ -320,36 +324,28 @@ class PruneQueueTests(Isolated):
             seen.append(pool._recheck_prune_holds(self.con, 'repo'))
             return False
         with patch.object(api, 'get', return_value={'state': 'idle'}), \
-                patch.object(prune, 'worker_gone', side_effect=probe) as worker:
+                patch.object(prune, 'recheck', side_effect=probe) as worker:
             self.assertFalse(pool._recheck_prune_holds(self.con, 'repo'))
         self.assertEqual(seen, [False])
         worker.assert_called_once()
 
-    def test_queue_names_held_capacity_and_waiter_gets_box_after_next_probe(self):
+    def test_queued_acquire_does_not_repeat_ssh_probes(self):
         for bid in ('one', 'two', 'three'):
             self.hold(bid)
         self.box('busy', member=True)
         self.busy('busy')
         clock = [0.0]
-        epoch = common.now()
         def sleep(seconds):
             clock[0] += seconds
-        def gone(bid, *args):
-            return clock[0] >= 60 and bid == 'one'
-        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4', 'OFFBOX_POOL_WAIT_SECONDS': '120'}), \
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '4', 'OFFBOX_POOL_WAIT_SECONDS': '65'}), \
                 patch.object(pool.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(pool.time, 'sleep', side_effect=sleep), \
-                patch.object(pool, 'now', side_effect=lambda: epoch + clock[0]), \
-                patch.object(api, 'get', return_value={'state': 'running'}), \
-                patch.object(prune, 'worker_gone', side_effect=gone) as probe, \
-                patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
+                patch.object(prune, 'recheck', return_value=False) as probe, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            row = pool.acquire(self.me)
-            pool.release_guard(row)
+            with self.assertRaises(pool.PoolBusyError):
+                pool.acquire(self.me)
         self.assertIn('1/4 busy, 3 held by checkout cleanup, 0 other caller(s) waiting', err.getvalue())
-        self.assertEqual(row['box_id'], 'one')
-        self.assertEqual(clock[0], 60)
-        self.assertEqual(probe.call_count, 6)
+        self.assertEqual(probe.call_count, 2)
 
     def test_active_run_with_hold_counted_once_as_busy(self):
         self.hold('held-busy')

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import uuid
+import os
 from types import SimpleNamespace
 
 import card_vault_fill as card
@@ -28,6 +29,10 @@ class GateTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.ledger = go.Ledger(Path(temp.name) / 'go')
+        import card_status
+        p = patch.dict(os.environ, {'CARD_STATUS_FILE':str(Path(temp.name) / 'cards.json')})
+        p.start(); self.addCleanup(p.stop)
+        card_status.record_declined('9546', reason='synthetic-test-decline', source='unit-test')
         p = patch.object(go, 'Ledger', return_value=self.ledger)
         p.start(); self.addCleanup(p.stop)
         p = patch.object(journal, 'ROOT', Path(temp.name) / 'commerce')
@@ -193,8 +198,14 @@ class GateTests(unittest.TestCase):
                     scope_hash=nn._scope_hash('STORE',normalized,'a'*64)))
             self.approve(vendor='noon',item=item(original),amount=100,currency='AED')
             for change in changes:
-                with self.subTest(count=count,change=change), self.assertRaises(go.ApprovalError):
-                    go.require(vendor='noon',item=item([{**original[0],**change},*original[1:]]),amount=100,currency='AED')
+                with self.subTest(count=count,change=change):
+                    changed=[{**original[0],**change},*original[1:]]
+                    if change.get('modifiers') or change.get('notes'):
+                        with self.assertRaisesRegex(journal.JournalError,'NOWNOW_CUSTOMIZED_MANIFEST_UNSUPPORTED'):
+                            item(changed)
+                    else:
+                        with self.assertRaises(go.ApprovalError):
+                            go.require(vendor='noon',item=item(changed),amount=100,currency='AED')
 
     def test_hcloud_real_ledger_refusal_and_acceptance_then_credential_change(self):
         args = ['--context','Default','server','create','--ssh-key','123','--type','ccx33']

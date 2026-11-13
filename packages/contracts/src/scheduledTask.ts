@@ -170,7 +170,13 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
 });
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
-export const ScheduledTaskRunStatus = Schema.Literals(["never", "running", "succeeded", "failed"]);
+export const ScheduledTaskRunStatus = Schema.Literals([
+  "never",
+  "running",
+  "succeeded",
+  "failed",
+  "missed",
+]);
 export type ScheduledTaskRunStatus = typeof ScheduledTaskRunStatus.Type;
 
 export const ScheduledTaskWebhookEndpoint = Schema.Struct({
@@ -179,6 +185,13 @@ export const ScheduledTaskWebhookEndpoint = Schema.Struct({
   hasSecret: Schema.Boolean,
 });
 export type ScheduledTaskWebhookEndpoint = typeof ScheduledTaskWebhookEndpoint.Type;
+
+export const ScheduledTaskMissedRun = Schema.Struct({
+  slotAt: IsoDateTime,
+  recordedAt: IsoDateTime,
+  reason: Schema.String,
+  catchUpAt: Schema.NullOr(IsoDateTime),
+});
 
 export const ScheduledTask = Schema.Struct({
   id: ScheduledTaskId,
@@ -201,6 +214,10 @@ export const ScheduledTask = Schema.Struct({
   lastRunStatus: ScheduledTaskRunStatus,
   lastRunError: Schema.NullOr(Schema.String),
   runCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  missedRuns: Schema.optional(Schema.Array(ScheduledTaskMissedRun)).annotate({
+    description:
+      "The 20 most recent missed slots, newest first. Catch-up attempts keep their missed slot in this history.",
+  }),
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
 });
 export type ScheduledTask = typeof ScheduledTask.Type;

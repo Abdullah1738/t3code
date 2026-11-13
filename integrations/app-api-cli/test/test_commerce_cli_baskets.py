@@ -16,10 +16,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import commerce_cli as cli
+from owner_go_support import approve_test_flows
 
 
 class BasketCLITests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         binding = patch.object(cli.journal, 'binding', return_value={
             'app':'noon', 'vertical':'minutes', 'scope_hash':'b'*64})
         binding.start(); self.addCleanup(binding.stop)
@@ -31,7 +33,7 @@ class BasketCLITests(unittest.TestCase):
         self.flow.prepare_only.return_value = {
             'flow_id': self.flow.flow_id,
             'prepared_only': True,
-            'review': {'payable_minor': 123456, 'quantity': 42},
+            'review': {'payable_minor': 123456, 'quantity': 42, 'card_last4':'2342'},
             'readback': {'manifest_verified': True},
         }
 
@@ -85,7 +87,7 @@ class BasketCLITests(unittest.TestCase):
                 with patch(target) as cls, patch.object(cli, 'CommerceAuth'), \
                      patch('commerce_minutes.readback_active_orders', return_value=SimpleNamespace(
                          projection={'count': 0, 'active': []})), \
-                     patch.object(cli.journal, 'inspect', return_value={'order_id': None}):
+                     patch.object(cli.journal, 'inspect', return_value={'order_id': None, 'state':'ACTIVE'}):
                     cls.resume_active.return_value = self.flow
                     code, result = self.run_cli(['order', name, '--items-file', str(self.path),
                         '--resume-flow', self.flow.flow_id, '--prepare-only', *extra])

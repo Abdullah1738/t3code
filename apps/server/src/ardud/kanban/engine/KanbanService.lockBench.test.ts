@@ -134,6 +134,7 @@ const makeThreads = Effect.gen(function* () {
             thread.running = true;
           }
         }),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>

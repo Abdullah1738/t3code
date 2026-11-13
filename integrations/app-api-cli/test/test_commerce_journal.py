@@ -38,7 +38,7 @@ class CommerceJournalTest(unittest.TestCase):
         self.addCleanup(self.patcher.stop)
         self.flow = str(uuid.uuid4())
 
-    def open(self, flow=None, account='a'*64, app='noon', vertical='nownow'):
+    def open(self, flow=None, account='a'*64, app='noon', vertical='food'):
         flow = flow or self.flow
         j.open_flow(flow_id=flow, app=app, vertical=vertical,
                     account_hash=account, scope_hash='s'.encode().hex()*32)

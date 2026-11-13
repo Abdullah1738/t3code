@@ -4,10 +4,12 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 
 from __future__ import annotations
 
-from . import api, bases, capacity, lease
+import time
+
+from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, mine, now, say)
+                     iso_ts, kv_set, mine, now, say)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -23,6 +25,23 @@ def _protected(con) -> set[str]:
     ids = {r[0] for r in con.execute("SELECT box_id FROM bases")}
     ids |= {r[0] for r in con.execute("SELECT box_id FROM templates")}
     return ids
+
+
+def _recheck_prune_holds(con, actions: list[str]) -> None:
+    # Check least recently probed first so an unreachable worker cannot starve the rest on every tick.
+    rows = con.execute("SELECT h.box_id, h.run_id FROM prune_holds h JOIN leases l USING(box_id) "
+                       "LEFT JOIN kv k ON k.k='prunecheck:' || h.box_id "
+                       f"WHERE l.state='running' AND {mine('l')} AND h.created_at<? "
+                       "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id "
+                       "AND r.status IN ('starting','running')) "
+                       "ORDER BY CAST(COALESCE(k.v, '0') AS REAL), h.created_at", (now() - 300,)).fetchall()
+    deadline = time.monotonic() + 10
+    for hold in rows:
+        if time.monotonic() >= deadline:
+            break
+        kv_set(con, 'prunecheck:' + hold['box_id'], now())
+        released = prune.recheck(con, hold['box_id'], hold['run_id'], deadline - time.monotonic())
+        actions.append(f"prune hold {'released' if released else 'kept'} {hold['box_id']}")
 
 
 def reap(dry: bool = False) -> list[str]:
@@ -155,6 +174,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     rows = con.execute("SELECT * FROM leases WHERE (state IN ('running','stopped') "
                        f"OR box_id IN (SELECT box_id FROM prune_holds)) AND {mine()}").fetchall()
     _renew_live_runs(con, rows, live, protected, dry)
+    if not dry:
+        _recheck_prune_holds(con, actions)
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -192,10 +213,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 actions.append(f"forget {bid}: {api.NAME} deleted its data")
             continue
         state = b.get("state")
-        if not dry and state in api.LIVE_STATES and con.execute(
-                "SELECT 1 FROM prune_holds WHERE box_id=?", (bid,)).fetchone():
-            released = lease.release_hold_if_worker_gone(con, bid)
-            actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions, start_budget)

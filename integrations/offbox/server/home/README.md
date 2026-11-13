@@ -212,7 +212,7 @@ ejects.
 
 As built on 2026-11-12 (details: FAILURE-MODES 1.15, 1.16, 3.26-3.28): BIOS 1804 (flashed with EZ Flash from
 the stick), two DIMMs in A2 + B2 because four never trained, memory speed Auto, the four BIOS settings above
-set. The wired port has no link, so the server is on WiFi: with no cable the installed system has no network
+set. The server has been wired since 13 Nov 2026 (FAILURE-MODES 3.27, 3.39) and keeps WiFi as its fallback. On install day the wired port had no link: with no cable the installed system has no network
 after the install, and the one way in is the KVM console (root + the Keychain console password), where
 `/etc/netplan/60-wifi.yaml` (`wifis: wlp8s0: dhcp4: true, access-points: "<ssid>": password:`) and
 `netplan apply` bring it onto the LAN and the tailnet within a minute. The KVM's reset button does nothing;

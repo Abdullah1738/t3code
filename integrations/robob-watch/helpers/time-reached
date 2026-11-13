@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # time-reached ISO_TIME [TEXT...]
 # Prints TEXT (or "Reminder due") once the given time has passed; prints nothing before.
 # Used for iMessage reminders via robob-watch (mode notify or wake, max-fires 1).

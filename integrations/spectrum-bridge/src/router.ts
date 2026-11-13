@@ -1123,7 +1123,7 @@ export class Router {
     }
   }
 
-  private sealBatch(handled: Set<string>): InboundRecord | undefined {
+  private sealBatch(handled: Set<string>): (InboundRecord & { resumed?: boolean }) | undefined {
     return this.store.db.transaction(() => {
       this.cancelQueuedNew();
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")) return;
@@ -1165,15 +1165,16 @@ export class Router {
         this.store.updateInbound(row.id, "failed");
         this.options.log?.("reply-nudge-dropped", "overtaken");
       }
-      // A prompt ID already used for a steer can only carry its original sealed members.
-      if (this.store.get(`batch-phase:${leader.id}`) === "queued-steer") {
+      // A deferred wake or previously attempted steer keeps its original sealed members.
+      if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${leader.id}`) ?? "")) {
+        const resumed = this.store.get(`batch-phase:${leader.id}`) === "deferred-wake";
         const batch = this.store.get<NormalizedInbound | null>(`batch:${leader.id}`);
         const ids = batch?.batchIds ?? [leader.id];
         const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
         if (ids.some(id => state.get(id)?.state !== (id === leader.id ? "pending" : "batched"))) return;
         this.store.updateInbound(leader.id, "processing");
         this.store.set(`batch-phase:${leader.id}`, steer ? "steering" : "preparing");
-        return { ...leader, state: "processing" };
+        return { ...leader, state: "processing", resumed };
       }
       const input = leader.payload as NormalizedInbound;
       const ordinary = !input.text.trimStart().startsWith("/");
@@ -1191,7 +1192,7 @@ export class Router {
           if (row.id.startsWith("wake:") && !leader.id.startsWith("wake:")) continue;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           // Sendblue's reply_to is not the swiped message, so two swipes never share a batch.
-          if (this.store.get(`batch-phase:${row.id}`) === "queued-steer"
+          if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
             || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo || (this.options.swipes && next.replyTo)
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
@@ -1419,12 +1420,28 @@ export class Router {
         if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
         return true;
       }
-      for (const member of ids) this.store.updateInbound(member, "pending");
-      // Original payloads were never replaced by the aggregate.
-      this.store.set(`batch:${id}`, null);
-      this.store.set(`batch-phase:${id}`, null);
+      // A busy wake stays sealed even if a later arrival interrupts its next readiness check.
+      const deferred = this.wakeBatch(id) && this.store.get<boolean>(`wake-deferred:${id}`);
+      for (const member of ids) this.store.updateInbound(member, deferred && member !== id ? "batched" : "pending");
+      if (!deferred) this.store.set(`batch:${id}`, null);
+      this.store.set(`batch-phase:${id}`, deferred ? "deferred-wake" : null);
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       return true;
+    }).immediate();
+  }
+
+  private deferBusyBatch(row: InboundRecord): void {
+    if (!this.wakeBatch(row.id)) { this.unsealBatch(row.id); return; }
+    this.store.db.transaction(() => {
+      if (this.store.get(`batch-phase:${row.id}`) !== "preparing"
+        || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing") return;
+      this.store.updateInbound(row.id, "pending");
+      this.store.set(`batch-phase:${row.id}`, "deferred-wake");
+      this.store.set("preparingDelivery", null);
+      if (!this.store.get<boolean>(`wake-deferred:${row.id}`)) {
+        this.store.set(`wake-deferred:${row.id}`, true);
+        this.stage("wake-deferred", row.id);
+      }
     }).immediate();
   }
 
@@ -1447,7 +1464,7 @@ export class Router {
   private async dispatch(handled: Set<string>): Promise<void> {
     const next = this.sealBatch(handled);
     if (!next) return;
-    this.stage("batch-sealed", next.id);
+    if (!next.resumed) this.stage("batch-sealed", next.id);
     if (this.steering(next.id)) await this.steer(next, handled);
     else {
       this.store.set("preparingDelivery", { id: next.id, startedAt: Date.now(), attemptAt: Date.now(), attempt: 1 } satisfies PreparingDelivery);
@@ -2616,7 +2633,7 @@ export class Router {
       let busy = false;
       try { busy = (await this.statusesFor(route))[id] !== undefined; } catch { /* Checked again after downloads. */ }
       if (interrupted()) return;
-      if (busy) { this.unsealBatch(row.id); return; }
+      if (busy) { this.deferBusyBatch(row); return; }
     }
     const downloaded: (Parameters<typeof prepareIncoming>[0] & { guid: string })[] = [];
     const undelivered: string[] = [];
@@ -2734,7 +2751,7 @@ export class Router {
       } catch { /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
-        this.unsealBatch(row.id);
+        this.deferBusyBatch(row);
         return;
       }
       if (interrupted() || !activeRoute) return;
@@ -3341,6 +3358,35 @@ export class Router {
     await this.sendDelivery(turn, body, handled, true);
   }
 
+  private requestScan?: {
+    key: string;
+    result: Promise<{ request: PermissionRequest | QuestionRequest; directory?: string }[]>;
+  };
+
+  /** Child discovery can outlive a tick; root completion must still be read on the next one. */
+  private async scanRequests(turn: Turn, statuses: Record<string, SessionStatus>) {
+    const key = JSON.stringify([turn.id, turn.directory, turn.generation]);
+    if (this.requestScan?.key !== key) {
+      this.requestScan = { key, result: this.requests(turn, statuses) };
+      // A scan may fail between ticks, before its next reader attaches.
+      void this.requestScan.result.catch(() => {});
+    }
+    const scan = this.requestScan;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        scan.result,
+        // Give local request reads a short budget; retain a slow scan for the next tick.
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 100); }),
+      ]);
+      if (result !== undefined && this.requestScan === scan) this.requestScan = undefined;
+      return result;
+    } catch (error) {
+      if (this.requestScan === scan) this.requestScan = undefined;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
+
   /**
    * Pending permission and question requests for the route session and every
    * running subagent below it, at any depth. OpenChamber and the telegram
@@ -3407,12 +3453,19 @@ export class Router {
       const live = new Set<string>();
       let statuses: Record<string, SessionStatus> = {};
       let refreshed = false;
+      let discoveryPending = false;
       const refreshRequestsOnce = async () => {
         if (refreshed) return;
         refreshed = true;
         const currentTurn = turn!;
         statuses = await this.statusesFor(currentTurn);
-        const requests = await this.requests(currentTurn, statuses);
+        const requests = await this.scanRequests(currentTurn, statuses);
+        if (!requests) {
+          discoveryPending = true;
+          // An incomplete scan says nothing about whether an already-asked request closed.
+          for (const entry of entries) if (["pending", "submitting", "unknown"].includes(entry.state)) live.add(entry.operationId);
+          return;
+        }
         if (!this.current(currentTurn)) return;
         for (const { request, directory } of requests) {
           const kind = "questions" in request ? "question" : "permission";
@@ -3638,6 +3691,8 @@ export class Router {
           this.store.set("activeTurn", turn);
           return;
         }
+        // Absence is only known after discovery finishes, even if the handover grace elapsed.
+        if (discoveryPending) return;
         // Only a request that is still open keeps the turn: an answer whose
         // outcome is unknown for a request that has since gone away (answered
         // elsewhere, child aborted) must not hold the conversation forever.
@@ -3659,7 +3714,7 @@ export class Router {
       }
       // Busy activity may belong to an older run whose records precede this watermark.
       // Once it stops, there is no later idle marker for this empty background turn.
-      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size) {
+      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size && !discoveryPending) {
         this.store.db.transaction(() => {
           this.store.set("activeTurn", null);
           this.store.set("pendingApprovals", null);
@@ -3795,7 +3850,9 @@ export class Router {
       const followUp = statuses[route.id] !== undefined || after.some(m => m.type === "assistant");
       if (!followUp && !after.some(m => m.type === "user") && Object.keys(statuses).some(id => id !== route.id)) {
         const probe: Turn = { ...route, messageId: mark.id, startedAt: now, phase: "running", background: true };
-        const asking = (await this.requests(probe, statuses)).length > 0;
+        const requests = await this.scanRequests(probe, statuses);
+        if (!requests) return;
+        const asking = requests.length > 0;
         const latest = this.store.get<Turn | null>("activeTurn");
         if (!this.current(route) || (latest && latest.phase !== "failed" && this.current(latest))) return;
         if (asking) {

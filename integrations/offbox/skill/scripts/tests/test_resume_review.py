@@ -25,7 +25,8 @@ class ResumeRecoveryTests(Isolated):
 
     def pending(self, bid, state='stopped'):
         self.box(bid, state, member=True)
-        self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', 'large', self.clock.t))
+        # No sender metadata: abandoned legacy requests are older than their 4 s provisioning grace.
+        self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', 'large', self.clock.t - 5))
         self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_provision:{bid}', str(self.clock.t + 4), self.clock.t))
         self.con.commit()
 
@@ -135,7 +136,7 @@ class ResumeRecoveryTests(Isolated):
     def test_deletion_settles_journal_so_it_cannot_be_recovered(self):
         self.pending('old')
         self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume','old','http_504')",
-                         (self.clock.t - 1,))
+                         (self.clock.t - 5,))
         self.con.commit()
         with patch('offbox_lib.spend.record_final_usage'), patch.object(lease.ssh_sync, 'close_master'), \
                 patch.object(api, 'delete', return_value={}):
@@ -155,7 +156,7 @@ class ResumeRecoveryTests(Isolated):
                 for bid in ('one', 'two'):
                     self.box(bid, 'stopped', member=True)
                     self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume',?,?)",
-                                     (self.clock.t - 2, bid, outcome))
+                                     (self.clock.t - 5, bid, outcome))
                 self.con.commit()
                 if not self.con.execute('SELECT 1 FROM bases').fetchone():
                     self.base(True)
@@ -293,11 +294,12 @@ class PersistentArchivedTests(Isolated):
 
     def pending(self, bid, journal=False):
         self.box(bid, 'stopped', member=True)
+        # These are abandoned legacy sends, past the default 300 s provisioning grace.
         if journal:
             self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume',?,'uncertain')",
-                             (self.clock.t - 1, bid))
+                             (self.clock.t - 301, bid))
         else:
-            self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', 'large', self.clock.t))
+            self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', 'large', self.clock.t - 301))
         self.con.commit()
 
     def test_two_pending_archived_boxes_reconcile_then_single_retry_succeeds(self):
