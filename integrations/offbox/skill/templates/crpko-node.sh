@@ -1,23 +1,14 @@
 # offbox template: crpko-node (large). Expo/React Native prototypes (crpko-mobile-prototype), crpko-devops scripts,
-# Next.js frontends. Node 24 (nvm default) plus Node 22 for repos that pin 22.13 (.nvmrc/engines); offbox picks the one the repo asks for.
+# Next.js frontends. Node 24 (nvm default), Node 20 and Node 22 for repos that pin 22.13 (.nvmrc/engines); offbox picks the one the repo asks for.
 # npm cache lives in $HOME/.npm (npm_config_cache), kept by stops/forks.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NVM_DIR="$HOME/.nvm"
-if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-  mkdir -p "$NVM_DIR"
-  nvm_install=$(mktemp)
-  offbox_fetch "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh" "$nvm_install"
-  PROFILE=/dev/null bash "$nvm_install"
-  rm -f "$nvm_install"
-fi
 # shellcheck disable=SC1091
 . "$NVM_DIR/nvm.sh"
 
 NODE_MAJOR="${OFFBOX_NODE_MAJOR:-24}"
-nvm install "$NODE_MAJOR" >/dev/null
-nvm install 22 >/dev/null  # crpko_mobile_app and backoffice-frontend pin 22.13 via .nvmrc/engines; offbox picks per repo
-nvm install 20 >/dev/null
+# The builder provisions nvm Node 20, >=22.13 <23 and 24 with the run prelude before this recipe.
 nvm alias default "$NODE_MAJOR" >/dev/null
 nvm use default >/dev/null
 node --version

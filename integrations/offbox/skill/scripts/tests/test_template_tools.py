@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import bases, common  # noqa: E402
+from offbox_lib import bases, common, toolchain  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "templates"
 FETCH = (TEMPLATES / "tools/fetch.sh").read_text()
@@ -107,13 +107,13 @@ class TemplateTools(unittest.TestCase):
         script = FETCH + "\n" + (TEMPLATES / "crpko-node.sh").read_text().split("sudo apt-get update -qq", 1)[0]
         return subprocess.run(["/bin/bash", "-c", script], env=self.env, text=True, capture_output=True, timeout=10)
 
-    def test_node_bootstraps_missing_nvm_and_provisions_all_three_majors(self):
-        result = self.run_node(False)
+    def test_node_recipe_activates_builder_provisioned_versions_without_reinstalling(self):
+        result = self.run_node(True)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertEqual(sum(c.startswith("curl ") for c in calls), 1)
+        self.assertFalse(any(c.startswith("curl ") for c in calls))
         for major in (20, 22, 24):
-            self.assertIn(f"nvm install {major}", calls)
+            self.assertFalse(any(c.startswith("nvm install ") for c in calls))
             self.assertIn(f"nvm use {major}", calls)
         self.assertEqual(calls.count("corepack prepare pnpm@10 --activate"), 3)
         self.assertEqual(calls[-1], "nvm use default")
@@ -129,7 +129,7 @@ class TemplateTools(unittest.TestCase):
                 with self.subTest(name=name):
                     body, _ = bases.recipe(name)
                     self.assertTrue(body.startswith(FETCH + '\n'))
-                    uses = list(re.finditer(r'^\s*offbox_fetch\s+', body, re.M))
+                    uses = list(re.finditer(r'^\s*(?:offbox_fetch|__offbox_curl)\s+', body, re.M))
                     self.assertTrue(uses)
                     self.assertLess(body.index('offbox_fetch()'), uses[0].start())
                     self.assertIn("UV_LINK_MODE=copy", body)
@@ -138,6 +138,22 @@ class TemplateTools(unittest.TestCase):
                                      int(name in ("crpko-go", "crpko-harness")))
                     result = subprocess.run(["/bin/bash", "-n"], input=body, text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_toolchain_downloads_use_shared_bounds_and_retry_count(self):
+        self.assertTrue(toolchain.SHELL.startswith(FETCH))
+        self.shim('curl', 'echo "$*" >> "$CALLS"\nexit 18\n')
+        script = toolchain.SHELL + '''
+OFFBOX_FETCH_BOUNDS=(--connect-timeout 7 --speed-limit 30 --speed-time 2 --max-time 9 --retry 1)
+__offbox_curl -fsSL https://example.invalid/node.tar.xz -o /tmp/fixture
+'''
+        result = subprocess.run(['/bin/bash', '-c', script], env=self.env,
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 18)
+        self.assertEqual(len(self.calls()), 2)
+        for call in self.calls():
+            self.assertIn('--connect-timeout 7 --speed-limit 30 --speed-time 2 --max-time 9', call)
+            self.assertIn('--retry 1 --retry 0', call)
+        self.assertIn('attempt 2/2 failed (curl exit 18)', result.stderr)
 
     def test_no_download_curl_bypasses_fetch(self):
         downloads = []

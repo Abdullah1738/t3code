@@ -10,6 +10,7 @@ import {
   evaluatePullRequestWatch,
   pullRequestWatchMessage,
 } from "./pullRequestWatch.ts";
+import greenRollups from "./fixtures/crpko-green-rollups.json" with { type: "json" };
 
 const STARTED = "2026-10-02T12:00:00.000Z";
 
@@ -71,6 +72,25 @@ const frontendRequired = [
 ].map((name) => ({ ...check(name, "success"), required: true }));
 
 describe("evaluatePullRequestWatch", () => {
+  it.each(greenRollups)("confirms PR $number's complete ungated head rollup once", (rollup) => {
+    const green = detail({
+      headSha: rollup.headSha,
+      headBranchSha: rollup.headSha,
+      checksHeadSha: rollup.headSha,
+      checks: rollup.checks.map(([name, conclusion]) => ({
+        ...check(name!, conclusion === "skipped" ? "skipped" : "success"),
+        required: false,
+      })),
+    });
+    const first = evaluatePullRequestWatch(watch(), green, noRemarks);
+    assert.deepEqual(first.changes, []);
+    const confirmed = evaluatePullRequestWatch(first.next, green, noRemarks);
+    assert.deepEqual(confirmed.changes, [
+      { kind: "checks-passed", count: rollup.checks.length, required: false },
+    ]);
+    assert.deepEqual(evaluatePullRequestWatch(confirmed.next, green, noRemarks).changes, []);
+  });
+
   it("holds PR 1571's required green while its test shards are pending, then wakes once", () => {
     const pending = detail({
       headSha: "d1f7fff87a6c38e3235f45d2a16ccafbe3cf0aab",

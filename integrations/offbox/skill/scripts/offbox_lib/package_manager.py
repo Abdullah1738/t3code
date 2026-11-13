@@ -6,6 +6,12 @@ from pathlib import Path
 KEY = r"(?:[\w-]+|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")"
 
 VERSION = r"\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+PNPM_DESCRIPTOR = re.compile(r"^v?\d+(?:(?:\.\d+){0,2}|(?:\.\d+)?\.(?:x|\*))"
+                             r"(?:\+sha(?:224|256|384|512)\.[a-zA-Z0-9+/=]+)?$")
+
+
+def supported_pnpm_descriptor(pin):
+    return isinstance(pin, str) and PNPM_DESCRIPTOR.fullmatch(pin) is not None
 
 
 def read(path):
@@ -310,11 +316,13 @@ def env_scope(path):
             len(path) == 3 and path[0] == 'jobs' and path[2] == 'steps')
 
 
-def ci_pnpm_selection(root):
-    """(literal version, needs inspection). GitHub expressions are never evaluated here."""
+def ci_pnpm_pin(root):
+    """(literal version, needs inspection, source); only direct literal env references resolve."""
     versions = set()
+    sources = set()
 
-    def record(value):
+    def record(value, source="ci pnpm/action-setup"):
+        sources.add(source)
         literal = re.fullmatch(rf"\s*['\"]?({VERSION})['\"]?\s*", value)
         # An unresolved expression must not disappear while an unrelated literal survives.
         versions.add(literal[1] if literal else None)
@@ -324,19 +332,46 @@ def ci_pnpm_selection(root):
         lines = [without_comments(line) for line in ci_lines(read(path))]
         steps_indent = sequence_indent = None
         parents = []
+        env_values = {}
+        references = []
+
+        def action_version(value, context):
+            reference = re.fullmatch(
+                r"\s*(['\"]?)\$\{\{\s*env(?:\.PNPM_VERSION|\[\s*(['\"])PNPM_VERSION\2\s*\])\s*\}\}\1\s*",
+                value)
+            if reference:
+                references.append(context)
+            else:
+                record(value)
+
         for i, line in enumerate(lines):
             if not line.strip():
                 continue
+            # Explicit/decorated keys and merges can hide a narrower env override.
+            if re.match(rf"^\s*(?:-\s+)?(?:\?(?:\s|$)|<<\s*:|"
+                        rf"(?:[!&][^\s]+\s+)+(?:{KEY}|<<)\s*:|\*[^\s:]+\s*:)", line):
+                record('unsupported configuration key')
+            step = re.match(r"^(\s*)-\s+", line)
+            if step:
+                # A sequence item is its own scope, even when steps use indentless YAML.
+                column = len(step[1]) + 1
+                while parents and parents[-1][0] >= column:
+                    parents.pop()
+                parents.append((column, None, i))
+                step_context = tuple(index for _, _, index in parents)
             mapping = re.match(rf"^(\s*)(?:-\s+)?({KEY})\s*:\s*(.*)", line)
             if mapping:
                 column, key, value = mapping.start(2), mapping[2].strip('\"\''), mapping[3]
                 while parents and parents[-1][0] >= column:
                     parents.pop()
-                path = [name for _, name in parents]
+                path = [name for _, name, _ in parents if name is not None]
                 if '\\' in mapping[2]:
                     record('unsupported escaped configuration key')
+                if key == '<<':
+                    record('unsupported merge key')
                 if key == 'PNPM_VERSION' and path and path[-1] == 'env' and env_scope(path[:-1]):
-                    record(value)
+                    record(value, "ci PNPM_VERSION")
+                    env_values[tuple(index for _, _, index in parents[:-1])] = value
                 if key == 'env' and env_scope(path) and value and (
                     not value.startswith('{') or flow_env_needs_inspection(value)
                 ):
@@ -352,10 +387,9 @@ def ci_pnpm_selection(root):
                         record('unresolved steps container')
                     else:
                         steps_indent, sequence_indent = column, None
-                    parents.append((column, key))
+                    parents.append((column, key, i))
                     continue
-                parents.append((column, key))
-            step = re.match(r"^(\s*)-\s+", line)
+                parents.append((column, key, i))
             indent = len(line) - len(line.lstrip())
             if steps_indent is not None and (indent < steps_indent or (indent == steps_indent and not step)):
                 steps_indent = sequence_indent = None
@@ -402,7 +436,7 @@ def ci_pnpm_selection(root):
                     else:
                         for name, value in settings:
                             if name == 'version':
-                                record(value)
+                                action_version(value, step_context)
                 if re.fullmatch(rf" {{{key_indent}}}['\"]?with['\"]?\s*:\s*(?:#.*)?", item):
                     in_with = True
                     with_child_indent = None
@@ -415,10 +449,48 @@ def ci_pnpm_selection(root):
                     with_child_indent = with_child_indent or len(item) - len(item.lstrip())
                     match = re.fullmatch(rf" {{{with_child_indent}}}['\"]?version['\"]?\s*:\s*(.*)", item)
                     if match:
-                        record(without_comments(match[1]))
+                        action_version(without_comments(match[1]), step_context)
+        # Env can appear after steps/with. Resolve only ancestors of this exact action;
+        # another job, step or workflow cannot supply a missing env value.
+        for context in references:
+            value = next((env_values[context[:size]] for size in range(len(context), -1, -1)
+                          if context[:size] in env_values), 'unresolved PNPM_VERSION reference')
+            record(value, "ci PNPM_VERSION")
     needs_inspection = None in versions or len(versions) > 1
+    source = "ci PNPM_VERSION" if "ci PNPM_VERSION" in sources else "ci pnpm/action-setup"
     return (next(iter(versions)) if len(versions) == 1 and not needs_inspection else None,
-            needs_inspection)
+            needs_inspection, source)
+
+
+def ci_pnpm_selection(root):
+    version, needs_inspection, _ = ci_pnpm_pin(root)
+    return version, needs_inspection
+
+
+def pnpm_selection(root, *, ci_root=None):
+    """One pin policy for install hints and remote activation; an empty pin needs inspection."""
+    root = Path(root)
+    if (root / 'package.json').is_file():
+        try:
+            if not isinstance(json.loads(read(root / 'package.json')), dict):
+                return '', 'invalid package.json'
+        except ValueError:
+            return '', 'invalid package.json'
+    declaration = declared_manager(root)
+    if declaration:
+        return (declaration[2], 'packageManager') if declaration[1] == 'pnpm' else None
+    lock = root / 'pnpm-lock.yaml'
+    if not lock.is_file():
+        return None
+    version, needs_inspection, source = ci_pnpm_pin(Path(ci_root) if ci_root is not None else root)
+    if needs_inspection:
+        return '', 'ambiguous CI pnpm version'
+    if version:
+        return version, source
+    match = re.search(r"^lockfileVersion:\s*[\"']?([^\s\"'#]+)", read(lock), re.M)
+    lock_version = match[1] if match else '?'
+    # Lockfile 9 spans pnpm 9/10/11; only the fallback is capped to retain package.json overrides.
+    return {'9': '10', '6': '8', '5': '7'}.get(lock_version.split('.')[0], ''), f'lockfile {lock_version}'
 
 
 def install_command(root):
@@ -440,9 +512,10 @@ def install_command(root):
             (("package-lock.json", "npm-shrinkwrap.json"), "npm"),
         ) if any((root / name).is_file() for name in names)), "npm")
     if manager == "pnpm":
-        if not declaration:
-            version, needs_inspection = ci_pnpm_selection(root)
-            if needs_inspection:
+        selection = pnpm_selection(root)
+        if selection:
+            version = selection[0]
+            if not supported_pnpm_descriptor(version):
                 return '<repo-install>'
         return f"corepack pnpm{'@' + version if version else ''} install --frozen-lockfile"
     if manager == "yarn":

@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync
 from . import containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, file_lock, log, new_id, now,
@@ -1281,11 +1281,11 @@ class Runner:
                 if keeper_scope is not None and not keeper_scope.settled.is_set():
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
-        try:
-            w = node_version.want(self.root, self.cwd)
-            node_block = node_version.block(w) if w else ""
-        except Exception:
-            node_block = ""
+        w = node_version.want(self.root, self.cwd)
+        node_block = node_version.block(w) if w else ""
+        pm = pnpm_version.want(self.root, self.cwd)
+        if pm:
+            node_block += "\n" + pnpm_version.block(pm)
         new_checkout_hint(row, self.root)
         warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
         if warning:

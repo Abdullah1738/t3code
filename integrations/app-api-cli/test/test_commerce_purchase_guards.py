@@ -54,10 +54,11 @@ class PurchaseGuardTests(unittest.TestCase):
             card_status.record_declined('9546', reason='issuer decline', source='fixture')
             flow = self.consume()
             self.assertEqual(j.inspect(flow)['operations'][0]['state'], 'MAY_HAVE_SENT')
-            # A decline never releases an unresolved account or permits a second card send.
-            with self.assertRaises(j.JournalError):
-                j.open_flow(flow_id=str(uuid.uuid4()), app='noon', vertical='minutes',
-                            account_hash=j.binding(flow)['account_hash'], scope_hash='f'*64)
+            # New flows are independent; the original consumed send stays protected.
+            new = str(uuid.uuid4())
+            j.open_flow(flow_id=new, app='noon', vertical='minutes',
+                        account_hash=j.binding(flow)['account_hash'], scope_hash='f'*64)
+            self.assertEqual(j.inspect(new)['state'],'ACTIVE')
             with self.assertRaises(j.JournalError):
                 j.consume(flow, 'replacement', kind='place', request_hash='c'*64,
                           cart_hash='d'*64, review_hash='e'*64, payable_minor=100)
