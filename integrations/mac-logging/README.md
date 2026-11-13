@@ -21,10 +21,11 @@ Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
 The collector gathers directory sizes with read-only du calls outside the guard,
 allowing up to 60 s per root under a shared 210 s scan budget. The two big
-roots (`~/.local/share` and `~/.robob`) run first, one first-level child at a
-time with a 15 s child timeout. Each root gets at most 60 s. The collector
+roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
+time with a 15 s child timeout. Roots rotate by their last attempt, and each
+gets at most 60 s. The collector
 also limits the scan to the time remaining in its five-minute run budget,
-running crash collection first (at most 120 s), then the disk tooling probe and
+running crash collection first (at most 165 s), then the disk tooling probe and
 inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
@@ -85,14 +86,20 @@ only readable entries; permission grants remain an owner action.
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
 `failedCount`. Child timeouts/errors remain named source errors. An incomplete
-root emits an error with `failure=partial`, `partial=true`, and the completed
-children's `bytes` as a lower bound. `failedCount` includes one additional
+root emits an error with `failure=partial`, `partial=true`, and the available
+children's `bytes`. Cached sizes make that aggregate an estimate. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
 count of every unvisited child. Summing child du totals does not deduplicate
 hard links across children and excludes the root directory's own blocks.
-Missing totals are never replaced with an old total, even within 24 hours.
-If every child fails, the root has an error and no cached size. Inventory state
-retains completed child sizes in `children` and aggregate flags in `partials`.
+Root attempts rotate oldest first, with never-attempted roots ahead of measured
+ones. Budget-skipped roots retain their place; full failed attempts rotate too.
+Shortened failed attempts keep priority for a full allowance on the next run.
+`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+Child attempts rotate the same way. A failed child retains its last good size
+and timestamp in `childState`; a root containing cached or unreadable children
+remains partial. `cachedCount` and `ageS` describe retained measurements.
+If every child fails without a last-good measurement, the root has no size.
+Inventory state retains child sizes in `children` and aggregate flags in `partials`.
 Summary `sourceErrors` counts affected roots, not their child error lines.
 Partial roots are excluded from growth comparisons on both sides, so changing
 scan coverage cannot become a reported grower.
@@ -102,7 +109,8 @@ errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
 Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
 has a one-hour maximum window, split into contiguous 15-minute chunks under a
-shared 90 s budget. Each command has at most 60 s, shortened to that shared
+shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
+Each command has at most 60 s, shortened to that shared
 budget and the collector's remaining absolute budget. Its source event/error and
 `crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
 `skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
@@ -129,10 +137,13 @@ filenames (metadata only); retries skip those filenames, retaining progress
 without counting them again. The source cursor advances to that window's end
 only after enumeration completes. Reports arriving after that end remain for
 the next window. Healthy sources continue independently.
+IPS headers are read as at most 4096 bytes before decoding, so invalid body
+bytes cannot break a valid header. Unreadable or malformed files are skipped
+individually; each report source logs `unreadableCount` without file contents.
 
 `collector.main` sets a 290 s absolute work deadline, leaving ten seconds for
-state/log overhead within five minutes. Crash collection has at most 120 s for
-three 10 s report sources, the shared 90 s log budget, and daily rollup. The disk
+state/log overhead within five minutes. Crash collection has at most 165 s for
+three 10 s report sources, the shared 135 s log budget, and daily rollup. The disk
 tooling probe follows, then inventory uses the remaining absolute budget.
 No log command starts once its shared budget is exhausted. No live configuration
 or schedule change is needed for this order.
