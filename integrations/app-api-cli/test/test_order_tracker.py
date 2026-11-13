@@ -4,7 +4,7 @@ import time
 import unittest
 import json
 import io
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import order_tracker as t
@@ -361,8 +361,55 @@ class TrackerTest(unittest.TestCase):
             self.assertEqual(state.get('status') == 'delivered', whole)
             self.assertEqual(t.transition(result, state, cfg, time.time()), [])
 
-    def test_amazon_cache_bounds_reads_and_outage_never_uses_legacy_delivery(self):
+    def test_eta_alert_refreshes_recent_fallback_cache_within_one_fetch(self):
+        import native_orders
+        now = time.time()
+        cfg = dict(self.cfg(), app='careem')
+        for stage in ('delivered', 'out for delivery', 'unknown'):
+            with self.subTest(stage=stage):
+                cached = {'stage': 'preparing', 'confidence': 'exact_order', 'observed_at': t.stamp(now - 60)}
+                state = {'primed': True, 'status': 'preparing', 'mail_checked': now - 60, 'mail_cache': [cached]}
+                latest = [] if stage == 'unknown' else [dict(cached, stage=stage, observed_at=t.stamp(now))]
+                with mock.patch('native_orders.track', side_effect=native_orders.OrderError('AUTH_EXPIRED')) as native, \
+                     mock.patch.object(t, 'mail_evidence', return_value=(latest, [])) as mail, \
+                     mock.patch.object(t.store, 'evidence', return_value=([], [])):
+                    result = t.fetch(cfg, state, now)
+                native.assert_called_once_with('careem', cfg['order'], timeout=8)
+                mail.assert_called_once()
+                self.assertEqual(state['mail_cache'], latest)
+                self.assertEqual(result['status'], stage)
+                kinds = [e['kind'] for e in t.transition(result, state, cfg, now)]
+                self.assertEqual('eta_elapsed' in kinds, stage != 'delivered')
+                self.assertEqual(state.get('status') == 'delivered', stage == 'delivered')
+
+    def test_eta_alert_uses_one_fresh_native_read_without_mail_fallback(self):
+        cfg = dict(self.cfg(), app='noon', order='IAEFIXTURE')
+        state = {'primed': True, 'status': 'out for delivery'}
+        with mock.patch('native_orders.track', return_value={'status': 'delivered', 'coverage': 'native'}) as native, \
+             mock.patch('noon_order_details.details', return_value={}), \
+             mock.patch.object(t, 'mail_evidence') as mail:
+            result = t.fetch(cfg, state, time.time())
+        native.assert_called_once()
+        mail.assert_not_called()
+        self.assertEqual(t.transition(result, state, cfg, time.time()),
+                         [{'kind': 'stage_change', 'status': 'delivered'}])
+
+    def test_eta_alert_refreshes_recent_amazon_cache(self):
+        now = time.time()
         cfg = dict(self.cfg(), app='amazon', order='408-1234567-1234567')
+        state = {'primed': True, 'status': 'out for delivery', 'amazon_checked': now - 60,
+                 'amazon_cache': self.amazon()}
+        with mock.patch('amazon_email_orders.track', return_value=self.amazon(whole=True)) as scan, \
+             mock.patch.object(t.store, 'evidence', return_value=([], [])):
+            result = t.fetch(cfg, state, now)
+        scan.assert_called_once()
+        self.assertEqual(scan.call_args.kwargs['timeout'], 35)
+        self.assertEqual(t.transition(result, state, cfg, now),
+                         [{'kind': 'stage_change', 'status': 'delivered'}])
+        self.assertTrue(state['amazon_cache']['whole_order_delivered'])
+
+    def test_amazon_cache_bounds_reads_and_outage_never_uses_legacy_delivery(self):
+        cfg = dict(self.cfg(), app='amazon', order='408-1234567-1234567', eta=None)
         state = {'mail_cache': [{'stage': 'delivered', 'confidence': 'exact_order'}]}
         now = time.time()
         with mock.patch('amazon_email_orders.track', return_value=self.amazon()) as scan, \
@@ -702,7 +749,7 @@ class AmazonGlueTest(unittest.TestCase):
 
 
 class RetireTest(unittest.TestCase):
-    """Terminal trackers stop themselves a quiet 30 minutes after the delivered wake."""
+    """Keep the terminal wake, then archive without another provider read."""
 
     def setUp(self):
         self.now = 1_800_000_000.0
@@ -711,32 +758,37 @@ class RetireTest(unittest.TestCase):
         self.wid = self.cfg['watcher']
         self.live = Path.home() / '.local/share/robob-watch/watchers' / self.wid
 
-    def check(self, state, result, folder=None, run=None):
+    def check(self, state, result, folder=None, run=None, card=None):
         output = io.StringIO()
         run = run or mock.Mock(return_value='')
-        with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder or self.live)), \
+        with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder or self.live), WATCH_RUN=getattr(self, 'watch_run', 'scheduled-fixture')), \
              mock.patch.object(Path, 'open', mock.mock_open()), \
              mock.patch.object(Path, 'exists', return_value=True), \
              mock.patch.object(t.fcntl, 'flock'), \
              mock.patch.object(t, 'read', return_value=state), \
              mock.patch.object(t, 'write') as write, \
              mock.patch.object(t.time, 'time', return_value=self.now), \
-             mock.patch.object(t, 'fetch', return_value=result), \
-             mock.patch.object(t.store, 'reconcile'), \
+             mock.patch.object(t, 'fetch', return_value=result) as fetch, \
+             mock.patch.object(t.store, 'reconcile') as reconcile, \
+             mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
              mock.patch.object(t, 'run', run), \
              redirect_stdout(output):
             t.check(self.cfg)
+        self.fetch = fetch
+        self.reconcile = reconcile
+        self.sync = sync
         return run, write, output.getvalue()
 
-    def test_delivered_tracker_retires_itself_after_a_quiet_half_hour(self):
+    def test_delivered_tracker_retires_without_polling(self):
         state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801}
         run, write, out = self.check(state, {'status': 'delivered', 'errors': []})
         run.assert_called_once_with(['robob-watch', 'remove', self.wid])
         self.assertIs(self.cfg.get('active'), False)
         self.assertIs(write.call_args.args[1], self.cfg)
         self.assertEqual(out, '')
+        self.fetch.assert_not_called()
 
-    def test_food_terminal_read_emits_once_and_retires_at_thirty_minutes(self):
+    def test_food_terminal_read_emits_once_and_retires_on_the_next_tick(self):
         import noon_vertical_reads as vertical
 
         for raw, expected in [('canceled', 'cancelled'), ('delivered', 'delivered')]:
@@ -747,7 +799,7 @@ class RetireTest(unittest.TestCase):
                 response = {'status': 'success', 'data': {'orderNr': cfg['order'], 'status': raw}}
                 watchers = Path('/fixture/watchers')
                 output = io.StringIO()
-                with mock.patch.dict(t.os.environ, WATCH_DIR=str(watchers / cfg['watcher'])), \
+                with mock.patch.dict(t.os.environ, WATCH_DIR=str(watchers / cfg['watcher']), WATCH_RUN='scheduled-fixture'), \
                      mock.patch.object(t, 'WATCHERS', watchers), \
                      mock.patch.object(Path, 'open', mock.mock_open()), \
                      mock.patch.object(Path, 'exists', return_value=True), \
@@ -771,22 +823,17 @@ class RetireTest(unittest.TestCase):
 
                     output.seek(0)
                     output.truncate(0)
-                    clock.return_value = self.now + 1799
-                    t.check(cfg)
-                    run.assert_not_called()
-                    self.assertTrue(cfg['active'])
-                    self.assertEqual(output.getvalue(), '')
-
-                    clock.return_value = self.now + 1800
+                    clock.return_value = self.now + 60
                     t.check(cfg)
                     run.assert_called_once_with(['robob-watch', 'remove', cfg['watcher']])
                     self.assertFalse(cfg['active'])
                     self.assertEqual(output.getvalue(), '')
 
-    def test_delivered_tracker_waits_out_the_first_half_hour(self):
+    def test_delivered_tracker_retires_on_the_next_tick(self):
         state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 600}
         run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
-        run.assert_not_called()
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.fetch.assert_not_called()
         self.assertEqual(out, '')
 
     def test_terminal_wake_run_never_retires(self):
@@ -796,11 +843,15 @@ class RetireTest(unittest.TestCase):
         self.assertEqual(state['terminal_at'], self.now)
         self.assertEqual([e['kind'] for e in json.loads(out)['events']], ['stage_change'])
 
-    def test_amazon_tracker_never_retires_itself(self):
+    def test_complete_amazon_tracker_retires_without_polling(self):
         self.cfg.update(app='amazon', watcher='order-amazon-12345')
-        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 7200}
+        self.wid = self.cfg['watcher']
+        self.live = t.WATCHERS / self.wid
+        state = {'primed': True, 'status': 'delivered',
+                 'last_result': {'status': 'delivered', 'whole_order_complete': True}}
         run, _, _ = self.check(state, {'status': 'delivered', 'errors': [], 'whole_order_complete': True})
-        run.assert_not_called()
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.fetch.assert_not_called()
 
     def test_scratch_watch_dir_never_retires(self):
         import tempfile
@@ -814,7 +865,125 @@ class RetireTest(unittest.TestCase):
         run = mock.Mock(side_effect=RuntimeError('robob-watch failed'))
         _, write, _ = self.check(state, {'status': 'delivered', 'errors': []}, run=run)
         self.assertEqual(state['retire_error'], 'robob-watch failed')
+        self.fetch.assert_not_called()
         write.assert_called()
+
+    def test_overdue_delivered_read_emits_arrival_and_next_tick_does_not_poll(self):
+        self.cfg['eta'] = t.stamp(self.now - 600)
+        state = {'primed': True, 'status': 'out for delivery'}
+        delivered = {'status': 'delivered', 'errors': [], 'whole_order_complete': True}
+        run, _, out = self.check(state, delivered)
+        self.assertEqual(json.loads(out)['events'], [{'kind': 'stage_change', 'status': 'delivered'}])
+        self.assertNotIn('delay_sent', state)
+        run.assert_not_called()  # Removing here would discard the runner's terminal event.
+        run, _, out = self.check(state, {'status': 'out for delivery', 'errors': []})
+        self.fetch.assert_not_called()
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertEqual(out, '')
+
+    def test_genuinely_late_and_unknown_orders_still_emit_eta_elapsed(self):
+        self.cfg['eta'] = t.stamp(self.now - 600)
+        for status in ('out for delivery', 'unknown', 'preparing', 'nearby'):
+            with self.subTest(status=status):
+                state = {'primed': True, 'status': 'out for delivery'}
+                run, _, out = self.check(state, {'status': status, 'errors': []})
+                self.fetch.assert_called_once()
+                self.assertIn('eta_elapsed', [e['kind'] for e in json.loads(out)['events']])
+                run.assert_not_called()
+
+    def test_partial_marketplace_and_amazon_delivery_do_not_retire(self):
+        for app, whole in (('noon', False), ('amazon', False), ('amazon', None)):
+            with self.subTest(app=app, whole=whole):
+                self.cfg['app'] = app
+                state = {'primed': True, 'status': 'out for delivery'}
+                result = {'status': 'delivered', 'errors': [], 'whole_order_complete': whole}
+                run, _, _ = self.check(state, result)
+                self.fetch.assert_called_once()
+                run.assert_not_called()
+                self.assertNotEqual(state['status'], 'delivered')
+                self.reconcile.assert_not_called()
+
+    def test_cancelled_tracker_retires_without_polling(self):
+        state = {'primed': True, 'status': 'cancelled'}
+        run, _, out = self.check(state, {'status': 'preparing', 'errors': []})
+        self.fetch.assert_not_called()
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertEqual(out, '')
+
+    def test_retirement_keeps_order_and_archived_terminal_record(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            watchers = root / 'watchers'
+            folder = watchers / self.wid
+            folder.mkdir(parents=True)
+            orders = root / 'orders'
+            orders.mkdir()
+            cfg = dict(self.cfg, active=True)
+            record = orders / (self.wid + '.json')
+            t.write(record, cfg)
+            state = {'primed': True, 'status': 'delivered',
+                     'last_result': {'status': 'delivered', 'whole_order_complete': True}}
+            t.write(folder / 'order-tracker-state.json', state)
+            archive = root / 'archived'
+            def remove(args):
+                self.assertEqual(args, ['robob-watch', 'remove', self.wid])
+                folder.rename(archive)
+            with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'), \
+                 mock.patch.object(t, 'ROOT', root), mock.patch.object(t, 'WATCHERS', watchers), \
+                 mock.patch.object(t, 'run', side_effect=remove), \
+                 mock.patch.object(t, 'fetch') as fetch:
+                t.check(cfg)
+            fetch.assert_not_called()
+            self.assertFalse(folder.exists())
+            self.assertEqual(t.read(archive / 'order-tracker-state.json'), state)
+            self.assertIs(t.read(record)['active'], False)
+            self.assertEqual(t.read(record)['order'], cfg['order'])
+
+    def test_terminal_prime_preserves_watcher_for_registration(self):
+        self.watch_run = 'prime-fixture'
+        state = {}
+        run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
+        self.assertEqual(state['status'], 'delivered')
+        self.assertEqual(out, '')
+        run.assert_not_called()
+        # A repeated prime must also keep the already-confirmed record.
+        run, _, _ = self.check(state, {'status': 'delivered', 'errors': []})
+        self.fetch.assert_not_called()
+        run.assert_not_called()
+
+    def test_terminal_registration_in_progress_does_not_retire(self):
+        self.cfg['delivery_card'] = {'ready': False}
+        state = {'primed': True, 'status': 'delivered'}
+        run, _, _ = self.check(state, {'status': 'delivered', 'errors': []})
+        self.fetch.assert_not_called()
+        run.assert_not_called()
+
+    def test_direct_terminal_check_does_not_archive_wake(self):
+        self.watch_run = ''
+        state = {'primed': True, 'status': 'delivered'}
+        run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
+        self.fetch.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(out, '')
+
+    def test_pending_terminal_wake_is_kept_without_polling(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            folder = root / 'watchers' / self.wid
+            folder.mkdir(parents=True)
+            pending = {'key': 'terminal-fixture', 'event': 'delivered', 'at': t.stamp(self.now)}
+            runner_state = {'status': 'active', 'pending': pending}
+            t.write(folder / 'state.json', runner_state)
+            t.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'delivered'})
+            with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'), \
+                 mock.patch.object(t, 'ROOT', root), mock.patch.object(t, 'WATCHERS', folder.parent), \
+                 mock.patch.object(t, 'run') as remove, mock.patch.object(t, 'fetch') as fetch:
+                t.check(self.cfg)
+            fetch.assert_not_called()
+            remove.assert_not_called()
+            self.assertEqual(t.read(folder / 'state.json'), runner_state)
 
     def test_remove_command_still_retires(self):
         cfg = dict(self.cfg, active=True)
@@ -829,6 +998,94 @@ class RetireTest(unittest.TestCase):
         self.assertIs(cfg['active'], False)
         self.assertIs(write.call_args.args[1], cfg)
         self.assertEqual(output.getvalue().strip(), f'Removed {self.wid}')
+
+
+class TerminalCardRenderTest(unittest.TestCase):
+    def scenario(self, failure, *, fail_render=False):
+        import tempfile
+        cards = t.delivery_cards
+        with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+            root = Path(scratch)
+            watchers = root / 'watchers'
+            cfg = {'app': 'noon', 'order': 'IAEFIXTURE', 'for': 'owner', 'chat': 'owner',
+                   'watcher': 'order-noon-fixture', 'registered_at': t.stamp(time.time() - 60),
+                   'delivery_card': {'ready': True}, 'card_meta': {'items': [{'name': 'Fixture', 'qty': 1}]},
+                   'active': True}
+            folder = watchers / cfg['watcher']
+            folder.mkdir(parents=True)
+            record = root / 'orders' / (cfg['watcher'] + '.json')
+            t.write(record, cfg)
+            t.write(folder / 'state.json', {'status': 'active'})
+            t.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+            for obj, name, value in ((t, 'ROOT', root), (t, 'WATCHERS', watchers),
+                                     (cards, 'ROOT', root), (cards, 'APPS', root / 'apps')):
+                stack.enter_context(mock.patch.object(obj, name, value))
+            stack.enter_context(mock.patch.object(t.toollog, 'root', return_value=root / 'logs'))
+            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'))
+            stack.enter_context(mock.patch.object(cards, 'preview', return_value=False))
+            stack.enter_context(mock.patch.object(cards, 'route', return_value='fixture-session'))
+            def bridge(args, **kwargs):
+                if args[0] == 'publish':
+                    return {} if failure == 'publish_ack' else {'url': 'https://fixture.example/card/'}
+                if args[0] == 'app':
+                    if failure == 'send_error':
+                        raise cards.BridgeError('fixture transport failure')
+                    return {}
+                raise AssertionError('unexpected bridge operation')
+            transport = stack.enter_context(mock.patch.object(cards, 'bridge', side_effect=bridge))
+            preparing = {'status': 'preparing', 'errors': []}
+            placed = cards.safe_sync(cfg, preparing, send=True)
+            expected = {'publish_ack': 'failed:card_publish_bad_ack', 'send_ack': 'failed:card_send_bad_ack',
+                        'send_error': 'failed:bridge_request_failed'}[failure]
+            self.assertEqual(placed['status'], expected)
+            self.assertIs(placed['rendered'], True)
+            card_path = root / 'cards' / (cfg['watcher'] + '.json')
+            placement = cards.read(card_path)
+            retry_fields = {k: placement[k] for k in ('status', 'send_args', 'open', 'attempted_at') if k in placement}
+            transport.reset_mock()
+            delivered = {'status': 'delivered', 'errors': [], 'whole_order_complete': True}
+            fetch = stack.enter_context(mock.patch.object(t, 'fetch', return_value=delivered))
+            archive = root / 'archive'
+            def remove(args):
+                self.assertEqual(args, ['robob-watch', 'remove', cfg['watcher']])
+                folder.rename(archive)
+            removal = stack.enter_context(mock.patch.object(t, 'run', side_effect=remove))
+            status_path = root / 'apps' / placement['slug'] / 'status.json'
+            before_status = status_path.read_bytes()
+            real_atomic = cards.atomic
+            def atomic(path, data):
+                if Path(path) == status_path:
+                    raise OSError('fixture render write failed')
+                return real_atomic(path, data)
+            output, errors = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(errors):
+                if fail_render:
+                    with mock.patch.object(cards, 'atomic', side_effect=atomic):
+                        t.check(cfg)
+                        t.check(cfg)
+                    removal.assert_not_called()
+                    self.assertEqual(status_path.read_bytes(), before_status)
+                else:
+                    t.check(cfg)
+                    removal.assert_not_called()
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                t.check(cfg)
+            fetch.assert_called_once()
+            transport.assert_not_called()
+            removal.assert_called_once()
+            self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+            self.assertIs(t.read(record)['active'], False)
+            self.assertEqual(t.read(archive / 'order-tracker-state.json')['status'], 'delivered')
+            retained = cards.read(card_path)
+            self.assertEqual({k: retained[k] for k in retry_fields}, retry_fields)
+
+    def test_placement_failures_do_not_block_terminal_retirement_after_real_sync(self):
+        for failure in ('publish_ack', 'send_ack', 'send_error'):
+            with self.subTest(failure=failure):
+                self.scenario(failure)
+
+    def test_terminal_render_failure_retries_before_retiring_despite_placement_failure(self):
+        self.scenario('publish_ack', fail_render=True)
 
 
 if __name__ == '__main__':
