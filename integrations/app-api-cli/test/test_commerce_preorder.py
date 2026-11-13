@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import time
@@ -9,7 +10,7 @@ from noon_nownow_checkout import SavedCard,Snapshot
 from noon_nownow_controller import CardSyncBinding
 import commerce_nownow as c
 import commerce_preorder as p
-from test import test_noon_nownow_review as fixtures
+import test_noon_nownow_review as fixtures
 
 
 class Store:
@@ -19,6 +20,9 @@ class Store:
 
 
 class PreorderFlowTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_native_preorder_reserves_before_wire_and_recovery_never_replays(self):
         fixture=fixtures.ReviewTests();fixture.setUp();fixture.row['prepaidPaymentMisc']['isCvvRequired']=True
         with tempfile.TemporaryDirectory() as temp,patch.object(c.journal,'ROOT',Path(temp).resolve()/'commerce'), \

@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rename, rm } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
 import {
   INSTALL_DATABASE_FILE,
   checkSignature,
@@ -18,6 +19,54 @@ import {
   relaunchAfterFailure,
   uStateProcesses,
 } from "./install-robob-fast.mjs";
+
+// Every post-quit failure must keep its owner alive through recovery, including rollback.
+for (const rollback of [false, true]) {
+  for (const failed of ["quit", "backup", "swap", "launch", "readReady", "report"]) {
+    test(`${rollback ? "rollback" : "install"} ${failed} failure retains hold until healthy recovery`, async () => {
+      const calls = [];
+      let quitStarted = false;
+      const ops = Object.fromEntries([
+        "stage", "verify", "verifyPrevious", "migrations", "hostPreflight", "cancelWindow",
+        "quit", "backup", "swap", "launch", "readReady", "report", "phase",
+      ].map((name) => [name, async () => {
+        if (name === "quit") quitStarted = true;
+        if (name === failed) throw new Error(`failed ${name}`);
+      }]));
+      const { release } = await acquireInstallHold({ pid: 42, env: {}, run: async (_cmd, args) => calls.push(args[0]) });
+      const waiting = Promise.withResolvers();
+      const recovered = Promise.withResolvers();
+      let probes = 0;
+      const attempt = (async () => {
+        try {
+          await install(ops, { rollback });
+        } finally {
+          await finishInstallHold({
+            release, quitStarted,
+            healthy: async () => {
+              calls.push("health");
+              probes++;
+              if (probes === 1) throw new Error("connection refused");
+              if (probes === 2) return false;
+              waiting.resolve();
+              return recovered.promise;
+            },
+            onWaiting: async () => calls.push("attention"),
+            sleep: async () => { assert.ok(!calls.includes("stop")); },
+          });
+        }
+      })();
+      const failure = assert.rejects(attempt, new RegExp(`failed ${failed}`));
+      await waiting.promise;
+      assert.equal(calls[0], "start");
+      assert.equal(calls.includes("stop"), false);
+      assert.equal(calls.filter((x) => x === "attention").length, 1);
+      recovered.resolve(true);
+      await failure;
+      assert.equal(calls.at(-1), "stop");
+    });
+  }
+}
 
 test("preflights before downtime, swaps sandbox bundles and waits for a new server", async () => {
   const root = await mkdtemp(join(tmpdir(), "install-test-"));

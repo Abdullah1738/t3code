@@ -72,6 +72,7 @@ _STOP = set("""a an the and or to from for with this that these those next time 
     only must should don't dont do not again remember rule owner please keep use using no all
     when then have will would could can into about every before after same more than source
     message messages comment comments send sending push deploy services repo branch""".split())
+_FACT_GENERIC = set("your you its it is are was were has had have been done hello thanks update notification alert due tomorrow today payment amount available card account people place schedule limit over under about owner build builds finished successfully complete completed test tests status ready work working fix fixed code tool tools file files".split())
 _ACTION_WORDS = {
     "git.push": r"\b(?:push|deploy)(?:es|ing)?\b",
     "git.commit": r"\bcommits?\b",
@@ -96,6 +97,11 @@ def _tokens(text: str) -> set[str]:
     return {word.lower() for word in _WORD.findall(text)}
 
 
+def fact_terms(text):
+    return {t for t in _tokens(text) - _STOP - _FACT_GENERIC
+            if len(t) >= 3 and (not t.isdigit() or len(t) >= 4)}
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -108,6 +114,11 @@ def _arguments(arguments) -> dict:
             return {"command": arguments}
         return value if isinstance(value, dict) else {}
     return arguments if isinstance(arguments, dict) else {}
+
+
+def message_recipients(arguments):
+    return {arguments[k].casefold().strip() for k in ('recipient', 'to', 'contact', 'chat', 'chat_name')
+            if isinstance(arguments.get(k), str) and arguments[k].strip()}
 
 
 def _tool_name(tool: str) -> str:
@@ -920,9 +931,7 @@ class RuleIndex:
         older/action-labelled imports did not index entity words. No corpus I/O.
         """
         text = " ".join(messages)
-        generic = set("your you its it is are was were has had have been done hello thanks update notification alert due tomorrow today payment amount available card account people place schedule limit over under about owner build builds finished successfully complete completed test tests status ready work working fix fixed code tool tools file files".split())
-        terms = _tokens(text) - _STOP - generic
-        terms = {t for t in terms if len(t) >= 3 and (not t.isdigit() or len(t) >= 4)}
+        terms = fact_terms(text)
         if not terms: return []
         scopes = {"", _path(cwd), *map(str, Path(_path(cwd)).parents)}
         with closing(self._connect(readonly=True)) as con:
@@ -937,7 +946,7 @@ class RuleIndex:
                 scopes.add('crpko')
             rows = con.execute("SELECT r.* FROM rules r WHERE scope IN ("+",".join("?" for _ in scopes)+") "
                                "AND EXISTS (SELECT 1 FROM rule_sources s WHERE s.rule_id=r.id AND " + _active_source_clause(con) + ") LIMIT 4000", sorted(scopes)).fetchall()
-            tokens = [(_tokens(r['text']) - _STOP - generic) for r in rows]
+            tokens = [(_tokens(r['text']) - _STOP - _FACT_GENERIC) for r in rows]
             token_groups = {}
             for row, ts in zip(rows, tokens):
                 token_groups.setdefault(normalized(row['text']), set()).update(ts)
@@ -1012,7 +1021,7 @@ class RuleIndex:
                     return []
                 sql += " AND r.id IN (SELECT rule_id FROM rule_keys WHERE " + " OR ".join(clauses) + ")"
             records = []
-            argument_text = (tool + " " + _json(arguments)).lower()
+            recipients = message_recipients(arguments)
             for row in con.execute(sql, params).fetchall():
                 record = self._record(con, row)
                 triggers = [r[0] for r in con.execute("SELECT value FROM rule_keys WHERE rule_id=? AND kind='path'", (row["id"],))]
@@ -1030,8 +1039,7 @@ class RuleIndex:
                 if tool and not record["actions"] and not record["recipient"]:
                     if len(set(token_values) & (_tokens(record["text"]) - _STOP)) < 2:
                         continue
-                if tool and record["recipient"] and not re.search(
-                        r"(?<![\w])" + re.escape(record["recipient"].lower()) + r"(?![\w])", argument_text):
+                if tool and record["recipient"] and record["recipient"].casefold().strip() not in recipients:
                     continue
                 record["matched_cwds"] = [location for location, local in by_location.items() if record["scope"] in local]
                 git_actions = set(record["actions"]) & {"git.commit", "git.push"}

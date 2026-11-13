@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import json
 import tempfile
@@ -41,6 +42,7 @@ class Reader:
 
 class FoodFinancialTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name)/"commerce"
         p=patch.object(j,'ROOT',self.root);p.start();self.addCleanup(p.stop)
@@ -345,6 +347,9 @@ class FoodFinancialTests(unittest.TestCase):
 
 
 class NativeOrderTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def fixture(self):
         flow=SimpleNamespace(account=fingerprint('synthetic-customer'),scope='b'*64,outlet='OUTLET1',
             headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'},
@@ -473,6 +478,9 @@ class NativeOrderTests(unittest.TestCase):
 
 
 class RegistrarTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_registration_requires_receipt_exact_config_watcher_and_hold(self):
         with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
             root=Path(temp);name='order-noon-'+ORDER.lower()

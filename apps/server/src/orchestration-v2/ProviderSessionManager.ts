@@ -2464,6 +2464,61 @@ export const layerWithOptions = (
           ),
       );
 
+      const persistClaudeRefusal = Effect.fn("ProviderSessionManager.persistClaudeRefusal")(
+        function* (entry: LiveSessionEntry, incoming: OrchestrationV2ProviderThread) {
+          const threadId = incoming.appThreadId;
+          const nativeId = incoming.nativeThreadRef?.nativeId;
+          if (threadId === null || nativeId == null || incoming.driver !== "claudeAgent") return;
+          // A refusal belongs to the native session, even when no run is reading.
+          // Merge only that exclusion; the incoming roster/model/status can be stale.
+          while (true) {
+            const projection = yield* projectionStore
+              .getThreadRecords(threadId, ["providerThreads"])
+              .pipe(
+                Effect.catchIf(Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError), () =>
+                  Effect.succeed(undefined),
+                ),
+              );
+            if (projection === undefined) return;
+            const current = projection.providerThreads.find((row) => row.id === incoming.id);
+            if (
+              current === undefined ||
+              current.driver !== "claudeAgent" ||
+              current.providerInstanceId !== entry.runtime.instanceId ||
+              incoming.providerInstanceId !== entry.runtime.instanceId ||
+              incoming.providerSessionId !== entry.runtime.providerSessionId ||
+              current.nativeThreadRef?.nativeId !== nativeId ||
+              current.nativeThreadRef?.driver !== incoming.nativeThreadRef?.driver ||
+              current.nativeMetadata?.claudeRefusalObserved === true
+            )
+              return;
+            const now = yield* DateTime.now;
+            const result = yield* eventSink.writeIfProviderThreadUnchanged({
+              expected: current,
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({
+                    threadId,
+                    providerSessionId: entry.runtime.providerSessionId,
+                  }),
+                  type: "provider-thread.updated",
+                  threadId,
+                  driver: current.driver,
+                  providerInstanceId: current.providerInstanceId,
+                  occurredAt: now,
+                  payload: {
+                    ...current,
+                    nativeMetadata: { ...current.nativeMetadata, claudeRefusalObserved: true },
+                    updatedAt: now,
+                  },
+                },
+              ],
+            });
+            if (result.committed) return;
+          }
+        },
+      );
+
       const startEventPump = (entry: LiveSessionEntry) => {
         let stoppedByProvider = false;
         return entry.runtime.events.pipe(
@@ -2507,6 +2562,21 @@ export const layerWithOptions = (
               ),
               Effect.andThen(
                 Effect.gen(function* () {
+                  if (
+                    entry.runtime.driver === "claudeAgent" &&
+                    event.type === "provider_thread.updated" &&
+                    event.providerThread.nativeMetadata?.claudeRefusalObserved === true
+                  )
+                    yield* persistClaudeRefusal(entry, event.providerThread).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderAdapter.ProviderAdapterEventStreamError({
+                            driver: entry.runtime.driver,
+                            providerSessionId: entry.runtime.providerSessionId,
+                            cause,
+                          }),
+                      ),
+                    );
                   if (
                     event.type === "provider_thread.updated" &&
                     event.providerThread.status === "error"

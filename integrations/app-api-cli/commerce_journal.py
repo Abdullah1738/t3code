@@ -5,6 +5,7 @@ An unknown send retains account ownership; a different flow ID cannot escape it.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import owner_go
 from contextlib import contextmanager
 import hashlib
 import json
@@ -350,6 +351,11 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                     order_card.require_purchase_fallback()
                 except RuntimeError as exc:
                     fail(str(exc))
+            try:
+                owner_go.require(vendor=flow['app'], item=owner_go.commerce_item(flow),
+                                 amount=payable_minor, currency='AED')
+            except owner_go.ApprovalError:
+                fail('OWNER_GO_REQUIRED')
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')

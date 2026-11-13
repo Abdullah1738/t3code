@@ -1,4 +1,9 @@
 import {
+  claudeRecoveryResult,
+  continuedLaunchRecovery,
+  launchRecoveryDelayMs,
+} from "./launchRecovery.ts";
+import {
   emptyDelegatedRecoveryCounts,
   type DelegatedRecoveryCounts,
 } from "../ardud/observability/StartupPhaseLog.ts";
@@ -2199,7 +2204,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             id: `effect:${commandId}:provider-turn.start:${queuedRun.id}`,
             commandId,
             threadId,
-            request: { type: "provider-turn.start", runId: queuedRun.id },
+            request: {
+              type: "provider-turn.start",
+              runId: queuedRun.id,
+              ...(queuedRun.launchRecovery === undefined
+                ? {}
+                : { retryDelayMs: launchRecoveryDelayMs(queuedRun, DateTime.toEpochMillis(now)) }),
+            },
           },
         ],
       );
@@ -5167,9 +5178,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection = applyToProjection(projection, event);
     }
 
-    const continuedTaskId = projection.runs.find(
+    const continuationSource = projection.runs.find(
       (run) => run.id === command.restartContinuationOfRunId,
-    )?.delegatedTaskId;
+    );
+    const continuedTaskId = continuationSource?.delegatedTaskId;
+    const continuedRecovery = continuedLaunchRecovery(continuationSource, projection.providerTurns);
 
     if (projection.thread.settledOverride !== null) {
       const now = yield* DateTime.now;
@@ -5694,6 +5707,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
       };
       const attempt: OrchestrationV2RunAttempt = {
@@ -6045,6 +6059,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? { workspacePreparation: dispatchMode.workspaceStrategy }
           : {}),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
       };
@@ -6261,7 +6276,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         id: `effect:${command.commandId}:provider-turn.start:${runId}`,
         commandId: command.commandId,
         threadId: command.threadId,
-        request: { type: "provider-turn.start", runId },
+        request: {
+          type: "provider-turn.start",
+          runId,
+          ...(run.launchRecovery === undefined
+            ? {}
+            : { retryDelayMs: launchRecoveryDelayMs(run, DateTime.toEpochMillis(now)) }),
+        },
       } satisfies PendingOrchestrationEffectV2;
       if (dispatchMode.type !== "defer_start") {
         yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
@@ -6766,6 +6787,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+      ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
       ...(command.contextReset === true ? { contextReset: true } : {}),
       ...wakeWorkStartedAt(projection.runs, command),
     };
@@ -7234,7 +7256,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       id: `effect:${command.commandId}:provider-turn.start:${runId}`,
       commandId: command.commandId,
       threadId: command.threadId,
-      request: { type: "provider-turn.start", runId },
+      request: {
+        type: "provider-turn.start",
+        runId,
+        ...(run.launchRecovery === undefined
+          ? {}
+          : { retryDelayMs: launchRecoveryDelayMs(run, DateTime.toEpochMillis(now)) }),
+      },
     } satisfies PendingOrchestrationEffectV2;
     yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
   });
@@ -11774,7 +11802,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
         ...(childRun.delegatedTaskStall === undefined ? {} : { failureReason: "stalled" as const }),
-        result: result.text,
+        ...(childRun.launchRecovery?.kind === "model_access"
+          ? { model: childRun.modelSelection.model }
+          : {}),
+        result: claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
         completedAt: now,
         updatedAt: now,
       };

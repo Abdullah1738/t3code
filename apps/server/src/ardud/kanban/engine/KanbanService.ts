@@ -90,6 +90,7 @@ import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
 import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
+import { bugMatches } from "./bugMatches.ts";
 import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as FileSystem from "effect/FileSystem";
@@ -136,10 +137,12 @@ function sameOptions(
 }
 const OWNER_NAME = "You";
 
-type EvaluatorSubmission =
+type EvaluatorLaunch =
   | { readonly threadId: ThreadId }
-  | { readonly matched: true; readonly card: KanbanCard; readonly sightingAppended: true }
   | { readonly queued: true; readonly queueId: number };
+type EvaluatorSubmission =
+  | EvaluatorLaunch
+  | { readonly matched: true; readonly card: KanbanCard; readonly sightingAppended: true };
 
 interface EvaluatorJob {
   readonly mergedKeys?: ReadonlyArray<string>;
@@ -759,6 +762,28 @@ export interface KanbanServiceShape {
       readonly forceNew?: boolean;
     },
   ) => Effect.Effect<EvaluatorSubmission, KanbanError>;
+  readonly reportBug: (input: {
+    readonly boardId: string;
+    readonly threadId: ThreadId;
+    readonly title: string;
+    readonly evidence: string;
+    readonly cardHint?: string | undefined;
+  }) => Effect.Effect<
+    {
+      readonly appendedTo?: string;
+      readonly deduped?: boolean;
+      readonly candidates?: ReadonlyArray<{
+        readonly id: KanbanCardId;
+        readonly number: number;
+        readonly title: string;
+        readonly score: number;
+      }>;
+      readonly threadId?: ThreadId;
+      readonly queued?: boolean;
+      readonly queueId?: number;
+    },
+    KanbanError
+  >;
   readonly resolveBoard: (
     threadId: ThreadId,
     input: {
@@ -3483,13 +3508,13 @@ const make = Effect.gen(function* () {
     boardId: KanbanBoardId,
     wanted?: string,
   ): Effect.fn.Return<
-    EvaluatorSubmission,
+    EvaluatorLaunch,
     KanbanError | KanbanStoreError | KanbanThreadError | SqlError.SqlError
   > {
     const rows = yield* boardSql<EvaluatorQueueRow>`
       SELECT * FROM ardud_kanban_evaluator_queue WHERE board_id = ${boardId} AND done_at IS NULL ORDER BY id
     `.pipe(NodeSqliteClient.readOnly);
-    let result: EvaluatorSubmission | undefined;
+    let result: EvaluatorLaunch | undefined;
     for (const row of rows) {
       // A discussion may have acquired an owner while its launch was queued.
       // Deliver its retained text there before considering another spawn.
@@ -12478,6 +12503,160 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const startEvaluator: KanbanServiceShape["startEvaluator"] = (boardId, purpose, text) =>
+    SavedWrite.recover(
+      guard(
+        Effect.gen(function* () {
+          yield* checkText([
+            ["text", text],
+            [
+              "text",
+              purpose.kind === "setup" || purpose.kind === "request" ? purpose.text : undefined,
+            ],
+          ]);
+          const board = yield* boardOf(boardId);
+          if (
+            purpose.kind === "stalled" ||
+            purpose.kind === "completed" ||
+            purpose.kind === "deployed" ||
+            purpose.kind === "check"
+          ) {
+            const running = yield* runningSweep(board.id, purpose.kind);
+            if (running) {
+              return yield* failWith(
+                "conflict",
+                `a ${purpose.kind} sweep is already running on this board (thread ${running}). Steer it with t3_thread_send, or hand one job to a new evaluator with kind "request" and text.`,
+              );
+            }
+          }
+          const matches =
+            purpose.kind === "request"
+              ? matchingCards(
+                  purpose.text,
+                  yield* openRequestCards(board.id),
+                  yield* requestLinks(board.id, purpose.text),
+                )
+              : [];
+          return yield* startEvaluatorUnlocked(board, purpose, {
+            text,
+            cardId: matches.length === 1 ? matches[0]!.id : null,
+          });
+        }),
+      ),
+      (saved) => (saved.kind === "evaluator" ? saved.threadId : undefined),
+    );
+
+  const reportBug = Effect.fn("KanbanService.reportBug")(function* (
+    input: Parameters<KanbanServiceShape["reportBug"]>[0],
+  ) {
+    yield* checkText([
+      ["title", input.title],
+      ["evidence", input.evidence],
+    ]);
+    const title = input.title.trim();
+    const evidence = input.evidence.trim();
+    if (!title || !evidence)
+      return yield* failWith("invalid", "A bug report needs title and evidence.");
+    const board = (yield* readDb(store.boards)).find(
+      (board) => board.id === input.boardId.trim() || board.slug === input.boardId.trim(),
+    );
+    if (!board) return yield* failWith("invalid", `No Missions board "${input.boardId}".`);
+    const body = `sighting\n\n${evidence}`;
+    const actor: KanbanActor = { _tag: "thread", threadId: input.threadId };
+    // Recover a committed append if publishing the card change races another board write.
+    let appended:
+      | {
+          appendedTo: string;
+          deduped?: boolean;
+          candidates?: Array<{ id: KanbanCardId; number: number; title: string; score: number }>;
+        }
+      | undefined;
+    const result = yield* SavedWrite.recover(
+      guard(
+        Effect.gen(function* () {
+          const open = (yield* store.cards(board.id)).filter(
+            (card) => card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage),
+          );
+          const hint = input.cardHint?.trim();
+          const hinted =
+            hint && /^#?\d+$/.test(hint)
+              ? open.find((card) => card.number === Number(hint.replace(/^#/, "")))
+              : undefined;
+          const matches = hinted ? [] : bugMatches(open, title);
+          const best = matches[0];
+          const ambiguous = best && !best.exact && matches[1]?.score === best.score;
+          const target = hinted ?? (best?.strong && !ambiguous ? best.card : undefined);
+          if (!target) return undefined;
+          const candidates = matches.slice(0, 3).map(({ card, score }) => ({
+            id: card.id,
+            number: card.number,
+            title: card.title,
+            score,
+          }));
+          const response = { appendedTo: `#${target.number}`, ...(hinted ? {} : { candidates }) };
+          const now = yield* Clock.currentTimeMillis;
+          const duplicate = (yield* store.cardEvents(target.id)).some(
+            (event) =>
+              event.kind === "comment" &&
+              event.body === body &&
+              event.actor._tag === "thread" &&
+              event.actor.threadId === input.threadId &&
+              now - Date.parse(event.at) >= 0 &&
+              now - Date.parse(event.at) < 30 * 60_000,
+          );
+          if (duplicate) {
+            appended = { ...response, deduped: true };
+            yield* SavedWrite.record({ kind: "card", card: target });
+            return appended;
+          }
+          const next = { ...target, updatedAt: yield* nowIso };
+          appended = response;
+          yield* logEvent(next, actor, "comment", { body });
+          yield* saveCard(next);
+          return response;
+        }),
+        undefined,
+        board.id,
+      ),
+      (saved) => (saved.kind === "card" ? appended : undefined),
+    );
+    if (result) return result;
+    let text = `${title}\n\n${evidence}`;
+    const source = yield* readDb(store.threadLink(input.threadId));
+    if (source && (source.role === "work" || source.role === "review")) {
+      const sourceBoard = yield* readDb(boardOf(source.boardId));
+      const [carried] = yield* readDb(store.cardsByThread(input.threadId));
+      const sourceCard = carried ?? (source.cardId ? yield* readDb(cardOf(source.cardId)) : null);
+      const cardPart = sourceCard
+        ? `, card [#${sourceCard.number} ${sourceCard.title}](t3-context://v1/kanban-card/${sourceCard.id})`
+        : "";
+      text = `Handed on by a ${source.role} thread on the "${sourceBoard.name}" board${cardPart}, thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
+    } else {
+      text = `Reported by thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
+    }
+    const key = uuid();
+    // reportBug has already resolved its matches. Caller provenance in the
+    // stamped text must not associate a novel report with the caller's own card.
+    return yield* SavedWrite.recover(
+      guard(
+        serial(
+          evaluating,
+          board.id,
+          Effect.gen(function* () {
+            return yield* admitEvaluator(
+              yield* boardOf(board.id),
+              { kind: "request", text },
+              { key },
+            );
+          }),
+        ),
+        undefined,
+        board.id,
+      ),
+      (saved) => (saved.kind === "evaluator" ? { threadId: saved.threadId } : undefined),
+    );
+  }, Effect.mapError(toKanbanError));
+
   return KanbanService.of({
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
@@ -12676,48 +12855,8 @@ const make = Effect.gen(function* () {
           return { discussionId: started.discussionId };
         }),
       ),
-    startEvaluator: (boardId, purpose, text) =>
-      SavedWrite.recover(
-        guard(
-          Effect.gen(function* () {
-            yield* checkText([
-              ["text", text],
-              [
-                "text",
-                purpose.kind === "setup" || purpose.kind === "request" ? purpose.text : undefined,
-              ],
-            ]);
-            const board = yield* boardOf(boardId);
-            if (
-              purpose.kind === "stalled" ||
-              purpose.kind === "completed" ||
-              purpose.kind === "deployed" ||
-              purpose.kind === "check"
-            ) {
-              const running = yield* runningSweep(board.id, purpose.kind);
-              if (running) {
-                return yield* failWith(
-                  "conflict",
-                  `a ${purpose.kind} sweep is already running on this board (thread ${running}). Steer it with t3_thread_send, or hand one job to a new evaluator with kind "request" and text.`,
-                );
-              }
-            }
-            const matches =
-              purpose.kind === "request"
-                ? matchingCards(
-                    purpose.text,
-                    yield* openRequestCards(board.id),
-                    yield* requestLinks(board.id, purpose.text),
-                  )
-                : [];
-            return yield* startEvaluatorUnlocked(board, purpose, {
-              text,
-              cardId: matches.length === 1 ? matches[0]!.id : null,
-            });
-          }),
-        ),
-        (saved) => (saved.kind === "evaluator" ? saved.threadId : undefined),
-      ),
+    startEvaluator,
+    reportBug,
     submitEvaluator: (boardId, purpose, options = {}) => {
       const key = uuid();
       return guard(
