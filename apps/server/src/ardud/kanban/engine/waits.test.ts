@@ -1166,6 +1166,41 @@ describe("endWait", () => {
 });
 
 describe("resolveWait", () => {
+  it("ends Crpko #4247's completed-card time wait for its evaluator", () => {
+    const at = "2026-11-13T10:31:00.000Z";
+    const waiting = card(4247, {
+      stage: "completed",
+      reviewStep: 1,
+      activeThreadId: null,
+      activePool: null,
+      settledAt: null,
+      deciding: undefined,
+      movedAt: "2026-11-13T07:20:56.377Z" as never,
+      subtasks: [
+        ...[subtask("work"), subtask("review"), subtask("evaluator")].map((task, i) => ({
+          ...task,
+          id: `s${i + 1}`,
+          step: i + 1,
+          state: "done" as const,
+        })),
+        { ...subtask("evaluator"), id: "s4", step: 4 },
+      ],
+      wait: wait({
+        on: "time",
+        pr: null,
+        sinceHead: null,
+        until: "2026-11-13T10:30:00.000Z",
+        at: "2026-11-13T08:20:01.257Z",
+        wakeRole: "evaluator",
+      }),
+    });
+    expect(resolveWait(waiting, facts({ nowMs: Date.parse(at) }), ctx, at)).toMatchObject({
+      _tag: "end",
+      wake: { to: "evaluator" },
+      card: { stage: "completed" },
+    });
+  });
+
   it("does nothing for a card with no wait or with a thread", () => {
     expect(resolveWait(card(1), facts(), ctx, AT)).toEqual({ _tag: "none" });
     expect(
