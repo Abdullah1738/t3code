@@ -25,7 +25,7 @@ import { robobSubagentNotice, opencodeSubagentNotice } from "./fixtures/subagent
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
 // The config root points at a nonexistent directory so router tests never
 // read the machine's real OpenCode config and stay deterministic.
-const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0 };
+const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0, medsFold: false as const };
 const stores: Store[] = [];
 const directories: string[] = [];
 const messageId = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;

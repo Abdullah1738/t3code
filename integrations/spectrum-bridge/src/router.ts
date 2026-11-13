@@ -1,5 +1,6 @@
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { toolError, toolLog } from "./toollog.ts";
+import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { isAbsolute } from "node:path";
@@ -138,6 +139,7 @@ type Options = {
   swipes?: { find: Swipes; line: string; waitMs?: number };
   /** "final" (default) forwards each turn's final text; "tool" forwards nothing and the agent sends with imessage_send. */
   replyMode?: ReplyMode;
+  medsFold?: FoldOptions | false;
   notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
@@ -608,6 +610,60 @@ async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
 }
 
 export class Router {
+  private medsFolding = new Map<string, Promise<void>>();
+
+  async foldToolText(text: string, operationId: string): Promise<string> {
+    if (!this.toolMode) return text;
+    const turn = this.store.get<Turn | null>("activeTurn");
+    return (await this.foldTexts(turn, [text], operationId, "tool"))[0]!;
+  }
+
+  private async foldTexts(turn: Turn | null | undefined, texts: string[], operationId: string, replyMode: ReplyMode): Promise<string[]> {
+    try {
+      const chat = this.options.context?.chat;
+      if (chat?.kind !== "owner" || chat.slug === "moni" || this.options.medsFold === false
+        || process.env.SPECTRUM_MEDS_FOLD_ENABLED === "0") return texts;
+      if (!turn || turn.background || turn.origin || !turn.inboundId || synthetic(turn.inboundId)
+        || !["running", "submitting", "unknown"].includes(turn.phase) || !this.current(turn)) {
+        foldSkipped("background", replyMode); return texts;
+      }
+      const batch = this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`);
+      const rows = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?");
+      const inputs = (batch?.batchIds ?? [turn.inboundId]).map(id => {
+        const row = rows.get(id);
+        return row ? JSON.parse(row.payload) as NormalizedInbound : undefined;
+      });
+      if (batch?.isAudioMessage || inputs.some(input => input?.source !== "typed" || input.isAudioMessage || input.poll || isTapback(input.text))
+        || !inputs.some(input => input?.text.trim())) {
+        foldSkipped("background", replyMode); return texts;
+      }
+      const stillLive = () => {
+        const live = this.store.get<Turn | null>("activeTurn");
+        return this.current(turn) && live?.messageId === turn.messageId && live.inboundId === turn.inboundId
+          && live.startedAt === turn.startedAt && !live.background && !live.origin && live.phase !== "failed" && live.phase !== "held";
+      };
+      if (!stillLive()) { foldSkipped("background", replyMode); return texts; }
+      if (!texts.some(text => stripInternalText(replyText(text)))) { foldSkipped("no_text", replyMode); return texts; }
+      // Persist before spawning: recovery may lose a fold, but cannot consume another slot for this turn.
+      const key = `meds-fold:${turn.id}:${turn.generation}:${turn.inboundId}:${turn.startedAt}`;
+      const inflight = this.medsFolding.get(key);
+      if (inflight) await inflight;
+      const saved = this.store.get<{ operationId: string; line?: string }>(key);
+      if (saved) {
+        foldSkipped("already_folded", replyMode);
+        return stillLive() && saved.operationId === operationId ? appendFold(texts, saved.line) : texts;
+      }
+      this.store.set(key, { operationId });
+      const pending = (async () => {
+        const result = await foldMedsLine({ ...this.options.medsFold, replyMode });
+        this.store.set(key, { operationId, ...(result.line ? { line: result.line } : {}) });
+      })();
+      this.medsFolding.set(key, pending);
+      try { await pending; } finally { this.medsFolding.delete(key); }
+      if (!stillLive()) return texts;
+      return appendFold(texts, this.store.get<{ line?: string }>(key)?.line);
+    } catch { return texts; }
+  }
   private ticking?: Promise<void>;
   private typingActive = false;
   private typingAt = 0;
@@ -3990,7 +4046,7 @@ export class Router {
               && reply.answer !== false && (sameFinal ? reply.finish === "stop" && reply.interruptReplyComplete !== false
                 : ended?.type === "idle" && ended.outcome === "succeeded" && !ended.modelError && !ended.firstTurnFailure);
           });
-          this.enqueueReply(turn, idle, replies, safeEarlier, final,
+          await this.enqueueReply(turn, idle, replies, safeEarlier, final,
             final.id === turn.earlySent ? "" : text, scope, entries);
           this.stage("reply-recovered-after-interrupt", turn.inboundId);
           return;
@@ -4013,11 +4069,15 @@ export class Router {
         }
         // The terminal failed idle is outside scope; its open run must never contribute a partial reply.
         const completedEarlier = earlier.filter(reply => successfulReplies.has(reply.id));
-        const failAfterEarlier = (text: string, reason: DropReason, immediate = false) => {
+        const failAfterEarlier = async (text: string, reason: DropReason, immediate = false) => {
+          const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) }))
+            .filter(item => item.text && !this.store.getOperation(`reply:${turn!.generation}:${item.reply.id}`));
+          const folded = !this.toolMode && said.length
+            ? await this.foldTexts(turn, said.map(item => item.text), said.at(-1)!.reply.id, "final") : said.map(item => item.text);
+          if (!this.current(turn!) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn!.messageId) return;
           this.store.db.transaction(() => {
-            const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) })).filter(item => item.text);
-            for (const { reply, text } of said) this.store.enqueue({
-              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
+            for (const [index, { reply }] of said.entries()) this.store.enqueue({
+              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: folded[index]!, sessionId: turn!.id, generation: turn!.generation,
               ...this.replyTarget(turn!.inboundId),
             });
             if (said.length) this.noteGroupReply(turn!.inboundId, said.map(item => item.text));
@@ -4040,7 +4100,7 @@ export class Router {
           this.recordFailure(turn.inboundId, "execution", detail, turn);
         }
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
-          failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
+          await failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
           return;
         }
         // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
@@ -4048,7 +4108,7 @@ export class Router {
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
           ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
           : false);
-        failAfterEarlier(idle.outcome === "interrupted"
+        await failAfterEarlier(idle.outcome === "interrupted"
           ? "The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"
           : "Something went wrong on my end with that one. Mind trying again?", ran ? "failed" : "errored");
         return;
@@ -4112,37 +4172,38 @@ export class Router {
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
-      this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
+      await this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
     } catch { toolError("router", "router.catch48");
       // Transient backend trouble: polling simply retries on the next tick.
     }
   }
 
-  private enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
+  private async enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
     replies: Extract<MessageRecord, { type: "assistant" }>[], earlier: Extract<MessageRecord, { type: "assistant" }>[],
     final: Extract<MessageRecord, { type: "assistant" }> | undefined, text: string,
-    scope: MessageRecord[], entries: Pending[], priorFailure?: Extract<MessageRecord, { type: "idle" }>): void {
+    scope: MessageRecord[], entries: Pending[], priorFailure?: Extract<MessageRecord, { type: "idle" }>): Promise<void> {
     const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
       .find(tokens => typeof tokens?.input === "number");
     // Tool mode: a final ending in NO_REPLY (one block or a whole multi-block message) is a deliberate silence.
     const silent = !!final && (quietMessages(scope).has(final.id) || (!!assistantText(final).trim() && !replyText(assistantText(final))));
     if (turn.inboundId?.startsWith("wake:")) watcherLog({ component: "wakes", kind: "event", name: "wake.reply_guard", ok: true, ids: { key: turn.inboundId, thread: turn.id }, props: { accepted: silent } });
+    const outgoing = [...earlier.map(reply => ({ id: reply.id, text: replyText(assistantText(reply)) })),
+      ...(final ? [{ id: final.id, text }] : [])]
+      .filter(reply => reply.text && (!turn.background || stripInternalText(reply.text).trim())
+        && !this.store.getOperation(`reply:${turn.generation}:${reply.id}`));
+    const folded = this.toolMode ? [] : await this.foldTexts(turn, outgoing.map(reply => reply.text), outgoing.at(-1)?.id ?? idle.id, "final");
+    if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return;
     this.store.db.transaction(() => {
       if (priorFailure) this.notice(turn, "failed", firstFailureText(priorFailure.modelError));
       // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.
       const sent = this.toolMode ? this.turnSends(turn) : undefined;
       if (!this.toolMode) {
-        for (const reply of earlier) {
-          const words = replyText(assistantText(reply));
-          if (words && (!turn.background || stripInternalText(words).trim())) this.store.enqueue({
-            id: `reply:${turn.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn.id, generation: turn.generation,
+        for (const [index, reply] of outgoing.entries()) {
+          this.store.enqueue({
+            id: `reply:${turn.generation}:${reply.id}`, kind: "conversation", text: folded[index]!, sessionId: turn.id, generation: turn.generation,
             ...this.replyTarget(turn.inboundId),
           });
         }
-        if (text && (!turn.background || stripInternalText(text).trim())) this.store.enqueue({
-          id: `reply:${turn.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn.id, generation: turn.generation,
-          ...this.replyTarget(turn.inboundId),
-        });
       }
       const said = this.toolMode ? sent ?? []
         : [turn.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);

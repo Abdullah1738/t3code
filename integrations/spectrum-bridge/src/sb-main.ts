@@ -223,6 +223,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         publishApps: isOwner ? publishApps : async () => shares.secretBase() } } : {}),
       enabled: ready, health: () => ({}),
       replyCheck: text => checkReply(chat.info, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
+      foldText: (text, operationId) => router.foldToolText(text, operationId),
       log,
     });
     return { router, delivery, api: chatApi, backend: chatBackend, busy: false };
