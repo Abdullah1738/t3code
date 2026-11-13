@@ -4,14 +4,23 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  AuthSessionId,
+  KANBAN_WS_METHODS,
+  KanbanScriptAcknowledgeInput,
   KanbanBoardId,
+  KanbanError,
+  KanbanScript as KanbanScriptSchema,
   KanbanScriptId,
   ProjectId,
   ProviderInstanceId,
@@ -23,6 +32,11 @@ import {
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 
+import { Etag, HttpPlatform, HttpRouter } from "effect/http";
+import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import { kanbanRouteLayer } from "../http.ts";
+import { makeKanbanWsHandlers } from "../ws.ts";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -33,6 +47,7 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
 import * as Rules from "./rules.ts";
+import * as SavedWrite from "./savedWrite.ts";
 import * as ScriptService from "./ScriptService.ts";
 import * as Scripts from "./scripts.ts";
 import { modelSelectionOf, modelSelectionResult } from "./defaults.ts";
@@ -47,6 +62,7 @@ import type * as Waits from "./waits.ts";
 const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
+    pendingUserInputs: () => Effect.succeed([]),
     view: () => Effect.succeed(null),
     find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
@@ -74,12 +90,29 @@ const boardFilesLayer = (apply = false) =>
     ),
   );
 
-const makeTestLayer = (threadsLayer: Layer.Layer<KanbanThreads>, apply = false) =>
+const makeTestLayer = (
+  threadsLayer: Layer.Layer<KanbanThreads>,
+  apply = false,
+  wrap: (
+    service: KanbanService.KanbanService["Service"],
+  ) => KanbanService.KanbanService["Service"] = (service) => service,
+  wrapStore: (store: KanbanStore.KanbanStore["Service"]) => KanbanStore.KanbanStore["Service"] = (
+    store,
+  ) => store,
+) =>
   ScriptService.layer.pipe(
-    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(
+      Layer.effect(KanbanService.KanbanService, Effect.map(KanbanService.KanbanService, wrap)).pipe(
+        Layer.provide(KanbanService.layer),
+      ),
+    ),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threadsLayer),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(
+      Layer.effect(KanbanStore.KanbanStore, Effect.map(KanbanStore.KanbanStore, wrapStore)).pipe(
+        Layer.provide(KanbanStore.layer),
+      ),
+    ),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -91,6 +124,9 @@ const testLayer = makeTestLayer(threads);
 
 const owner: KanbanActor = { _tag: "owner" };
 const manual: KanbanScriptTrigger = { _tag: "manual" };
+const decodeScript = Schema.decodeUnknownEffect(KanbanScriptSchema);
+const decodeAcknowledgement = Schema.decodeUnknownEffect(KanbanScriptAcknowledgeInput);
+const encodeScript = Schema.encodeEffect(KanbanScriptSchema);
 
 const scriptFile = (body: string, name = "script.sh") => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-board-script-"));
@@ -919,6 +955,7 @@ it.effect(
     const recording = Layer.succeed(
       KanbanThreads,
       KanbanThreads.of({
+        pendingUserInputs: () => Effect.succeed([]),
         view: () => Effect.succeed(null),
         find: () => Effect.succeed(null),
         lastFailure: () => Effect.succeed(null),
@@ -1587,4 +1624,967 @@ it.effect(
       assert.strictEqual(woken.stage, "needs_review");
     }).pipe(Effect.provide(withReader));
   },
+);
+
+const busyError = () =>
+  new KanbanError({
+    code: "conflict",
+    detail: "Board busy: not written. Safe to retry once.",
+    saved: false,
+  });
+
+const retryFixture = Effect.gen(function* () {
+  const firstAttempt = yield* Deferred.make<void>();
+  let calls = 0;
+  let failure: () => KanbanError | null = () => busyError();
+  const layer = makeTestLayer(threads, false, (service) => ({
+    ...service,
+    createCard: (boardId, input, actor) =>
+      actor._tag !== "script"
+        ? service.createCard(boardId, input, actor)
+        : Effect.gen(function* () {
+            calls += 1;
+            yield* Deferred.succeed(firstAttempt, undefined);
+            const error = failure();
+            if (error) return yield* Effect.fail(error);
+            return yield* service.createCard(boardId, input, actor);
+          }),
+  }));
+  return {
+    layer,
+    firstAttempt,
+    calls: () => calls,
+    failWith: (next: () => KanbanError | null) => {
+      failure = next;
+    },
+  };
+});
+
+const cardLine = `echo '{"kanban":"card","prompt":"Investigate","title":"Lost ticket"}'`;
+const scriptMessages = (board: KanbanBoard) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const discussions = yield* kanban.discussions(board.id);
+    assert.strictEqual(discussions.length, 1);
+    return yield* kanban.messages(discussions[0]!.id, {});
+  });
+
+it.effect(
+  "#577 retries busy card creation twice, with 3s then 10s backoff, and creates exactly once",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(() => (fixture.calls() <= 2 ? busyError() : null));
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const script = yield* register(board, scriptFile(cardLine));
+        yield* scripts.run(script.id, "manual");
+        yield* Deferred.await(fixture.firstAttempt);
+        assert.strictEqual(fixture.calls(), 1);
+        yield* TestClock.adjust(2_999);
+        assert.strictEqual(fixture.calls(), 1);
+        yield* TestClock.adjust(1);
+        assert.strictEqual(fixture.calls(), 2);
+        yield* TestClock.adjust(9_999);
+        assert.strictEqual(fixture.calls(), 2);
+        yield* TestClock.adjust(1);
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 3);
+        assert.strictEqual((yield* kanban.snapshot(board.id)).cards.length, 1);
+        assert.include(
+          (yield* scripts.runs(script.id, 1))[0]!.output,
+          "Added card #1 after 2 retries.",
+        );
+        assert.lengthOf(yield* kanban.discussions(board.id), 0);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect(
+  "#577 holds exhausted busy work, posts one notice, and delivers it on the next trigger once",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const path = scriptFile(cardLine + "\nexit 7");
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* Deferred.await(fixture.firstAttempt);
+        yield* TestClock.adjust(43_000);
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 4);
+        const held = (yield* store.script(script.id))!.held!;
+        assert.strictEqual(held.length, 1);
+        assert.strictEqual(held[0]!.attempts, 4);
+        const run = (yield* scripts.runs(script.id, 1))[0]!;
+        assert.strictEqual(run.exitCode, 7);
+        assert.isTrue(run.output.startsWith("Held 1 command(s) for retry\n"));
+        const notices = yield* scriptMessages(board);
+        assert.lengthOf(notices, 1);
+        assert.include(JSON.stringify(notices), "Will retry next run");
+        NodeFS.writeFileSync(path, cardLine);
+        fixture.failWith(() => null);
+        yield* scripts.run(script.id, "schedule");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 5);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        const delivered = yield* scriptMessages(board);
+        assert.lengthOf(delivered, 2);
+        assert.include(JSON.stringify(delivered), "Delivered held card: Lost ticket");
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 replay sees a card added by another writer and clears the held command", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      yield* store.putScript({
+        ...script,
+        held: [
+          {
+            command: { kanban: "card", prompt: "Investigate", title: "Lost ticket" },
+            firstFailedAt: "1970-01-01T00:00:00.000Z",
+            lastError: "Busy",
+            attempts: 4,
+          },
+        ],
+      });
+      yield* kanban.createCard(board.id, { prompt: "Investigate", title: "Lost ticket" }, owner);
+      yield* scripts.run(script.id, "manual");
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 0);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      assert.include(JSON.stringify(yield* scriptMessages(board)), "Delivered held card");
+      assert.include((yield* scripts.runs(script.id, 1))[0]!.output, "already on the board");
+    }).pipe(Effect.provide(fixture.layer));
+  }),
+);
+
+it.effect(
+  "#577 MAY_HAVE_APPLIED is never retried or held, including while replaying held work",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () =>
+          new KanbanError({
+            code: "conflict",
+            detail: "May have been applied",
+            saved: null,
+          }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const path = scriptFile(cardLine);
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 1);
+        assert.lengthOf((yield* store.script(script.id))!.held ?? [], 0);
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 1);
+        yield* store.putScript({
+          ...(yield* store.script(script.id))!,
+          held: [
+            {
+              command: { kanban: "card", prompt: "Investigate", title: "Held uncertain" },
+              firstFailedAt: "1970-01-01T00:00:00.000Z",
+              lastError: "Busy",
+              attempts: 4,
+            },
+          ],
+        });
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 2);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 2);
+        NodeFS.writeFileSync(path, cardLine);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 2);
+        assert.include(JSON.stringify(yield* scriptMessages(board)), "Will not retry");
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 drops held commands at 24 hours or 10 attempts and posts the reason", () =>
+  Effect.gen(function* () {
+    const scripts = yield* ScriptService.KanbanScripts;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* toyBoard;
+    const script = yield* register(board, scriptFile(""));
+    yield* store.putScript({
+      ...script,
+      held: [
+        {
+          command: { kanban: "card", prompt: "Old", title: "Expired" },
+          firstFailedAt: "1970-01-01T00:00:00.000Z",
+          lastError: "Old busy",
+          attempts: 4,
+        },
+        {
+          command: { kanban: "post", text: "Too many attempts" },
+          firstFailedAt: "1970-01-02T00:00:00.000Z",
+          lastError: "Still busy",
+          attempts: 10,
+        },
+      ],
+    });
+    yield* TestClock.adjust("24 hours");
+    yield* scripts.run(script.id, "manual");
+    yield* scripts.idle;
+    assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+    const output = (yield* scripts.runs(script.id, 1))[0]!.output;
+    assert.include(output, "24 hours old");
+    assert.include(output, "10 attempts");
+    assert.include(output, "Old busy");
+    const messages = yield* scriptMessages(board);
+    assert.lengthOf(messages, 1);
+    assert.include(JSON.stringify(messages), "Expired");
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("#577 old script rows decode and held commands survive schema encoding", () =>
+  Effect.gen(function* () {
+    const { first } = scriptWriteFixture();
+    const legacy = yield* decodeScript(first);
+    assert.isUndefined(legacy.held);
+    const withHeld = yield* decodeScript({
+      ...first,
+      held: [
+        {
+          command: { kanban: "post", text: "Keep this" },
+          firstFailedAt: first.createdAt,
+          lastError: "Busy",
+          attempts: 4,
+        },
+      ],
+    });
+    const encoded = yield* encodeScript(withHeld);
+    const decoded = yield* decodeScript(encoded);
+    assert.deepStrictEqual(decoded.held, withHeld.held);
+    assert.lengthOf(decoded.held!, 1);
+  }),
+);
+
+it.effect(
+  "#577 configuration errors are held, capped at 100 oldest-first, while malformed commands are dropped",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () => new KanbanError({ code: "invalid", detail: "no pool runs missing/model" }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const body = [
+          ...Array.from(
+            { length: 101 },
+            (_, n) => `echo '{"kanban":"card","prompt":"Ticket ${n}","title":"Ticket ${n}"}'`,
+          ),
+          `echo '{"kanban":"card","prompt":""}'`,
+          `echo '{"kanban":"post","text":"bad\\u0001"}'`,
+        ].join("\n");
+        const script = yield* register(board, scriptFile(body));
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        const held = (yield* store.script(script.id))!.held!;
+        assert.lengthOf(held, 100);
+        assert.strictEqual(fixture.calls(), 101);
+        assert.strictEqual(held[0]!.command.kanban, "card");
+        assert.include(JSON.stringify(held[0]), 'Ticket 1"');
+        assert.include(JSON.stringify(held.at(-1)), "Ticket 100");
+        assert.isTrue(held.every((entry) => entry.attempts === 1));
+        const run = (yield* scripts.runs(script.id, 1))[0]!;
+        assert.isTrue(run.output.startsWith("Held 100 command(s) for retry"));
+        assert.include(run.output, "100 command limit");
+        assert.include(run.output, "invalid command");
+        assert.lengthOf(yield* scriptMessages(board), 1);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect("#577 a held card gets at most ten total delivery attempts", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      yield* store.putScript({
+        ...script,
+        held: [
+          {
+            command: { kanban: "card", prompt: "Investigate", title: "Lost ticket" },
+            firstFailedAt: "1970-01-01T00:00:00.000Z",
+            lastError: "Busy",
+            attempts: 9,
+          },
+        ],
+      });
+      yield* scripts.run(script.id, "manual");
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 1);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      assert.include((yield* scripts.runs(script.id, 1))[0]!.output, "10 attempts");
+    }).pipe(Effect.provide(fixture.layer));
+  }),
+);
+
+it.effect("#577 a post retries, is held, then is delivered before the next run's new post", () =>
+  Effect.gen(function* () {
+    const attempted = yield* Deferred.make<void>();
+    let fail = true;
+    let calls = 0;
+    const layer = makeTestLayer(threads, false, (service) => ({
+      ...service,
+      post: (id, actor, blocks) =>
+        Effect.gen(function* () {
+          if (blocks.some((block) => block._tag === "md" && block.text === "Original post")) {
+            calls += 1;
+            yield* Deferred.succeed(attempted, undefined);
+            if (fail) return yield* Effect.fail(busyError());
+          }
+          return yield* service.post(id, actor, blocks);
+        }),
+    }));
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const path = scriptFile(`echo '{"kanban":"post","text":"Original post"}'`);
+      const script = yield* register(board, path);
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(attempted);
+      yield* TestClock.adjust(42_999);
+      assert.strictEqual(calls, 3);
+      yield* TestClock.adjust(1);
+      yield* scripts.idle;
+      assert.strictEqual(calls, 4);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 1);
+      fail = false;
+      NodeFS.writeFileSync(path, `echo '{"kanban":"post","text":"New post"}'`);
+      yield* scripts.run(script.id, "event");
+      yield* scripts.idle;
+      assert.strictEqual(calls, 5);
+      assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+      const messages = yield* scriptMessages(board);
+      const texts = messages.flatMap((message) =>
+        message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
+      );
+      assert.strictEqual(texts.filter((text) => text === "Original post").length, 1);
+      assert.isBelow(texts.indexOf("Original post"), texts.indexOf("New post"));
+      assert.include(texts.join("\n"), "Delivered held post: Original post");
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("#577 checks for an intervening duplicate before retrying card creation", () =>
+  Effect.gen(function* () {
+    const fixture = yield* retryFixture;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(cardLine));
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(fixture.firstAttempt);
+      yield* kanban.createCard(board.id, { title: "Lost ticket", prompt: "Investigate" }, owner);
+      yield* TestClock.adjust(3_000);
+      yield* scripts.idle;
+      assert.strictEqual(fixture.calls(), 1);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+      assert.include(
+        (yield* scripts.runs(script.id, 1))[0]!.output,
+        "already on the board after 1 retry",
+      );
+    }).pipe(Effect.provide(fixture.layer));
+  }),
+);
+
+const backoffCases = (["card", "post"] as const).flatMap((kind) =>
+  (["new", "held"] as const).flatMap((source) =>
+    [0, 1, 2].map((backoff) => ({ kind, source, backoff })),
+  ),
+);
+
+it.effect.each(backoffCases)(
+  "#577 restart during backoff $backoff preserves $source $kind work",
+  ({ kind, source, backoff }) =>
+    Effect.gen(function* () {
+      const attempted = yield* Effect.all(Array.from({ length: 3 }, () => Deferred.make<void>()));
+      const priorAttempts = source === "held" ? 4 : 0;
+      let calls = 0;
+      let failing = true;
+      const command =
+        kind === "card"
+          ? { kanban: "card" as const, prompt: "Restart delivery", title: "Restart delivery" }
+          : { kanban: "post" as const, text: "Restart delivery" };
+      const layer = makeTestLayer(threads, false, (service) => ({
+        ...service,
+        createCard: (boardId, input, actor) =>
+          Effect.suspend(() => {
+            if (actor._tag === "script" && kind === "card") {
+              calls += 1;
+              if (failing)
+                return Deferred.succeed(attempted[calls - 1]!, undefined).pipe(
+                  Effect.andThen(Effect.fail(busyError())),
+                );
+            }
+            return service.createCard(boardId, input, actor);
+          }),
+        post: (id, actor, blocks) =>
+          Effect.suspend(() => {
+            if (
+              kind === "post" &&
+              blocks.some((block) => block._tag === "md" && block.text === "Restart delivery")
+            ) {
+              calls += 1;
+              if (failing)
+                return Deferred.succeed(attempted[calls - 1]!, undefined).pipe(
+                  Effect.andThen(Effect.fail(busyError())),
+                );
+            }
+            return service.post(id, actor, blocks);
+          }),
+      }));
+      yield* Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const path = scriptFile(source === "new" ? `echo '${JSON.stringify(command)}'` : "");
+        const script = yield* register(board, path);
+        if (source === "held")
+          yield* store.putScript({
+            ...script,
+            held: [
+              {
+                command,
+                firstFailedAt: script.createdAt,
+                lastError: "Busy",
+                attempts: priorAttempts,
+              },
+            ],
+          });
+        const firstScope = yield* Scope.fork(yield* Effect.scope);
+        const firstContext = yield* Layer.buildWithScope(
+          Layer.fresh(ScriptService.layer),
+          firstScope,
+        );
+        const first = Context.get(firstContext, ScriptService.KanbanScripts);
+        yield* first.run(script.id, "manual");
+        yield* Deferred.await(attempted[0]!);
+        for (let attempt = 0; attempt < backoff; attempt += 1) {
+          yield* TestClock.adjust([3_000, 10_000][attempt]!);
+          yield* Deferred.await(attempted[attempt + 1]!);
+        }
+        yield* TestClock.adjust(0);
+        assert.strictEqual(calls, backoff + 1);
+        const beforeRestart = (yield* store.script(script.id))!;
+        assert.lengthOf(beforeRestart.held!, 1);
+        assert.strictEqual(beforeRestart.held![0]!.attempts, priorAttempts + calls);
+        assert.strictEqual(beforeRestart.held![0]!.firstFailedAt, script.createdAt);
+        assert.lengthOf(beforeRestart.unresolved ?? [], 0);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 0);
+        yield* Scope.close(firstScope, Exit.void);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 1);
+        failing = false;
+        NodeFS.writeFileSync(path, "");
+        yield* Effect.gen(function* () {
+          const second = yield* ScriptService.KanbanScripts;
+          yield* second.recover;
+          yield* second.run(script.id, "manual");
+          yield* second.idle;
+        }).pipe(Effect.provide(Layer.fresh(ScriptService.layer)));
+        assert.strictEqual(calls, backoff + 2);
+        const afterRestart = (yield* store.script(script.id))!;
+        assert.lengthOf(afterRestart.held!, 0);
+        assert.lengthOf(afterRestart.unresolved!, 0);
+        const messages = yield* scriptMessages(board);
+        assert.include(JSON.stringify(messages), `Delivered held ${kind}: Restart delivery`);
+        if (kind === "card") assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        else
+          assert.strictEqual(
+            messages
+              .flatMap((message) => message.blocks)
+              .filter((block) => block._tag === "md" && block.text === "Restart delivery").length,
+            1,
+          );
+      }).pipe(Effect.scoped, Effect.provide(layer));
+    }),
+);
+
+it.effect.each(["card", "post"] as const)(
+  "#577 an interrupted in-flight %s stays visible and cannot replay or be re-emitted",
+  (kind) =>
+    Effect.gen(function* () {
+      const written = yield* Deferred.make<void>();
+      let calls = 0;
+      const layer = makeTestLayer(threads, false, (service) => ({
+        ...service,
+        createCard: (boardId, input, actor) =>
+          service.createCard(boardId, input, actor).pipe(
+            Effect.tap(() => {
+              if (actor._tag !== "script" || kind !== "card") return Effect.void;
+              calls += 1;
+              return Deferred.succeed(written, undefined).pipe(Effect.andThen(Effect.never));
+            }),
+          ),
+        post: (id, actor, blocks) =>
+          service.post(id, actor, blocks).pipe(
+            Effect.tap(() => {
+              if (
+                kind !== "post" ||
+                !blocks.some(
+                  (block) => block._tag === "md" && block.text === "Unconfirmed delivery",
+                )
+              )
+                return Effect.void;
+              calls += 1;
+              return Deferred.succeed(written, undefined).pipe(Effect.andThen(Effect.never));
+            }),
+          ),
+      }));
+      yield* Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const command =
+          kind === "card"
+            ? {
+                kanban: "card" as const,
+                prompt: "Unconfirmed delivery",
+                title: "Unconfirmed delivery",
+              }
+            : { kanban: "post" as const, text: "Unconfirmed delivery" };
+        const script = yield* register(board, scriptFile(`echo '${JSON.stringify(command)}'`));
+        const firstScope = yield* Scope.fork(yield* Effect.scope);
+        const firstContext = yield* Layer.buildWithScope(
+          Layer.fresh(ScriptService.layer),
+          firstScope,
+        );
+        const first = Context.get(firstContext, ScriptService.KanbanScripts);
+        yield* first.run(script.id, "manual");
+        yield* Deferred.await(written);
+        const active = (yield* store.script(script.id))!;
+        assert.lengthOf(active.held ?? [], 0);
+        assert.lengthOf(active.unresolved!, 1);
+        assert.deepStrictEqual(active.unresolved![0]!.command, command);
+        yield* Scope.close(firstScope, Exit.void);
+        yield* Effect.gen(function* () {
+          const second = yield* ScriptService.KanbanScripts;
+          yield* second.recover;
+          yield* second.run(script.id, "manual");
+          yield* second.idle;
+          yield* second.run(script.id, "manual");
+          yield* second.idle;
+        }).pipe(Effect.provide(Layer.fresh(ScriptService.layer)));
+        assert.strictEqual(calls, 1);
+        const recovered = (yield* store.script(script.id))!;
+        assert.lengthOf(recovered.unresolved!, 1);
+        assert.isTrue(recovered.unresolved![0]!.reported);
+        assert.lengthOf(recovered.held!, 0);
+        const messages = yield* scriptMessages(board);
+        assert.strictEqual(
+          messages.filter((message) => JSON.stringify(message.blocks).includes("Will not retry"))
+            .length,
+          1,
+        );
+        if (kind === "card") assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        else
+          assert.strictEqual(
+            messages
+              .flatMap((message) => message.blocks)
+              .filter((block) => block._tag === "md" && block.text === "Unconfirmed delivery")
+              .length,
+            1,
+          );
+      }).pipe(Effect.scoped, Effect.provide(layer));
+    }),
+);
+
+it.effect(
+  "#577 a full unresolved ledger holds new work without forgetting uncertain outcomes",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () =>
+          new KanbanError({
+            code: "failed",
+            detail: "Must not send with a full unresolved ledger",
+          }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* toyBoard;
+        const path = scriptFile(cardLine);
+        const script = yield* register(board, path);
+        yield* store.putScript({
+          ...script,
+          unresolved: Array.from({ length: 100 }, (_, n) => ({
+            command: { kanban: "post" as const, text: `Unconfirmed ${n}` },
+            firstFailedAt: script.createdAt,
+            attempts: 1,
+            lastError: "Unknown",
+            reported: true,
+          })),
+        });
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 0);
+        const queued = (yield* store.script(script.id))!;
+        assert.lengthOf(queued.unresolved!, 100);
+        assert.lengthOf(queued.held!, 1);
+        assert.strictEqual(queued.held![0]!.attempts, 0);
+        assert.include((yield* scripts.runs(script.id, 1))[0]!.output, "100 unresolved deliveries");
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 0);
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 100);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+);
+
+const scriptHttp = Effect.gen(function* () {
+  const context = yield* Effect.context<
+    ScriptService.KanbanScripts | KanbanService.KanbanService | ServerSettings.ServerSettingsService
+  >();
+  const handler = yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      HttpRouter.toWebHandler(
+        kanbanRouteLayer.pipe(
+          Layer.provide(Layer.succeedContext(context)),
+          Layer.provide(
+            Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+              authenticateHttpRequest: (request) =>
+                Effect.succeed({
+                  sessionId: AuthSessionId.make("scripts-test"),
+                  subject: "operator",
+                  method: "bearer-access-token",
+                  scopes:
+                    request.headers.authorization === "Bearer operate"
+                      ? ["orchestration:read", "orchestration:operate"]
+                      : ["orchestration:read"],
+                }),
+            }),
+          ),
+          Layer.provide(
+            HttpPlatform.layer.pipe(
+              Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(Etag.layerWeak),
+            ),
+          ),
+        ),
+        { disableLogger: true },
+      ),
+    ),
+    (handler) => Effect.promise(() => handler.dispose()),
+  );
+  return (
+    scriptId: KanbanScript["id"],
+    deliveries: KanbanScriptAcknowledgeInput["deliveries"],
+    token = "operate",
+  ) =>
+    Effect.promise(() =>
+      handler.handler(
+        new Request(`http://env.local/api/ardud/kanban/scripts/${scriptId}/acknowledge`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ deliveries }),
+        }),
+        context,
+      ),
+    );
+});
+
+it.effect.each(["service", "http", "ws"] as const)(
+  "#577 acknowledgement via %s releases full-cap capacity without replaying uncertain commands",
+  (entry) =>
+    Effect.gen(function* () {
+      const fixture = yield* retryFixture;
+      fixture.failWith(
+        () =>
+          new KanbanError({
+            code: "conflict",
+            detail: "Unknown outcome",
+            saved: null,
+          }),
+      );
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const path = scriptFile(
+          Array.from(
+            { length: 101 },
+            (_, n) => `echo '{"kanban":"card","prompt":"Ticket ${n}","title":"Ticket ${n}"}'`,
+          ).join("\n"),
+        );
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 100);
+        const full = (yield* store.script(script.id))!;
+        assert.lengthOf(full.unresolved!, 100);
+        assert.lengthOf(full.held!, 1);
+        const deliveries = [full.unresolved![0]!];
+        if (entry === "http") {
+          const request = yield* scriptHttp;
+          assert.strictEqual((yield* request(script.id, deliveries, "read")).status, 403);
+          assert.lengthOf((yield* store.script(script.id))!.unresolved!, 100);
+          assert.strictEqual((yield* request(script.id, [])).status, 400);
+          assert.strictEqual((yield* request(script.id, deliveries)).status, 200);
+        } else if (entry === "ws") {
+          const input = yield* decodeAcknowledgement({ scriptId: script.id, deliveries });
+          yield* makeKanbanWsHandlers(kanban, scripts, {
+            sessionId: "scripts-owner",
+            subject: "operator",
+            origin: { _tag: "owner", source: "paired-client" },
+          })[KANBAN_WS_METHODS.scriptAcknowledge](input);
+        } else yield* scripts.acknowledge({ scriptId: script.id, deliveries });
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 99);
+        assert.strictEqual(fixture.calls(), 100);
+        fixture.failWith(() => null);
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 101);
+        assert.lengthOf((yield* store.script(script.id))!.held!, 0);
+        assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        assert.strictEqual((yield* kanban.snapshot(board.id)).cards[0]!.title, "Ticket 100");
+        const remaining = (yield* store.script(script.id))!.unresolved!;
+        yield* scripts.acknowledge({ scriptId: script.id, deliveries: remaining });
+        assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(fixture.calls(), 101);
+      }).pipe(Effect.scoped, Effect.provide(fixture.layer));
+    }),
+);
+
+it.effect.each(["command", "firstFailedAt", "attempts"] as const)(
+  "#577 acknowledgement refuses a stale %s without clearing any checked outcomes",
+  (field) =>
+    Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(""));
+      const checked = {
+        command: { kanban: "post" as const, text: "Checked" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      const stale = {
+        ...checked,
+        ...(field === "command" ? { command: { kanban: "post" as const, text: "Changed" } } : {}),
+        ...(field === "firstFailedAt" ? { firstFailedAt: "2026-11-13T00:00:00.000Z" } : {}),
+        ...(field === "attempts" ? { attempts: 2 } : {}),
+      };
+      yield* store.putScript({ ...script, unresolved: [checked] });
+      const conflict = yield* scripts
+        .acknowledge({ scriptId: script.id, deliveries: [checked, stale] })
+        .pipe(Effect.flip);
+      assert.strictEqual(conflict.code, "conflict");
+      assert.deepStrictEqual((yield* store.script(script.id))!.unresolved, [checked]);
+      yield* scripts.acknowledge({ scriptId: script.id, deliveries: [checked] });
+      assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("#577 acknowledgement refuses an active script and preserves unrelated fields", () =>
+  Effect.gen(function* () {
+    const attempted = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = makeTestLayer(threads, false, (service) => ({
+      ...service,
+      createCard: (boardId, input, actor) =>
+        actor._tag !== "script"
+          ? service.createCard(boardId, input, actor)
+          : Deferred.succeed(attempted, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(
+                Effect.fail(new KanbanError({ code: "failed", detail: "Not delivered" })),
+              ),
+            ),
+    }));
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile(cardLine));
+      const existing = {
+        command: { kanban: "post" as const, text: "Uncertain" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      yield* store.putScript({ ...script, unresolved: [existing] });
+      yield* scripts.run(script.id, "manual");
+      yield* Deferred.await(attempted);
+      assert.strictEqual(
+        (yield* scripts
+          .acknowledge({ scriptId: script.id, deliveries: [existing] })
+          .pipe(Effect.flip)).code,
+        "conflict",
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* scripts.idle;
+      yield* scripts.setEnabled(script.id, false);
+      const before = (yield* store.script(script.id))!;
+      const after = yield* scripts.acknowledge({ scriptId: script.id, deliveries: [existing] });
+      assert.isFalse(after.enabled);
+      assert.deepStrictEqual(after.lastRun, before.lastRun);
+      assert.deepStrictEqual(after.held, before.held);
+      assert.lengthOf(after.unresolved!, 0);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("#577 events queued during acknowledgement still run after it commits", () =>
+  Effect.gen(function* () {
+    const saving = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const eventRead = yield* Deferred.make<void>();
+    let hold = false;
+    const layer = makeTestLayer(
+      threads,
+      false,
+      (service) => service,
+      (store) => ({
+        ...store,
+        scripts: (boardId) =>
+          store
+            .scripts(boardId)
+            .pipe(Effect.tap(() => (hold ? Deferred.succeed(eventRead, undefined) : Effect.void))),
+        putScript: (script) =>
+          hold && script.unresolved?.length === 0
+            ? Deferred.succeed(saving, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(store.putScript(script)),
+              )
+            : store.putScript(script),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile('echo "$KANBAN_TRIGGER"'), {
+        _tag: "event",
+        event: "card.created",
+      });
+      const checked = {
+        command: { kanban: "post" as const, text: "Checked" },
+        firstFailedAt: script.createdAt,
+        attempts: 1,
+        lastError: "Unknown",
+      };
+      yield* store.putScript({ ...script, unresolved: [checked] });
+      yield* scripts.listen;
+      hold = true;
+      const acknowledging = yield* Effect.forkChild(
+        scripts.acknowledge({ scriptId: script.id, deliveries: [checked] }),
+      );
+      yield* Deferred.await(saving);
+      yield* kanban.createCard(board.id, { prompt: "Event", title: "Event" }, owner);
+      yield* Deferred.await(eventRead);
+      yield* TestClock.adjust(0);
+      hold = false;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(acknowledging);
+      yield* scripts.idle;
+      const runs = yield* scripts.runs(script.id, 10);
+      assert.lengthOf(runs, 1);
+      assert.strictEqual(runs[0]!.trigger, "event");
+      assert.include(runs[0]!.output, "event");
+      assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
+    }).pipe(Effect.scoped, Effect.provide(layer));
+  }),
+);
+
+it.effect.each(
+  (["card", "post"] as const).flatMap((kind) =>
+    (["committing", "saved"] as const).map((evidence) => ({ kind, evidence })),
+  ),
+)(
+  "#577 main $evidence evidence prevents a $kind retry even when a later error says not saved",
+  ({ kind, evidence }) =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const layer = makeTestLayer(threads, false, (service) => ({
+        ...service,
+        createCard: (boardId, input, actor) =>
+          actor._tag !== "script" || kind !== "card"
+            ? service.createCard(boardId, input, actor)
+            : Effect.gen(function* () {
+                calls += 1;
+                if (evidence === "saved") yield* service.createCard(boardId, input, actor);
+                else yield* SavedWrite.committing;
+                return yield* Effect.fail(busyError());
+              }),
+        post: (id, actor, blocks) =>
+          kind !== "post" ||
+          !blocks.some((block) => block._tag === "md" && block.text === "Main saved signal")
+            ? service.post(id, actor, blocks)
+            : Effect.gen(function* () {
+                calls += 1;
+                if (evidence === "saved") yield* service.post(id, actor, blocks);
+                else yield* SavedWrite.committing;
+                return yield* Effect.fail(busyError());
+              }),
+      }));
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const command =
+          kind === "card"
+            ? { kanban: "card", prompt: "Main saved signal", title: "Main saved signal" }
+            : { kanban: "post", text: "Main saved signal" };
+        const path = scriptFile(`echo '${JSON.stringify(command)}'`);
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* TestClock.adjust(43_000);
+        yield* scripts.idle;
+        assert.strictEqual(calls, 1);
+        const current = (yield* store.script(script.id))!;
+        assert.lengthOf(current.held!, 0);
+        assert.lengthOf(current.unresolved!, evidence === "saved" ? 0 : 1);
+        if (evidence === "saved" && kind === "card")
+          assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(calls, 1);
+      }).pipe(Effect.provide(layer));
+    }),
 );

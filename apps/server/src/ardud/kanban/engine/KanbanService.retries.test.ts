@@ -83,6 +83,7 @@ const makeFake = () => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: read,
       find: read,
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),

@@ -238,7 +238,7 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(c.m.MinutesError,'ACTIVE_ORDER_PRESENT'):self.invoke(active=1)
         c.j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='minutes',
                     account_hash=self.flow.snapshot.account_ref,scope_hash='a'*64)
-        with self.assertRaisesRegex(c.j.JournalError,'ACCOUNT_RECONCILIATION_REQUIRED'):self.invoke()
+        self.assertTrue(self.invoke()[0]['cart_empty'])
 
     def test_readback_change_immediately_before_clear_sends_nothing(self):
         c.j.abandon(self.flow.flow_id)
@@ -258,5 +258,5 @@ class CleanupTests(unittest.TestCase):
             constructor._response_receipt=real._response_receipt
             with self.assertRaisesRegex(c.m.MinutesError,'REQUEST_TIMEOUT'):
                 cleanup.clear_cart(self.flow.flow_id,auth=self.auth)
-        with self.assertRaisesRegex(c.j.JournalError,'ACCOUNT_RECONCILIATION_REQUIRED'):
-            c.j.require_account_available('noon',self.flow.snapshot.account_ref)
+        self.assertTrue(c.j.require_account_available('noon',self.flow.snapshot.account_ref))
+        self.assertTrue(any(row['state']=='FENCED' for row in c.j.open_payments()))

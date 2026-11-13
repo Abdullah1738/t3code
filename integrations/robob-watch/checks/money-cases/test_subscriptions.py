@@ -316,6 +316,11 @@ class Subscriptions(Base):
                     self.assertEqual(result['verdict'], 'ask')
                     self.assertEqual(mc.follow(self.data, now + dt.timedelta(days=8), said=lambda *a, **kw: []), [])
                 questions = mc.load_questions(self.data)['questions']
+                self.assertEqual(questions[0]['status'], 'open')
+                self.assertEqual(len(mc.load(self.data)['cases']), 2)
+                with mc.Locked(self.data, 'questions') as book:
+                    mc.case_from(self.data, book['questions'][0], now + dt.timedelta(days=8), 'check')
+                questions = mc.load_questions(self.data)['questions']
                 self.assertEqual(questions[0]['status'], 'case')
                 self.assertEqual(len(mc.load(self.data)['cases']), 3)
 

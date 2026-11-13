@@ -302,6 +302,9 @@ const CLAUDE_SCRIPT_EXTENSIONS = [".js", ".mjs", ".tsx", ".ts", ".jsx"];
 // Claude can consume a subagent result before the launching turn ends, leaving
 // its notification with no native wake turn to answer the continuation.
 const CLAUDE_WAKE_TURN_START_DEADLINE = "2 minutes";
+// Retained SDK traces: 55 successful compactions, slowest 41.433 s (Haiku).
+// Five minutes allows ample headroom while bounding a silent compaction stall.
+const CLAUDE_COMPACTION_NO_PROGRESS_MS = 5 * 60_000;
 // Claude Code flushes transcript writes every 100 ms, so a workflow member's
 // reply can land after the progress frame that settles it. Its transcript
 // stays the source of its answer this long after it settles.
@@ -3492,6 +3495,8 @@ interface ActiveClaudeTurnContext {
   readonly toolCalls: Map<string, ActiveClaudeToolCall>;
   // A successful status can precede the boundary that supplies its token counts.
   compaction: Extract<OrchestrationV2TurnItem, { type: "compaction" }> | null;
+  compactionWatchdogStop: Deferred.Deferred<void> | null;
+  lastSdkMessageAt: number;
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
@@ -5171,6 +5176,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const projectClaudeWorkflowMembers = Effect.fnUntraced(function* (input: {
           readonly coordinator: ActiveClaudeSubagent;
           readonly workflow: OrchestrationV2SubagentWorkflow;
+          readonly skipTranscriptReads?: boolean;
         }) {
           const parentThread = input.coordinator.childThread;
           const taskId = input.coordinator.task.nativeTaskRef?.nativeId;
@@ -5220,6 +5226,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               previous?.model !== model;
             const agentId = member.agentId;
             const readTranscript =
+              input.skipTranscriptReads !== true &&
               settled &&
               transcriptDir !== undefined &&
               agentId !== undefined &&
@@ -5229,7 +5236,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             // The CLI forwards nothing a member says, so every frame while it
             // runs reads what its transcript gained since the last one.
             const readLiveTranscript =
-              status === "running" && transcriptDir !== undefined && agentId !== undefined;
+              input.skipTranscriptReads !== true &&
+              status === "running" &&
+              transcriptDir !== undefined &&
+              agentId !== undefined;
             if (!changed && !readTranscript && !readLiveTranscript) continue;
 
             const nodeId = idAllocator.derive.nodeFromProviderItem({
@@ -5447,6 +5457,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               // Only the progress excerpt is left when the transcript says
               // nothing, read after its last writes had time to land.
               if (
+                input.skipTranscriptReads !== true &&
                 !textShown &&
                 !resultShown &&
                 member.result !== undefined &&
@@ -5556,6 +5567,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             { readonly type: "system"; readonly subtype: "task_notification" }
           >;
           readonly onlyIfRunningInRun?: RunId | null;
+          readonly deferWorkflowTranscripts?: boolean;
         }) {
           const registeredSubagent = (yield* Ref.get(sessionSubagentsByTaskId)).get(input.taskId);
           const existingSubagent =
@@ -5889,6 +5901,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             yield* projectClaudeWorkflowMembers({
               coordinator: subagent,
               workflow: workflowWithThreads,
+              skipTranscriptReads: input.deferWorkflowTranscripts === true,
             });
             if ((yield* Ref.get(sessionSubagentsByTaskId)).get(input.taskId) !== subagent) return;
           }
@@ -5950,6 +5963,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ordinal: resultItemOrdinal,
               now,
             });
+          }
+          if (workflowWithThreads !== undefined && input.deferWorkflowTranscripts === true) {
+            // Disposal publishes every member's terminal state before any file
+            // read. Enrichment cannot retain the shutdown/admission locks.
+            yield* projectClaudeWorkflowMembers({
+              coordinator: subagent,
+              workflow: workflowWithThreads,
+            }).pipe(
+              Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.claude-disposal-transcript-enrichment-failed", {
+                  taskId: input.taskId,
+                  cause,
+                }),
+              ),
+              Effect.forkIn(sessionScope),
+            );
           }
         });
 
@@ -6609,6 +6639,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
         });
 
+        const stopCompactionWatchdog = Effect.fn("ClaudeAdapterV2.stopCompactionWatchdog")(
+          function* (context: ActiveClaudeTurnContext) {
+            const stop = context.compactionWatchdogStop;
+            context.compactionWatchdogStop = null;
+            if (stop !== null) yield* Deferred.succeed(stop, undefined);
+          },
+        );
+
         const performActiveTurnFinalization = Effect.fnUntraced(function* (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly status: Extract<
@@ -6619,9 +6657,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly failure?: OrchestrationV2ProviderFailure;
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
+          readonly deferWorkflowTranscripts?: boolean;
         }) {
           yield* Effect.gen(function* () {
             input.context.acceptingSteers = false;
+            yield* stopCompactionWatchdog(input.context);
             yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
             if (input.context.compaction?.status === "running") {
               yield* emitProviderEvent({
@@ -6629,6 +6669,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 driver: CLAUDE_PROVIDER,
                 turnItem: {
                   ...input.context.compaction,
+                  summary: input.failure?.message ?? "Claude compaction ended without a result.",
                   status: input.status === "completed" ? "failed" : input.status,
                   title:
                     input.status === "completed" || input.status === "failed"
@@ -6661,6 +6702,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   taskId,
                   status: input.status === "failed" ? "failed" : "cancelled",
                   onlyIfRunningInRun: input.context.input.runId,
+                  deferWorkflowTranscripts: input.deferWorkflowTranscripts === true,
                 });
               }
             }
@@ -7045,13 +7087,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const finalizeActiveTurnAfterQueryExit = Effect.fnUntraced(function* (
           closedQuery: ClaudeLiveQueryContext,
           cause?: Cause.Cause<ClaudeAgentSdkQueryRunnerError>,
+          failure?: OrchestrationV2ProviderFailure,
         ) {
           const current = yield* Ref.get(activeTurn);
           // A replacement query can reuse the native thread id; only this query's turn is ours.
           const context = closedQuery.lastTurn;
           if (context === null) return;
           const interrupted =
-            closedQuery.stopping || (yield* Ref.get(interruptedTurns)).has(context.providerTurnId);
+            failure === undefined &&
+            (closedQuery.stopping ||
+              (yield* Ref.get(interruptedTurns)).has(context.providerTurnId));
           // Finalization can yield to a replacement process; capture ownership and outcomes first.
           const subagents = yield* Ref.get(sessionSubagentsByTaskId);
           const buffered = (yield* Ref.get(wakeBuffers)).get(closedQuery.nativeThreadId)?.messages;
@@ -7060,13 +7105,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               context,
               status: interrupted ? "interrupted" : "failed",
               completedAt: yield* DateTime.now,
+              deferWorkflowTranscripts: failure !== undefined,
               ...(interrupted
                 ? {}
                 : {
-                    failure: makeProviderFailure({
-                      cause: cause === undefined ? undefined : Cause.squash(cause),
-                      class: "transport_error",
-                    }),
+                    failure:
+                      failure ??
+                      makeProviderFailure({
+                        cause: cause === undefined ? undefined : Cause.squash(cause),
+                        class: "transport_error",
+                      }),
                   }),
             });
           } else if (
@@ -7112,6 +7160,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 ? {}
                 : { workflowFrame: completion, result: completion.summary }),
               onlyIfRunningInRun: subagent.task.runId,
+              deferWorkflowTranscripts: failure !== undefined,
             });
           }
           yield* Ref.update(interruptedTurns, (current) => {
@@ -7522,6 +7571,71 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           return subagent?.task.status === "running" ? settled : null;
         });
 
+        const startCompactionWatchdog = Effect.fn("ClaudeAdapterV2.startCompactionWatchdog")(
+          function* (context: ActiveClaudeTurnContext, liveQuery: ClaudeLiveQueryContext) {
+            yield* stopCompactionWatchdog(context);
+            const stop = yield* Deferred.make<void>();
+            context.compactionWatchdogStop = stop;
+            const compactionId = context.compaction?.id;
+            yield* Effect.gen(function* () {
+              let remaining = CLAUDE_COMPACTION_NO_PROGRESS_MS;
+              while (remaining > 0) {
+                yield* Effect.sleep(remaining);
+                remaining = yield* sdkMessageLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    if (
+                      (yield* Ref.get(activeTurn)) !== context ||
+                      (yield* Ref.get(queryContext)) !== liveQuery ||
+                      liveQuery.stopping ||
+                      turnFinalizations.has(context) ||
+                      context.compaction?.id !== compactionId ||
+                      context.compaction?.status !== "running"
+                    )
+                      return 0;
+                    const idle = (yield* Clock.currentTimeMillis) - context.lastSdkMessageAt;
+                    if (idle < CLAUDE_COMPACTION_NO_PROGRESS_MS)
+                      return CLAUDE_COMPACTION_NO_PROGRESS_MS - idle;
+                    // Fence this process before settling: a late result must not
+                    // complete the failed turn or deliver its queued steers.
+                    context.compactionWatchdogStop = null;
+                    liveQuery.stopping = true;
+                    yield* Ref.set(queryContext, null);
+                    // Close starts independently of both turn cleanup and
+                    // workflow transcript enrichment, including their failures.
+                    yield* liveQuery.query.close.pipe(
+                      Effect.timeout("10 seconds"),
+                      Effect.ignore,
+                      Effect.forkIn(sessionScope),
+                    );
+                    yield* Effect.gen(function* () {
+                      yield* finalizeActiveTurnAfterQueryExit(
+                        liveQuery,
+                        undefined,
+                        makeProviderFailure({
+                          class: "provider_error",
+                          category: "transient",
+                          code: "compaction_no_progress",
+                          message: "Claude compaction made no progress for 5 min.",
+                        }),
+                      );
+                      yield* endSubagentCallsOfClosedQuery(liveQuery, "failed");
+                    }).pipe(
+                      Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("orchestration-v2.claude-compaction-disposal-failed", {
+                          providerTurnId: context.providerTurnId,
+                          cause,
+                        }),
+                      ),
+                    );
+                    return 0;
+                  }).pipe(turnControlLock.withPermits(1)),
+                );
+              }
+            }).pipe(Effect.raceFirst(Deferred.await(stop)), Effect.forkIn(sessionScope));
+          },
+        );
+
         const handleSdkMessageFrame = Effect.fnUntraced(function* (input: {
           readonly query: ClaudeAgentSdkQuerySession;
           readonly message: SDKMessage;
@@ -7858,9 +7972,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 message.compact_result === "failed" ? { message: message.compact_error } : null;
             }
             if (context.compaction?.status === "running") {
+              yield* stopCompactionWatchdog(context);
               const now = yield* DateTime.now;
               context.compaction = {
                 ...context.compaction,
+                ...(message.compact_result === "success"
+                  ? {}
+                  : {
+                      summary:
+                        message.compact_error?.trim() ||
+                        (message.compact_result === "failed"
+                          ? "Claude compaction failed without a reason."
+                          : "Claude compaction ended without a result."),
+                    }),
                 status:
                   message.compact_result === "success"
                     ? "completed"
@@ -7922,6 +8046,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               } satisfies OrchestrationV2TurnItem);
             if (message.subtype === "status") {
               context.compaction = compaction;
+              yield* startCompactionWatchdog(context, liveQuery);
               yield* emitProviderEvent({
                 type: "turn_item.updated",
                 driver: CLAUDE_PROVIDER,
@@ -7929,6 +8054,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               });
               return;
             }
+            yield* stopCompactionWatchdog(context);
             if (context.streamUsage !== null) context.streamUsage.usage = null;
             const postTokens = message.compact_metadata.post_tokens;
             const afterTokenCount =
@@ -9082,6 +9208,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const message = input.message;
           const context = yield* Ref.get(activeTurn);
           const liveQuery = yield* Ref.get(queryContext);
+          if (context !== null && liveQuery?.query === input.query) {
+            context.lastSdkMessageAt = yield* Clock.currentTimeMillis;
+          }
           // A session can refuse during a native wake or before a prompt is admitted.
           // Record that exclusion before routing can hold or discard its turn frames.
           if (
@@ -9967,6 +10096,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               streamUsage: null,
               toolCalls: new Map(),
               compaction: null,
+              compactionWatchdogStop: null,
+              lastSdkMessageAt: yield* Clock.currentTimeMillis,
               ignoredTaskIds: new Set(),
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,

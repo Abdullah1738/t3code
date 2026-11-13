@@ -191,11 +191,12 @@ describe("createKanbanClient", () => {
   });
 
   it("reports a denied grant as false, so its control is disabled", () => {
-    const fake = fakeTransport(new Set(["kanban.pool.set"]));
+    const fake = fakeTransport(new Set(["kanban.pool.set", "kanban.script.acknowledge"]));
     const client = createKanbanClient(fake.transport);
     const registry = AtomRegistry.make();
     const read = (tag: KanbanRequestTag) => registry.get(client.permission(tag));
     expect(read("kanban.pool.set")).toBe(false);
+    expect(read("kanban.script.acknowledge")).toBe(false);
     expect(read("kanban.board.update")).toBe(true);
   });
 

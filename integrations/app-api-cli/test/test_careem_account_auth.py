@@ -41,6 +41,7 @@ class AccountAuthTest(unittest.TestCase):
             stack.enter_context(patch(target, side_effect=AssertionError('EXTERNAL_ACCESS_DENIED')))
         for name in ['load', 'store', '_transport']:
             stack.enter_context(patch.object(a, name, side_effect=AssertionError('UNMOCKED_BOUNDARY')))
+        stack.enter_context(patch.object(a.inbox_auth, 'expect', return_value=None))
 
     def otp_flow(self):
         with patch.object(a, 'guest_context', return_value=context()):

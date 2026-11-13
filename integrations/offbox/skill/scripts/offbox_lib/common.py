@@ -261,6 +261,7 @@ EXIT_HOME_DOWN = 93            # person-box work while the home server is down: 
 EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
+EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
@@ -420,7 +421,7 @@ CREATE INDEX IF NOT EXISTS leases_owner ON leases(owner, repo_root, state);
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, box_id TEXT, owner TEXT, session_id TEXT, thread_id TEXT,
   repo_root TEXT, cwd TEXT, cmd TEXT, size TEXT, mode TEXT,   -- fg | bg | local
-  process_id INTEGER, command_id TEXT,
+  process_id INTEGER, command_id TEXT, wrapper_pid INTEGER,
   status TEXT,                     -- starting | running | done | failed | killed | lost | infra
   exit_code INTEGER, start_at REAL, end_at REAL,
   sync_s REAL, setup_s REAL, sent_bytes INTEGER, log_path TEXT, error TEXT,
@@ -461,6 +462,19 @@ CAPACITY_SCHEMA = """
         CREATE TABLE IF NOT EXISTS pool_pending (
           token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL, source TEXT
         );
+        CREATE TABLE IF NOT EXISTS pool_waiters (
+          pool_key TEXT NOT NULL, token TEXT PRIMARY KEY, pid INTEGER, run_id TEXT,
+          queued_at REAL NOT NULL, source TEXT, size TEXT, reserved INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS pool_waiters_order ON pool_waiters(pool_key,queued_at);
+        CREATE TABLE IF NOT EXISTS pool_cap_callers (
+          token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, run_id TEXT, cap INTEGER NOT NULL,
+          granted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS pool_cap_callers_key ON pool_cap_callers(pool_key);
+        CREATE TABLE IF NOT EXISTS pool_caps (
+          pool_key TEXT PRIMARY KEY, cap INTEGER NOT NULL, set_by_pid INTEGER, set_at REAL NOT NULL
+        );
         -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
         -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
         CREATE TABLE IF NOT EXISTS prune_holds (
@@ -469,7 +483,7 @@ CAPACITY_SCHEMA = """
 """
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_TIMEOUT = 30
 
 
@@ -545,9 +559,14 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER"):
+                "client_pid INTEGER", "wrapper_pid INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    if 'wrapper_pid' not in have:
+        # Recovery used to copy the wrapper's OS PID into the API ID column. A command_id proves API provenance.
+        con.execute("UPDATE runs SET wrapper_pid=process_id,process_id=NULL WHERE process_id IS NOT NULL "
+                    "AND command_id IS NULL AND EXISTS (SELECT 1 FROM kv WHERE k IN "
+                    "('start_unattached:' || runs.run_id, 'start_unknown:' || runs.run_id))")
     # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
     for table in ("templates", "bases"):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}

@@ -65,6 +65,7 @@ export type ProjectCommandReceiptV2 = typeof ProjectCommandReceiptV2.Type;
 type AnyCommandReceiptV2 = CommandReceiptV2 | ProjectCommandReceiptV2;
 
 export interface CommandReceiptStoreV2Shape {
+  readonly findMcpThreadCreations: OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository["Service"]["findMcpThreadCreations"];
   readonly insertIfAbsent: (
     receipt: AnyCommandReceiptV2,
   ) => Effect.Effect<boolean, CommandReceiptStoreV2Error>;
@@ -137,6 +138,7 @@ const layerBase: Layer.Layer<
     const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
 
     return CommandReceiptStoreV2.of({
+      findMcpThreadCreations: receipts.findMcpThreadCreations,
       insertIfAbsent: (receipt) =>
         receipts.insertIfAbsent(toApplicationReceipt(receipt)).pipe(
           Effect.mapError(

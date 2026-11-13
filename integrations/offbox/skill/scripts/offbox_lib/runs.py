@@ -17,10 +17,10 @@ import traceback
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync
 from . import containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
-                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, local_error, log, new_id, now,
+                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      offsets_path, person, read_json, say, silence, write)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
@@ -1231,8 +1231,9 @@ class Runner:
         db_retry(register)
         self.registered = True
         if a.bg:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.log_path.touch()
+            with log_lock(self.run_id):
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log_path.touch()
         say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
         event(con, None, "run_pending", self.run_id)
         t0 = now()
@@ -1294,11 +1295,11 @@ class Runner:
                 if keeper_scope is not None and not keeper_scope.settled.is_set():
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
-        try:
-            w = node_version.want(self.root, self.cwd)
-            node_block = node_version.block(w) if w else ""
-        except Exception:
-            node_block = ""
+        w = node_version.want(self.root, self.cwd)
+        node_block = node_version.block(w) if w else ""
+        pm = pnpm_version.want(self.root, self.cwd)
+        if pm:
+            node_block += "\n" + pnpm_version.block(pm)
         new_checkout_hint(row, self.root)
         warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
         if warning:
@@ -1339,12 +1340,12 @@ class Runner:
                 time.sleep(start_check.GRACE_S)
                 result = start_check.check(self.box, self.run_id)
                 if result.code is not None:
-                    self.pid, self.recovered_code = result.pid, result.code
+                    self.recovered_code = result.code
                     self.remote_code = result.code
-                    save_run_state(self.run_id, box_id=self.box, process_id=self.pid,
+                    save_run_state(self.run_id, box_id=self.box, wrapper_pid=result.pid,
                                    status='done' if result.code == 0 else 'failed', exit_code=result.code, end_at=now())
                     try:
-                        self.record(process_id=self.pid, status='running')
+                        self.record(wrapper_pid=result.pid, status='running')
                     except sqlite3.Error as error:
                         state_warning(self.run_id, result.code, error)
                     say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
@@ -1650,6 +1651,13 @@ def _status_code(st: dict) -> int | None:
 def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None) -> dict | None:
     """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
     request, no retries, never past the caller's deadline; any error counts as not ended."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            return None
     try:
         left = 60.0 if until is None else max(1.0, min(60.0, until - now()))
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
@@ -1715,14 +1723,75 @@ def run_kind(cmd_text: str) -> str:
     return " ".join(words[:2])[:60] or "?"
 
 
+_log_locks = threading.local()
+
+
+@contextlib.contextmanager
+def log_lock(run_id: str, timeout: float = 600, *, until: float | None = None):
+    """Serialize one run's log writers. Callers needing a box lock must acquire it first.
+
+    Reentrant within a thread so takeover publication and finalization can use follow/finish safely.
+    The zero-timeout file-lock attempts keep the retry pause within an interactive reader's budget.
+    """
+    held = getattr(_log_locks, 'held', set())
+    if run_id in held:
+        yield False
+        return
+    deadline = now() + timeout
+    if until is not None:
+        deadline = min(deadline, until)
+    waited = False
+    while True:
+        guard = file_lock('log-' + run_id, timeout=0)
+        try:
+            guard.__enter__()
+            break
+        except OffboxError:
+            left = deadline - now()
+            if left <= 0:
+                if until is not None and now() >= until:
+                    raise OffboxError(f"--timeout reached; {run_id} was not stopped. "
+                                      f"Wait again: offbox wait {run_id}", code=EXIT_WAIT_TIMEOUT)
+                raise
+            waited = True
+            time.sleep(min(0.1, left))
+    _log_locks.held = held
+    held.add(run_id)
+    try:
+        yield waited
+    finally:
+        held.remove(run_id)
+        guard.__exit__(None, None, None)
+
+
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
-           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0) -> int | None:
+           replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
+           receipt_locked: bool = False) -> int | None:
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
     The per-stream offsets are saved beside the local log after every chunk, so a waiter that takes over a dead
     holder's follow resumes from them (see offsets_path) instead of replaying output."""
+    if run_id:
+        from . import start_check
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            unattached = row and not start_check.api_pid(con, row) and start_check.recovery_marked(con, row)
+        if unattached:
+            from .misc import _wait_start_receipt
+            row = _wait_start_receipt(row, until, locked=receipt_locked)
+            if row['status'] not in ('starting', 'running'):
+                return row['exit_code']
+            pid = row['process_id']
+    guard = log_lock(run_id or Path(log_path).stem, until=until) if log_path else contextlib.nullcontext()
+    with guard:
+        return _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
+                              replay_path, mirror_path, mirror_keep)
+
+
+def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
+                   replay_path, mirror_path, mirror_keep):
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -2227,16 +2296,17 @@ def _detach(rn, signum) -> int:
     rn.record(mode='bg')
     message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "
                f"Re-attach: offbox wait {rn.run_id}")
-    rn.log_path.parent.mkdir(parents=True, exist_ok=True)
-    ck = read_json(offsets_path(rn.log_path), {})
-    with open(rn.log_path, 'ab') as f:
-        # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
-        if ck:
-            f.truncate(ck['logBytes'])
-            f.seek(0, os.SEEK_END)
-        f.write(f"\noffbox: {message}\n".encode())
-        length = f.tell()
-    _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
+    with log_lock(rn.run_id):
+        rn.log_path.parent.mkdir(parents=True, exist_ok=True)
+        ck = read_json(offsets_path(rn.log_path), {})
+        with open(rn.log_path, 'ab') as f:
+            # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
+            if ck:
+                f.truncate(ck['logBytes'])
+                f.seek(0, os.SEEK_END)
+            f.write(f"\noffbox: {message}\n".encode())
+            length = f.tell()
+        _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
     say(message)
     log(message)
     try:
@@ -2276,7 +2346,7 @@ def _run_remote(a, rn) -> int:
             from . import start_check
             con = db()
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
-            start_check.settle(con, row, start_check.Result('started', rn.recovered_code, rn.pid),
+            start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
                                'start receipt recovered')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)

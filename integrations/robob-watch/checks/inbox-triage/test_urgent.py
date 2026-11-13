@@ -84,7 +84,8 @@ sys.exit(int(os.environ.get('NOTIFY_EXIT', '0')))
         text = calls[0][calls[0].index('--text') + 1]
         self.assertLessEqual(len(text), 300)
         self.assertNotIn('123456', text)
-        self.assertIn('Please review this activity', text)
+        self.assertIn('Security:', text)
+        self.assertNotIn(hit['sender'], text)
         self.assertIn('telegram_sent_at', report['hits'][0])
         self.assertEqual(event, '')  # no raw event for the runner to send to Telegram a second time
         followup = t.event_text('batch.json', report['hits'], {})

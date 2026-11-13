@@ -93,7 +93,7 @@ class MissingDepsTests(unittest.TestCase):
             ({'pnpm-lock.yaml'}, 'bun@1.3.0', 'bun install --frozen-lockfile'),
             ({'pnpm-lock.yaml', 'package-lock.json'}, 'npm@11.0.0', 'npm ci'),
             ({'pnpm-lock.yaml'}, 'npm@11.0.0', 'npm ci'),
-            ({'pnpm-lock.yaml', 'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'corepack pnpm install --frozen-lockfile'),
+            ({'pnpm-lock.yaml', 'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'corepack pnpm@10 install --frozen-lockfile'),
             ({'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'corepack yarn install --frozen-lockfile'),
             ({'bun.lockb'}, None, 'bun install --frozen-lockfile'),
             ({'bun.lock'}, None, 'bun install --frozen-lockfile'),
@@ -101,7 +101,7 @@ class MissingDepsTests(unittest.TestCase):
             ({'package-lock.json'}, None, 'npm ci'),
             ({'npm-shrinkwrap.json'}, None, 'npm ci'),
             (set(), None, 'npm install'),
-            ({'pnpm-lock.yaml'}, 'unknown@1', 'corepack pnpm install --frozen-lockfile'),
+            ({'pnpm-lock.yaml'}, 'unknown@1', 'corepack pnpm@10 install --frozen-lockfile'),
             ({'package-lock.json'}, '', 'npm ci'),
         ]
         for files, manager, install in cases:
@@ -109,7 +109,7 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / 'package.json').write_text(json.dumps({'packageManager': manager}))
                 for name in files:
-                    (root / name).touch()
+                    (root / name).write_text("lockfileVersion: '9.0'\n" if name == 'pnpm-lock.yaml' else '')
                 hint = runs.missing_deps_hint(root)
                 self.assertIn(f"offbox run -- '{install} && <command>'", hint)
                 self.assertIn('offbox save --default', hint)
@@ -124,7 +124,7 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 pin = 'yarn@4.0.0' + suffix
                 (root / 'package.json').write_text(json.dumps({'packageManager': pin}))
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 expected = f'corepack {pin} install --immutable'
                 self.assertIn(expected, runs.missing_deps_hint(root))
                 err = io.StringIO()
@@ -147,7 +147,7 @@ class MissingDepsTests(unittest.TestCase):
                         else:
                             block = '  - ' + block.lstrip()
                         (root / '.github/workflows/ci.yml').write_text('steps:\n' + block)
-                        (root / 'pnpm-lock.yaml').touch()
+                        (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                         self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_ci_action_with_nonstandard_child_indent(self):
@@ -157,7 +157,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with:\n' + ' ' * spaces + 'version: 10.18.0\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_block_scalar_text_cannot_invent_ci_pins(self):
@@ -169,7 +169,7 @@ class MissingDepsTests(unittest.TestCase):
                     body = '\n'.join('      ' + line for line in fake.splitlines())
                     workflow = 'steps:\n  - run: ' + style + '\n' + body + '\n  - uses: pnpm/action-setup@v4\n    with:\n      version: 10\n'
                     (root / '.github/workflows/ci.yml').write_text(workflow)
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     self.assertIn('corepack pnpm@10 install', runs.missing_deps_hint(root))
 
     def test_npm_and_bun_pins_are_printed_in_both_hints(self):
@@ -196,7 +196,7 @@ class MissingDepsTests(unittest.TestCase):
                         settings = (indent + 'with: { version: "10.18.0" }\n' if inline else
                                     indent + 'with:\n' + indent + '  version: 10.18.0\n')
                         (root / '.github/workflows/ci.yml').write_text('steps:\n' + uses + settings)
-                        (root / 'pnpm-lock.yaml').touch()
+                        (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                         self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_explicit_url_descriptor_keeps_manager_and_requests_inspection(self):
@@ -208,7 +208,8 @@ class MissingDepsTests(unittest.TestCase):
                 (root / ('yarn.lock' if manager == 'pnpm' else 'pnpm-lock.yaml')).touch()
                 hint = runs.missing_deps_hint(root)
                 self.assertIn(f'packageManager declares {manager} with a non-numeric descriptor', hint)
-                self.assertIn(f"{'corepack ' if manager in ('yarn', 'pnpm') else ''}{manager} ", hint)
+                self.assertIn('<repo-install>' if manager == 'pnpm' else
+                              f"{'corepack ' if manager == 'yarn' else ''}{manager} ", hint)
                 self.assertNotIn('https://', hint)
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
@@ -225,10 +226,10 @@ class MissingDepsTests(unittest.TestCase):
                     if real:
                         workflow += '  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n'
                     (root / '.github/workflows/ci.yml').write_text(workflow)
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     hint = runs.missing_deps_hint(root)
                     self.assertNotIn('pnpm@26', hint)
-                    self.assertIn('corepack pnpm@10.18.0 install' if real else 'corepack pnpm install', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real else 'corepack pnpm@10 install', hint)
 
     def test_flow_mapping_version_with_other_keys_and_nested_values(self):
         for fields in ('version: 10.18.0, run_install: false',
@@ -241,7 +242,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with: {' + fields + '}\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_scalar_name_with_variable_dash_spacing_preserves_sibling_keys(self):
@@ -254,7 +255,7 @@ class MissingDepsTests(unittest.TestCase):
                     workflow = ('steps:\n  -' + ' ' * spacing + 'name: ' + style + '\n' + indent + '  Setup pnpm\n' +
                                 indent + 'uses: pnpm/action-setup@v4\n' + indent + 'with: {version: 10.18.0}\n')
                     (root / '.github/workflows/ci.yml').write_text(workflow)
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_all_scalar_key_styles_and_plain_continuations_are_opaque(self):
@@ -267,7 +268,7 @@ class MissingDepsTests(unittest.TestCase):
                     workflow = ('steps:\n  - ' + key + ': ' + value + '\n      PNPM_VERSION: 26\n' + close +
                                 '  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
                     (root / '.github/workflows/ci.yml').write_text(workflow)
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_flow_trailing_comment_does_not_change_fields(self):
@@ -277,7 +278,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0} ' + comment + '\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_literal_config_keys_can_be_quoted(self):
@@ -285,7 +286,7 @@ class MissingDepsTests(unittest.TestCase):
             with self.subTest(quote=quote), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 workflow = ('steps:\n  - ' + quote + 'uses' + quote + ': pnpm/action-setup@v4\n    ' +
                             quote + 'with' + quote + ':\n      ' + quote + 'version' + quote + ': 10.18.0\n')
                 (root / '.github/workflows/ci.yml').write_text(workflow)
@@ -303,7 +304,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n      ' + contents + '\n    }\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_scalar_body_can_start_after_the_key_line(self):
@@ -318,7 +319,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - run:\n      ' + value + '\n  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_quotes_in_plain_scalars_cannot_keep_comment_pins(self):
@@ -334,10 +335,10 @@ class MissingDepsTests(unittest.TestCase):
                         fields += '      version: 10.18.0\n'
                     (root / '.github/workflows/ci.yml').write_text(
                         'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n' + fields + '    }\n')
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     hint = runs.missing_deps_hint(root)
                     self.assertNotIn('pnpm@26', hint)
-                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm install', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm@10 install', hint)
 
     def test_colon_in_plain_scalar_is_not_a_quote_boundary(self):
         for quote in ("'", '"'):
@@ -350,10 +351,10 @@ class MissingDepsTests(unittest.TestCase):
                         field += '      version: 10.18.0\n'
                     (root / '.github/workflows/ci.yml').write_text(
                         'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n' + field + '    }\n')
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     hint = runs.missing_deps_hint(root)
                     self.assertNotIn('pnpm@26', hint)
-                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm install', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm@10 install', hint)
 
     def test_compact_quoted_key_value_mapping_retains_version(self):
         for quote in ("'", '"'):
@@ -362,7 +363,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with: {' + quote + 'version' + quote + ':' + quote + '10.18.0' + quote + '}\n')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_vite_plus_repo_installs_with_its_manager_not_vp(self):
@@ -392,7 +393,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yaml').write_text(workflow)
                 (root / 'package.json').write_text(json.dumps({'engines': {'node': '^20.19.0 || >=22.12.0 <23'}}))
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 hint = runs.missing_deps_hint(root)
                 pin = '10.18.0' if '10.18.0' in workflow else '10'
                 self.assertIn(f'corepack pnpm@{pin} install --frozen-lockfile', hint)
@@ -409,7 +410,7 @@ class MissingDepsTests(unittest.TestCase):
                 self.assertIn('corepack pnpm@11.7.0 ', runs.missing_deps_hint(root))
 
     def test_ci_setup_expressions_defer_both_hints(self):
-        expressions = ('matrix.pnpm', 'env.PNPM_VERSION', 'env.OTHER_VERSION',
+        expressions = ('matrix.pnpm', 'env.OTHER_VERSION',
                        'inputs.pnpm', 'needs.setup.outputs.pnpm')
         for expression in expressions:
             for layout in ('block', 'flow', 'quoted-flow'):
@@ -427,7 +428,7 @@ class MissingDepsTests(unittest.TestCase):
                                 ''.join('    ' + line for line in settings.splitlines(keepends=True)))
                     (root / '.github/workflows/ci.yml').write_text(workflow)
                     (root / 'package.json').write_text('{}')
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
@@ -460,16 +461,16 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(workflow)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
                     runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
-                    self.assertIn('<repo-install>' if inspect else 'corepack pnpm install', hint)
+                    self.assertIn('<repo-install>' if inspect else 'corepack pnpm@10 install', hint)
                     self.assertEqual('CI pnpm version is ambiguous' in hint, inspect)
-                    self.assertNotIn('pnpm@', hint)
+                    self.assertEqual('pnpm@' in hint, not inspect)
 
     def test_ci_expression_in_another_workflow_blocks_literal_selection(self):
         for dynamic in ("version: ${{ matrix.pnpm }}", "version: nightly", "version:"):
@@ -480,7 +481,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows/check.yaml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with:\n      ' + dynamic + '\n')
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -510,7 +511,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows/ci.yml').write_text(
                     "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -538,7 +539,7 @@ class MissingDepsTests(unittest.TestCase):
                         "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
                         key + ': ' + quote + value + quote + '\n')
                     (root / 'package.json').write_text('{}')
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
@@ -559,7 +560,7 @@ class MissingDepsTests(unittest.TestCase):
                     ": {PNPM_VERSION: '${{ matrix.pnpm }}'}\n    strategy:\n      matrix:\n        pnpm: [11]\n"
                     "    steps:\n      - run: corepack pnpm@${{ env.PNPM_VERSION }} install --frozen-lockfile\n")
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -594,7 +595,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows/ci.yml').write_text(
                     "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -611,7 +612,7 @@ class MissingDepsTests(unittest.TestCase):
             (root / '.github/workflows').mkdir(parents=True)
             (root / '.github/workflows/ci.yml').write_text(
                 'steps:\n  -\n    uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
-            (root / 'pnpm-lock.yaml').touch()
+            (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
             self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
 
     def test_complex_step_containers_require_inspection(self):
@@ -629,7 +630,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + container)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -651,7 +652,7 @@ class MissingDepsTests(unittest.TestCase):
                         "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
                         key + ':\n      ' + value + '\n')
                     (root / 'package.json').write_text('{}')
-                    (root / 'pnpm-lock.yaml').touch()
+                    (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
@@ -695,7 +696,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
@@ -726,7 +727,7 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
                 (root / 'package.json').write_text('{}')
-                (root / 'pnpm-lock.yaml').touch()
+                (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()

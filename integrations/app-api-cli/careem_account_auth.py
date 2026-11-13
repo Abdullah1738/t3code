@@ -4,6 +4,7 @@ Mutations run only through explicit bootstrap/refresh commands. No browser or
 phone integration. Account material never appears in CLI output or argv.
 """
 import argparse
+import inbox_auth
 import base64
 from contextlib import contextmanager
 import copy
@@ -321,6 +322,7 @@ class Bootstrap:
         guard = solve_pow(config)
         body = {'client_id': self.context['client_id'], 'identifier': self.phone,
                 'type': 'SMS', 'locale': 'en', 'multiTimeUse': False, 'guard': guard}
+        inbox_auth.expect(('Careem',))
         # Mark before send: an ambiguous timeout must not cause duplicate OTP.
         self.otp_sent = True
         started = time.monotonic()

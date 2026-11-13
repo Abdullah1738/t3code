@@ -1,12 +1,14 @@
 """Durable local HTTP-commerce ownership and at-most-once operations.
 
 No network, credentials, raw cart/payment payloads, retry, reset or cancellation.
-An unknown send retains account ownership; a different flow ID cannot escape it.
+An unknown send remains consumed on its flow; new noon flows remain independent.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import inbox_auth
 import owner_go
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -81,6 +83,16 @@ SCHEMA = {**SCHEMA,
     'duplicate_closures': '''CREATE TABLE duplicate_closures (
         flow_id TEXT PRIMARY KEY, closed_at REAL NOT NULL,
         evidence TEXT NOT NULL, evidence_hash TEXT NOT NULL)''',
+}
+
+SCHEMA_V3 = SCHEMA.copy()
+SCHEMA = {**SCHEMA,
+    'active_account': """CREATE UNIQUE INDEX active_account
+        ON flows(app, account_hash) WHERE app != 'noon' AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') """,
+    'baskets': """CREATE TABLE baskets (
+        flow_id TEXT PRIMARY KEY, vertical TEXT NOT NULL, account_hash TEXT NOT NULL,
+        basket_hash TEXT NOT NULL, card_last4 TEXT NOT NULL, acknowledgements TEXT NOT NULL,
+        legacy_scopes TEXT NOT NULL, approval_minor INTEGER)""",
 }
 
 
@@ -215,8 +227,48 @@ def _stat(path, directory=False):
     return info
 
 
+_READ_ONLY = ContextVar('commerce_journal_read_only', default=False)
+
+
+@contextmanager
+def read_only():
+    """Use validated in-memory snapshots, without creating or migrating live state."""
+    token = _READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
+
+
+@contextmanager
+def _read_db():
+    db = sqlite3.connect(':memory:')
+    try:
+        _stat(ROOT.parent, True)
+        _stat(ROOT, True)
+        path = ROOT / 'journal.sqlite'
+        _stat(path)
+        db.deserialize(_snapshot(path))
+        db.row_factory = sqlite3.Row
+        objects = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'"))
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                or (version == 4 and _schema_matches(objects, SCHEMA))):
+            fail('JOURNAL_SCHEMA_UNSUPPORTED')
+        db.execute('PRAGMA query_only=ON')
+        yield db
+    except sqlite3.Error:
+        fail('JOURNAL_READ_ONLY_OR_UNAVAILABLE')
+    finally:
+        db.close()
+
+
 @contextmanager
 def _db():
+    if _READ_ONLY.get():
+        with _read_db() as snapshot:
+            yield snapshot
+        return
     db = None
     try:
         _stat(ROOT.parent, True)
@@ -241,23 +293,29 @@ def _db():
         objects = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'"))
         version = db.execute('PRAGMA user_version').fetchone()[0]
         if not objects and version == 0 and before.st_size == 0:
-            for statement in SCHEMA.values():
+            for statement in SCHEMA_V3.values():
                 db.execute(statement)
             db.execute('PRAGMA user_version=3')
         elif version == 1 and any(_schema_matches(objects, expected) for expected in
                 (SCHEMA_V1, {**SCHEMA_V1, 'active_account': LEGACY_ACTIVE_ACCOUNT})):
             db.execute('DROP INDEX active_account')
-            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA_V3['active_account'])
             db.execute(SCHEMA['owner_attestations'])
             db.execute(SCHEMA['duplicate_closures'])
             db.execute('PRAGMA user_version=3')
         elif version == 2 and _schema_matches(objects, SCHEMA_V2):
             db.execute('DROP INDEX active_account')
-            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA_V3['active_account'])
             db.execute(SCHEMA['duplicate_closures'])
             db.execute('PRAGMA user_version=3')
-        elif version != 3 or not _schema_matches(objects, SCHEMA):
+        elif not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                  or (version == 4 and _schema_matches(objects, SCHEMA))):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
+        if db.execute('PRAGMA user_version').fetchone()[0] == 3:
+            db.execute('DROP INDEX active_account')
+            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA['baskets'])
+            db.execute('PRAGMA user_version=4')
         yield db
         db.execute('COMMIT')
         for directory in (ROOT, ROOT.parent):
@@ -294,7 +352,7 @@ def _active(row):
 
 
 def open_flow(*, flow_id, app, vertical, account_hash, scope_hash):
-    """Claim the account for a specific new intent; never adopts an existing flow."""
+    """Open a new intent; never adopts an existing flow."""
     _flow(flow_id)
     if (type(app) is not str or app not in VERTICALS or type(vertical) is not str
             or vertical not in VERTICALS[app] or not _hash(account_hash) or not _hash(scope_hash)):
@@ -356,6 +414,9 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                                  amount=payable_minor, currency='AED')
             except owner_go.ApprovalError:
                 fail('OWNER_GO_REQUIRED')
+        if financial and flow['app'] == 'noon':
+            from commerce_pending import require_acknowledged
+            require_acknowledged(db, flow)
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')
@@ -411,6 +472,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                 fail('JOURNAL_PAYMENT_ALREADY_REPORTED')
         db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                    (flow_id, operation, kind, request_hash, 'MAY_HAVE_SENT', time.time()))
+        if financial and flow['app'] == 'noon':
+            inbox_auth.expect_payment(order_card.LAST4)
     return True
 
 
@@ -865,8 +928,7 @@ def release_preparation(flow_id, operation, *, evidence_hash):
 def release(flow_id, *, evidence_hash):
     """Terminal evidence-reviewed closure of a fenced never-paid flow.
 
-    The journal's permanent fence exists because an unknown send keeps
-    account ownership. When the exact merchant state later proves the order
+    An unknown send stays consumed. When exact merchant state later proves the order
     dead (failed/cancelled, not active, intent never captured) and no payment
     continuation was ever consumed, the caller may release THIS fence after
     gathering that evidence. The reservation stays counted; no order ID is
@@ -1268,7 +1330,7 @@ def _snapshot(path, tries=20):
 
 
 def open_payments(*, since_seconds=1800, now=None):
-    """All account-blocking flows, including ACTIVE preparations. Read only.
+    """Unresolved flows, including ACTIVE preparations. Read only.
 
     since_seconds is retained for CLI compatibility; unresolved fences do not
     disappear with age, and a preparation never authorizes a bank prompt.
@@ -1285,7 +1347,9 @@ def open_payments(*, since_seconds=1800, now=None):
         # code fully understands may give it.
         objects = {r['name']: r['sql'] for r in db.execute(
             "SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'")}
-        if db.execute('PRAGMA user_version').fetchone()[0] != 3 or not _schema_matches(objects, SCHEMA):
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                or (version == 4 and _schema_matches(objects, SCHEMA))):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
@@ -1544,13 +1608,18 @@ def adopt_stable_cart(new_flow_id, old_flow_id, cart_hash, *, evidence_hash):
 
 
 def require_account_available(app, account_hash, *, flow_id=None):
-    """Reject a fenced/owned account before preparing a new remote operation.
-
-    Reads remain available independently. This does not release, reset, or adopt
-    an existing flow; consume() repeats the check atomically before every send.
-    """
+    """Noon fences constrain their own flow; legacy apps retain account ownership."""
     if app not in VERTICALS or not _hash(account_hash):fail('JOURNAL_SCOPE_INVALID')
     if flow_id is not None:_flow(flow_id)
+    if app == 'noon':
+        if flow_id is not None:
+            with _db() as db:
+                row = db.execute('SELECT * FROM flows WHERE id=?', (flow_id,)).fetchone()
+                if row is not None:
+                    if row['app'] != app or row['account_hash'] != account_hash:
+                        fail('JOURNAL_SCOPE_INVALID')
+                    _active(row)
+        return True
     with _db() as db:
         active=db.execute("SELECT id,state FROM flows WHERE app=? AND account_hash=? "
                           "AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE')",

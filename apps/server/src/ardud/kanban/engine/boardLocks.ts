@@ -127,6 +127,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             Effect.die(
               new KanbanError({
                 code: "conflict",
+                saved: op.committed ? null : false,
                 detail: op.committed
                   ? MAY_HAVE_APPLIED
                   : "Board busy: not written. Safe to retry once.",
