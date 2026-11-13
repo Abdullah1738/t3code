@@ -132,6 +132,18 @@ for __offbox_d in "$HOME"/.nvm/versions/node/v*; do
   esac
 done
 __offbox_choice='newest nvm'
+if [ "$__offbox_default" = system ]; then
+  __offbox_path=; __offbox_sep=; __offbox_tail=$PATH:
+  while [[ "$__offbox_tail" == *:* ]]; do
+    __offbox_entry=${__offbox_tail%%:*}; __offbox_tail=${__offbox_tail#*:}
+    case "$__offbox_entry" in "$HOME"/.nvm/versions/node/*/bin) continue ;; esac
+    __offbox_path=$__offbox_path$__offbox_sep$__offbox_entry; __offbox_sep=:
+  done
+  export PATH=$__offbox_path
+  hash -r 2>/dev/null || :
+  __offbox_best=
+  __offbox_preferred=
+fi
 if [ -n "$__offbox_preferred" ]; then
   __offbox_best=$__offbox_preferred
   __offbox_choice='nvm default'
@@ -143,9 +155,13 @@ if [ -n "$__offbox_best" ]; then
 else
   __offbox_cur=$(node --version 2>/dev/null) || __offbox_cur=none
   __offbox_command=$(command -v node) || __offbox_command=unavailable
-  echo "offbox: node $__offbox_cur (no pin; box default $__offbox_command)" >&2
+  if [ "$__offbox_default" = system ]; then
+    echo "offbox: node $__offbox_cur (no pin; nvm default system $__offbox_command)" >&2
+  else
+    echo "offbox: node $__offbox_cur (no pin; box default $__offbox_command)" >&2
+  fi
 fi
-unset __offbox_default __offbox_best __offbox_bk __offbox_preferred __offbox_pk __offbox_d __offbox_v __offbox_k __offbox_choice __offbox_cur __offbox_command
+unset __offbox_default __offbox_best __offbox_bk __offbox_preferred __offbox_pk __offbox_d __offbox_v __offbox_k __offbox_choice __offbox_cur __offbox_command __offbox_path __offbox_sep __offbox_tail __offbox_entry
 """
 
 
@@ -314,6 +330,50 @@ def _want(root, cwd):
     return None
 
 
+def _ci_values(text):
+    entries = []
+    list_indent = scalar_indent = None
+    flow = ''
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if scalar_indent is not None:
+            if not line.strip() or indent > scalar_indent:
+                continue
+            scalar_indent = None
+        # Script/heredoc bodies are YAML data, not workflow keys.
+        scalar = re.match(r'^(\s*)(-\s+)?[^#]+:\s*[|>][0-9+-]*\s*(?:#.*)?$', line)
+        if scalar:
+            scalar_indent = len(scalar[1]) + len(scalar[2] or '')
+            list_indent = None
+            continue
+        clean = re.sub(r'\$\{\{.*?\}\}', 'EXPRESSION', line.split('#', 1)[0])
+        value = clean.strip()
+        if flow:
+            flow += ' ' + value
+            if flow.endswith(']'):
+                entries.extend(flow[1:-1].split(','))
+                flow = ''
+            continue
+        match = re.match(r"^(\s*)(?:['\"]node-version['\"]|node-version):\s*(.*)$", clean)
+        if match:
+            value = match[2].strip()
+            list_indent = len(match[1]) if not value else None
+            if value.startswith('['):
+                if value.endswith(']'):
+                    entries.extend(value[1:-1].split(','))
+                else:
+                    flow = value
+            else:
+                entries.append(value)
+        elif list_indent is not None and value:
+            item = re.match(r'^(\s*)-\s+(.+)$', clean)
+            if item and len(item[1]) >= list_indent:
+                entries.append(item[2].strip())
+            else:
+                list_indent = None
+    return entries
+
+
 def _ci_want(root):
     signals = []
     workflows = root / '.github/workflows'
@@ -321,22 +381,8 @@ def _ci_want(root):
         text = _read(path)
         if text is None:
             continue
-        entries = []
-        list_indent = None
-        for line in text.splitlines():
-            match = re.match(r"^(\s*)(?:['\"]node-version['\"]|node-version):\s*(.*)$", line)
-            if match:
-                value = match[2].split('#', 1)[0].strip()
-                list_indent = len(match[1]) if not value else None
-                entries.extend(value[1:-1].split(',') if value.startswith('[') and value.endswith(']') else [value])
-            elif list_indent is not None and line.strip() and not line.lstrip().startswith('#'):
-                item = re.match(r'^(\s*)-\s+(.+)$', line)
-                if item and len(item[1]) > list_indent:
-                    entries.append(item[2].split('#', 1)[0].strip())
-                else:
-                    list_indent = None
         ranges, versions = [], []
-        for value in entries:
+        for value in _ci_values(text):
             value = value.strip().strip("'\"")
             if not value or '${{' in value:
                 continue

@@ -137,6 +137,37 @@ class WantTests(unittest.TestCase):
                 self.assertEqual(ranges, expected)
                 self.assertIn('.github/workflows/ci.yml node-version', label)
 
+    def test_matrix_list_layouts(self):
+        for layout in [
+            '[20, 22]',
+            "['20', '22']",
+            '\n          - 20\n          - 22',
+            '\n        - 20\n        - 22',
+            '[\n          20,\n          22\n        ]',
+            "[20,\n          '22',\n        ]",
+            "[20, ${{ matrix['node'] }}, 22]",
+        ]:
+            with self.subTest(layout=layout):
+                self.write('.github/workflows/ci.yml', f'        node-version: {layout}\n')
+                self.assertEqual(node_version.want(self.root, self.root)[0], [(K(20), K(21)), (K(22), K(23))])
+
+    def test_yaml_scalar_bodies_are_not_workflow_keys(self):
+        for style in ['|', '|-', '|+', '|2', '>', '>-', '>+']:
+            for script_first in [True, False]:
+                with self.subTest(style=style, script_first=script_first):
+                    script = f'      - run: {style}\n          cat <<EOF\n          node-version: 24\n          EOF\n'
+                    setup = '      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n'
+                    self.write('.github/workflows/ci.yml', script + setup if script_first else setup + script)
+                    self.assertEqual(node_version.want(self.root, self.root)[0], [(K(22), K(23))])
+
+    def test_step_scalar_preserves_sibling_setup_node_keys(self):
+        for style in ['|', '|-', '|+', '|2', '>', '>-', '>+']:
+            with self.subTest(style=style):
+                self.write('.github/workflows/ci.yml',
+                           f'      - name: {style}\n          A multiline step name\n          node-version: 24\n'
+                           '        uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
+                self.assertEqual(node_version.want(self.root, self.root)[0], [(K(22), K(23))])
+
     def test_ci_ignored_forms_and_no_files(self):
         self.assertIsNone(node_version.want(self.root, self.root))
         self.assertIn('no pin;', node_version.block(None))
@@ -222,6 +253,19 @@ class NoPinTests(unittest.TestCase):
                 (alias / 'lts/jod').write_text('v22.13.0\n')
                 result, _ = self.run_no_pin(home)
                 self.assertEqual(result.stdout.splitlines()[-1], expected)
+
+    def test_system_default_removes_inherited_nvm_paths(self):
+        for inherited in [False, True]:
+            with self.subTest(inherited=inherited), tempfile.TemporaryDirectory() as home:
+                fake_nvm(home, ('v22.13.0', 'v24.1.0'))
+                alias = Path(home) / '.nvm/alias/default'
+                alias.parent.mkdir(parents=True)
+                alias.write_text('system\n')
+                before = f'export PATH="{home}/.nvm/versions/node/v22.13.0/bin:$PATH"\n' if inherited else ''
+                result, original = self.run_no_pin(home, before=before)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [original, 'v24.22.1'])
+                self.assertIn(f'(no pin; nvm default system {home}/box/bin/node)', result.stderr)
 
     def test_box_default_keeps_path_and_names_executable(self):
         with tempfile.TemporaryDirectory() as home:
