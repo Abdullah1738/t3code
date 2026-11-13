@@ -844,6 +844,8 @@ class DueDates(Base):
 
 
 class Brief(Base):
+    PAN_LENGTHS = ((13, '6'), (14, '2'), (15, '6'), (16, '2'), (17, '6'), (18, '2'), (19, '6'))
+
     def test_lists_due_and_changed_only(self):
         self.assertEqual(mc.brief([], at('2026-10-24T08:00')), '')
         self.case('acme', deadline='2026-10-25', when=at('2026-10-20T09:00'))
@@ -1014,6 +1016,31 @@ class Brief(Base):
         self.assertNotIn('\n', line)
         self.assertIn('[card number removed]', line)
         self.assertIn('[secret removed]', line)
+
+    def test_brief_redacts_pan_ids_at_every_supported_length(self):
+        for length, checksum in self.PAN_LENGTHS:
+            with self.subTest(length=length):
+                number = '4' + '0' * (length - 2) + checksum
+                self.watcher(number, 'active')
+                self.case(number, merchant=f'Length {length}', watchers=[number])
+                mc.close(self.data, number, 'resolved')
+                closed = mc.find(mc.load(self.data), number)
+                refund = dict(closed, status='open', state='refund to 5542', watchers=[])
+                line = mc.brief([closed, refund], root=self.root, cancelled={'5542'})
+                self.assertFalse(number in line, 'brief leaked a synthetic PAN')
+                self.assertEqual(line.count('[card number removed]'), 3)
+                self.assertTrue('closed but watcher running:' in line)
+                self.assertTrue('refund to cancelled card 5542:' in line)
+
+    def test_pan_redaction_handles_grouping_at_every_supported_length(self):
+        for length, checksum in self.PAN_LENGTHS:
+            number = '4' + '0' * (length - 2) + checksum
+            for form, separator in (('plain', ''), ('spaces', ' '), ('hyphens', '-')):
+                with self.subTest(length=length, form=form):
+                    grouped = separator.join(number[i:i + 4] for i in range(0, length, 4))
+                    output = mc.redact(f'case {grouped}; card ending 5542')
+                    self.assertTrue(output == 'case [card number removed]; card ending 5542',
+                                    'redaction leaked a synthetic PAN or removed the last-4')
 
     def test_cli_brief_includes_both_parts(self):
         self.watcher('refund-reply', 'active')
