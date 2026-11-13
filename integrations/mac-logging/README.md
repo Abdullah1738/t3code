@@ -25,7 +25,7 @@ roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
 time with a 15 s child timeout. Roots rotate by their last attempt, and each
 gets at most 60 s. The collector
 also limits the scan to the time remaining in its five-minute run budget,
-running crash collection first (at most 165 s), then the disk tooling probe and
+running crash collection first (at most 165 s), then disk-wait collection, the disk tooling probe and
 inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
@@ -144,7 +144,8 @@ individually; each report source logs `unreadableCount` without file contents.
 `collector.main` sets a 290 s absolute work deadline, leaving ten seconds for
 state/log overhead within five minutes. Crash collection has at most 165 s for
 three 10 s report sources, the shared 135 s log budget, and daily rollup. The disk
-tooling probe follows, then inventory uses the remaining absolute budget.
+wait check follows with at most 45 s for ps and alerts, shortened to the remaining
+absolute budget. The disk tooling probe follows, then inventory uses what remains.
 No log command starts once its shared budget is exhausted. No live configuration
 or schedule change is needed for this order.
 
@@ -175,6 +176,35 @@ daemon kill commands, restarts daemons, or changes mounts.
 On 13 Nov 2026, `sudo killall storagekitd` returned 0 but pid 80846 (up 17 h
 52 m) ignored SIGTERM. `sudo kill -9 80846` cleared it; launchd restarted
 storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
+
+## Processes stuck in disk wait
+
+Each hourly run emits `proc.disk_wait` from a read-only, 10 s-bounded
+`ps -axo pid,ppid,etime,stat,comm,args`. It counts processes observed in
+`U` with a process age of at least ten minutes, retaining the ten oldest
+(`pid`, `ppid`, `ageS`, `stat`, `comm`, `args`). Arguments are limited
+to 300 characters, with credential-like values redacted; no environment
+is logged. `stuckUnmount` and `mountPoint` flag an unmount among all matches,
+even if it is outside the ten retained entries. A failed ps records an error
+without stopping the other collector sources.
+
+Process age is not time continuously spent in U: this is an hourly observation,
+and an old process can be caught during normal I/O. An umount aged at least
+30 minutes, or another process aged at least six hours, triggers one Telegram
+attention alert per PID/start time. A bounded ps start-time lookup prevents
+PID reuse from suppressing a new incident. Failed notifications retry with
+the same key and frozen text; they never fail collection. The shared 45 s disk-wait
+budget defers remaining alerts to the next run when notifications are slow.
+Daily `diskWait` rollups give runs with matches, maximum process age, and
+the latest stuck-unmount mount point.
+
+A kernel-stuck unmount can block the stat child of plain lsof, even for an
+unrelated APFS file, and may also affect diskutil. While a U-state umount
+exists, use `lsof -b -w` with a subprocess timeout, preferably selecting
+a PID. It skips stat/lstat/readlink, so pathname queries may return
+'Resource temporarily unavailable'; missing output does not prove a file
+has no holders. A reboot clears a stuck umount. The collector only reports
+it and never changes mounts or restarts the Mac.
 
 ## Install after review and owner approval
 
