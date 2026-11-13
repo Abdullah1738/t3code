@@ -144,10 +144,10 @@ robob-watch list                  # status, fires, expiry, last run, failures, u
 robob-watch show ID               # definition, state, last 20 log lines
 robob-watch logs ID [-n 100]      # the watcher log tail (there is no `robob-watch log`)
 robob-watch pause ID | resume ID [--expires 7d]   # resume also re-arms a done/expired watcher
-robob-watch remove ID             # closes for 15 min, then archives; --now stops immediately
+robob-watch remove ID             # cancel now; --inflight-check watchers get reply grace; --now skips it
 ```
 
-Removal (`remove` or `rm`) keeps checks and late replies for 15 minutes with `WATCH_CLOSING=1` (checks must restrict to existing in-flight outreach), then archives after queued events deliver; `--now` archives immediately and `resume` cancels closing.
+Removal (`remove` or `rm`) cancels ordinary or paused watchers immediately; only an unpaused watcher configured with `--inflight-check CMD` (`inflight_check` in JSON) gets 15 minutes of reply grace, running that frozen command with `WATCH_CLOSING=1` for existing outreach only (for example, `whatsapp-new-message KNOWN_JID`); it must never start new outreach, `--now` skips grace, `resume` returns to the normal check, and a removed ID stays retired (use a fresh ID for a replacement).
 Remove watchers once the thing is resolved, or when the owner says to stop. Done and expired watchers stay listed until removed. Remove them when you notice them.
 
 - Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the JSON key `expires_at` (an ISO time or a duration like "14d"). The `--expires` flag on the CLI is a separate option. If the JSON has no `expires_at`, the watcher gets the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.

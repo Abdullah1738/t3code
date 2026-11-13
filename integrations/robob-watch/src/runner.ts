@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  finalizeClosing, checking, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
@@ -44,10 +44,12 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
 
 /** Returns true once the event is delivered (or had been already). */
 async function deliverPending(watcher: Watcher, state: State): Promise<boolean> {
+  const instance = watcherInstance(watcher.id);
   // A held event keeps its key and is retried each minute, so it goes out once the quiet hours end.
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(pending.watcher ?? watcher, pending.event, pending.key, state);
+  if (watcherInstance(watcher.id) !== instance) return false;
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!loadWatcher(watcher.id)) return false;
   const current = loadState(watcher.id);
@@ -72,6 +74,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
  * watchers, because a single-fire watcher is already done by the time its wake is waiting.
  */
 async function headsUps(watcher: Watcher, state: State): Promise<void> {
+  const instance = watcherInstance(watcher.id);
   if (!state.wakes?.length) return;
   // Heads-ups leak raw watcher text to the owner; only watchers that opt in get them.
   if (watcher.headsup !== true) { delete state.wakes; const fresh = loadState(watcher.id); delete fresh.wakes; saveState(watcher.id, fresh); return; }
@@ -79,6 +82,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
   for (const wake of state.wakes) {
     const age = now() - wake.delivered_at;
     const row = await inboundState(wake.inbound);
+    if (watcherInstance(watcher.id) !== instance) return;
     // A just-delivered wake's row can briefly read as missing; only trust "missing" after a short grace.
     if (row === "missing" && age < 15_000) { keep.push(wake); continue; }
     if (row !== undefined && row !== "pending") {
@@ -105,7 +109,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
     // Once sent it is never tracked again; a failed send retries a few ticks, same key, then gives up.
     if (via === "none" && attempts < 5) keep.push({ ...wake, attempts });
   }
-  if (!loadWatcher(watcher.id)) return;
+  if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance) return;
   const fresh = loadState(watcher.id);
   const seen = new Set(state.wakes.map(wake => wake.inbound));
   // Keep entries added since this pass loaded state; replace the ones it handled.
@@ -118,6 +122,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
 
 /** The persisted pause survives a failed notice send or runner restart; retries keep the same text and key. */
 async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
+  const instance = watcherInstance(watcher.id);
   if (!state.failure_alerted) {
     const mins = Math.round((Date.parse(state.failure_paused_at!) - Date.parse(state.failing_since!)) / 60_000);
     const sent = await alert(watcher, `Watcher "${watcher.title}" paused after ${state.consecutive_failures} failures in a row (${mins} min). Last error: ${(state.last_error ?? "").slice(0, 300)}. Fix it, then robob-watch resume ${watcher.id}. Log: ${join(watcherDir(watcher.id), "log")}`,
@@ -125,7 +130,7 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
     log(watcher.id, `pause notice ok=${sent.ok} via=${sent.via}`);
     const fresh = loadState(watcher.id);
     // Resume/remove can happen while the bridge is sending; never restore the old pause over that command.
-    if (!loadWatcher(watcher.id) || fresh.failure_paused_at !== state.failure_paused_at) return;
+    if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== state.failure_paused_at) return;
     fresh.failure_alerted = sent.ok;
     saveState(watcher.id, fresh);
     Object.assign(state, fresh);
@@ -134,7 +139,7 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
     const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failing_since ?? "").slice(0, 32)}`);
     log(watcher.id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
     const fresh = loadState(watcher.id);
-    if (!loadWatcher(watcher.id) || fresh.failure_paused_at !== state.failure_paused_at) return;
+    if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== state.failure_paused_at) return;
     fresh.failure_escalated = sent.ok;
     saveState(watcher.id, fresh);
     Object.assign(state, fresh);
@@ -142,15 +147,23 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
 }
 
 export async function tickOne(id: string): Promise<void> {
+  const instance = watcherInstance(id);
+  const sameInstance = () => watcherInstance(id) === instance;
   const initial = loadWatcher(id);
   if (!initial) return;
   let state = loadState(id);
-  await headsUps(initial, state);
-  if (state.failure_paused_at) await pauseNotice(initial, state);
-  const watcher = loadWatcher(id);
-  if (!watcher) return;
+  const initialPoller = pollingWatcher(initial, state);
+  if (!initialPoller) return;
+  await headsUps(initialPoller, state);
+  if (!sameInstance()) return;
+  if (state.failure_paused_at) await pauseNotice(initialPoller, state);
+  if (!sameInstance()) return;
+  const definition = loadWatcher(id);
+  if (!definition) return;
   state = loadState(id);
-  if (state.status === "closing" && now() >= state.closing_until! && state.closing_final_check && !state.pending && !state.batch) {
+  const watcher = pollingWatcher(definition, state);
+  if (!watcher) return;
+  if (state.status === "closing" && now() >= state.closing_until! && (watcher.paused || (state.closing_final_check && !state.pending && !state.batch))) {
     finalizeClosing(id);
     return;
   }
@@ -175,7 +188,7 @@ export async function tickOne(id: string): Promise<void> {
   if (state.pending) {
     if ((state.next_at ?? 0) > t) return;
     if (!(await deliverPending(watcher, state))) {
-      if (loadWatcher(id)) {
+      if (sameInstance() && loadWatcher(id)) {
         state = loadState(id);
         state.next_at = now() + Math.min(watcher.interval_s, 60) * 1_000;
         saveState(id, state);
@@ -209,9 +222,11 @@ export async function tickOne(id: string): Promise<void> {
   let timeoutMs = 0;
   let checkedWatcher: Watcher | undefined;
   let finalDeadline: number | undefined;
-  const result = await slots.run(async () => {
-    const current = loadWatcher(id);
+  const result = await slots.run(async () => withRelayLock(() => {
+    if (!sameInstance()) return undefined;
+    const definition = loadWatcher(id);
     state = loadState(id);
+    const current = definition && pollingWatcher(definition, state);
     // A slot may open several ticks later, after maintenance or an owner pause began.
     const final = state.status === "closing" && now() >= state.closing_until!;
     if (!current || !checking(state) || current.paused || (state.failure_paused_at && !final) || held(current)) return undefined;
@@ -221,17 +236,26 @@ export async function tickOne(id: string): Promise<void> {
     schedule();
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_CLOSING: state.status === "closing" ? "1" : "0" }, timeoutMs);
-  });
-  if (!result) return;
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_CLOSING: state.status === "closing" ? "1" : "0" }, timeoutMs, instance);
+  }));
+  if (!result || !sameInstance()) return;
   const endLoad = sampleLoad();
   let fresh = loadState(id);
-  const current = loadWatcher(id);
+  const currentDefinition = loadWatcher(id);
+  const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
   if (!current || !checking(fresh)) return;
+  const ackRun = () => { try { if (sameInstance()) writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
+  if (fresh.status === "closing" && checkedWatcher?.check !== current.check) {
+    fresh.next_at = 0;
+    saveState(id, fresh);
+    // The canceled normal command must not replay its helper outbox through the reply-only command.
+    ackRun();
+    log(id, "normal check completed after removal; only the configured in-flight check may emit during grace");
+    return;
+  }
   fresh.last_run_ms = result.ms;
   const queued = now() - t - result.ms;
   if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s`);
-  const ackRun = () => { try { writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
   // A shell can exit nonzero while a descendant holds its pipes until the deadline.
   const timedOut = result.timedOut && (result.code === null || result.code === 0);
   if (timedOut || result.code !== 0) {
@@ -276,7 +300,7 @@ export async function tickOne(id: string): Promise<void> {
       const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} times in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
         `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}`, "error");
       const current = loadState(id);
-      if (!loadWatcher(id) || current.failing_since !== fresh.failing_since) {
+      if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
         log(id, "failure notice completed after resume/remove; state kept");
         return;
       }
@@ -288,7 +312,7 @@ export async function tickOne(id: string): Promise<void> {
     if (shouldEscalate(watcher, fresh)) {
       const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
       const current = loadState(id);
-      if (!loadWatcher(id) || current.failing_since !== fresh.failing_since) {
+      if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
         log(id, "failure notice completed after resume/remove; state kept");
         return;
       }
@@ -323,7 +347,7 @@ export async function tickOne(id: string): Promise<void> {
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
   if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
-  if (fresh.pending) await deliverPending(current, fresh);
+  if (fresh.pending && !current.paused) await deliverPending(current, fresh);
 }
 
 let previousMaintenance: Maintenance | undefined;

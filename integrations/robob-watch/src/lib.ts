@@ -75,6 +75,8 @@ export type Watcher = {
   id: string;
   title: string;
   check: string;
+  /** Read-only poll for replies to existing outreach; the only check allowed during removal grace. */
+  inflight_check?: string;
   interval_s: number;
   timeout_s?: number;
   mode: Mode;
@@ -115,6 +117,7 @@ export type State = {
   status: "active" | "closing" | "done" | "expired";
   closing_until?: number;
   closing_from?: "active" | "done" | "expired";
+  closing_watcher?: Watcher;
   closing_final_started?: boolean;
   closing_final_check?: boolean;
   batch?: { at: number; events: string[]; watcher?: Watcher };
@@ -149,16 +152,35 @@ export const REMOVAL_GRACE_MS = 15 * 60_000;
 // The bridge is the only wake destination on this version; notify keeps its direct-send timing.
 export const personChat = (watcher: Watcher) => watcher.mode === "wake";
 export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
-export const checking = (state: State) => state.status === "active" || state.status === "closing";
+export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
+export const pollingWatcher = (watcher: Watcher, state: State) => state.status === "closing"
+  ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused }
+  : watcher;
+
+export function watcherInstance(id: string): string | undefined {
+  try {
+    // Removal renames this directory into archive; reusing the ID creates a different directory.
+    const stat = statSync(watcherDir(id));
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  } catch { return undefined; }
+}
+
+export function retiredWatcher(id: string): boolean {
+  return existsSync(join(ARCHIVE, "retired", `${id}.json`));
+}
 
 export function archiveWatcher(id: string): string {
   const target = join(ARCHIVE, `${id}-${now()}`);
+  const retired = join(ARCHIVE, "retired");
+  mkdirSync(retired, { recursive: true, mode: 0o700 });
+  writeJson(join(retired, `${id}.json`), { archived: target, at: iso() });
   log(id, "removed");
   const state = loadState(id);
   if (state.status === "closing" && state.closing_from) {
     state.status = state.closing_from;
     delete state.closing_from;
     delete state.closing_until;
+    delete state.closing_watcher;
     delete state.closing_final_started;
     delete state.closing_final_check;
     saveState(id, state);
@@ -170,8 +192,9 @@ export function archiveWatcher(id: string): string {
 export function finalizeClosing(id: string): boolean {
   return withRelayLock(() => {
     const state = loadState(id);
-    if (!loadWatcher(id) || state.status !== "closing" || now() < state.closing_until!
-      || !state.closing_final_check || state.pending || state.batch) return false;
+    const watcher = loadWatcher(id);
+    if (!watcher || state.status !== "closing" || now() < state.closing_until!
+      || (!watcher.paused && (!state.closing_final_check || state.pending || state.batch))) return false;
     archiveWatcher(id);
     return true;
   });
@@ -182,11 +205,12 @@ export function removeWatcher(id: string, immediately = false): { archived?: str
     if (immediately) return { archived: archiveWatcher(id) };
     const watcher = loadWatcher(id);
     if (!watcher) throw new Error(`Unknown watcher ${id}`);
-    if (watcher.paused) writeJson(join(watcherDir(id), "watcher.json"), { ...watcher, paused: false });
+    if (!watcher.inflight_check || watcher.paused) return { archived: archiveWatcher(id) };
     const state = loadState(id);
     if (state.status !== "closing") {
       state.closing_from = state.status;
       state.closing_until = now() + REMOVAL_GRACE_MS;
+      state.closing_watcher = { ...watcher, check: watcher.inflight_check };
       delete state.closing_final_started;
       delete state.closing_final_check;
     }
@@ -373,6 +397,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
   if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  if (input.inflight_check !== undefined && (typeof input.inflight_check !== "string" || !input.inflight_check.trim())) errors.push("inflight_check must be a nonempty read-only reply check command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
   const timeout = input.timeout_s;
@@ -417,6 +442,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(input.inflight_check !== undefined ? { inflight_check: input.inflight_check.trim() } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
@@ -437,6 +463,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
 }
 
 export function loadWatcher(id: string): Watcher | undefined {
+  if (retiredWatcher(id)) return undefined;
   return readJson<Watcher>(join(watcherDir(id), "watcher.json"));
 }
 
@@ -450,7 +477,7 @@ export function saveState(id: string, state: State): void {
 
 export function listIds(): string[] {
   if (!existsSync(WATCHERS)) return [];
-  return readdirSync(WATCHERS).filter(name => validId(name) && existsSync(join(WATCHERS, name, "watcher.json"))).sort();
+  return readdirSync(WATCHERS).filter(name => validId(name) && !!loadWatcher(name)).sort();
 }
 
 export function log(id: string | null, message: string): void {
@@ -475,7 +502,7 @@ export type CheckResult = { code: number | null; stdout: string; stderr: string;
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -491,10 +518,19 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       clearTimeout(grace);
       resolve({ code, stdout, stderr: stderr + extra, timedOut, ms: now() - started });
     };
-    const child = spawn(shell[0]!, shell.slice(1), {
+    const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, WATCH_CLOSING: loadState(watcher.id).status === "closing" ? "1" : "0", ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv, WATCH_CLOSING: closing },
     });
+    // Admission shares the removal lock; a stale callback must never start canceled outreach.
+    const child = dir === watcherDir(watcher.id) ? withRelayLock(() => {
+      if (retiredWatcher(watcher.id) || !instance || watcherInstance(watcher.id) !== instance) throw new Error("Watcher removed before check admission");
+      const state = loadState(watcher.id);
+      const definition = loadWatcher(watcher.id);
+      const current = definition && pollingWatcher(definition, state);
+      if (!current || !checking(state) || current.paused || current.check !== watcher.check) throw new Error("Watcher check changed before admission");
+      return spawnChild(state.status === "closing" ? "1" : "0");
+    }) : spawnChild();
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
@@ -687,13 +723,17 @@ export function relayCheck(given: Watcher, to: string, eta?: number, at = now())
  * Relay checks, stops and replacements run one at a time across processes, so two fires can't both take one ETA
  * slot or miss a stop written meanwhile. A SQLite write lock: the OS drops it if the holder dies.
  */
+// Runner admission calls the library's spawn guard while holding the same process's lock.
+let relayLockDepth = 0;
 export function withRelayLock<T>(fn: () => T): T {
+  if (relayLockDepth) return fn();
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   const db = new Database(join(ROOT, "relay-lock.sqlite"));
   try {
     db.exec("PRAGMA busy_timeout = 15000");
     db.exec("BEGIN IMMEDIATE");
-    try { return fn(); } finally { db.exec("COMMIT"); }
+    relayLockDepth++;
+    try { return fn(); } finally { relayLockDepth--; db.exec("COMMIT"); }
   } finally { db.close(); }
 }
 
