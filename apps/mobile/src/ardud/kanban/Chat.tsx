@@ -5,6 +5,7 @@ import type {
   KanbanMessage,
   KanbanParticipant,
 } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS } from "@t3tools/contracts";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import {
   avatarOf,
@@ -47,6 +48,7 @@ import {
   useKanbanBoardCard,
   useKanbanMessages,
   useKanbanMessagesFeed,
+  useKanbanPermission,
 } from "./kanbanStore";
 import {
   cardGlyph,
@@ -1223,6 +1225,7 @@ export function Composer(props: {
   const [field, setField] = useState(0);
   const action = useBoardAction();
   const environmentId = usePairedEnvironmentId();
+  const canPost = useKanbanPermission(KANBAN_WS_METHODS.messagePost);
   const configs = useServerConfigs();
   const capabilities =
     environmentId === null ? undefined : configs.get(environmentId)?.environment.capabilities;
@@ -1232,7 +1235,7 @@ export function Composer(props: {
   const failing = drafts.some((draft) => draft.failed);
   const empty = text.trim().length === 0 && drafts.length === 0;
   // A failed upload must be retried or removed first; sending around it would post a partial set.
-  const blocked = empty || action.pending || uploading || failing;
+  const blocked = !canPost || empty || action.pending || uploading || failing;
 
   // Live drafts and the in-flight send batch, read by the unmount cleanup, which runs once.
   const draftsRef = useRef(drafts);
@@ -1348,7 +1351,8 @@ export function Composer(props: {
 
   const send = () => {
     if (blocked) return;
-    const body = text.trim();
+    const originalText = text;
+    const body = originalText.trim();
     const sending = drafts;
     const stored = sending.flatMap((draft) => (draft.uploaded ? [draft.uploaded] : []));
     const owner = scope.current;
@@ -1384,7 +1388,13 @@ export function Composer(props: {
           return;
         }
         // A failed send gives the text and files back so the owner can send again.
-        setText((current) => (current === "" ? body : current));
+        setText((current) =>
+          current === ""
+            ? originalText
+            : originalText === ""
+              ? current
+              : `${originalText}\n${current}`,
+        );
         setDrafts((current) => [...sending, ...current]);
       });
   };
@@ -1417,10 +1427,10 @@ export function Composer(props: {
           // The new input after a send takes the focus back, so the keyboard stays up.
           autoFocus={field > 0}
           multiline
-          accessibilityLabel="Message"
+          accessibilityLabel={canPost ? "Message" : "Your connection can't post here"}
           value={text}
           onChangeText={setText}
-          placeholder={props.placeholder ?? "Message"}
+          placeholder={canPost ? (props.placeholder ?? "Message") : "Your connection can't post here"}
           placeholderTextColorClassName="accent-foreground-muted"
           className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
         />
