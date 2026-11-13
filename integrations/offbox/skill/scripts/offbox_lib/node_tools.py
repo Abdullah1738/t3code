@@ -90,11 +90,23 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
   mkdir -p "$HOME/.offbox"
   __offbox_bash_env=$(mktemp "$HOME/.offbox/bash-env.XXXXXX") || exit 97
   export __offbox_bash_env
-  printf '%s\n' \
-    'export BASH_ENV=$__offbox_original_bash_env' \
-    '__offbox_expand_bash_env "$@"' \
-    '[ ! -r "$__offbox_expanded_bash_env" ] || . "$__offbox_expanded_bash_env"' \
-    '__offbox_repo_init' > "$__offbox_bash_env"
+  {
+    # Non-Bash launchers can drop exported functions while keeping BASH_ENV.
+    printf '%s\n' 'if [[ -n ${__offbox_repo_root-} && ${__offbox_repo_bins+x} && ${__offbox_original_bash_env+x} && -n ${__offbox_bash_env-} ]]; then'
+    for __offbox_function in __offbox_repo_path __offbox_repo_init __offbox_expand_bash_env __offbox_command_not_found; do
+      if declare -F "$__offbox_function" >/dev/null; then
+        printf 'declare -F %s >/dev/null || {\n' "$__offbox_function"
+        declare -f "$__offbox_function"
+        printf '}\nexport -f %s\n' "$__offbox_function"
+      fi
+    done
+    printf '%s\n' \
+      'export BASH_ENV=$__offbox_original_bash_env' \
+      '__offbox_expand_bash_env "$@"' \
+      '[ ! -r "$__offbox_expanded_bash_env" ] || . "$__offbox_expanded_bash_env"' \
+      '__offbox_repo_init' \
+      'fi'
+  } > "$__offbox_bash_env"
   export BASH_ENV=$__offbox_bash_env
 fi'''
 
