@@ -78,6 +78,7 @@ import {
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as Clock from "effect/Clock";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -3457,79 +3458,90 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadReadResult;
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
-      const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
-      yield* assertLiveCallerForOtherThread(scope, parent, target);
-      yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
-      yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
+      return yield* SendAcknowledgement.bounded(
+        (clientRequestId) =>
+          Effect.gen(function* () {
+            const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+            yield* assertLiveCallerForOtherThread(scope, parent, target);
+            yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
+            yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
 
-      const mode = input.mode ?? "auto";
-      const key = yield* requestKey(input.clientRequestId);
-      // Recover sends accepted by older builds before the caller's credential was rebound.
-      const messages =
-        scope.thread === undefined
-          ? []
-          : (yield* threadManagement
-              .getThreadRecords(input.threadId, ["messages"], {
-                messageRoles: ["user"],
-                turnItemTypes: [],
+            const mode = input.mode ?? "auto";
+            const key = yield* requestKey(clientRequestId);
+            // Recover sends accepted by older builds before the caller's credential was rebound.
+            const messages =
+              scope.thread === undefined
+                ? []
+                : (yield* threadManagement
+                    .getThreadRecords(input.threadId, ["messages"], {
+                      messageRoles: ["user"],
+                      turnItemTypes: [],
+                    })
+                    .pipe(Effect.mapError(threadManagementFailure))).messages;
+            const prior =
+              scope.thread === undefined
+                ? undefined
+                : messages.find((message) => {
+                    const parts = message.id.split(":");
+                    return (
+                      message.senderThreadId === scope.thread?.threadId &&
+                      parts.length === 5 &&
+                      parts[0] === "message" &&
+                      parts[1] === "mcp" &&
+                      parts[3] === "thread-send" &&
+                      parts[4] === stablePart(key)
+                    );
+                  });
+            const messageId =
+              prior?.id ??
+              stableOperationMessageId({
+                scope,
+                requestKey: key,
+                operation: "thread-send",
+              });
+            const commandId =
+              prior === undefined
+                ? stableCommandId({ scope, requestKey: key, operation: "thread-send" })
+                : CommandId.make(`command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`);
+            const result = yield* threadManagement
+              .sendToThread({
+                projectId: target.thread.projectId,
+                commandId,
+                threadId: input.threadId,
+                ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+                messageId,
+                text: input.message,
+                attachments: [],
+                mode,
+                createdBy: "agent",
+                creationSource: "mcp",
               })
-              .pipe(Effect.mapError(threadManagementFailure))).messages;
-      const prior =
-        scope.thread === undefined
-          ? undefined
-          : messages.find((message) => {
-              const parts = message.id.split(":");
-              return (
-                message.senderThreadId === scope.thread?.threadId &&
-                parts.length === 5 &&
-                parts[0] === "message" &&
-                parts[1] === "mcp" &&
-                parts[3] === "thread-send" &&
-                parts[4] === stablePart(key)
-              );
-            });
-      const messageId =
-        prior?.id ??
-        stableOperationMessageId({
-          scope,
-          requestKey: key,
-          operation: "thread-send",
-        });
-      const commandId =
-        prior === undefined
-          ? stableCommandId({ scope, requestKey: key, operation: "thread-send" })
-          : CommandId.make(`command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`);
-      const result = yield* threadManagement
-        .sendToThread({
-          projectId: target.thread.projectId,
-          commandId,
-          threadId: input.threadId,
-          ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-          messageId,
-          text: input.message,
-          attachments: [],
-          mode,
-          createdBy: "agent",
-          creationSource: "mcp",
-        })
-        .pipe(
-          Effect.mapError((error) =>
-            isThreadManagementError(error)
-              ? threadManagementFailure(error)
-              : failure(
-                  "orchestration_error",
-                  `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+              .pipe(
+                Effect.mapError((error) =>
+                  isThreadManagementError(error)
+                    ? threadManagementFailure(error)
+                    : failure(
+                        "orchestration_error",
+                        `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                      ),
                 ),
-          ),
-        );
-      return {
-        threadId: input.threadId,
-        messageId,
-        runId: result.run.id,
-        ...(result.run.delegatedTaskId === undefined ? {} : { taskId: result.run.delegatedTaskId }),
-        status: result.run.status,
-        delivery: result.delivery,
-      } satisfies OrchestratorMcpThreadSendResult;
+              );
+            // Delivery is the committed route, not provider acceptance. Claude's priority-next
+            // steer may wait for a tool boundary; that wait must never hold the MCP reply.
+            return {
+              threadId: input.threadId,
+              messageId,
+              runId: result.run.id,
+              ...(result.run.delegatedTaskId === undefined
+                ? {}
+                : { taskId: result.run.delegatedTaskId }),
+              status: result.run.status,
+              delivery: result.delivery,
+            } satisfies OrchestratorMcpThreadSendResult;
+          }),
+        serviceScope,
+        input.clientRequestId,
+      ).pipe(Effect.provideService(Crypto.Crypto, crypto));
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
       const waitStartedAt = yield* Clock.monotonicTimeNanos;

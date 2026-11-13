@@ -13,6 +13,7 @@
  */
 import {
   KANBAN_RETRY_BACKOFF_MS,
+  kanbanRetryNotBefore,
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardRetry,
@@ -30,6 +31,11 @@ export type RetryRole = KanbanCardRetry["role"];
  * retry starts 60 to 90 seconds after the failure when a slot is free.
  */
 export const RETRY_BACKOFF_MS = KANBAN_RETRY_BACKOFF_MS;
+
+export const heldForRetry = (card: Pick<KanbanCard, "retries">, nowMs: number): boolean => {
+  const notBefore = kanbanRetryNotBefore(card);
+  return notBefore !== null && notBefore > nowMs;
+};
 
 /**
  * How long after the dispatcher started the retry the old failed run may still be

@@ -986,6 +986,8 @@ export const KanbanCard = Schema.Struct({
   deciding: ForwardCompatibleOptional(KanbanCardDeciding),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
+  /** A delivered steer can start the detached work thread while a newer wait remains. */
+  detachedSteerAt: Schema.optional(IsoDateTime),
   /**
    * Automatic retries used on the current attempt, at most one per kind. Absent on
    * most cards and on every card stored before retries existed. Cleared by a real

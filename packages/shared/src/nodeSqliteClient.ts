@@ -197,6 +197,12 @@ const TransactionAcquire = Context.Reference<TransactionPending | undefined>(
   { defaultValue: () => undefined },
 );
 
+/** Observes only a successful outer writer COMMIT, before the fiber can yield. */
+export const TransactionCommitObserver = Context.Reference<(() => void) | undefined>(
+  "@t3tools/shared/nodeSqliteClient/TransactionCommitObserver",
+  { defaultValue: () => undefined },
+);
+
 export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
   "UnsupportedNodeSqliteVersionError",
   {
@@ -1554,6 +1560,18 @@ const make = Effect.fn("makeWithDatabase")(function* (
               const result = statement.run(...(params as any));
               return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
             });
+            const commitObserver = fiber.getRef(TransactionCommitObserver);
+            if (
+              commitObserver !== undefined &&
+              !db.isTransaction &&
+              /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)
+            ) {
+              try {
+                commitObserver();
+              } catch {
+                /* An observer cannot turn a successful COMMIT into a failed write. */
+              }
+            }
             if (statementMetrics) {
               // SQLite has returned and released the outer transaction. This marks
               // each commit, not an atomic receipt for a multi-write service call.

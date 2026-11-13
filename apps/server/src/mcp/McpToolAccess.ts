@@ -1,5 +1,6 @@
 import {
   OrchestratorMcpFailure,
+  type OrchestratorMcpThreadSendResult,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
@@ -18,6 +19,7 @@ import {
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { jsonExceedsBudget, MAX_REPLY_BYTES, ReplyTooLarge } from "../ardud/http/replyBudget.ts";
 import { ReplyRejection } from "../ardud/http/ReplyRejection.ts";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
 import {
   assertFullAccess,
@@ -171,6 +173,23 @@ export const writesThreads = <P, A, E, R>(
         ),
       );
     }),
+  );
+
+/** Includes access reads in the send deadline without bypassing their checks. */
+export const boundedThreadSend = <
+  P extends { readonly clientRequestId?: string | undefined },
+  E,
+  R,
+>(
+  declaration: Declaration<(params: P) => Effect.Effect<OrchestratorMcpThreadSendResult, E, R>>,
+  scope: Scope.Scope,
+) =>
+  declare((params: P) =>
+    SendAcknowledgement.bounded(
+      (clientRequestId) => checkedHandler(declaration)({ ...params, clientRequestId }),
+      scope,
+      params.clientRequestId,
+    ),
   );
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>

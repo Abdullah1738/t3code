@@ -543,6 +543,10 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     import json
                     from .runs import do_pulls
                     do_pulls(bid, dict(run), json.loads(run['pulls']))
+                from .runs import settled_steps_code, planned_steps
+                code = settled_steps_code(run, code, locked=True)
+                if planned_steps(run):
+                    status = 'infra' if code is None else ('done' if code == 0 else 'failed')
                 con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=?",
                             (status, code, now(), run["run_id"]))
                 con.commit()

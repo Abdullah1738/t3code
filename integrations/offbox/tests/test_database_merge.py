@@ -15,6 +15,68 @@ from test_capacity import Isolated
 
 
 class DatabaseMerge(Isolated):
+    def test_step_completion_under_writer_keeps_only_validated_results(self):
+        connect = common.db
+        connections = []
+
+        def fast_db():
+            con = connect()
+            con.execute('PRAGMA busy_timeout=1')
+            connections.append(con)
+            return con
+
+        def history(*args, **kwargs):
+            for con in connections:
+                try:
+                    self.assertFalse(con.in_transaction)
+                except sqlite3.ProgrammingError:  # finish closes its preliminary reader.
+                    pass
+            return 'complete'
+
+        for entry in ('finish', 'receipt'):
+            for complete, raw in ((False, 0), (False, 17), (True, 0), (True, 17)):
+                with self.subTest(entry=entry, complete=complete, raw=raw):
+                    rid = f'steps-{entry}-{complete}-{raw}'
+                    self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count) "
+                                     "VALUES (?,'box','running','fg',2)", (rid,))
+                    row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                    path = runs.LOGS_DIR / (rid + '.log')
+                    path.write_text('offbox step 1 rc=0: first\n' +
+                                    ('offbox step 2 rc=0: second\n' if complete else ''))
+                    connections.clear()
+                    with contextlib.closing(fast_db()) as other:
+                        self.con.execute('BEGIN IMMEDIATE')
+                        try:
+                            with patch.object(runs, 'db', side_effect=fast_db), \
+                                    patch.object(api, '_request', side_effect=AssertionError('unexpected API')), \
+                                    patch.object(misc, '_catch_up_log', side_effect=history), \
+                                    contextlib.redirect_stderr(io.StringIO()):
+                                if entry == 'finish':
+                                    code = runs.finish(rid, raw)
+                                    self.assertEqual(code, raw if complete else None)
+                                else:
+                                    start_check.settle(other, row, start_check.Result('started', raw, 321), 'receipt')
+                        finally:
+                            self.con.rollback()
+                    restored = runs.restore_run_state(row)
+                    self.assertEqual(restored['exit_code'], raw if complete else None)
+                    self.assertEqual(runs.terminal_result(restored), complete)
+                    if not complete and raw:
+                        self.assertEqual(restored['known_exit_code'], raw)
+
+    def test_version_three_upgrade_adds_step_evidence_without_changing_handles(self):
+        path = Path(self.tmp.name) / 'version-three.sqlite'
+        with patch.object(common, 'DB_PATH', path):
+            with contextlib.closing(common.db()) as old:
+                old.execute('ALTER TABLE runs DROP COLUMN step_count')
+                old.execute('ALTER TABLE runs DROP COLUMN known_exit_code')
+                old.execute("INSERT INTO runs(run_id,status,process_id,wrapper_pid) VALUES ('prior','running',7,321)")
+                old.execute('PRAGMA user_version=3')
+            with contextlib.closing(common.db()) as upgraded:
+                self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], common.SCHEMA_VERSION)
+                self.assertEqual(tuple(upgraded.execute('SELECT process_id,wrapper_pid,step_count,known_exit_code '
+                                                       'FROM runs').fetchone()), (7, 321, 0, None))
+
     def test_saved_receipt_repairs_infra_reservation_for_all_readers(self):
         for reader in ('wait','pool','reaper'):
             for code in (0,17):
@@ -71,7 +133,7 @@ class DatabaseMerge(Isolated):
             old.execute('PRAGMA user_version=2')
             old.commit()
         with patch.object(common, 'DB_PATH', path), contextlib.closing(common.db()) as upgraded:
-            self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], common.SCHEMA_VERSION)
             self.assertEqual(tuple(upgraded.execute('SELECT process_id,wrapper_pid FROM runs').fetchone()), (None,321))
             for table in ('pool_waiters', 'pool_cap_callers', 'pool_caps'):
                 self.assertEqual(upgraded.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
