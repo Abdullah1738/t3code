@@ -1,6 +1,6 @@
-import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { constants } from "node:os";
 
@@ -24,7 +24,16 @@ const values: Record<string, readonly string[]> = {
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
 };
-export const logDirectory = () => process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/watchers");
+let testRoot: string | undefined;
+export const logDirectory = () => {
+  if (process.env.TOOLLOG_DIR) return process.env.TOOLLOG_DIR;
+  const bunTest = process.versions.bun && /(?:\.(?:test|spec)|_(?:test|spec))\.[cm]?[jt]sx?$/.test(process.argv[1] ?? "");
+  if (process.env.ROBOB_TEST || process.env.NODE_ENV === "test" || process.env.PYTEST_CURRENT_TEST || bunTest) {
+    testRoot ??= mkdtempSync(join(tmpdir(), "watchers-test-logs-"));
+    return process.env.TOOLLOG_DIR = testRoot;
+  }
+  return join(homedir(), ".robob/logs/tools/watchers");
+};
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 
