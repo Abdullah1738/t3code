@@ -5,12 +5,18 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import {
   CommandId,
+  EventId,
+  MessageId,
+  RunAttemptId,
+  TurnItemId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   RunId,
   RuntimeRequestId,
-  MessageId,
+  NodeId,
+  type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2TurnItem,
   ThreadId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
@@ -19,10 +25,12 @@ import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -321,6 +329,161 @@ it.effect("interrupt fails on a failed shell read and treats a missing thread as
   }),
 );
 
+it.effect(
+  "pendingUserInputs returns readable pending questions only, preserving every option",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-questions");
+      const requests = [
+        ["pending", "user_input", "pending"],
+        ["resolved", "user_input", "resolved"],
+        ["cancelled", "user_input", "cancelled"],
+        ["expired", "user_input", "expired"],
+        ["approval", "command", "pending"],
+        ["missing-item", "user_input", "pending"],
+      ] as const;
+      const runtimeRequests: OrchestrationV2RuntimeRequest[] = requests.map(
+        ([id, kind, status]) => ({
+          id: RuntimeRequestId.make(id),
+          nodeId: NodeId.make(id),
+          kind,
+          status,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          responseCapability: { type: "message" },
+          createdAt: at(QUESTION_AT),
+          resolvedAt: status === "pending" ? null : at(FINISHED_AT),
+        }),
+      );
+      const questions = [
+        {
+          id: "strategy",
+          header: "Git",
+          question: "Rebase or merge?",
+          options: [
+            { label: "Rebase", description: "Force-push", value: "rebase" },
+            { label: "Merge", description: "Normal push" },
+          ],
+        },
+      ];
+      const turnItems: OrchestrationV2TurnItem[] = requests
+        .filter(([id]) => id !== "missing-item")
+        .map(([id], ordinal) => ({
+          id: TurnItemId.make(id),
+          threadId,
+          runId: null,
+          nodeId: NodeId.make(id),
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "waiting",
+          title: null,
+          startedAt: at(QUESTION_AT),
+          completedAt: null,
+          updatedAt: at(QUESTION_AT),
+          type: "user_input_request",
+          requestId: RuntimeRequestId.make(id),
+          questions,
+        }));
+      let fail = false;
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadRecords: () =>
+          fail
+            ? Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({ threadId, cause: "read failed" }),
+              )
+            : Effect.succeed({ runtimeRequests, turnItems } as never),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        expect(yield* threads.pendingUserInputs(threadId)).toEqual([
+          { requestId: RuntimeRequestId.make("pending"), questions },
+        ]);
+        fail = true;
+        const result = yield* Effect.result(threads.pendingUserInputs(threadId));
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) expect(result.failure.operation).toBe("pendingUserInputs");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  { status: "rejected", cross: true, acceptedRetry: false, sends: 1 },
+  { status: "accepted", cross: true, acceptedRetry: false, sends: 0 },
+  { status: "rejected", cross: true, acceptedRetry: true, sends: 0 },
+  { status: "rejected", cross: false, acceptedRetry: false, sends: 0 },
+  { status: "accepted", cross: false, acceptedRetry: false, sends: 0 },
+] as const)(
+  "delivery replacement: prior=$status cross=$cross acceptedRetry=$acceptedRetry",
+  (row) =>
+    Effect.gen(function* () {
+      const old = ThreadId.make("old-evaluator");
+      const replacement = ThreadId.make("replacement-evaluator");
+      const sent: string[] = [];
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+        sendToThread: (input) =>
+          Effect.sync(() => {
+            sent.push(input.commandId);
+            return { run: { id: "delivered" } } as never;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+        const receipt = {
+          commandId: CommandId.make("kanban:send:question-key"),
+          aggregateKind: "thread" as const,
+          aggregateId: old,
+          commandType: "message.dispatch",
+          acceptedAt: QUESTION_AT,
+          resultSequence: 1,
+          status: row.status,
+          error: row.status === "rejected" ? "unavailable" : null,
+        };
+        yield* receipts.insertIfAbsent(receipt);
+        if (row.acceptedRetry)
+          yield* receipts.insertIfAbsent({
+            ...receipt,
+            commandId: CommandId.make("kanban:send:question-key:retry:1"),
+            status: "accepted",
+            error: null,
+          });
+        const threads = yield* KanbanThreads;
+        const result = yield* Effect.result(
+          threads.send({
+            threadId: replacement,
+            text: "Same question",
+            key: "question-key",
+            keyAcrossThreads: row.cross,
+          }),
+        );
+        expect(Result.isSuccess(result)).toBe(row.cross);
+        expect(sent).toHaveLength(row.sends);
+        if (row.sends) expect(sent[0]).toBe("kanban:send:question-key:retry:1");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provideMerge(CommandReceipts.layer),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect("a keyed send passes stable command and message ids to thread management", () =>
   Effect.gen(function* () {
     const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];
@@ -331,7 +494,10 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       sendToThread: (input) =>
         Effect.sync(() => {
           sent.push(input);
-          return { run: { id: `run-${sent.length}` } } as never;
+          return {
+            run: { id: `run-${sent.length}` },
+            delivery: input.mode === "steer" ? "steered" : "started",
+          } as never;
         }),
     });
     yield* Effect.gen(function* () {
@@ -428,6 +594,11 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   let failBeforeDispatch = false;
   let failAfterDispatch = false;
+  let queueWithdrawal = false;
+  let startWithdrawal = false;
+  let restartBeforeCleanup = false;
+  let siblingBeforeInterrupt = false;
+  let nativeSteering: ThreadManagementService.ThreadManagementSendResult | null = null;
   const runtime = ProviderReplayHarness.layerWithRegistry(
     { name: "kanban-wake-receipts" },
     registry,
@@ -439,17 +610,87 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const dependencies = Layer.mergeAll(
     management,
     receipts,
+    ProjectionStore.layer.pipe(Layer.provide(db)),
     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   );
   const instrumentedManagement = Layer.effect(
     ThreadManagementService.ThreadManagementService,
     Effect.gen(function* () {
       const real = yield* ThreadManagementService.ThreadManagementService;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
       return ThreadManagementService.ThreadManagementService.of({
         ...real,
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            if (siblingBeforeInterrupt && command.type === "run.interrupt") {
+              siblingBeforeInterrupt = false;
+              const records = yield* real.getThreadRecords(threadId, [
+                "runs",
+                "messages",
+                "turnItems",
+              ]);
+              const run = records.runs.find((entry) => entry.id === command.runId)!;
+              const root = records.turnItems.find(
+                (item) => item.type === "user_message" && item.runId === run.id,
+              );
+              if (root?.type !== "user_message") return yield* Effect.die("Missing shared root");
+              expect(command.expectedLastInputMessageId).toBe(root.messageId);
+              yield* projections
+                .apply({
+                  id: EventId.make("withdrawal:native-sibling-after-read"),
+                  type: "turn-item.updated",
+                  threadId,
+                  runId: run.id,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...root,
+                    id: TurnItemId.make("item:late-native-sibling"),
+                    messageId: MessageId.make("message:late-native-sibling"),
+                    ordinal: root.ordinal + 1,
+                    inputIntent: "steer",
+                    text: "Late sibling work",
+                  },
+                })
+                .pipe(Effect.orDie);
+              nativeSteering = {
+                dispatch: { sequence: 0, storedEvents: [] },
+                projection: records,
+                message: records.messages.find((message) => message.id === run.userMessageId)!,
+                run,
+                turnItem: root,
+                delivery: "steered",
+              };
+            }
+            if (restartBeforeCleanup && command.type === "run.interrupt") {
+              restartBeforeCleanup = false;
+              const records = yield* real.getThreadRecords(threadId, ["runs"]);
+              const run = records.runs.find((entry) => entry.id === command.runId)!;
+              expect(command.fenced).toBe(true);
+              expect(command.expectedAttemptId).toBe(run.activeAttemptId);
+              // A genuine restart commits after cleanup's read but before its interrupt.
+              yield* projections
+                .apply({
+                  id: EventId.make("withdrawal:concurrent-steering-restart"),
+                  type: "run.updated",
+                  threadId,
+                  runId: run.id,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...run,
+                    status: "starting",
+                    userMessageId: MessageId.make("message:genuine-steer"),
+                    activeAttemptId: RunAttemptId.make("attempt:genuine-steer"),
+                  },
+                })
+                .pipe(Effect.orDie);
+            }
+            return yield* real.dispatch(command);
+          }),
         sendToThread: (input) =>
           Effect.gen(function* () {
             recorded.push(input);
+            if (nativeSteering !== null && input.mode === "steer")
+              return { ...nativeSteering, delivery: "steered" as const };
             if (failBeforeDispatch) {
               failBeforeDispatch = false;
               return yield* new ThreadManagementService.ThreadManagementProjectionLoadError({
@@ -458,7 +699,11 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
                 cause: "injected before dispatch",
               });
             }
-            const result = yield* real.sendToThread(input);
+            const result = yield* real.sendToThread(
+              input.mode === "steer" && (queueWithdrawal || startWithdrawal)
+                ? { ...input, mode: queueWithdrawal ? "queue" : "auto" }
+                : input,
+            );
             if (failAfterDispatch) {
               failAfterDispatch = false;
               return yield* new ThreadManagementService.ThreadManagementProjectionLoadError({
@@ -512,6 +757,21 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
     available = true;
     yield* Effect.gen(function* () {
       const threads = yield* KanbanThreads;
+      // Withdrawals cannot become a queued turn when the original run is no longer steerable.
+      const withdrawal = yield* Effect.result(
+        threads.send({
+          threadId,
+          text: "Assignment withdrawn",
+          key: "wake:withdrawal",
+          mode: "steer",
+        }),
+      );
+      expect(Result.isFailure(withdrawal)).toBe(true);
+      expect(recorded.at(-1)?.mode).toBe("steer");
+      expect(
+        (yield* orchestrator.getThreadRecords(threadId, ["messages", "runs"])).messages,
+      ).toHaveLength(0);
+      expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(0);
       const wake = { threadId, text: "Model answers again", key: "wake:real-receipt" };
       failBeforeDispatch = true;
       expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
@@ -536,6 +796,162 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
       expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(
         1,
       );
+      const acceptedWake = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+      yield* threads.withdraw({
+        threadId,
+        key: "wake:real-receipt",
+        text: "The board changed while assigning this review",
+      });
+      const revoked = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      expect(["interrupted", "cancelled"]).toContain(
+        revoked.runs.find((run) => run.id === acceptedWake.id)?.status,
+      );
+      expect(
+        revoked.messages.some(
+          (message) => message.text === "The board changed while assigning this review",
+        ),
+      ).toBe(false);
+      yield* threads.send({ threadId, key: "wake:next-worker", text: "Next valid work" });
+      const original = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
+      const records = yield* orchestrator.getThreadRecords(threadId, [
+        "runs",
+        "messages",
+        "turnItems",
+      ]);
+      const root = records.turnItems.find(
+        (item) => item.type === "user_message" && item.runId === original.id,
+      );
+      if (root?.type !== "user_message") return yield* Effect.die("Missing original root message");
+      // Native steering adds an accepted input without replacing the root message or attempt.
+      yield* (yield* ProjectionStore.ProjectionStoreV2).apply({
+        id: EventId.make("withdrawal:successful-native-sibling"),
+        type: "turn-item.updated",
+        threadId,
+        runId: original.id,
+        occurredAt: yield* DateTime.now,
+        payload: {
+          ...root,
+          id: TurnItemId.make("item:successful-sibling"),
+          messageId: MessageId.make("message:successful-sibling"),
+          ordinal: root.ordinal + 1,
+          inputIntent: "steer",
+          text: "Sibling work",
+        },
+      });
+      nativeSteering = {
+        dispatch: { sequence: 0, storedEvents: [] },
+        projection: records,
+        message: records.messages.find((message) => message.id === original.userMessageId)!,
+        run: original,
+        turnItem: root,
+        delivery: "steered",
+      };
+      yield* threads.withdraw({
+        threadId,
+        key: "wake:next-worker",
+        text: "The board changed while assigning the original card",
+      });
+      nativeSteering = null;
+      const shared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+      const preservedRun = shared.runs.find((run) => run.id === original.id)!;
+      expect(preservedRun.status).toBe(original.status);
+      expect(preservedRun.userMessageId).toBe(original.userMessageId);
+      expect(preservedRun.activeAttemptId).toBe(original.activeAttemptId);
+      expect(shared.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      expect(recorded.at(-1)?.mode).toBe("steer");
+      expect(recorded.at(-1)?.text).toBe("The board changed while assigning the original card");
+      // Both a returned result and a lost post-acceptance response must clean up the exact withdrawal.
+      for (const lostResponse of [false, true]) {
+        queueWithdrawal = true;
+        failAfterDispatch = lostResponse;
+        const withdrawn = yield* Effect.result(
+          threads.send({
+            threadId,
+            text: "Assignment withdrawn",
+            key: `wake:demoted-withdrawal:${lostResponse}`,
+            mode: "steer",
+          }),
+        );
+        expect(Result.isFailure(withdrawn)).toBe(true);
+        const runs = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        expect(runs.filter((run) => run.status === "queued")).toHaveLength(0);
+        expect(runs.find((run) => run.id === original.id)?.status).toBe(original.status);
+      }
+      // Reproduce completion after steer preflight: the orchestrator starts a new withdrawal turn.
+      yield* orchestrator.dispatch({
+        type: "run.interrupt",
+        commandId: CommandId.make("wake:finish-original"),
+        threadId,
+        runId: original.id,
+        holdQueue: false,
+      });
+      queueWithdrawal = false;
+      startWithdrawal = true;
+      for (const lostResponse of [false, true]) {
+        failAfterDispatch = lostResponse;
+        const withdrawn = yield* Effect.result(
+          threads.send({
+            threadId,
+            text: "Assignment withdrawn",
+            key: `wake:late-withdrawal:${lostResponse}`,
+            mode: "steer",
+          }),
+        );
+        expect(Result.isFailure(withdrawn)).toBe(true);
+        const runs = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        expect(
+          runs.filter((run) =>
+            ["queued", "preparing", "starting", "running", "waiting"].includes(run.status),
+          ),
+        ).toHaveLength(0);
+      }
+      restartBeforeCleanup = true;
+      const raced = yield* Effect.result(
+        threads.send({
+          threadId,
+          text: "Assignment withdrawn",
+          key: "wake:cleanup-attempt-race",
+          mode: "steer",
+        }),
+      );
+      expect(Result.isFailure(raced)).toBe(true);
+      expect(restartBeforeCleanup).toBe(false);
+      const preserved = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+        (run) => run.activeAttemptId === "attempt:genuine-steer",
+      );
+      expect(preserved?.status).toBe("starting");
+      expect(preserved?.userMessageId).toBe("message:genuine-steer");
+      // The preceding attempt is synthetic and has no runtime attempt row to interrupt.
+      yield* (yield* ProjectionStore.ProjectionStoreV2).apply({
+        id: EventId.make("withdrawal:finish-synthetic-restart"),
+        type: "run.updated",
+        threadId,
+        runId: preserved!.id,
+        occurredAt: yield* DateTime.now,
+        payload: { ...preserved!, status: "interrupted", completedAt: yield* DateTime.now },
+      });
+      yield* threads.send({
+        threadId,
+        key: "wake:late-native-sibling",
+        text: "Original card before late sibling",
+      });
+      const lateRoot = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
+      siblingBeforeInterrupt = true;
+      yield* threads.withdraw({
+        threadId,
+        key: "wake:late-native-sibling",
+        text: "Stop only the original card",
+      });
+      nativeSteering = null;
+      expect(siblingBeforeInterrupt).toBe(false);
+      const lateShared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+      const latePreserved = lateShared.runs.find((run) => run.id === lateRoot.id)!;
+      expect(latePreserved.status).toBe(lateRoot.status);
+      expect(latePreserved.userMessageId).toBe(lateRoot.userMessageId);
+      expect(latePreserved.activeAttemptId).toBe(lateRoot.activeAttemptId);
+      expect(lateShared.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      expect(recorded.at(-1)?.mode).toBe("steer");
+      expect(recorded.at(-1)?.text).toBe("Stop only the original card");
     }).pipe(Effect.provide(Layer.fresh(layer).pipe(Layer.provide(instrumentedManagement))));
   }).pipe(Effect.provide(dependencies));
 });
@@ -747,5 +1163,67 @@ it.effect.each([
         ),
       ),
     );
+  },
+);
+
+it.effect(
+  "interrupt distinguishes a real already-terminal result and reads target settlement",
+  () => {
+    const db = Sqlite.layerMemory;
+    const instanceId = ProviderInstanceId.make("codex");
+    const threadId = ThreadId.make("thread:interrupt-noop");
+    const projectId = ProjectId.make("project:interrupt-noop");
+    const adapter = {
+      instanceId,
+      driver: ProviderDriverKind.make("codex"),
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+      openSession: () => Effect.die("Provider execution is disabled in this test"),
+    } as ProviderAdapter.ProviderAdapterV2["Service"];
+    const runtime = ProviderReplayHarness.layerWithRegistry(
+      { name: "kanban-interrupt-noop" },
+      ProviderAdapterRegistry.layerFromAdapters([adapter]),
+      { databaseLayer: db, runEffectWorker: false },
+    );
+    const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+    const management = ThreadManagementService.layer.pipe(
+      Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    );
+    const dependencies = Layer.mergeAll(
+      management,
+      receipts,
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+    );
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("interrupt-noop:create"),
+        threadId,
+        projectId,
+        title: "Interrupt outcome",
+        modelSelection: { instanceId, model: "gpt-5.1-codex" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        yield* threads.send({ threadId, text: "Start", key: "interrupt-noop:start" });
+        const run = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        expect(yield* threads.runSettled(threadId, run.id)).toBe(false);
+        expect(yield* threads.interrupt(threadId, "Stop", false, run.id)).toEqual({
+          outcome: "requested",
+          runId: run.id,
+        });
+        expect(yield* threads.runSettled(threadId, run.id)).toBe(true);
+        expect(yield* threads.interrupt(threadId, "Already ended", false, run.id)).toEqual({
+          outcome: "noop",
+        });
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(dependencies));
   },
 );

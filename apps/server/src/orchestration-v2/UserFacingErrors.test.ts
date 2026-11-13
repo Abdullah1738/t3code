@@ -1,3 +1,4 @@
+import { annotateSqliteError } from "@t3tools/shared/nodeSqliteErrors";
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -123,10 +124,7 @@ describe("userFacingDispatchErrorMessage", () => {
         cause: toPersistenceSqlError("OrchestrationEventStore.append:query")(cause),
       });
 
-      assert.include(message, "server could not open a database file (SQLITE_CANTOPEN)");
-      assert.include(message, "machine running the server");
-      assert.include(message, "free disk space");
-      assert.include(message, "data and temporary directories exist and are writable");
+      assert.include(message, "storage is temporarily unavailable");
       assert.include(message, "then retry");
       assert.notInclude(message, directory);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -170,8 +168,8 @@ describe("userFacingDispatchErrorMessage", () => {
     [6, "SQLITE_LOCKED", "Wait a moment, then retry"],
     [10 | (3 << 8), "SQLITE_IOERR", "free disk space and disk health"],
     [14 | (6 << 8), "SQLITE_CANTOPEN", "exist and are writable"],
-    [11, "SQLITE_CORRUPT", "Preserve the server data directory"],
-    [26, "SQLITE_NOTADB", "configured database path"],
+    [11, "SQLITE_CORRUPT", "temporarily unavailable"],
+    [26, "SQLITE_NOTADB", "temporarily unavailable"],
   ] as const)("maps SQLite code %i to %s with recovery guidance", (errcode, code, guidance) => {
     const cause = Object.assign(new Error("private-query-data"), { errcode, errno: errcode });
     const error = new SqlError({ reason: classifySqliteError(cause) });
@@ -181,6 +179,94 @@ describe("userFacingDispatchErrorMessage", () => {
     assert.include(message, guidance);
     assert.notInclude(message, "private-query-data");
   });
+
+  it.each([
+    ["primary", false, undefined, "appears damaged"],
+    ["primary", true, undefined, "temporarily unavailable"],
+    ["replica", false, undefined, "temporarily unavailable"],
+    ["unknown", false, undefined, "temporarily unavailable"],
+    ["primary", false, "EIO", "temporarily unavailable"],
+    ["primary", false, "ENOENT", "temporarily unavailable"],
+  ] as const)(
+    "classifies corruption from %s (missing=%s, io=%s)",
+    (role, volumeUnavailable, code, wording) => {
+      const raw = Object.assign(new Error("private-sql"), {
+        errcode: 779,
+        errno: 779,
+        ...(code ? { code } : {}),
+      });
+      annotateSqliteError(raw, {
+        file: ":memory:",
+        role,
+        connection: "reader",
+        operation: "execute",
+        span: "test",
+        ...(code ? {} : { volumeUnavailable }),
+      });
+      const message = userFacingDispatchErrorMessage(
+        new SqlError({ reason: classifySqliteError(raw) }),
+      );
+      assert.include(message, wording);
+      assert.notInclude(message, "backup");
+      assert.notInclude(message, "private-sql");
+    },
+  );
+
+  it("returns retryable wording for a replica read interrupted by replacement", () => {
+    const raw = { errcode: 26, errno: 26 };
+    annotateSqliteError(raw, {
+      file: ":memory:",
+      role: "replica",
+      connection: "reader",
+      operation: "execute",
+      span: "test",
+    });
+    const message = userFacingDispatchErrorMessage(
+      new SqlError({ reason: classifySqliteError(raw) }),
+    );
+    assert.include(message, "temporarily unavailable");
+    assert.notInclude(message, "backup");
+  });
+
+  it.effect("reports a real failed replica open as retryable storage unavailability", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const filename = path.join(directory, "replica.sqlite");
+      yield* fs.writeFileString(filename, "invalid SQLite file".repeat(1024));
+      const failed = yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`SELECT * FROM sqlite_schema`;
+      }).pipe(
+        Effect.provide(
+          NodeSqliteClient.layer({ filename, readonly: true, databaseRole: "replica" }),
+        ),
+        Effect.flip,
+      );
+      assert.include(userFacingDispatchErrorMessage(failed), "temporarily unavailable");
+      assert.notInclude(userFacingDispatchErrorMessage(failed), "backup");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.each(["ENOENT", "EIO"])(
+    "maps volume error %s without a SQLite result code to retryable wording",
+    (code) => {
+      const cause = { code };
+      annotateSqliteError(cause, {
+        file: ":memory:",
+        role: "primary",
+        connection: "writer",
+        operation: "open",
+        span: "test",
+      });
+      const message = userFacingDispatchErrorMessage(
+        new SqlError({ reason: classifySqliteError(cause) }),
+      );
+      assert.include(message, "temporarily unavailable");
+      assert.notInclude(message, "backup");
+    },
+  );
 
   it("keeps unknown SQL failures contextual without exposing driver text or parameters", () => {
     const cause = Object.assign(new Error("private-query-data"), { errcode: 1 });

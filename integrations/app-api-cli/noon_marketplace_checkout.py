@@ -628,7 +628,10 @@ class MarketplaceClient:
             try:
                 accepted = self._before_send({'service': op.service, 'operation': name,
                     'request_digest': op.digest, 'order_id': op.order_id})
-            except Exception:
+            except Exception as exc:
+                if str(exc) == 'OWNER_GO_REQUIRED':
+                    self._mutation_fenced = False
+                    raise MarketplaceError('OWNER_GO_REQUIRED') from None
                 raise MarketplaceError('PARENT_JOURNAL_RESERVATION_FAILED') from None
             if accepted is not True:
                 self._mutation_fenced = False

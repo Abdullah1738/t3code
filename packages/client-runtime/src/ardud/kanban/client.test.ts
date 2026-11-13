@@ -34,6 +34,7 @@ function fakeTransport(denied: ReadonlySet<string> = new Set()) {
   const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
     permission: (tag) => Atom.make(() => !denied.has(tag)),
+    permissionStatus: (tag) => Atom.make(() => (denied.has(tag) ? "denied" : "granted")),
     stream(tag, _input, onValue, onError) {
       streams += 1;
       if (tag === "kanban.boards") {
@@ -832,6 +833,7 @@ describe("discussion preview loader", () => {
     const pending: Pending[] = [];
     const transport: KanbanTransport = {
       permission: () => Atom.make(() => true),
+      permissionStatus: () => Atom.make(() => "granted" as const),
       stream(tag, input, onValue) {
         if (tag === "kanban.boards") return () => {};
         const boardId = (input as { boardId: string }).boardId;

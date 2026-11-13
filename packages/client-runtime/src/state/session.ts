@@ -1,5 +1,6 @@
 import type { AuthSessionState, EnvironmentId, ServerConfig } from "@t3tools/contracts";
 import * as Data from "effect/Data";
+import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -50,16 +51,50 @@ const SESSION_STATE_RETRY_SCHEDULE = Schedule.exponential("1 second").pipe(
 export function isTransientSessionStateError(error: {
   readonly _tag: string;
   readonly cause?: unknown;
+  readonly status?: number;
 }): boolean {
   if (error._tag === "RemoteEnvironmentAuthTimeoutError") return true;
+  if (error._tag === "RemoteEnvironmentAuthUndeclaredStatusError")
+    return error.status !== undefined && [502, 503, 504].includes(error.status);
   if (error._tag !== "RemoteEnvironmentAuthFetchError") return false;
   // The HTTP helper also wraps renewal rejections and missing relay services.
   const cause = error.cause;
-  if (HttpClientError.isHttpClientError(cause)) return cause.reason._tag === "TransportError";
+  if (HttpClientError.isHttpClientError(cause))
+    return (
+      cause.reason._tag === "TransportError" ||
+      (cause.reason._tag === "StatusCodeError" &&
+        [502, 503, 504].includes(cause.reason.response.status))
+    );
   if (typeof cause === "object" && cause !== null && "_tag" in cause) {
     return cause._tag === "ConnectionTransientError";
   }
   return cause instanceof Error;
+}
+
+export function isRejectedSessionStateError(error: unknown): boolean {
+  if (HttpClientError.isHttpClientError(error))
+    return error.response?.status === 401 || error.response?.status === 403;
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return false;
+  switch (error._tag) {
+    case "EnvironmentAuthInvalidError":
+    case "EnvironmentScopeRequiredError":
+    case "EnvironmentOperationForbiddenError":
+    case "ConnectionBlockedError":
+      return true;
+    case "RemoteEnvironmentAuthUndeclaredStatusError":
+      return "status" in error && (error.status === 401 || error.status === 403);
+    case "RemoteEnvironmentAuthFetchError":
+      return (
+        "cause" in error &&
+        (isRejectedSessionStateError(error.cause) ||
+          (typeof error.cause === "object" &&
+            error.cause !== null &&
+            "authenticated" in error.cause &&
+            error.cause.authenticated === false))
+      );
+    default:
+      return false;
+  }
 }
 
 export const fetchEnvironmentSessionState = Effect.fn(
@@ -144,6 +179,36 @@ function makeEnvironmentSessionAtoms<R, E>(
     ).pipe(Atom.withLabel(`environment-prepared-connection:${environmentId}`)),
   );
 
+  const reconnectGenerationAtom = Atom.family((environmentId: EnvironmentId) =>
+    runtime
+      .atom(
+        followStreamInEnvironment(
+          environmentId,
+          Stream.unwrap(
+            EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+              Effect.map((supervisor) =>
+                SubscriptionRef.changes(supervisor.state).pipe(
+                  Stream.map((state) => state.phase === "connected"),
+                  Stream.changes,
+                  Stream.scan(
+                    () => ({ connected: undefined as boolean | undefined, generation: 0 }),
+                    (previous, connected) => ({
+                      connected,
+                      generation:
+                        previous.generation + (previous.connected === false && connected ? 1 : 0),
+                    }),
+                  ),
+                  Stream.map((state) => state.generation),
+                  Stream.changes,
+                ),
+              ),
+            ),
+          ),
+        ),
+      )
+      .pipe(Atom.setIdleTTL(0)),
+  );
+
   const sessionStateAtom = Atom.family((environmentId: EnvironmentId) => {
     const refreshSignal = Atom.make(() => ({})).pipe(Atom.setIdleTTL(0));
     const connection = Atom.make((get) => {
@@ -188,12 +253,17 @@ function makeEnvironmentSessionAtoms<R, E>(
       Option.Option<{
         readonly prepared: PreparedConnection | null;
         readonly result: SessionResult;
+        readonly generation: number;
       }>
     >(Option.none()).pipe(Atom.setIdleTTL(5 * 60_000));
 
     return Atom.readable(
       (get): SessionResult => {
         get.mount(cached);
+        const generation = Option.getOrElse(
+          AsyncResult.value(get(reconnectGenerationAtom(environmentId))),
+          () => 0,
+        );
         // An uninitialized stream is not an explicit disconnect. Do not erase
         // cached data until the supervisor has answered on a remount.
         const preparedState = get(preparedConnectionAtom(environmentId));
@@ -202,11 +272,21 @@ function makeEnvironmentSessionAtoms<R, E>(
           return AsyncResult.initial();
         }
         const binding = get(connection);
+        const previous = get.once(cached);
+        if (
+          Option.isSome(previous) &&
+          previous.value.prepared === binding.prepared &&
+          previous.value.generation !== generation &&
+          previous.value.result._tag === "Failure" &&
+          !isRejectedSessionStateError(Cause.squash(previous.value.result.cause))
+        ) {
+          // Consume each reconnect once; an unanswered retry must not refresh itself.
+          get.refresh(refreshSignal);
+        }
         const current =
           binding.prepared === null
             ? AsyncResult.initial<AuthSessionState>()
             : get(request(binding));
-        const previous = get.once(cached);
         const result: SessionResult =
           current._tag === "Failure"
             ? AsyncResult.failure(current.cause, { waiting: current.waiting })
@@ -216,7 +296,7 @@ function makeEnvironmentSessionAtoms<R, E>(
                 previous.value.prepared === binding.prepared
               ? AsyncResult.waiting(previous.value.result)
               : current;
-        get.set(cached, Option.some({ prepared: binding.prepared, result }));
+        get.set(cached, Option.some({ prepared: binding.prepared, result, generation }));
         return result;
       },
       (refresh) => refresh(refreshSignal),

@@ -194,7 +194,8 @@ echo "watchman $*" >> "$FIX/calls"
 [ "$1" != watch-list ] || echo poison
 ''')
         with patch.object(runs, 'WATCH_REPAIR', fx.script), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'GO_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'GO_REPAIR', ':'), \
+                patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', ['echo USER_COMMAND; exit 3'], None, 'watch-test')
         result = fx.run(script)
         self.assertEqual((result.returncode, result.stdout), (3, 'USER_COMMAND\n'))

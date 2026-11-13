@@ -165,10 +165,10 @@ it.effect("fires a once task missed by less than an hour when the server comes b
   }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
 
-it.effect("marks a once task missed by more than an hour instead of firing it", () =>
+it.effect("marks a once task missed by more than 24 hours instead of firing it", () =>
   Effect.gen(function* () {
     yield* seedOnceRow("2026-10-05T08:55:00.000Z");
-    yield* TestClock.setTime(Date.parse("2026-10-05T10:00:00.000Z"));
+    yield* TestClock.setTime(Date.parse("2026-10-06T10:00:00.000Z"));
     const launches = yield* Ref.make(0);
     yield* withService(
       launches,
@@ -179,8 +179,8 @@ it.effect("marks a once task missed by more than an hour instead of firing it", 
         const [task] = (yield* service.list()).tasks;
         assert.equal(task?.enabled, false);
         assert.isNull(task?.nextRunAt ?? null);
-        assert.equal(task?.lastRunStatus, "failed");
-        assert.include(task?.lastRunError ?? "", "Missed");
+        assert.equal(task?.lastRunStatus, "missed");
+        assert.include(task?.lastRunError ?? "", "Robob unavailable");
       }),
     );
   }).pipe(Effect.provide(Sqlite.layerMemory)),

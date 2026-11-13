@@ -519,6 +519,7 @@ const makeThreads = (watch: Watch) => {
         updatedAt: at,
         quietSince: at,
         runStartedAt: thread.running ? at : null,
+        lastActivityAt: thread.running ? at : null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
@@ -535,12 +536,14 @@ const makeThreads = (watch: Watch) => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: read,
       find: read,
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {
@@ -571,6 +574,7 @@ const makeThreads = (watch: Watch) => {
           thread.failure = null;
           if (input.model) thread.model = input.model;
         }),
+      withdraw: () => Effect.void,
       setModel: (threadId, model) =>
         Effect.sync(() => {
           const thread = threads.get(threadId);

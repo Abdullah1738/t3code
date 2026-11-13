@@ -118,7 +118,7 @@ def exact_failed_evidence(auth, order, *, timeout=25):
 
 def telegram_3ds_notify(order,total_minor):
     """One attention ping for the owner's out-of-band ENBD 3DS approval."""
-    text=f"this is ours: approve noon Minutes AED {m.wire_amount(total_minor):.2f} in ENBD X now (order {order})"
+    text=f"this is ours: approve noon Minutes AED {m.wire_amount(total_minor):.2f} in {order_card.BANK_APP} now (order {order})"
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[*TELEGRAM_CLI,'--source','Noon payment','--severity','attention',
              '--text',text,'--key',f'minutes-cli-3ds-{order}']
@@ -138,7 +138,7 @@ STALL_SECONDS=300
 
 def telegram_stall_notify(order,total_minor):
     """Second alert when the sent payment is still unconfirmed after STALL_SECONDS."""
-    text=(f"noon Minutes AED {m.wire_amount(total_minor):.2f} still not confirmed after 5 min. If ENBD X has "
+    text=(f"noon Minutes AED {m.wire_amount(total_minor):.2f} still not confirmed after 5 min. If {order_card.BANK_APP} has "
           "a prompt, approve it. No prompt: check noon > Orders before ordering in the app, "
           "this one can still go through.")
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
@@ -258,6 +258,8 @@ class MinutesFlow:
         if financial and self.review is None:
             j.fail('MINUTES_EXACT_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register, legacy_scopes
+            register(self.flow_id, 'minutes', self.snapshot.account_ref, self.skus, legacy=legacy_scopes('minutes', self.skus, self.snapshot.address_ref, extra=self.driver_note_extra, use_current_cart=self.use_current_cart))
             j.open_flow(flow_id=self.flow_id,app='noon',vertical='minutes',
                 account_hash=self.snapshot.account_ref,scope_hash=self.scope_hash)
             self.opened=True
@@ -414,6 +416,8 @@ class MinutesFlow:
             AccountHome('minutes',self.snapshot.account_ref,self.snapshot.address_ref,time.time()),
             header_provider=self._headers,receipt=self._receipt,response_cookies=self._cookies,
             home_provider=self._fresh_home)
+        from commerce_pending import register, legacy_scopes
+        register(self.flow_id, 'minutes', self.snapshot.account_ref, self.skus, legacy=legacy_scopes('minutes', self.skus, self.snapshot.address_ref, extra=self.driver_note_extra, use_current_cart=self.use_current_cart))
         return self
 
     def select_quiet(self):
@@ -582,14 +586,19 @@ class MinutesFlow:
                 self.review[key]=value+'+04:00'
             elif isinstance(value,str) and value:
                 self.review[key]=value
-        return self.client.complete_payment(order=order,client_secret=body['clientSecret'],card=self.card,
-            provider_code=provider,cvv_encryption=cvv_encryption,optional_fields=optional,before_send=self._before,timeout=25).projection
+        result = self.client.complete_payment(order=order,client_secret=body['clientSecret'],card=self.card,
+            provider_code=provider,cvv_encryption=cvv_encryption,optional_fields=optional,before_send=self._before,timeout=25)
+        if result.projection.get('redirect_required'):
+            from commerce_redirect import open_once
+            open_once(self.flow_id, hashlib.sha256(body['clientSecret'].encode()).hexdigest(), result.wire.get('redirect_url'))
+        return result.projection
 
     def notify_3ds(self):
         return telegram_3ds_notify(self.review['order'],self.review['amount'])
 
     def await_payment(self,*,notify=None,poll_seconds=5.0,wait_seconds=240.0,
-                      sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS):
+                      sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS,
+                      open_redirect=False):
         """Poll the payment intent through the out-of-band 3DS window.
 
         notify(order,total_minor) runs exactly once before the first poll.
@@ -617,6 +626,9 @@ class MinutesFlow:
                 snap=self.client.payment_intent_status(order=order,client_secret=secret,
                     total_minor=self.review['amount'],timeout=25)
                 p=snap.projection
+                if open_redirect and p.get('redirect_required'):
+                    from commerce_redirect import open_once
+                    open_once(self.flow_id, hashlib.sha256(secret.encode()).hexdigest(), snap.wire.get('redirect_url'))
             except m.MinutesError as exc:
                 # Transient read failures never end the wait and never resend
                 # anything; auth loss must surface for an app rebind instead.
@@ -710,7 +722,7 @@ class MinutesFlow:
         sent on this path; only order reads and status polling remain.
         """
         binding=j.binding(flow_id);state=j.inspect(flow_id)
-        if (binding['app']!='noon' or binding['vertical']!='minutes' or state['state']!='ACTIVE'
+        if (binding['app']!='noon' or binding['vertical']!='minutes' or state['state'] not in ('ACTIVE', 'FENCED')
                 or not state['order_id'] or not any(x['kind']=='payment' for x in state['operations'])
                 or any(x['kind'] not in ('cart','instructions','selection','place','payment')
                        for x in state['operations'])):

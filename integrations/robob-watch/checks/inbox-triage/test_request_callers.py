@@ -1,6 +1,8 @@
 """Real request entry points with only merchant transport and notifications stubbed."""
 import contextlib
+import datetime as dt
 import io
+import os
 from pathlib import Path
 import sys
 import time
@@ -14,6 +16,7 @@ APP = Path(__file__).resolve().parents[3] / 'app-api-cli'
 sys.path.insert(0, str(APP))
 sys.path.insert(0, str(APP / 'test'))
 import careem_account_auth as careem
+import card_status
 import commerce_journal as journal
 import commerce_receipts as receipts
 import inbox_auth
@@ -22,9 +25,24 @@ import test_commerce_main_order as main_fixture
 
 
 class RequestCallerTests(unittest.TestCase):
-    setUp = delivery.DeliveryTests.setUp
+    def setUp(self):
+        delivery.DeliveryTests.setUp(self)
+        self.owner_ledger = journal.owner_go.Ledger(self.root.resolve() / 'owner-go')
+        self.stack.enter_context(patch.object(journal.owner_go, 'Ledger', return_value=self.owner_ledger))
+        self.stack.enter_context(patch.dict(os.environ, {
+            'CARD_STATUS_FILE': str(self.root / 'cards.json'),
+            'ORDERING_PAUSE_FILE': str(self.root / 'ordering-paused'),
+        }))
+        card_status.record_declined('9546', reason='synthetic-test-decline', source='unit-test')
+
     run_items = delivery.DeliveryTests.run_items
     notifications = delivery.DeliveryTests.notifications
+
+    def approve_flow(self, flow_id, amount):
+        binding = journal.binding(flow_id)
+        self.owner_ledger.record(vendor=binding['app'], item=journal.owner_go.commerce_item(binding),
+                                 amount=amount, currency='AED', quote='Approve this synthetic test basket',
+                                 source='unit-test:938', at=dt.datetime.now(journal.owner_go.UTC).isoformat())
 
     def prepare_registry(self):
         self.stack.enter_context(patch.object(inbox_auth, 'DATA', self.data))
@@ -87,6 +105,7 @@ class RequestCallerTests(unittest.TestCase):
                 flow.checkout_session()
                 flow.review_session()
                 flow.prepare_payment()
+                self.approve_flow(flow.flow_id, flow.review['payable_minor'])
                 original_request = wire.request
                 # Client captured the bound method at construction; wrap that boundary.
                 def request(op, *args, **kwargs):
@@ -127,11 +146,42 @@ class RequestCallerTests(unittest.TestCase):
         self.stack.enter_context(patch.object(journal, 'ROOT', self.root.resolve() / 'commerce'))
         flow_id = '00000000-0000-4000-8000-000000000938'
         journal.open_flow(flow_id=flow_id, app='noon', vertical='main', account_hash='a'*64, scope_hash='b'*64)
+        self.approve_flow(flow_id, 120000)
         with patch.object(inbox_auth, 'SOURCE', self.root / 'missing'):
-            with self.assertRaises(journal.JournalError):
+            with self.assertRaisesRegex(journal.JournalError, 'JOURNAL_UNAVAILABLE'):
                 journal.consume(flow_id, 'place', kind='place', request_hash='c'*64,
                                 cart_hash='d'*64, review_hash='e'*64, payable_minor=120000)
         self.assertEqual(journal.inspect(flow_id)['operations'], [])
+
+    def test_owner_go_denial_records_no_auth_expectation_and_sends_nothing(self):
+        self.prepare_registry()
+        for last4 in ('2342', '9546'):
+            with self.subTest(last4=last4), patch.object(journal.order_card, 'LAST4', last4), \
+                 patch.object(journal, 'ROOT', self.root.resolve() / ('commerce-' + last4)), \
+                 patch.object(receipts, 'ROOT', self.root.resolve() / ('commerce-' + last4)):
+                responses = main_fixture.happy_responses()
+                for method in responses['session']['paymentMethods']:
+                    for card in method.get('cards', []):
+                        if card['isSelected']:
+                            card['mask'] = 'xxxx' + last4
+                flow, wire = main_fixture.make_flow(responses)
+                flow.offers = {main_fixture.SKU: main_fixture.OFFER}
+                wire.responses['cart'] = main_fixture.cart_state()
+                flow.add()
+                flow.checkout_session()
+                flow.review_session()
+                before = journal.inspect(flow.flow_id)['operations']
+                with patch.object(journal.owner_go, 'require', wraps=journal.owner_go.require) as require, \
+                     patch.object(flow.client, '_request', wraps=wire.request) as transport:
+                    with self.assertRaisesRegex(main_fixture.market.MarketplaceError, 'OWNER_GO_REQUIRED'):
+                        flow.place()
+                    require.assert_called_once()
+                    transport.assert_not_called()
+                self.assertEqual(journal.inspect(flow.flow_id)['operations'], before)
+                self.assertEqual(journal.inspect(flow.flow_id)['reserved_minor'], 0)
+                self.assertFalse((self.data / 'inflight-actions.json').exists())
+                self.assertFalse((self.data / 'inflight-actions.lock').exists())
+                self.assertEqual(self.notifications(), [])
 
 
 if __name__ == '__main__':

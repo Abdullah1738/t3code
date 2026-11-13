@@ -15,7 +15,7 @@ from noon_auth_lifecycle import NoonAuthLifecycle
 
 def telegram_3ds_notify(order, total_minor):
     key = f'noon-marketplace-3ds-{order}'
-    text = f"this is ours: approve noon AED {total_minor / 100:.2f} in ENBD X"
+    text = f"this is ours: approve noon AED {total_minor / 100:.2f} in {order_card.BANK_APP}"
     env = {k: v for k, v in os.environ.items()
            if k not in ('NODE_OPTIONS', 'BUN_OPTIONS', 'BUN_INSPECT')}
     command = [str(Path.home() / '.bun/bin/bun'),
@@ -38,7 +38,7 @@ STALL_SECONDS = 300
 def telegram_stall_notify(order, total_minor):
     """Second, separate alert when a sent payment has neither confirmed nor failed in 5 min."""
     key = f'noon-marketplace-stall-{order}'
-    text = (f"noon AED {total_minor / 100:.2f} still not confirmed after 5 min. If ENBD X has "
+    text = (f"noon AED {total_minor / 100:.2f} still not confirmed after 5 min. If {order_card.BANK_APP} has "
             "a prompt, approve it. No prompt: check noon > Orders before ordering in the app, "
             "this one can still go through.")
     env = {k: v for k, v in os.environ.items()
@@ -197,6 +197,12 @@ class MarketplacePayment:
                         client_secret=secret, timeout=min(timeout, end - clock()))
             if payment is not None:
                 summary = payment.summary()
+                if summary['has_redirect'] and (not getattr(self, '_recovery_only', False)
+                                               or getattr(self, 'open_redirect', False)):
+                    from commerce_redirect import open_once
+                    import hashlib
+                    open_once(self.flow_id, hashlib.sha256(secret.encode()).hexdigest(),
+                              payment.data.get('redirect_url'))
                 current_payment = (summary['raw_status'], summary['transaction_status'],
                                    summary['is_3ds_failure'], summary['has_redirect'])
                 if current_payment != last_payment:

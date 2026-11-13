@@ -42,15 +42,15 @@ def failed_evidence(status, detail, refund, order, amount):
             and market.fils(payment.get('nonRefundableDetails', {}).get('amount')) == 0)
     methods = payment.get('paymentMethods')
     require(isinstance(methods, list) and len(methods) == 1
-            and methods[0].get('code') == 'mastercard'
-            and methods[0].get('title') == f'MASTERCARD xxxx{order_card.LAST4}'
+            and methods[0].get('code') == order_card.NETWORK
+            and methods[0].get('title') == f'{order_card.NETWORK.upper()} xxxx{order_card.LAST4}'
             and market.fils(methods[0].get('amount')) == amount)
     for name in ('completedRefunds', 'triggeredRefunds'):
         block = sections.get(name, {})
         mediums = block.get('refundMediums')
         require(isinstance(mediums, list) and len(mediums) == 1)
         medium = mediums[0]
-        require(medium.get('code') == 'mastercard'
+        require(medium.get('code') == order_card.NETWORK
                 and medium.get('title') == f'Processed to xxxx{order_card.LAST4}'
                 and market.fils(medium.get('amount')) == amount
                 and isinstance(medium.get('description'), str)

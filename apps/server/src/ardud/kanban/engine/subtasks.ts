@@ -298,9 +298,56 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }
 
-/** The wake note that sends a card's worker to its next step. */
-export const nextStepNote = (card: Pick<KanbanCard, "subtasks">, lead = "") =>
-  `${lead}Next on the plan:\n${subtaskLines(card)}\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
+/** Only the lead is stored; briefs render the plan from the card at delivery. */
+export const nextStepNote = (lead = "") =>
+  `${lead}Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review.`;
+
+/** Remove plans frozen by older releases, retaining text before and after them. */
+export const wakeLead = (note: string | null): string | null => {
+  const lead = note
+    ?.replace(/\r\n?|[\u2028\u2029]/g, "\n")
+    .replace(
+      /Next on the plan:\nSubtasks \(same step means any order;[\s\S]*?Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review\./g,
+      "",
+    )
+    .replace(
+      /Do this step's work subtasks, mark each with subtask_done, then card_move to needs_review\./g,
+      "",
+    )
+    .trim();
+  return lead || null;
+};
+
+/** Keep human context while discarding instructions for a finished/removed worker step. */
+export const pendingWakeNote = (card: Pick<KanbanCard, "wakeNote" | "subtasks">) => {
+  const lead = wakeLead(card.wakeNote);
+  let findings = false;
+  const cleaned = lead
+    ?.split("\n")
+    .map((line) => {
+      // Findings refer to completed work precisely because it needs fixing;
+      // only standalone queued instructions outside that section are obsolete.
+      if (/^Review findings \(round \d+\):/.test(line)) findings = true;
+      if (findings) {
+        if (line === "Fix them, then card_move to needs_review.") findings = false;
+        return line;
+      }
+      const prefix = line.match(/^\s*(?:[-*+]|\d+[.)])\s+/)?.[0] ?? "";
+      const body = line.slice(prefix.length);
+      const kept = body.split(/(?<=[.!?;])\s+/).filter((instruction) => {
+        const request = instruction.trim().match(/^(?:Do\s+(s\d+)\b|(s\d+)\s*:)/i);
+        const target = (request?.[1] ?? request?.[2])?.toLowerCase();
+        return (
+          !target ||
+          card.subtasks.some((s) => s.id === target && s.owner === "work" && s.state === "open")
+        );
+      });
+      return kept.length > 0 ? prefix + kept.join(" ") : "";
+    })
+    .join("\n")
+    .trim();
+  return cleaned || null;
+};
 
 /** Ids of open subtasks, for refusals: "s1, s3". */
 export const subtaskIds = (subtasks: ReadonlyArray<KanbanSubtask>) =>

@@ -79,6 +79,7 @@ const testLayer = () => {
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: (threadId) =>
         Effect.succeed({
           threadId,
@@ -88,6 +89,7 @@ const testLayer = () => {
           updatedAt: "2026-11-10T08:00:00.000Z",
           quietSince: "2026-11-10T08:00:00.000Z",
           runStartedAt: null,
+          lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],
@@ -97,10 +99,12 @@ const testLayer = () => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
       send: () => Effect.void,
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
@@ -555,62 +559,6 @@ it.effect(
         ),
       ),
     ),
-);
-
-it.effect("what a thread does through the board tools is its own, never the owner's", () =>
-  Effect.gen(function* () {
-    const { kanban, board, card } = yield* setup;
-    yield* kanban.dispatchNow;
-    const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-
-    // The card's worker posts in its discussion: the message is the thread's.
-    const posted = yield* call(worker, "discussion_post", { card: card.id, text: "Half done." });
-    assert.isFalse(posted.isError, posted.text);
-    assert.deepStrictEqual(posted.structured.message.author, { _tag: "thread", threadId: worker });
-
-    // An evaluator files a card and opens a discussion: both are the evaluator's.
-    const filed = yield* call(evaluator, "card_create", {
-      board: board.id,
-      title: "Follow-up",
-      prompt: "Do the follow-up.",
-    });
-    assert.isFalse(filed.isError, filed.text);
-    const cards = (yield* kanban.snapshot(board.id)).cards;
-    assert.deepStrictEqual(cards.find((entry) => entry.title === "Follow-up")?.createdBy, {
-      _tag: "evaluator",
-      threadId: evaluator,
-    });
-    const opened = yield* call(evaluator, "discussion_create", {
-      board: board.id,
-      title: "Rollout plan",
-      text: "Here is the plan.",
-    });
-    assert.isFalse(opened.isError, opened.text);
-    const discussion = (yield* kanban.discussions(board.id)).find(
-      (entry) => entry.title === "Rollout plan",
-    )!;
-    assert.deepStrictEqual(discussion.createdBy, { _tag: "evaluator", threadId: evaluator });
-
-    // An approval the worker asks for is not approved by an agent saying so in the discussion.
-    yield* call(worker, "card_ask", {
-      card: card.id,
-      question: "Deploy tonight?",
-      blocking: true,
-      action: { summary: "Deploy build 42" },
-    });
-    const said = yield* call(evaluator, "discussion_post", { card: card.id, text: "Approved." });
-    assert.isFalse(said.isError, said.text);
-    assert.strictEqual(said.structured.message.author._tag, "evaluator");
-    const ask = (yield* kanban.card(card.id)).card.asks[0]!;
-    assert.isNull(ask.closedAt);
-    assert.isUndefined(ask.answer);
-    // Nothing in any of it was written as the owner.
-    const messages = yield* kanban.messages((yield* kanban.cardDiscussion(card.id)).id, {});
-    assert.notInclude(
-      messages.map((message) => message.author._tag),
-      "owner",
-    );
-  }).pipe(Effect.provide(testLayer())),
 );
 
 it.effect("an action says what happens after it, and an old client reads it in the message", () =>

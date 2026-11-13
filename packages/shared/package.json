@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./nodeSqliteErrors": "./src/nodeSqliteErrors.ts",
     "./ownedProcessTree": "./src/ownedProcessTree.ts",
     "./githubMarkdownLinks": {
       "types": "./src/githubMarkdownLinks.ts",

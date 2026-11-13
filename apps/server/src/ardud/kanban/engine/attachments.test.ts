@@ -36,6 +36,7 @@ const makeFake = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: (threadId) =>
         Ref.get(threads).pipe(
           Effect.map((all): KanbanThreadView | null => {
@@ -49,6 +50,7 @@ const makeFake = Effect.gen(function* () {
               updatedAt: "2026-10-27T10:00:00.000Z",
               quietSince: "2026-10-27T10:00:00.000Z",
               runStartedAt: null,
+              lastActivityAt: null,
               backgroundWork: 0,
               prWatches: 0,
               prs: [],
@@ -72,9 +74,11 @@ const makeFake = Effect.gen(function* () {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

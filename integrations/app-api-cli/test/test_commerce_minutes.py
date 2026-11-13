@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
 _os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -19,12 +20,13 @@ import commerce_minutes as c
 from commerce_auth_status import CommerceAuth
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint
-from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
-from test.test_noon_minutes_checkout import Harness, HEADERS, fixture
+from test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
+from test_noon_minutes_checkout import Harness, HEADERS, fixture
 
 
 class MinutesIntegrationTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -150,7 +152,7 @@ class MinutesIntegrationTests(unittest.TestCase):
 def _session_wire(cvv_required):
     """A fixture-based cart session that satisfies approve()'s fee and arithmetic gates."""
     import copy
-    from test.test_noon_minutes_checkout import fixture as _fixture
+    from test_noon_minutes_checkout import fixture as _fixture
     session=copy.deepcopy(_fixture())
     session['isCvvRequired']=cvv_required
     for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
@@ -284,16 +286,29 @@ PREPARE_SENDS=7
 
 
 class OrderMinutesEndToEndTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     """`commerce order minutes --cvv-from-keychain` through the real CLI, MinutesFlow
     constructor and client. Only the outside world is faked: noon's HTTP (urllib
     opener), the noon auth lifecycle, the Keychain CVV read and the Telegram /
     order-watch subprocesses. Journal, receipts, watcher files and card status
     live in a temp dir. CVV encryption is real, with the captured public key.
     """
-    def order(self, *, cvv_required, seconds_before_place=0):
+    def order(self, *, cvv_required, seconds_before_place=0, redirect=None):
         events=[];commands=[]
         auth=_NoonAuth(events)
-        transport=_NoonTransport(_noon_script(cvv_required),events)
+        script = _noon_script(cvv_required)
+        if redirect:
+            challenge = {'status': 'payment_ready_to_redirect',
+                         'redirect_url': 'https://bank.invalid/challenge'}
+            index = next(i for i, (route, _) in enumerate(script) if route == 'payment_complete')
+            if redirect == 'immediate':
+                script[index] = ('payment_complete', challenge)
+            else:
+                script.insert(index+1, ('payment_status', challenge))
+        expected_routes = [x[0] for x in script]
+        transport=_NoonTransport(script,events)
         real_time=time.time;offset=[0.0]
         def keychain():
             events.append('keychain')
@@ -301,6 +316,13 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
             return b'123'
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp).resolve()
+            def open_browser(url):
+                if redirect == 'immediate':
+                    active = c.j.open_payments()[0]
+                    self.assertEqual(active['state'], 'FENCED')
+                    resumed = c.MinutesFlow.resume_payment(active['flow_id'], auth=auth)
+                    self.assertEqual(resumed.review['order'], ORDER)
+                return True
             def run(command,**kwargs):
                 commands.append(command)
                 if command[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI:
@@ -325,14 +347,19 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
                     patch.object(c.m.urllib.request,'build_opener',transport.build_opener), \
                     patch.object(c.m.urllib.request,'urlopen',side_effect=AssertionError('network')), \
                     patch.object(c.subprocess,'run',run), \
+                    patch('commerce_redirect.open_dia', side_effect=open_browser) as browser, \
                     patch.object(c.time,'time',lambda:real_time()+offset[0]), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
+                if __import__('order_card').LAST4 == '2342':
+                    __import__('card_status').record_declined('9546', reason='synthetic issuer decline', source='fixture')
                 code=cli.main(['order','minutes','--sku','SYNTHETIC_SHAKE','--cvv-from-keychain',
                                '--label','minutes e2e test'])
                 lines=[json.loads(x) for x in output.getvalue().splitlines() if x] or [{}]
                 journal=c.j.inspect(lines[-1]['flow_id']) if lines[-1].get('flow_id') else None
+                if redirect:
+                    browser.assert_called_once_with('https://bank.invalid/challenge')
         self.assertEqual(code,0,lines[-1])
-        self.assertEqual([x[0] for x in transport.calls],[x[0] for x in _noon_script(cvv_required)])
+        self.assertEqual([x[0] for x in transport.calls],expected_routes)
         cvv.assert_called_once_with()
         return {'result':lines[-1],'lines':lines,'events':events,'calls':transport.calls,
                 'commands':commands,'journal':journal}
@@ -360,6 +387,13 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
         alerts=[x for x in run['commands'] if x[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI]
         self.assertEqual(len(alerts),1)
         self.assertEqual(alerts[0][alerts[0].index('--key')+1],f'minutes-cli-3ds-{ORDER}')
+
+    def test_immediate_and_delayed_redirect_complete_without_resend(self):
+        for redirect in ('immediate', 'delayed'):
+            with self.subTest(redirect=redirect):
+                run = self.order(cvv_required=True, redirect=redirect)
+                self.assertEqual(run['journal']['state'], 'COMPLETE')
+                self.assertEqual(sum(route == 'payment_complete' for route, _ in run['calls']), 1)
 
     def test_order_minutes_places_and_pays_300s_after_preparation(self):
         """Done-when path 2: 300 s pass between real preparation and place. The home
@@ -389,6 +423,9 @@ def paid_projection(status='payment_confirmed',txn='CAPTURED',authorized=1725,ca
 
 
 class PaymentAwaitTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def flow(self):
         from unittest.mock import Mock
         flow=object.__new__(c.MinutesFlow)
@@ -561,7 +598,7 @@ class PaymentAwaitTests(unittest.TestCase):
         command=run.call_args.args[0]
         self.assertIn('minutes-cli-3ds-IAEGA123',command)
         text=command[command.index('--text')+1]
-        self.assertEqual(text,'this is ours: approve noon Minutes AED 17.25 in ENBD X now (order IAEGA123)')
+        self.assertEqual(text,f'this is ours: approve noon Minutes AED 17.25 in {c.order_card.BANK_APP} now (order IAEGA123)')
         self.assertEqual(command[command.index('--source')+1],'Noon payment')
         self.assertEqual(command[command.index('--severity')+1],'attention')
         env=run.call_args.kwargs['env']
@@ -577,6 +614,7 @@ class PaymentAwaitTests(unittest.TestCase):
 
 class ResumeActiveTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -730,6 +768,9 @@ class ResumeActiveTests(unittest.TestCase):
 
 
 class ResumeAndCloseTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_failed_evidence_accepts_rejected_dead_intent_only(self):
         from unittest.mock import Mock
         auth=Mock()

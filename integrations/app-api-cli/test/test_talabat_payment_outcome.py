@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import json
 from pathlib import Path
@@ -7,8 +8,8 @@ from unittest.mock import patch
 
 import talabat_payment_outcome as p
 import talabat_fresh_review as review
-from test import test_talabat_fresh_review as review_fixtures
-from test import test_talabat_place_contract as fixtures
+import test_talabat_fresh_review as review_fixtures
+import test_talabat_place_contract as fixtures
 
 
 def tracking(order='1234567890', status='order_delivered'):
@@ -21,6 +22,9 @@ def placed(order='1234567890'):
 
 
 class PaymentOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def assert_blocked(self, result):
         for key in ('retry_allowed','payment_completion_verified','charged_card_verified',
                     'charged_amount_verified','settlement_verified','merchant_acceptance_verified',

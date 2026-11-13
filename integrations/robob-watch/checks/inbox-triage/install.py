@@ -15,7 +15,7 @@ LIVE = Path.home() / '.local/share/robob-watch/watchers/inbox-triage'
 DATA = Path.home() / 'Documents/assistant/inbox-triage'
 AUTH_PRODUCERS = Path.home() / '.local/share/app-api-cli'
 PRODUCER_FILES = ('inbox_auth.py', 'careem_account_auth.py', 'commerce_journal.py')
-SOURCE_FILES = ('triage.py', 'fastpath.py', 'expected_auth.py', 'check.sh', 'install.py', 'test_triage.py', 'test_urgent.py', 'test_fastpath.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
+SOURCE_FILES = ('triage.py', 'fastpath.py', 'expected_auth.py', 'check.sh', 'install.py', 'test_triage.py', 'test_owner_go.py', 'test_urgent.py', 'test_fastpath.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
 
 
 def atomic_copy(source, destination, executable=False):
