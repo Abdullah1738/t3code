@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../../ardud/keybindingAnalytics";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type ProviderInstanceId,
@@ -504,6 +505,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       } else {
         onInstanceModelChange(instanceId, resolvedModel);
       }
+      return true;
     }
   };
 
@@ -773,6 +775,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       });
       setSearchQuery("");
       handleSelectInstance(next);
+      if (next !== selectedInstanceId || searchQuery !== "") recordConsumedShortcut(event, command);
       return;
     }
     const jumpIndex = modelPickerJumpIndexFromCommand(command ?? "");
@@ -790,7 +793,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     if (!model) {
       return;
     }
-    handleModelSelect(model.slug, model.instanceId);
+    if (handleModelSelect(model.slug, model.instanceId)) recordConsumedShortcut(event, command);
   };
 
   return (

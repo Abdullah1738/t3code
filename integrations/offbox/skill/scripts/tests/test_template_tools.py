@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import bases, common, toolchain  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "templates"
@@ -24,7 +25,7 @@ class TemplateTools(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "calls"
-        self.env = dict(os.environ, HOME=str(self.root), NVM_DIR=str(self.root / ".nvm"),
+        self.env = clean_env(HOME=str(self.root), NVM_DIR=str(self.root / ".nvm"),
                         PATH=f"{self.bin}:/usr/bin:/bin", CALLS=str(self.log))
         self.env.pop('BASH_ENV', None)
 

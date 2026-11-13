@@ -59,6 +59,11 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
           code: input.code,
           stage: input.stage,
           threadId: input.threadId ?? "unknown",
+          threadKind: input.threadId?.startsWith("thread:delegated-task:")
+            ? "delegated-task"
+            : input.threadId === undefined
+              ? "client"
+              : "thread",
           elapsedMs: Number(now - startedAt) / 1_000_000,
           wait: pending.wait,
           waitElapsedMs: Number(now - pending.since) / 1_000_000,

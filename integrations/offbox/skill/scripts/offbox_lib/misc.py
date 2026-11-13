@@ -874,6 +874,9 @@ def logs(run_id: str, do_follow: bool) -> int:
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _incomplete_log(_validated_step_row(r, code), result)
+    if code is None:
+        from .run_evidence import report
+        report(dict(r), p)
     if planned_steps(r) and code is None:
         return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
@@ -927,6 +930,9 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
             finally:
                 con.close()
     out(f"{r['run_id']}: {status} exit={code}")
+    if code is None:
+        from .run_evidence import report
+        report(dict(r), LOGS_DIR / f"{r['run_id']}.log", until=until)
     if code is None and r['box_id']:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
@@ -1113,12 +1119,15 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     code, how = _status_code(st), "boat's process status"
     if code is None:
         code, how = _recover_by(r, log_path, deadline)
+    receipt_code = code
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     _tail(log_path, pos, echo)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
     out(f"{r['run_id']}: exit={code}")
     if code is None:
+        from .run_evidence import report
+        report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     return 90 if code is None else code
 
@@ -1362,6 +1371,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message, settled_steps_code)
+    receipt_code = code
     delivered = delivered_bytes(log_path)
     try:
         if delivered > os.path.getsize(log_path):
@@ -1415,6 +1425,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         state_warning(r['run_id'], code, error)
     out(f"{r['run_id']}: exit={code}")
     if code is None:
+        from .run_evidence import report
+        report(dict(r), log_path, until=until, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     return 90 if code is None else code
 

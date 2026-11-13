@@ -121,6 +121,8 @@ def _check(binary, args, harness, native_id, event=None, *, ignore_pin=False):
     try:
         engine._log(harness=harness, event="shim", tool=binary,
                     robobThreadId=identity.get("robobThreadId"), decision=result["decision"],
+                    sessionId=engine._native(event or {"session_id": native_id}, harness)[0], cwd=os.getcwd(), command=command,
+                    nativeAgentId=(event or {}).get("agent_id") if harness == "claude" else None,
                     rule=result["context"].get("rule"),
                     error="coord-unresolved" if result["context"].get("rule") == "coord-unresolved" else None,
                     ms=round((time.monotonic() - started) * 1000, 3))

@@ -82,6 +82,17 @@ test("jev without a usable key or with a bad answer fails instead of guessing", 
   expect(await jevJudge({ keyFile: "/nonexistent/key", fetch })([])).toEqual([]);
 });
 
+test("slash text from people stays in group lines while commands are left out", () => {
+  const store = new Store(":memory:");
+  stores.push(store);
+  const t0 = Date.parse("2026-11-13T10:00:00Z");
+  for (const [index, text] of ["/ defrosted", "/new", "/New", "/Users/ardud/x.txt", "/frobnicate"].entries()) {
+    store.acceptInbound(`m${index}`, { text, sender: "person", receivedAt: t0 + index * 1_000 });
+  }
+  expect(groupLines(store.db, () => "Abdullah", ["m4"]).map(line => line.text))
+    .toEqual(["/ defrosted", "/Users/ardud/x.txt", "/frobnicate"]);
+});
+
 test("the judge sees people and Robob in order, with Robob labelled and bridge rows left out", () => {
   const store = new Store(":memory:");
   stores.push(store);

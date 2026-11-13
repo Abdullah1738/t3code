@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-source "${0:A:h}/toollog.zsh" output-changed 2>/dev/null || true
+source "${0:A:h}/toollog.zsh" output-changed "$0" "$@" || true
 # output-changed [--show] [--label TEXT] -- CMD...   (or: output-changed --url URL [--show])
 # Fires when CMD's output (or the URL body) differs from last run. First run records a baseline silently.
 # --show prints the new output (clipped to 3000 chars) instead of a one-line summary. A failing CMD is a check failure.

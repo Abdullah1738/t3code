@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -39,7 +40,7 @@ class SyncSeedTests(Isolated):
         self.con.commit()
 
     def fake_ssh(self, box, command, **kwargs):
-        return self.real_run(["sh", "-c", command], env={**os.environ, "HOME": str(self.box_home)},
+        return self.real_run(["sh", "-c", command], env=clean_env(HOME=str(self.box_home)),
                              capture_output=True, timeout=kwargs.get("timeout"))
 
     def watch_local(self, cmd, timeout, input=None, **kwargs):

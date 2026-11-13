@@ -1,5 +1,6 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
 import { resolveThreadReferenceCopyTarget } from "@t3tools/shared/threadReference";
+import { activeAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import {
   createContext,
   use,
@@ -119,9 +120,9 @@ export function HardwareKeyboardCommandProvider({
     (command: HardwareKeyboardCommand) => {
       if (command === "commandPalette") {
         setPaletteOpen(true);
-        return;
+        return !paletteOpen;
       }
-      if (dispatchHardwareKeyboardCommand(command)) return;
+      if (dispatchHardwareKeyboardCommand(command)) return true;
 
       if (command === "copyThreadReference") {
         if (copyTarget === null) return;
@@ -144,35 +145,47 @@ export function HardwareKeyboardCommandProvider({
                 },
           );
         });
-        return;
+        return true;
       }
 
       if (command === "newTask") {
         navigation.navigate("NewTaskSheet", { screen: "NewTask" });
-        return;
+        return true;
       }
       if (command === "back") {
         if (navigation.canGoBack()) {
           navigation.goBack();
+          return true;
         } else {
           navigation.dispatch(StackActions.replace("Home"));
         }
-        return;
+        return pathname !== "/";
       }
 
       const thread = parseActiveThreadPath(pathname);
       if (!thread) return;
       if (command === "files" && !/\/files(?:\/|$)/.test(pathname)) {
         navigation.navigate("ThreadFiles", thread);
+        return true;
       }
       if (command === "terminal" && !/\/terminal(?:\/|$)/.test(pathname)) {
         navigation.navigate("ThreadTerminal", thread);
+        return true;
       }
       if (command === "review" && !/\/review(?:\/|$)/.test(pathname)) {
         navigation.navigate("ThreadReview", thread);
+        return true;
       }
     },
-    [copyTarget, navigation, pathname, showCopyFeedback],
+    [copyTarget, navigation, paletteOpen, pathname, showCopyFeedback],
+  );
+
+  const onHardwareCommand = useCallback(
+    (command: HardwareKeyboardCommand) => {
+      const collector = activeAnalytics();
+      if (onCommand(command)) collector?.record("command.keybinding", { props: { key: command } });
+    },
+    [onCommand],
   );
 
   const palette = useMemo(
@@ -185,7 +198,7 @@ export function HardwareKeyboardCommandProvider({
 
   return (
     <CommandPaletteContext value={palette}>
-      <T3KeyboardCommands enabledCommands={enabledCommands} onCommand={onCommand}>
+      <T3KeyboardCommands enabledCommands={enabledCommands} onCommand={onHardwareCommand}>
         {children}
       </T3KeyboardCommands>
       <GitActionProgressOverlay progress={copyFeedback} onDismiss={dismissCopyFeedback} />

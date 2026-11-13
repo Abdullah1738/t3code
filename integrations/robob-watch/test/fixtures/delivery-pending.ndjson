@@ -1,0 +1,5 @@
+{"ts":"2026-11-13T23:58:00Z","tool":"watchers","component":"runner","kind":"perf","name":"watch.run","ok":true,"ids":{"watcher":"failed-send"},"props":{"outcome":"fire","queuedMs":0},"durationMs":10}
+{"ts":"2026-11-13T23:58:01Z","tool":"watchers","component":"wakes","kind":"error","name":"wake.sent","ok":false,"ids":{"watcher":"failed-send"},"error":{"tag":"wake.delivery_failed"}}
+{"ts":"2026-11-13T23:59:00Z","tool":"watchers","component":"runner","kind":"perf","name":"watch.run","ok":true,"ids":{"watcher":"quiet-held"},"props":{"outcome":"fire","queuedMs":0},"durationMs":20}
+{"ts":"2026-11-13T23:59:20Z","tool":"watchers","component":"runner","kind":"error","name":"watch.run","ok":false,"ids":{"watcher":"escalated"},"props":{"outcome":"fail","queuedMs":0},"durationMs":30,"error":{"tag":"watch.check_failed"}}
+{"ts":"2026-11-13T23:59:21Z","tool":"watchers","component":"wakes","kind":"perf","name":"wake.sent","ok":true,"ids":{"watcher":"escalated"}}

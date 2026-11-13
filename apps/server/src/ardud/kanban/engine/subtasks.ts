@@ -87,7 +87,11 @@ const approvesGate = (
   const command = words
     .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
     .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
-  if (/^(?:yes|approve|approved|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(command))
+  if (
+    /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
+      command,
+    )
+  )
     return true;
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
   const normalized = approvalAction(action);
@@ -149,9 +153,24 @@ export const approvalProblem = (
         const option = latest?.options?.find((entry) => entry.id === id);
         return option !== undefined && approvesGate(option.label, gate, subtask.text);
       }));
-  return approved
-    ? null
-    : `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval after it was created; a dropped ask is not approval`;
+  if (approved) return null;
+  let reason: string;
+  if (!latest || !answer) {
+    reason = `no owner answer on a ${gate} ask since ${since}`;
+  } else if (answer.verdict === "dropped") {
+    reason = `the latest decision, ${latest.id}, was dropped (a dropped ask is not approval)`;
+  } else if (answer.verdict === "picked") {
+    const labels = (answer.optionIds ?? [])
+      .map((id) => latest.options?.find((option) => option.id === id)?.label ?? id)
+      .join(", ");
+    reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
+  } else {
+    reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
+  }
+  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}`.replace(
+    /[\r\n]+/g,
+    " ",
+  );
 };
 
 export const MAX_SUBTASKS = 30;

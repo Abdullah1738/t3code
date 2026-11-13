@@ -60,6 +60,7 @@ import {
 } from "~/state/session";
 import { environmentIdsKey } from "~/state/environmentAtomList";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { activeAnalytics, recordSettingsKeys } from "@t3tools/client-runtime/ardud/analytics";
 
 const CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE = "[CLIENT_SETTINGS]";
 
@@ -190,6 +191,7 @@ export function persistClientSettingsPatch(
   patch: ClientSettingsPatch,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
 ): Promise<void> {
+  const analytics = activeAnalytics();
   // Patches queued before hydration must publish before newer optimistic patches.
   const deferPatch =
     clientSettingsHydrationStatus !== "ready" || deferredClientSettingsPatchCount > 0;
@@ -210,6 +212,7 @@ export function persistClientSettingsPatch(
       }
     }
     await persist(getClientSettingsSnapshot());
+    recordSettingsKeys(analytics, patch);
   }).catch((error) => {
     console.error(`${CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE} persist failed`, {
       operation: "persist",
@@ -227,6 +230,7 @@ export async function persistClientSettingsUpdate(
   update: (current: ClientSettings) => ClientSettings,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
 ): Promise<ClientSettings> {
+  const analytics = activeAnalytics();
   return enqueueClientSettingsPersistence(async () => {
     if (clientSettingsHydrationStatus !== "ready") {
       await hydrateClientSettings();
@@ -236,6 +240,9 @@ export async function persistClientSettingsUpdate(
       const next = update(current);
       await persist(next);
       if (getClientSettingsSnapshot() === current) {
+        for (const key of Object.keys(next) as Array<keyof ClientSettings>) {
+          if (!Object.is(current[key], next[key])) recordSettingsKeys(analytics, { [key]: true });
+        }
         replaceClientSettingsSnapshot(next);
         return next;
       }

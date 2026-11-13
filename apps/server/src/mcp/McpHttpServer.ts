@@ -1,3 +1,8 @@
+import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
+import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
+import * as DateTime from "effect/DateTime";
+import { AnalyticsToolkit } from "./toolkits/analytics/tools.ts";
+import * as AnalyticsHandlers from "./toolkits/analytics/handlers.ts";
 import * as RedactionTools from "../ardud/redaction/tools.ts";
 import * as SavedBoardReply from "../ardud/kanban/tools/savedReply.ts";
 import * as Cause from "effect/Cause";
@@ -895,6 +900,7 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const ownerAnalytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
     const largeRepliesForTools = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
     const boardReplyReady = yield* ReplyReadiness.boardReadiness;
     const controlReplyReady = yield* ReplyReadiness.controlReadiness;
@@ -1079,7 +1085,42 @@ const withToolAnalytics =
                   // Handoff tools look up threads to record; the response must not wait on them.
                   return Clock.currentTimeMillis.pipe(
                     Effect.flatMap((endedAt) =>
-                      record(options.tool.name, payload, result, endedAt - startedAt),
+                      Effect.gen(function* () {
+                        if (
+                          Option.isSome(ownerAnalytics) &&
+                          options.tool.name !== "analytics_read"
+                        ) {
+                          const failed =
+                            exit._tag === "Failure" ||
+                            (result !== undefined &&
+                              "isError" in result &&
+                              result.isError === true);
+                          yield* recordServerAnalytics(ownerAnalytics.value, {
+                            ts: DateTime.formatIso(DateTime.makeUnsafe(endedAt)),
+                            kind: failed ? "server.mcp.error" : "server.mcp",
+                            surface: "server",
+                            route: "mcp",
+                            ...(invocation?.thread === undefined
+                              ? {}
+                              : { threadId: invocation.thread.threadId }),
+                            durationMs: Math.max(0, endedAt - startedAt),
+                            props: {
+                              method: options.tool.name,
+                              span: "mcp.tools.call",
+                              originKind: invocation?.thread === undefined ? "mcp-client" : "agent",
+                              ...(failed
+                                ? {
+                                    errorTag:
+                                      exit._tag === "Failure"
+                                        ? analyticsErrorTag(exit.cause)
+                                        : "McpToolError",
+                                  }
+                                : {}),
+                            },
+                          });
+                        }
+                        yield* record(options.tool.name, payload, result, endedAt - startedAt);
+                      }),
                     ),
                     Effect.forkDetach,
                     Effect.asVoid,
@@ -1223,6 +1264,7 @@ export const layerMcpTransport = McpServer.layerHttp({
 }).pipe(Layer.provide(layerMcpAuthMiddleware));
 
 export const layer = Layer.mergeAll(
+  toolkitRegistration(AnalyticsToolkit, AnalyticsHandlers.layer),
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,

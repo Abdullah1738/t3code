@@ -7,6 +7,11 @@ import { rollup, toolLog, toolError } from "../src/toollog.ts";
 const before = process.env.TOOLLOG_DIR;
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
+const emptyBreakdown = {
+  byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0 }, fires: 0 },
+  byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [],
+  wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } },
+};
 const day = () => new Date().toISOString().slice(0, 10);
 const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -79,7 +84,7 @@ test("rollup counts fixture names/kinds, rates, percentiles and top error tags, 
 
 test("a missing day writes and prints an empty rollup with exit 0", async () => {
   const dir = fixture(), emptyDay = "2000-01-01";
-  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [] };
+  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [], ...emptyBreakdown };
   expect(await rollup(emptyDay)).toEqual(expected);
   const target = join(dir, `rollup-${emptyDay}.json`);
   expect(JSON.parse(readFileSync(target, "utf8"))).toEqual(expected);
@@ -103,7 +108,7 @@ test.each(["logs", "new-parent/logs"])("CLI creates missing log directory %s for
     env: { ...process.env, TOOLLOG_DIR: dir, ROBOB_WATCH_ROOT: join(root, "watchers-root") },
   });
   expect(child.exitCode).toBe(0);
-  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [] };
+  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [], ...emptyBreakdown };
   expect(JSON.parse(child.stdout.toString())).toEqual(expected);
   const target = join(dir, `rollup-${emptyDay}.json`);
   expect(JSON.parse(readFileSync(target, "utf8"))).toEqual(expected);

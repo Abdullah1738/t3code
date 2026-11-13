@@ -154,7 +154,7 @@ def in_scope():
 
 
 @contextlib.contextmanager
-def guard(box_id=None, recover_create=False, reconcile=False):
+def guard(box_id=None, recover_create=False, reconcile=False, lock_wait=None):
     check_queue()
     if _HELD.get():
         yield
@@ -165,6 +165,8 @@ def guard(box_id=None, recover_create=False, reconcile=False):
     queued = _QUEUE.get()
     wait = queued['wait'] if queued else pool.wait_seconds()
     end = queued['end'] if queued else time.monotonic() + wait
+    if lock_wait is not None:
+        end = min(end, time.monotonic() + lock_wait)
     said = False
     while True:
         try:

@@ -72,8 +72,8 @@ import { cn } from "~/lib/utils";
 import { observeResize } from "~/lib/observeResize";
 
 export interface BranchToolbarHandle {
-  openBranchPicker: () => void;
-  usePreviousWorktree: () => void;
+  openBranchPicker: () => boolean | void;
+  usePreviousWorktree: () => boolean | void;
 }
 
 interface BranchToolbarProps {
@@ -642,6 +642,7 @@ export const BranchToolbar = memo(function BranchToolbar({
         if (!showGitControls || !canUsePreviousWorktree || !previousWorktreeSeed) return;
         onUsePreviousWorktree();
         onComposerFocusRequest?.();
+        return true;
       },
     }),
     [

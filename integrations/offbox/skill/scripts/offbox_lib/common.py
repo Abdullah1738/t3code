@@ -195,6 +195,10 @@ def select_backend(name: str) -> str:
     return name
 
 
+# Value-taking options on the run/box lookup commands; keep in sync with cli.build_parser.
+_ENTRY_VALUE_OPTIONS = {"--timeout", "--local", "--box"}
+
+
 def entry_backend(argv: list[str]) -> str:
     """The backend for one `offbox ...` call. Without a home server: boat, with no lookups at all.
     Otherwise: spend is Boat's meter and stats is the home server's; a command that names a run or a box goes to
@@ -211,9 +215,22 @@ def entry_backend(argv: list[str]) -> str:
         return "server"
     first = default_backend()
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
-        named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
-                                                                      and not x.startswith("-"))]
-        if sub == 'keep':
+        named = [x for x in argv if x.startswith(("run-", "bx_"))]
+        if sub in ("logs", "wait", "kill"):
+            named = []
+            args = iter(argv[argv.index(sub) + 1:])
+            for arg in args:
+                if arg == "--":
+                    arg = next(args, "")
+                elif arg.startswith("-"):
+                    option, equals, _ = arg.partition("=")
+                    # argparse also accepts unambiguous long-option abbreviations.
+                    if not equals and any(flag.startswith(option) for flag in _ENTRY_VALUE_OPTIONS):
+                        next(args, None)
+                    continue
+                named = [arg] if arg else []
+                break
+        elif sub == 'keep':
             # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
             import argparse
             selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
@@ -223,13 +240,14 @@ def entry_backend(argv: list[str]) -> str:
             except argparse.ArgumentError:
                 return first  # The full command parser reports malformed input.
             named = [selected.box] if selected.box else []
-        for name in (first, "boat" if first == "server" else "server"):
-            if any(_known(name, x) for x in named):
-                return name
+        for suffix in (False, True):
+            for name in (first, "boat" if first == "server" else "server"):
+                if any(_known(name, x, suffix=suffix) for x in named):
+                    return name
     return first
 
 
-def _known(name: str, ident: str) -> bool:
+def _known(name: str, ident: str, *, suffix: bool) -> bool:
     """Does this backend's database know the run or box? Read-only; a missing database knows nothing."""
     path = db_path_for(name)
     if not path.exists():
@@ -238,9 +256,11 @@ def _known(name: str, ident: str) -> bool:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
         try:
             if ident.startswith("bx_"):
+                if suffix:
+                    return False  # Box IDs only support exact lookup.
                 return con.execute("SELECT 1 FROM leases WHERE box_id=?", (ident,)).fetchone() is not None
-            return con.execute("SELECT 1 FROM runs WHERE run_id=? OR run_id LIKE ?",
-                               (ident, f"%{ident}")).fetchone() is not None
+            op, value = ("LIKE", f"%{ident}") if suffix else ("=", ident)
+            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ?", (value,)).fetchone() is not None
         finally:
             con.close()
     except sqlite3.Error:

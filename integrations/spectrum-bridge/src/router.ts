@@ -9,6 +9,7 @@ import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./f
 import { assistantText, isDelegatedCompletionText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
+import { commandWord, controlCommand, isCommand } from "./commands.ts";
 import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
@@ -326,7 +327,7 @@ const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wak
 /** A person's plain typed text, the only kind of row steered into a running turn. */
 const steerText = (row: { id: string; payload: unknown }) => {
   const input = row.payload as Detachable;
-  return !synthetic(row.id) && !input.detached && !input.attachments.length && !!input.text.trim() && !input.text.trimStart().startsWith("/");
+  return !synthetic(row.id) && !input.detached && !input.attachments.length && !!input.text.trim() && !isCommand(input.text);
 };
 /** How long a steer that was sent but never shows up in the session holds the turn's reply. */
 const STEER_SETTLE_MS = 60_000;
@@ -644,7 +645,7 @@ export class Router {
     return this.store.pendingInbound().some(row => {
       const input = row.payload as NormalizedInbound;
       return row.state === "pending" && !synthetic(row.id) && input.source === "typed"
-        && !input.text.trimStart().startsWith("/") && !input.poll && !isTapback(input.text)
+        && !isCommand(input.text) && !input.poll && !isTapback(input.text)
         && input.receivedAt !== undefined && Date.now() - input.receivedAt >= 120_000;
     });
   }
@@ -679,7 +680,7 @@ export class Router {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
-        && !input.text.trimStart().startsWith("/") && !input.poll;
+        && !isCommand(input.text) && !input.poll;
       return !(row.state === "pending" && this.store.get(`inbound-delivered:${row.id}`) !== undefined)
         && (wake || typed) && Number.isSafeInteger(input.receivedAt)
         && now - input.receivedAt! >= (wake ? 15 * 60_000 : 120_000);
@@ -716,7 +717,7 @@ export class Router {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
-        && !input.text.trimStart().startsWith("/") && !input.poll;
+        && !isCommand(input.text) && !input.poll;
       if (!wake && !typed || !Number.isSafeInteger(input.receivedAt)) continue;
       const age = now - input.receivedAt!;
       if (age < (wake ? 15 * 60_000 : 120_000)) continue;
@@ -1368,8 +1369,7 @@ export class Router {
       let latestReceivedAt = 0;
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
-        const text = input.text.trimStart();
-        if (row.state !== "pending" || (text.startsWith("/") && !/^\/(notification|context)(?:\s|$)/.test(text))) continue;
+        if (row.state !== "pending" || controlCommand(input.text)) continue;
         // Legacy rows get a durable receipt time once, including while another turn runs.
         if (input.receivedAt === undefined || !Number.isSafeInteger(input.receivedAt) || input.receivedAt < 0) {
           input.receivedAt = now;
@@ -1393,7 +1393,7 @@ export class Router {
       // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
       // What a person typed goes ahead of watcher wakes queued before it: nobody waits behind an event they never sent.
       const sendable = (row: InboundRecord) => row.state === "pending" && !this.stuckWakeAttempted(row.id) && !this.backingOff(row.id, now)
-        && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart());
+        && !controlCommand((row.payload as NormalizedInbound).text);
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
         ?? rows.find(row => sendable(row) && !row.id.startsWith("wake:"))
@@ -1416,7 +1416,7 @@ export class Router {
         return { ...leader, state: "processing", resumed };
       }
       const input = leader.payload as NormalizedInbound;
-      const ordinary = !input.text.trimStart().startsWith("/");
+      const ordinary = !isCommand(input.text);
       const members = [leader];
       if (ordinary && !resetRow(leader.id)) {
         // Include terminal rows in this scan: consumed controls still split batches after restart.
@@ -1432,7 +1432,7 @@ export class Router {
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           // Sendblue's reply_to is not the swiped message, so distinct swipes never share a batch.
           if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
-            || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo
+            || row.state !== "pending" || isCommand(next.text) || next.replyTo !== input.replyTo
             || (this.options.swipes && next.replyTo && !sameAttachmentMessage(input, next))
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
@@ -1456,7 +1456,8 @@ export class Router {
       }
       const attachments = new Map<string, NormalizedInbound["attachments"][number]>();
       for (const item of inputs) for (const file of item.attachments) if (!attachments.has(file.guid)) attachments.set(file.guid, file);
-      const named = (item: NormalizedInbound) => context && context.chat.kind !== "owner" && item.sender && item.text.trim()
+      // Sender labels would hide reference commands from submit().
+      const named = (item: NormalizedInbound) => context && context.chat.kind !== "owner" && item.sender && item.text.trim() && !isCommand(item.text)
         ? `${context.roleOf(item.sender).name}${context.roleOf(item.sender).role === "guest" ? ` (${item.sender})` : ""}: ${item.text}`
         : item.text;
       const batch: NormalizedInbound = {
@@ -1769,16 +1770,16 @@ export class Router {
 
   private async control(row: InboundRecord, input: NormalizedInbound, preceding: Set<string>): Promise<void> {
     const text = input.text.trim();
-    const command = text.split(/\s/, 1)[0];
-    if (text === "/new") {
+    const command = commandWord(text);
+    if (text.toLowerCase() === "/new") {
       await this.newChat(row.id, preceding);
       return;
     }
-    if (text === "/status") {
+    if (text.toLowerCase() === "/status") {
       this.acknowledge(row.id, this.describe(row.id));
       return;
     }
-    if (command === "/approve" || command === "/answer") {
+    if (command === "approve" || command === "answer") {
       await this.respond(row.id, input);
       return;
     }
@@ -1793,11 +1794,11 @@ export class Router {
       }
       return;
     }
-    if (text.startsWith("/") && command !== "/notification" && command !== "/context") {
+    if (controlCommand(text)) {
       this.acknowledge(row.id, "Just text me normally. /new starts fresh, /status shows what I'm up to.");
       return;
     }
-    if (text.startsWith("/") || (input as Detachable).detached) return;
+    if (isCommand(text) || (input as Detachable).detached) return;
     // While a question or approval is being asked, the next ordinary text is the answer.
     const front = this.front();
     if (!front) return;
@@ -2554,7 +2555,7 @@ export class Router {
   private ungated(row: InboundRecord): boolean {
     if (!this.isGroup() || row.state !== "pending" || synthetic(row.id) || this.store.get<string>(`group-gate:${row.id}`)) return false;
     const input = row.payload as NormalizedInbound;
-    return !input.poll && !input.text.trimStart().startsWith("/");
+    return !input.poll && !isCommand(input.text);
   }
 
   /**
@@ -2784,7 +2785,7 @@ export class Router {
     return this.store.pendingInbound().some(row => {
       if (row.state !== "pending" || handled.has(row.id)) return false;
       const input = row.payload as NormalizedInbound;
-      return input.poll !== undefined || /^\/(?!(?:notification|context)(?:\s|$))/.test(input.text.trim());
+      return input.poll !== undefined || controlCommand(input.text);
     });
   }
 
@@ -2821,7 +2822,7 @@ export class Router {
       = explicit ? this.store.findOutbox(explicit[2]!) : input.replyTo && !this.options.swipes ? this.store.byProviderId(input.replyTo) : undefined;
     let route = this.store.get<Route | null>("route");
     let quote = "";
-    if ((text.startsWith("/notification") || text.startsWith("/context")) && !explicit) {
+    if (["notification", "context"].includes(commandWord(text) ?? "") && !explicit) {
       this.acknowledge(row.id, "Use /notification ID question or /context ID question.");
       return;
     }

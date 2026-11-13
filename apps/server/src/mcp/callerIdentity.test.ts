@@ -69,9 +69,13 @@ it.effect(
     ),
 );
 
-it.effect.each(["board", "send", "status"] as const)(
-  "%s resolves an active caller with the real background reader pinned",
-  (operation) =>
+it.effect.each(
+  (["board", "send", "status"] as const).flatMap((operation) =>
+    (["root", "delegated-codex", "delegated-claude"] as const).map((kind) => ({ operation, kind })),
+  ),
+)(
+  "$operation resolves an active $kind caller with the real background reader pinned",
+  ({ operation, kind }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -85,6 +89,16 @@ it.effect.each(["board", "send", "status"] as const)(
         const release = yield* Deferred.make<void>();
         const resolved = yield* Deferred.make<void>();
         const recordEntered = yield* Deferred.make<void>();
+        const providerInstanceId = ProviderInstanceId.make(
+          kind === "delegated-claude" ? "claudeAgent" : "codex",
+        );
+        const callerScope = { ...scope, thread: { ...scope.thread!, providerInstanceId } };
+        const shell = {
+          ...liveThreadShell(callerId),
+          providerInstanceId,
+          forkedFrom:
+            kind === "root" ? null : { type: "node" as const, nodeId: NodeId.make("task:caller") },
+        };
         const holder = yield* sql
           .withTransaction(
             Effect.gen(function* () {
@@ -104,7 +118,7 @@ it.effect.each(["board", "send", "status"] as const)(
                 .withTransaction(sql`SELECT * FROM entries`)
                 .pipe(SqliteClient.readOnly, Effect.orDie);
               yield* Deferred.succeed(resolved, undefined);
-              return liveThreadShell(callerId);
+              return shell;
             }),
           getThreadShell: () => Effect.die("active caller must not load its full shell"),
           getThreadRecords: () =>
@@ -149,11 +163,11 @@ it.effect.each(["board", "send", "status"] as const)(
             const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
             const pending = yield* (
               operation === "status"
-                ? mcp.taskStatus(scope, NodeId.make("task:foreground"))
-                : mcp.sendToThread(scope, { message: "test", threadId: callerId })
+                ? mcp.taskStatus(callerScope, NodeId.make("task:foreground"))
+                : mcp.sendToThread(callerScope, { message: "test", threadId: callerId })
             ).pipe(Effect.forkChild);
             yield* Deferred.await(resolved);
-            yield* Deferred.await(recordEntered);
+            yield* Effect.raceFirst(Fiber.join(pending), Deferred.await(recordEntered));
             assert.isFalse(yield* Deferred.isDone(release));
             if (operation === "status") {
               yield* TestClock.adjust("10 seconds");
@@ -161,6 +175,9 @@ it.effect.each(["board", "send", "status"] as const)(
                 taskId: NodeId.make("task:foreground"),
                 partial: true,
                 callerResolved: true,
+                stoppedAt: "parent_records",
+                retryHint:
+                  "Robob was busy and this read stopped at parent_records. The task itself is unaffected. Retry task_status in a few seconds.",
               });
             } else yield* Fiber.interrupt(pending);
           }
@@ -168,7 +185,7 @@ it.effect.each(["board", "send", "status"] as const)(
           assert.isFalse(yield* Deferred.isDone(release));
         }).pipe(
           Effect.provide(OrchestratorMcp.layer.pipe(Layer.provideMerge(deps))),
-          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, callerScope),
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         yield* Fiber.join(holder);
@@ -236,4 +253,54 @@ it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
         OrchestratorMcp.isLiveCallerShell(shell, ProviderInstanceId.make("codex")),
       );
     }).pipe(Effect.provide(Layer.mock(ThreadManagement.ThreadManagementService)({}))),
+);
+
+it.effect.each(["ended", "archived", "other-provider", "background-subagent"] as const)(
+  "delegated %s caller retains the full liveness check",
+  (state) =>
+    Effect.gen(function* () {
+      const base = liveThreadShell(callerId);
+      const shell = {
+        ...base,
+        forkedFrom: { type: "node" as const, nodeId: NodeId.make("task:caller") },
+        activeRunId: state === "archived" || state === "other-provider" ? base.activeRunId : null,
+        archivedAt: state === "archived" ? base.createdAt : null,
+        providerInstanceId: ProviderInstanceId.make(
+          state === "other-provider" ? "claudeAgent" : "codex",
+        ),
+        pendingBackgroundTasks:
+          state === "background-subagent"
+            ? [
+                {
+                  taskId: "native-task",
+                  kind: "subagent" as const,
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                },
+              ]
+            : [],
+      };
+      let fallbackReads = 0;
+      const caller = yield* ThreadAccess.loadCaller().pipe(
+        Effect.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: () => Effect.succeed(shell),
+            getThreadShell: () =>
+              Effect.gen(function* () {
+                assert.equal(yield* SqliteClient.ReaderLane, "background");
+                fallbackReads++;
+                return shell;
+              }),
+          }),
+        ),
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+      );
+      assert.equal(fallbackReads, 1);
+      assert.strictEqual(caller.caller, shell);
+      if (state === "background-subagent") yield* ThreadAccess.assertLiveCaller(caller);
+      else
+        assert.equal(
+          (yield* ThreadAccess.assertLiveCaller(caller).pipe(Effect.flip)).code,
+          "parent_not_active",
+        );
+    }),
 );

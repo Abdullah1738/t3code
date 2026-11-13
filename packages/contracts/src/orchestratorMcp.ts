@@ -279,6 +279,14 @@ export const OrchestratorMcpTaskStatusResult = Schema.Union([
     taskId: NodeId,
     partial: Schema.Literal(true),
     callerResolved: Schema.optional(Schema.Literal(true)),
+    stoppedAt: Schema.Literals(["caller", "parent_records", "child_records", "result"]).annotate({
+      description:
+        "Read stage still pending when the status deadline expired. This describes the status read, not the delegated task's progress.",
+    }),
+    retryHint: Schema.String.annotate({
+      description:
+        "What to do after this status read timed out. The delegated task is unaffected; follow this hint to retry or read the known child thread.",
+    }),
   })),
 ]);
 export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;

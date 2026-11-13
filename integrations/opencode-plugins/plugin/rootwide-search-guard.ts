@@ -39,10 +39,11 @@ export function createGuardHook(directory: string, check = classify) {
     // Like the existing OpenCode DB guard, rewrite before the shell executes.
     // The native hooks and this adapter share the exact operand parser.
     const started = performance.now();
+    const cwd = input.workdir ?? input.cwd ?? directory;
     let verdict: Verdict;
-    try { verdict = await check(command, input.workdir ?? input.cwd ?? directory); }
-    catch { toolLogHook("rootwide-search", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}); return; }
-    toolLogHook("rootwide-search", verdict.root && verdict.reason ? "denied" : "allowed", "rootwide-search", started, command, undefined, {sessionId:event.sessionID});
+    try { verdict = await check(command, cwd); }
+    catch { toolLogHook("rootwide-search", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}, {cwd}); return; }
+    toolLogHook("rootwide-search", verdict.root && verdict.reason ? "denied" : "allowed", "rootwide-search", started, command, undefined, {sessionId:event.sessionID}, {cwd, matchedRoot:verdict.root});
     if (verdict.root && verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 3`, background: false };
     }

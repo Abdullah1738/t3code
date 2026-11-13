@@ -113,7 +113,9 @@ def _log(**record):
         decision = "denied" if record.get("decision") == "deny" else "rewritten" if record.get("rewritten") else "allowed"
         toollog.hook(harness, guard, decision, rule, record.get("ms", 0), record.get("command"),
                      _log_enum(record.get("error"), _LOG_ERRORS),
-                     ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId")})
+                     ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId"),
+                          "nativeAgentId": record.get("nativeAgentId"),
+                          "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"))
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -1107,6 +1109,8 @@ def decide(event, harness):
     error_type = None
     log_tool = None
     binding_only = False
+    cwd = None
+    matched_root = None
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
     lineage_nodes = None
     lineage_deadline = None
@@ -1149,6 +1153,7 @@ def decide(event, harness):
         if command:
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+            cwd = command_cwd
             try:
                 root = rootwide_search_guard.classify(command, command_cwd)
             except Exception as error:
@@ -1157,6 +1162,7 @@ def decide(event, harness):
                 error_type = type(error).__name__
                 root = None
             if root:
+                matched_root = root
                 result = {"decision": "deny", "reason": rootwide_search_guard.reason(root, command_cwd),
                           "context": {"rule": "rootwide-search"}}
                 return result
@@ -1276,15 +1282,18 @@ def decide(event, harness):
                 masked, changed = card_mask.mask_value(event.get("tool_response"))
                 if changed:
                     result["context"]["updatedToolOutput"] = masked
-                    _log(harness=harness, event="PostToolUse", rule="card-mask")
+                    result["context"]["rule"] = "card-mask"
             except Exception as error:
                 # Fail open: retain the original result and never log its contents.
-                log_event_error(harness, "PostToolUse", "card-mask", type(error).__name__)
+                result["context"]["rule"] = "card-mask"
+                error_type = type(error).__name__
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
              identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
-             sessionId=event.get("session_id") if isinstance(event, dict) else None,
+             sessionId=_native(event, harness)[0] if isinstance(event, dict) else None,
+             nativeAgentId=event.get("agent_id") if harness == "claude" and isinstance(event, dict) else None,
+             cardNumber=identity.get("cardNumber"), cwd=cwd, matchedRoot=matched_root,
              command=command, rewritten="updatedInput" in result["context"] or "updatedToolOutput" in result["context"], ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 

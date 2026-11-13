@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import runs
 from offbox_lib.runs import LDCACHE_REPAIR, remote_script
 
@@ -43,7 +44,7 @@ class Fixture:
                        .replace('/usr/lib/', str(self.fix / 'usr/lib') + '/')
                        .replace('/tmp/offbox-ldcache.lock', str(self.fix / 'ldcache.lock'))
                        + '\necho USER_COMMAND\nexit 3\n')
-        self.env = dict(os.environ, HOME=str(home), FIX=str(self.fix), PATH=f'{bins}:/usr/bin:/bin')
+        self.env = clean_env(HOME=str(home), FIX=str(self.fix), PATH=f'{bins}:/usr/bin:/bin')
 
     def soname(self, name, target=True):
         if target:

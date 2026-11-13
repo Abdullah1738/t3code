@@ -10,6 +10,7 @@ import type { Database } from "bun:sqlite";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isCommand } from "./commands.ts";
 
 export const JEV_MODEL = "typesafe/jev-1.13";
 /** Same line the Moni classifier settled on: a false wake costs less than a missed request. */
@@ -76,7 +77,7 @@ export function inboundTime(input: { receivedAt?: number; sentAt?: number }): nu
 }
 
 function personLine(id: string, input: InboundPayload, nameOf: (address: string) => string, at: number | undefined): GroupLine | undefined {
-  if (synthetic(id) || input.poll || (input.text ?? "").trimStart().startsWith("/")) return;
+  if (synthetic(id) || input.poll || isCommand(input.text ?? "")) return;
   if (at === undefined) return;
   const text = inboundWords(input);
   if (!text) return;
