@@ -8300,7 +8300,7 @@ const make = Effect.gen(function* () {
     turnEnd?: KanbanThreadLink,
   ) {
     yield* Effect.annotateCurrentSpan({ "kanban.board_id": boardId, "kanban.tick_step": step });
-    return yield* locks.step(effect, cardId).pipe(
+    return yield* locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
       Effect.map(Option.some),
       Effect.catchDefect((defect) =>
         Effect.gen(function* () {

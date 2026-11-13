@@ -1663,7 +1663,10 @@ it.effect(
         yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
         for (const result of [yield* Fiber.join(create), yield* Fiber.join(open)]) {
           assert.isTrue(result.isError, result.text);
-          assert.include(result.text, "Board busy: not written. Safe to retry once.");
+          assert.include(
+            result.text,
+            "Board busy: not written (held 2m0s by KanbanBoardLocks.run). Safe to retry once.",
+          );
         }
         assert.isUndefined(holder.pollUnsafe());
         assert.lengthOf(yield* kanban.discussions(board.id), 0);

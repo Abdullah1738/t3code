@@ -1,3 +1,6 @@
+import * as Clock from "effect/Clock";
+import * as References from "effect/References";
+import * as Option from "effect/Option";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -9,7 +12,19 @@ import * as SavedWrite from "./savedWrite.ts";
 // A board-wide writer excludes card writers; independent card writers share the gate.
 const BOARD_PERMITS = 1_000_000;
 
+interface Holder {
+  readonly label: string;
+  readonly boardId: string;
+  readonly cardId: string | undefined;
+  readonly fiberId: number;
+  readonly lock: "migration" | "gate" | "card";
+  readonly mode: "shared" | "exclusive";
+  readonly acquiredAtMs: number;
+}
+
 interface BoardLock {
+  readonly holders: Map<symbol, Holder>;
+  lastWarningAtMs: number;
   readonly gate: Semaphore.Semaphore;
   readonly cards: Map<string, Semaphore.Semaphore>;
   readonly resources: Map<string, number>;
@@ -24,9 +39,12 @@ interface Held {
   readonly cardId: string | undefined;
   readonly mutex: Semaphore.Semaphore | undefined;
   readonly permits: number;
+  readonly releases: ReadonlyArray<Effect.Effect<void>>;
 }
 
 interface Operation {
+  readonly label: string;
+  diagnosticCardId: string | undefined;
   readonly fiberId: number;
   readonly cardId: string | undefined;
   held: Held | undefined;
@@ -92,6 +110,7 @@ export const REPLAY_MAX_MS = 30_000;
 /** State locks are never held across another service's I/O. A stale continuation cannot write. */
 export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const boards = new Map<string, BoardLock>();
+  const migrationHolders = new Map<symbol, Holder>();
   const dispatches = new Set<Operation>();
   let migrationGeneration = 0;
   // Only selection migration takes every permit; ordinary boards never exclude each other here.
@@ -100,6 +119,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     let board = boards.get(id);
     if (!board) {
       board = {
+        holders: new Map(),
+        lastWarningAtMs: -Infinity,
         gate: Semaphore.makeUnsafe(BOARD_PERMITS),
         cards: new Map(),
         resources: new Map([["epoch", 0]]),
@@ -118,21 +139,123 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   });
   const check = (op: Operation) =>
     op.stale ? Effect.die(new BoardStateChanged(op.committed)) : Effect.void;
-  const wait = <A>(op: Operation, effect: Effect.Effect<A>) =>
+  // These helpers share the caller's operation span; the hot admission loop adds no spans.
+  const label = Effect.map(Effect.option(Effect.currentSpan), (span) => {
+    if (Option.isNone(span)) return "KanbanBoardLocks.run";
+    const nearest = span.value;
+    let cursor: import("effect/Tracer").AnySpan | undefined = nearest;
+    while (cursor?._tag === "Span") {
+      const tool = cursor.attributes.get("mcp.tool.name");
+      if (typeof tool === "string") return tool;
+      cursor = Option.getOrUndefined(cursor.parent);
+    }
+    const parent = Option.getOrUndefined(nearest.parent);
+    return nearest.name === "KanbanService.serial"
+      ? `${parent?._tag === "Span" ? parent.name : nearest.name} (${nearest.attributes.get("serial.queue") ?? "serial"})`
+      : nearest.name;
+  });
+  const holdersAt = (now: number) =>
+    [
+      ...[...boards.values()].flatMap((board) => [...board.holders.values()]),
+      ...[...migrationHolders.values()].filter((holder) => holder.mode === "exclusive"),
+    ].map((holder) => ({
+      ...holder,
+      cardId: holder.cardId ?? null,
+      heldForMs: Math.max(0, now - holder.acquiredAtMs),
+    }));
+  const waitingOn = (boardId: string, lock: Holder["lock"], cardId?: string) => ({
+    boardId,
+    lock,
+    cardId,
+  });
+  type WaitingOn = ReturnType<typeof waitingOn>;
+  const blockersAt = (target: WaitingOn, now: number) =>
+    (target.lock === "migration"
+      ? [...migrationHolders.values()]
+      : [...boardOf(target.boardId).holders.values()].filter(
+          (holder) =>
+            holder.lock === target.lock &&
+            (target.lock !== "card" || holder.cardId === target.cardId),
+        )
+    ).map((holder) => ({
+      ...holder,
+      cardId: holder.cardId ?? null,
+      heldForMs: Math.max(0, now - holder.acquiredAtMs),
+    }));
+  const warning = Effect.fnUntraced(function* (
+    op: Operation,
+    target: WaitingOn,
+    started: number,
+    refused: boolean,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    const blockers = blockersAt(target, now);
+    const board = boardOf(target.boardId);
+    if (!refused) {
+      if (
+        !blockers.some((holder) => holder.heldForMs >= 60_000) ||
+        now - board.lastWarningAtMs < 30_000
+      )
+        return blockers;
+      board.lastWarningAtMs = now;
+    }
+    const fields = {
+      "board.observed_at_ms": now,
+      "board.waiter": op.label,
+      "board.id": target.boardId,
+      "board.card_id": op.diagnosticCardId ?? null,
+      "board.waiter_fiber_id": op.fiberId,
+      "board.waiting_on": target.lock,
+      "board.waited_ms": Math.max(0, now - started),
+      "board.holders": holdersAt(now).filter(
+        (holder) =>
+          target.lock === "migration" ||
+          holder.boardId === target.boardId ||
+          holder.boardId === "*",
+      ),
+      "board.blockers": blockers,
+    };
+    // Console pretty-printers truncate nested objects. Keep a complete JSON line
+    // in the durable child log as well as structured annotations for OTLP.
+    yield* Effect.logWarning(
+      // Fixed internal diagnostic fields; encoding must not add a failure to lock admission.
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      JSON.stringify({
+        event: refused ? "kanban board write refused" : "kanban board lock held too long",
+        ...fields,
+      }),
+    ).pipe(Effect.annotateLogs(fields), Effect.provideService(References.MinimumLogLevel, "Warn"));
+    return blockers;
+  });
+  const wait = <A>(op: Operation, target: WaitingOn, started: number, effect: Effect.Effect<A>) =>
     Effect.flatMap(writeWaitMs, (duration) =>
       effect.pipe(
+        // Only contended admissions start this monitor; it dies with the waiter.
+        Effect.raceFirst(
+          Effect.forever(
+            warning(op, target, started, false).pipe(Effect.andThen(Effect.sleep(30_000))),
+          ),
+        ),
         Effect.timeoutOrElse({
           duration,
-          orElse: () =>
-            Effect.die(
+          orElse: Effect.fnUntraced(function* () {
+            const blockers = yield* warning(op, target, started, true);
+            const oldest = blockers.sort((a, b) => b.heldForMs - a.heldForMs)[0];
+            const seconds = Math.floor((oldest?.heldForMs ?? 0) / 1_000);
+            const heldFor = `${Math.floor(seconds / 60)}m${seconds % 60}s`;
+            const summary = oldest
+              ? ` (held ${heldFor} by ${oldest.label}${blockers.length > 1 ? ` +${blockers.length - 1} more` : ""})`
+              : " (holder released at deadline)";
+            return yield* Effect.die(
               new KanbanError({
                 code: "conflict",
                 saved: op.committed ? null : false,
                 detail: op.committed
                   ? MAY_HAVE_APPLIED
-                  : "Board busy: not written. Safe to retry once.",
+                  : `Board busy: not written${summary}. Safe to retry once.`,
               }),
-            ),
+            );
+          }),
         }),
       ),
     );
@@ -142,28 +265,50 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       : `${held.board.boardGeneration}:${held.board.cardGenerations.get(held.cardId) ?? 0}`;
   // Card versions contain two counters; retain them independently of wall-clock timestamps.
   const versions = new WeakMap<Operation, Map<string, number | string>>();
-  const take = (op: Operation, semaphore: Semaphore.Semaphore, permits: number) =>
+  const take = (
+    op: Operation,
+    semaphore: Semaphore.Semaphore,
+    permits: number,
+    target: WaitingOn,
+  ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const started = performance.now();
+        const started = yield* Clock.currentTimeMillis;
         while (!(yield* semaphore.takeIfAvailable(permits))) {
           // withPermits owns cancellation cleanup while waiting. The actual transfer
           // happens masked, so an interrupt cannot land between take and ownership.
           yield* restore(
-            Effect.interruptible(wait(op, semaphore.withPermits(permits)(Effect.void))),
+            Effect.interruptible(
+              wait(op, target, started, semaphore.withPermits(permits)(Effect.void)),
+            ),
           );
         }
-        yield* Effect.annotateCurrentSpan("board.admission_wait_ms", performance.now() - started);
+        const acquiredAtMs = yield* Clock.currentTimeMillis;
+        const token = Symbol();
+        const board = boardOf(target.boardId);
+        const holder: Holder = {
+          ...target,
+          cardId: op.diagnosticCardId,
+          label: op.label,
+          fiberId: op.fiberId,
+          acquiredAtMs,
+          mode: permits === BOARD_PERMITS || target.lock === "card" ? "exclusive" : "shared",
+        };
+        board.holders.set(token, holder);
+        if (target.lock === "migration") migrationHolders.set(token, holder);
+        yield* Effect.annotateCurrentSpan("board.admission_wait_ms", acquiredAtMs - started);
+        return Effect.sync(() => {
+          board.holders.delete(token);
+          migrationHolders.delete(token);
+        }).pipe(Effect.andThen(semaphore.release(permits)), Effect.asVoid);
       }),
     );
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
     const held = op.held;
     if (!held) return;
     op.held = undefined;
-    if (held.mutex) yield* held.mutex.release(1);
-    yield* held.board.gate.release(held.permits);
-    yield* migration.release(1);
-  });
+    yield* Effect.forEach(held.releases.toReversed(), (release) => release, { discard: true });
+  }, Effect.uninterruptible);
   const acquire = (op: Operation, boardId: string, reconcile = false) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
@@ -182,15 +327,17 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           }
         }
         const permits = cardId === undefined ? BOARD_PERMITS : 1;
-        yield* take(op, migration, 1);
-        yield* take(op, board.gate, permits).pipe(Effect.onError(() => migration.release(1)));
-        if (mutex)
-          yield* take(op, mutex, 1).pipe(
-            Effect.onError(() =>
-              board.gate.release(permits).pipe(Effect.andThen(migration.release(1))),
-            ),
-          );
-        const held: Held = { boardId, board, cardId, mutex, permits };
+        const releases: Array<Effect.Effect<void>> = [];
+        yield* Effect.gen(function* () {
+          releases.push(yield* take(op, migration, 1, waitingOn(boardId, "migration", cardId)));
+          releases.push(yield* take(op, board.gate, permits, waitingOn(boardId, "gate", cardId)));
+          if (mutex) releases.push(yield* take(op, mutex, 1, waitingOn(boardId, "card", cardId)));
+        }).pipe(
+          Effect.onError(() =>
+            Effect.forEach(releases.toReversed(), (release) => release, { discard: true }),
+          ),
+        );
+        const held: Held = { boardId, board, cardId, mutex, permits, releases };
         op.held = held;
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
@@ -218,6 +365,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Only a stale rerun passes this in: every new execution starts with its own empty map.
     replayOf?: Map<string, Array<ReplayEntry>>,
     retry?: { readonly reruns: number; readonly backoffMs: number },
+    operationLabel?: string,
   ): Effect.Effect<A, E, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -226,8 +374,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const policy = retry ?? (yield* retryPolicy);
         const replay = replayOf ?? new Map<string, Array<ReplayEntry>>();
         const op: Operation = {
+          label: operationLabel ?? (yield* label),
           fiberId: yield* Effect.fiberId,
           cardId,
+          diagnosticCardId: cardId,
           held: undefined,
           stale: false,
           committed: false,
@@ -272,7 +422,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
                   policy.backoffMs > 0
                     ? Effect.sleep(policy.backoffMs * 2 ** attempt)
                     : Effect.void,
-                ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy)))
+                ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
               : Effect.die(defect),
           ),
         );
@@ -290,6 +440,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const op = yield* operation;
         if (!op)
           return yield* write ? run(access(boardId, effect, true, resource)) : restore(effect);
+        if (resource?.startsWith("card:")) op.diagnosticCardId ??= resource.slice(5);
         // Row-scoped access does not subscribe to unrelated card writes.
         const previous = versions.get(op)!;
         const broad = previous.has(boardId);
@@ -481,6 +632,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   });
 
   return {
+    holders: Effect.map(Clock.currentTimeMillis, holdersAt),
     run,
     // Dispatch alone replaces its planning snapshot with the card and slot it will take.
     // Collection reads inside that dispatch must not silently restore a board-wide dependency.
@@ -520,8 +672,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Only the metadata persistence is marked; publication and its follow-ups keep normal conflicts.
     dispatchMetadata: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(Effect.provideService(dispatchMetadata, true)),
-    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string) =>
-      run(effect, cardId).pipe(Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 })),
+    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, operationLabel?: string) =>
+      run(effect, cardId, 0, undefined, undefined, operationLabel).pipe(
+        Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 }),
+      ),
     access,
     outside,
     // Compensation must run without permits even after the snapshot became stale.
@@ -575,20 +729,42 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         ),
       ),
     exclusive: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      migration.withPermits(BOARD_PERMITS)(
-        effect.pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              // Migration uses the raw store. In-flight I/O must not commit pre-migration models.
-              migrationGeneration += 1;
-              for (const board of boards.values()) {
-                board.generation += 1;
-                board.boardGeneration += 1;
-                for (const [key, value] of board.resources) board.resources.set(key, value + 1);
-              }
-            }),
-          ),
-        ),
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          // Migration owns all boards, including boards first seen while it is running.
+          const token = Symbol();
+          const holder: Holder = {
+            label: yield* label,
+            boardId: "*",
+            cardId: undefined,
+            fiberId: yield* Effect.fiberId,
+            lock: "migration",
+            mode: "exclusive",
+            acquiredAtMs: 0,
+          };
+          return yield* restore(
+            migration.withPermits(BOARD_PERMITS)(
+              Effect.gen(function* () {
+                const acquired = { ...holder, acquiredAtMs: yield* Clock.currentTimeMillis };
+                migrationHolders.set(token, acquired);
+                return yield* effect;
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    migrationHolders.delete(token);
+                    migrationGeneration += 1;
+                    for (const board of boards.values()) {
+                      board.generation += 1;
+                      board.boardGeneration += 1;
+                      for (const [key, value] of board.resources)
+                        board.resources.set(key, value + 1);
+                    }
+                  }),
+                ),
+              ),
+            ),
+          );
+        }),
       ),
   };
 });
