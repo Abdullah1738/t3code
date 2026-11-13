@@ -345,8 +345,36 @@ def bind_purchase(data, result, at, qid):
     return True
 
 
+def receipt_for_question(data, charge, qid=None, questions=None):
+    questions = load_questions(data)['questions'] if questions is None else questions
+    # Same-card copies share a question. Distinct questions, including settled ones, are
+    # competing transactions; merchant and amount alone cannot assign their receipt.
+    rivals = [q for q in questions if q['id'] != qid and q.get('kind') == 'charge'
+              and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])]
+
+    def accepts(row, text):
+        received = dt.datetime.fromtimestamp(row['ts'], TZ)
+        for other in rivals:
+            explained = other.get('explanation') or {}
+            if row.get('id') is not None and explained.get('msgs') == row['id']:
+                return False
+            observed = moment(other.get('at'))
+            if observed is None:
+                continue
+            named = any(re.search(r'\b' + re.escape(word) + r'\b', text, re.I)
+                        for word in charges.words(other['merchant']))
+            for matched, is_named in ((named, True), (charges.last_four(other).search(text), False)):
+                start, end = charges.receipt_window(observed, received, is_named)
+                if matched and start <= received <= end:
+                    return False
+        return True
+
+    return accepts
+
+
 def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None):
-    return purchase_match(data, charge, at, qid) or charges.explain(charge, at, now, deadline, find, said)
+    return purchase_match(data, charge, at, qid) or charges.explain(
+        charge, at, now, deadline, find, said, receipt_ok=receipt_for_question(data, charge, qid))
 
 
 def norm_ref(text):
@@ -1308,7 +1336,7 @@ def reconcile_merchants(data=None, now=None, end=None):
         for case in book['cases']:
             if (case.get('merchant_card_key') and case['merchant_card_key'] not in active
                     and not case.get('merchant_card_resolved')):
-                if case['status'] == 'open':
+                if case['status'] in ('open', 'awaiting_answer'):
                     payment_close(case, 'merchant no longer holds a cancelled or declined card', now)
                 else:
                     case['history'].append({'at': stamp(now), 'text': 'dead saved card no longer present'})
@@ -2063,7 +2091,8 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
             if q['status'] == 'case':
                 return {**base, 'verdict': 'held' if owner == 'moni' else 'case', 'why': f"money case {q['case']}", 'id': qid}
             if r.get('purchase') and not bind_purchase(data, r, at, q['id']):
-                r = charges.explain(charge, at, now, deadline, find, said)
+                r = charges.explain(charge, at, now, deadline, find, said,
+                                    receipt_ok=receipt_for_question(data, charge, q['id'], book['questions']))
                 verdict = 'explained' if r['verdict'] in ('receipt', 'owner') else r['verdict']
             if verdict == 'explained' and active(q):
                 explain_question(data, q, r, 'check' if q.get('asks') or q.get('passed') else 'triage', now, deadline)
@@ -2133,7 +2162,8 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
         if r is None:
             r = explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None)
         if r.get('purchase') and not bind_purchase(data, r, at, q['id']):
-            r = charges.explain(charge, at, now, deadline, find, said)
+            r = charges.explain(charge, at, now, deadline, find, said,
+                                receipt_ok=receipt_for_question(data, charge, q['id'], book['questions']))
         note_why(q, r['why'], now)
         if r['errors']:
             return 4, '\n'.join(f"UNVERIFIED: source {e.split(':', 1)[0]} unreadable ({q['id']})" for e in r['errors'])
@@ -2262,7 +2292,10 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             try:
                 with within(each, LookupTimeout('out of time')):
                     matched = subscription_match(data, charge_of(q), at, record=True, end=each) if q.get('subscription_dated', False) else None
-                    hit = matched or purchase_match(data, charge_of(q), at, q['id']) or charges.found(charge_of(q), at, now, each, find, owner, errors, memo, stats)
+                    charge = charge_of(q)
+                    hit = matched or purchase_match(data, charge, at, q['id']) or charges.found(
+                        charge, at, now, each, find, owner, errors, memo, stats,
+                        receipt_ok=receipt_for_question(data, charge, q['id'], questions))
             except (charges.Lookup, LookupTimeout) as e:
                 errors.append(str(e))
                 # A slow receipt cannot hide owner evidence already loaded in this run.

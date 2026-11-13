@@ -5,9 +5,136 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from test_cases import Base, ALERT, BANK, RECEIPT, at, finder, nobody, mc
+from test_charges import Finder
 
 
 class Unanswered(Base):
+    def test_a_newer_same_amount_receipt_cannot_close_an_older_unanswered_charge(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                self.data, self.wd = self.tmp / str(linked), self.tmp / ('wd-' + str(linked))
+                self.wd.mkdir()
+                old = self.seed(when='2026-11-01T09:00')
+                self.assertEqual(mc.ask(self.data, 'Yours?', qid=old, now=at('2026-11-01T10:00'),
+                                        find=finder(), said=nobody)[0], 0)
+                if linked:
+                    with mc.Locked(self.data, 'questions') as book:
+                        cid = mc.case_from(self.data, mc.find_question(book, old), at('2026-11-01T11:00'), 'check')
+                self.fire('2026-11-09T10:00')
+                self.fire('2026-11-20T10:00', 1)
+                receipt = dict(RECEIPT, ts=at('2026-12-06T09:01').timestamp())
+                with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+                    fresh = mc.screen(ALERT, BANK, at('2026-12-06T09:00'), at('2026-12-06T09:02'),
+                                      data=self.data, find=finder(receipt), said=nobody, item='sms:december')
+                    self.assertEqual(fresh['verdict'], 'explained')
+                    mc.run_check(self.wd, 'december', self.data, self.root, at('2026-12-06T10:00'), finder(receipt), nobody)
+                q = mc.find_question(mc.load_questions(self.data), old)
+                self.assertEqual(q['status'], 'awaiting_answer')
+                self.assertIn(old, self.cli('questions', '--json'))
+                self.assertIn(cid if linked else old, self.cli('list', '--json'))
+                self.assertIn('awaiting answer', self.cli('brief'))
+                if linked:
+                    self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'awaiting_answer')
+
+    def test_receipt_timestamp_class_is_bound_to_the_charge_even_on_a_late_check(self):
+        observed = at('2026-11-01T09:00')
+        charge = mc.charges.parse(ALERT, BANK)
+        # receipt offset | merchant-only receipt is tied to this charge's 36-hour window
+        for hours, seconds, matched in ((-2, -1, False), (-2, 0, True), (11, 0, True),
+                                        (36, 0, True), (36, 1, False), (35 * 24, 0, False)):
+            with self.subTest(hours=hours, seconds=seconds):
+                received = observed + mc.dt.timedelta(hours=hours, seconds=seconds)
+                receipt = dict(RECEIPT, ts=received.timestamp())
+                with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+                    result = mc.charges.explain(charge, observed, at('2026-12-06T10:00'),
+                                                find=finder(receipt), said=nobody)
+                self.assertEqual(result['verdict'] == 'receipt', matched)
+
+    def test_a_historical_receipt_found_later_still_settles_its_original_charge(self):
+        old = self.seed(when='2026-11-01T09:00')
+        mc.ask(self.data, 'Yours?', qid=old, now=at('2026-11-01T10:00'), find=finder(), said=nobody)
+        receipt = dict(RECEIPT, ts=at('2026-11-01T20:00').timestamp())
+        with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+            mc.run_check(self.wd, 'late-archive', self.data, self.root, at('2026-12-06T10:00'), finder(receipt), nobody)
+        self.assertEqual(mc.find_question(mc.load_questions(self.data), old)['status'], 'closed')
+
+    def test_receipt_with_multiple_candidate_charges_stays_ambiguous_on_every_entry_point(self):
+        # entry point | distinct same-channel alerts one second or two hours apart
+        for entry in ('screen', 'ask', 'charge', 'follow'):
+            for gap in (mc.dt.timedelta(seconds=1), mc.dt.timedelta(hours=2)):
+                with self.subTest(entry=entry, gap=gap):
+                    self.data = self.tmp / (entry + str(gap.total_seconds()))
+                    observed = at('2026-11-01T09:00')
+                    old = mc.screen(ALERT, BANK, observed, observed, data=self.data,
+                                    find=finder(), said=nobody, item='sms:old')['id']
+                    mc.ask(self.data, 'Yours?', qid=old, now=observed, find=finder(), said=nobody)
+                    newer = observed + gap
+                    fresh = mc.screen(ALERT, BANK, newer, newer, data=self.data,
+                                      find=finder(), said=nobody, item='sms:new')['id']
+                    receipt = dict(RECEIPT, ts=(newer + mc.dt.timedelta(minutes=1)).timestamp())
+                    with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+                        if entry == 'follow':
+                            mc.follow(self.data, newer + mc.dt.timedelta(minutes=2), self.root, find=finder(receipt), said=nobody)
+                        elif entry == 'screen':
+                            result = mc.screen(ALERT, BANK, newer, newer + mc.dt.timedelta(minutes=2),
+                                               data=self.data, find=finder(receipt), said=nobody, item='sms:new')
+                            self.assertNotEqual(result['verdict'], 'explained')
+                        elif entry == 'ask':
+                            _, text = mc.ask(self.data, 'Yours?', qid=fresh, now=newer + mc.dt.timedelta(minutes=2),
+                                             find=finder(receipt), said=nobody)
+                            self.assertNotIn('is explained', text)
+                        else:
+                            with patch.object(mc.charges, 'search', finder(receipt)), patch.object(mc.charges, 'owner_texts', nobody):
+                                result = json.loads(self.cli('charge', ALERT, '--sender', BANK, '--at', newer.isoformat(),
+                                                             '--now', (newer + mc.dt.timedelta(minutes=2)).isoformat()))
+                            self.assertNotEqual(result['verdict'], 'receipt')
+                    self.assertEqual(mc.find_question(mc.load_questions(self.data), old)['status'], 'awaiting_answer')
+                    self.assertEqual(mc.find_question(mc.load_questions(self.data), fresh)['status'], 'open')
+
+    def test_rejected_ambiguous_receipt_does_not_hide_a_separate_original_receipt(self):
+        old = self.seed(when='2026-11-01T09:00')
+        mc.ask(self.data, 'Yours?', qid=old, now=at('2026-11-01T10:00'), find=finder(), said=nobody)
+        self.seed(when='2026-11-02T23:00')
+        ambiguous = dict(RECEIPT, id=91, ts=at('2026-11-02T21:00').timestamp())
+        original = dict(RECEIPT, id=92, ts=at('2026-11-01T10:00').timestamp())
+        with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+            mc.follow(self.data, at('2026-11-03T10:00'), self.root, find=finder(ambiguous, original), said=nobody)
+        question = mc.find_question(mc.load_questions(self.data), old)
+        self.assertEqual(question['status'], 'closed')
+        self.assertEqual(question['explanation']['msgs'], 92)
+
+    def test_processor_receipt_uses_the_same_minute_allowance_for_competing_charges(self):
+        # receipt time | the two card matches both include the boundary allowance
+        for received, fresh_status in (('09:15:00', 'open'), ('09:15:45', 'open'),
+                                       ('09:16:00', 'open'), ('09:16:00.001', 'closed')):
+            with self.subTest(received=received):
+                self.data = self.tmp / received.replace(':', '')
+                old = mc.screen(ALERT, BANK, at('2026-11-01T09:00:00'), at('2026-11-01T09:00:00'),
+                                data=self.data, find=finder(), said=nobody, item='sms:acme')['id']
+                mc.ask(self.data, 'Yours?', qid=old, now=at('2026-11-01T09:00:00'), find=finder(), said=nobody)
+                text = ALERT.replace('ACME * EATS PENDING', 'INITECH')
+                fresh = mc.screen(text, BANK, at('2026-11-01T09:00:30'), at('2026-11-01T09:00:30'),
+                                  data=self.data, find=finder(), said=nobody, item='sms:initech')['id']
+                receipt = {'id': 91, 'ts': at('2026-11-01T' + received).timestamp(), 'sender': 'Processor',
+                           'subject': 'Your payment receipt', 'body': 'Payment received EUR 12.34 on card 1111'}
+                with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+                    mc.follow(self.data, at('2026-11-01T10:00'), self.root, find=Finder([receipt]), said=nobody)
+                self.assertEqual(mc.find_question(mc.load_questions(self.data), old)['status'], 'awaiting_answer')
+                self.assertEqual(mc.find_question(mc.load_questions(self.data), fresh)['status'], fresh_status)
+
+    def test_later_mail_cannot_fill_the_receipt_search_page_before_date_filtering(self):
+        old = self.seed(when='2026-11-01T09:00')
+        mc.ask(self.data, 'Yours?', qid=old, now=at('2026-11-01T10:00'), find=finder(), said=nobody)
+        receipt = dict(RECEIPT, id=92, ts=at('2026-11-01T10:00').timestamp())
+        later = [dict(RECEIPT, id=n + 100, ts=at('2026-12-01T10:00').timestamp() + n) for n in range(60)]
+        archive = Finder([receipt, *later])
+        with patch.object(mc.charges, 'show', lambda row, deadline=None, **kw: row['subject'] + '\n' + row['body']):
+            mc.follow(self.data, at('2026-12-06T10:00'), self.root, find=archive, said=nobody)
+        question = mc.find_question(mc.load_questions(self.data), old)
+        self.assertEqual(question['status'], 'closed')
+        self.assertEqual(question['explanation']['msgs'], 92)
+        self.assertTrue(all(call[2] == '2026-11-03' for call in archive.calls))
+
     def seed(self, amount='12.34', when='2026-11-10T09:00'):
         text = ALERT.replace('12.34', amount)
         result = mc.screen(text, BANK, at(when), at(when), data=self.data, find=finder(), said=nobody)

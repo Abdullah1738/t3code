@@ -1380,7 +1380,7 @@ class CheckBudget(Base):
         self.assertTrue(all(call.args[1] - call.args[0] <= dt.timedelta(hours=1)
                             for call in query.call_args_list))
 
-    def test_msgs_cache_is_shared_by_questions_and_reset_each_run(self):
+    def test_msgs_cache_is_shared_by_ambiguous_questions_and_reset_each_run(self):
         now = at('2026-10-25T12:00')
         self.seed([now, now])
         row = {'id': 1, 'ts': now.timestamp(), 'sender': 'Acme', 'subject': 'Acme receipt'}
@@ -1391,11 +1391,11 @@ class CheckBudget(Base):
             return subprocess.CompletedProcess(argv, 0, body, '')
         with patch.object(mc.charges.subprocess, 'run', msgs):
             mc.run_check(self.wd, 'r', self.data, self.root, now, said=nobody)
-            self.assertEqual([a[1] for a in calls], ['search', 'show'])
+            self.assertEqual([a[1] for a in calls], ['search', 'show', 'search'])
             self.seed([now, now])
             mc.run_check(self.wd, 'r2', self.data, self.root, now, said=nobody)
-        self.assertEqual([a[1] for a in calls], ['search', 'show', 'search', 'show'])
-        self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
+        self.assertEqual([a[1] for a in calls], ['search', 'show', 'search'] * 2)
+        self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
 
 
 class DeadCards(Base):
