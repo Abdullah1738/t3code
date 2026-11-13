@@ -1442,7 +1442,21 @@ const make = Effect.gen(function* () {
   });
   const analyticsActors = new WeakMap<KanbanCard, KanbanActor>();
   const poolHours = new Map<string, number>();
-  const failedRuns = new Map<string, string>();
+  const failedRuns = new Set<string>();
+  const stoppedRunCards = new Map<
+    string,
+    { runId: string; card: Pick<KanbanCard, "id" | "boardId" | "activePool" | "model"> }
+  >();
+  const observeStop = (
+    id: string,
+    result: { outcome: "requested"; runId: string } | { outcome: "noop" } | void,
+  ) => {
+    const pending = stoppedRunCards.get(id);
+    if (!pending) return;
+    if (result?.outcome === "requested")
+      stoppedRunCards.set(id, { ...pending, runId: result.runId });
+    else if (result?.outcome === "noop") stoppedRunCards.delete(id);
+  };
   const poolWaits = new Map<
     string,
     { boardId: string; pool: string; movedAt: string; at: number }
@@ -1666,7 +1680,9 @@ const make = Effect.gen(function* () {
                 stop?.kind === "interrupt"
                   ? cancelQueued
                     ? interruptThread(id, stop.reason, true)
-                    : threadIo.interrupt(id, stop.reason)
+                    : threadIo
+                        .interrupt(id, stop.reason)
+                        .pipe(Effect.tap((result) => Effect.sync(() => observeStop(id, result))))
                   : Effect.forEach(
                       notes,
                       ([key, entry]) =>
@@ -1778,6 +1794,7 @@ const make = Effect.gen(function* () {
             touching(id, threadIo.interrupt(id, reason, cancelQueued, runId)).pipe(
               Effect.tap((result) =>
                 Effect.sync(() => {
+                  observeStop(id, result);
                   if (result?.outcome === "requested") pendingRunStops.set(id, result.runId);
                   else if (runId !== undefined && pendingRunStops.get(id) === runId)
                     pendingRunStops.delete(id);
@@ -7278,6 +7295,7 @@ const make = Effect.gen(function* () {
                         links,
                         updatedAt: _updatedAt,
                         discussionId: _discussionId,
+                        analyticsStageEnteredAt: _analyticsStageEnteredAt,
                         ...card
                       }: KanbanCard) => ({
                         ...card,
@@ -8217,11 +8235,18 @@ const make = Effect.gen(function* () {
     // Out of usage or down: a nudge or a flag can't help, so the thread waits for
     // probeOutages to wake it on the same model.
     if (Option.isSome(analytics) && link.role !== "evaluator") {
+      const stopped = stoppedRunCards.get(threadId);
       const lastRun =
-        failure === null
+        failure === null || stopped !== undefined
           ? yield* threads.latestRun(threadId).pipe(Effect.orElseSucceed(() => null))
           : null;
       const interrupted = lastRun?.status === "interrupted" || lastRun?.status === "cancelled";
+      const observations: Array<{
+        card: Pick<KanbanCard, "id" | "boardId" | "activePool" | "model">;
+        runId: string;
+        errorClass: string;
+        model: ModelSelection;
+      }> = [];
       if (failure !== null || interrupted) {
         const affected =
           link.role === "work"
@@ -8229,27 +8254,57 @@ const make = Effect.gen(function* () {
             : card === null || card.activeThreadId !== threadId || card.activeRole !== "review"
               ? []
               : [card];
-        for (const entry of affected) {
-          const identity = `${threadId}:${failure?.runId ?? lastRun?.runId ?? link.startedAt}`;
-          if (failedRuns.get(entry.id) === identity) continue;
-          const model = failure?.model ?? link.model ?? entry.model;
-          yield* recordAnalytics({
-            kind: "kanban.worker_failed",
-            boardId: entry.boardId,
-            cardId: entry.id,
-            threadId,
-            props: {
-              poolKey: entry.activePool ?? Rules.poolKey(model),
-              model: BoardAnalytics.label(model.model),
-              errorClass:
-                failure === null
-                  ? "interrupted"
-                  : BoardAnalytics.reasonClass(failure.message, failure.category),
-            },
+        for (const entry of affected)
+          observations.push({
+            card: entry,
+            runId: failure?.runId ?? lastRun?.runId ?? link.startedAt,
+            errorClass:
+              failure === null
+                ? "interrupted"
+                : BoardAnalytics.reasonClass(failure.message, failure.category),
+            model: failure?.model ?? link.model ?? entry.model,
           });
-          failedRuns.set(entry.id, identity);
-          if (failedRuns.size > 4096) failedRuns.delete(failedRuns.keys().next().value!);
-        }
+      }
+      if (stopped !== undefined) {
+        // A new run may already be current when the stopped run's notification arrives.
+        const terminal =
+          lastRun?.runId === stopped.runId
+            ? lastRun
+            : yield* threads
+                .compactRun(threadId, stopped.runId)
+                .pipe(Effect.orElseSucceed(() => null));
+        if (terminal?.status === "interrupted" || terminal?.status === "cancelled")
+          observations.push({
+            card: stopped.card,
+            runId: stopped.runId,
+            errorClass: "interrupted",
+            model: stopped.card.model,
+          });
+        if (
+          terminal !== null &&
+          ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(
+            terminal.status,
+          )
+        )
+          stoppedRunCards.delete(threadId);
+      }
+      for (const observation of observations) {
+        const { card: entry, runId, errorClass, model } = observation;
+        const identity = `${entry.id}:${threadId}:${runId}`;
+        if (failedRuns.has(identity)) continue;
+        yield* recordAnalytics({
+          kind: "kanban.worker_failed",
+          boardId: entry.boardId,
+          cardId: entry.id,
+          threadId,
+          props: {
+            poolKey: entry.activePool ?? Rules.poolKey(model),
+            model: BoardAnalytics.label(model.model),
+            errorClass,
+          },
+        });
+        failedRuns.add(identity);
+        if (failedRuns.size > 4096) failedRuns.delete(failedRuns.values().next().value!);
       }
     }
     const outage = failure !== null && Rules.isOutage(failure) ? failure : null;
@@ -13686,6 +13741,37 @@ const make = Effect.gen(function* () {
                 );
             }
           }
+          if (Option.isSome(analytics))
+            for (const id of new Set([
+              card.activeThreadId,
+              card.workThreadId,
+              card.reviewThreadId,
+            ])) {
+              if (
+                id === null ||
+                (yield* store.cardsByThread(id)).some((other) => other.id !== card.id)
+              )
+                continue;
+              const run = yield* threads.latestRun(id).pipe(Effect.orElseSucceed(() => null));
+              if (
+                run === null ||
+                ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(
+                  run.status,
+                )
+              )
+                continue;
+              stoppedRunCards.set(id, {
+                runId: run.runId,
+                card: {
+                  id: card.id,
+                  boardId: card.boardId,
+                  activePool: card.activePool,
+                  model: (yield* store.threadLink(id))?.model ?? card.model,
+                },
+              });
+              if (stoppedRunCards.size > 4096)
+                stoppedRunCards.delete(stoppedRunCards.keys().next().value!);
+            }
           const kept = yield* endCardThreads(
             card,
             text.trim() ? `was stopped: ${text.trim()}` : "was stopped",

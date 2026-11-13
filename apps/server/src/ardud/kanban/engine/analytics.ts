@@ -47,7 +47,7 @@ export function cardEvents(
   after: KanbanCard,
   actor: KanbanActor,
 ): Event[] {
-  if (before === null) return [];
+  before ??= { ...after, asks: [], stalled: null };
   const common = { boardId: after.boardId, cardId: after.id };
   const events: Event[] = [];
   if (before.stage !== after.stage || before.movedAt !== after.movedAt)

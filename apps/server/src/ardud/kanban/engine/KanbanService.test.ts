@@ -652,6 +652,9 @@ it.effect(
           ),
         );
         yield* kanban.dispatchNow;
+        const resumed = (yield* kanban.card(card.id)).card;
+        assert.equal(resumed.stage, "working");
+        assert.equal(resumed.activeThreadId, worker.threadId);
         yield* kanban.moveCard(card.id, "needs_review", "owner", owner);
         yield* kanban.turnEnded(worker.threadId);
         yield* kanban.dispatchNow;
@@ -758,24 +761,23 @@ it.effect(
         assert.isTrue(
           events.some((event) => event.kind === "kanban.ask_pending" && event.props?.key === "q1"),
         );
-        const shared = yield* kanban.createCard(
+        const initialAsk = yield* kanban.createCard(
           board.id,
-          { title: "Private shared", prompt: "Private" },
+          {
+            title: "Private initial",
+            prompt: "Private initial",
+            stage: "needs_owner",
+            question: "Private question",
+          },
           owner,
         );
-        yield* kanban.dispatchNow;
-        const sharedThread = (yield* kanban.card(shared.id)).card.activeThreadId!;
-        const sibling = (yield* kanban.createForThread(sharedThread, {
-          title: "Private sibling",
-          prompt: "Private",
-        })).card;
-        const failureCount = events.filter((event) => event.kind === "kanban.worker_failed").length;
-        const stoppedCount = fake.interrupted.length;
-        yield* kanban.cardThread(sibling.id, "stop", "Private stop", owner);
-        assert.equal(fake.interrupted.length, stoppedCount);
-        assert.equal(
-          events.filter((event) => event.kind === "kanban.worker_failed").length,
-          failureCount,
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.cardId === initialAsk.id &&
+              event.kind === "kanban.ask_opened" &&
+              event.props?.key === "q1",
+          ),
         );
         assert.isFalse(JSON.stringify(events).includes("Private"));
       }).pipe(
@@ -784,9 +786,15 @@ it.effect(
             Layer.provide(
               Layer.mock(Analytics.Analytics)({
                 record: (event) =>
-                  Effect.sync(() => {
-                    events.push(Schema.decodeUnknownSync(AnalyticsEvent)(event));
-                  }),
+                  Schema.decodeUnknownEffect(AnalyticsEvent)(event).pipe(
+                    Effect.orDie,
+                    Effect.tap((decoded) =>
+                      Effect.sync(() => {
+                        events.push(decoded);
+                      }),
+                    ),
+                    Effect.asVoid,
+                  ),
               }),
             ),
           ),
@@ -7084,6 +7092,7 @@ it.effect("a card moved to the backlog pauses, and goes back to its thread when 
 it.effect("stopping one card of a batch tells the thread instead of interrupting it", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
       const board = yield* kanban.ensureBoard({
@@ -7101,6 +7110,7 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       yield* kanban.cardThread(second.card.id, "stop", "not needed", evaluator);
       assert.deepStrictEqual(fake.interrupted, []);
+      assert.isFalse(events.some((event) => event.kind === "kanban.worker_failed"));
       const sent = (yield* Ref.get(fake.threads)).get(thread)!.messages;
       assert.include(sent.at(-1) ?? "", `#${second.card.number}`);
       assert.include(sent.at(-1) ?? "", `#${first.number}`);
@@ -7109,9 +7119,19 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       // Dropped for good: it won't rejoin this thread once unflagged.
       assert.strictEqual(stopped.workThreadId, null);
 
-      // The last card stopping interrupts the thread.
+      // The last card stopping interrupts the thread; its terminal run arrives after release.
+      fake.lastRuns.set(thread, { runId: "stop-run", status: "running", message: "private" });
       yield* kanban.cardThread(first.id, "stop", "", evaluator);
       assert.deepStrictEqual(fake.interrupted, [thread]);
+      assert.isFalse(events.some((event) => event.kind === "kanban.worker_failed"));
+      fake.runHistory.set("stop-run", { status: "interrupted", message: "private" });
+      fake.lastRuns.set(thread, { runId: "new-run", status: "running", message: "private" });
+      yield* kanban.turnEnded(thread);
+      yield* kanban.turnEnded(thread);
+      const failures = events.filter((event) => event.kind === "kanban.worker_failed");
+      assert.lengthOf(failures, 1);
+      assert.equal(failures[0]?.cardId, first.id);
+      assert.equal(failures[0]?.props?.errorClass, "interrupted");
 
       // Card history lists the thread for both cards.
       const threads = (yield* kanban.card(second.card.id)).threads;
@@ -7119,7 +7139,20 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
         threads.map((link) => link.threadId),
         [thread],
       );
-    }).pipe(Effect.provide(testLayer(fake.layer)));
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
   }),
 );
 
