@@ -1003,19 +1003,30 @@ it.effect(
   () => {
     const trace = capture();
     let nestedRead: Effect.Effect<void> = Effect.void;
+    let readCount = 0;
     return Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const sink = yield* EventSink.EventSinkV2;
-      nestedRead = sql.withTransaction(sql`SELECT 1`).pipe(Effect.asVoid, Effect.orDie);
+      nestedRead = sql.withTransaction(sql`SELECT 1`).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            readCount += 1;
+          }),
+        ),
+        Effect.asVoid,
+        Effect.orDie,
+      );
       yield* sink.write({ events: [created] });
+      readCount = 0;
       const results = yield* Effect.all(
         [1, 2].map((i) => sink.write({ events: [item(i)] })),
         { concurrency: "unbounded" },
       ).pipe(Effect.withTracer(trace.tracer));
+      assert.equal(readCount, 2);
       assert.lengthOf(writeSpans(trace.spans), 2);
       assert.lengthOf(
         trace.spans.filter((span) => span.name === "sql.transaction"),
-        3,
+        1,
       );
       assert.equal(results[1]![0]!.sequence, results[0]![0]!.sequence + 1);
       const batch = trace.spans.find((span) => span.name === "orchestrationV2.EventSink.batch")!;

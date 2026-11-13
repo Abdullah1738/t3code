@@ -793,8 +793,8 @@ const layerBase: Layer.Layer<
           const committed = yield* sql
             .withTransaction(
               Effect.gen(function* () {
-                const connection = yield* sql.transactionService;
                 const transactionContext = yield* Effect.context<never>();
+                const connection = Context.getUnsafe(transactionContext, sql.transactionService);
                 const results = yield* Effect.forEach(entries, (entry) =>
                   writeDirect(entry.request.input, entry.request.isCancelled).pipe(
                     // Keep the transaction's private savepoint semaphore while restoring
@@ -831,7 +831,9 @@ const layerBase: Layer.Layer<
             Effect.gen(function* () {
               const published = yield* Effect.exit(publications[index]!);
               entry.completeUnsafe(
-                Exit.isFailure(published) ? published : Exit.succeed(committed.value[index]!),
+                Exit.isFailure(published)
+                  ? Exit.failCause(published.cause)
+                  : Exit.succeed(committed.value[index]!),
               );
             }),
           ).pipe(Effect.ensuring(publishLane.release(1)));
