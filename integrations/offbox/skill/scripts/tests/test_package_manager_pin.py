@@ -15,10 +15,129 @@ from offbox_lib import package_manager, pnpm_version, runs
 
 
 class PackageManagerPinTests(unittest.TestCase):
+    def test_ci_env_reference_scopes_and_forms(self):
+        action = '  - uses: pnpm/action-setup@v4\n    with: {version: "${{ env.PNPM_VERSION }}"}\n'
+        job = 'jobs:\n  test:\n    steps:\n' + ''.join('    ' + line for line in action.splitlines(keepends=True))
+        cases = [
+            ('workflow env', 'env:\n  PNPM_VERSION: 10\n' + job, '10'),
+            ('workflow env after jobs', job + 'env:\n  PNPM_VERSION: 10\n', '10'),
+            ('inline workflow env', 'env: {PNPM_VERSION: 10}\n' + job, '10'),
+            ('job env', job + '    env: {PNPM_VERSION: 11.7.0}\n', '11.7.0'),
+            ('step env after with', 'steps:\n' + action + '    env: {PNPM_VERSION: 10}\n', '10'),
+            ('step env before uses', 'steps:\n  - env: {PNPM_VERSION: 10}\n    uses: pnpm/action-setup@v4\n'
+             '    with: {version: "${{ env.PNPM_VERSION }}"}\n', '10'),
+            ('named with before uses', 'env: {PNPM_VERSION: 10}\nsteps:\n  - name: Install pnpm\n'
+             '    with: {version: "${{ env.PNPM_VERSION }}"}\n    uses: pnpm/action-setup@v4\n', '10'),
+            ('flow step', 'steps:\n  - {with: {version: "${{ env.PNPM_VERSION }}"}, '
+             'uses: pnpm/action-setup@v4, env: {PNPM_VERSION: 10}}\n', '10'),
+            ('indentless sequence', 'env: {PNPM_VERSION: 10}\nsteps:\n' +
+             ''.join(line[2:] for line in action.splitlines(keepends=True)), '10'),
+            ('same pin in nested scopes', 'env: {PNPM_VERSION: 10}\n' +
+             job + '    env: {PNPM_VERSION: 10}\n', '10'),
+            ('matrix item anchor is harmless', 'env: {PNPM_VERSION: 10}\n' + job +
+             '    strategy:\n      matrix:\n        include:\n          - &linux {os: ubuntu-latest}\n', '10'),
+            ('missing env', 'steps:\n' + action, None),
+            ('sibling step env', 'steps:\n  - run: echo other\n    env: {PNPM_VERSION: 10}\n' + action, None),
+            ('following sibling step env', 'steps:\n' + action +
+             '  - run: echo other\n    env: {PNPM_VERSION: 10}\n', None),
+            ('sibling job env', 'jobs:\n  other:\n    env: {PNPM_VERSION: 10}\n    steps: []\n' + job[6:], None),
+            ('conflicting job env', 'env: {PNPM_VERSION: 10}\n' + job +
+             '    env: {PNPM_VERSION: 11}\n', None),
+            ('dynamic job override', 'env: {PNPM_VERSION: 10}\n' + job +
+             '    env: {PNPM_VERSION: "${{ matrix.pnpm }}"}\n', None),
+            ('dynamic step override', 'env: {PNPM_VERSION: 10}\nsteps:\n' + action +
+             '    env: {PNPM_VERSION: "${{ inputs.pnpm }}"}\n', None),
+            ('dynamic env mapping', 'env: {PNPM_VERSION: 10}\nsteps:\n' + action +
+             '    env: ${{ inputs.env }}\n', None),
+        ]
+        for expression in ('${{ env.PNPM_VERSION }}', '${{env.PNPM_VERSION}}',
+                           "${{ env['PNPM_VERSION'] }}", '${{ env["PNPM_VERSION"] }}'):
+            for quote in ('', "'", '"'):
+                if quote and quote in expression:
+                    continue
+                cases.append((f'expression {quote}{expression}{quote}', 'env: {PNPM_VERSION: 10}\nsteps:\n'
+                              '  - uses: pnpm/action-setup@v4\n    with:\n      version: ' +
+                              quote + expression + quote + '\n', '10'))
+        for expression in ('env.OTHER_VERSION', "env.PNPM_VERSION || '11'", 'matrix.pnpm',
+                           "format('{0}', env.PNPM_VERSION)"):
+            cases.append((expression, 'env: {PNPM_VERSION: 10}\nsteps:\n' +
+                          action.replace('env.PNPM_VERSION', expression), None))
+        for gap in (' ', '  ', '   ', '    '):
+            indent = ' ' * (3 + len(gap))
+            setup = '  -' + gap + 'uses: pnpm/action-setup@v4\n' + indent + 'with:\n' + indent + \
+                    '  version: ${{ env.PNPM_VERSION }}\n'
+            cases.append((f'{len(gap)} spaces after dash: sibling env',
+                          'steps:\n  - run: echo other\n    env: {PNPM_VERSION: 10}\n' + setup, None))
+            cases.append((f'{len(gap)} spaces after dash: own env',
+                          'steps:\n' + setup + indent + 'env: {PNPM_VERSION: 10}\n', '10'))
+        for scope, indent in (('workflow', ''), ('job', '    '), ('step', '        ')):
+            for key in ('env', "'env'", '"env"'):
+                for value in ('{PNPM_VERSION: 11}', '\n' + indent + '  PNPM_VERSION: 11'):
+                    override = indent + '? ' + key + '\n' + indent + ': ' + value + '\n'
+                    workflow = 'env: {PNPM_VERSION: 10}\n' + job
+                    cases.append((f'explicit {scope} {key}: {"block" if value.startswith(chr(10)) else "flow"}',
+                                  workflow + override, None))
+        cases.extend([
+            ('explicit env entry', 'env:\n  ? PNPM_VERSION\n  : 10\n' + job, None),
+            ('standalone explicit key', 'env: {PNPM_VERSION: 10}\nsteps:\n' + action +
+             '    ?\n      env\n    : {PNPM_VERSION: 11}\n', None),
+            ('explicit first step key', 'env: {PNPM_VERSION: 10}\nsteps:\n  - ? env\n'
+             '    : {PNPM_VERSION: 11}\n    uses: pnpm/action-setup@v4\n'
+             '    with: {version: "${{ env.PNPM_VERSION }}"}\n', None),
+            ('explicit key in shell scalar is opaque', 'env: {PNPM_VERSION: 10}\nsteps:\n'
+             '  - run: |\n      ? env\n      : {PNPM_VERSION: 11}\n' + action, '10'),
+        ])
+        for key in ('!!str env', '&env-key env', '*env-key'):
+            cases.append((f'decorated job key {key}', 'env: {PNPM_VERSION: 10}\n' + job +
+                          '    ' + key + ': {PNPM_VERSION: 11}\n', None))
+        for key in ('<<', "'<<'", '"<<"'):
+            cases.append((f'job merge key {key}', 'env: {PNPM_VERSION: 10}\n' + job +
+                          '    ' + key + ': {env: {PNPM_VERSION: 11}}\n', None))
+            cases.append((f'env merge key {key}', 'env: {PNPM_VERSION: 10}\n' + job +
+                          '    env:\n      OTHER: ignored\n      ' + key + ': {PNPM_VERSION: 11}\n', None))
+            for decoration in ('&merge-key', '!!merge', '&merge-key !!merge', '!!merge &merge-key',
+                               '!<tag:yaml.org,2002:merge>'):
+                for value in ('{env: {PNPM_VERSION: 11}}', '\n      env: {PNPM_VERSION: 11}'):
+                    cases.append((f'decorated merge {decoration} {key}: '
+                                  f'{"block" if value.startswith(chr(10)) else "flow"}',
+                                  'env: {PNPM_VERSION: 10}\n' + job +
+                                  '    ' + decoration + ' ' + key + ': ' + value + '\n', None))
+        for label, workflow, pin in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(workflow)
+                selection = pnpm_version.want(root, root)
+                self.assertEqual(selection, (pin, 'ci PNPM_VERSION') if pin else
+                                 ('', 'ambiguous CI pnpm version'))
+                self.assertEqual(package_manager.install_command(root),
+                                 f'corepack pnpm@{pin} install --frozen-lockfile' if pin else '<repo-install>')
+                if not pin:
+                    result = subprocess.run(['bash', '-c', pnpm_version.block(selection) + '\necho COMMAND_MARKER'],
+                                            env={'HOME': tmp, 'PATH': '/usr/bin:/bin'},
+                                            capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 99, label)
+                    self.assertNotIn('COMMAND_MARKER', result.stdout, label)
+
+    def test_ci_env_reference_does_not_cross_workflows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+            workflows = root / '.github/workflows'
+            workflows.mkdir(parents=True)
+            (workflows / 'a.yml').write_text('env: {PNPM_VERSION: 10}\n')
+            (workflows / 'b.yml').write_text('steps:\n  - uses: pnpm/action-setup@v4\n'
+                                           '    with: {version: "${{ env.PNPM_VERSION }}"}\n')
+            self.assertEqual(pnpm_version.want(root, root), ('', 'ambiguous CI pnpm version'))
+
     def test_hints_and_actual_pnpm_line_agree(self):
         for manager, workflow, pin, active, source in (
             ('pnpm@11.7.0', 'env:\n  PNPM_VERSION: 10\n', '11.7.0', '11.7.0', 'packageManager'),
             (None, 'env:\n  PNPM_VERSION: 10.26.2\n', '10.26.2', '10.26.2', 'ci PNPM_VERSION'),
+            (None, "env:\n  PNPM_VERSION: '10'\njobs:\n  test:\n    steps:\n"
+             "      - uses: pnpm/action-setup@v2\n        with:\n          version: ${{ env.PNPM_VERSION }}\n",
+             '10', '10.26.2', 'ci PNPM_VERSION'),
             (None, 'steps:\n  - uses: pnpm/action-setup@v4\n    with: {version: 10.26.2}\n',
              '10.26.2', '10.26.2', 'ci pnpm/action-setup'),
             (None, '', '10', '10.26.2', 'lockfile 9.0'),
@@ -56,7 +175,7 @@ class PackageManagerPinTests(unittest.TestCase):
     def test_ambiguous_ci_defers_hint_and_stops_activation(self):
         for workflow in (
             'env:\n  PNPM_VERSION: 10\nsteps:\n  - uses: pnpm/action-setup@v4\n    with: {version: 11}\n',
-            'env:\n  PNPM_VERSION: 10\nsteps:\n  - uses: pnpm/action-setup@v4\n    with: {version: "${{ env.PNPM_VERSION }}"}\n',
+            'env:\n  PNPM_VERSION: 10\nsteps:\n  - uses: pnpm/action-setup@v4\n    with: {version: "${{ matrix.pnpm }}"}\n',
         ):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

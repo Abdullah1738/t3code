@@ -317,7 +317,7 @@ def env_scope(path):
 
 
 def ci_pnpm_pin(root):
-    """(literal version, needs inspection, source); expressions are never evaluated here."""
+    """(literal version, needs inspection, source); only direct literal env references resolve."""
     versions = set()
     sources = set()
 
@@ -332,19 +332,46 @@ def ci_pnpm_pin(root):
         lines = [without_comments(line) for line in ci_lines(read(path))]
         steps_indent = sequence_indent = None
         parents = []
+        env_values = {}
+        references = []
+
+        def action_version(value, context):
+            reference = re.fullmatch(
+                r"\s*(['\"]?)\$\{\{\s*env(?:\.PNPM_VERSION|\[\s*(['\"])PNPM_VERSION\2\s*\])\s*\}\}\1\s*",
+                value)
+            if reference:
+                references.append(context)
+            else:
+                record(value)
+
         for i, line in enumerate(lines):
             if not line.strip():
                 continue
+            # Explicit/decorated keys and merges can hide a narrower env override.
+            if re.match(rf"^\s*(?:-\s+)?(?:\?(?:\s|$)|<<\s*:|"
+                        rf"(?:[!&][^\s]+\s+)+(?:{KEY}|<<)\s*:|\*[^\s:]+\s*:)", line):
+                record('unsupported configuration key')
+            step = re.match(r"^(\s*)-\s+", line)
+            if step:
+                # A sequence item is its own scope, even when steps use indentless YAML.
+                column = len(step[1]) + 1
+                while parents and parents[-1][0] >= column:
+                    parents.pop()
+                parents.append((column, None, i))
+                step_context = tuple(index for _, _, index in parents)
             mapping = re.match(rf"^(\s*)(?:-\s+)?({KEY})\s*:\s*(.*)", line)
             if mapping:
                 column, key, value = mapping.start(2), mapping[2].strip('\"\''), mapping[3]
                 while parents and parents[-1][0] >= column:
                     parents.pop()
-                path = [name for _, name in parents]
+                path = [name for _, name, _ in parents if name is not None]
                 if '\\' in mapping[2]:
                     record('unsupported escaped configuration key')
+                if key == '<<':
+                    record('unsupported merge key')
                 if key == 'PNPM_VERSION' and path and path[-1] == 'env' and env_scope(path[:-1]):
                     record(value, "ci PNPM_VERSION")
+                    env_values[tuple(index for _, _, index in parents[:-1])] = value
                 if key == 'env' and env_scope(path) and value and (
                     not value.startswith('{') or flow_env_needs_inspection(value)
                 ):
@@ -360,10 +387,9 @@ def ci_pnpm_pin(root):
                         record('unresolved steps container')
                     else:
                         steps_indent, sequence_indent = column, None
-                    parents.append((column, key))
+                    parents.append((column, key, i))
                     continue
-                parents.append((column, key))
-            step = re.match(r"^(\s*)-\s+", line)
+                parents.append((column, key, i))
             indent = len(line) - len(line.lstrip())
             if steps_indent is not None and (indent < steps_indent or (indent == steps_indent and not step)):
                 steps_indent = sequence_indent = None
@@ -410,7 +436,7 @@ def ci_pnpm_pin(root):
                     else:
                         for name, value in settings:
                             if name == 'version':
-                                record(value)
+                                action_version(value, step_context)
                 if re.fullmatch(rf" {{{key_indent}}}['\"]?with['\"]?\s*:\s*(?:#.*)?", item):
                     in_with = True
                     with_child_indent = None
@@ -423,7 +449,13 @@ def ci_pnpm_pin(root):
                     with_child_indent = with_child_indent or len(item) - len(item.lstrip())
                     match = re.fullmatch(rf" {{{with_child_indent}}}['\"]?version['\"]?\s*:\s*(.*)", item)
                     if match:
-                        record(without_comments(match[1]))
+                        action_version(without_comments(match[1]), step_context)
+        # Env can appear after steps/with. Resolve only ancestors of this exact action;
+        # another job, step or workflow cannot supply a missing env value.
+        for context in references:
+            value = next((env_values[context[:size]] for size in range(len(context), -1, -1)
+                          if context[:size] in env_values), 'unresolved PNPM_VERSION reference')
+            record(value, "ci PNPM_VERSION")
     needs_inspection = None in versions or len(versions) > 1
     source = "ci PNPM_VERSION" if "ci PNPM_VERSION" in sources else "ci pnpm/action-setup"
     return (next(iter(versions)) if len(versions) == 1 and not needs_inspection else None,

@@ -410,7 +410,7 @@ class MissingDepsTests(unittest.TestCase):
                 self.assertIn('corepack pnpm@11.7.0 ', runs.missing_deps_hint(root))
 
     def test_ci_setup_expressions_defer_both_hints(self):
-        expressions = ('matrix.pnpm', 'env.PNPM_VERSION', 'env.OTHER_VERSION',
+        expressions = ('matrix.pnpm', 'env.OTHER_VERSION',
                        'inputs.pnpm', 'needs.setup.outputs.pnpm')
         for expression in expressions:
             for layout in ('block', 'flow', 'quoted-flow'):
