@@ -129,7 +129,7 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
                 **command_props(command)}, error_tag=error_tag or (rule if decision == 'denied' else None))
 
 
-def read(board, day, kind=None, name=None):
+def _read_records(board, day):
     # Validate dates before constructing paths, including dates supplied by another board.
     if datetime.strptime(day, '%Y-%m-%d').strftime('%Y-%m-%d') != day:
         raise ValueError('invalid UTC day')
@@ -137,24 +137,29 @@ def read(board, day, kind=None, name=None):
     if not path.exists():
         return
     with path.open(encoding='utf-8') as source:
-        for line in source:
+        for line_number, line in enumerate(source, 1):
             try:
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     continue
-                if kind and row.get('kind') != kind or name and row.get('name') != name:
-                    continue
-                yield row
+                yield line_number, row
             except (ValueError, UnicodeError):
                 continue
+
+
+def read(board, day, kind=None, name=None):
+    for _, row in _read_records(board, day):
+        if kind and row.get('kind') != kind or name and row.get('name') != name:
+            continue
+        yield row
 
 
 def rollup(board, day):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
-    samples, durations = {}, defaultdict(list)
+    samples, references, durations = {}, {}, defaultdict(list)
     total = oks = failed = errors = observed = 0
-    for row in read(board, day):
+    for line_number, row in _read_records(board, day):
         total += 1
         name, kind = row.get('name', 'unknown'), row.get('kind', 'unknown')
         counts_name[name] += 1
@@ -170,8 +175,10 @@ def rollup(board, day):
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
             tags[tag] += 1
-            if not samples.get(tag):
-                samples[tag] = row.get('ids') or {}
+            references.setdefault(tag, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
+            identity = row.get('ids')
+            if isinstance(identity, dict) and identity:
+                samples.setdefault(tag, identity)
     def percentiles(values):
         values.sort()
         return {'p50': values[max(0, math.ceil(len(values) * .5) - 1)],
@@ -181,7 +188,7 @@ def rollup(board, day):
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
             'errorRate': errors / total if total else 0,
             'durationMsByName': {name: percentiles(values) for name, values in sorted(durations.items())},
-            'topErrorTags': [{'tag': tag, 'count': count, 'sampleId': samples[tag]}
+            'topErrorTags': [{'tag': tag, 'count': count, 'sampleId': samples.get(tag, references[tag])}
                              for tag, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
 
 

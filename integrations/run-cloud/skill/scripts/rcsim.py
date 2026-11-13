@@ -567,6 +567,18 @@ def my_active(con, me: dict):
     return out
 
 
+def _log_session(name, row, started, *, ok=True, error_tag=None, observed_at=None, operation=None):
+    try:
+        observed_at = now() if observed_at is None else observed_at
+        toollog.emit('rcsim', 'perf' if ok else 'error', name, ok=ok,
+                     duration_ms=(time.perf_counter() - started) * 1000,
+                     ids={'sessionId': row['id']}, props={'platform': row['platform'],
+                     'billedMinutes': max(0, min(observed_at, row['expires_at'] or observed_at) - row['created_at']) / 60,
+                     'status': 'elapsed-estimate', 'operation': operation}, error_tag=error_tag)
+    except Exception:
+        pass
+
+
 @logged_sim('sim.heartbeat')
 def cmd_heartbeat(a) -> None:
     con = db()
@@ -588,9 +600,7 @@ def cmd_heartbeat(a) -> None:
         event(con, sid, "heartbeat", who)
         a._log_session_id = sid
         a.platform = row['platform']
-        toollog.emit('rcsim', 'perf', 'sim.heartbeat', ok=True, duration_ms=(time.perf_counter() - started) * 1000,
-                     ids={'sessionId': sid}, props={'platform': row['platform'],
-                     'billedMinutes': max(0, min(now(), row['expires_at'] or now()) - row['created_at']) / 60, 'status': 'elapsed-estimate'})
+        _log_session('sim.heartbeat', row, started)
         left = (row["expires_at"] or 0) - now()
         print(f"{sid}: heartbeat ok, next due by {hhmm(now() + HEARTBEAT_S)}; hard stop {hhmm(row['expires_at'])} ({mins(max(left, 0))} left)")
 
@@ -614,10 +624,7 @@ def release(con, row, reason: str) -> tuple[bool, str]:
             return True, status or 'released'
         return False, (json.dumps(redact(data)) if data else (out + err).strip())[:300]
     finally:
-        toollog.emit('rcsim', 'perf' if ok else 'error', 'sim.release', ok=ok,
-                     duration_ms=(time.perf_counter() - started) * 1000,
-                     ids={'sessionId': row['id']}, props={'platform': row['platform'],
-                     'billedMinutes': max(0, min(now(), row['expires_at'] or now()) - row['created_at']) / 60, 'status': 'elapsed-estimate'},
+        _log_session('sim.release', row, started, ok=ok,
                      error_tag=None if ok else tag or 'sim.release.failed')
 
 
@@ -791,10 +798,16 @@ def fold_touches(con) -> None:
             except ValueError:
                 pass
     tmp.unlink(missing_ok=True)
+    updated = []
     for sid, ts in latest.items():
-        con.execute("UPDATE sims SET last_hb=?, hb_by='interaction', warned_at=NULL "
-                    "WHERE id=? AND state='active' AND (last_hb IS NULL OR last_hb < ?)", (ts, sid, ts))
+        started = time.perf_counter()
+        cursor = con.execute("UPDATE sims SET last_hb=?, hb_by='interaction', warned_at=NULL "
+                             "WHERE id=? AND state='active' AND (last_hb IS NULL OR last_hb < ?)", (ts, sid, ts))
+        if cursor.rowcount:
+            updated.append((get_row(con, sid), ts, started))
     con.commit()
+    for row, ts, started in updated:
+        _log_session('sim.heartbeat', row, started, observed_at=ts, operation='interaction')
 
 
 def describe(row) -> str:
@@ -864,10 +877,13 @@ def monitor(dry: bool = False) -> None:
         exp = row["expires_at"] or 0
         reason = "hard timeout" if exp and t >= exp - 5 else "released outside rcsim"
         if not dry:
+            started = time.perf_counter()
             con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
                         (t, reason, row["id"]))
             con.commit()
             event(con, row["id"], "gone", reason)
+            _log_session('sim.release', row, started, observed_at=t,
+                         operation='hard-timeout' if reason == 'hard timeout' else 'outside')
         log(f"{row['id']} no longer active ({reason})")
 
     # 2. live sims we don't know: adopt from tags, else orphan

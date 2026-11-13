@@ -102,6 +102,37 @@ class ToolLogTests(unittest.TestCase):
         toollog.emit('fixture', 'error', 'fixture.error', error_tag='fixture.failure', ids={'sessionId': 'available-id'})
         self.assertEqual(toollog.rollup('agent-tools', self.day)['topErrorTags'][0]['sampleId'], {'sessionId': 'available-id'})
 
+    def test_rollup_sample_reference_shapes(self):
+        cases = [
+            ('ids-first', [{'sessionId': 'first'}, {}], 0, {'sessionId': 'first'}),
+            ('ids-later', [{}, {'sessionId': 'later'}], 0, {'sessionId': 'later'}),
+            ('ids-absent', [None], 0, None),
+            ('ids-empty', [{}], 0, None),
+            ('ids-all-empty', [None, {}], 0, None),
+            ('invalid-prefix', [None], 1, None),
+        ]
+        for board, ids, prefix_lines, expected_ids in cases:
+            with self.subTest(case=board):
+                if prefix_lines:
+                    directory = toollog.board_dir(board)
+                    directory.mkdir(parents=True)
+                    (directory / (self.day + '.ndjson')).write_text('invalid fixture line\n')
+                for identity in ids:
+                    toollog.emit('harness-cli', 'error', 'canary.run', board=board,
+                                 error_tag='canary.runtime', ids=identity)
+                result = toollog.rollup(board, self.day)['topErrorTags'][0]
+                self.assertEqual(result['count'], len(ids))
+                if expected_ids:
+                    self.assertEqual(result['sampleId'], expected_ids)
+                else:
+                    sample = result['sampleId']
+                    self.assertEqual(sample['file'], self.day + '.ndjson')
+                    self.assertEqual(sample['line'], prefix_lines + 1)
+                    path = toollog.board_dir(board) / sample['file']
+                    record = json.loads(path.read_text().splitlines()[sample['line'] - 1])
+                    self.assertEqual(sample['ts'], record['ts'])
+                    self.assertEqual(record['error']['tag'], result['tag'])
+
     def test_hook_errors_keep_ids_in_rollups(self):
         native = 'thread:project:/fixture%2Frepo:thread-id'
         toollog.hook('codex', 'shell', 'denied', 'fixture.denied', 1, ids={'threadId': native})

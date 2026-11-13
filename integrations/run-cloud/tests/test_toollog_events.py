@@ -48,3 +48,88 @@ class SimEvents(unittest.TestCase):
             self.assertEqual(rows[0]['error']['tag'],'sim.release.start_failed')
             self.assertEqual(rows[0]['ids']['sessionId'],sid)
             self.assertNotIn('secret path',json.dumps(rows))
+
+
+class AutomaticSimEvents(unittest.TestCase):
+    SID = '11111111-2222-3333-4444-555555555555'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, {'TOOLLOG_ROOT': str(self.root/'logs')}))
+        for name, value in [('STATE_DIR', self.root), ('DB_PATH', self.root/'rcsim.db'),
+                            ('TOUCH_LOG', self.root/'touch'), ('LOCK_PATH', self.root/'lock')]:
+            self.stack.enter_context(patch.object(rcsim, name, value))
+        self.stack.enter_context(patch.object(rcsim, 'now', return_value=10000.0))
+        self.con = rcsim.db()
+        self.addCleanup(self.con.close)
+        self.stack.enter_context(patch.object(rcsim, 'db', return_value=self.con))
+        self.stack.enter_context(patch.object(rcsim, 'log'))
+        self.stack.enter_context(patch.object(rcsim, 'rc', return_value=(0, [], '', '')))
+        lock = self.stack.enter_context((self.root/'lock').open('w'))
+        self.stack.enter_context(patch.object(rcsim, 'open', return_value=lock, create=True))
+        self.telegram = self.stack.enter_context(patch.object(rcsim, 'telegram'))
+
+    def register(self, state='active', expires_at=10600.0):
+        self.con.execute('DELETE FROM sims')
+        self.con.execute("INSERT INTO sims (id, platform, created_at, expires_at, last_hb, state) VALUES (?, 'ios', 9400, ?, 9500, ?)",
+                         (self.SID, expires_at, state))
+        self.con.commit()
+
+    def rows(self):
+        return [json.loads(line) for path in (self.root/'logs').rglob('*.ndjson')
+                for line in path.read_text().splitlines()]
+
+    def test_interaction_heartbeat_records_only_applied_touches(self):
+        cases = [
+            ('fresh', 'active', f'9700 {self.SID}\n', 9700, 1),
+            ('coalesced', 'active', f'9600 {self.SID}\n9700 {self.SID}\n', 9700, 1),
+            ('stale', 'active', f'9400 {self.SID}\n', 9500, 0),
+            ('same', 'active', f'9500 {self.SID}\n', 9500, 0),
+            ('released', 'released', f'9700 {self.SID}\n', 9500, 0),
+            ('unregistered', 'active', '9700 22222222-2222-3333-4444-555555555555\n', 9500, 0),
+            ('malformed', 'active', f'bad {self.SID}\n9700 invalid-id\n', 9500, 0),
+        ]
+        for label, state, source, last_hb, count in cases:
+            with self.subTest(case=label):
+                self.register(state)
+                before = len(self.rows())
+                rcsim.TOUCH_LOG.write_text(source)
+                rcsim.fold_touches(self.con)
+                row = rcsim.get_row(self.con, self.SID)
+                self.assertEqual(row['last_hb'], last_hb)
+                records = self.rows()[before:]
+                self.assertEqual(len(records), count)
+                if records:
+                    self.assertEqual(records[0]['name'], 'sim.heartbeat')
+                    self.assertTrue(records[0]['ok'])
+                    self.assertEqual(records[0]['ids']['sessionId'], self.SID)
+                    self.assertEqual(records[0]['props']['operation'], 'interaction')
+                    self.assertEqual(records[0]['props']['billedMinutes'], 5)
+                    self.assertGreater(records[0]['durationMs'], 0)
+
+    def test_monitor_reconciles_gone_sessions_and_terminal_minutes(self):
+        for label, expires, minutes in [('hard-timeout', 9880.0, 8), ('outside', 10600.0, 10)]:
+            for dry in (False, True):
+                with self.subTest(case=label, dry=dry):
+                    self.register(expires_at=expires)
+                    before = len(self.rows())
+                    rcsim.monitor(dry=dry)
+                    row = rcsim.get_row(self.con, self.SID)
+                    records = self.rows()[before:]
+                    self.assertEqual(row['state'], 'active' if dry else 'released')
+                    self.assertEqual(len(records), 0 if dry else 1)
+                    if not dry:
+                        self.assertEqual(records[0]['name'], 'sim.release')
+                        self.assertTrue(records[0]['ok'])
+                        self.assertEqual(records[0]['ids']['sessionId'], self.SID)
+                        self.assertEqual(records[0]['props']['operation'], label)
+                        self.assertEqual(records[0]['props']['billedMinutes'], minutes)
+                        self.assertGreater(records[0]['durationMs'], 0)
+                        # A later scan must not count the terminal transition twice.
+                        rcsim.monitor()
+                        self.assertEqual(len(self.rows()), before + 1)
+        self.telegram.assert_not_called()

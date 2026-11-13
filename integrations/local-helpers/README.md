@@ -222,5 +222,7 @@ Focused verification:
 NDJSON. Use `--day YYYY-MM-DD` for another day, `--name dotted.name` to filter,
 or another board slug for that board's logs. `toollog rollup --board agent-tools`
 writes `~/.robob/logs/tools/agent-tools/rollup-YYYY-MM-DD.json`.
+When an error tag has no IDs, its `sampleId` gives the day file, timestamp and
+one-based physical line number so the original record can still be found.
 The Python logger has one source in `libexec/toollog/`; the other integrations'
 source symlinks are materialized beside their entry points by their installers.

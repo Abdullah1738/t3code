@@ -728,6 +728,7 @@ class CanaryTests(FakeCliTestCase):
         super().setUp()
         self.gen = self.homes_pkg / "generate_homes.py"
         shutil.copy(PKG.parent / "harness-homes" / "generate_homes.py", self.gen)
+        shutil.copy(PKG.parent / "harness-homes" / "toollog.py", self.homes_pkg / "toollog.py")
         shutil.copytree(PKG.parent / "harness-homes" / "vendor", self.homes_pkg / "vendor")
         shutil.copy(PKG.parent / "harness-homes" / "manifest.json", self.homes_pkg / "manifest.json")
         shutil.copytree(PKG.parent / "harness-homes" / "overlays", self.homes_pkg / "overlays")
