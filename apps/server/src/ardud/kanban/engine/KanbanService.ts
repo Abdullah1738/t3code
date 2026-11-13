@@ -131,6 +131,16 @@ import {
   recordServerAnalytics,
 } from "../../../observability/RpcInstrumentation.ts";
 
+// Analytics metadata must not revoke an edit's post-save work or a dispatch claim.
+function sameCardState(left: KanbanCard | null, right: KanbanCard): boolean {
+  const state = (card: KanbanCard | null) => {
+    if (card === null) return null;
+    const { analyticsStageEnteredAt: _analyticsStageEnteredAt, ...rest } = card;
+    return rest;
+  };
+  return NodeUtil.isDeepStrictEqual(state(left), state(right));
+}
+
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
 export const BOARD_WRITE_START_DEADLINE_MS = BoardLocks.WRITE_WAIT_MS;
@@ -2489,7 +2499,19 @@ const make = Effect.gen(function* () {
         }
         const actor: KanbanActor = analyticsActors.get(card) ??
           by ?? { _tag: "system", component: "dispatcher" };
-        const before = Option.isSome(analytics) ? yield* store.card(card.id) : null;
+        let before = Option.isSome(analytics) ? yield* store.card(card.id) : null;
+        if (before !== null && before.analyticsStageEnteredAt === undefined) {
+          // Seed old cards from their actual transition history, since queue age may predate it.
+          const stage = before.stage;
+          const entered = (yield* store.cardEvents(card.id)).findLast(
+            (event) => event.toStage === stage && event.fromStage !== event.toStage,
+          );
+          const since =
+            entered !== undefined && Date.parse(entered.at) > Date.parse(before.movedAt)
+              ? entered.at
+              : before.movedAt;
+          before = { ...before, analyticsStageEnteredAt: since };
+        }
         if (Option.isSome(analytics))
           card = {
             ...card,
@@ -8245,7 +8267,7 @@ const make = Effect.gen(function* () {
         card: Pick<KanbanCard, "id" | "boardId" | "activePool" | "model">;
         runId: string;
         errorClass: string;
-        model: ModelSelection;
+        model: ModelSelection | null;
       }> = [];
       if (failure !== null || interrupted) {
         const affected =
@@ -8262,7 +8284,7 @@ const make = Effect.gen(function* () {
               failure === null
                 ? "interrupted"
                 : BoardAnalytics.reasonClass(failure.message, failure.category),
-            model: failure?.model ?? link.model ?? entry.model,
+            model: failure?.model ?? lastRun?.model ?? null,
           });
       }
       if (stopped !== undefined) {
@@ -8278,7 +8300,7 @@ const make = Effect.gen(function* () {
             card: stopped.card,
             runId: stopped.runId,
             errorClass: "interrupted",
-            model: stopped.card.model,
+            model: terminal.model ?? null,
           });
         if (
           terminal !== null &&
@@ -8298,8 +8320,8 @@ const make = Effect.gen(function* () {
           cardId: entry.id,
           threadId,
           props: {
-            poolKey: entry.activePool ?? Rules.poolKey(model),
-            model: BoardAnalytics.label(model.model),
+            poolKey: entry.activePool ?? (model === null ? "unknown" : Rules.poolKey(model)),
+            model: model === null ? "unknown" : BoardAnalytics.label(model.model),
             errorClass,
           },
         });
@@ -8512,7 +8534,7 @@ const make = Effect.gen(function* () {
         for (const oldEntry of carried) {
           if (
             expectedFailedWorkRunId === undefined &&
-            !NodeUtil.isDeepStrictEqual(yield* store.card(oldEntry.id), oldEntry)
+            !sameCardState(yield* store.card(oldEntry.id), oldEntry)
           )
             continue;
           let entry = oldEntry;
@@ -11894,7 +11916,7 @@ const make = Effect.gen(function* () {
             if (
               workThread !== null &&
               !modelSelectionsEqual(card.model, saved.model) &&
-              NodeUtil.isDeepStrictEqual(yield* cardOf(saved.id), saved)
+              sameCardState(yield* cardOf(saved.id), saved)
             ) {
               // The thread now runs the new model's pool; its slot follows, so the pool
               // counts and the one-slot limit stay right. Cards sharing the thread take the
@@ -11922,7 +11944,7 @@ const make = Effect.gen(function* () {
           plan?.ok &&
           saved.activeThreadId !== null &&
           (saved.activeRole !== "work" || kanbanWorkStep(saved)) &&
-          NodeUtil.isDeepStrictEqual(yield* cardOf(saved.id), saved)
+          sameCardState(yield* cardOf(saved.id), saved)
         ) {
           // A notification can start an idle worker, so evaluator/script steps
           // wait for eligible work; its next brief contains the current plan.
@@ -13766,7 +13788,7 @@ const make = Effect.gen(function* () {
                   id: card.id,
                   boardId: card.boardId,
                   activePool: card.activePool,
-                  model: (yield* store.threadLink(id))?.model ?? card.model,
+                  model: run.model ?? card.model,
                 },
               });
               if (stoppedRunCards.size > 4096)

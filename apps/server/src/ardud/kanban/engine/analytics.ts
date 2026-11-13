@@ -2,7 +2,7 @@ import type { AnalyticsEvent, KanbanActor, KanbanCard } from "@t3tools/contracts
 
 type Event = Omit<AnalyticsEvent, "ts" | "surface" | "route">;
 export const label = (value: string) =>
-  /^[a-zA-Z0-9_.:/#@%+\-]{1,160}$/.test(value) ? value : "other";
+  /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(value) ? value : "other";
 export const elapsed = (at: string, since: string) => {
   const value = Date.parse(at) - Date.parse(since);
   return Number.isFinite(value) ? Math.max(0, value) : 0;

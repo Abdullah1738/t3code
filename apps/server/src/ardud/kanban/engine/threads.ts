@@ -141,6 +141,7 @@ export interface KanbanThreadsShape {
       readonly runId: string;
       readonly status: string;
       readonly message: string | null;
+      readonly model?: ModelSelection | null;
     } | null,
     KanbanThreadError
   >;
@@ -155,6 +156,7 @@ export interface KanbanThreadsShape {
     {
       readonly status: string;
       readonly message: string | null;
+      readonly model?: ModelSelection | null;
     } | null,
     KanbanThreadError
   >;
@@ -380,6 +382,7 @@ const make = Effect.gen(function* () {
             Effect.map((messages) => ({
               runId: run.id,
               status: run.status,
+              model: run.modelSelection,
               message: messages.messages[0]?.text ?? null,
             })),
           );
@@ -418,6 +421,7 @@ const make = Effect.gen(function* () {
           .pipe(
             Effect.map((messages) => ({
               status: run.status,
+              model: run.modelSelection,
               message: messages.messages[0]?.text ?? null,
             })),
           );

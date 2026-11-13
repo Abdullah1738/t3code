@@ -134,8 +134,14 @@ const makeFake = Effect.gen(function* () {
   >();
   const failureReads: Array<string> = [];
   const missingFailureRunIds = new Set<string>();
-  const lastRuns = new Map<string, { runId: string; status: string; message: string | null }>();
-  const runHistory = new Map<string, { status: string; message: string | null }>();
+  const lastRuns = new Map<
+    string,
+    { runId: string; status: string; message: string | null; model?: ModelSelection | null }
+  >();
+  const runHistory = new Map<
+    string,
+    { status: string; message: string | null; model?: ModelSelection | null }
+  >();
   // One run id per stored failure object (the same run reports the same id).
   const runIds = new WeakMap<object, string>();
   let nextRun = 0;
@@ -542,6 +548,7 @@ const observedInlineTestLayer = (...args: Parameters<typeof observedTestLayer>) 
     Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "inline")),
   );
 
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent);
 const owner: KanbanActor = { _tag: "owner" };
 /** The session of the owner's own app, for the WS handlers. */
 const OWNER_APP_SESSION = {
@@ -692,6 +699,14 @@ it.effect(
           ),
         );
         assert.notEqual(released.analyticsStageEnteredAt, released.movedAt);
+        const store = yield* KanbanStore.KanbanStore;
+        const { analyticsStageEnteredAt: _clock, ...legacyReleased } = released;
+        yield* store.putCard(legacyReleased);
+        yield* kanban.editCard(card.id, { description: "Private edit" }, owner);
+        assert.equal(
+          (yield* store.card(card.id))!.analyticsStageEnteredAt,
+          released.analyticsStageEnteredAt,
+        );
         yield* kanban.turnEnded(failedWorker);
         const failures = events.filter(
           (event) => event.kind === "kanban.worker_failed" && event.cardId === card.id,
@@ -786,7 +801,7 @@ it.effect(
             Layer.provide(
               Layer.mock(Analytics.Analytics)({
                 record: (event) =>
-                  Schema.decodeUnknownEffect(AnalyticsEvent)(event).pipe(
+                  decodeAnalyticsEvent(event).pipe(
                     Effect.orDie,
                     Effect.tap((decoded) =>
                       Effect.sync(() => {
@@ -7106,6 +7121,18 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
       const second = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
 
+      const store = yield* KanbanStore.KanbanStore;
+      for (const id of [first.id, second.card.id]) {
+        const { analyticsStageEnteredAt: _clock, ...legacy } = (yield* store.card(id))!;
+        yield* store.putCard(legacy);
+      }
+      const switched = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      yield* kanban.setPool(board.id, switched, 2);
+      yield* kanban.editCard(first.id, { model: switched }, owner);
+      assert.deepEqual((yield* kanban.card(second.card.id)).card.model, switched);
+      assert.equal((yield* kanban.card(second.card.id)).card.activePool, Rules.poolKey(switched));
+      assert.deepEqual((yield* store.threadLink(thread))!.model, board.defaultCardModel);
+
       // An evaluator stops the second card; the thread goes on with the first.
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       yield* kanban.cardThread(second.card.id, "stop", "not needed", evaluator);
@@ -7119,17 +7146,47 @@ it.effect("stopping one card of a batch tells the thread instead of interrupting
       // Dropped for good: it won't rejoin this thread once unflagged.
       assert.strictEqual(stopped.workThreadId, null);
 
+      fake.lastRuns.set(thread, {
+        runId: "ordinary-interrupted",
+        status: "interrupted",
+        message: "private",
+        model: switched,
+      });
+      yield* kanban.turnEnded(thread);
+      yield* kanban.turnEnded(thread);
+      const ordinary = events.filter((event) => event.kind === "kanban.worker_failed");
+      assert.lengthOf(ordinary, 1);
+      assert.equal(ordinary[0]?.props?.model, switched.model);
+
       // The last card stopping interrupts the thread; its terminal run arrives after release.
-      fake.lastRuns.set(thread, { runId: "stop-run", status: "running", message: "private" });
+      fake.lastRuns.set(thread, {
+        runId: "stop-run",
+        status: "running",
+        message: "private",
+        model: switched,
+      });
       yield* kanban.cardThread(first.id, "stop", "", evaluator);
       assert.deepStrictEqual(fake.interrupted, [thread]);
-      assert.isFalse(events.some((event) => event.kind === "kanban.worker_failed"));
-      fake.runHistory.set("stop-run", { status: "interrupted", message: "private" });
-      fake.lastRuns.set(thread, { runId: "new-run", status: "running", message: "private" });
+      assert.lengthOf(
+        events.filter((event) => event.kind === "kanban.worker_failed"),
+        1,
+      );
+      fake.runHistory.set("stop-run", {
+        status: "interrupted",
+        message: "private",
+        model: switched,
+      });
+      fake.lastRuns.set(thread, {
+        runId: "new-run",
+        status: "running",
+        message: "private",
+        model: board.defaultCardModel,
+      });
       yield* kanban.turnEnded(thread);
       yield* kanban.turnEnded(thread);
       const failures = events.filter((event) => event.kind === "kanban.worker_failed");
-      assert.lengthOf(failures, 1);
+      assert.lengthOf(failures, 2);
+      assert.isTrue(failures.every((event) => event.props?.model === switched.model));
       assert.equal(failures[0]?.cardId, first.id);
       assert.equal(failures[0]?.props?.errorClass, "interrupted");
 
