@@ -2896,6 +2896,15 @@ const make = Effect.gen(function* () {
     const board = yield* boardOf(card.boardId);
     const check = Rules.checkMove(role, card, to);
     if (!check.ok) return yield* failWith("denied", check.reason);
+    const waitFrom =
+      card.stage === "needs_owner" && to === "needs_review"
+        ? (yield* askedBy(card))?.fromStage
+        : null;
+    // A pause only resumes a review when its recorded origin and counter
+    // identify an unfinished chain. Work-origin and unknown pauses start over.
+    const resumeReview =
+      (waitFrom === "in_review" || waitFrom === "needs_review") &&
+      !Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1);
     const at = yield* nowIso;
     const leaving = card.activeThreadId !== null && !KANBAN_THREAD_STAGES.includes(to);
     const bySelf = role === "cardThread";
@@ -2937,7 +2946,10 @@ const make = Effect.gen(function* () {
       updatedAt: at,
       question: to === "needs_owner" ? (asked ?? card.question) : null,
       reviewStep:
-        (card.stage === "working" || card.stage === "todo") && to === "needs_review"
+        to === "needs_review" &&
+        (card.stage === "working" ||
+          card.stage === "todo" ||
+          (card.stage === "needs_owner" && !resumeReview))
           ? 0
           : card.reviewStep,
     };

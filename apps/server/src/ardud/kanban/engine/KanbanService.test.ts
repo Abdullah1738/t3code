@@ -5650,6 +5650,254 @@ const reviewHandbacks = ["attached worker", "unattached worker", "evaluator", "o
     ].map((entry) => ({ path, ...entry })),
 );
 
+const twoStepReviewWithEarlierWork = Effect.fn("twoStepReviewWithEarlierWork")(function* () {
+  const started = yield* reviewWithEarlierTask("work");
+  const board = (yield* started.kanban.boards).find((entry) => entry.id === started.card.boardId)!;
+  yield* started.kanban.updateBoard(board.id, {
+    reviewChains: [{ name: "Two", steps: [board.evaluatorModel, board.defaultCardModel] }],
+    defaultReviewChain: "Two",
+  });
+  return { ...started, board };
+});
+
+const ownerWaitEntries = ["move", "ask", "block"] as const;
+const ownerWaitExits = ["evaluator move", "owner move", "owner answer", "drop"] as const;
+
+const pauseForOwner = Effect.fn("pauseForOwner")(function* (
+  cardId: KanbanCardId,
+  entry: (typeof ownerWaitEntries)[number],
+  actor: KanbanActor,
+  role: "cardThread" | "evaluator",
+) {
+  const kanban = yield* KanbanService.KanbanService;
+  if (entry === "move")
+    return yield* kanban.moveCard(cardId, "needs_owner", role, actor, { question: "Continue?" });
+  const asked = yield* kanban.askOwner(
+    cardId,
+    {
+      question: "Continue?",
+      blocking: entry === "ask",
+      options: ["Yes", "No"],
+    },
+    actor,
+    role,
+  );
+  return entry === "ask"
+    ? asked
+    : yield* kanban.changeAsk(cardId, asked.asks.at(-1)!.id, "block", actor, role);
+});
+
+const resolveOwnerWait = Effect.fn("resolveOwnerWait")(function* (
+  cardId: KanbanCardId,
+  exit: (typeof ownerWaitExits)[number],
+) {
+  const kanban = yield* KanbanService.KanbanService;
+  const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+  const waiting = (yield* kanban.card(cardId)).card;
+  const ask = waiting.asks.at(-1)!;
+  if (exit === "owner answer") {
+    yield* kanban.answerAsk(
+      cardId,
+      ask.id,
+      { verdict: "text", text: "Continue", revision: ask.revision ?? 0 },
+      owner,
+    );
+  } else if (exit === "drop") {
+    yield* kanban.changeAsk(cardId, ask.id, "drop", evaluator, "evaluator");
+  } else {
+    yield* kanban.moveCard(
+      cardId,
+      "needs_review",
+      exit === "owner move" ? "owner" : "evaluator",
+      exit === "owner move" ? owner : evaluator,
+      { note: "Ready for review" },
+    );
+  }
+  return (yield* kanban.card(cardId)).card;
+});
+
+it.effect.each(
+  ["working", "todo"].flatMap((origin) =>
+    ownerWaitEntries.flatMap((entry) => ownerWaitExits.map((exit) => ({ origin, entry, exit }))),
+  ),
+)(
+  "#1390 $origin wait via $entry and $exit restarts the full review chain",
+  ({ origin, entry, exit }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, worker, reviewThread } = yield* twoStepReviewWithEarlierWork();
+        yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        yield* kanban.dispatchNow;
+        yield* kanban.reviewResult(
+          (yield* kanban.card(card.id)).card.activeThreadId!,
+          "clear",
+          [],
+          "ae3303eb5b",
+        );
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        if (origin === "working") yield* kanban.dispatchNow;
+        const waiting = yield* pauseForOwner(
+          card.id,
+          entry,
+          origin === "working" ? worker : evaluator,
+          origin === "working" ? "cardThread" : "evaluator",
+        );
+        assert.strictEqual(waiting.stage, "needs_owner");
+        assert.strictEqual(waiting.reviewStep, 2);
+        yield* kanban.markSubtask(card.id, "s1", "done", "Checked", evaluator, "evaluator");
+        const resolved = yield* resolveOwnerWait(card.id, exit);
+        if (exit === "owner answer" || exit === "drop") {
+          assert.strictEqual(resolved.stage, "todo");
+          yield* kanban.moveCard(card.id, "needs_review", "evaluator", evaluator);
+        }
+        assert.strictEqual((yield* kanban.card(card.id)).card.reviewStep, 0);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.deepStrictEqual(
+          (yield* Ref.get(fake.threads)).get(reviewing.activeThreadId!)!.model,
+          board.evaluatorModel,
+        );
+        const midway = yield* kanban.reviewResult(
+          reviewing.activeThreadId!,
+          "clear",
+          [],
+          "bbbbbbb222",
+        );
+        assert.strictEqual(midway.card.reviewStep, 1);
+        assert.strictEqual(midway.card.stage, "needs_review");
+        yield* kanban.dispatchNow;
+        const finished = yield* kanban.reviewResult(
+          (yield* kanban.card(card.id)).card.activeThreadId!,
+          "clear",
+          [],
+          "bbbbbbb222",
+        );
+        assert.strictEqual(finished.card.reviewStep, 2);
+        assert.strictEqual(finished.card.stage, "completed");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(
+  ["in_review", "needs_review"].flatMap((origin) =>
+    ownerWaitExits.map((exit) => ({ origin, exit })),
+  ),
+)(
+  "#1390 an unfinished $origin wait resolved by $exit resumes its review step",
+  ({ origin, exit }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, reviewThread } = yield* twoStepReviewWithEarlierWork();
+        yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        if (origin === "in_review") yield* kanban.dispatchNow;
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const waiting = yield* pauseForOwner(card.id, "ask", evaluator, "evaluator");
+        assert.strictEqual(waiting.reviewStep, 1);
+        const resolved = yield* resolveOwnerWait(card.id, exit);
+        assert.strictEqual(resolved.stage, "needs_review");
+        assert.strictEqual(resolved.reviewStep, 1);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.deepStrictEqual(
+          (yield* Ref.get(fake.threads)).get(reviewing.activeThreadId!)!.model,
+          board.defaultCardModel,
+        );
+        const finished = yield* kanban.reviewResult(
+          reviewing.activeThreadId!,
+          "clear",
+          [],
+          "ae3303eb5b",
+        );
+        assert.strictEqual(finished.card.reviewStep, 2);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(ownerWaitExits)(
+  "#1390 a finished review wait resolved by %s only starts a new chain on an explicit review move",
+  (exit) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, worker, reviewThread } = yield* twoStepReviewWithEarlierWork();
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        yield* kanban.markSubtask(card.id, "s1", "done", "Checked", evaluator, "evaluator");
+        const store = yield* KanbanStore.KanbanStore;
+        const url = "https://github.com/o/r/pull/1390";
+        fake.prs.set(worker.threadId!, [{ url, title: "Change", state: "open" }]);
+        yield* store.putCard({
+          ...(yield* kanban.card(card.id)).card,
+          links: [{ kind: "pr", url, label: null, state: "open", checkedAt: null }],
+        });
+        yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+        yield* kanban.dispatchNow;
+        const passed = yield* kanban.reviewResult(
+          (yield* kanban.card(card.id)).card.activeThreadId!,
+          "clear",
+          [],
+          "ae3303eb5b",
+        );
+        assert.strictEqual(passed.card.stage, "in_review");
+        assert.strictEqual(passed.card.reviewStep, 2);
+        yield* pauseForOwner(card.id, "ask", evaluator, "evaluator");
+        const resolved = yield* resolveOwnerWait(card.id, exit);
+        if (exit === "owner answer" || exit === "drop") {
+          assert.strictEqual(resolved.stage, "in_review");
+          assert.strictEqual(resolved.reviewStep, 2);
+          yield* kanban.dispatchNow;
+          assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+        } else {
+          assert.strictEqual(resolved.stage, "needs_review");
+          assert.strictEqual(resolved.reviewStep, 0);
+          yield* kanban.dispatchNow;
+          const reviewing = (yield* kanban.card(card.id)).card;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fake.threads)).get(reviewing.activeThreadId!)!.model,
+            board.evaluatorModel,
+          );
+          const midway = yield* kanban.reviewResult(
+            reviewing.activeThreadId!,
+            "clear",
+            [],
+            "bbbbbbb222",
+          );
+          assert.strictEqual(midway.card.stage, "needs_review");
+          assert.strictEqual(midway.card.reviewStep, 1);
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1390 a Needs Owner handback with no recorded origin starts review over", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, reviewThread } = yield* twoStepReviewWithEarlierWork();
+      yield* kanban.reviewResult(reviewThread, "clear", [], "ae3303eb5b");
+      yield* kanban.dispatchNow;
+      yield* kanban.reviewResult(
+        (yield* kanban.card(card.id)).card.activeThreadId!,
+        "clear",
+        [],
+        "ae3303eb5b",
+      );
+      const store = yield* KanbanStore.KanbanStore;
+      yield* store.putCard({ ...(yield* kanban.card(card.id)).card, stage: "needs_owner" });
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const moved = yield* kanban.moveCard(card.id, "needs_review", "evaluator", evaluator);
+      assert.strictEqual(moved.reviewStep, 0);
+      yield* kanban.dispatchNow;
+      assert.deepStrictEqual(
+        (yield* Ref.get(fake.threads)).get((yield* kanban.card(card.id)).card.activeThreadId!)!
+          .model,
+        board.evaluatorModel,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect.each(reviewHandbacks)(
   "#1390 $path handback at $label restarts the whole review chain",
   ({ path, head }) =>
