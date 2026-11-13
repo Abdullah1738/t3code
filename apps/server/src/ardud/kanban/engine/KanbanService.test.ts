@@ -665,7 +665,7 @@ it.effect("records tick queues and phases during overlaps without blocking local
       assert.equal(tick.props?.overlappingTicks, 1);
       assert.isAtLeast(tick.props!.cardsScanned!, 1);
       for (const event of [tick, overlap, ...phases])
-        Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" })(event);
+        yield* Schema.decodeEffect(AnalyticsEvent, { onExcessProperty: "error" })(event);
       assert.isTrue(phases.every((event) => event.props?.tickId === tick.props?.tickId));
       yield* kanban.tick;
       assert.equal(events.filter((event) => event.kind === "kanban.tick").length, 2);

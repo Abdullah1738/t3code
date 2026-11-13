@@ -13,6 +13,61 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("rolls server tick phases up independently by board and phase, including idle phases", () => {
+    const accumulator = makeAccumulator();
+    const phase = (boardId: string, phase: string, durationMs: number) =>
+      event({
+        kind: "kanban.tick_phase",
+        boardId,
+        durationMs,
+        props: { phase, count: 2, tickId: "tick-1" },
+      });
+    for (const duration of [10, 20, 90])
+      accumulate(accumulator, phase("a", "thread_status", duration));
+    accumulate(accumulator, phase("a", "event_persistence", 0));
+    accumulate(accumulator, phase("b", "thread_status", 1_000));
+    // Older ticks and overlaps have no phase sample; incomplete and client-shaped rows don't invent one.
+    accumulate(accumulator, event({ kind: "kanban.tick", boardId: "a", durationMs: 900_000 }));
+    accumulate(accumulator, event({ kind: "kanban.tick_overlap", boardId: "a" }));
+    accumulate(accumulator, event({ kind: "kanban.tick_phase", boardId: "a", durationMs: 10 }));
+    accumulate(
+      accumulator,
+      event({ kind: "kanban.tick_phase", boardId: "a", props: { phase: "thread_status" } }),
+    );
+    accumulate(accumulator, { ...phase("a", "thread_status", 10_000), surface: "web" });
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.deepEqual(rollup.tickPhases, [
+      {
+        boardId: "a",
+        phase: "event_persistence",
+        count: 1,
+        p50Ms: 0,
+        p95Ms: 0,
+        maxMs: 0,
+        approximate: false,
+      },
+      {
+        boardId: "a",
+        phase: "thread_status",
+        count: 3,
+        p50Ms: 20,
+        p95Ms: 90,
+        maxMs: 90,
+        approximate: false,
+      },
+      {
+        boardId: "b",
+        phase: "thread_status",
+        count: 1,
+        p50Ms: 1_000,
+        p95Ms: 1_000,
+        maxMs: 1_000,
+        approximate: false,
+      },
+    ]);
+    assert.equal(rollup.kindCounts["kanban.tick_overlap"], 1);
+  });
+
   it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
     const accumulator = makeAccumulator();
     const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>
@@ -146,10 +201,26 @@ describe("analytics rollups", () => {
         event({ kind: `kind.${index}`, props: { errorTag: `error.${index}` } }),
       );
       accumulate(accumulator, event({ durationMs: index, props: { method: `method.${index}` } }));
+      accumulate(
+        accumulator,
+        event({
+          kind: "kanban.tick_phase",
+          boardId: `board-${index}`,
+          durationMs: index,
+          props: { phase: "thread_status" },
+        }),
+      );
     }
     assert.isAtMost(accumulator.kinds.size, 129);
     assert.isAtMost(accumulator.errors.size, 129);
     assert.isAtMost(accumulator.rpcs.size, 129);
+    assert.isAtMost(accumulator.tickPhases.size, 129);
+    assert.equal(
+      finishRollup(accumulator, "2026-11-13", ts).tickPhases!.find(
+        (group) => group.phase === "__other__",
+      )!.count,
+      872,
+    );
     assert.isAtMost(finishRollup(accumulator, "2026-11-13", ts).topSlowRpcs.length, 20);
   });
 

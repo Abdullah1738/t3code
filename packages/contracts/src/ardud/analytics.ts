@@ -121,6 +121,9 @@ export const AnalyticsRollup = Schema.Struct({
   errorCounts: Schema.Record(Label, Measurement),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
+  tickPhases: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
+  ),
   mcpCalls: Schema.Array(
     Schema.Struct({
       tool: Label,

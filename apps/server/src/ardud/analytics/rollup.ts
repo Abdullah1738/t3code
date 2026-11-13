@@ -51,6 +51,7 @@ export const makeAccumulator = () => ({
   errors: new Map<string, number>(),
   rpcs: new Map<string, Durations>(),
   answers: durations(),
+  tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -102,6 +103,27 @@ export function accumulate(
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
   else if ((event.props?.status ?? 0) >= 400)
     increment(target.errors, `status.${event.props!.status}`);
+
+  if (
+    event.kind === "kanban.tick_phase" &&
+    event.surface === "server" &&
+    event.boardId &&
+    event.props?.phase &&
+    event.durationMs !== undefined
+  ) {
+    const identity = JSON.stringify([event.boardId, event.props.phase]);
+    const key = boundedKey(target.tickPhases, identity);
+    let group = target.tickPhases.get(key);
+    if (!group) {
+      group = {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        phase: key === OTHER ? OTHER : event.props.phase,
+        durations: durations(),
+      };
+      target.tickPhases.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+  }
 
   if (
     /(^|[._-])rpc([._-]|$)/i.test(event.kind) &&
@@ -241,6 +263,13 @@ export function finishRollup(
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
+    tickPhases: [...target.tickPhases.values()]
+      .map((group) => ({
+        boardId: group.boardId,
+        phase: group.phase,
+        ...summarize(group.durations),
+      }))
+      .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.phase.localeCompare(b.phase)),
     mcpCalls: [...target.mcp]
       .map(([key, group]) => ({
         tool: group.tool,

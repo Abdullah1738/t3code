@@ -1,6 +1,8 @@
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import type * as Scope from "effect/Scope";
+import type { KanbanStoreError, KanbanStoreShape } from "../store/KanbanStore.ts";
 
 // Higher priority scopes own elapsed wall time when tick fibers overlap. This
 // partitions the tick rather than summing concurrent or nested I/O durations.
@@ -124,15 +126,18 @@ const storePhase = (key: string): Phase => {
 };
 
 /** Preserve the service's signatures, instrumenting both methods and effect properties. */
-export const store = <T extends object>(source: T): T =>
+export const store = (source: KanbanStoreShape): KanbanStoreShape =>
   new Proxy(source, {
     get(target, key, receiver) {
-      const member: unknown = Reflect.get(target, key, receiver);
-      const wrap = (value: unknown, args: unknown[] = []) => {
-        if (!Effect.isEffect(value)) return value;
-        return measure(
+      if (!Object.hasOwn(target, key)) return Reflect.get(target, key, receiver);
+      const member = target[key as keyof KanbanStoreShape];
+      const wrap = (
+        operation: Effect.Effect<unknown, KanbanStoreError, Scope.Scope>,
+        args: unknown[] = [],
+      ) =>
+        measure(
           storePhase(String(key)),
-          value.pipe(
+          operation.pipe(
             Effect.tap((result) =>
               Effect.flatMap(current, (timing) =>
                 Effect.sync(() => {
@@ -144,9 +149,16 @@ export const store = <T extends object>(source: T): T =>
           ),
           true,
         );
-      };
       return typeof member === "function"
-        ? (...args: unknown[]) => wrap(Reflect.apply(member, target, args), args)
+        ? (...args: unknown[]) =>
+            wrap(
+              Reflect.apply<
+                typeof target,
+                never[],
+                Effect.Effect<unknown, KanbanStoreError, Scope.Scope>
+              >(member, target, args as never[]),
+              args,
+            )
         : wrap(member);
     },
   });
