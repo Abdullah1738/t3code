@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - random fixture text prevents string interning in retention measurements.
+import * as NodeCrypto from "node:crypto";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1375,6 +1377,78 @@ it.live(
   60_000,
 );
 
+it.effect("validates large metadata rows across all id-keyed caches", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const metadata = (text: string) => ({
+      board: { ...board, name: text },
+      goal: {
+        id: KanbanGoalId.make("large-goal"),
+        boardId,
+        name: text,
+        status: "active" as const,
+        now: null,
+        story: [{ at, text: "Full goal only".repeat(50) }],
+        createdAt: at,
+      },
+      pool: { key: "large-pool", model: { ...model, model: text }, slots: 1 },
+      discussion: { ...discussion(1), title: text },
+    });
+    const first = metadata("a".repeat(2048));
+    const second = metadata("b".repeat(2048));
+    yield* store.putBoard(first.board);
+    yield* store.putGoal(first.goal);
+    yield* store.putPool(boardId, first.pool);
+    yield* store.putDiscussion(first.discussion);
+    const read = Effect.gen(function* () {
+      return {
+        board: yield* store.board(boardId),
+        goal: (yield* store.goals(boardId))[0],
+        goalFeed: (yield* store.feedGoals(boardId))[0],
+        pool: (yield* store.pools(boardId))[0],
+        discussion: yield* store.discussion(first.discussion.id),
+      };
+    });
+    const coldRows = yield* read;
+    const cold = yield* store.decodeCacheStats;
+    const warmRows = yield* read;
+    const warm = yield* store.decodeCacheStats;
+    for (const name of ["board", "goal", "goalFeed", "pool", "discussion"] as const) {
+      assert.strictEqual(warmRows[name], coldRows[name]);
+      assert.strictEqual(warm[name]!.misses, cold[name]!.misses);
+      assert.strictEqual(warm[name]!.hits - cold[name]!.hits, 1);
+    }
+    const write = (rows: typeof first) =>
+      Effect.gen(function* () {
+        yield* sql`UPDATE ardud_kanban_boards SET json = ${JSON.stringify(rows.board)} WHERE id = ${boardId}`;
+        yield* sql`UPDATE ardud_kanban_goals SET json = ${JSON.stringify(rows.goal)} WHERE id = ${rows.goal.id}`;
+        yield* sql`UPDATE ardud_kanban_pools SET json = ${JSON.stringify(rows.pool)} WHERE board_id = ${boardId} AND key = ${rows.pool.key}`;
+        yield* sql`UPDATE ardud_kanban_discussions SET json = ${JSON.stringify(rows.discussion)} WHERE id = ${rows.discussion.id}`;
+      });
+    yield* write(second);
+    const changed = yield* read;
+    const changedStats = yield* store.decodeCacheStats;
+    assert.deepStrictEqual(changed.board, second.board);
+    assert.deepStrictEqual(changed.goal, second.goal);
+    assert.deepStrictEqual(changed.pool, second.pool);
+    assert.deepStrictEqual(changed.discussion, second.discussion);
+    assert.strictEqual(changed.goalFeed!.name, second.goal.name);
+    assert.strictEqual(changed.goalFeed!.story[0]!.text.length, 512);
+    assert.strictEqual(changed.goal!.story[0]!.text, second.goal.story[0]!.text);
+    for (const name of ["board", "goal", "goalFeed", "pool", "discussion"]) {
+      assert.strictEqual(changedStats[name]!.misses - cold[name]!.misses, 1);
+      assert.strictEqual(changedStats[name]!.entries, 1);
+    }
+    yield* sql
+      .withTransaction(
+        write(first).pipe(Effect.andThen(read), Effect.andThen(Effect.fail("rollback"))),
+      )
+      .pipe(Effect.flip);
+    assert.deepStrictEqual(yield* read, changed);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.live(
   "keeps a 6000-card working set across boards, projections and thread reads",
   () =>
@@ -1460,6 +1534,66 @@ it.live(
       });
     }).pipe(Effect.provide(TestLayer)),
   60_000,
+);
+
+it.live(
+  "retains decoded card text without another full JSON copy",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const count = 128;
+      const promptBytes = 131_072;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          for (let number = 1; number <= count; number++) {
+            yield* store.putCard({
+              ...card(number, "todo"),
+              prompt: NodeCrypto.randomBytes(promptBytes / 2).toString("hex"),
+            });
+          }
+        }),
+      );
+      // Random fixture text cannot be interned; GC excludes temporary SQL/codec allocations.
+      NodeV8.setFlagsFromString("--expose_gc");
+      const gc = NodeVM.runInNewContext("gc") as () => void;
+      gc();
+      const before = process.memoryUsage().heapUsed;
+      yield* store.cards(boardId);
+      yield* Effect.yieldNow;
+      gc();
+      const retained = process.memoryUsage().heapUsed - before;
+      assert.isBelow(retained, count * promptBytes * 1.5);
+      const cold = yield* store.decodeCacheStats;
+      yield* store.cards(boardId);
+      const warm = yield* store.decodeCacheStats;
+      assert.strictEqual(warm.card!.misses, cold.card!.misses);
+      assert.strictEqual(warm.card!.hits - cold.card!.hits, count);
+      yield* Effect.logInfo("KANBAN_JSON_RETENTION", { retained, textBytes: count * promptBytes });
+    }).pipe(Effect.provide(TestLayer)),
+  30_000,
+);
+
+it.effect("invalidates same-length row text with unchanged timestamps", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const row = { ...card(1, "todo"), prompt: "first".repeat(512) };
+    yield* store.putCard(row);
+    const original = yield* store.card(row.id);
+    assert.strictEqual(yield* store.card(row.id), original);
+    const cold = yield* store.decodeCacheStats;
+    for (const prompt of ["other".repeat(512), "\ud800".repeat(512), "\ud801".repeat(512)]) {
+      const changed = { ...row, prompt };
+      yield* sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify(changed)} WHERE id = ${row.id}`;
+      const decoded = yield* store.card(row.id);
+      assert.deepStrictEqual(decoded, changed);
+      assert.strictEqual(yield* store.card(row.id), decoded);
+    }
+    const warm = yield* store.decodeCacheStats;
+    assert.strictEqual(warm.card!.misses - cold.card!.misses, 3);
+    assert.strictEqual(warm.card!.entries, 1);
+  }).pipe(Effect.provide(TestLayer)),
 );
 
 it.effect("replaces a row version and drops deleted card and thread entries", () =>
