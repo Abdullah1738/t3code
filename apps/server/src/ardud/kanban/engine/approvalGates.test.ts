@@ -819,3 +819,80 @@ it.effect("dropping a blocking ask cannot restore a verified stage over an open 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect(
+  "Crpko #3329 dev rollout follows board guesses while stored deploy gates stay enforced",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard();
+        const text = "Tag the main-dev tip and dev-deploy it";
+        const legacy = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Legacy rollout",
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          owner,
+        );
+        assert.strictEqual(legacy.subtasks[0]!.gate, "deploy");
+        yield* kanban.updateBoard(board.id, { guessedGates: ["money", "secret"] });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Crpko #3329 rollout",
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          owner,
+        );
+        assert.isUndefined(card.subtasks[0]!.gate);
+        const done = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Dev rollout complete",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(done.subtasks[0]!.state, "done");
+        const edited = yield* kanban.createCard(board.id, { prompt: "Edited rollout" }, owner);
+        const planned = yield* kanban.editCard(
+          edited.id,
+          {
+            subtasks: [{ text, owner: "evaluator" }],
+          },
+          evaluator,
+        );
+        assert.isUndefined(planned.subtasks[0]!.gate);
+        yield* kanban.markSubtask(
+          edited.id,
+          "s1",
+          "done",
+          "Dev rollout complete",
+          evaluator,
+          "evaluator",
+        );
+        for (const input of [
+          { text, owner: "evaluator", gate: "deploy" },
+          { text: "Pay the invoice", owner: "evaluator" },
+        ] as const) {
+          const gated = yield* kanban.createCard(
+            board.id,
+            { prompt: input.text, subtasks: [input] },
+            owner,
+          );
+          const result = yield* Effect.result(
+            kanban.markSubtask(gated.id, "s1", "done", "Done", evaluator, "evaluator"),
+          );
+          assert.strictEqual(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.include(result.failure.detail, "needs Abdullah's approval");
+        }
+        const old = yield* Effect.result(
+          kanban.markSubtask(legacy.id, "s1", "done", "Done", evaluator, "evaluator"),
+        );
+        assert.strictEqual(old._tag, "Failure");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);

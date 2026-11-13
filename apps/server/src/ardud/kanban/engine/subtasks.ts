@@ -7,6 +7,7 @@ import {
   kanbanStepSubtasks,
   type KanbanActor,
   type KanbanCard,
+  type KanbanBoard,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
@@ -40,11 +41,16 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 
 export const gateOf = (
   subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
-): KanbanSubtask["gate"] =>
+  guessedGates?: KanbanBoard["guessedGates"],
+): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
-  subtask.owner === "work" || subtask.owner === "review"
-    ? undefined
-    : (subtask.gate ?? inferGate(subtask.text));
+  if (subtask.owner === "work" || subtask.owner === "review") return undefined;
+  if (subtask.gate !== undefined) return subtask.gate;
+  const guessed = inferGate(subtask.text);
+  return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
+    ? guessed
+    : undefined;
+};
 
 export const isNegativeOption = (label: string): boolean =>
   /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
@@ -136,8 +142,9 @@ const approvesGate = (
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
+  guessedGates?: KanbanBoard["guessedGates"],
 ): string | null => {
-  const gate = gateOf(subtask);
+  const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
@@ -152,7 +159,7 @@ export const approvalProblem = (
       if (ids.size > 0) return ids.has(subtask.id);
       const candidates = card.subtasks.filter(
         (entry) =>
-          gateOf(entry) === gate &&
+          gateOf(entry, guessedGates) === gate &&
           entry.state !== "skipped" &&
           (entry.createdAt ?? card.createdAt) <= answer.at,
       );
@@ -254,6 +261,7 @@ export function planSubtasks(
   inputs: ReadonlyArray<SubtaskInput>,
   seq = 0,
   at?: string,
+  guessedGates?: KanbanBoard["guessedGates"],
 ): SubtaskPlan {
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
@@ -302,7 +310,7 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined });
+    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates);
     const script = input.script?.trim() || undefined;
     if (script && owner !== "script") {
       return {
@@ -316,7 +324,7 @@ export function planSubtasks(
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
       const { script: _old, gate: _oldGate, ...rest } = known;
-      const previousGate = gateOf(known);
+      const previousGate = gateOf(known, guessedGates);
       const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
       planned.push({
         ...rest,
