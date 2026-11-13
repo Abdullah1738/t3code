@@ -128,16 +128,17 @@ class MessageSinkTests(unittest.TestCase):
             scratch = root / 'scratch/activity-digest'
             scratch.mkdir()
             shutil.copy2(ROOT / 'watchers/activity-digest/summarize.py', scratch / 'summarize.py')
-            out = subprocess.run([sys.executable, str(scratch / 'summarize.py'), '/tmp/digest.md'], cwd=tmp, env=env,
+            out = subprocess.run([sys.executable, str(scratch / 'summarize.py'), str(root / 'digest.md')], cwd=tmp, env=env,
                                  input='- 2026-11-13 10:00 · password: Fake#Pass123 · note\n',
                                  text=True, capture_output=True, timeout=10)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertNotIn('Fake#Pass123', out.stdout)
 
     def test_activity_topics_sanitized_before_shortening(self):
-        out = subprocess.run([sys.executable, str(ROOT / 'watchers/activity-digest/summarize.py'), '/tmp/digest.md'],
-                             input='- 2026-11-13 10:00 · password: Fake#Pass123 · note\n',
-                             text=True, capture_output=True, timeout=5)
+        with tempfile.TemporaryDirectory() as temp:
+            out = subprocess.run([sys.executable, str(ROOT / 'watchers/activity-digest/summarize.py'), str(Path(temp) / 'digest.md')],
+                                 input='- 2026-11-13 10:00 · password: Fake#Pass123 · note\n',
+                                 text=True, capture_output=True, timeout=5)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertNotIn('Fake#Pass123', out.stdout)
 
