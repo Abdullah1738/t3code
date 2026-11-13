@@ -16,7 +16,7 @@ NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshot
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
-                'windowStart', 'windowEnd', 'windowS', 'skippedS'))
+                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
 SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',

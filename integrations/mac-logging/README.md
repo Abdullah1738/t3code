@@ -10,8 +10,10 @@ The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
 Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. A failed query retains the exact bounded window for retry,
-and success advances its cursor to that window end.
+explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
+after each completed chunk. A failed query retains the unfinished suffix for retry.
+Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
+markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
 
@@ -22,7 +24,8 @@ allowing up to 60 s per root under a shared 210 s scan budget. The two big
 roots (`~/.local/share` and `~/.robob`) run first, one first-level child at a
 time with a 15 s child timeout. Each root gets at most 60 s. The collector
 also limits the scan to the time remaining in its five-minute run budget,
-reserving 65 s for crash collection after the existing disk tooling probe. Samples expose
+running crash collection first (at most 120 s), then the disk tooling probe and
+inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -75,11 +78,19 @@ scan coverage cannot become a reported grower.
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
 Missing optional database/WAL files are skipped. The filtered unified-log query
-has a one-hour maximum window and a timeout of at most 60 s, shortened to the
-collector's remaining absolute budget. Its source event/error and
+has a one-hour maximum window, split into contiguous 15-minute chunks under a
+shared 90 s budget. Each command has at most 60 s, shortened to that shared
+budget and the collector's remaining absolute budget. Its source event/error and
 `crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-and `skippedS` (older time omitted by the cap). On failure, `unifiedRetry`
-retains the exact window until it succeeds; then the cursor advances to its end.
+`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
+and `chunksDone`. Each completed chunk emits its observations and saves its cursor
+before the next command. The next chunk excludes that cursor's instant, including
+when log's second rounding/end padding returns overlapping rows. Missing or invalid
+event timestamps fail the chunk rather than risk attributing events twice.
+On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
+completed chunks are not queried again. An old one-hour retry is split the same
+way. After a delayed retry completes, the next run applies the recent-hour cap
+again and reports any omitted older time in `skippedS`.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,
@@ -94,8 +105,11 @@ only after enumeration completes. Reports arriving after that end remain for
 the next window. Healthy sources continue independently.
 
 `collector.main` sets a 290 s absolute work deadline, leaving ten seconds for
-state/log overhead within five minutes. Report work, the log query and daily
-rollup share that deadline; no log command starts once the budget is exhausted.
+state/log overhead within five minutes. Crash collection has at most 120 s for
+three 10 s report sources, the shared 90 s log budget, and daily rollup. The disk
+tooling probe follows, then inventory uses the remaining absolute budget.
+No log command starts once its shared budget is exhausted. No live configuration
+or schedule change is needed for this order.
 
 ## diskutil hangs
 

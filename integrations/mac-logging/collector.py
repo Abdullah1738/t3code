@@ -3,6 +3,7 @@
 from collections import Counter
 import datetime as dt
 import json
+import math
 import fcntl
 import os
 import plistlib
@@ -22,6 +23,8 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
 
 
 UNIFIED_WINDOW_S = 3600
+UNIFIED_CHUNK_S = 900
+UNIFIED_BUDGET_S = 90
 
 
 def deadline_call(deadline, operation, *args, **kwargs):
@@ -148,28 +151,37 @@ def unified(since, until, run=subprocess.run, timeout=60):
         raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
     for row in rows:
         timestamp = row.get('timestamp')
-        if timestamp:
-            try:
-                at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
-            except (AttributeError, TypeError, ValueError):
-                raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
-            if at.tzinfo is None:
-                at = at.replace(tzinfo=dt.timezone.utc)
-            if not since < at.timestamp() <= until:
-                continue
+        try:
+            at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
+        except (AttributeError, TypeError, ValueError):
+            raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=dt.timezone.utc)
+        if not since < at.timestamp() <= until:
+            continue
         message = row.get('eventMessage', '')
         if not isinstance(message, str):
             raise SourceFailure('parse', 'invalid unified log data', result.returncode)
         if '=== system boot' in message:
-            counts['restart', 'kernel'] += 1
+            # Preserve boot time and collapse duplicate markers at that instant.
+            counts['restart', 'kernel', at.timestamp()] = 1
         elif 'wdog' in message.lower() or 'unresponsive' in message.lower():
             counts['hang', 'system'] += 1
     return counts
 
 
+def crash_observations(counts):
+    for key, count in counts.items():
+        kind, process = key[:2]
+        props = dict(resourceKind=kind, process=process, count=count)
+        if len(key) == 3:
+            props['observedAt'] = key[2]
+        emit('crashes', 'event', 'crash.observed', ok=True, props=props)
+
+
 def collect(now=None, roots=None, log_reader=None, deadline=None):
     started = time.monotonic()
-    deadline = started+65 if deadline is None else deadline
+    deadline = min(started+120, deadline) if deadline is not None else started+120
     now = time.time() if now is None else now
     state = read_state('crashes')
     counts, errors = Counter(), 0
@@ -198,33 +210,45 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             errors += 1
             source_error('crashes', 'crash.source', root, source_started, exc,
                          {'partial': bool(completed)})
+    crash_observations(counts)
+    save_state('crashes', state)
     source_started = time.monotonic()
     since = state.get('unified', now-3600)
     window = state.get('unifiedRetry') or dict(windowStart=max(since, now-UNIFIED_WINDOW_S),
                                              windowEnd=now, skippedS=max(0, now-UNIFIED_WINDOW_S-since))
     window = dict(window, windowS=window['windowEnd']-window['windowStart'])
+    window.update(chunks=math.ceil(max(0, window['windowS'])/UNIFIED_CHUNK_S), chunksDone=0)
+    cursor = window['windowStart']
+    unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
     try:
-        remaining = min(60, deadline-time.monotonic())
-        if remaining <= 0:
+        if time.monotonic() >= unified_deadline:
             raise SourceFailure('timeout', 'collector budget exhausted')
-        if log_reader is None:
-            observed = deadline_call(deadline, unified, window['windowStart'], window['windowEnd'],
-                                     timeout=remaining)
-        else:
-            observed = deadline_call(deadline, log_reader, window['windowStart'], window['windowEnd'])
-        counts.update(observed)
+        while cursor < window['windowEnd']:
+            end = min(cursor+UNIFIED_CHUNK_S, window['windowEnd'])
+            remaining = min(60, unified_deadline-time.monotonic())
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'unified log budget exhausted')
+            if log_reader is None:
+                observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
+            else:
+                observed = deadline_call(unified_deadline, log_reader, cursor, end)
+            counts.update(observed)
+            crash_observations(observed)
+            cursor = end
+            state['unified'] = cursor
+            window['chunksDone'] += 1
+            # Only the unfinished suffix survives a timeout or process restart.
+            state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'], skippedS=0)
+            save_state('crashes', state)
         state['unified'] = window['windowEnd']
         state.pop('unifiedRetry', None)
         emit('crashes', 'event', 'crash.source', ok=True,
              props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000, **window))
     except Exception as exc:
         errors += 1
-        # Keep the exact failed chunk even if the next attempt is hours later.
-        state['unifiedRetry'] = window
+        state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                     skippedS=window['skippedS'] if not window['chunksDone'] else 0)
         source_error('crashes', 'crash.source', 'unified', source_started, exc, window)
-    for (kind, process), count in counts.items():
-        emit('crashes', 'event', 'crash.observed', ok=True,
-             props={'resourceKind': kind, 'process': process, 'count': count})
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},
@@ -447,15 +471,15 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 
 def main():
     deadline = time.monotonic()+290
-    disk_tooling_probe()
-    try:
-        directory_inventory(deadline=deadline-65)
-    except Exception:
-        emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
     try:
         collect(deadline=deadline)
     except Exception:
         emit('crashes', 'error', 'crash.collect', ok=False, error_tag='crash.collect_failed')
+    disk_tooling_probe()
+    try:
+        directory_inventory(deadline=deadline)
+    except Exception:
+        emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
 
 
 if __name__ == '__main__':
