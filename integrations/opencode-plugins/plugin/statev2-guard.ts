@@ -118,7 +118,7 @@ export default {
       } catch (err) {
         errorTag = 'hook.error'
       } finally {
-        if (typeof command === 'string') toolLogHook('statev2', decision, rule, started, command, errorTag, {sessionId:e.sessionID})
+        if (typeof command === 'string') toolLogHook('statev2', decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd:e.input?.workdir ?? e.input?.cwd ?? ctx.location?.directory})
       }
     })
   },
