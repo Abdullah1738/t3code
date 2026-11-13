@@ -2585,10 +2585,10 @@ const make = Effect.gen(function* () {
   // with other cards that were not running when the compaction was requested.
   const threadCompacting = Effect.fn("KanbanService.threadCompacting")(function* (
     threadId: ThreadId,
-    boardId: KanbanBoardId,
+    cards: ReadonlyArray<KanbanCard>,
   ) {
     let latest: KanbanCardEvent | undefined;
-    for (const candidate of yield* store.openCards(boardId)) {
+    for (const candidate of cards) {
       if (
         candidate.stage !== "todo" ||
         candidate.activeThreadId !== null ||
@@ -6462,12 +6462,69 @@ const make = Effect.gen(function* () {
     return saved;
   });
 
+  // Each dispatch owns this view. Store write notifications refresh only
+  // changed rows, including this pass's writes and independent store writers.
+  const dispatchCardPass = (boardId: KanbanBoardId, changed: Set<KanbanCardId>) => {
+    let rows: Map<string, KanbanCard | null> | undefined;
+    let snapshot: ReadonlyArray<KanbanCard> = [];
+    const candidate = (card: KanbanCard) =>
+      card.settledAt === null &&
+      (["todo", "working", "needs_review", "in_review"].includes(card.stage) ||
+        card.wait !== undefined ||
+        card.deciding !== undefined ||
+        card.activeThreadId !== null);
+    const read = locks.access(
+      boardId,
+      Effect.gen(function* () {
+        const loaded = rows !== undefined;
+        if (rows === undefined)
+          rows = new Map((yield* rawStore.dispatchCards(boardId)).map((card) => [card.id, card]));
+        if (loaded && changed.size === 0) return snapshot;
+        while (changed.size > 0) {
+          const ids = [...changed];
+          changed.clear();
+          // A write notification may precede its enclosing transaction's commit.
+          // Taking the writer waits for that commit (or rollback) before refreshing.
+          const fresh = yield* boardSql
+            .withTransaction(Effect.forEach(ids, (id) => rawStore.card(id)))
+            .pipe(
+              Effect.mapError(
+                (cause) => new KanbanStoreError({ operation: "refresh dispatch cards", cause }),
+              ),
+            );
+          for (let i = 0; i < ids.length; i++) rows.set(ids[i]!, fresh[i]!);
+        }
+        const cards = new Map<string, KanbanCard>();
+        const pending = [...rows.values()].flatMap((card) =>
+          card !== null && candidate(card) ? [card] : [],
+        );
+        for (let i = 0; i < pending.length; i++) {
+          const card = pending[i]!;
+          if (cards.has(card.id) || card.settledAt !== null) continue;
+          cards.set(card.id, card);
+          if (KANBAN_DONE_STAGES.has(card.stage)) continue;
+          // Completed cards can still block on an evaluator's merge subtask;
+          // needs_owner cards can block too. Load named dependencies, not history.
+          for (const id of card.blockedBy) {
+            if (!rows.has(id)) rows.set(id, yield* rawStore.card(KanbanCardId.make(id)));
+            const dependency = rows.get(id);
+            if (dependency?.boardId === boardId && !cards.has(id)) pending.push(dependency);
+          }
+        }
+        snapshot = [...cards.values()].sort((a, b) => a.number - b.number);
+        return snapshot;
+      }),
+    );
+    return { read };
+  };
+
   /** Only this card's changes and relevant board writes invalidate its start. */
   const startCard = Effect.fn("KanbanService.startCard")(function* (
     boardId: KanbanBoard["id"],
     dispatch: Rules.Dispatch,
     planned: KanbanCard,
     destination: { newThread: boolean; expectedCard: KanbanCard },
+    pass: ReturnType<typeof dispatchCardPass>,
   ) {
     const board = yield* boardOf(boardId);
     if (settingUp.has(board.id)) return;
@@ -6476,7 +6533,7 @@ const make = Effect.gen(function* () {
     const confirmed = Rules.confirmDispatch(
       board,
       planned,
-      yield* store.openCards(board.id),
+      yield* pass.read,
       Rules.maskDownPools(yield* store.pools(board.id), new Set((yield* Ref.get(down)).keys())),
       yield* boardHolds(board.id, `${board.id}:${dispatch.cardId}`),
       dispatch,
@@ -6525,7 +6582,7 @@ const make = Effect.gen(function* () {
       if (existingRead?._tag === "Failure") return;
       const view = existingRead === null ? yield* threads.view(existing) : existingRead.success;
       const compactEvent =
-        dispatch.role === "work" ? yield* threadCompacting(existing, board.id) : undefined;
+        dispatch.role === "work" ? yield* threadCompacting(existing, yield* pass.read) : undefined;
       if (dispatch.joins && !view) {
         // The thread holding the slot is gone: the card stops pointing at it,
         // so the next pass gives it a slot of its own instead of joining again.
@@ -6648,9 +6705,7 @@ const make = Effect.gen(function* () {
       }
       if (!view && dispatch.role === "work") {
         // Its old thread is gone, so a block by that thread's work counts again.
-        const byId = new Map(
-          (yield* store.openCards(card.boardId)).map((c) => [c.id as string, c]),
-        );
+        const byId = new Map((yield* pass.read).map((c) => [c.id as string, c]));
         if (Rules.isBlocked(card, byId, null)) {
           destination.expectedCard = yield* saveDispatchCard({
             ...card,
@@ -6967,6 +7022,8 @@ const make = Effect.gen(function* () {
             dispatching,
             candidate.id,
             Effect.gen(function* () {
+              const changed = yield* rawStore.watchCardWrites(candidate.id);
+              const pass = dispatchCardPass(candidate.id, changed);
               const attempted = new Set(stoppedCards);
               while (true) {
                 // Replan after each attempt so a failed head leaves room for lower cards.
@@ -6974,7 +7031,7 @@ const make = Effect.gen(function* () {
                   Effect.gen(function* () {
                     const board = yield* boardOf(candidate.id);
                     if (board.archivedAt !== null || settingUp.has(board.id)) return null;
-                    const cards = yield* upgradeFindings(yield* store.openCards(board.id));
+                    const cards = yield* upgradeFindings(yield* pass.read);
                     const depths = yield* tickQueueDepths;
                     if (depths !== undefined) {
                       depths.todo = cards.filter(
@@ -7123,7 +7180,7 @@ const make = Effect.gen(function* () {
                             )
                           )
                             return false;
-                          const cards = yield* rawStore.openCards(board.id);
+                          const cards = yield* pass.read;
                           const pools = Rules.maskDownPools(
                             yield* rawStore.pools(board.id),
                             new Set((yield* Ref.get(down)).keys()),
@@ -7165,7 +7222,7 @@ const make = Effect.gen(function* () {
                           );
                         }).pipe(Effect.orDie),
                       );
-                      yield* startCard(boardId, dispatch, card, destination);
+                      yield* startCard(boardId, dispatch, card, destination, pass);
                     }),
                     card.id,
                   )
@@ -7228,7 +7285,7 @@ const make = Effect.gen(function* () {
                     ),
                   );
               }
-            }),
+            }).pipe(Effect.scoped),
             false,
           ).pipe(
             Effect.tapCause((cause) =>
