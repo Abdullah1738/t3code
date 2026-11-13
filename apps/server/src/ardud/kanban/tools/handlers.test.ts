@@ -5221,16 +5221,17 @@ it.effect(
         );
         const attached = yield* kanban.cardDiscussion(card.id);
         const standalone = yield* kanban.createDiscussion(board.id, "Stand-alone", owner);
-        yield* kanban.askOwner(
-          card.id,
-          { question: "private-question", blocking: false },
-          owner,
-          "owner",
-        );
         for (const discussion of [attached, standalone]) {
           const seed = yield* kanban.post(discussion.id, owner, [
             { _tag: "md", text: "private-seed" },
           ]);
+          if (discussion.cardId)
+            yield* kanban.askOwner(
+              card.id,
+              { question: "private-question", blocking: false },
+              owner,
+              "owner",
+            );
           for (const caller of [worker, ThreadId.make("outside-discussion-reader")]) {
             for (const operation of [
               "read",

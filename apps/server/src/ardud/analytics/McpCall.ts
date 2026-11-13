@@ -127,7 +127,11 @@ export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "None") return;
   const error = cause.reasons.flatMap((reason) =>
-    reason._tag === "Fail" ? [fields(reason.error)] : [],
+    reason._tag === "Fail"
+      ? [fields(reason.error)]
+      : reason._tag === "Die"
+        ? [fields(reason.defect)]
+        : [],
   )[0];
   const classified = classifyFailure(error ?? {});
   call.value.handlerErrorTag = classified?.tag ?? (Cause.hasDies(cause) ? "Defect" : "Failure");
