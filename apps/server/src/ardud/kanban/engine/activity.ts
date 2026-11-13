@@ -70,7 +70,7 @@ export const isPass = (event: KanbanCardEvent) =>
  * (no_verdict also covers the second time, when the board stalls the card).
  * A fresh start someone asked for is not a failure.
  */
-export type FailureKind = "stalled" | "retried" | "fresh_thread" | "no_verdict";
+export type FailureKind = "stalled" | "retried" | "fresh_thread" | "no_verdict" | "verdict_refused";
 const FAILURE_PREFIXES: ReadonlyArray<readonly [FailureKind, string]> = [
   ["retried", Retries.RETRYING_EVENT],
   ["fresh_thread", Retries.FRESH_START_EVENT],
@@ -80,6 +80,8 @@ export const failureKind = (event: KanbanCardEvent): FailureKind | null => {
   const body = event.body ?? "";
   if (event.kind === "flagged") {
     if (body.startsWith("Run failed")) return "stalled";
+    if (event.actor._tag === "system" && body.startsWith(Retries.REFUSED_VERDICT_PREFIX))
+      return "verdict_refused";
     return event.actor._tag === "system" && body === Retries.NO_VERDICT_REASON
       ? "no_verdict"
       : null;
@@ -663,7 +665,7 @@ export const rollup = (input: RollupInput) => {
   const stallItems: Array<{
     card: number;
     at: string;
-    kind: "run_failed" | "flagged";
+    kind: "run_failed" | "flagged" | "verdict_refused";
     until?: string;
     minutes?: number;
     ongoing?: true;
@@ -678,7 +680,12 @@ export const rollup = (input: RollupInput) => {
       stallItems.push({
         card: card.number,
         at: stamp(event.at),
-        kind: isFailure(event) ? "run_failed" : "flagged",
+        kind:
+          failureKind(event) === "verdict_refused"
+            ? "verdict_refused"
+            : isFailure(event)
+              ? "run_failed"
+              : "flagged",
         ...(end !== undefined
           ? { until: stamp(end.at), minutes: minutesBetween(event.at, end.at) }
           : ongoing

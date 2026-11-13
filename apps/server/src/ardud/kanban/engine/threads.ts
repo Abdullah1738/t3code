@@ -50,8 +50,10 @@ export interface KanbanThreadPr {
   readonly url: string;
   readonly title: string | null;
   readonly state: "open" | "draft" | "merged" | "closed";
-  /** Its head commit while the thread watches the PR (the watch keeps it current); null otherwise. */
+  /** The watch's CI checkpoint, which may lag the observed branch head. */
   readonly head?: string | null;
+  /** Latest branch head observed by a live watch; null when unknown. */
+  readonly observedHead?: string | null;
   /** Checks on the head as last synced; null when none were reported. */
   readonly checks?: "passing" | "failing" | "pending" | null;
   /** When its state and checks were last synced from the host; null when never. */
@@ -299,6 +301,7 @@ const make = Effect.gen(function* () {
                 : pr.snapshot.state,
           // Only a live watch: an ended one's head may be commits behind.
           head: pr.watch?.headSha ?? null,
+          observedHead: pr.watch?.observedHeadSha ?? null,
           checks: pr.snapshot?.checksState ?? null,
           at: pr.snapshot?.syncedAt ?? null,
         })),

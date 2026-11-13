@@ -34,6 +34,7 @@ import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 import * as Duration from "effect/Duration";
 import * as Stream from "effect/Stream";
 import * as DateTime from "effect/DateTime";
@@ -93,6 +94,32 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
+
+const captureSpans = () => {
+  const ended: Array<{
+    name: string;
+    spanId: string;
+    parentSpanId: string | undefined;
+    attributes: Record<string, unknown>;
+  }> = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const end = span.end.bind(span);
+      span.end = (time, exit) => {
+        end(time, exit);
+        ended.push({
+          name: span.name,
+          spanId: span.spanId,
+          parentSpanId: Option.getOrUndefined(span.parent)?.spanId,
+          attributes: Object.fromEntries(span.attributes),
+        });
+      };
+      return span;
+    },
+  });
+  return { ended, tracer };
+};
 
 describe("OrchestratorMcpService", () => {
   it.effect("a terminal stalled run is reported correctly before parent finalization", () =>
@@ -572,6 +599,7 @@ describe("OrchestratorMcpService", () => {
     "returns only available fields at the task_status deadline during $blockedStage read (stalled=$stalled)",
     ({ blockedStage, stalled }) =>
       Effect.gen(function* () {
+        const { ended, tracer } = captureSpans();
         const parentThreadId = ThreadId.make("thread:deadline-parent");
         const childThreadId = ThreadId.make("thread:deadline-child");
         const taskId = NodeId.make("node:deadline-task");
@@ -667,6 +695,20 @@ describe("OrchestratorMcpService", () => {
           yield* Deferred.await(blocked);
           yield* TestClock.adjust("10 seconds");
           const result = yield* Fiber.join(read);
+          const attributes = ended.find(
+            (span) => span.name === "OrchestratorMcpService.taskStatus",
+          )!.attributes;
+          const traceStage =
+            blockedStage === "parent"
+              ? "parent_records"
+              : blockedStage === "controls"
+                ? "child_records"
+                : blockedStage === "restart"
+                  ? "pending_result"
+                  : blockedStage;
+          assert.equal(attributes["t3.task.result"], "partial");
+          assert.equal(attributes["t3.task.stage"], traceStage);
+          assert.equal(attributes[`t3.task.stage_ms.${traceStage}`], 10_000);
           assert.equal(result.partial, true);
           assert.equal(result.taskId, taskId);
           if (result.partial !== true) return;
@@ -700,111 +742,160 @@ describe("OrchestratorMcpService", () => {
           );
           assert.isUndefined(result.status);
           assert.isUndefined(result.summary);
-        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+        }).pipe(
+          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+          Effect.withTracer(tracer),
+        );
       }),
   );
 
-  it.effect("reports a restart-cut child as working until its continuation settles", () =>
-    Effect.gen(function* () {
-      const parentThreadId = ThreadId.make("thread:mcp-restart-parent");
-      const childThreadId = ThreadId.make("thread:mcp-restart-child");
-      const taskId = NodeId.make("node:mcp-restart-task");
-      const dispatched = yield* Ref.make(0);
-      let awaitsRestart = true;
-      let readFails = true;
-      const parentProjection = {
-        thread: { id: parentThreadId },
-        runs: [],
-        contextTransfers: [],
-        subagents: [
-          {
-            id: taskId,
+  it.effect.each(["active_continuation", "recut_nested", "recut_native"] as const)(
+    "preserves delegated work through restart for %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:mcp-restart-parent");
+        const childThreadId = ThreadId.make("thread:mcp-restart-child");
+        const taskId = NodeId.make("node:mcp-restart-task");
+        const dispatched = yield* Ref.make(0);
+        const now = yield* DateTime.now;
+        let awaitsRestart = true;
+        let readFails = true;
+        const parentProjection = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              driver: "codex",
+              model: "gpt-5.6-terra",
+              status: "running",
+              result: null,
+              completionDelivery: { state: "pending" },
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        let childProjection = {
+          thread: { id: childThreadId },
+          runs: [
+            {
+              id: RunId.make("run:mcp-restart-child"),
+              ordinal: 1,
+              status: "cancelled",
+              delegatedTaskId: taskId,
+            },
+            { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
+            { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
+          ],
+          contextTransfers: [],
+          messages: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        if (scenario !== "active_continuation") {
+          childProjection = {
+            ...childProjection,
+            runs: [
+              { ...childProjection.runs[0]!, status: "completed", startedAt: now },
+              {
+                ...childProjection.runs[0]!,
+                id: RunId.make("run:mcp-recut"),
+                ordinal: 2,
+                status: "cancelled",
+                startedAt: null,
+                restartContinuationOfRunId: childProjection.runs[0]!.id,
+              },
+            ],
+            subagents: scenario === "recut_nested" ? [{ status: "running" } as never] : [],
+            providerThreads:
+              scenario === "recut_native" ? [{ pendingBackgroundTasks: [{}] } as never] : [],
+          };
+        }
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (threadId) =>
+              Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
+            delegatedTaskResultPending: () =>
+              readFails
+                ? Effect.fail(new OrchestratorProjectionError({ threadId: childThreadId }))
+                : Effect.succeed(awaitsRestart),
+            dispatch: () =>
+              Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({} as never)),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:mcp-restart"),
+          requestNamespace: "provider-session:mcp-restart",
+          thread: {
             threadId: parentThreadId,
-            origin: "app_owned",
-            childThreadId,
-            driver: "codex",
-            model: "gpt-5.6-terra",
-            status: "running",
-            result: null,
-            completionDelivery: { state: "pending" },
+            providerSessionId: "provider-session:mcp-restart",
+            providerInstanceId: ProviderInstanceId.make("codex"),
           },
-        ],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const childProjection = {
-        thread: { id: childThreadId },
-        runs: [
-          {
-            id: RunId.make("run:mcp-restart-child"),
-            ordinal: 1,
-            status: "cancelled",
-            delegatedTaskId: taskId,
-          },
-          { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
-          { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
-        ],
-        contextTransfers: [],
-        messages: [],
-        subagents: [],
-        providerThreads: [],
-        runtimeRequests: [],
-        turnItems: [],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const layerDependencies = Layer.mergeAll(
-        NodeServices.layer,
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadRecords: (threadId) =>
-            Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
-          delegatedTaskResultPending: () =>
-            readFails
-              ? Effect.fail(new OrchestratorProjectionError({ threadId: childThreadId }))
-              : Effect.succeed(awaitsRestart),
-          dispatch: () => Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({} as never)),
-        }),
-        ServerSettings.layerTest(),
-        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-          list: () => Effect.succeed([]),
-        }),
-        Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(SecretRequests.SecretRequests)({}),
-        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
-      );
-      const scope: McpInvocationScope = {
-        environmentId: EnvironmentId.make("environment:mcp-restart"),
-        requestNamespace: "provider-session:mcp-restart",
-        thread: {
-          threadId: parentThreadId,
-          providerSessionId: "provider-session:mcp-restart",
-          providerInstanceId: ProviderInstanceId.make("codex"),
-        },
-        client: undefined,
-        capabilities: new Set(["orchestration"]),
-        issuedAt: 1,
-      };
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
 
-      yield* Effect.gen(function* () {
-        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const failed = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
-        assert.equal(failed.code, "orchestration_error");
-        assert.equal(yield* Ref.get(dispatched), 0);
-        readFails = false;
-        const held = yield* service.taskStatus(scope, taskId);
-        assert.equal(held.status, "running");
-        assert.equal(held.workState, "working");
-        assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
-        assert.equal(held.currentRunId, RunId.make("run:mcp-restart-later"));
-        assert.equal(held.currentRunStatus, "running");
-        assert.equal(held.latestTerminalStatus, "cancelled");
-        assert.equal(held.hasPendingChildRuns, true);
-        assert.isNull(held.summary);
-        assert.equal(yield* Ref.get(dispatched), 0);
-        awaitsRestart = false;
-        const settled = yield* service.taskStatus(scope, taskId);
-        assert.equal(settled.status, "cancelled");
-      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
-    }),
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          if (scenario === "active_continuation") {
+            const failed = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
+            assert.equal(failed.code, "orchestration_error");
+            assert.equal(yield* Ref.get(dispatched), 0);
+          }
+          readFails = false;
+          const held = yield* service.taskStatus(scope, taskId);
+          assert.equal(held.status, "running");
+          assert.equal(
+            held.workState,
+            scenario === "active_continuation" ? "working" : "waiting_for_children",
+          );
+          assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
+          assert.equal(
+            held.currentRunId,
+            scenario === "active_continuation" ? RunId.make("run:mcp-restart-later") : null,
+          );
+          assert.equal(
+            held.currentRunStatus,
+            scenario === "active_continuation" ? "running" : null,
+          );
+          assert.equal(
+            held.latestTerminalStatus,
+            scenario === "active_continuation" ? "cancelled" : "completed",
+          );
+          assert.equal(held.hasPendingChildRuns, scenario === "active_continuation");
+          assert.isNull(held.summary);
+          assert.equal(yield* Ref.get(dispatched), 0);
+          awaitsRestart = false;
+          const settled = yield* service.taskStatus(scope, taskId);
+          if (scenario === "active_continuation") {
+            assert.equal(settled.status, "cancelled");
+          } else {
+            assert.equal(settled.status, "running");
+            assert.equal(settled.workState, "waiting_for_children");
+            childProjection = { ...childProjection, subagents: [], providerThreads: [] };
+            const finished = yield* service.taskStatus(scope, taskId);
+            assert.equal(finished.status, "cancelled");
+            assert.equal(finished.workState, "result_available");
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }),
   );
 
   it.effect.each([false, true])(
@@ -1517,6 +1608,51 @@ describe("OrchestratorMcpService provider resolution", () => {
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
 
+  it.effect.each(["node:delegated-task:unknown", "unknown"])(
+    "taskStatus traces an unknown id %s",
+    (id) =>
+      Effect.gen(function* () {
+        const { ended, tracer } = captureSpans();
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              Effect.succeed({ ...liveThreadShell(threadId), ...parentProjection([]).thread }),
+            getThreadRecords: () => Effect.succeed(parentProjection([])),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([]),
+          adapterRegistryLayer([]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const error = yield* service.taskStatus(scope, NodeId.make(id)).pipe(Effect.flip);
+          assert.equal(error.code, "task_not_found");
+        }).pipe(
+          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+          Effect.withTracer(tracer),
+        );
+        const attributes = ended.find(
+          (span) => span.name === "OrchestratorMcpService.taskStatus",
+        )!.attributes;
+        assert.equal(attributes["t3.mcp.caller_thread_id"], parentThreadId);
+        assert.equal(attributes["t3.task.task_id"], id);
+        assert.equal(
+          attributes["t3.task.result"],
+          id.startsWith("node:delegated-task:") ? "not_found_in_flight" : "not_found",
+        );
+        assert.equal(attributes["t3.task.stage"], "parent_records");
+        assert.equal(attributes["t3.task.stage_ms.caller"], 0);
+        assert.equal(attributes["t3.task.stage_ms.parent_records"], 0);
+        const statusSpan = ended.find((span) => span.name === "OrchestratorMcpService.taskStatus")!;
+        const readSpan = ended.find((span) => span.name === "OrchestratorMcpService.readTask")!;
+        assert.equal(readSpan.parentSpanId, statusSpan.spanId);
+      }),
+  );
+
   it.effect("status and same-key delegation finish while the background reader is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1662,7 +1798,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect.each(["none", "rejected"] as const)(
+  it.effect.each(["none", "rejected", "read_error"] as const)(
     "a %s receipt does not report a rejected delegation as saved",
     (receipt) =>
       Effect.gen(function* () {
@@ -1680,6 +1816,22 @@ describe("OrchestratorMcpService provider resolution", () => {
               Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: () => Effect.succeed(parentProjection([])),
             hasReceipt: () => Effect.succeed(receipt === "rejected"),
+            getCommandReceipt: (commandId) =>
+              receipt === "read_error"
+                ? Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId }))
+                : Effect.succeed(
+                    receipt === "none"
+                      ? Option.none()
+                      : Option.some({
+                          commandId,
+                          threadId: parentThreadId,
+                          commandType: "delegated_task.request",
+                          acceptedAt: DateTime.makeUnsafe("2026-11-13T00:00:00.000Z"),
+                          resultSequence: 1,
+                          status: "rejected" as const,
+                          error: "Rejected",
+                        }),
+                  ),
             dispatch: (command) =>
               Effect.fail(
                 receipt === "rejected"
@@ -1718,6 +1870,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             .pipe(Effect.flip);
           assert.equal(error.code, "orchestration_error");
           assert.isFalse(state.saved);
+          assert.isDefined(state.delegation);
+          assert.equal(
+            yield* state.delegation!.readCommitted,
+            receipt === "read_error" ? "unknown" : receipt === "rejected",
+          );
         }).pipe(
           Effect.provideService(McpCall, state),
           Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
@@ -1725,17 +1882,15 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
-  it.effect.each([
-    "caller",
-    "parent_records",
-    "catalog",
-    "receipt",
-    "selection",
-    "dispatch",
-  ] as const)(
-    "delegateTask bounds a stalled %s phase and never dispatches after a preflight timeout",
-    (stage) =>
+  it.effect.each(
+    (["caller", "parent_records", "catalog", "receipt", "selection", "dispatch"] as const).flatMap(
+      (stage) => [false, true].map((interrupted) => ({ stage, interrupted })),
+    ),
+  )(
+    "delegateTask traces stalled $stage (interrupted: $interrupted) without dispatching after preflight",
+    ({ stage, interrupted }) =>
       Effect.gen(function* () {
+        const { ended, tracer } = captureSpans();
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         let dispatches = 0;
@@ -1793,10 +1948,35 @@ describe("OrchestratorMcpService provider resolution", () => {
             })
             .pipe(Effect.flip, Effect.forkChild);
           yield* Deferred.await(entered);
-          yield* TestClock.adjust("30 seconds");
+          if (interrupted) yield* Fiber.interrupt(call);
+          else yield* TestClock.adjust("30 seconds");
           const completed = call.pollUnsafe();
           yield* Deferred.succeed(release, undefined);
           assert.isDefined(completed);
+          const attributes = ended.find(
+            (span) => span.name === "OrchestratorMcpService.delegateTask",
+          )!.attributes;
+          assert.equal(attributes["t3.mcp.caller_thread_id"], parentThreadId);
+          assert.equal(attributes["t3.delegate.client_request_id"], "cancelled-first-run");
+          assert.equal(attributes["t3.delegate.stage"], stage);
+          assert.equal(
+            attributes["t3.delegate.outcome"],
+            interrupted
+              ? "interrupted"
+              : stage === "caller"
+                ? "caller_unresolved"
+                : "timeout_dispatch",
+          );
+          assert.equal(attributes["t3.delegate.mode"], "async");
+          assert.isNumber(attributes[`t3.delegate.stage_ms.${stage}`]);
+          if (stage === "dispatch") {
+            assert.match(String(attributes["t3.delegate.task_id"]), /^node:delegated-task:/);
+            assert.isString(attributes["t3.delegate.command_id"]);
+            assert.equal(attributes["t3.delegate.provider_instance_id"], codexInstanceId);
+            assert.equal(attributes["t3.delegate.model"], "gpt-5.4");
+          }
+          assert.notInclude(JSON.stringify(attributes), "Check the diff");
+          if (interrupted) return;
           const error = yield* Fiber.join(call);
           assert.equal(error.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
           assert.include(error.message, parentThreadId);
@@ -1805,7 +1985,10 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.include(error.message, "Nothing was saved; retry the same call.");
           if (stage === "dispatch") assert.include(error.message, "cancelled-first-run");
           assert.equal(dispatches, stage === "dispatch" ? 1 : 0);
-        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+        }).pipe(
+          Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+          Effect.withTracer(tracer),
+        );
       }),
   );
 
@@ -1813,6 +1996,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     "delegateTask recovers an accepted task when %s I/O stalls",
     (stage) =>
       Effect.gen(function* () {
+        const { ended, tracer } = captureSpans();
         const state: McpCall["Service"] = {
           callerResolved: false,
           callerResolveMs: 0,
@@ -1923,9 +2107,25 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(retry.taskId, taskId);
           assert.equal(commandIds.length, 2);
           assert.equal(commandIds[0], commandIds[1]);
+          const spans = ended.filter((span) => span.name === "OrchestratorMcpService.delegateTask");
+          assert.lengthOf(spans, 2);
+          assert.equal(
+            spans[0]!.attributes["t3.delegate.outcome"],
+            stage === "result" ? "accepted" : "timeout_wait",
+          );
+          const attributes = spans[1]!.attributes;
+          assert.equal(attributes["t3.mcp.caller_thread_id"], parentThreadId);
+          assert.equal(attributes["t3.delegate.client_request_id"], input.clientRequestId);
+          assert.equal(attributes["t3.delegate.task_id"], retry.taskId);
+          assert.equal(attributes["t3.delegate.retry_of_accepted"], true);
+          assert.equal(attributes["t3.delegate.outcome"], "accepted");
+          assert.equal(attributes["t3.delegate.stage_ms.catalog"], 0);
+          assert.equal(attributes["t3.delegate.stage_ms.request_key"], 0);
+          assert.notInclude(JSON.stringify(attributes), input.task);
         }).pipe(
           Effect.provideService(McpCall, state),
           Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+          Effect.withTracer(tracer),
         );
       }),
   );

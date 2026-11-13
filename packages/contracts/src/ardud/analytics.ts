@@ -12,16 +12,29 @@ const Timestamp = Schema.String.check(
 // Metadata only. Deliberately no arbitrary property bag or free-form text fields.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
-  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+\-]*$/),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
 );
 const Id = Schema.String.check(
   Schema.isMaxLength(512),
-  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+\-]*$/),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
+);
+// Derived task/thread IDs retain encodeURIComponent's punctuation and can exceed 512 chars.
+// The event byte limit still bounds the complete row.
+const DerivedId = Schema.String.check(
+  Schema.isMaxLength(8192),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*-]*$/),
 );
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
-const McpOutcome = Schema.Literals(["ok", "error", "timeout", "refused"]);
+const McpOutcome = Schema.Literals([
+  "ok",
+  "error",
+  "timeout",
+  "refused",
+  "interrupted",
+  "interrupted_by_shutdown",
+]);
 const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
 export const AnalyticsEvent = Schema.Struct({
   ts: Timestamp,
@@ -31,11 +44,15 @@ export const AnalyticsEvent = Schema.Struct({
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
   discussionId: Schema.optionalKey(Id),
-  threadId: Schema.optionalKey(Id),
+  threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
-  callerThreadId: Schema.optionalKey(Id),
+  bootId: Schema.optionalKey(Id),
+  startedAt: Schema.optionalKey(Timestamp),
+  committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  taskId: Schema.optionalKey(DerivedId),
+  callerThreadId: Schema.optionalKey(DerivedId),
   callerResolved: Schema.optionalKey(Schema.Boolean),
   callerResolveMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
@@ -185,6 +202,7 @@ export const AnalyticsRollup = Schema.Struct({
       tool: Label,
       hour: Label,
       build: Label,
+      bootId: Id,
       ...LatencyFields,
       failures: Measurement,
       failureRate: Measurement,

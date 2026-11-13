@@ -10,6 +10,11 @@ import engine
 
 
 class HookEvents(unittest.TestCase):
+    def setUp(self):
+        sampling = patch.object(engine.toollog.random, 'random', return_value=0)
+        sampling.start()
+        self.addCleanup(sampling.stop)
+
     def test_success_denial_rewrite_and_codex_cu(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp+'/logs', 'HARNESS_HOOKS_STATE_DIR':temp+'/state', 'CODEX_HOME':temp+'/codex-cu'}):
             for cwd, expected in [('/Users/ardud/crpko-devops', 'allow'), ('/unrelated', 'deny')]:

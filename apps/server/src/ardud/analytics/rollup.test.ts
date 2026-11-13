@@ -14,6 +14,32 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("separates restart interruptions by boot and tool", () => {
+    const accumulator = makeAccumulator();
+    for (const [bootId, tool] of [
+      ["boot-a", "delegate_task"],
+      ["boot-b", "delegate_task"],
+      ["boot-a", "card_update"],
+      ["boot-a", "delegate_task"],
+    ] as const) {
+      accumulate(
+        accumulator,
+        event({ kind: "mcp.call", bootId, tool, outcome: "interrupted_by_shutdown" }),
+      );
+    }
+    assert.deepEqual(
+      finishRollup(accumulator, "2026-11-13", ts).mcpCalls.map(({ bootId, tool, outcomes }) => ({
+        bootId,
+        tool,
+        outcomes,
+      })),
+      [
+        { bootId: "boot-a", tool: "card_update", outcomes: { interrupted_by_shutdown: 1 } },
+        { bootId: "boot-a", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 2 } },
+        { bootId: "boot-b", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 1 } },
+      ],
+    );
+  });
   it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
     const accumulator = makeAccumulator();
     const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>

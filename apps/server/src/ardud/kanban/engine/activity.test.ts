@@ -930,3 +930,35 @@ describe("parseWindow", () => {
     });
   });
 });
+
+it("reports a refused verdict separately from no verdict and ordinary flags", () => {
+  const reason = "Review verdict refused: needs approval";
+  const reviewing = card("refused", {
+    stage: "needs_review",
+    stalled: { reason, by: { _tag: "system", component: "dispatcher" }, at: t("02:00") },
+  });
+  const attempted = {
+    ...event(
+      "refused",
+      t("01:00"),
+      "comment",
+      null,
+      null,
+      "Review verdict refused: clear at abcdef12: needs approval",
+      "abcdef1234",
+    ),
+    actor: { _tag: "thread" as const, threadId: ThreadId.make("reviewer") },
+  };
+  const flag = event("refused", t("02:00"), "flagged", "in_review", "needs_review", reason);
+  expect(Activity.failureKind(attempted)).toBeNull();
+  expect(Activity.failureKind(flag)).toBe("verdict_refused");
+  expect(Activity.failureKind({ ...flag, actor: { _tag: "owner" } })).toBeNull();
+  const events = [attempted, flag];
+  const result = Activity.rollup({ window, cards: [reviewing], events, threads: [], pools });
+  expect(result.failures.byKind).toEqual({ verdict_refused: 1 });
+  expect(result.stalls.items).toMatchObject([{ kind: "verdict_refused", ongoing: true }]);
+  expect(Activity.compactRow(reviewing, events, window)).toMatchObject({
+    failures: 1,
+    lastFailure: reason,
+  });
+});

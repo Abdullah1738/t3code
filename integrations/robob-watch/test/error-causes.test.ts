@@ -79,6 +79,16 @@ test("cause fields reject free text and malformed metadata at the writer", () =>
   expect(rows()[0].props).toBeUndefined();
 });
 
+test("collection source counts survive the metadata writer without free text", () => {
+  fixture();
+  toolLog({ component: "triage", kind: "error", name: "triage.error", ids: { helper: "mail-worker" },
+    props: { failedSources: 2, totalSources: 6, stderr: "PRIVATE", ...stderrCause("PRIVATE authentication failed\n") },
+    error: { tag: "collection.failed" } });
+  expect(rows()[0]).toMatchObject({ ids: { helper: "mail-worker" },
+    props: { failedSources: 2, totalSources: 6, stderrClass: "auth" } });
+  expect(JSON.stringify(rows())).not.toContain("PRIVATE");
+});
+
 test("failed log writes preserve the helper's exit and stderr", async () => {
   const dir = fixture(); process.env.TOOLLOG_DIR = join(dir, "blocked"); writeFileSync(process.env.TOOLLOG_DIR, "file");
   const result = await runCheck(normalize({ mode: "notify", id: "fixture", title: "x", check: "print -u2 'PRIVATE permission denied'; exit 2" }), dir);
