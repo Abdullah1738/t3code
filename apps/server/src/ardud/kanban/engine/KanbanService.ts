@@ -3207,13 +3207,13 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
-  const newDiscussion = Effect.fn("KanbanService.newDiscussion")(function* (
+  const makeDiscussion = (
     boardId: KanbanBoard["id"],
     title: string,
     cardId: KanbanCard["id"] | null,
     actor: KanbanActor,
-  ) {
-    const at = yield* nowIso;
+    at: string,
+  ): KanbanDiscussion => {
     const opened: KanbanDiscussion = {
       id: KanbanDiscussionId.make(`disc-${uuid()}`),
       boardId,
@@ -3241,9 +3241,16 @@ const make = Effect.gen(function* () {
       reopenedAt: null,
     };
     // The evaluator that opens a discussion is the one the owner's replies go to.
-    const discussion = actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
-    yield* saveDiscussion(discussion);
-    return discussion;
+    return actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
+  };
+
+  const newDiscussion = Effect.fn("KanbanService.newDiscussion")(function* (
+    boardId: KanbanBoard["id"],
+    title: string,
+    cardId: KanbanCard["id"] | null,
+    actor: KanbanActor,
+  ) {
+    return yield* saveDiscussion(makeDiscussion(boardId, title, cardId, actor, yield* nowIso));
   });
 
   const cardDiscussionUnlocked = Effect.fn("KanbanService.cardDiscussionUnlocked")(function* (
@@ -3681,6 +3688,8 @@ const make = Effect.gen(function* () {
       }
     }
     const at = yield* nowIso;
+    let nightly: { readonly board: KanbanBoard; readonly discussion: KanbanDiscussion } | null =
+      null;
     if (purpose.kind === "nightly" && !purpose.discussionId) {
       const review = board.nightlyReview ?? {
         ...DEFAULT_NIGHTLY_REVIEW,
@@ -3689,11 +3698,17 @@ const make = Effect.gen(function* () {
         lastDiscussionId: null,
       };
       const { day } = nightlyLocalTime(Date.parse(at), review.timeZone);
-      const discussion = yield* newDiscussion(board.id, `Nightly review, ${day}`, null, {
-        _tag: "system",
-        component: "nightly-review",
-      });
-      purpose = { kind: "nightly", discussionId: discussion.id, day };
+      const discussion = makeDiscussion(
+        board.id,
+        `Nightly review, ${day}`,
+        null,
+        {
+          _tag: "system",
+          component: "nightly-review",
+        },
+        at,
+      );
+      purpose = { ...purpose, discussionId: discussion.id, day };
       const since = Date.parse(at) - 24 * 60 * 60 * 1000;
       const sources = (yield* store.discussions(board.id))
         .filter(
@@ -3724,21 +3739,34 @@ const make = Effect.gen(function* () {
           lastDiscussionId: discussion.id,
         },
       };
-      yield* store.putBoard(next);
-      yield* publish(board.id, { _tag: "board", board: next });
+      nightly = { board: next, discussion };
     }
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal durable job, same shape as its caller.
     const json = JSON.stringify({ purpose, extra });
-    yield* locks.access(
-      board.id,
-      boardSql`
+    const enqueue = boardSql`
       INSERT INTO ardud_kanban_evaluator_queue (job_key, board_id, card_id, json, created_at)
       VALUES (${key}, ${board.id}, ${extra.cardId ?? null}, ${json}, ${at})
       ON CONFLICT (job_key) DO NOTHING
-    `,
-      true,
-      "evaluator-queue",
-    );
+    `;
+    if (nightly) {
+      const saved = nightly;
+      // The daily marker must never outlive a failed admission without its recoverable job.
+      yield* locks.access(
+        board.id,
+        boardSql.withTransaction(
+          Effect.gen(function* () {
+            yield* rawStore.putDiscussion(saved.discussion);
+            yield* rawStore.putBoard(saved.board);
+            yield* enqueue;
+          }),
+        ),
+        true,
+      );
+      yield* publish(board.id, { _tag: "discussion", discussion: saved.discussion });
+      yield* publish(board.id, { _tag: "board", board: saved.board });
+    } else {
+      yield* locks.access(board.id, enqueue, true, "evaluator-queue");
+    }
     return yield* drainEvaluatorQueue(board.id, key);
   });
 
@@ -3814,6 +3842,20 @@ const make = Effect.gen(function* () {
         }
       }
       const currentBoard = yield* boardOf(boardId);
+      if (
+        job.purpose.kind === "nightly" &&
+        job.purpose.scheduled &&
+        (!currentBoard.nightlyReview?.enabled || currentBoard.archivedAt !== null)
+      ) {
+        const at = yield* nowIso;
+        yield* locks.access(
+          boardId,
+          boardSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${at} WHERE id = ${row.id}`,
+          true,
+          "evaluator-queue",
+        );
+        continue;
+      }
       const existingSweep = ["stalled", "completed", "deployed", "check", "nightly"].includes(
         job.purpose.kind,
       )
@@ -13649,7 +13691,7 @@ const make = Effect.gen(function* () {
               if (yield* runningSweep(board.id, "nightly")) return;
               yield* admitEvaluator(
                 board,
-                { kind: "nightly" },
+                { kind: "nightly", scheduled: true },
                 { key: `${board.id}:nightly:${day}` },
               );
             }),

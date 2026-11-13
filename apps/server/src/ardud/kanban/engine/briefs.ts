@@ -225,7 +225,12 @@ export type EvaluatorPurpose =
       readonly title: string;
       readonly cardNumber: number | null;
     }
-  | { readonly kind: "nightly"; readonly discussionId?: string; readonly day?: string }
+  | {
+      readonly kind: "nightly";
+      readonly discussionId?: string;
+      readonly day?: string;
+      readonly scheduled?: boolean;
+    }
   | { readonly kind: "stalled" }
   | { readonly kind: "completed" }
   | { readonly kind: "deployed" }
