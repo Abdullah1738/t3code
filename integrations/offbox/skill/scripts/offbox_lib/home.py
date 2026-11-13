@@ -26,6 +26,7 @@ from .common import EXIT_HOME_DOWN, EXIT_INFRA, OffboxError, log, say
 PROBE_TIMEOUT_S = 3.0
 FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this run is on Boat ("unreachable: ...")
 MAX_FAILURE_LINES = 200
+RECENT_FAILURE_S = 180
 WAIT_STARTED = None
 
 
@@ -86,6 +87,38 @@ def record_failure(reason: str, run_id: str = "") -> None:
         log(f"home failure not recorded: {e}")
 
 
+def recent_failure() -> bool:
+    try:
+        lines = common.HOME_FAILURES.read_text().splitlines()[-MAX_FAILURE_LINES:]
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+            age = time.time() - float(item["ts"])
+            reason = str(item["reason"]).lower()
+        except (ValueError, TypeError, KeyError):
+            continue
+        if 0 <= age <= RECENT_FAILURE_S and any(word in reason for word in (
+                "no answer", "unreachable", "timed out", "timeouterror", "deadline passed", "connection refused",
+                "authenticated api did not answer")):
+            return True
+    return False
+
+
+def before_run(argv: list[str]) -> None:
+    if not may_fail_over():
+        return
+    from . import api
+    recent = recent_failure()
+    why = api.probe_backend("server", PROBE_TIMEOUT_S) if recent else probe()
+    if why and not recent and why.startswith("no answer"):
+        # /health or the network may blip while the authenticated API remains usable.
+        why = api.probe_backend("server", PROBE_TIMEOUT_S)
+    if why:
+        fail_over(why, argv)
+
+
 def person_gate() -> None:
     """Person-box work with a home server configured: stop at once when home is down. Never Boat."""
     who = common.person()
@@ -107,13 +140,29 @@ def unreachable(e: OffboxError) -> bool:
     return bool(getattr(e, "outage", False)) and not e.started and e.code == EXIT_INFRA
 
 
-def fail_over(reason: str, argv: list[str], run_id: str = "") -> None:
-    """Send this one run to Boat: record why, say so once, and start over as a Boat process. Does not return.
-    Only called while nothing has started on the home server."""
+def network_failure(error: OffboxError) -> bool:
+    from . import api
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, api.NetworkError):
+            return True
+        if getattr(error, "status", None) is not None:
+            return False
+        error = error.__cause__
+    return False
+
+
+def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
+    """Exec onto an answering Boat, or return False to keep waiting on home. Only before command start."""
+    from . import api
+    record_failure(reason, run_id)
+    if api.probe_backend("boat", PROBE_TIMEOUT_S):
+        say("Boat's API is unavailable too; keeping this run on home")
+        return False
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
-    record_failure(reason, run_id)
     say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")

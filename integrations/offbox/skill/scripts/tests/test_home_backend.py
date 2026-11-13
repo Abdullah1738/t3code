@@ -287,6 +287,7 @@ class Failover(HomeFiles):
         self.configure()
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         self.execs = []
+        self.stack.enter_context(patch.object(api, "probe_backend", side_effect=lambda name, timeout: "no answer" if name == "server" else None))
 
         def execve(path, argv, env):
             self.execs.append((argv, env))
@@ -308,6 +309,79 @@ class Failover(HomeFiles):
     def failures(self):
         f = self.dir / "home-failures.jsonl"
         return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+    def test_recent_failure_auth_probe_selects_backend_before_resume(self):
+        for answer in (None, "no answer"):
+            with self.subTest(answer=answer):
+                self.execs.clear()
+                home.record_failure("offbox server API unreachable: timed out", "previous")
+                with patch.object(home, "probe", side_effect=AssertionError("use authenticated probe")), \
+                        patch.object(api, "probe_backend", side_effect=lambda name, timeout: answer if name == "server" else None) as probe, \
+                        patch.object(runs, "run_remote", return_value=7) as run, patch.object(api, "resume") as resume:
+                    self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec" if answer else 7)
+                self.assertEqual(run.call_count, 0 if answer else 1)
+                resume.assert_not_called()
+                self.assertEqual(probe.call_args_list[0].args, ("server", home.PROBE_TIMEOUT_S))
+
+    def test_old_malformed_future_and_non_outage_failures_do_not_probe(self):
+        import time
+        for row in ("{broken", "[]", {"ts": "bad", "reason": "unreachable"},
+                    {"ts": time.time() - home.RECENT_FAILURE_S - 1, "reason": "unreachable"},
+                    {"ts": time.time() + 60, "reason": "unreachable"},
+                    {"ts": time.time(), "reason": "API 409 refused"}):
+            with self.subTest(row=row):
+                common.HOME_FAILURES.write_text(row if isinstance(row, str) else json.dumps(row))
+                with patch.object(home, "probe", return_value=None), \
+                        patch.object(api, "probe_backend", side_effect=AssertionError("no recent outage")), \
+                        patch.object(runs, "run_remote", return_value=0):
+                    self.assertEqual(self.run_cmd("--remote", "--", "true")[0], 0)
+
+    def test_one_network_blip_and_good_reprobe_stays_home(self):
+        for wrapped in (False, True):
+            error = api.NetworkError("temporary connection reset")
+            if wrapped:
+                try:
+                    raise error
+                except api.NetworkError as cause:
+                    try:
+                        raise lease.ResumeUnresolved("nothing ran", cause) from cause
+                    except lease.ResumeUnresolved as result:
+                        error = result
+            with self.subTest(wrapped=wrapped), patch.object(home, "probe", return_value=None), \
+                    patch.object(api, "probe_backend", return_value=None) as probe, \
+                    patch.object(runs, "run_remote", side_effect=[error, 7]) as run:
+                self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
+                self.assertEqual(run.call_count, 2)
+                probe.assert_called_once_with("server", home.PROBE_TIMEOUT_S)
+        self.assertEqual(self.execs, [])
+
+    def test_boat_down_does_not_accept_failover(self):
+        with patch.object(api, "probe_backend", return_value="no answer"), \
+                patch.object(home, "probe", return_value="no answer"), \
+                patch.object(runs, "run_remote", return_value=7):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
+        self.assertEqual(self.execs, [])
+        self.assertTrue(home.recent_failure())
+
+    def test_health_blip_gets_one_auth_reprobe_but_explicit_not_ready_still_moves(self):
+        with patch.object(home, "probe", return_value="no answer (URLError)"), \
+                patch.object(api, "probe_backend", return_value=None) as probe, \
+                patch.object(runs, "run_remote", return_value=7):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
+        probe.assert_called_once_with("server", home.PROBE_TIMEOUT_S)
+        with patch.object(home, "probe", return_value="server says it cannot take runs (pool missing)"), \
+                patch.object(api, "probe_backend", return_value=None) as probe:
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        probe.assert_called_once_with("boat", home.PROBE_TIMEOUT_S)
+
+    def test_recent_failure_does_not_probe_or_move_pinned_or_person_work(self):
+        home.record_failure("unreachable")
+        for env in ({"OFFBOX_BACKEND": "server"}, {"OFFBOX_THREAD": "person:moni"}):
+            with self.subTest(env=env), patch.dict(os.environ, env), \
+                    patch.object(api, "probe_backend", side_effect=AssertionError("policy unchanged")), \
+                    patch.object(home, "probe", side_effect=AssertionError("policy unchanged")), \
+                    patch.object(runs, "run_remote", return_value=7):
+                self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
 
     def test_server_does_not_answer_the_run_goes_to_boat_and_the_monitor_hears_of_it(self):
         with patch.object(home, "probe", return_value="no answer (TimeoutError)"), \
@@ -404,6 +478,7 @@ class BoxReadinessFailover(Isolated):
         self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
                                                         if k not in ("OFFBOX_BACKEND", "OFFBOX_THREAD")}, clear=True))
         self.execs = []
+        self.stack.enter_context(patch.object(api, "probe_backend", side_effect=lambda name, timeout: "no answer" if name == "server" else None))
         self.clock = Clock()
         for mod in (pool, prepare, api):
             self.stack.enter_context(patch.object(mod, "time", self.clock.time))
@@ -447,6 +522,18 @@ class BoxReadinessFailover(Isolated):
 
     def test_fresh_box_500_moves_to_boat(self):
         self.assert_failover()
+
+    def test_silent_initial_status_does_not_try_other_boxes_or_create(self):
+        self.box("cold", "stopped", member=True)
+        def silent(*args, **kwargs):
+            self.clock.sleep(5)
+            raise api.NetworkError("GET /sandboxes/cold timed out")
+        with patch.object(api, "get", side_effect=silent) as get, \
+                patch.object(lease, "acquire_private") as create:
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        create.assert_not_called()
+        self.assertEqual(get.call_count, 1)
+        self.command.assert_not_called()
 
     def test_boat_box_500_still_exits_90(self):
         with patch.object(common, "_BACKEND", "boat"):
