@@ -424,6 +424,7 @@ class NowNowOrderFlow:
                                                  before_send=self._before, timeout=timeout)
         return self.current.projection
 
+    @toollog.timed("commerce", "step.checkout", lane="nownow")
     def guard_validated(self, *, timeout=25):
         """Pre-place guard on the validate response: sane fees, exact address.
 

@@ -46,6 +46,26 @@ class LaneLogs(unittest.TestCase):
         self.assertEqual([r['ok'] for r in added],[True,False])
         self.assertEqual(added[0]['props']['source'],'cli')
 
+    def test_other_noon_lanes_keep_address_and_quiet_guard_tags(self):
+        cases=[
+            ('test_commerce_main_order.LaneTests.test_address_binding_mismatch_refused',
+             'MAIN_ADDRESS_BINDING_MISMATCH'),
+            ('test_commerce_supermall_order.LaneTests.test_address_binding_mismatch_refused',
+             'SUPERMALL_ADDRESS_BINDING_MISMATCH'),
+            ('test_commerce_nownow_order.LaneTests.test_wrong_address_refused_before_place',
+             'NOWNOW_ADDRESS_BINDING_MISMATCH'),
+            ('test_commerce_main_order.LaneTests.test_silent_delivery_inactive_refused_before_place',
+             'MAIN_SILENT_DELIVERY_NOT_ACTIVE'),
+            ('test_commerce_supermall_order.LaneTests.test_silent_delivery_inactive_refused_before_place',
+             'SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE'),
+            ('test_commerce_nownow_order.LaneTests.test_fresh_readback_missing_quiet_note_blocks_place',
+             'NOWNOW_QUIET_NOTE_MISMATCH'),
+        ]
+        for fixture,code in cases:
+            with self.subTest(fixture=fixture):
+                rows=self.replay(fixture)
+                self.assertTrue(any(r['name']=='guard.refused' and r['error']['tag']==code for r in rows))
+
     def test_registration_records_phone_and_email_sources(self):
         from test_order_watch_notice import AddNoticeTests
         fixture=AddNoticeTests('test_slow_first_check_still_sends_and_registers')

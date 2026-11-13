@@ -231,9 +231,9 @@ class Coordinator:
             return self._recover()
         return self.locked(action)
 
-    @toollog.timed('commerce', 'step.confirmation', lane="food")
     def recover(self):
-        return self.locked(self._recover_report)
+        with toollog.deferred():
+            return self.locked(self._recover_report)
 
     def _recover_report(self):
         try:
@@ -248,6 +248,7 @@ class Coordinator:
                 'tell':'Placement was sent and may have charged the card. Do not place another order.',
                 'next':[f'commerce recover-payment {self.flow_id} (reads only; never resends)']}) from None
 
+    @toollog.timed('commerce', 'step.confirmation', lane="food")
     def _recover(self):
         state=json.loads(self.path.read_text());local=j.inspect(self.flow_id)
         candidate=local.get('order_id') or state.get('candidate_order_id')
