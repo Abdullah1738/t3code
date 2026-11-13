@@ -401,6 +401,126 @@ const planned = () => {
 };
 
 describe("planSubtasks", () => {
+  it.each(["done", "skipped"] as const)("keeps listed %s history unchanged", (state) => {
+    const known: KanbanSubtask = {
+      ...planned()[2]!,
+      step: 7,
+      owner: "script",
+      script: "land",
+      gate: "deploy",
+      createdAt: at,
+      state,
+      note: "PR #4",
+      doneBy: owner,
+      doneAt: at,
+    };
+    for (const text of ["x", "", "x".repeat(501)]) {
+      const plan = planSubtasks(
+        [known],
+        [{ id: known.id, text, owner: "work", step: -1, gate: "money", script: "other" }],
+        3,
+        "2026-10-27T12:00:00.000Z",
+      );
+      expect(plan).toEqual({ ok: true, subtasks: [known], subtaskSeq: 3 });
+    }
+  });
+
+  it.each(["evaluator", "script"] as const)(
+    "keeps an open %s subtask unchanged with an id alone",
+    (owner) => {
+      const known: KanbanSubtask = {
+        ...planned()[2]!,
+        step: 7,
+        owner,
+        gate: "deploy",
+        createdAt: at,
+        ...(owner === "script" ? { script: "land" } : {}),
+      };
+      expect(planSubtasks([known], [{ id: known.id }], 3)).toEqual({
+        ok: true,
+        subtasks: [known],
+        subtaskSeq: 3,
+      });
+    },
+  );
+
+  it("rewords an open id while keeping its omitted owner and step", () => {
+    const known = { ...planned()[0]!, step: 7 };
+    const plan = planSubtasks([known], [{ id: known.id, text: "  Write the fix  " }]);
+    expect(plan.ok && plan.subtasks).toEqual([{ ...known, text: "Write the fix" }]);
+  });
+
+  it("changes an open id's owner while keeping its omitted text and step", () => {
+    const known = { ...planned()[0]!, step: 7 };
+    const plan = planSubtasks([known], [{ id: known.id, owner: "review" }]);
+    expect(plan.ok && plan.subtasks).toEqual([{ ...known, owner: "review" }]);
+  });
+
+  it("applies a gate to an open id with omitted text and owner", () => {
+    const known = { ...planned()[3]!, step: 7 };
+    const plan = planSubtasks([known], [{ id: known.id, gate: "money" }], 4, at);
+    expect(plan.ok && plan.subtasks).toEqual([{ ...known, gate: "money", createdAt: at }]);
+    expect(planSubtasks([planned()[0]!], [{ id: "s1", gate: "money" }])).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it("keeps the text and plan limits on new and edited open entries", () => {
+    const inputs = Array.from({ length: 30 }, () => ({
+      text: "x".repeat(500),
+      owner: "work" as const,
+    }));
+    const plan = planSubtasks([], inputs);
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks).toHaveLength(30);
+    expect(planSubtasks([], [...inputs, { text: "Extra", owner: "work" }])).toEqual({
+      ok: false,
+      reason: "a card has at most 30 subtasks",
+    });
+    expect(planSubtasks([], [{ text: "x".repeat(501), owner: "work" }])).toEqual({
+      ok: false,
+      reason: "a subtask is at most 500 characters",
+    });
+    for (const text of [" ", "x".repeat(501)]) {
+      expect(planSubtasks(plan.subtasks, [{ id: "s1", text }])).toMatchObject({ ok: false });
+    }
+  });
+
+  it.each([{}, { text: "New" }, { owner: "work" as const }])(
+    "refuses a new entry without text and owner: %j",
+    (input) => {
+      const existing = planned();
+      const before = structuredClone(existing);
+      expect(planSubtasks(existing, [{ id: "s1" }, input])).toEqual({
+        ok: false,
+        reason: "a new subtask needs text and owner",
+      });
+      expect(existing).toEqual(before);
+    },
+  );
+
+  it.each(["open", "done", "skipped"] as const)(
+    "adds a new step after kept ids ending in %s",
+    (state) => {
+      const existing = planned()
+        .slice(0, 2)
+        .map((subtask, i) => ({
+          ...subtask,
+          step: i === 0 ? 4 : 7,
+          state: i === 0 ? subtask.state : state,
+        }));
+      const plan = planSubtasks(existing, [
+        { id: "s1" },
+        { id: "s2" },
+        { text: "new", owner: "evaluator" },
+      ]);
+      expect(plan.ok).toBe(true);
+      if (!plan.ok) return;
+      expect(plan.subtasks.slice(0, 2)).toEqual(existing);
+      expect(plan.subtasks[2]).toMatchObject({ id: "s3", text: "new", step: 8 });
+    },
+  );
+
   it.each([undefined, null])("does not store a gate on new work (gate=%s)", (gate) => {
     const plan = planSubtasks([], [{ text: "Test restart handling", owner: "work", gate }], 0, at);
     if (!plan.ok) throw new Error(plan.reason);
@@ -521,24 +641,22 @@ describe("planSubtasks", () => {
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
     expect(plan.subtasks.map((subtask) => [subtask.id, subtask.state, subtask.step])).toEqual([
-      ["s2", "open", 1],
       ["s1", "done", 1],
-      ["s7", "open", 2],
+      ["s2", "open", 2],
+      ["s7", "open", 3],
     ]);
   });
 
   it("refuses unknown or repeated ids and empty text", () => {
-    expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }])).toMatchObject({
+    expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
       reason: "the card has no subtask s9. Existing subtask ids: none",
     });
     const subtasks = planned();
-    expect(
-      planSubtasks(subtasks, [
-        { id: "s1", text: "a", owner: "work" },
-        { id: "s1", text: "b", owner: "work" },
-      ]),
-    ).toMatchObject({ ok: false, reason: "subtask s1 is listed twice" });
+    expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
+      ok: false,
+      reason: "subtask s1 is listed twice",
+    });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
   });
 });

@@ -230,7 +230,7 @@ export interface CardPatch {
   readonly removeLinks?: ReadonlyArray<string> | undefined;
   readonly blockedBy?: ReadonlyArray<KanbanCard["id"]> | undefined;
   readonly reviewChain?: string | null | undefined;
-  /** The whole plan: listed ids keep their state, open ones left out go, done ones stay. */
+  /** The whole plan: an id alone keeps it unchanged; done/skipped ids can't be rewritten. Open ones left out go, done ones stay. */
   readonly subtasks?: ReadonlyArray<Subtasks.SubtaskInput> | undefined;
   readonly comment?: string | undefined;
 }
