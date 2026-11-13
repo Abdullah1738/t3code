@@ -40,7 +40,8 @@ class RepoToolTests(unittest.TestCase):
 
     def run_script(self, command=None, *, steps=None, rel='.', node=''):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+                patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo with spaces', rel, command or [], None, 'r',
                                         steps=steps, node=node, repo_root=self.root)
         return subprocess.run([shutil.which('bash'), '-c', script], env=self.env, capture_output=True,

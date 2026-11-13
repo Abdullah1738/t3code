@@ -42,6 +42,7 @@ import {
   KanbanPriority,
   KanbanReviewChain,
   KanbanScript,
+  KanbanScriptAcknowledgeInput,
   KanbanScriptId,
   KanbanScriptRun,
   KanbanStage,
@@ -81,6 +82,7 @@ export const KANBAN_WS_METHODS = {
   scriptRuns: "kanban.script.runs",
   scriptEnable: "kanban.script.enable",
   scriptRun: "kanban.script.run",
+  scriptAcknowledge: "kanban.script.acknowledge",
 } as const;
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
@@ -303,6 +305,7 @@ export const KanbanRpcs = RpcGroup.make(
   ),
   /** Starts a run now and answers with it open; it finishes in the background. */
   call(M.scriptRun, ScriptRef, KanbanScriptRun),
+  call(M.scriptAcknowledge, KanbanScriptAcknowledgeInput, KanbanScript),
 );
 
 export const KANBAN_READ_SCOPES = {
@@ -340,6 +343,7 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.answer]: AuthOrchestrationOperateScope,
   [M.scriptEnable]: AuthOrchestrationOperateScope,
   [M.scriptRun]: AuthOrchestrationOperateScope,
+  [M.scriptAcknowledge]: AuthOrchestrationOperateScope,
 } as const;
 
 export const KANBAN_AGGREGATES = Object.fromEntries(

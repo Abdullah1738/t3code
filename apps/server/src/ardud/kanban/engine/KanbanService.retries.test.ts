@@ -44,6 +44,7 @@ type Failure = OrchestrationV2ProviderFailure & {
 
 interface FakeThread {
   readonly messages: Array<string>;
+  model: ModelSelection;
   failure: Failure | null;
 }
 
@@ -82,9 +83,10 @@ const makeFake = () => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: read,
       find: read,
-      model: () => Effect.succeed(null),
+      model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
@@ -94,7 +96,7 @@ const makeFake = () => {
         Effect.sync(() => {
           nextThread += 1;
           const threadId = ThreadId.make(`thread-${nextThread}`);
-          threads.set(threadId, { messages: [input.text], failure: null });
+          threads.set(threadId, { messages: [input.text], model: input.model, failure: null });
           return threadId;
         }),
       send: (input) =>
@@ -102,7 +104,11 @@ const makeFake = () => {
           threads.get(input.threadId)?.messages.push(input.text);
         }),
       withdraw: () => Effect.void,
-      setModel: () => Effect.void,
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          const thread = threads.get(threadId);
+          if (thread) thread.model = model;
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

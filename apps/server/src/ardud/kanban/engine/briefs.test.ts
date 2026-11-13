@@ -9,6 +9,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   evaluatorBrief,
+  claimBrief,
+  wakeText,
   nudgeWorkText,
   reviewBrief,
   workBrief,
@@ -137,4 +139,95 @@ describe("board briefs", () => {
       expect(brief).toContain("The board review thread alone records card_review_result");
     }
   });
+});
+
+describe("current-step plan rendering", () => {
+  it.each(["\n", "\r\n", "\r", "\u2028", "\u2029"])(
+    "replaces legacy frozen plans with separator %j in every worker brief",
+    (separator) => {
+      const oldPlan =
+        "Next on the plan:\nSubtasks (same step means any order; a step opens when the ones before are done or skipped):\n- s2 step 2, worker (now): Removed work\n\nDo this step's work subtasks, mark each with subtask_done, then card_move to needs_review.";
+      const current = {
+        ...card,
+        wakeNote: `Owner says keep the rate.\n\n${oldPlan}\n\nLater owner words.`.replaceAll(
+          "\n",
+          separator,
+        ),
+        subtasks: [
+          {
+            id: "s7",
+            step: 3,
+            text: "Wait for QA",
+            owner: "evaluator" as const,
+            state: "open" as const,
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+          {
+            id: "s4",
+            step: 4,
+            text: "Current work",
+            owner: "work" as const,
+            state: "open" as const,
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+        ],
+      };
+      for (const brief of [
+        workBrief(board, current, null),
+        wakeText(current),
+        claimBrief(current, null, current.wakeNote),
+        nudgeWorkText([current]),
+      ]) {
+        expect(brief).not.toContain("Removed work");
+        expect(brief).toContain("evaluator (now): Wait for QA");
+        expect(brief).toContain("worker (later): Current work");
+        expect(brief).toContain("Owner says keep the rate.");
+        expect(brief).toContain("Later owner words.");
+      }
+    },
+  );
+});
+
+it.each(["fresh", "reused", "claimed", "nudge"] as const)("worker brief cleanup: %s", (path) => {
+  const current = {
+    ...card,
+    wakeNote: "Do s1 again. For s3, use 2%.",
+    subtasks: [
+      {
+        id: "s1",
+        step: 1,
+        text: "Old work",
+        owner: "work" as const,
+        state: "done" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+      {
+        id: "s3",
+        step: 3,
+        text: "Current work",
+        owner: "work" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  };
+  const brief =
+    path === "fresh"
+      ? workBrief(board, current, null)
+      : path === "reused"
+        ? wakeText(current)
+        : path === "claimed"
+          ? claimBrief(current, null, current.wakeNote)
+          : nudgeWorkText([current]);
+  expect(brief).not.toContain("Do s1 again");
+  expect(brief).toContain("For s3, use 2%.");
+  expect(brief).toContain("worker (now): Current work");
 });

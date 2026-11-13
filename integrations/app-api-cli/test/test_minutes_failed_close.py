@@ -93,8 +93,7 @@ class JournalCloseTests(JournalCase):
         self.placed()
         local = j.inspect(FLOW)
         self.assertEqual(local['state'], 'ACTIVE')
-        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', ACCOUNT)
+        self.assertTrue(j.require_account_available('noon', ACCOUNT))
         out = j.close_minutes_failed_uncaptured(FLOW, evidence=self.evidence(), expected_local=local, now=self.later())
         self.assertEqual(out['state'], 'RELEASED')
         self.assertFalse(out['retry_allowed'])

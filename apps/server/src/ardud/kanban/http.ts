@@ -19,6 +19,7 @@ import {
   KanbanError,
   KanbanPriority,
   KanbanScriptId,
+  KanbanScriptAcknowledgeInput,
   KanbanScriptTrigger,
   KanbanStage,
   ProviderOptionSelections,
@@ -225,6 +226,8 @@ const ScriptBody = Schema.Struct({
   trigger: KanbanScriptTrigger,
   enabled: Schema.optional(Schema.Boolean),
 });
+
+const ScriptAcknowledgeBody = KanbanScriptAcknowledgeInput.mapFields(Struct.omit(["scriptId"]));
 
 const ScriptPatchBody = Schema.Struct({ enabled: Schema.Boolean });
 
@@ -948,6 +951,14 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const acknowledgeScript = write(
+      Effect.gen(function* () {
+        const id = yield* scriptId;
+        const input = yield* body(ScriptAcknowledgeBody);
+        return yield* scripts.acknowledge({ ...input, scriptId: id });
+      }),
+    );
+
     const runScript = write(
       Effect.gen(function* () {
         const id = yield* scriptId;
@@ -981,6 +992,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/boards/:board/scripts`, handle(registerScript)),
       HttpRouter.route("PATCH", `${p}/scripts/:script`, handle(patchScript)),
       HttpRouter.route("POST", `${p}/scripts/:script/run`, handle(runScript)),
+      HttpRouter.route("POST", `${p}/scripts/:script/acknowledge`, handle(acknowledgeScript)),
       HttpRouter.route("GET", `${p}/scripts/:script/runs`, handle(listRuns)),
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),

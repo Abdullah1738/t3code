@@ -14,6 +14,7 @@ import {
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanScriptAcknowledgeInput,
   type KanbanThreadLink,
   type KanbanThreadRow,
   type KanbanWatchEvent,
@@ -145,6 +146,7 @@ export interface KanbanClient {
   setScriptEnabled(scriptId: string, enabled: boolean): Promise<void>;
   /** Starts a run now; it shows up in the runs store as it opens and ends. */
   runScript(scriptId: string): Promise<void>;
+  acknowledgeScript(input: KanbanScriptAcknowledgeInput): Promise<void>;
   /**
    * While watched, the newest message of recent discussions is read whenever
    * a preview falls behind. Screens that list discussions watch; the board
@@ -1006,6 +1008,9 @@ export function createKanbanClient(
     },
     async setScriptEnabled(scriptId, enabled) {
       await transport.request(M.scriptEnable, { scriptId: scriptId as never, enabled });
+    },
+    async acknowledgeScript(input) {
+      await transport.request(M.scriptAcknowledge, input);
     },
     async runScript(scriptId) {
       await transport.request(M.scriptRun, { scriptId: scriptId as never });

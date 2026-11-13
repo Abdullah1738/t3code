@@ -9,6 +9,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
+  type ModelSelection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
@@ -105,6 +106,7 @@ const fakeThreads = (
   const missing = new Set<ThreadId>();
   const deleted = new Set<ThreadId>();
   const unreadable = new Set<ThreadId>();
+  const models = new Map<ThreadId, ModelSelection>();
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
@@ -134,6 +136,7 @@ const fakeThreads = (
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view,
       find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
@@ -144,7 +147,9 @@ const fakeThreads = (
       launch: (input) => {
         const launch = Effect.sync(() => {
           launches.push(input.text);
-          return ThreadId.make(`thread-${++launched}`);
+          const threadId = ThreadId.make(`thread-${++launched}`);
+          models.set(threadId, input.model);
+          return threadId;
         });
         return launchGate
           ? Deferred.succeed(launchGate.held, undefined).pipe(
@@ -159,8 +164,11 @@ const fakeThreads = (
           rejectSends.has(input.threadId)
             ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "send failed" }))
             : Effect.void),
-      model: () => Effect.succeed(null),
-      setModel: () => Effect.void,
+      model: (threadId) => Effect.sync(() => models.get(threadId) ?? null),
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          models.set(threadId, model);
+        }),
       withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
@@ -1772,12 +1780,29 @@ it.effect("MCP model writes resolve legacy selections only under the apply flag"
       (yield* kanban.card(KanbanCardId.make(card.id))).card.model.model,
       "claude-haiku-5-5",
     );
+    const nativeHaiku = { instanceId: "claudeAgent", model: "claude-haiku-5-5", effort: "max" };
+    const applied = yield* call(evaluator, "card_edit", { card: card.id, model: nativeHaiku });
+    assert.isFalse(applied.isError, applied.text);
 
-    const weighted = yield* call(evaluator, "card_edit", {
+    const routedList = yield* call(evaluator, "card_edit", {
       card: card.id,
       models: [
         { ...opus, weight: 2 },
         { ...haiku, weight: 1 },
+      ],
+    });
+    assert.isFalse(routedList.isError, routedList.text);
+    assert.deepStrictEqual(
+      (yield* kanban.card(KanbanCardId.make(card.id))).card.models.map(
+        (entry) => entry.model.instanceId,
+      ),
+      ["claudeAgent", "claudeAgent"],
+    );
+    const weighted = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      models: [
+        { instanceId: "claudeAgent", model: "claude-opus-5-5", effort: "high", weight: 2 },
+        { ...nativeHaiku, weight: 1 },
       ],
     });
     assert.isFalse(weighted.isError, weighted.text);
@@ -2409,6 +2434,8 @@ it.effect.each(["id", "number", "implicit", "board", "edit", "noop", "comment", 
       );
       yield* kanban.dispatchNow;
       const current = (yield* kanban.card(card.id)).card;
+      assert.isNotNull(current.workThreadId);
+      assert.isNull(current.stalled);
       const thread = current.workThreadId!;
       yield* store.putCard({
         ...current,

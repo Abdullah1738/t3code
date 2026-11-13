@@ -1281,7 +1281,7 @@ describe("thread batching", () => {
       planDispatch(board, [review, todo, findings], pools([[opus, 3]])).map(
         (entry) => entry.cardId,
       ),
-    ).toEqual([review.id, findings.id]);
+    ).toEqual([review.id]);
   });
 
   it("offers related todo cards with a reason, in pick order", () => {

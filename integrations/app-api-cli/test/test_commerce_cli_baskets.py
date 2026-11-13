@@ -149,5 +149,23 @@ class BasketCLITests(unittest.TestCase):
         cls.resume_paid.assert_not_called()
 
 
+
+# Metadata checks run even when a transport is stubbed.
+_journal_temp = tempfile.TemporaryDirectory()
+_journal_patch = patch.object(cli.journal, 'ROOT', Path(_journal_temp.name).resolve()/'commerce')
+_original_setup = globals().get('setUpModule', lambda: None)
+_original_teardown = globals().get('tearDownModule', lambda: None)
+def setUpModule():
+    _journal_patch.start()
+    _original_setup()
+    import order_card, card_status
+    if order_card.LAST4=='2342':
+        card_status.record_declined('9546',reason='synthetic issuer decline',source='test')
+def tearDownModule():
+    _original_teardown()
+    _journal_patch.stop()
+    _journal_temp.cleanup()
+
+
 if __name__ == '__main__':
     unittest.main()

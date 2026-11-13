@@ -27,7 +27,7 @@ def identities(value):
     return result
 
 
-def marker_for(con, *, source=None, session=None, turn=None, payload=None, record_id=None, capture_id=None):
+def marker_for(con, *, source=None, session=None, turn=None, payload=None, record_id=None, capture_id=None, capture_alias=None):
     # Most installations have no tombstones. Never create tables from a reader.
     if not con.execute("SELECT 1 FROM sqlite_master WHERE name='recall_redacted_ids'").fetchone():
         return None
@@ -36,6 +36,10 @@ def marker_for(con, *, source=None, session=None, turn=None, payload=None, recor
         keys.append(('id', json.dumps([session,record_id])))
     if capture_id and session:
         keys.append(('native',json.dumps([capture_id[0],session,capture_id[1]])))
+        # Existing masked archives may use the sanitized line's hash. Accept
+        # that alias alongside the stable source identity during replay.
+        if capture_alias and capture_alias != capture_id[1]:
+            keys.append(('native',json.dumps([capture_id[0],session,capture_alias])))
     if source and session and turn:
         keys.append(('turn', json.dumps([source, session, turn])))
     for kind, value in keys:
@@ -45,13 +49,13 @@ def marker_for(con, *, source=None, session=None, turn=None, payload=None, recor
     return None
 
 
-def event(con, source, session, turn, content, metadata, capture_id=None):
-    marker = marker_for(con, source=source, session=session, turn=turn, payload=metadata, capture_id=capture_id)
+def event(con, source, session, turn, content, metadata, capture_id=None, capture_alias=None):
+    marker = marker_for(con, source=source, session=session, turn=turn, payload=metadata, capture_id=capture_id, capture_alias=capture_alias)
     return (marker, json.dumps({'redacted': True})) if marker else (content, metadata)
 
 
-def raw(con, payload, record_id=None, session=None, capture_id=None):
-    marker = marker_for(con, payload=payload, record_id=record_id, session=session, capture_id=capture_id)
+def raw(con, payload, record_id=None, session=None, capture_id=None, capture_alias=None):
+    marker = marker_for(con, payload=payload, record_id=record_id, session=session, capture_id=capture_id, capture_alias=capture_alias)
     return (json.dumps({'redacted': marker}) + '\n').encode() if marker else payload
 
 
@@ -61,8 +65,8 @@ class CaptureGuard:
         self.con = con
         self.enabled = bool(con.execute("SELECT 1 FROM sqlite_master WHERE name='recall_redacted_ids'").fetchone())
 
-    def event(self, source, session, turn, content, metadata, capture_id=None):
-        return event(self.con,source,session,turn,content,metadata,capture_id) if self.enabled else (content,metadata)
+    def event(self, source, session, turn, content, metadata, capture_id=None, capture_alias=None):
+        return event(self.con,source,session,turn,content,metadata,capture_id,capture_alias) if self.enabled else (content,metadata)
 
-    def raw(self, payload, record_id=None, session=None, capture_id=None):
-        return raw(self.con,payload,record_id,session,capture_id) if self.enabled else payload
+    def raw(self, payload, record_id=None, session=None, capture_id=None, capture_alias=None):
+        return raw(self.con,payload,record_id,session,capture_id,capture_alias) if self.enabled else payload

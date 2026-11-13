@@ -952,9 +952,8 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
-        const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
-        const model = input.model ? yield* modelOf(input.model, apply) : undefined;
-        const models = yield* modelsOf(input.models, apply);
+        const model = input.model ? yield* modelOf(input.model, false) : undefined;
+        const models = yield* modelsOf(input.models, false);
         const edited = yield* service.editCard(
           card.id,
           {
