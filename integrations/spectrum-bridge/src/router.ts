@@ -311,6 +311,16 @@ function undeliveredNote(attachment: NormalizedInbound["attachments"][number], d
   ].filter(Boolean).join(", ");
   return `- The owner sent ${JSON.stringify(attachment.fileName || "a file")} (${attachment.mimeType || "unknown type"}, ${size}, attachment guid ${JSON.stringify(attachment.guid)}), but the bridge could not download it (Photon: ${detail.photon ?? "failed"}; local Messages copy: ${detail.reason}${detail.missing ? ", not yet downloaded from iCloud" : ""}).${where ? ` Found in Messages: ${where}.` : ""} Pull it yourself before answering: find it with \`imsg history --chat-id <id> --attachments --json\` (match transfer_name), and if the file is missing, open that chat in Messages with cua-driver, AXPress the attachment bubble whose label has the file name, wait for the file to appear at original_path, then read it from there (the imsg skill has the steps). Only if that also fails, tell the owner briefly and ask them to resend.`;
 }
+
+function sameAttachmentMessage(first: NormalizedInbound, next: NormalizedInbound): boolean {
+  // Sendblue emits each photo as a row: UUID, UUID_1, UUID_2. A swipe boundary
+  // separates distinct replies, but must not separate the photos in one reply.
+  const message = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[1-9]\d*)?$/i;
+  const firstId = message.exec(first.id)?.[1];
+  return firstId !== undefined && firstId === message.exec(next.id)?.[1]
+    && first.sender !== undefined && first.sender === next.sender && first.threadOrigin === next.threadOrigin
+    && next.attachments.length > 0 && !next.text.trim();
+}
 /** Rows the bridge injects itself (secure-form notices, watcher wakes, reset nudges): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:") || id.startsWith("reset:");
 /** A person's plain typed text, the only kind of row steered into a running turn. */
@@ -1409,9 +1419,10 @@ export class Router {
           // A wake queued between two typed texts keeps its own turn and does not split them.
           if (row.id.startsWith("wake:") && !leader.id.startsWith("wake:")) continue;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
-          // Sendblue's reply_to is not the swiped message, so two swipes never share a batch.
+          // Sendblue's reply_to is not the swiped message, so distinct swipes never share a batch.
           if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
-            || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo || (this.options.swipes && next.replyTo)
+            || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo
+            || (this.options.swipes && next.replyTo && !sameAttachmentMessage(input, next))
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
           members.push({ ...row, payload: next });
@@ -3018,7 +3029,9 @@ export class Router {
     if (interrupted()) return;
     if (!this.current(activeRoute)) return;
     const parts: FilePart[] = [];
-    const notes: string[] = [...undelivered];
+    const notes: string[] = undelivered.length
+      ? [`${downloaded.length} of ${input.attachments.length} attachments arrived.`, ...undelivered]
+      : [];
     let previewBytes = 0;
     try {
       for (const file of files) {

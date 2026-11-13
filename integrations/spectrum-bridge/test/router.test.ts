@@ -2988,6 +2988,73 @@ function filesSetup(overrides: Partial<ConstructorParameters<typeof Router>[3]> 
   return { ...h, root };
 }
 
+const photoReplyContext: ChatContext = {
+  chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Abdullah" },
+  roleOf: () => ({ name: "Abdullah", role: "owner" }),
+  typing: () => false,
+  react: async () => {},
+};
+
+test.each(["_1", "_2", "_10"])("Sendblue photo part %s stays in its swipe reply's prompt", async suffix => {
+  const id = "884F872B-C570-46D0-BE94-08E488EFEA7A";
+  const h = filesSetup({ chatGuid: photoReplyContext.chat.key, context: photoReplyContext, swipes: { line: "+15555550124", waitMs: 0, find: () => null } });
+  h.transport.downloadAttachment = async guid => {
+    h.downloads.push([guid, 0]);
+    return { data: Buffer.concat([tinyPng, Buffer.from(guid)]), mimeType: "image/png", name: "photo.png" };
+  };
+  const reply = { replyTo: "same-before", threadOrigin: "same-origin", sender: options.owner };
+  h.input(id, "Bowl weight before and after", { ...reply, attachments: [attachment("image/png", 1, id)] });
+  h.input(`${id}${suffix}`, "", { ...reply, attachments: [attachment("image/png", 1, `${id}${suffix}`)] });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!;
+  expect(prompt.text).toContain("Bowl weight before and after");
+  expect(prompt.files).toHaveLength(2);
+  expect(prompt.files[0]!.url).not.toBe(prompt.files[1]!.url);
+  expect(h.downloads.map(([guid]) => guid)).toEqual([id, `${id}${suffix}`]);
+  expect(h.store.get<NormalizedInbound>(`batch:${id}`)!.batchIds).toEqual([id, `${id}${suffix}`]);
+  expect(readdirSync(join(h.root, "ses_1", "attachments"))).toHaveLength(2);
+  h.backend.final();
+  await h.router.tick();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test.each(["different-message", "different-sender", "different-origin", "caption", "no-file", "invalid-suffix"])("Sendblue sibling exception preserves the %s swipe boundary", async kind => {
+  const id = "884F872B-C570-46D0-BE94-08E488EFEA7A";
+  const h = filesSetup({ chatGuid: photoReplyContext.chat.key, context: photoReplyContext, swipes: { line: "+15555550124", waitMs: 0, find: () => null } });
+  h.transport.downloadAttachment = async guid => ({ data: tinyPng, mimeType: "image/png", name: `${guid}.png` });
+  const reply = { replyTo: "same-before", threadOrigin: "same-origin", sender: options.owner };
+  h.input(id, "First swipe", { ...reply, attachments: [attachment()] });
+  const nextId = kind === "different-message" ? "984F872B-C570-46D0-BE94-08E488EFEA7A_1" : `${id}${kind === "invalid-suffix" ? "_one" : "_1"}`;
+  h.input(nextId, kind === "caption" || kind === "no-file" ? "Separate swipe" : "", {
+    ...reply, ...(kind === "different-sender" ? { sender: "+15555550125" } : {}),
+    ...(kind === "different-origin" ? { threadOrigin: "other-origin" } : {}),
+    attachments: kind === "no-file" ? [] : [attachment("image/png", 1, nextId)],
+  });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.files).toHaveLength(1);
+  expect(h.store.get<NormalizedInbound>(`batch:${id}`)!.batchIds).toEqual([id]);
+  expect(inbounds(h.store).find(row => row.id === nextId)!.state).toBe("pending");
+});
+
+test.each([0, 1, 2])("partial incoming files report %i of 2 attachments arrived", async arrived => {
+  const h = filesSetup({ recoverAttachment: async () => ({ detail: { reason: "notFound" } }) });
+  const ids = ["photo", "photo_1"];
+  h.transport.downloadAttachment = async guid => {
+    if (ids.indexOf(guid) >= arrived) throw new TransportError("invalidAttachment");
+    return { data: tinyPng, mimeType: "image/png", name: `${guid}.png` };
+  };
+  h.input("photos", "Compare both", { attachments: ids.map(id => attachment("image/png", 1, id)) });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.files).toHaveLength(arrived);
+  const system = h.backend.prompts[0]!.system!;
+  if (arrived < 2) expect(system).toContain(`${arrived} of 2 attachments arrived`);
+  else expect(system).not.toContain("attachments arrived");
+});
+
 test("native attachments become data URLs with saved originals; text URLs are never fetched", async () => {
   const h = filesSetup();
   const data = tinyPng;
