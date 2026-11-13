@@ -467,6 +467,76 @@ describe("t3_worktree_handoff", () => {
     }).pipe(Effect.provide(realGitWorkflowLayer)),
   );
 
+  it.effect.each(
+    [
+      { branch: "main", sameNameTag: false },
+      { branch: "main", sameNameTag: true },
+      { branch: "feature/topic", sameNameTag: true },
+      { branch: "heads/main", sameNameTag: true },
+      { branch: "refs/heads/main", sameNameTag: true },
+      { branch: "origin/main", sameNameTag: true },
+    ].flatMap((row) => [false, true].map((startFromOrigin) => ({ ...row, startFromOrigin }))),
+  )(
+    "preserves an inferred branch with a remote-ahead base and locked source index: %j",
+    ({ branch, sameNameTag, startFromOrigin }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const git = yield* GitVcsDriver.GitVcsDriver;
+        const workflow = yield* GitWorkflowService.GitWorkflowService;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-branch-name-" });
+        const cwd = `${directory}/repo`;
+        const worktreePath = `${directory}/worktree`;
+        const remote = `${directory}/remote.git`;
+        yield* fs.makeDirectory(cwd);
+        const command = (at: string, args: string[]) =>
+          git.execute({ operation: "handoff-test", cwd: at, args });
+        const commit = (message: string) =>
+          command(cwd, [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+          ]);
+        yield* command(cwd, ["init", "-b", branch]);
+        yield* commit("base");
+        const localCommit = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+        yield* command(cwd, ["init", "--bare", remote]);
+        yield* command(cwd, ["remote", "add", "origin", remote]);
+        const refspec = `refs/heads/${branch}:refs/heads/${branch}`;
+        yield* command(cwd, ["push", "-u", "origin", refspec]);
+        yield* commit("remote ahead");
+        const remoteCommit = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+        yield* command(cwd, ["push", "origin", refspec]);
+        yield* command(cwd, ["reset", "--hard", localCommit]);
+        if (sameNameTag)
+          yield* command(cwd, ["tag", branch, startFromOrigin ? localCommit : remoteCommit]);
+        const indexLock = `${cwd}/.git/index.lock`;
+        yield* fs.writeFileString(indexLock, "held by another process");
+        const harness = makeHarness({
+          workspaceRoot: cwd,
+          git: {
+            ...workflow,
+            createWorktree: (input) => git.createWorktree({ ...input, path: worktreePath }),
+          },
+        });
+        const result = yield* runHandoff(harness, {
+          branch: "feature/from-remote",
+          startFromOrigin,
+          runSetupScript: false,
+        });
+        expect((yield* command(worktreePath, ["rev-parse", "HEAD"])).stdout.trim()).toBe(
+          startFromOrigin ? remoteCommit : localCommit,
+        );
+        expect(result).toMatchObject({ baseRef: branch, startedFromOrigin: startFromOrigin });
+        expect((yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(localCommit);
+        expect(yield* fs.readFileString(indexLock)).toBe("held by another process");
+      }).pipe(Effect.provide(realGitWorkflowLayer)),
+  );
+
   it.effect.each([undefined, "main"])("rejects a real non-repository with baseRef %s", (baseRef) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -499,9 +569,9 @@ describe("t3_worktree_handoff", () => {
       expect(harness.fetchWorktreeBaseCommit).not.toHaveBeenCalled();
       expect(harness.createWorktree).toHaveBeenCalledWith({
         cwd: workspaceRoot,
-        refName: "dev",
+        refName: "refs/heads/dev",
         newRefName: "feature/handoff",
-        baseRefName: "dev",
+        baseRefName: "refs/heads/dev",
         path: null,
       });
       expect(harness.dispatch).toHaveBeenCalledWith(

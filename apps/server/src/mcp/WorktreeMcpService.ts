@@ -214,8 +214,9 @@ const make = Effect.gen(function* () {
 
     const startFromOrigin = input.startFromOrigin ?? (yield* readDefaultStartFromOrigin);
 
-    let worktreeBaseRef = baseRef;
-    let baseRefName = baseRef;
+    // An inferred branch must not resolve to a same-name tag during local checkout.
+    let worktreeBaseRef = input.baseRef === undefined ? `refs/heads/${baseRef}` : baseRef;
+    let baseRefName = worktreeBaseRef;
     let startedFromOrigin = false;
     if (startFromOrigin) {
       const resolvedRemoteBase = yield* gitWorkflow

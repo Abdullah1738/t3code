@@ -306,10 +306,14 @@ export const make = Effect.gen(function* () {
       const result = yield* git.execute({
         operation: "GitWorkflowService.readCurrentBranch",
         cwd,
-        args: ["symbolic-ref", "--short", "--quiet", "HEAD"],
+        args: ["symbolic-ref", "--quiet", "HEAD"],
         allowNonZeroExit: true,
       });
-      return result.exitCode === 0 ? result.stdout.trim() || null : null;
+      const refName = result.stdout.trim();
+      // --short can return heads/main when a tag is also named main.
+      return result.exitCode === 0 && refName.startsWith("refs/heads/")
+        ? refName.slice("refs/heads/".length)
+        : null;
     }),
     hasCommit: (input) =>
       ensureGitCommand("GitWorkflowService.hasCommit", input.cwd).pipe(
