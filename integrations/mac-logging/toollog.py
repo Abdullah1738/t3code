@@ -15,6 +15,8 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
+NUMBERS.update(('lockAgeS', 'lockPid'))
+SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
@@ -36,7 +38,9 @@ def directory():
 def safe_fields(values):
     result = {}
     for key, value in (values or {}).items():
-        if key in NULLABLE and value is None:
+        if key == 'skipReason' and isinstance(value, str) and value in SKIP_REASONS:
+            result[key] = value
+        elif key in NULLABLE and value is None:
             result[key] = None
         elif key in BOOLEANS and type(value) is bool:
             result[key] = value
