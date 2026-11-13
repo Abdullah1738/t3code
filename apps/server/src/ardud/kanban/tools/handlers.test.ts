@@ -1982,8 +1982,7 @@ it.effect(
         threadId: evaluator,
       });
     }).pipe(
-      Effect.provide(layer),
-      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.provide(Layer.mergeAll(layer, Logger.layer([logger], { mergeWithExisting: false }))),
     );
   },
 );
@@ -2062,8 +2061,7 @@ it.effect.each([false, true])(
       assert.isFalse(again.isError, again.text);
       assert.deepStrictEqual((yield* kanban.card(card.id)).events, events);
     }).pipe(
-      Effect.provide(layer),
-      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.provide(Layer.mergeAll(layer, Logger.layer([logger], { mergeWithExisting: false }))),
     );
   },
 );
