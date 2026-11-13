@@ -366,6 +366,23 @@ export const layer: Layer.Layer<
       };
     };
 
+    // Restart workers keep this session too; its callbacks must not capture startup's projection.
+    const makeResumedSession = (session: ProviderAdapter.ProviderAdapterV2SessionRuntime) => ({
+      ...session,
+      startTurn: (input: Parameters<typeof session.startTurn>[0]) =>
+        Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+          Effect.andThen(session.startTurn(input)),
+        ),
+      ...(session.compactThread === undefined
+        ? {}
+        : {
+            compactThread: (input: Parameters<typeof session.startTurn>[0]) =>
+              Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+                Effect.andThen(session.compactThread!(input)),
+              ),
+          }),
+    });
+
     const start = Effect.fn("orchestrationV2.providerTurnStart.start")(function* (input: {
       readonly threadId: ThreadId;
       readonly runId: RunId;
@@ -790,7 +807,7 @@ export const layer: Layer.Layer<
       }
       const session = makeRecoverySession(
         sessionResult.success,
-        () => isCurrentAttemptInStatus("running"),
+        runControls.shouldStartProviderTurn,
         isAutomaticClaudeRecovery(sessionResult.success.driver, run)
           ? runControls.loadRecoveryAdmission
           : undefined,
@@ -1710,21 +1727,7 @@ export const layer: Layer.Layer<
         session:
           run.restartContinuationOfRunId === undefined && !isRecoveredQueueRun(run.id)
             ? deliverySession
-            : {
-                ...deliverySession,
-                startTurn: (input) =>
-                  Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
-                    Effect.andThen(deliverySession.startTurn(input)),
-                  ),
-                ...(deliverySession.compactThread === undefined
-                  ? {}
-                  : {
-                      compactThread: (input: Parameters<typeof deliverySession.startTurn>[0]) =>
-                        Effect.sync(() =>
-                          markInstallLifecycle("firstResumedProviderRequestAt"),
-                        ).pipe(Effect.andThen(deliverySession.compactThread!(input))),
-                    }),
-              },
+            : makeResumedSession(deliverySession),
         run: runningRun,
         rootNode: runningRootNode,
         checkpointScope,
