@@ -189,17 +189,56 @@ def _python_touches_live(source, directory, replica=False):
 
     definitions, stores = {}, {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             stores[node.id] = stores.get(node.id, 0) + 1
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg)):
             name = node.arg if isinstance(node, ast.arg) else node.name
             stores[name] = stores.get(name, 0) + 1
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for imported in node.names:
+                name = imported.asname or (imported.name.split('.')[0] if isinstance(node, ast.Import) else imported.name)
+                stores[name] = stores.get(name, 0) + 1
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            stores[node.name] = stores.get(node.name, 0) + 1
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            stores[node.rest] = stores.get(node.rest, 0) + 1
+        if type(node).__name__ in {'TypeVar', 'ParamSpec', 'TypeVarTuple'}:
+            stores[node.name] = stores.get(node.name, 0) + 1
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
                 if isinstance(target, ast.Name):
                     definitions[target.id] = node.value
 
+    # A cached path must not retain trust from an import that was rebound.
+    ambiguous = {name for name in aliases if stores.get(name) != 1}
+    ambiguous.update(name for name in {'Path', 'pathlib', 'os'} if name not in aliases)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = _name(node).split('.')[0]
+            if root in aliases:
+                ambiguous.add(root)
+    dependents = {}
+    for name, value in definitions.items():
+        for part in ast.walk(value) if value is not None else ():
+            if isinstance(part, ast.Name):
+                dependents.setdefault(part.id, set()).add(name)
+    pending = list(ambiguous)
+    while pending:
+        for name in dependents.get(pending.pop(), ()):
+            if name not in ambiguous:
+                ambiguous.add(name)
+                pending.append(name)
+    bindings = {name: value for name, value in bindings.items() if name not in ambiguous}
+    opaque = any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names) or
+                 _name(n) in {'globals', 'locals', 'vars', 'setattr', 'delattr'} or
+                 aliases.get(_name(n)) == 'sys.modules' or
+                 isinstance(n, ast.Attribute) and (n.attr in {'__dict__', '__globals__', 'f_globals', 'f_locals', '__getattribute__', '__setattr__'} or
+                     n.attr == 'modules' and aliases.get(_name(n.value), _name(n.value)) == 'sys')
+                 for n in ast.walk(tree))
+
     def uri_value(node, seen=frozenset()):
+        if any(isinstance(n, ast.Name) and n.id in ambiguous for n in ast.walk(node)):
+            return None
         value = _path_expression(node, bindings, aliases)
         if value is not None:
             return value
@@ -221,10 +260,10 @@ def _python_touches_live(source, directory, replica=False):
     original_live = source_touches_live(source)
     replica_calls = set()
     for node in ast.walk(tree):
-        if not replica or original_live or not isinstance(node, ast.Call) or not node.args:
+        if not replica or original_live or opaque or not isinstance(node, ast.Call) or not node.args:
             continue
         root, *rest = _name(node.func).split('.')
-        if root not in aliases or stores.get(root) or '.'.join([aliases[root], *rest]) != 'sqlite3.connect':
+        if root not in aliases or root in ambiguous or stores.get(root) != 1 or '.'.join([aliases[root], *rest]) != 'sqlite3.connect':
             continue
         value = uri_value(node.args[0])
         if value is None:

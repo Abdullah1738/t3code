@@ -286,6 +286,43 @@ class GuardTests(unittest.TestCase):
                 script = self.write('tmp/escaped-shadow.mjs', source)
                 self.assertEqual(self.classify(f'node {script}'), SCRIPT)
                 self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_python_replica_import_bindings_must_be_unambiguous(self):
+        prefix = ('from pathlib import Path\nimport sqlite3\n'
+                  'from custom import connect_legacy, reader\n'
+                  'class E(Exception):\n    connect = staticmethod(connect_legacy)\n'
+                  'path = Path.home() / ".robob/userdata/readonly/state.sqlite"\n')
+        call = 'sqlite3.connect(str(path))\n'
+        for name, source in [
+            ('except', prefix + 'try:\n    raise E()\nexcept Exception as sqlite3:\n    ' + call),
+            ('except-star', prefix + 'try:\n    raise E()\nexcept* Exception as sqlite3:\n    ' + call),
+            ('conditional-import', 'from pathlib import Path\nfrom custom import sqlite3\nif False:\n    import sqlite3\n'
+             'sqlite3.connect(str(Path.home() / ".robob/userdata/readonly/state.sqlite"))\n'),
+            ('star-import', prefix + 'from custom import *\n' + call),
+            ('match-as', prefix + 'match reader:\n    case sqlite3:\n        ' + call),
+            ('match-star', prefix + 'match [reader]:\n    case [*sqlite3]:\n        ' + call),
+            ('match-rest', prefix + 'match {"connect": connect_legacy}:\n    case {**sqlite3}:\n        ' + call),
+            ('with', prefix + 'with reader as sqlite3:\n    ' + call),
+            ('for', prefix + 'for sqlite3 in [reader]:\n    ' + call),
+            ('assignment', prefix + 'sqlite3 = reader\n' + call),
+            ('globals', prefix + 'globals()["sqlite3"] = reader\n' + call),
+            ('locals', prefix + 'locals()["sqlite3"] = reader\n' + call),
+            ('vars', prefix + 'vars()["sqlite3"] = reader\n' + call),
+            ('module-attribute', prefix + 'import sys\nsys.modules[__name__].sqlite3 = reader\n' + call),
+            ('module-dict', prefix + 'import sys\nsys.modules[__name__].__dict__["sqlite3"] = reader\n' + call),
+            ('module-import', prefix + 'from sys import modules as registry\nregistry[__name__].sqlite3 = reader\n' + call),
+            ('function-globals', prefix + 'def binding(): pass\nbinding.__globals__["sqlite3"] = reader\n' + call),
+            ('path-shadow', prefix + 'class Path:\n    home = staticmethod(reader.home)\n'
+             'sqlite3.connect(str(Path.home() / ".robob/userdata/readonly/state.sqlite"))\n'),
+            ('builder-mutation', prefix + 'import os\nos.path.join = reader\n'
+             'sqlite3.connect(os.path.join(str(Path.home()), ".robob/userdata/readonly/state.sqlite"))\n'),
+        ]:
+            with self.subTest(binding=name):
+                script = self.write('tmp/rebound-reader.py', source)
+                self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+                self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
+    def test_escaped_probe_option_references_cannot_hide_transforms(self):
         original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
         for identifier in [r'v\u0061lues', r'v\u{61}lues', r'\u0076alues', r'value\u0073']:
             for rename in ['', '.replace("state", "statev2")']:
