@@ -10,7 +10,14 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Layer from "effect/Layer";
-import { EnvironmentId, NodeId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as Logger from "effect/Logger";
+import {
+  EnvironmentId,
+  NodeId,
+  type OrchestrationV2ThreadProjection,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -26,9 +33,13 @@ import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 it.effect.each([
   { stage: "caller", stop: "deadline" },
-  { stage: "records", stop: "deadline" },
+  { stage: "parent_records", stop: "deadline" },
+  { stage: "child_records", stop: "deadline" },
+  { stage: "result", stop: "deadline" },
   { stage: "caller", stop: "interruption" },
-  { stage: "records", stop: "interruption" },
+  { stage: "parent_records", stop: "interruption" },
+  { stage: "child_records", stop: "interruption" },
+  { stage: "result", stop: "interruption" },
 ] as const)(
   "releases task_status on $stop while the production reader snapshot gate holds $stage",
   ({ stage, stop }) =>
@@ -52,6 +63,37 @@ it.effect.each([
         yield* sql`CREATE TABLE entries (value INTEGER)`;
         yield* gate.take(1);
         const parent = ThreadId.make("thread:review516");
+        const child = ThreadId.make("thread:review516-child");
+        const taskId = NodeId.make("node:review516");
+        const parentProjection = {
+          thread: { id: parent },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parent,
+              origin: "app_owned",
+              childThreadId: child,
+              status: "running",
+              result: null,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const childProjection = {
+          thread: { id: child },
+          runs: [],
+          messages: [],
+          contextTransfers: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const logs: unknown[] = [];
+        const logger = Logger.make(({ message }) => {
+          logs.push(message);
+        });
         const snapshot = sql.withTransaction(sql`SELECT * FROM entries`).pipe(
           SqliteClient.readOnly,
           Effect.mapError(
@@ -70,7 +112,17 @@ it.effect.each([
               stage === "caller"
                 ? snapshot.pipe(Effect.as(liveThreadShell(parent)))
                 : Effect.succeed(liveThreadShell(parent)),
-            getThreadRecords: () => snapshot.pipe(Effect.andThen(Effect.never)),
+            getThreadRecords: (threadId, fields) => {
+              const readingStage =
+                threadId === parent
+                  ? "parent_records"
+                  : fields.some((field) => field === "runs")
+                    ? "child_records"
+                    : "result";
+              return stage === readingStage
+                ? snapshot.pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(threadId === parent ? parentProjection : childProjection);
+            },
           }),
           ServerSettings.layerTest(),
           Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
@@ -99,7 +151,7 @@ it.effect.each([
                 capabilities: new Set(["orchestration"]),
                 issuedAt: 1,
               },
-              NodeId.make("node:review516"),
+              taskId,
             )
             .pipe(Effect.forkChild);
           yield* Deferred.await(entered);
@@ -117,9 +169,39 @@ it.effect.each([
             assert.deepEqual(result, {
               taskId: NodeId.make("node:review516"),
               partial: true,
-              ...(stage === "records" ? { callerResolved: true } : {}),
+              stoppedAt: stage,
+              retryHint:
+                `Robob was busy and this read stopped at ${stage}. The task itself is unaffected. Retry task_status in a few seconds` +
+                (["child_records", "result"].includes(stage)
+                  ? ", or read childThreadId with t3_thread_read."
+                  : "."),
+              ...(stage !== "caller" ? { callerResolved: true } : {}),
+              ...(["child_records", "result"].includes(stage)
+                ? { childThreadId: child, childNodeId: taskId }
+                : {}),
+              ...(stage === "result"
+                ? {
+                    childRunId: null,
+                    currentRunId: null,
+                    currentRunStatus: null,
+                    latestTerminalRunId: null,
+                    latestTerminalStatus: null,
+                    hasPendingChildRuns: false,
+                  }
+                : {}),
             });
           }
+          assert.deepEqual(
+            logs,
+            stop === "deadline"
+              ? [
+                  [
+                    "orchestrator-mcp.task-status.partial",
+                    { taskId, stoppedAt: stage, elapsedMs: 10000, callerThreadId: parent },
+                  ],
+                ]
+              : [],
+          );
           yield* Deferred.await(finalized);
           // A fresh BEGIN on the same reader fails if cancellation stranded its transaction.
           const rows = yield* sql
@@ -131,7 +213,12 @@ it.effect.each([
             "cleanup must remain with the masked read until the gate opens",
           );
           return completed;
-        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+        }).pipe(
+          Effect.provide([
+            OrchestratorMcpService.layer.pipe(Layer.provide(dependencies)),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ]),
+        );
         assert.isTrue(
           completedAtDeadline,
           "read still waits for the masked archive snapshot gate after its deadline",

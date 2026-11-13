@@ -161,6 +161,9 @@ it.effect.each(["board", "send", "status"] as const)(
                 taskId: NodeId.make("task:foreground"),
                 partial: true,
                 callerResolved: true,
+                stoppedAt: "parent_records",
+                retryHint:
+                  "Robob was busy and this read stopped at parent_records. The task itself is unaffected. Retry task_status in a few seconds.",
               });
             } else yield* Fiber.interrupt(pending);
           }

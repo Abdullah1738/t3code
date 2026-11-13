@@ -536,6 +536,8 @@ describe("OrchestratorMcpService", () => {
         if (Option.isNone(observed)) return;
         assert.equal(observed.value.status, "completed");
         assert.equal(observed.value.partial, false);
+        assert.notProperty(observed.value, "stoppedAt");
+        assert.notProperty(observed.value, "retryHint");
         assert.isNull(observed.value.currentRunId);
         assert.isNull(observed.value.currentRunStatus);
         yield* Deferred.await(commandFailed);
@@ -661,6 +663,23 @@ describe("OrchestratorMcpService", () => {
           const result = yield* Fiber.join(read);
           assert.equal(result.partial, true);
           assert.equal(result.taskId, taskId);
+          if (result.partial !== true) return;
+          const stoppedAt =
+            blockedStage === "caller"
+              ? "caller"
+              : blockedStage === "parent"
+                ? "parent_records"
+                : blockedStage === "controls"
+                  ? "child_records"
+                  : "result";
+          assert.equal(result.stoppedAt, stoppedAt);
+          assert.include(result.retryHint, `read stopped at ${stoppedAt}`);
+          assert.include(result.retryHint, "The task itself is unaffected");
+          assert.include(result.retryHint, "Retry task_status in a few seconds");
+          assert.equal(
+            result.retryHint.includes("t3_thread_read"),
+            !["caller", "parent"].includes(blockedStage),
+          );
           assert.equal(
             result.childThreadId,
             ["caller", "parent"].includes(blockedStage) ? undefined : childThreadId,
