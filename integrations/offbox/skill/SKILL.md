@@ -281,6 +281,8 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 ## Home server, Boat standby
 
+On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace it); offbox manages the box through its own `offbox-mgmt-ssh` service on port 2222, which you must leave alone.
+
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
 `offbox run` picks its backend once, when it starts:
