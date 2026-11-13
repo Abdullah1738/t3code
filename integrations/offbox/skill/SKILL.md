@@ -28,6 +28,9 @@ gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terrafo
 file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
+A repo’s pool name (at home and on the Boat standby alike) comes from its origin URL’s basename, normalized to lowercase letters, digits and dashes.
+If git is slow or fails, offbox reuses the last good name for that resolved checkout root and logs the fallback; a first failure warns before using the directory name.
+
 **Where it runs.** With no home server set up (no `~/.local/share/offbox/server.json`, or `"disabled": true` in
 it), everything below is boat.dev, as it always was. With one, see "Home server, Boat standby".
 

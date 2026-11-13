@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import common
 from .common import HOME, OffboxError, db, kv_get, kv_set, log, now, say
 
 # offbox's own component credential first, the old shared file last.
@@ -344,18 +345,25 @@ def normalize_repo_name(name: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
 
 
+def repo_key_db():
+    """Checkout identity belongs to the Mac, so a home/Boat failover must share its cache."""
+    common.ensure_dirs()
+    con = sqlite3.connect(common.STATE / "repo-keys.db", timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, ts REAL)")
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
 def repo_key(root: Path) -> str:
     """Remember the last successful origin lookup per resolved checkout, without caching a guessed name."""
     root = root.resolve()
     cache_key = "repo_key:" + str(root)
     con, remembered = None, None
-    try:
-        con = db()
-        remembered = kv_get(con, cache_key)
-        if not isinstance(remembered, str) or not remembered:
-            remembered = None
-    except (OSError, sqlite3.Error) as error:
-        log(f"repo_key_cache_error {root} operation=read error={type(error).__name__}")
     name, reason = None, None
     try:
         p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=root, capture_output=True,
@@ -374,6 +382,14 @@ def repo_key(root: Path) -> str:
     except Exception:  # noqa: BLE001
         reason = "error"
     try:
+        # Another lookup can commit the origin key while this one waits on git.
+        try:
+            con = repo_key_db()
+            remembered = kv_get(con, cache_key)
+            if not isinstance(remembered, str) or not remembered:
+                remembered = None
+        except (OSError, sqlite3.Error) as error:
+            log(f"repo_key_cache_error {root} operation=read error={type(error).__name__}")
         if reason:
             used = remembered or normalize_repo_name(root.name)
             log(f"repo_key_fallback {root} reason={reason} used={used}")
