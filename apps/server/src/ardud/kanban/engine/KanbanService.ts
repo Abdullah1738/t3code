@@ -1335,6 +1335,16 @@ interface EffectSink {
 const effectSink = Context.Reference<EffectSink | undefined>("KanbanEffectSink", {
   defaultValue: () => undefined,
 });
+interface BoardPublication {
+  readonly boardId: KanbanBoard["id"];
+  readonly change: KanbanChange;
+}
+const publicationSink = Context.Reference<Array<BoardPublication> | undefined>(
+  "KanbanPublicationSink",
+  {
+    defaultValue: () => undefined,
+  },
+);
 
 /**
  * Dispatch kicks asked for by a tick's own steps. The tick dispatches as its last
@@ -1984,10 +1994,7 @@ const make = Effect.gen(function* () {
     effect: Effect.Effect<A, E, R>,
   ) => serialEach(all, key, effect);
 
-  const changes = yield* PubSub.unbounded<{
-    readonly boardId: KanbanBoard["id"];
-    readonly change: KanbanChange;
-  }>();
+  const changes = yield* PubSub.unbounded<BoardPublication>();
   const jobs = yield* Queue.unbounded<Job>();
   const kickPending = yield* Ref.make(false);
   /**
@@ -2125,7 +2132,12 @@ const make = Effect.gen(function* () {
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
   const publish = (boardId: KanbanBoard["id"], change: KanbanChange) =>
-    PubSub.publish(changes, { boardId, change });
+    Effect.flatMap(publicationSink, (sink) => {
+      if (sink === undefined)
+        return PubSub.publish(changes, { boardId, change }).pipe(Effect.asVoid);
+      sink.push({ boardId, change });
+      return Effect.void;
+    });
 
   // Announced so thread lists can leave the board's threads out as they start.
   const linkThread = Effect.fn("KanbanService.linkThread")(function* (
@@ -8274,6 +8286,7 @@ const make = Effect.gen(function* () {
     cardId?: string,
     turnEnd?: KanbanThreadLink,
   ) {
+    yield* Effect.annotateCurrentSpan({ "kanban.board_id": boardId, "kanban.tick_step": step });
     return yield* locks.step(effect, cardId).pipe(
       Effect.map(Option.some),
       Effect.catchDefect((defect) =>
@@ -8293,6 +8306,182 @@ const make = Effect.gen(function* () {
             ...(turnEnd ? { threadId: turnEnd.threadId, committed: defect.committed } : {}),
           });
           return Option.none<A>();
+        }),
+      ),
+    );
+  });
+
+  const overdueWaitWarnings = new Map<string, string>();
+  const localWaitPasses = new Set<string>();
+  // These checks only need board state. In particular, do not put them behind
+  // evaluator delivery, thread reads, or the running maintenance tick's guard.
+  const tickLocalWaits = Effect.fn("KanbanService.tickLocalWaits")(function* (boardId: string) {
+    if (!Waits.WAITS_ENGINE_WIRED || localWaitPasses.has(boardId)) return;
+    localWaitPasses.add(boardId);
+    const started = yield* nowMillis;
+    const stats = { parked: 0, checked: 0, ended: 0, expired: 0, failed: 0, overdue: 0 };
+    const checkedCards: number[] = [];
+    const failedCards: number[] = [];
+    const overdueCards: number[] = [];
+    yield* Effect.gen(function* () {
+      const board = yield* store.board(KanbanBoardId.make(boardId));
+      if (!board || board.archivedAt !== null) return;
+      const all = yield* store.cards(board.id);
+      const parked = all.filter((card) => card.wait !== undefined && card.activeThreadId === null);
+      stats.parked = parked.length;
+      const facts: Waits.WaitFacts = {
+        nowMs: started,
+        prs: [],
+        cards: new Map(all.map((card) => [card.id as string, card])),
+      };
+      const pending = new Map(parked.map((card) => [card.id, card]));
+      const deliveryLanes = new Set<string>();
+      for (const card of all) {
+        if (card.wait?.on !== "time") overdueWaitWarnings.delete(card.id);
+      }
+      for (const card of parked) {
+        if (card.wait?.on !== "time" && card.wait?.on !== "card" && card.wait?.on !== "owner_go")
+          continue;
+        stats.checked += 1;
+        checkedCards.push(card.number);
+        const quiet = Waits.resolveWait(
+          card,
+          facts,
+          {
+            chainLength: Rules.chainFor(board, card)?.steps.length ?? 1,
+          },
+          yield* nowIso,
+        );
+        if (quiet._tag === "none" || (quiet._tag === "hold" && quiet.save === null)) continue;
+        const outcome = yield* Effect.result(
+          tickStep(
+            boardId,
+            "localWait",
+            Effect.gen(function* () {
+              const freshBoard = yield* boardOf(boardId);
+              if (freshBoard.archivedAt !== null) return "none";
+              const current = yield* store.card(card.id);
+              if (!current || current.activeThreadId !== null || current.wait === undefined)
+                return "none";
+              // The wait may have been replaced since planning, including by a PR wait.
+              if (
+                current.wait.on !== "time" &&
+                current.wait.on !== "card" &&
+                current.wait.on !== "owner_go"
+              )
+                return "none";
+              const cards = new Map(facts.cards);
+              for (const id of new Set([
+                ...(current.wait.card === null ? [] : [current.wait.card]),
+                ...current.blockedBy,
+              ])) {
+                const dependency = yield* store.card(KanbanCardId.make(id));
+                if (dependency) cards.set(id, dependency);
+                else cards.delete(id);
+              }
+              const now = yield* nowMillis;
+              const resolved = Waits.resolveWait(
+                current,
+                { ...facts, nowMs: now, cards },
+                {
+                  chainLength: Rules.chainFor(freshBoard, current)?.steps.length ?? 1,
+                },
+                yield* nowIso,
+              );
+              // Save the ended wait and its notification together. Delivery must
+              // never keep the next local check behind thread I/O.
+              const sink: EffectSink = { effects: [], closed: false };
+              const publications: Array<BoardPublication> = [];
+              const lanes = yield* boardSql.withTransaction(
+                Effect.gen(function* () {
+                  yield* applyWaitStep(resolved, { _tag: "system", component: "waits" });
+                  return yield* saveEffectRows(sink.effects);
+                }).pipe(
+                  Effect.provideService(effectSink, sink),
+                  Effect.provideService(publicationSink, publications),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      sink.closed = true;
+                    }),
+                  ),
+                ),
+              );
+              // Consumers can read or run scripts as soon as a change is published.
+              // Nothing from a rolled-back wait or discussion may reach them.
+              for (const publication of publications)
+                yield* publish(publication.boardId, publication.change);
+              for (const lane of lanes) deliveryLanes.add(lane);
+              return resolved._tag;
+            }),
+            card.id,
+          ),
+        );
+        if (Result.isFailure(outcome) || Option.isNone(outcome.success)) {
+          stats.failed += 1;
+          failedCards.push(card.number);
+        } else if (outcome.success.value === "end") {
+          stats.ended += 1;
+          pending.delete(card.id);
+        } else if (outcome.success.value === "expire") {
+          stats.expired += 1;
+          pending.delete(card.id);
+        }
+        if (Result.isFailure(outcome) || Option.isNone(outcome.success)) {
+          const persisted = yield* store.card(card.id);
+          if (persisted) pending.set(card.id, persisted);
+          else pending.delete(card.id);
+        }
+      }
+      // Read persisted state: an attempted end whose save failed is still overdue
+      // and is retried from the row on the next tick, with no in-memory completion.
+      const now = yield* nowMillis;
+      for (const card of pending.values()) {
+        const wait = card.wait;
+        if (wait?.on !== "time" || card.activeThreadId !== null || wait.expiredAt !== null)
+          continue;
+        const overdueMs = now - Date.parse(wait.until ?? "");
+        if (overdueMs > 2 * 60_000) overdueCards.push(card.number);
+        if (overdueMs > 5 * 60_000 && overdueWaitWarnings.get(card.id) !== wait.at) {
+          overdueWaitWarnings.set(card.id, wait.at);
+          yield* Effect.logWarning("kanban time wait overdue", {
+            boardId,
+            card: card.number,
+            until: wait.until,
+            overdueMs,
+          });
+        }
+      }
+      stats.overdue = overdueCards.length;
+      for (const lane of deliveryLanes) yield* triggerOwnerDrain(lane);
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban local wait pass failed", { boardId, cause }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              stats.failed += 1;
+            }),
+          ),
+        ),
+      ),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          const durationMs = (yield* nowMillis) - started;
+          yield* Effect.annotateCurrentSpan({
+            "kanban.board_id": boardId,
+            ...stats,
+            durationMs,
+            overdueCards,
+          });
+          yield* Effect.logInfo("kanban wait pass", {
+            boardId,
+            scope: "local",
+            ...stats,
+            durationMs,
+            checkedCards,
+            failedCards,
+            overdueCards,
+          });
+          localWaitPasses.delete(boardId);
         }),
       ),
     );
@@ -9497,7 +9686,12 @@ const make = Effect.gen(function* () {
             // ended is cleared here, before the PRs-landed step below.
             const parked = Waits.WAITS_ENGINE_WIRED
               ? (yield* cardsForPlan).filter(
-                  (card) => card.wait !== undefined && card.activeThreadId === null,
+                  (card) =>
+                    card.wait !== undefined &&
+                    card.activeThreadId === null &&
+                    card.wait.on !== "time" &&
+                    card.wait.on !== "card" &&
+                    card.wait.on !== "owner_go",
                 )
               : [];
             if (parked.length > 0) {
@@ -9775,23 +9969,31 @@ const make = Effect.gen(function* () {
     boardId: string,
     turnEndLinks: ReadonlyMap<string, KanbanThreadLink>,
   ) {
-    if (runningTicks.has(boardId)) return;
-    runningTicks.add(boardId);
+    yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
+    const busy = runningTicks.has(boardId);
+    if (!busy) runningTicks.add(boardId);
     const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
-    yield* serialEach(ticking, boardId, tickSteps(boardId, turnEndLinks), false).pipe(
+    yield* tickLocalWaits(boardId).pipe(
+      Effect.andThen(
+        busy ? Effect.void : serialEach(ticking, boardId, tickSteps(boardId, turnEndLinks), false),
+      ),
       Effect.provideService(tickKicks, kicks),
       Effect.ensuring(
         Effect.sync(() => {
           kicks.held = false;
         }),
       ),
-      Effect.andThen(dispatchUnlocked(boardId, kicks.stoppedCards)),
+      Effect.andThen(
+        busy
+          ? Effect.suspend(() => (kicks.asked ? kick : Effect.void))
+          : dispatchUnlocked(boardId, kicks.stoppedCards),
+      ),
       Effect.onExit((exit) =>
         Effect.suspend(() => (Exit.isSuccess(exit) || !kicks.asked ? Effect.void : kick)),
       ),
       Effect.ensuring(
         Effect.sync(() => {
-          runningTicks.delete(boardId);
+          if (!busy) runningTicks.delete(boardId);
         }),
       ),
     );
@@ -11906,10 +12108,8 @@ const make = Effect.gen(function* () {
       return;
     }
     // The wait ended and the card is held for its evaluator (`deciding`): the hold is
-    // part of this write, so it starts here, whenever the evaluator is told. A deferred
-    // write's note is sent by its lane's drain, which marks the card told once it has
-    // been. From the tick the note is sent below in this same operation, so the card
-    // is saved as told: a tick that cannot write again after sending leaves it right.
+    // part of this write. A queued note's drain marks the card told after delivery.
+    // Inline callers mark it now because they may not be able to save after sending.
     const decides = step._tag === "end" && step.card.deciding !== undefined;
     const sink = yield* effectSink;
     const sentHere = sink === undefined || sink.closed;
@@ -11928,7 +12128,7 @@ const make = Effect.gen(function* () {
     yield* saveCard(card);
     if (step.wake.to === "evaluator") {
       // A thread follow-on like any other: saved and sent by its lane's drain
-      // under `guardDeferred`, sent here (outside the gate) from the tick.
+      // under a deferred write or local wait pass; inline callers send outside the gate.
       const text = step.wake.text;
       const discussion = yield* cardDiscussionUnlocked(step.card.id);
       // A card left in review with nobody on it is the evaluator's to decide. There the
