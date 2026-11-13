@@ -1128,6 +1128,9 @@ NO_REFUND = dict(REFUND, id=302, sender='Dean Lewis <Dean.Lewis@digicert.com>',
 
 
 def read(row, deadline=None, **_):
+    if row.get('source') == 'email':
+        return (f"Account: fixture   Folder: INBOX\nDate: fixture\nFrom: {row.get('sender', '')}\n"
+                f"To: owner@example.test\nSubject: {row.get('subject', '')}\nFile: -\n\n{row.get('body', '')}")
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
 
 
@@ -1329,6 +1332,55 @@ class Questions(Base):
                 self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8,
                                                finder(REFUND, newest)), [])
                 self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], 303)
+
+    def test_refund_negation_survives_money_number_and_wrapped_line_formats(self):
+        amounts = ('USD 864.00', 'USD 1,864.00', 'USD 864,00', 'USD 1.864,00',
+                   'USD 0.50', 'USD 864.5', '$864.00', '864.00 USD', 'USD 864.00\n')
+        for i, amount in enumerate(amounts):
+            with self.subTest(amount=amount):
+                self.data = self.tmp / f'negative-amount-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm whether the {amount} refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_completion_requires_authored_body_not_mail_headers(self):
+        pending = 'Your request is still pending. We will contact you when there is an update.'
+        subject = 'RE: Refund processed?'
+        rows = [
+            ('archive', read(dict(REFUND, subject=subject, body=pending)), False),
+            ('header-only', f'Subject: {subject}\n\n{pending}', False),
+            ('folded-subject', f'Subject: RE:\n Refund processed?\n\n{pending}', False),
+            ('crlf', read(dict(REFUND, subject=subject, body=pending)).replace('\n', '\r\n'), False),
+            ('no-body', f'Subject: {subject}', False),
+            ('other-header', f'From: Refund processed <ar@digicert.com>\nSubject: Update\n\n{pending}', False),
+            ('affirmative-body', read(dict(REFUND, subject=subject, body='Your refund was processed.')), True),
+            ('question-body', read(dict(REFUND, subject='Status', body='Was your refund processed?')), False),
+            ('bare-body', 'Your refund was processed.', True),
+        ]
+        for label, shown, matches in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('header-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND),
+                                read=lambda row, deadline: shown)
+                case = mc.load(self.data)['cases'][0]
+                if matches:
+                    self.assertEqual(case['refund_mail']['id'], REFUND['id'])
+                else:
+                    self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_ends_at_sentence_punctuation(self):
+        for i, punctuation in enumerate(('.', '!', '?', ';')):
+            with self.subTest(punctuation=punctuation):
+                self.data = self.tmp / f'positive-sentence-{i}'
+                self.refund_case()
+                row = dict(REFUND, body=f'We cannot provide an exact arrival date{punctuation} '
+                                       'Your refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertIn('refund_mail', mc.load(self.data)['cases'][0])
 
     def test_refund_lookup_cannot_overwrite_concurrent_case_edit(self):
         self.refund_case()

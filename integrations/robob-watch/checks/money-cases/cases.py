@@ -2829,6 +2829,15 @@ def mark_daily_skip(data, row, reason, now, end, wait_until=None):
         pass
 
 
+def refund_text(shown):
+    text = shown.replace('\r\n', '\n').replace('\r', '\n').lstrip()
+    if charges.HEADER.match(text):
+        # msgs show includes inherited subjects and other metadata before a blank line.
+        parts = re.split(r'\n[ \t]*\n', text, maxsplit=1)
+        text = parts[1] if len(parts) == 2 else ''
+    return QUOTED_REPLY.split(text, maxsplit=1)[0].replace('’', "'")
+
+
 def refund_mails(data, now, deadline, find=None, read=None):
     find, read = find or charges.search, read or charges.show
     errors = []
@@ -2852,9 +2861,12 @@ def refund_mails(data, now, deadline, find=None, read=None):
                             or charges.BANKS.search(sender) or not any(w in sender for w in words)
                             or str(row['id']) == str(case.get('refund_mail', {}).get('id'))):
                         continue
-                    text = QUOTED_REPLY.split(read(row, deadline), maxsplit=1)[0].replace('’', "'")
+                    text = refund_text(read(row, deadline))
                     done = False
-                    for sentence in re.split(r'[.!?;]+', text):
+                    # A decimal point inside an amount cannot end the scope of a negation.
+                    for sentence in re.split(r'(?<=[.!?;])\s+', text):
+                        if sentence.rstrip().endswith('?'):
+                            continue
                         for match in REFUND_DONE.finditer(sentence):
                             verb = next(match.start(name) for name in ('after', 'before', 'credit') if match[name])
                             if not REFUND_NEGATION.search(sentence[:verb]):
