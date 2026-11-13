@@ -708,7 +708,7 @@ export const OrchestratorMcpRequestSecretResult = Schema.Union([
   Schema.Struct({
     status: Schema.Literals(["declined", "cancelled", "timed_out"]).annotate({
       description:
-        "declined: the user chose not to. cancelled: the request ended with the run. timed_out: the user did not answer in time; the card is closed, so ask again with a new clientRequestId if still needed.",
+        "declined: the user chose not to. cancelled: the request ended with the run. timed_out: the response budget expired; card cleanup continues on the server. Ask again with a new clientRequestId if still needed.",
     }),
   }),
 ]);

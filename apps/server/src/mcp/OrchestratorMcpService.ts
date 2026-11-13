@@ -770,36 +770,15 @@ function delegationCommandId(
   );
 }
 
-function stableThreadId(input: {
-  readonly scope: McpInvocationScope;
-  readonly requestKey: string;
-  readonly index: number;
-}): ThreadId {
-  return ThreadId.make(
-    [
-      "thread",
-      "mcp",
-      stablePart(requestIdentity(input.scope)),
-      stablePart(input.requestKey),
-      String(input.index),
-    ].join(":"),
-  );
-}
-
-function stableMessageId(input: {
-  readonly scope: McpInvocationScope;
-  readonly requestKey: string;
-  readonly index: number;
-}): MessageId {
-  return MessageId.make(
-    [
-      "message",
-      "mcp",
-      stablePart(requestIdentity(input.scope)),
-      stablePart(input.requestKey),
-      String(input.index),
-    ].join(":"),
-  );
+function threadCreationIds(namespace: string, requestKey: string, index: number) {
+  const identity = stablePart(namespace);
+  const key = stablePart(requestKey);
+  return {
+    commandId: (operation: string) =>
+      CommandId.make(`command:mcp:${identity}:${operation}:${key}:${index}`),
+    threadId: ThreadId.make(`thread:mcp:${identity}:${key}:${index}`),
+    messageId: MessageId.make(`message:mcp:${identity}:${key}:${index}`),
+  };
 }
 
 function stableOperationMessageId(input: {
@@ -1177,6 +1156,27 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
+
+  const creationNamespaces = Effect.fn("OrchestratorMcpService.creationNamespaces")(function* (
+    scope: McpThreadInvocationScope,
+  ) {
+    const records = yield* threadManagement
+      .getThreadRecords(scope.thread.threadId, ["turnItems"], {
+        turnItemTypes: ["thread_created"],
+        messageRoles: [],
+      })
+      .pipe(Effect.mapError(threadManagementFailure));
+    const namespaces = new Set([scope.requestNamespace]);
+    for (const item of records.turnItems ?? []) {
+      if (item.type !== "thread_created") continue;
+      const parts = item.targetThreadId.split(":");
+      if (parts.length !== 5 || parts[0] !== "thread" || parts[1] !== "mcp") continue;
+      // Only this parent's creation records can supply another credential's namespace.
+      const decoded = yield* Effect.try(() => decodeURIComponent(parts[2]!)).pipe(Effect.option);
+      if (Option.isSome(decoded)) namespaces.add(decoded.value);
+    }
+    return [...namespaces];
+  });
 
   const loadProjectThread = (
     projectId: OrchestrationV2ThreadProjection["thread"]["projectId"],
@@ -2429,128 +2429,122 @@ const make = Effect.gen(function* () {
     ),
     requestSecret: Effect.fn("OrchestratorMcpService.requestSecret")(function* (scope, input) {
       const waitStartedAt = yield* Clock.monotonicTimeNanos;
-      const { scope: threadScope, parent } = yield* loadThreadCaller(scope, "request_secret");
-      const threadId = threadScope.thread.threadId;
-      const run = ThreadManagementService.latestActiveRun(
-        yield* loadProjection(parent.thread.id, ["runs"]),
-      );
-      if (
-        run === undefined ||
-        run.rootNodeId === null ||
-        run.providerInstanceId !== threadScope.thread.providerInstanceId
-      ) {
-        return yield* failure(
-          "parent_not_active",
-          "Asking for a secret requires an active run owned by this MCP provider session.",
+      let closeCard = Effect.void;
+      const request = Effect.gen(function* () {
+        const { scope: threadScope, parent } = yield* loadThreadCaller(scope, "request_secret");
+        const threadId = threadScope.thread.threadId;
+        const run = ThreadManagementService.latestActiveRun(
+          yield* loadProjection(parent.thread.id, ["runs"]),
         );
-      }
-      const runId = run.id;
-      const nodeId = run.rootNodeId;
-      const key = yield* requestKey(input.clientRequestId);
-      const turnItemId = TurnItemId.make(
-        `turn-item:secret-request:${stablePart(threadId)}:${stablePart(key)}`,
-      );
-      const record = (secretStatus: "pending" | "cancelled") =>
-        threadManagement
-          .dispatch({
-            type: "secret_request.record",
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: `secret-${secretStatus}`,
-            }),
-            threadId: threadId,
-            runId,
-            nodeId,
-            turnItemId,
-            label: input.label,
-            reason: input.reason,
-            ...(input.placeholder === undefined ? {} : { placeholder: input.placeholder }),
-            secretStatus,
-          })
-          .pipe(
-            Effect.mapError((error) =>
-              failure(
-                "orchestration_error",
-                `Could not record the secret request: ${errorMessage(error)}`,
-              ),
-            ),
+        if (
+          run === undefined ||
+          run.rootNodeId === null ||
+          run.providerInstanceId !== threadScope.thread.providerInstanceId
+        ) {
+          return yield* failure(
+            "parent_not_active",
+            "Asking for a secret requires an active run owned by this MCP provider session.",
           );
-      yield* record("pending");
-      // Only this call can hand the agent its ref, so the card must not
-      // outlive it: a timeout, a failed wait or an aborted call closes it as
-      // cancelled.
-      const closeCard = record("cancelled").pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("Could not close a secret request card", { error: error.message }),
-        ),
-      );
-
-      const answered = yield* Effect.gen(function* () {
-        while (true) {
-          const projection = yield* threadManagement
-            .getThreadRecords(threadId, ["runs", "turnItems"], {
-              turnItemTypes: ["secret_request"],
-              messageRoles: [],
+        }
+        const runId = run.id;
+        const nodeId = run.rootNodeId;
+        const key = yield* requestKey(input.clientRequestId);
+        const turnItemId = TurnItemId.make(
+          `turn-item:secret-request:${stablePart(threadId)}:${stablePart(key)}`,
+        );
+        const record = (secretStatus: "pending" | "cancelled") =>
+          threadManagement
+            .dispatch({
+              type: "secret_request.record",
+              commandId: stableCommandId({
+                scope,
+                requestKey: key,
+                operation: `secret-${secretStatus}`,
+              }),
+              threadId: threadId,
+              runId,
+              nodeId,
+              turnItemId,
+              label: input.label,
+              reason: input.reason,
+              ...(input.placeholder === undefined ? {} : { placeholder: input.placeholder }),
+              secretStatus,
             })
             .pipe(
               Effect.mapError((error) =>
                 failure(
                   "orchestration_error",
-                  `Unable to read the secret request: ${errorMessage(error)}`,
+                  `Could not record the secret request: ${errorMessage(error)}`,
                 ),
               ),
             );
-          const item = projection.turnItems.find((candidate) => candidate.id === turnItemId);
-          if (item?.type === "secret_request" && item.secretStatus !== "pending") {
-            return item.secretStatus;
+        // A delayed pending commit must finish before cleanup, even when the caller is gone.
+        const pending = yield* record("pending").pipe(Effect.forkIn(serviceScope));
+        closeCard = Fiber.await(pending).pipe(
+          Effect.andThen(record("cancelled")),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Could not close a secret request card", { cause }),
+          ),
+          Effect.asVoid,
+        );
+        yield* Fiber.join(pending);
+        const status = yield* Effect.gen(function* () {
+          while (true) {
+            const projection = yield* threadManagement
+              .getThreadRecords(threadId, ["runs", "turnItems"], {
+                turnItemTypes: ["secret_request"],
+                messageRoles: [],
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  failure(
+                    "orchestration_error",
+                    `Unable to read the secret request: ${errorMessage(error)}`,
+                  ),
+                ),
+              );
+            const item = projection.turnItems.find((candidate) => candidate.id === turnItemId);
+            if (item?.type === "secret_request" && item.secretStatus !== "pending") {
+              return item.secretStatus;
+            }
+            const current = projection.runs.find((candidate) => candidate.id === runId);
+            if (
+              current === undefined ||
+              ThreadManagementService.isTerminalRunStatus(current.status)
+            ) {
+              return "cancelled" as const;
+            }
+            yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
           }
-          const current = projection.runs.find((candidate) => candidate.id === runId);
-          if (
-            current === undefined ||
-            ThreadManagementService.isTerminalRunStatus(current.status)
-          ) {
-            yield* record("cancelled");
-            return "cancelled" as const;
-          }
-          yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
+        });
+        if (status !== "saved") return { status };
+        const secretRef = yield* secretRequests.savedRef({ threadId, turnItemId });
+        if (Option.isNone(secretRef)) {
+          return yield* failure(
+            "orchestration_error",
+            "The user saved the secret, but it could not be read. Ask again with a new clientRequestId.",
+          );
         }
-      }).pipe(
+        return { status, secretRef: secretRef.value };
+      });
+      const response = yield* request.pipe(
+        McpDeadline.awaitInterruptibly,
         Effect.timeoutOption(
           Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
         ),
-        Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : closeCard)),
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) &&
+          Option.isSome(exit.value) &&
+          (exit.value.value.status === "saved" || exit.value.value.status === "declined")
+            ? Effect.void
+            : closeCard.pipe(Effect.forkIn(serviceScope), Effect.asVoid),
+        ),
       );
-      if (Option.isNone(answered)) yield* closeCard;
-      const status = Option.isSome(answered)
-        ? answered.value
-        : yield* threadManagement
-            .getThreadRecords(threadId, ["turnItems"], {
-              turnItemTypes: ["secret_request"],
-              messageRoles: [],
-            })
-            .pipe(
-              Effect.map((records) => {
-                const item = records.turnItems.find((candidate) => candidate.id === turnItemId);
-                return item?.type === "secret_request" &&
-                  (item.secretStatus === "saved" || item.secretStatus === "declined")
-                  ? item.secretStatus
-                  : ("timed_out" as const);
-              }),
-              Effect.orElseSucceed(() => "timed_out" as const),
-            );
-      yield* Effect.annotateCurrentSpan({ "secret_request.status": status });
-      yield* Metrics.increment(Metrics.secretRequestsTotal, { status });
-      if (status !== "saved") return { status };
-      const secretRef = yield* secretRequests.savedRef({ threadId: threadId, turnItemId });
-      if (Option.isNone(secretRef)) {
-        return yield* failure(
-          "orchestration_error",
-          "The user saved the secret, but it could not be read. Ask again with a new clientRequestId.",
-        );
-      }
-      return { status, secretRef: secretRef.value };
-    }),
+      const result = Option.isSome(response) ? response.value : { status: "timed_out" as const };
+      yield* Effect.annotateCurrentSpan({ "secret_request.status": result.status });
+      yield* Metrics.increment(Metrics.secretRequestsTotal, { status: result.status });
+      return result;
+    }, untilShutdown),
 
     capabilities: Effect.fn("OrchestratorMcpService.capabilities")(function* (scope) {
       const { parent, limits } = yield* loadCaller(scope);
@@ -2632,7 +2626,7 @@ const make = Effect.gen(function* () {
         "caller",
         loadThreadCaller(callerScope, "delegate_task"),
       );
-      const parentRecords = yield* bounded("caller", loadProjection(parent.thread.id, ["runs"]));
+      const parentRecords = yield* bounded("caller", loadProjection(parent.thread.id, ["runs", "subagents"]));
       const parentRun = parentRecords.runs
         .filter(ThreadManagementService.isActiveRun)
         .toSorted((left, right) => right.ordinal - left.ordinal)[0];
@@ -2649,7 +2643,7 @@ const make = Effect.gen(function* () {
       const providers = yield* bounded("catalog", loadProviders);
       const key = yield* bounded("request_key", requestKey(input.clientRequestId));
       retryKey = key;
-      const commandId = delegationCommandId(scope, parent, key);
+      const commandId = delegationCommandId(scope, parentRecords, key);
       const isRetryOfAcceptedDelegation = yield* bounded(
         "receipt",
         threadManagement.hasReceipt(commandId),
@@ -3099,21 +3093,22 @@ const make = Effect.gen(function* () {
         const parentNodeId = parentRun.rootNodeId;
         const providers = yield* loadProviders;
         const key = yield* requestKey(input.clientRequestId);
+        const legacyNamespaces = yield* Effect.cached(creationNamespaces(scope));
         const created = yield* Effect.forEach(
           input.threads,
           (request, index) =>
             Effect.gen(function* () {
-              const commandId = stableCommandId({
-                scope,
-                requestKey: key,
-                operation: "create-thread",
-                index,
-              });
-              const threadId = stableThreadId({
-                scope,
-                requestKey: key,
-                index,
-              });
+              let ids = threadCreationIds(requestIdentity(scope), key, index);
+              // Check the old receipt family before creating new thread-scoped work.
+              for (const namespace of yield* legacyNamespaces) {
+                const legacy = threadCreationIds(namespace, key, index);
+                if (yield* threadManagement.hasReceipt(legacy.commandId("create-thread"))) {
+                  ids = legacy;
+                  break;
+                }
+              }
+              const commandId = ids.commandId("create-thread");
+              const threadId = ids.threadId;
               const isRetryOfAcceptedCreation = yield* threadManagement.hasReceipt(commandId);
               const committedThread = isRetryOfAcceptedCreation
                 ? yield* threadManagement
@@ -3181,19 +3176,10 @@ const make = Effect.gen(function* () {
                     type: "message.dispatch",
                     createdBy: "agent",
                     creationSource: "mcp",
-                    commandId: stableCommandId({
-                      scope,
-                      requestKey: key,
-                      operation: "dispatch-thread",
-                      index,
-                    }),
+                    commandId: ids.commandId("dispatch-thread"),
                     threadId,
                     senderThreadId: scope.thread.threadId,
-                    messageId: stableMessageId({
-                      scope,
-                      requestKey: key,
-                      index,
-                    }),
+                    messageId: ids.messageId,
                     text: request.prompt,
                     attachments: [],
                     modelSelection: resolvedModelSelection,
@@ -3215,12 +3201,7 @@ const make = Effect.gen(function* () {
               yield* threadManagement
                 .dispatch({
                   type: "thread.created.record",
-                  commandId: stableCommandId({
-                    scope,
-                    requestKey: key,
-                    operation: "record-created-thread",
-                    index,
-                  }),
+                  commandId: ids.commandId("record-created-thread"),
                   parentThreadId: scope.thread.threadId,
                   parentRunId: parentRun.id,
                   parentNodeId,
