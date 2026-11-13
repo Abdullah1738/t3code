@@ -264,7 +264,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
-A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. CMake and other build systems still need a fresh configure after relocation (for example, `cmake --fresh`).
+A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
 
 ## Housekeeping
 
