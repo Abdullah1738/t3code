@@ -236,9 +236,21 @@ it.effect(
         assert.include(lanes, "background");
         for (const span of reads) {
           assert.isNumber(span["db.lock_wait_ms"]);
+          assert.equal(span["db.reader.acquire_wait_ms"], span["db.lock_wait_ms"]);
+          if (span.name === "sqlite") assert.isNumber(span["db.statement.execution_ms"]);
           assert.isNumber(span["db.reader.slot"]);
         }
         assert.isTrue(reads.some((span) => typeof span["db.reader.hold_ms"] === "number"));
+        const reserved = yield* spanAttributes(
+          Effect.all([
+            SqliteClient.authReadOnly(countEntries(sql)),
+            SqliteClient.identityReadOnly(countEntries(sql)),
+          ]).pipe(Effect.orDie),
+        );
+        for (const span of reserved.filter((span) => span.name === "sqlite")) {
+          assert.isNumber(span["db.reader.acquire_wait_ms"]);
+          assert.isNumber(span["db.statement.execution_ms"]);
+        }
         const transaction = spans.find((span) => span.name === "sql.transaction");
         assert.equal(transaction?.["db.reader.requested_lane"], "foreground");
         assert.equal(transaction?.["db.reader.effective_lane"], "foreground");

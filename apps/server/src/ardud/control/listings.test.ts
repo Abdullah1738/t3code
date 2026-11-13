@@ -237,9 +237,8 @@ const makeHarness = (
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
     yield* seedRows;
-    // Extra shells are real projection rows too, as in production: updatedSince listings read
-    // the changed range from the table and only build shells for what they return.
-    for (const extra of extraShells) {
+    // Light-row listings and shell reads must see the same persisted threads.
+    for (const extra of [...shells, ...extraShells]) {
       yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
         thread_id: extra.id,
         project_id: extra.projectId,
@@ -259,7 +258,7 @@ const makeHarness = (
           archivedAt: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
           updatedAt: DateTime.formatIso(extra.updatedAt),
         }),
-      })}`;
+      })} ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`;
     }
     const snapshotReads = yield* Ref.make(0);
     // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
@@ -327,7 +326,7 @@ const makeHarness = (
                             }),
                           )
                         : sql`SELECT 1`.pipe(
-                            NodeSqliteClient.readOnly,
+                            NodeSqliteClient.authReadOnly,
                             Effect.orDie,
                             Effect.as({
                               sessionId: AuthSessionId.make("session-cli"),
@@ -573,6 +572,42 @@ describe("control listings", () => {
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+  it.live("GET threads limit=1 completes while a background reader and writer are held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-list-latency-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        assert.equal((yield* harness.get("/threads?limit=1")).status, 200);
+        const readerHeld = yield* Deferred.make<void>();
+        const writerHeld = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const hold = (signal: Deferred.Deferred<void>) =>
+          Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
+        const reader = yield* sql
+          .withTransaction(hold(readerHeld))
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
+        yield* Deferred.await(readerHeld);
+        yield* Deferred.await(writerHeld);
+        const response = yield* harness
+          .get("/threads?limit=1")
+          .pipe(
+            Effect.timeout("500 millis"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+        assert.equal(response.status, 200);
+        assert.lengthOf(response.body.threads, 1);
+        assert.equal(yield* Ref.get(harness.snapshotReads), 0);
+        assert.isTrue((yield* Ref.get(harness.targetedReads)).every((ids) => ids.length === 1));
+        yield* Fiber.join(reader);
+        yield* Fiber.join(writer);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
       Effect.gen(function* () {
@@ -603,7 +638,20 @@ describe("control listings", () => {
     ),
   );
 
-  it.effect("keeps the shell snapshot for lists that include idle threads", () =>
+  it.effect("explicit and empty ids load only their requested shells", () =>
+    run(({ threadIds, snapshotReads, targetedReads }) =>
+      Effect.gen(function* () {
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=quiet"), ["quiet"]);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=quiet&active=true"), []);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids="), []);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=missing"), []);
+        assert.equal(yield* Ref.get(snapshotReads), 0);
+        assert.deepStrictEqual(yield* Ref.get(targetedReads), [["quiet"], ["quiet"], ["missing"]]);
+      }),
+    ),
+  );
+
+  it.effect("loads only matching shells for lists that include idle threads", () =>
     run(({ threadIds, snapshotReads }) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* threadIds("/threads?active=false"), [
@@ -622,7 +670,7 @@ describe("control listings", () => {
         assert.deepStrictEqual(yield* threadIds("/threads?archived=true&state=idle,running"), [
           "live-archived",
         ]);
-        assert.strictEqual(yield* Ref.get(snapshotReads), 3);
+        assert.strictEqual(yield* Ref.get(snapshotReads), 0);
       }),
     ),
   );

@@ -1062,7 +1062,7 @@ const makeRoutes = Effect.gen(function* () {
       total: needsState ? shells.length : matched.length - dropped,
       threads: summaries.slice(0, limit),
     });
-  });
+  }, NodeSqliteClient.foregroundReads);
 
   const listThreads = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1085,12 +1085,8 @@ const makeRoutes = Effect.gen(function* () {
     const liveOnly = active === true || (states !== undefined && !states.includes("idle"));
     const origin = params.get("origin");
     const limit = clampInt(params.get("limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-    // ardud: a parentThreadId listing (an agent polling its children) used to build every
-    // shell ever made inside one background reader transaction: 54-89 s on 11 Nov 2026.
-    // That snapshot pinned the WAL, the checkpoint worker hit its backpressure ceiling and
-    // held every writer BEGIN until the read ended (56-87 s writer holds). The range read
-    // takes the light rows in one statement and builds shells only for the children.
-    if ((since !== undefined || parentThreadId !== null) && !liveOnly && ids === undefined) {
+    // Filter light thread rows before loading shells, including the health probe.
+    if (!liveOnly && ids === undefined) {
       return yield* listUpdatedSince({
         location,
         since: since ?? null,
@@ -1104,23 +1100,14 @@ const makeRoutes = Effect.gen(function* () {
         limit,
       });
     }
-    const candidates = liveOnly
-      ? yield* shellsFor(
-          yield* store
-            .liveThreadIds()
-            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
-          location,
-        )
-      : // Every shell ever made: a heavy build, admitted like the HTTP snapshot routes.
-        yield* ReplyBuilders.bounded(
-          threads.getShellSnapshot({ location }).pipe(
-            Effect.map((snapshot) =>
-              location === "archive" ? snapshot.archivedThreads : snapshot.threads,
-            ),
-            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-          ),
-          "snapshot",
-        );
+    const candidates = yield* Effect.gen(function* () {
+      const candidateIds =
+        ids ??
+        (yield* store
+          .liveThreadIds()
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
+      return yield* shellsFor(candidateIds, location);
+    }).pipe(NodeSqliteClient.foregroundReads);
     let shells = candidates.filter(
       (shell) =>
         shell.deletedAt === null &&

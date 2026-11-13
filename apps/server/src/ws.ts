@@ -1034,6 +1034,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
+          bounded: input.acceptShellPages === true,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
