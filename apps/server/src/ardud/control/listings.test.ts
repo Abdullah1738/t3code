@@ -572,41 +572,70 @@ describe("control listings", () => {
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
-  it.live("GET threads limit=1 completes while a background reader and writer are held", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-list-latency-" });
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const harness = yield* makeHarness();
-        assert.equal((yield* harness.get("/threads?limit=1")).status, 200);
-        const readerHeld = yield* Deferred.make<void>();
-        const writerHeld = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const hold = (signal: Deferred.Deferred<void>) =>
-          Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
-        const reader = yield* sql
-          .withTransaction(hold(readerHeld))
-          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
-        const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
-        yield* Deferred.await(readerHeld);
-        yield* Deferred.await(writerHeld);
-        const response = yield* harness
-          .get("/threads?limit=1")
-          .pipe(
+  // All listing forms must keep candidate reads AND summary enrichment on the request lane.
+  for (const query of [
+    "limit=1",
+    "limit=1&active=true",
+    "limit=1&ids=quiet",
+    "limit=1&ids=quiet&active=false",
+    "limit=1&state=idle",
+    "limit=1&updatedSince=2025-01-01T00:00:00.000Z",
+    "limit=1&origin=none",
+    "limit=1&archived=true",
+    "limit=1&includeSubagents=true",
+  ]) {
+    it.live(`GET threads ${query} completes during a long candidate scan and a writer`, () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-list-latency-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const harness = yield* makeHarness();
+          assert.equal((yield* harness.get(`/threads?${query}`)).status, 200);
+          const readerHeld = yield* Deferred.make<void>();
+          const writerHeld = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const hold = (signal: Deferred.Deferred<void>) =>
+            Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
+          // Model the old unbounded candidate scan's held snapshot, without a sleep.
+          const reader = yield* sql
+            .withTransaction(
+              sql`SELECT thread_id, json_extract(payload_json, '$.lineage.parentThreadId')
+                FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL`.pipe(
+                Effect.andThen(hold(readerHeld)),
+              ),
+            )
+            .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+          const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
+          yield* Deferred.await(readerHeld);
+          yield* Deferred.await(writerHeld);
+          yield* Effect.gen(function* () {
+            const responses = yield* Effect.all(
+              [harness.get(`/threads?${query}`), harness.get(`/threads?${query}`)],
+              { concurrency: 2 },
+            );
+            for (const response of responses) {
+              assert.equal(response.status, 200);
+              assert.lengthOf(response.body.threads, 1);
+            }
+            yield* sql`SELECT 1`.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
+            assert.isUndefined(reader.pollUnsafe());
+            assert.isUndefined(writer.pollUnsafe());
+            assert.equal(yield* Ref.get(harness.snapshotReads), 0);
+            assert.isTrue(
+              (yield* Ref.get(harness.targetedReads)).every((ids) => ids.length <= 128),
+            );
+          }).pipe(
             Effect.timeout("500 millis"),
             Effect.ensuring(Deferred.succeed(release, undefined)),
           );
-        assert.equal(response.status, 200);
-        assert.lengthOf(response.body.threads, 1);
-        assert.equal(yield* Ref.get(harness.snapshotReads), 0);
-        assert.isTrue((yield* Ref.get(harness.targetedReads)).every((ids) => ids.length === 1));
-        yield* Fiber.join(reader);
-        yield* Fiber.join(writer);
-      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
+          yield* Fiber.join(reader);
+          yield* Fiber.join(writer);
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
@@ -846,6 +875,60 @@ describe("control listings", () => {
           });
           assert.deepStrictEqual(yield* list("&origin=none&limit=1"), { total: 2, ids: ["new-1"] });
           assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        }),
+      undefined,
+      extra,
+    );
+  });
+
+  it.effect("candidate pages preserve totals and limits across state and origin filters", () => {
+    const extra = Array.from({ length: 270 }, (_, i) =>
+      shell(`batch-${String(i).padStart(3, "0")}`, {
+        ...(i % 2 === 0 ? idle : {}),
+        updatedAt: DateTime.makeUnsafe("2026-03-01T00:00:00.000Z"),
+      }),
+    );
+    return run(
+      ({ get, sql }) =>
+        Effect.gen(function* () {
+          for (let i = 0; i < extra.length; i += 3) {
+            yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+          VALUES (${extra[i]!.id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+          }
+          const cases = [
+            { suffix: "&limit=200", total: 270, length: 200, first: ["batch-000", "batch-001"] },
+            {
+              suffix: "&state=idle&limit=2",
+              total: 135,
+              length: 2,
+              first: ["batch-000", "batch-002"],
+            },
+            {
+              suffix: "&origin=imessage&limit=2",
+              total: 90,
+              length: 2,
+              first: ["batch-000", "batch-003"],
+            },
+            {
+              suffix: "&state=idle&origin=imessage&limit=2",
+              total: 45,
+              length: 2,
+              first: ["batch-000", "batch-006"],
+            },
+          ];
+          for (const row of cases) {
+            const response = yield* get(
+              `/threads?updatedSince=2026-02-01T00:00:00.000Z${row.suffix}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, row.total, row.suffix);
+            const ids = (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+              (thread) => thread.threadId,
+            );
+            assert.lengthOf(ids, row.length);
+            assert.equal(new Set(ids).size, row.length);
+            assert.deepEqual(ids.slice(0, 2), row.first);
+          }
         }),
       undefined,
       extra,
