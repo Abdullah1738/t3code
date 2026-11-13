@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
@@ -448,25 +448,22 @@ def _fit_new(sz: str, size: str | None) -> str:
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
     """-> (sandbox dict, source label, base_remote_dir or None, size).
 
-    Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
-    deleted the template's data."""
+    Source "recipe:<template>" is a box that _bring_up builds when this backend has no usable template."""
     from . import home
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
     name = box_name(me, rk)
-    fresh_on_standby = False
     if not fresh:
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
+                # Saved on the home server, which is down: Boat never had it.
                 say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
                 base = None
-                fresh_on_standby = True
             elif not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
@@ -474,7 +471,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                                f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
             if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
                 say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
         if brow:
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
@@ -488,24 +485,21 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
         # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
-        # which would mark it gone. Such a caller starts from a fresh box instead.
+        # which would mark it gone. Such a caller builds its own box from the recipe instead.
         trow = con.execute(f"SELECT * FROM templates WHERE name=? AND {mine()}", (tname,)).fetchone()
-        if not trow and tname != "generic":
-            trow = con.execute(f"SELECT * FROM templates WHERE name='generic' AND {mine()}").fetchone()
-            if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
-                say(f"template {tname} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
-            elif trow:
-                say(f"template {tname} not built yet; using generic")
+        sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
         if trow:
-            sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
             s = _start_from(con, "templates", trow, sz, name, idem)
             if s:
                 return s, f"template:{trow['name']}", None, sz
             say(f"template {trow['name']} is gone (boat deleted its data); building this box from its recipe "
                 f"instead, which takes a few minutes. The reaper rebuilds the template.")
-            s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
-            return s, f"recipe:{trow['name']}", None, sz
+        else:
+            backend = "home server" if api.BACKEND == "server" else "boat.dev"
+            say(f"template {tname} not built on the {backend}; building this box from its recipe (a few minutes). "
+                f"offbox template build {tname} makes the next one fast.")
+        s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
+        return s, f"recipe:{tname}", None, sz
     sz = _fit_new(size or DEFAULT_SIZE.get(tname or "generic", "default"), size)
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
@@ -517,15 +511,20 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 RECIPE_TIMEOUT_S = 15 * 60
 
 
+def quarantine(box_id: str, why: str) -> None:
+    con = db()
+    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
+    event(con, box_id, "lease_quarantined", why[:300])
+    con.commit()
+
+
 def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
     """A box whose recipe did not finish cleanly is never handed out or reused: it may be half built, or its recipe
     may still be changing it. Quarantine it (pools and reuse only take running/stopped leases), stop the recipe, and
     delete the box: deletion is the one proof the recipe can no longer touch it. A failed delete leaves the lease
     quarantined and the reaper deletes it on a later pass. True once deleted."""
+    quarantine(box_id, why)
     con = db()
-    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
-    con.commit()
-    event(con, box_id, "lease_quarantined", why[:300])
     if pid is not None:
         try:
             api.cmd_kill(box_id, pid)
@@ -870,6 +869,7 @@ class BoxNotReady(OffboxError):
     def __init__(self, box_id: str, state: dict, cause: OffboxError):
         super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
                          code=cause.code, started=cause.started, outage=cause.outage)
+        self.status = getattr(cause, 'status', None)
         self.box_id, self.state = box_id, state
 
 
@@ -883,6 +883,10 @@ class ResumeUnresolved(OffboxError):
 
 class ResumeProvisionStalled(OffboxError):
     """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+    def __init__(self, message):
+        from . import home
+        super().__init__(message, outage=home.may_fail_over())
 
 
 def _wait_unanswered_resume(con, box_id):
@@ -1214,7 +1218,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         return None
     st = s.get("state")
     if st in api.STOPPING_STATES:
-        raise ArchivingSkip(f"{box_id} is {st}; skipping it for now", code=EXIT_BUSY)
+        queued = skip_archiving or allocation.in_queue()
+        action = "skipping it for now" if queued else "retry in a moment"
+        raise ArchivingSkip(f"{box_id} is {st}; {action}", code=EXIT_BUSY if queued else EXIT_INFRA)
     if st == "archiving":
         if skip_archiving or allocation.in_queue():
             action = "skipping it for now" if skip_archiving else "waiting to resume it"

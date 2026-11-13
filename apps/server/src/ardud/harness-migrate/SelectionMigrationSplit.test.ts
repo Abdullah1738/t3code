@@ -66,6 +66,7 @@ const inertThreads = Layer.succeed(
     lastFailure: () => Effect.succeed(null),
     findLastFailure: () => Effect.succeed(null),
     latestRun: () => Effect.succeed(null),
+    runSettled: () => Effect.succeed(true),
     compactRun: () => Effect.succeed(null),
     launch: () => Effect.die("split migration tests launch no thread"),
     send: () => Effect.die("split migration tests send to no thread"),

@@ -1,4 +1,5 @@
 import {
+  type ThreadId,
   isOrchestrationV2WorkActive,
   OrchestrationV2CommandOutputError,
   type OrchestrationV2CommandOutputFrame,
@@ -61,6 +62,7 @@ interface Subscriber {
 export type CommandOutputTarget = OrchestrationV2SubscribeCommandOutputInput;
 
 export interface CommandOutputHubShape {
+  readonly forgetThread: (threadId: ThreadId) => Effect.Effect<void>;
   /** Add raw output for a running command. Called for every provider chunk. */
   readonly append: (input: CommandOutputTarget & { readonly chunk: string }) => Effect.Effect<void>;
   /**
@@ -232,14 +234,21 @@ export const make = Effect.gen(function* () {
           .stream({
             threadId: target.threadId,
             afterSequence: fromSequence,
-            eventType: "turn-item.updated",
           })
           .pipe(
-            Stream.runForEach((stored) =>
-              stored.event.type === "turn-item.updated" && stored.event.payload.id === target.itemId
+            Stream.runForEach((stored) => {
+              if (stored.event.type === "thread.item-redacted") {
+                snapshotOutput = undefined;
+                settled = undefined;
+                return projections
+                  .getTurnItem(target)
+                  .pipe(Effect.flatMap((item) => observe(item ?? undefined)));
+              }
+              return stored.event.type === "turn-item.updated" &&
+                stored.event.payload.id === target.itemId
                 ? observe(stored.event.payload)
-                : Effect.void,
-            ),
+                : Effect.void;
+            }),
             // Without its event stream the row can never settle: end with an error
             // instead of waiting forever.
             Effect.catchCause((cause) =>
@@ -332,7 +341,20 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-  return CommandOutputHub.of({ append, finish, subscribe });
+  const forgetThread = Effect.fn("CommandOutputHub.forgetThread")((threadId: ThreadId) =>
+    Effect.sync(() => {
+      const prefix = `${threadId}\u0000`;
+      for (const map of [tails, finished])
+        for (const key of map.keys()) if (key.startsWith(prefix)) map.delete(key);
+      for (const [key, listeners] of subscribers)
+        if (key.startsWith(prefix))
+          for (const subscriber of listeners) {
+            subscriber.pendingAppend = "";
+            subscriber.needsReplace = true;
+          }
+    }),
+  );
+  return CommandOutputHub.of({ append, finish, subscribe, forgetThread });
 });
 
 export const layer: Layer.Layer<

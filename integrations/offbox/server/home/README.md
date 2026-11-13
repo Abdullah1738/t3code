@@ -127,7 +127,8 @@ Owner, 13 Nov 2026: "buy a residential proxy and use that as the exit". `exit-pr
 through one static residential address; everything else still leaves through Mullvad.
 
 - Why only a list: the address is "unlimited" under a fair-use policy, and the server pulls far more than any
-  such policy allows (22 GB in 87 minutes on 13 Nov). The list starts with `dl.google.com` and `go.dev`.
+  such policy allows (22 GB in 87 minutes on 13 Nov). The list starts with `dl.google.com`, `go.dev` and
+  `ftp.gnu.org` (GNU source archives reset TLS from the VPN exit).
   Add a name only when a site refuses the VPN address, then `offbox-exit-proxy reload`.
 - The address: IPRoyal "ISP Dedicated", 1 address, premium ("zero fraud score"), ordered for Germany, registered
   to a UK residential provider (Glide). $5.40 per 30 days, renews by itself on the Marriott card. Account

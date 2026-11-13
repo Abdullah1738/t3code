@@ -122,7 +122,7 @@ describe("board briefs", () => {
 
   it("tells reviewers how to retry a lost verdict", () => {
     expect(reviewBrief(board, card, null, null, [])).toContain(
-      "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
+      "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat within 10 minutes, if the card has not moved since, is acknowledged with a replay note; later calls are refused unless this thread is assigned to the review step):",
     );
   });
 

@@ -12,6 +12,7 @@ import * as Client from "effect/sql/SqlClient";
 import type { Connection } from "effect/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import { identity } from "effect/Function";
+import { annotateSqliteError } from "./nodeSqliteErrors.ts";
 import type { SqliteClientConfig } from "./nodeSqliteClient.ts";
 import { startReaderProcess, type ReaderRuntime } from "./nodeSqliteReaderProcess.ts";
 import { markNotStarted, readerBusy, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
@@ -99,7 +100,7 @@ try {
   db = next;
   parentPort.postMessage({ type: "ready" });
 } catch (error) {
-  parentPort.postMessage({ type: "unavailable", message: String(error && error.message ? error.message : error) });
+  parentPort.postMessage({ type: "unavailable", message: String(error && error.message ? error.message : error), errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code });
 }
 const statements = new Map();
 const prepare = (sql, cached) => {
@@ -161,6 +162,7 @@ type ReaderReply =
   | { readonly id: number; readonly rows: ReadonlyArray<any> }
   | {
       readonly id: number;
+      readonly failure?: SqlError;
       readonly error: {
         readonly operation: "open" | "prepare" | "execute";
         readonly message: string;
@@ -175,9 +177,6 @@ const readerFailureMessages = {
   prepare: "Failed to prepare statement",
   execute: "Failed to execute statement",
 } as const;
-
-const failed = (cause: unknown, message: string, operation: string) =>
-  new SqlError({ reason: classifyError(cause, message, operation) });
 
 // COMMIT, ROLLBACK and ROLLBACK TO SAVEPOINT. On a reader they change nothing,
 // so they succeed once the worker is gone instead of failing the cleanup.
@@ -196,6 +195,20 @@ export const makeAuthReader = Effect.fnUntraced(function* (
   awaitStartup: (started: Promise<ReaderStartup>) => Effect.Effect<ReaderStartup> = (started) =>
     Effect.promise(() => started),
 ) {
+  const failed = (cause: unknown, message: string, operation: string) => {
+    annotateSqliteError(
+      cause,
+      {
+        file: options.filename,
+        role: options.databaseRole ?? "primary",
+        connection: "reserved-reader",
+        operation,
+        span: `sqlite.reserved-reader.${operation}`,
+      },
+      options.errorObserver,
+    );
+    return new SqlError({ reason: classifyError(cause, message, operation) });
+  };
   const snapshotLock = options.readerSnapshotLock ?? (yield* Semaphore.make(1));
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const slowStatementMs = Duration.toMillis(
@@ -390,6 +403,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     };
     worker.on("message", (reply: ReaderReply | ReaderStartup | { readonly started: number }) => {
       if ("type" in reply) {
+        if (reply.type === "unavailable") failed(reply, "Failed to open reader", "open");
         announce(reply);
         if (pending.size === 0) worker.unref();
         return;
@@ -399,6 +413,17 @@ export const makeAuthReader = Effect.fnUntraced(function* (
         if (request !== undefined) request.execAt = performance.now();
         running = reply.started;
         return;
+      }
+      if ("error" in reply) {
+        const { operation, message, ...codes } = reply.error;
+        reply = {
+          ...reply,
+          failure: failed(
+            Object.assign(new Error(message), codes),
+            readerFailureMessages[operation],
+            operation,
+          ),
+        };
       }
       if (running === reply.id) running = undefined;
       const request = pending.get(reply.id);
@@ -488,11 +513,12 @@ export const makeAuthReader = Effect.fnUntraced(function* (
               const { operation, message, ...codes } = reply.error;
               resume(
                 Effect.fail(
-                  failed(
-                    Object.assign(new Error(message), codes),
-                    readerFailureMessages[operation],
-                    operation,
-                  ),
+                  reply.failure ??
+                    failed(
+                      Object.assign(new Error(message), codes),
+                      readerFailureMessages[operation],
+                      operation,
+                    ),
                 ),
               );
             },

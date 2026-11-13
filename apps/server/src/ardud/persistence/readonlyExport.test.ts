@@ -1073,3 +1073,34 @@ test("identical rows are not rewritten into the replica", () => {
     '{"big":false}',
   );
 });
+
+test("incomplete redaction prevents startup and refresh until maintenance completes", () => {
+  const f = fixture();
+  f.source.exec(
+    "CREATE TABLE ardud_thread_redaction_recovery(thread_id TEXT PRIMARY KEY,item_id TEXT,pending INTEGER); INSERT INTO ardud_thread_redaction_recovery VALUES('a','tool',1)",
+  );
+  expect(() => f.exporter.step()).toThrow("incomplete redaction maintenance");
+  expect(() => f.restart()).toThrow("incomplete redaction maintenance");
+  f.source.exec("UPDATE ardud_thread_redaction_recovery SET pending=0");
+  f.restart();
+  f.finish();
+});
+
+test.each(["primary", "replica"] as const)("annotates actual corrupt %s export handles", (role) => {
+  const f = fixture();
+  f.exporter.close();
+  const file =
+    role === "primary"
+      ? NodePath.join(NodePath.dirname(f.options.sourcePath), "bad-source.sqlite")
+      : NodePath.join(NodePath.dirname(f.options.sourcePath), "bad-replica.sqlite");
+  NodeFS.writeFileSync(file, "bad database".repeat(1024));
+  try {
+    createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...f.options,
+      ...(role === "primary" ? { sourcePath: file } : { replicaPath: file }),
+    });
+    throw new Error("expected corruption");
+  } catch (error) {
+    expect(error).toMatchObject({ errcode: 26, sqliteFile: file, sqliteRole: role });
+  }
+});

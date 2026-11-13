@@ -12,6 +12,34 @@ class UnsafeStateDatabase(sqlite3.OperationalError):
     pass
 
 
+class ReplicaNotReady(UnsafeStateDatabase):
+    pass
+
+
+class ReplicaReplaced(sqlite3.OperationalError):
+    pass
+
+
+class _ReplicaConnection(sqlite3.Connection):
+    pass
+
+
+def file_identity(path):
+    info = safe_path(path).stat()
+    return info.st_dev, info.st_ino
+
+
+def ensure_same_file(con, path):
+    if con.replica_identity != file_identity(path):
+        raise ReplicaReplaced("read-only replica inode changed during read")
+
+
+def connection_generation(con, path, *, native=False):
+    ensure_same_file(con, path)
+    updated = native_generation(con) if native else ready_generation(con)
+    return (*con.replica_identity, updated)
+
+
 def state_db(*overrides):
     for key in (*overrides, "ROBOB_READONLY_DB"):
         if os.environ.get(key):
@@ -78,14 +106,23 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
         raise FileNotFoundError(f"Read-only database {path} not found; waiting for owner export") from None
     if not stat.S_ISREG(info.st_mode):
         raise UnsafeStateDatabase("read-only replica must be a regular file")
-    return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout,
-                           check_same_thread=check_same_thread)
+    con = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout,
+                         check_same_thread=check_same_thread, factory=_ReplicaConnection)
+    con.replica_identity = info.st_dev, info.st_ino
+    try:
+        ensure_same_file(con, path)
+    except Exception:
+        con.close()
+        raise
+    return con
 
 
 def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False):
     """The exporter clears ready while paging, then publishes a new watermark."""
     try:
-        metadata = dict(con.execute("SELECT key,value FROM ardud_readonly_meta"))
+        metadata = dict(con.execute(
+            "SELECT key,value FROM ardud_readonly_meta "
+            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation')"))
         if schema_version is not None and metadata.get("schema_version") != schema_version:
             raise ValueError("unsupported export schema")
         if require_destructive and metadata.get("destructive_ready") != "1":
@@ -98,8 +135,15 @@ def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, r
             raise ValueError("timestamp has no timezone")
         age = (datetime.now(timezone.utc) - at).total_seconds()
         if metadata.get("ready") != "1" or not -30 <= age <= max_age:
-            raise ValueError("not ready or stale")
+            raise ReplicaNotReady(
+                f"{source} recall replica not ready (generation {metadata.get('generation', 'unknown')}, "
+                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}); retry later")
+    except ReplicaNotReady:
+        raise
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+        # The lineage retry boundary classifies interrupts as timeouts.
+        if isinstance(exc, sqlite3.OperationalError) and "interrupt" in str(exc).lower():
+            raise
         raise UnsafeStateDatabase(f"{source} read-only replica missing readiness or stale (>{max_age}s); waiting for server export") from exc
     return updated
 
@@ -124,7 +168,10 @@ def refresh_native(con, *, require_destructive=False):
     con.rollback()
     try:
         con.execute("BEGIN")
-        return native_generation(con, require_destructive=require_destructive)
+        generation = native_generation(con, require_destructive=require_destructive)
+        rows = con.execute("PRAGMA database_list").fetchall()
+        ensure_same_file(con, next(row[2] for row in rows if row[1] == "main"))
+        return generation
     except Exception:
         con.rollback()
         raise

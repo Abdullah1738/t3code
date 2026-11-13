@@ -5,6 +5,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  EventId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -566,4 +567,25 @@ it("does not scan every row against every run for a streaming item update", () =
   expect(next?.visibleTurnItems.at(-1)?.item).toBe(payload);
   expect(next?.visibleTurnItems[0]).toBe(projection.visibleTurnItems[0]);
   expect(runReads).toBeLessThanOrEqual(100);
+});
+
+it("removes redacted command output from both item collections", () => {
+  const item = commandItem("redact-fixture", "eyJFAKE.fixture-only");
+  const projection = {
+    ...emptyProjection,
+    turnItems: [item],
+    visibleTurnItems: [
+      { position: 1, visibility: "local", sourceThreadId: threadId, sourceItemId: item.id, item },
+    ],
+  } satisfies OrchestrationV2ThreadProjection;
+  const event = {
+    id: EventId.make("redaction-fixture"),
+    threadId,
+    type: "thread.item-redacted",
+    occurredAt: now,
+    payload: { itemId: item.id, reason: "fixture", at: DateTime.formatIso(now) },
+  } as OrchestrationV2DomainEvent;
+  const next = applyOrchestrationV2ProjectionEvent(projection, event);
+  expect(JSON.stringify(next).includes("eyJFAKE.fixture-only")).toBe(false);
+  expect(next?.turnItems[0]).toMatchObject({ id: item.id, input: "pwd", status: "completed" });
 });

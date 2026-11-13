@@ -130,6 +130,9 @@ def _refused(e: "ApiError", box_id: str | None):
     msg = str(e)
     m = SUPPLY_OUT.search(msg)
     if not m:
+        if 500 <= e.status < 600:
+            from . import home
+            e.outage = e.outage or home.may_fail_over()
         return None
     size = m.group(1).lower()
     capacity.supply_out(size, box_id, msg)
@@ -822,6 +825,7 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
                stale_error: str | None = None, on_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
+    from . import home
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
@@ -836,8 +840,19 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if m and _supply_refusal(s, st, since, stale_error):
             capacity.supply_out(m.group(1).lower(), box_id, s["error"])
             raise SupplyOut(m.group(1).lower(), box_id, s["error"])
-        if st in ("error", "cancelled"):
-            raise OffboxError(f"box {box_id} went to {st}: {s.get('error')}")
+        http_error = re.match(r"^([45]\d{2})\b", s.get("error") or "")
+        status = int(http_error[1]) if http_error else None
+        server_error = status is not None and status >= 500
+        # Home clears the error before acknowledging a resume. A newer stopped error belongs to this attempt;
+        # updatedAt is truncated to milliseconds by the server.
+        failed_resume = (home.may_fail_over() and st in STOPPED_STATES and server_error and since is not None
+                         and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
+        if st in ("error", "cancelled") or failed_resume:
+            failed_start = server_error and (st == "error" or failed_resume)
+            error = OffboxError(f"box {box_id} went to {st}: {s.get('error')}",
+                                outage=failed_start and home.may_fail_over())
+            error.status = status
+            raise error
         if on_state is not None:
             on_state(s)
         if time.time() > deadline:

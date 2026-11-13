@@ -191,9 +191,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
     if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
-    const liveCards = (config.liveCardChats ?? ["owner"]).includes(chat.info.slug);
+    const liveCards = (config.liveCardChats ?? []).includes(chat.info.slug);
     const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
-      liveCards ? {} : { static: true, previewImage: cardPreviewImage() });
+      liveCards ? {} : { static: true, previewImage: cardPreviewImage(file => observed.upload(file)) });
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,

@@ -39,6 +39,11 @@ class ReadonlyTest(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(ro.Path, "home", return_value=self.home).start()
         patch.dict(os.environ, {"HOME": str(self.home)}, clear=True).start()
+        # Keep even guard inode comparisons inside the temporary fixture.
+        live_paths = ro._live_paths
+        patch.object(ro, '_live_paths', side_effect=lambda: {
+            path for path in live_paths() if path.is_relative_to(self.home)
+        }).start()
 
     def make_replica(self):
         with closing(sqlite3.connect(self.replica)) as con, con:
@@ -352,6 +357,7 @@ class RecallReplicaTest(unittest.TestCase):
         patch.object(recall_core, "STATE_DB", self.path).start()
         patch.object(recall_core, "_state_snapshot", None).start()
         patch.object(recall_core, "_state_snapshot_generation", None).start()
+        patch.object(ro, '_live_paths', return_value={Path(self.tmp.name) / 'live.db'}).start()
         self.addCleanup(patch.stopall)
 
     def build(self, path, native, root):

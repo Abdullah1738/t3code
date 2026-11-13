@@ -167,7 +167,7 @@ export class RpcPermissionGuard extends Context.Reference<{
     environmentId: EnvironmentId,
     method: string,
     input: unknown,
-  ) => Effect.Effect<void, EnvironmentAuthorizationError>;
+  ) => Effect.Effect<void, EnvironmentAuthorizationError | EnvironmentRpcUnavailableError>;
 }>("@t3tools/client-runtime/rpc/RpcPermissionGuard", {
   defaultValue: () => ({
     authorize: (_environmentId, method, input) => {

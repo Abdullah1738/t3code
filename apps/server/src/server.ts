@@ -1,3 +1,6 @@
+import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import { redactionRouteLayer } from "./ardud/redaction/http.ts";
 import * as DelegatedTaskProgressGuard from "./orchestration-v2/DelegatedTaskProgressGuard.ts";
 import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -42,6 +45,7 @@ import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
 import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as DatabaseDiagnostics from "./persistence/DatabaseDiagnostics.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as PullRequestFilesViewed from "./persistence/PullRequestFilesViewed.ts";
 import * as PullRequestReviewGuides from "./persistence/PullRequestReviewGuides.ts";
@@ -243,7 +247,11 @@ const layerProviderEventLoggers = Layer.effect(
     );
     if (!store) return ProviderEventLoggers.NoOpProviderEventLoggers;
     yield* Effect.addFinalizer(() => store.close());
-    return { native: store.logger("native"), canonical: store.logger("canonical") };
+    return {
+      native: store.logger("native"),
+      canonical: store.logger("canonical"),
+      withMaintenance: store.withMaintenance,
+    };
   }),
 );
 
@@ -252,9 +260,13 @@ const layerSecrets = ServerSecretStore.layer.pipe(
   StartupPhaseLog.withStartupLayer("server.secrets"),
 );
 
+const layerSqlitePersistence = SqlitePersistence.layerConfig.pipe(
+  Layer.provideMerge(DatabaseDiagnostics.layer),
+);
+
 const layerServerSettings = ServerSettings.layer.pipe(
   Layer.provide(layerSecrets),
-  Layer.provideMerge(SqlitePersistence.layerConfig),
+  Layer.provideMerge(layerSqlitePersistence),
   StartupPhaseLog.withStartupLayer("server.settings"),
 );
 
@@ -339,7 +351,7 @@ const layerHttpServer = Layer.unwrap(
 const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = BoardsDatabase.layerConfig.pipe(
-  Layer.provideMerge(SqlitePersistence.layerConfig),
+  Layer.provideMerge(layerSqlitePersistence),
 );
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
@@ -765,6 +777,8 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    redactionRouteLayer,
+    McpHttpServer.layerRedactionToolkit,
     desktopLeaseRouteLayer,
     harnessCutoverRouteLayer,
     openCodeImportRouteLayer,
@@ -778,6 +792,17 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
 ).pipe(
+  Layer.provide(
+    ThreadRedaction.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ThreadCommandExecutor.layer,
+          EventStoreV2.layerFromOrchestrationEventStore,
+          RuntimeLayer.layerEventSink,
+        ),
+      ),
+    ),
+  ),
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
   ),
