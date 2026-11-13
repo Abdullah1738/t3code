@@ -71,7 +71,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
     owner: "+15555550123", timezone: "Asia/Dubai", chatGuid: ctx.chat.key,
     skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md",
     alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config",
-    context: ctx, ...overrides,
+    context: ctx, medsFold: false, ...overrides,
   });
   const input = (id: string, text: string, sender: string, extra: Partial<NormalizedInbound> = {}) =>
     store.acceptInbound(id, { id, text, sender, attachments: [], isAudioMessage: false, receivedAt: Date.now(), ...extra } satisfies NormalizedInbound);
