@@ -250,7 +250,7 @@ def _trusted_fixture_tool(executable, name, directory):
     return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
 
 
-def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads=False):
+def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads=False, data_helpers=False):
     """The fixture's Python helpers may inspect files, not change its tree."""
     try:
         if tree is None:
@@ -269,15 +269,22 @@ def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads
     if pathlib_reads:
         attributes |= {'Path', 'home', 'read_text', 'read_bytes'}
     functions = {'print', 'len', 'set', 'dict', 'list', 'tuple', 'str', 'int', 'bool', 'all', 'any', 'enumerate', 'range', 'sorted', 'min', 'max', 'open', 'SystemExit'}
+    if data_helpers:
+        attributes |= {'get', 'values', 'setdefault', 'exit', 'dumps'}
+        functions |= {'isinstance', 'Exception', 'Path'}
+        helpers = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+        if any(node.name in functions | modules or node.decorator_list for node in helpers):
+            return False
+        functions.update(node.name for node in helpers)
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)) or isinstance(node, ast.FunctionDef) and not data_helpers:
             return False
         if isinstance(node, ast.Import) and any(n.name not in modules or n.asname in functions for n in node.names):
             return False
         # Imported members can disguise a mutator as an allowed builtin.
         # The generated failure stand-in is the sole wildcard import used by
         # this fixture; ordinary helpers use module-qualified attributes.
-        if isinstance(node, ast.ImportFrom) and not (local_module == node.module == 'fixture_run_limited' and node.level == 0 and len(node.names) == 1 and node.names[0].name == '*' and node.names[0].asname is None):
+        if isinstance(node, ast.ImportFrom) and not (local_module == node.module == 'fixture_run_limited' and node.level == 0 and len(node.names) == 1 and node.names[0].name == '*' and node.names[0].asname is None) and not (data_helpers and node.module == 'pathlib' and node.level == 0 and len(node.names) == 1 and node.names[0].name == 'Path' and node.names[0].asname is None):
             return False
         if isinstance(node, ast.Attribute) and node.attr == 'insert' and (local_module != 'transcript_backup_manifest' or _name(node) != 'sys.path.insert'):
             return False
@@ -285,10 +292,18 @@ def _fixture_python_readonly(source, tree=None, local_module=None, pathlib_reads
             return False
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in functions | modules:
             return False
+        if data_helpers and isinstance(node, ast.arg) and node.arg in functions | modules:
+            return False
+        if data_helpers and isinstance(node, (ast.Global, ast.Nonlocal)):
+            return False
         if isinstance(node, ast.Attribute) and (node.attr not in attributes or isinstance(node.ctx, ast.Store)):
             return False
         if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
-            return False
+            root = node.value
+            while isinstance(root, ast.Subscript):
+                root = root.value
+            if not data_helpers or not isinstance(root, ast.Name) or root.id in functions | modules:
+                return False
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id not in functions:
                 return False
@@ -1386,21 +1401,111 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
     populated_variables = set()
     noclobber = False
 
-    def may_change_scripts(words):
+    def python_preserves_sources(source, directory):
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            return False
+        bindings, strings = {}, set()
+
+        def string_value(node):
+            return (isinstance(node, ast.Constant) and isinstance(node.value, str) or
+                    isinstance(node, ast.Name) and node.id in strings or
+                    isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+                    (node.func.attr == 'read' and isinstance(node.func.value, ast.Call) and _name(node.func.value.func) == 'open' or
+                     node.func.attr == 'replace' and string_value(node.func.value)))
+
+        class StringMethods(ast.NodeTransformer):
+            def visit_Call(self, node):
+                string_replace = isinstance(node.func, ast.Attribute) and node.func.attr == 'replace' and string_value(node.func.value)
+                self.generic_visit(node)
+                if string_replace:
+                    return ast.Tuple(elts=[node.func.value, *node.args, *(k.value for k in node.keywords)], ctx=ast.Load())
+                return node
+
+        for statement in tree.body:
+            # Only straight-line literal destinations can prove that a data
+            # edit leaves remembered scripts alone. Keep all value expressions
+            # in the AST so their side effects still face the read-only check.
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                call = statement.value
+                if isinstance(call.func, ast.Attribute) and call.func.attr in {'write', 'write_text', 'write_bytes'}:
+                    receiver = call.func.value
+                    if call.func.attr == 'write' and isinstance(receiver, ast.Call) and _name(receiver.func) == 'open':
+                        mode = receiver.args[1] if len(receiver.args) > 1 else next((k.value for k in receiver.keywords if k.arg == 'mode'), None)
+                        if not isinstance(mode, ast.Constant) or mode.value not in {'w', 'a', 'wb', 'ab'} or not receiver.args:
+                            return False
+                        destination = _path_expression(receiver.args[0], bindings, {})
+                        values = [*receiver.args, *(k.value for k in receiver.keywords)]
+                    elif call.func.attr in {'write_text', 'write_bytes'}:
+                        destination = _path_expression(receiver, bindings, {})
+                        values = [receiver]
+                    else:
+                        return False
+                    path = _literal_path(destination, directory) if destination is not None else None
+                    if path is None or path in written:
+                        return False
+                    statement.value = ast.Tuple(elts=[*values, *call.args, *(k.value for k in call.keywords)], ctx=ast.Load())
+            literal = None
+            is_string = False
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                literal = _path_expression(statement.value, bindings, {})
+                is_string = string_value(statement.value)
+            statement = StringMethods().visit(statement)
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    bindings.pop(node.id, None)
+                    strings.discard(node.id)
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                name = statement.targets[0].id
+                if literal is not None:
+                    bindings[name] = literal
+                if is_string:
+                    strings.add(name)
+        return _fixture_python_readonly(source, tree=tree, pathlib_reads=True, data_helpers=True)
+
+    def may_change_scripts(words, directory, stdin_sources=()):
         words = list(words)
         while words and (words[0] in {'do', 'then', 'else', 'if', '!'} or re.match(r'^[A-Za-z_]\w*=', words[0])):
             words.pop(0)
         if not words or words[0] in {'for', 'while', 'until', 'done', 'fi'}:
             return False
         binary = os.path.basename(words[0])
-        if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
-            return False
         if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
-            if re.fullmatch(r'python[\d.]*', binary) and '-c' in words:
-                index = words.index('-c')
-                if index + 1 < len(words) and _fixture_python_readonly(words[index + 1], pathlib_reads=True):
+            if re.fullmatch(r'python[\d.]*', binary):
+                args = _interpreter_args(binary, words[1:])
+                while args and args[0] in {'-I', '-E', '-s', '-S', '-B', '-u', '-b', '-bb', '-q'}:
+                    args.pop(0)
+                sources = []
+                if len(args) > 1 and args[0] == '-c':
+                    sources = [args[1]]
+                elif not args or args[0] == '-':
+                    sources = list(stdin_sources)
+                elif not args[0].startswith('-'):
+                    for candidate in script_variants(args[0]):
+                        path = _literal_path(candidate, directory)
+                        if path not in written or path in invalidated_written or LIVE.search(str(path)):
+                            return True
+                        sources.append(written[path][0])
+                        try:
+                            info = path.stat()
+                            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
+                                return True
+                            with path.open('rb') as handle:
+                                opened = os.fstat(handle.fileno())
+                                if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_SOURCE_BYTES:
+                                    return True
+                                contents = handle.read(MAX_SOURCE_BYTES + 1)
+                            if len(contents) > MAX_SOURCE_BYTES:
+                                return True
+                            sources.append(contents.decode('utf-8', errors='replace'))
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            return True
+                if sources and all(python_preserves_sources(source, directory) for source in sources):
                     return False
-            return any(word.startswith(('-c', '-e', '--eval', '-p', '--print')) or binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and re.fullmatch(r'-[a-z]*c[a-z]*', word) for word in words[1:])
+            return True
         # Search writes only to explicit output redirects, checked below.
         if binary == 'linctl' and words[1:3] == ['issue', 'search']:
             return False
@@ -1654,7 +1759,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def inspect(words, directory, depth, bodies, quoted, cwd_only=False):
+    def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False):
         nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_quoted, unsafe_bindings, noclobber
         words = list(words)
         checked = set()
@@ -1794,12 +1899,13 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             opaque_written.clear()
         invocation_written = dict(opaque_written)
         invocation_fresh = set(fresh_variables)
-        # Unknown commands can replace a remembered opaque file. Literal
-        # scripts still have their on-disk contents checked when invoked.
+        # Unknown commands can replace a remembered opaque file. A command
+        # may use its own source proof, but later commands cannot reuse it.
         if binary not in {'cat', 'tee', 'mkdir'}:
             opaque_written.clear()
-        if may_change_scripts(words):
-            invalidated_written.update(written)
+        stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
+        if may_change_scripts(words, directory, stdin_sources):
+            changed_sources.update(written)
             fresh_variables.clear()
         if binary == 'chmod' or binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
             fresh_variables.clear()
@@ -2103,9 +2209,11 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 uncertain = bool(branches) or guarded or concurrent
                 conditional += uncertain
                 uncertain_write += bool(branches) or concurrent or guarded and not safe_chain
+                changed_sources = set()
                 try:
-                    current = inspect(words, current, depth, bodies, quoted, cwd_only=probe) if words else current
+                    current = inspect(words, current, depth, bodies, quoted, changed_sources, cwd_only=probe) if words else current
                 finally:
+                    invalidated_written.update(changed_sources)
                     conditional -= uncertain
                     uncertain_write -= bool(branches) or concurrent or guarded and not safe_chain
                 if before != current:
@@ -2149,7 +2257,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                             group.append(word)
                             continue
                         targets = [group[i + 1] for i, token in enumerate(group[:-1]) if token in {'>', '>>'}]
-                        if may_change_scripts(group):
+                        if may_change_scripts(group, current):
                             invalidated_written.update(written)
                         if group and os.path.basename(group[0]) in {'cp', 'mv', 'rsync', 'ditto', 'tee', 'sed', 'perl', 'truncate'}:
                             targets += group[1:]

@@ -201,6 +201,58 @@ class GuardTests(unittest.TestCase):
             ('D=$(mktemp -d); cat >> "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
         ])
 
+    def test_interpreter_execution_invalidates_prior_source_proofs(self):
+        python = "from pathlib import Path\nPath('tmp/a.py').write_text(Path('tmp/read.py').read_text())\n"
+        javascript = "require('fs').copyFileSync('tmp/read.py', 'tmp/a.py')\n"
+        shell = 'cp tmp/read.py tmp/a.py\n'
+        self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        self.write('tmp/writer.py', python)
+        self.write('tmp/writer.js', javascript)
+        self.write('tmp/writer.sh', shell)
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        invoke = '\npython3 "$D/a.py"'
+        rows = [
+            ('python file', 'python3 tmp/writer.py'),
+            ('python file argv', 'python3 tmp/writer.py -c "print(1)"'),
+            ('python module', 'python3 -m tmp.writer'),
+            ('python stdin', "python3 - <<'PY'\n" + python + 'PY'),
+            ('python stdin argv', "python3 -I - \"$X\" <<'PY'\n" + python + 'PY'),
+            ('python implicit stdin', "python3 <<'PY'\n" + python + 'PY'),
+            ('python redirected stdin', 'python3 - < tmp/writer.py'),
+            ('python piped stdin', 'cat tmp/writer.py | python3 -'),
+            ('python here-string', 'python3 - <<< ' + shlex.quote(python)),
+            ('python inline', 'python3 -c ' + shlex.quote(python)),
+            ('python bound destination', "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/a.py')\np.write_text(Path('tmp/read.py').read_text())\nPY"),
+            ('python unknown destination', "python3 - <<'PY'\nimport sys\nopen(sys.argv[1], 'w').write('print(1)')\nPY"),
+            ('python global destination', "python3 - <<'PY'\ndef change():\n global p\n p='tmp/a.py'\np='tmp/report.txt'\nchange()\nopen(p, 'w').write(open('tmp/read.py').read())\nPY"),
+            ('shell file', 'bash tmp/writer.sh'),
+            ('shell stdin', "bash -s \"$X\" <<'SH'\n" + shell + 'SH'),
+            ('node file', 'node tmp/writer.js'),
+            ('node stdin', "node - <<'JS'\n" + javascript + 'JS'),
+            ('bun file', 'bun run tmp/writer.js'),
+            ('bun stdin', "bun - <<'JS'\n" + javascript + 'JS'),
+            ('deno file', 'deno run tmp/writer.js'),
+            ('deno stdin', "deno run - <<'JS'\nDeno.copyFileSync('tmp/read.py', 'tmp/a.py')\nJS"),
+            ('direct script', './tmp/writer.sh'),
+            ('command wrapper', 'command python3 tmp/writer.py'),
+            ('env wrapper', 'env python3 tmp/writer.py'),
+            ('uv wrapper', 'uv run python3 tmp/writer.py'),
+            ('offbox wrapper', 'offbox run -- python3 tmp/writer.py'),
+            ('loop next iteration', 'for i in one two; do python3 "$D/a.py"; python3 tmp/writer.py; done'),
+        ]
+        for label, writer in rows:
+            with self.subTest(form=label):
+                self.assertEqual(self.classify(prefix + writer + invoke), UNRESOLVED)
+        self.assertIsNone(self.classify(prefix + invoke))
+        self.assertIsNone(self.classify(prefix + 'python3 -I -c "print(1)"' + invoke))
+        other_edit = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/report.txt')\np.write_text('report')\nPY"
+        self.assertIsNone(self.classify(prefix + other_edit + invoke))
+        other_edit_live_read = other_edit.replace("'report'", 'open(' + repr(LIVE) + ').read()')
+        self.assertEqual(self.classify(prefix + other_edit_live_read + invoke), READ)
+        (self.root / 'tmp/report.txt').symlink_to('a.py')
+        self.assertEqual(self.classify(prefix + other_edit + invoke), UNRESOLVED)
+
     def test_exact_variable_script_reporters(self):
         fixtures = Path(__file__).with_name('fixtures') / 'variable-scripts'
         for name in ['card3409', 'card3650', 'card937', 'torssh31']:
