@@ -1,3 +1,4 @@
+import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -37,6 +38,7 @@ function backoff(state: State, interval: number, timedOut: boolean): number {
 
 
 function finish(watcher: Watcher, state: State, status: State["status"]): void {
+  toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: watcher.id }, props: { state: status } });
   state.status = status;
   saveState(watcher.id, state);
   log(watcher.id, `status -> ${status}`);
@@ -48,6 +50,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(watcher, pending.event, pending.key, state);
+  toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: watcher.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!delivery.ok) return false;
   state.fires += 1;
@@ -57,7 +60,10 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
     state.wakes = [...(state.wakes ?? []), { inbound: wakeInboundId(pending.key), key: pending.key, event: pending.event, delivered_at: now() }];
   }
   delete state.pending;
-  if (watcher.max_fires !== 0 && state.fires >= watcher.max_fires) finish(watcher, state, "done");
+  if (watcher.max_fires !== 0 && state.fires >= watcher.max_fires) {
+    toolLog({ component: "runner", kind: "event", name: "watch.fire_cap", ids: { watcher: watcher.id }, props: { count: state.fires } });
+    finish(watcher, state, "done");
+  }
   else saveState(watcher.id, state);
   return true;
 }
@@ -136,7 +142,7 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
   }
 }
 
-async function tickOne(id: string): Promise<void> {
+export async function tickOne(id: string): Promise<void> {
   const watcher = loadWatcher(id);
   if (!watcher) return;
   let state = loadState(id);
@@ -167,6 +173,7 @@ async function tickOne(id: string): Promise<void> {
 
   // An undelivered event is retried before running the check again, so nothing is lost or re-counted.
   if (state.pending) {
+    toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id }, props: { action: "send" } });
     schedule();
     if (!(await deliverPending(watcher, state)) && !held(watcher)) {
       state.next_at = now() + Math.min(watcher.interval_s, 60) * 1_000;
@@ -188,9 +195,13 @@ async function tickOne(id: string): Promise<void> {
     schedule();
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
+    if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
     return runCheck(current, watcherDir(id), { WATCH_RUN: runId }, timeoutMs);
   });
   if (!result) return;
+  const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
+  const failed = runTimedOut || result.code !== 0;
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", exitCode: result.code, queuedMs: Math.max(0, now() - t - result.ms) }, ...(failed ? { error: { tag: runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
   const endLoad = sampleLoad();
   let fresh = loadState(id);
   const current = loadWatcher(id);
@@ -198,7 +209,7 @@ async function tickOne(id: string): Promise<void> {
   fresh.last_run_ms = result.ms;
   const queued = now() - t - result.ms;
   if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s`);
-  const ackRun = () => { try { writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
+  const ackRun = () => { try { writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); } };
   // A shell can exit nonzero while a descendant holds its pipes until the deadline.
   const timedOut = result.timedOut && (result.code === null || result.code === 0);
   if (timedOut || result.code !== 0) {
@@ -231,6 +242,7 @@ async function tickOne(id: string): Promise<void> {
     fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
     log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : ""}`);
     if (shouldPause(watcher, fresh, timedOut)) {
+      toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: id }, props: { action: "pause", count: fresh.consecutive_failures } });
       fresh.failure_paused_at = iso();
       fresh.failure_alerted = false;
       // Commit the pause before sending: a crash or failed send must retry the notice, never the check.
@@ -273,7 +285,10 @@ async function tickOne(id: string): Promise<void> {
   }
   delete fresh.load_timeouts;
   delete fresh.load_timeout_since;
-  if (fresh.consecutive_failures) log(id, `check recovered after ${fresh.consecutive_failures} failures`);
+  if (fresh.consecutive_failures) {
+    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: fresh.consecutive_failures } });
+    log(id, `check recovered after ${fresh.consecutive_failures} failures`);
+  }
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
   delete fresh.failure_escalated;
@@ -290,7 +305,22 @@ async function tickOne(id: string): Promise<void> {
 }
 
 let previousMaintenance: Maintenance | undefined;
-async function tick(): Promise<void> {
+let rollingDay: string | undefined;
+export function previousDayRollup(): void {
+  const at = new Date();
+  if (at.getUTCHours() === 0 && at.getUTCMinutes() < 5) return;
+  const day = new Date(at.getTime() - 86400_000).toISOString().slice(0, 10);
+  if (rollingDay === day) return;
+  rollingDay = day;
+  if (existsSync(join(logDirectory(), `rollup-${day}.json`))) return;
+  // Parsing a day file runs outside the one-second runner tick.
+  try {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "log-rollup", "--day", day], { env: process.env, stdout: "ignore", stderr: "ignore" });
+    void child.exited.then(code => { if (code) toolError("runner", "log.rollup_failed"); }).catch(() => toolError("runner", "log.rollup_failed"));
+  } catch { toolError("runner", "log.rollup_spawn_failed"); }
+}
+export async function tick(): Promise<void> {
+  previousDayRollup();
   sampleLoad();
   const mounted = isMounted(SSD_PATH);
   if (mounted !== ssdMounted) log(null, `SSD ${mounted ? "mounted again" : "missing"}: ${SSD_PATH}`);
@@ -304,19 +334,20 @@ async function tick(): Promise<void> {
   for (const id of listIds()) {
     if (running.has(id)) continue;
     running.add(id);
-    jobs.push(tickOne(id).catch(error => log(id, `runner error: ${String(error).slice(0, 500)}`)).finally(() => running.delete(id)));
+    jobs.push(tickOne(id).catch(error => { toolError("runner", "watch.runner_failed", { watcher: id }); log(id, `runner error: ${String(error).slice(0, 500)}`); }).finally(() => running.delete(id)));
   }
   // Watchers run concurrently; a slow one never delays the next tick of the others.
   void Promise.all(jobs);
 }
 
+if (import.meta.main) {
 ensureDirs();
 // Only one runner at a time, even if launchd and a manual run overlap.
 const pidPath = join(ROOT, "runner.pid");
 const other = Number(existsSync(pidPath) ? readFileSync(pidPath, "utf8").trim() : 0);
 if (other && other !== process.pid) {
   let alive = false;
-  try { process.kill(other, 0); alive = true; } catch { /* stale */ }
+  try { process.kill(other, 0); alive = true; } catch { toolError("runner", "watch.stale_pid"); }
   const command = alive ? Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(other)]).stdout.toString() : "";
   if (alive && command.includes("robob-watch/src/runner.ts")) {
     log(null, `another runner is live (pid ${other}); exiting`);
@@ -325,5 +356,6 @@ if (other && other !== process.pid) {
 }
 writeFileSync(pidPath, `${process.pid}\n`);
 log(null, `robob-watch runner started pid=${process.pid} host load=${hostLoad().toFixed(1)}/core`);
-await tick();
-setInterval(() => void tick(), TICK_MS);
+await tick().catch(() => toolError("runner", "watch.tick_failed"));
+setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
+}

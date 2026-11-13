@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { useToolLogFixture } from "./toollog-fixture.ts";
 import { GrammyError, HttpError } from "grammy";
 import { MAX_TEXT, Telegram, TransportError, classifySendFailure } from "../src/telegram.ts";
 
@@ -46,3 +47,5 @@ test("network-level failures and unknown throws are retryable and uncertain", ()
   expect(classifySendFailure(new Error("PRIVATE_DETAIL")))
     .toEqual({ retryable: true, uncertain: true, code: "unknownSendFailure" });
 });
+
+useToolLogFixture();

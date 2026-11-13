@@ -6,6 +6,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
+import { toolError } from "./toollog.ts";
 
 const COMPONENT = "telegram-bridge";
 const PREFIX = "/api/ardud/control";
@@ -160,12 +161,13 @@ export class ControlClient {
         verbose: false,
       });
     } catch {
+      toolError("telegram", "tg.control.request");
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch { /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch { toolError("telegram", "tg.control.responseJson"); }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
@@ -221,9 +223,10 @@ export class ControlClient {
         verbose: false,
       });
     } catch {
+      toolError("telegram", "tg.control.upload");
       throw new ControlError(0, "upload_failed");
     }
-    await response.body?.cancel().catch(() => {});
+    await response.body?.cancel().catch(() => { toolError("telegram", "tg.control.uploadBodyCancel"); });
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -249,10 +252,11 @@ export class ControlClient {
         verbose: false,
       });
     } catch {
+      toolError("telegram", "tg.control.events");
       throw new ControlError(0);
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(() => { toolError("telegram", "tg.control.eventBodyCancel"); });
       throw new ControlError(response.status);
     }
     yield* parseSse(response.body, options.signal);
@@ -278,7 +282,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
         if (line === "") {
           if (data.length) {
             let parsed: unknown;
-            try { parsed = JSON.parse(data.join("\n")); } catch { parsed = undefined; }
+            try { parsed = JSON.parse(data.join("\n")); } catch { toolError("telegram", "tg.control.eventJson"); parsed = undefined; }
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
               yield { ...frame, data: parsed as Record<string, unknown> };
             }
@@ -298,7 +302,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => { toolError("telegram", "tg.control.eventReaderCancel"); });
     reader.releaseLock();
   }
 }

@@ -1,0 +1,86 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rollup, toolLog, toolError } from "../src/toollog.ts";
+
+const before = process.env.TOOLLOG_DIR;
+const dirs: string[] = [];
+const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
+const day = () => new Date().toISOString().slice(0, 10);
+const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
+afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test("format is private, allowlisted and identical across package copies", async () => {
+  const dir = fixture();
+  const secret = "private subject OTP 123456 password=abcdef card 4111111111111111";
+  const entry = { component: "runner", kind: "perf" as const, name: "watch.run", durationMs: 2, ok: true,
+    ids: { watcher: "fixture", key: secret, password: secret },
+    props: { outcome: "fire", exitCode: 0, subject: secret, health: 88, source: secret, severity: "info" },
+    error: { tag: "fixture.failure", message: secret } };
+  toolLog(entry);
+  for (const path of ["../../telegram-bridge/src/toollog.ts", "../../spectrum-bridge/src/toollog.ts"]) {
+    const copy = await import(path);
+    copy.toolLog(entry);
+    expect(readFileSync(join(import.meta.dir, path), "utf8")).toBe(readFileSync(join(import.meta.dir, "../src/toollog.ts"), "utf8"));
+  }
+  const all = rows(dir);
+  expect(all).toHaveLength(3);
+  for (const row of all) {
+    expect(row).toMatchObject({ tool: "watchers", component: "runner", kind: "perf", name: "watch.run", ok: true, durationMs: 2, ids: { watcher: "fixture" }, props: { outcome: "fire", exitCode: 0, severity: "info" }, error: { tag: "fixture.failure", message: "fixture.failure" } });
+    expect(row.ts).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    expect(JSON.stringify(row)).not.toContain(secret);
+    expect(row.ids.password).toBeUndefined();
+    expect(row.props.subject).toBeUndefined();
+    expect(row.props.health).toBeUndefined();
+  }
+  expect(statSync(dir).mode & 0o777).toBe(0o700);
+  expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
+});
+
+test("logging drops IO and serialization failures without raising", () => {
+  const dir = fixture(); process.env.TOOLLOG_DIR = join(dir, "blocked"); writeFileSync(process.env.TOOLLOG_DIR, "file");
+  expect(() => toolLog({ component: "runner", kind: "event", name: "watch.run" })).not.toThrow();
+  expect(() => toolLog({ get component(): string { throw new Error("private"); }, kind: "event", name: "watch.run" })).not.toThrow();
+});
+
+test("retention runs on first write and the shared cap keeps errors once event/perf stop", async () => {
+  const dir = fixture();
+  const old = "2000-01-01";
+  writeFileSync(join(dir, `${old}.ndjson`), "old"); writeFileSync(join(dir, `rollup-${old}.json`), "old");
+  writeFileSync(join(dir, "unrelated.txt"), "keep");
+  toolLog({ component: "runner", kind: "event", name: "watch.run" });
+  expect(readdirSync(dir)).not.toContain(`${old}.ndjson`); expect(readdirSync(dir)).not.toContain(`rollup-${old}.json`);
+  expect(readdirSync(dir)).toContain("unrelated.txt");
+  const file = join(dir, `${day()}.ndjson`), cap = 50 * 1024 * 1024 + 1;
+  truncateSync(file, cap);
+  const copy = await import("../../spectrum-bridge/src/toollog.ts");
+  toolLog({ component: "runner", kind: "event", name: "dropped.event" });
+  copy.toolLog({ component: "wakes", kind: "perf", name: "dropped.perf" });
+  toolLog({ component: "runner", kind: "error", name: "retained.error", ok: false, error: { tag: "fixture.failure" } });
+  const tail = readFileSync(file).subarray(cap).toString();
+  expect(tail.match(/"name":"log.cap"/g)).toHaveLength(1);
+  if (process.env.TOOLLOG_SAMPLES) console.log("LOG_SAMPLE " + tail.trim().split("\n")[0]);
+  expect(tail).toContain('"name":"retained.error"'); expect(tail).not.toContain("dropped.");
+});
+
+test("rollup counts fixture names/kinds, rates, percentiles and top error tags, skipping malformed lines", async () => {
+  const dir = fixture();
+  for (const ms of [1, 2, 3, 4, 100]) toolLog({ component: "runner", kind: "perf", name: "watch.run", durationMs: ms, ok: true });
+  toolLog({ component: "runner", kind: "error", name: "watch.run", durationMs: 8, ok: false, ids: { watcher: "fixture" }, error: { tag: "watch.timeout" } });
+  const result = await rollup(day());
+  expect(result).toMatchObject({ total: 6, counts: { "watch.run": 6 }, kinds: { perf: 5, error: 1 }, ok: 5, failed: 1, okRate: 5 / 6, errorRate: 1 / 6, durations: { "watch.run": { count: 6, p50: 3, p95: 100, max: 100 } }, errors: [{ tag: "watch.timeout", count: 1, sampleId: "fixture" }] });
+  expect(statSync(join(dir, `rollup-${day()}.json`)).mode & 0o777).toBe(0o600);
+  expect(await rollup("../../secret")).toBeUndefined();
+  expect(await rollup("2026-02-30")).toBeUndefined();
+  expect(await rollup("2000-01-01")).toBeUndefined();
+});
+
+
+test("error helper emits only a stable tag for each component", () => {
+  const dir = fixture();
+  for (const component of ["runner", "cli", "telegram"]) toolError(component, "fixture.failed");
+  expect(rows(dir).map(row => row.name)).toEqual(["runner.error", "cli.error", "telegram.error"]);
+  expect(rows(dir).every(row => row.kind === "error" && row.ok === false && row.error.message === "fixture.failed")).toBe(true);
+  if (process.env.TOOLLOG_SAMPLES) for (const row of rows(dir)) console.log("LOG_SAMPLE " + JSON.stringify(row));
+});

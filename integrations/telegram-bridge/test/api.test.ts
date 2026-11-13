@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import { createApi, MAX_FILE_BODY } from "../src/api.ts";
 import { MAX_FILE_BYTES } from "../src/cli.ts";
 import { Store } from "../src/store.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
 
 const stores: Store[] = [];
 const now = Date.parse("2026-09-10T00:00:00Z");
@@ -52,6 +55,9 @@ test("health projects safe fields and never exposes credentials, tokens, or chat
   const failure = await failing(new Request("http://bridge/health"));
   expect(failure.status).toBe(409);
   expect(await failure.json()).toEqual({ error: "Operation could not be completed" });
+  expect(logs.entries()).toMatchObject([{ tool: "watchers", kind: "error", name: "telegram.error", ok: false,
+    error: { tag: "tg.api.requestFailed", message: "tg.api.requestFailed" } }]);
+  expect(logs.text()).not.toContain("PRIVATE_");
 });
 
 test("notify queues one stable operation and never touches reminders or session notices", async () => {

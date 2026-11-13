@@ -213,4 +213,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        from pathlib import Path as _LogPath
+        sys.path.insert(0, str(_LogPath(__file__).resolve().parent))
+        from toollog import helper_main
+    except Exception:
+        # Standalone copies of helpers can run before the optional logger is installed.
+        def helper_main(_name, fn, *args):
+            return fn(*args)
+    helper_main("imsg-robob-sent", main, sys.argv[1:])

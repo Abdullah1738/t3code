@@ -6,6 +6,11 @@ import { parseCommand } from "../src/cli.ts";
 import { enqueueNotice } from "../src/notification-policy.ts";
 import { Store, type OutboxRecord } from "../src/store.ts";
 import { TransportError } from "../src/telegram.ts";
+import { createHash } from "node:crypto";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
+const logId = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 
 type Send = { chatId: number; text: string; replyTo?: number; keyboard?: unknown };
 type Document = { chatId: number; name: string; mimeType: string; data: Uint8Array; replyTo?: number };
@@ -448,4 +453,83 @@ test("operations enqueued with a providerId resume their identity instead of res
   h.readiness.chatId = 100;
   await h.delivery.tick();
   expect(h.calls.sends).toHaveLength(1);
+});
+
+test("tg.send logs actual chunk and attachment dispatches with severity and hashed identities", async () => {
+  const h = setup();
+  const key = "PRIVATE_NOTIFICATION_KEY";
+  const api = createApi({ store: h.store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({}) });
+  const response = await api(new Request("http://bridge/notify", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: "PRIVATE_SOURCE", severity: "attention", text: "PRIVATE_MESSAGE" + "x".repeat(3900), dedupeKey: key }) }));
+  const { id } = await response.json() as { id: string };
+  const data = Buffer.from("PRIVATE_ATTACHMENT_CONTENT");
+  h.store.enqueue({ id: "PRIVATE_FILE_OPERATION", kind: "notification", text: "", attachment: {
+    sha256: h.store.putBlob(data), name: "PRIVATE_FILENAME.pdf", mimeType: "application/pdf", size: data.length,
+  } });
+  h.readiness.enabled = false;
+  await h.delivery.tick();
+  expect(logs.entries().filter(row => row.name === "tg.send")).toEqual([]);
+  h.readiness.enabled = true;
+  await h.delivery.tick();
+  await h.delivery.tick();
+  const sends = logs.entries().filter(row => row.name === "tg.send");
+  expect(sends).toHaveLength(h.calls.sends.length + h.calls.documents.length);
+  expect(sends).toHaveLength(3);
+  expect(sends.map(row => row.props?.severity)).toEqual(["attention", "attention", "info"]);
+  expect(sends[0]?.ids).toEqual({ operation: logId(id), key: logId(id), chat: logId("100") });
+  expect(sends[2]?.ids?.operation).toBe(logId("PRIVATE_FILE_OPERATION"));
+  for (const send of sends) {
+    expect(send).toMatchObject({ tool: "watchers", component: "telegram", kind: "perf", ok: true,
+      props: { attempt: 1, accepted: true } });
+    expect(Number.isFinite(send.durationMs)).toBe(true);
+    expect(send.durationMs).toBeGreaterThanOrEqual(0);
+  }
+  expect(logs.text()).not.toContain("PRIVATE_");
+});
+
+test.each([
+  ["tg.send.rejected", () => new GrammyError("PRIVATE_MESSAGE", { ok: false, error_code: 400,
+    description: "PRIVATE_PROVIDER_RESPONSE" }, "sendMessage", {})],
+  ["tg.send.floodWait", () => new GrammyError("PRIVATE_MESSAGE", { ok: false, error_code: 429,
+    description: "PRIVATE_PROVIDER_RESPONSE", parameters: { retry_after: 2 } }, "sendMessage", {})],
+  ["tg.send.retryable", () => new TransportError("PRIVATE_TRANSPORT_CODE", true, false)],
+  ["tg.send.uncertain", () => new Error("PRIVATE_EXCEPTION_BODY")],
+] as const)("tg.send records %s without exception details", async (tag, failure) => {
+  const h = setup(() => { throw failure(); });
+  enqueueNotice(h.store, { id: "PRIVATE_KEY", source: "PRIVATE_SOURCE", text: "PRIVATE_HEALTH_VALUE", severity: "error" });
+  await h.delivery.tick();
+  const sends = logs.entries().filter(row => row.name === "tg.send");
+  expect(sends).toHaveLength(1);
+  expect(sends[0]).toMatchObject({ tool: "watchers", kind: "error", ok: false,
+    ids: { operation: logId("PRIVATE_KEY"), key: logId("PRIVATE_KEY"), chat: logId("100") },
+    props: { severity: "error", attempt: 1, accepted: false }, error: { tag, message: tag } });
+  expect(sends[0]?.durationMs).toBeGreaterThanOrEqual(0);
+  expect(logs.text()).not.toContain("PRIVATE_");
+});
+
+test("reminder delivery failures log the linked reminder and preserve cancellation behavior", async () => {
+  const h = setup(() => { throw new TransportError("PRIVATE_REJECTION", false, false); });
+  h.store.createReminder({ id: "PRIVATE_REMINDER", text: "PRIVATE_HEALTH_VALUE", dueAt: now, timezone: "UTC" });
+  h.store.enqueueDueReminders(now);
+  await h.delivery.tick();
+  expect(h.store.getOperation("reminder:PRIVATE_REMINDER:1")?.state).toBe("failed");
+  expect(h.store.cancelReminder("PRIVATE_REMINDER").status).toBe("cancelled");
+  const failure = logs.entries().find(row => row.name === "tg.reminder" && row.ok === false);
+  expect(failure).toMatchObject({ kind: "error", ids: { reminder: logId("PRIVATE_REMINDER"), operation: logId("reminder:PRIVATE_REMINDER:1") },
+    props: { state: "failed" }, error: { tag: "tg.reminder.deliveryFailed" } });
+  expect(logs.text()).not.toContain("PRIVATE_");
+});
+
+test("logging metadata failures cannot reject queue admission or prevent transport dispatch", async () => {
+  const h = setup();
+  h.store.db.exec(`CREATE TRIGGER reject_log_metadata BEFORE INSERT ON kv
+    WHEN NEW.key LIKE 'log:severity:%' BEGIN SELECT RAISE(ABORT, 'PRIVATE_METADATA_FAILURE'); END`);
+  expect(enqueueNotice(h.store, { id: "PRIVATE_KEY", source: "PRIVATE_SOURCE", text: "PRIVATE_MESSAGE", severity: "error" })).toBe(true);
+  h.store.db.query("INSERT INTO kv (key, value) VALUES (?, ?)").run("api:notification:PRIVATE_KEY", "PRIVATE_INVALID_JSON");
+  await h.delivery.tick();
+  expect(h.calls.sends).toHaveLength(1);
+  expect(h.store.getOperation("PRIVATE_KEY")?.state).toBe("sent");
+  expect(logs.entries().map(row => row.error?.tag).filter(Boolean)).toEqual(["tg.send.severityStore", "tg.send.severityRead"]);
+  expect(logs.entries().find(row => row.name === "tg.send")).toMatchObject({ ok: true, props: { severity: "info" } });
+  expect(logs.text()).not.toContain("PRIVATE_");
 });

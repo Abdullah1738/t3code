@@ -18,7 +18,7 @@ void ${JSON.stringify(failOn)};`);
 };
 const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
-const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
+const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), TOOLLOG_DIR: join(sandbox, "logs"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 // Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
@@ -29,6 +29,7 @@ const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.
 const readCalls = () => (existsSync(calls) ? readFileSync(calls, "utf8") : "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { cli: string; args: string[] });
 const optIn = (id: string) => { const f = join(sandbox, "root/watchers", id, "watcher.json"); writeFileSync(f, JSON.stringify({ ...JSON.parse(readFileSync(f, "utf8")), headsup: true })); };
 const state = (id: string) => JSON.parse(readFileSync(join(sandbox, "root/watchers", id, "state.json"), "utf8"));
+const events = (name: string, watcher?: string) => readFileSync(join(sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.name === name && (!watcher || row.ids?.watcher === watcher));
 
 async function runnerFor(ms: number) {
   const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/runner.ts")], { env, stdout: "ignore", stderr: "ignore" });
@@ -37,7 +38,12 @@ async function runnerFor(ms: number) {
   await child.exited;
 }
 
-afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+afterAll(() => {
+  if (process.env.TOOLLOG_SAMPLES) for (const name of ["watch.run", "watch.retry", "watch.fire_cap", "watch.recovered", "watch.disabled", "wake.sent", "helper.run"]) {
+    console.log("LOG_SAMPLE " + JSON.stringify(events(name)[0]));
+  }
+  rmSync(sandbox, { recursive: true, force: true });
+});
 
 test("a wake watcher fires once with its context, falling back to send when wake is unavailable, then disables", async () => {
   const flag = join(sandbox, "event");
@@ -61,6 +67,15 @@ test("a wake watcher fires once with its context, falling back to send when wake
   expect(all.some(call => call.cli === "telegram")).toBe(false);
   expect(state("demo")).toMatchObject({ status: "done", fires: 1, last_delivery: "imessage-send" });
   expect(state("demo").pending).toBeUndefined();
+  expect(events("watch.run", "demo")).toContainEqual(expect.objectContaining({ ok: true, props: expect.objectContaining({ outcome: "fire", exitCode: 0 }) }));
+  expect(events("wake.sent", "demo")).toContainEqual(expect.objectContaining({ ok: true }));
+  const sentKey = wake.args[wake.args.indexOf("--key") + 1]!;
+  const inboundId = "wake:" + new Bun.CryptoHasher("sha256").update(sentKey).digest("hex");
+  const correlationKey = new Bun.CryptoHasher("sha256").update(inboundId).digest("hex").slice(0, 24);
+  expect(events("wake.sent", "demo")[0].ids.key).toBe(correlationKey);
+  expect(events("watch.fire_cap", "demo")).toHaveLength(1);
+  expect(events("watch.disabled", "demo")).toHaveLength(1);
+  expect(events("helper.run", "demo").length).toBeGreaterThan(0);
 }, 20_000);
 
 test("a chat watcher wakes only that chat (wake --chat with the owner's live route), never the owner's chat", async () => {
@@ -102,6 +117,7 @@ test("an undelivered event is kept and retried under the same key before the che
   const pending = state("retry").pending;
   expect(pending.event).toBe("event-1");
   expect(state("retry").fires).toBe(0);
+  expect(events("wake.sent", "retry")).toContainEqual(expect.objectContaining({ ok: false, error: { tag: "wake.delivery_failed", message: "wake.delivery_failed" } }));
   rmSync(join(sandbox, "fail-notify"));
   const s = state("retry");
   s.next_at = 0;
@@ -110,6 +126,7 @@ test("an undelivered event is kept and retried under the same key before the che
   const tg = readCalls().filter(call => call.cli === "telegram");
   expect(tg.at(-1)!.args[tg.at(-1)!.args.indexOf("--key") + 1]).toBe(pending.key);
   expect(state("retry")).toMatchObject({ status: "done", fires: 1, last_delivery: "telegram" });
+  expect(events("watch.retry", "retry").length).toBeGreaterThan(0);
 }, 20_000);
 
 test("quiet hours hold an event, new or retried, under its key and deliver it once they end", async () => {
@@ -145,6 +162,7 @@ test("failing checks back off and alert once; expired watchers switch off with a
   writeFileSync(join(dir, "state.json"), JSON.stringify({ status: "active", fires: 0, consecutive_failures: 4, failure_alerted: false }));
   await runnerFor(2_000);
   expect(state("broken")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
+  expect(events("watch.run", "broken")).toContainEqual(expect.objectContaining({ ok: false, props: expect.objectContaining({ outcome: "fail", exitCode: 3 }) }));
   expect(state("broken").next_at - Date.now()).toBeGreaterThan(200_000);
   expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
 
@@ -192,6 +210,8 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   await runnerFor(2_000);
   expect(state("esc").failure_escalated).toBeUndefined();
   expect(state("esc").consecutive_failures).toBe(0);
+  expect(events("watch.recovered", "esc").length).toBeGreaterThan(0);
+  expect(events("watch.run", "esc")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "no_change" }) }));
   // Notify watchers never escalate.
   expect(cli("add", "--id", "escn", "--title", "EscN", "--check", "exit 1", "--mode", "notify", "--no-prime").exitCode).toBe(0);
   writeFileSync(join(sandbox, "root/watchers/escn/state.json"), JSON.stringify({ status: "active", fires: 0, consecutive_failures: 9,
@@ -315,6 +335,7 @@ test("timeouts alert into the burst immediately but pause only after ten minutes
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
   expect(state("slow").failure_paused_at).toBeUndefined();
+  expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout" }), ok: false }));
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
   expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));
