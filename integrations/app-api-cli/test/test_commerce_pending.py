@@ -334,3 +334,170 @@ class PendingTests(unittest.TestCase):
                 with self.assertRaisesRegex(j.JournalError,'SAME_BASKET_PENDING_ACK_REQUIRED'):self.send(new)
                 p.acknowledge(new,[old]);self.send(new)
                 with j._db() as db:db.execute("UPDATE flows SET state='RELEASED' WHERE id IN (?,?)",(old,new))
+
+    def test_unavailable_placed_legacy_merchandise_is_acknowledgeable(self):
+        from types import SimpleNamespace
+        from noon_http_orders import NoonError
+        cases = [
+            ('incomplete', {'items_complete': False}),
+            ('unknown_completeness', {'items_complete': None}),
+            ('scalar_response', None),
+            ('array_response', []),
+            ('missing_items', {'items': None}),
+            ('empty_items', {'items': []}),
+            ('missing_sku', {'items': [{'qty': 1}]}),
+            ('null_sku', {'items': [{'sku_config': None, 'item_code': None, 'qty': 1}]}),
+            ('malformed_row', {'items': [None]}),
+            ('invalid_quantity', {'items': [{'sku_config': 'A', 'item_code': 'A', 'qty': True}]}),
+            ('fractional_quantity', {'items': [{'sku_config': 'A', 'item_code': 'A', 'qty': 1.5}]}),
+            ('missing_quantity', {'items': [{'sku_config': 'A', 'item_code': 'A'}]}),
+            ('order_missing', NoonError('ORDER_NOT_FOUND')),
+            ('read_unavailable', NoonError('NATIVE_READ_FAILED')),
+            ('read_timeout', TimeoutError()),
+            ('schema_changed', NoonError('ORDER_ITEM_SCHEMA_CHANGED')),
+        ]
+        for lane, key in [('main', 'sku_config'), ('minutes', 'sku'), ('supermall', 'sku_config')]:
+            for case, result in cases:
+                with self.subTest(lane=lane, case=case):
+                    old = self.flow(lane); self.send(old)
+                    order = 'N'+old.replace('-', '')
+                    j.observe(old, 'place', outcome='ORDER_ID_RECEIVED', evidence_hash='6'*64, order_id=order)
+                    current = self.flow(lane)
+                    items = [{key: 'DIFFERENT_ITEM', 'quantity': 1}] if lane != 'minutes' else [{'sku': 'DIFFERENT_ITEM', 'qty': 1, 'modifiers': []}]
+                    flow = SimpleNamespace(flow_id=current, account_hash=self.account, items=items, skus=items,
+                                           snapshot=SimpleNamespace(account_ref=self.account, address_ref='7'*64))
+                    valid = {'order': order, 'account_verified': True, 'items_complete': True,
+                             'items': [{'sku_config': 'A', 'item_code': 'A', 'qty': 1}]}
+                    response = ({'side_effect': result} if isinstance(result, Exception) else
+                                {'return_value': {**valid, **result} if type(result) is dict else result})
+                    with patch('commerce_auth_status.CommerceAuth') as auth, patch('noon_order_details.details', **response), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        auth.return_value.noon.revalidate.return_value = flow.snapshot
+                        warnings = p.cli_review(flow, SimpleNamespace(order_command=lane, ack_pending=[]))
+                        self.assertEqual(warnings[0]['basket_match'], 'unresolved_legacy_manifest')
+                        self.assertEqual(warnings[0]['flow_id'], old)
+                        with self.assertRaisesRegex(j.JournalError, 'SAME_BASKET_PENDING_ACK_REQUIRED'):
+                            self.send(current)
+                        warnings = p.cli_review(flow, SimpleNamespace(order_command=lane, ack_pending=[old]))
+                        self.assertEqual(warnings[0]['flow_id'], old)
+                        self.send(current)
+                    with j._db() as db:
+                        self.assertIsNone(db.execute('SELECT 1 FROM baskets WHERE flow_id=?', (old,)).fetchone())
+                        db.execute("UPDATE flows SET state='RELEASED' WHERE id IN (?,?)", (old, current))
+
+    def test_legacy_hydration_keeps_current_auth_and_account_checks(self):
+        from types import SimpleNamespace
+        from noon_auth_lifecycle import AuthError
+        from noon_http_orders import NoonError
+        from noon_minutes_checkout import MinutesError
+        for lane in ('main', 'minutes', 'supermall'):
+            old = self.flow(lane); self.send(old)
+            order = 'N'+old.replace('-', '')
+            j.observe(old, 'place', outcome='ORDER_ID_RECEIVED', evidence_hash='6'*64, order_id=order)
+            for error in (AuthError('AUTH_EXPIRED'), AuthError('ACCOUNT_IDENTITY_MISMATCH')):
+                with self.subTest(lane=lane, error=str(error)), patch('commerce_auth_status.CommerceAuth') as auth, \
+                        patch('noon_order_details.details') as details:
+                    auth.return_value.noon.revalidate.side_effect = error
+                    with self.assertRaises(type(error)):
+                        p.refresh_legacy(lane, self.account)
+                    details.assert_not_called()
+            for error in (NoonError('AUTH_EXPIRED'), NoonError('AUTH_FORBIDDEN'), NoonError('ACCOUNT_HEADERS_INVALID'),
+                          NoonError('HOME_MISMATCH'), MinutesError('AUTH_EXPIRED')):
+                with self.subTest(lane=lane, error=str(error)), patch('commerce_auth_status.CommerceAuth') as auth, \
+                        patch('noon_order_details.details', side_effect=error):
+                    auth.return_value.noon.revalidate.return_value = SimpleNamespace(account_ref=self.account, address_ref='7'*64)
+                    with self.assertRaises(type(error)):
+                        p.refresh_legacy(lane, self.account)
+            for invalid in ({'order': 'NWRONG', 'account_verified': True},
+                            {'order': order, 'account_verified': False}):
+                with self.subTest(lane=lane, identity=invalid), patch('commerce_auth_status.CommerceAuth') as auth, \
+                        patch('noon_order_details.details', return_value=invalid):
+                    auth.return_value.noon.revalidate.return_value = SimpleNamespace(account_ref=self.account, address_ref='7'*64)
+                    with self.assertRaisesRegex(j.JournalError, 'PENDING_LEGACY_BASKET_EVIDENCE_INVALID'):
+                        p.refresh_legacy(lane, self.account)
+            with patch('commerce_auth_status.CommerceAuth') as auth, patch('noon_order_details.details') as details:
+                auth.return_value.noon.revalidate.return_value = SimpleNamespace(account_ref='8'*64)
+                with self.assertRaisesRegex(j.JournalError, 'RECOVERY_ACCOUNT_CHANGED'):
+                    p.refresh_legacy(lane, self.account)
+                details.assert_not_called()
+            with j._db() as db:
+                db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (old,))
+
+    def test_food_registration_uses_retained_card_instead_of_current_default(self):
+        from types import SimpleNamespace
+        import order_card
+        items = [{'itemCode': 'I1', 'qty': 1}]
+        with patch.object(order_card, 'LAST4', '9546'):
+            for retained in ('2342', '9546'):
+                with self.subTest(retained=retained):
+                    old = self.flow('food')
+                    flow = SimpleNamespace(flow_id=old, account=self.account, rows=items, card_last4=retained,
+                                           home=SimpleNamespace(address_ref='7'*64))
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        p.cli_review(flow, SimpleNamespace(order_command='food', ack_pending=[]))
+                    p.register(old, 'food', self.account, items, card_last4=retained)
+                    self.send(old)
+                    new = self.flow('food', items)
+                    warning = p.warnings(new)[0]
+                    self.assertEqual(warning['flow_id'], old)
+                    self.assertEqual(warning['card_last4'], retained)
+                    self.assertIn('••'+retained, warning['message'])
+                    with j._db() as db:
+                        db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (old,))
+
+
+    def test_legacy_wrong_native_order_identity_is_not_acknowledgeable(self):
+        from types import SimpleNamespace
+        import noon_order_details as detail
+        from noon_http_orders import NoonError
+        raw = json.loads((Path(__file__).parent/'fixture_supermall_order_detail_fresh_live.json').read_text())
+        cases = [('complete', {**raw, 'orderNr': 'NWRONG'}, {'orderNr': 'NWRONG', 'items': []}),
+                 ('missing_merchandise', {'orderNr': 'NWRONG'}, {'orderNr': 'NWRONG'}),
+                 ('malformed_merchandise', {'orderNr': 'NWRONG', 'itemGroups': [None]}, {'orderNr': 'NWRONG', 'items': [None]})]
+        for lane, key in [('main', 'sku_config'), ('minutes', 'sku'), ('supermall', 'sku_config')]:
+            for case, marketplace, minutes in cases:
+                with self.subTest(lane=lane, case=case):
+                    old = self.flow(lane); self.send(old)
+                    order = 'N'+old.replace('-', '')
+                    j.observe(old, 'place', outcome='ORDER_ID_RECEIVED', evidence_hash='6'*64, order_id=order)
+                    current = self.flow(lane)
+                    items = [{key: 'DIFFERENT_ITEM', 'quantity': 1}]
+                    flow = SimpleNamespace(flow_id=current, account_hash=self.account, items=items, skus=items,
+                                           snapshot=SimpleNamespace(account_ref=self.account, address_ref='7'*64))
+                    with patch('commerce_auth_status.CommerceAuth') as auth, \
+                            patch.object(detail.vertical, '_headers', return_value={}), \
+                            patch.object(detail.core, 'verified_session', return_value={}), \
+                            patch.object(detail.vertical, '_read', return_value=marketplace), \
+                            patch('noon_minutes_checkout.native_request', return_value=minutes), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        auth.return_value.noon.revalidate.return_value = flow.snapshot
+                        with self.assertRaisesRegex(NoonError, '^ORDER_MISMATCH$'):
+                            p.cli_review(flow, SimpleNamespace(order_command=lane, ack_pending=[old]))
+                    with j._db() as db:
+                        self.assertIsNone(db.execute('SELECT 1 FROM operations WHERE flow_id=?', (current,)).fetchone())
+                        db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (old,))
+
+    def test_legacy_real_parser_missing_merchandise_remains_acknowledgeable(self):
+        from types import SimpleNamespace
+        import noon_order_details as detail
+        for lane, key in [('main', 'sku_config'), ('minutes', 'sku'), ('supermall', 'sku_config')]:
+            with self.subTest(lane=lane):
+                old = self.flow(lane); self.send(old)
+                order = 'N'+old.replace('-', '')
+                j.observe(old, 'place', outcome='ORDER_ID_RECEIVED', evidence_hash='6'*64, order_id=order)
+                current = self.flow(lane)
+                items = [{key: 'DIFFERENT_ITEM', 'quantity': 1}]
+                flow = SimpleNamespace(flow_id=current, account_hash=self.account, items=items, skus=items,
+                                       snapshot=SimpleNamespace(account_ref=self.account, address_ref='7'*64))
+                with patch('commerce_auth_status.CommerceAuth') as auth, \
+                        patch.object(detail.vertical, '_headers', return_value={}), \
+                        patch.object(detail.core, 'verified_session', return_value={}), \
+                        patch.object(detail.vertical, '_read', return_value={'orderNr': order}), \
+                        patch('noon_minutes_checkout.native_request', return_value={'orderNr': order}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    auth.return_value.noon.revalidate.return_value = flow.snapshot
+                    warnings = p.cli_review(flow, SimpleNamespace(order_command=lane, ack_pending=[old]))
+                    self.assertEqual(warnings[0]['basket_match'], 'unresolved_legacy_manifest')
+                    self.send(current)
+                with j._db() as db:
+                    db.execute("UPDATE flows SET state='RELEASED' WHERE id IN (?,?)", (old, current))

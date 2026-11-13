@@ -51,6 +51,13 @@ def food(row, order):
             'source':'exact_native_order_detail','items_complete':True,'account_verified':True}
 
 
+def _check_order_identity(row, order):
+    if not isinstance(row, dict):
+        raise core.NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
+    if row.get('orderNr') is not None and row['orderNr'] != order:
+        raise core.NoonError('ORDER_MISMATCH')
+
+
 def details(order, service, timeout=12):
     deadline=core.operation_deadline(timeout)
     extra={}
@@ -60,15 +67,18 @@ def details(order, service, timeout=12):
     if service=='nownow':
         headers=vertical._headers('nownow',deadline)
         row=vertical._nownow_data(vertical._read('nownow_detail',headers,deadline,order))
+        _check_order_identity(row, order)
         raw=row.get('products'); store=core.text((row.get('storeInfo') or {}).get('name'))
     elif service=='minutes':
         import noon_minutes_checkout as minutes
         headers=core.verified_session('minutes',deadline)
         row=minutes.native_request('order_get',headers,deadline,{'orderNr':order},response_observer=lambda *a,**k:None)
+        _check_order_identity(row, order)
         raw=row.get('items'); store='noon Minutes'
     elif service in ('main','supermall','marketplace'):
         headers=vertical._headers('marketplace',deadline)
         row=vertical._read('marketplace_manifest',headers,deadline,order)
+        _check_order_identity(row, order)
         groups=row.get('itemGroups')
         if not isinstance(groups,list):raise core.NoonError('ORDER_ITEM_SCHEMA_CHANGED')
         raw=[i for g in groups for i in g.get('items',[])];store='noon'

@@ -152,7 +152,8 @@ def cli_review(flow, args):
     if lane in ('main','supermall','nownow','minutes','food') and type(items) in (list,tuple) and j._hash(account):
         home = flow.home.address_ref if lane == 'food' else flow.snapshot.address_ref
         legacy = legacy_scopes(lane,items,home,extra=getattr(flow,'driver_note_extra',None),use_current_cart=getattr(flow,'use_current_cart',False))
-        register(flow.flow_id, lane, account, items, legacy=legacy)
+        register(flow.flow_id, lane, account, items,
+                 card_last4=flow.card_last4 if lane == 'food' else None, legacy=legacy)
     if lane in ('main','supermall','minutes') and j._hash(account):
         refresh_legacy(lane,account)
     acknowledge(flow.flow_id, getattr(args, 'ack_pending', None))
@@ -184,16 +185,41 @@ def refresh_legacy(vertical, account):
         return
     from commerce_auth_status import CommerceAuth
     from noon_order_details import details
+    from noon_http_orders import NoonError
+    from noon_minutes_checkout import MinutesError
     snapshot = CommerceAuth().noon.revalidate('main' if vertical=='supermall' else vertical)
     if snapshot.account_ref != account:
         j.fail('RECOVERY_ACCOUNT_CHANGED')
     key = 'sku' if vertical=='minutes' else 'sku_config'
     for row in rows:
-        native = details(row['order_id'],vertical)
+        try:
+            native = details(row['order_id'],vertical)
+        except (NoonError, MinutesError) as exc:
+            code = getattr(exc, 'code', None) or str(exc)
+            if code == 'ORDER_MISMATCH' or code.startswith(('AUTH_', 'ACCOUNT_', 'HOME_', 'VERIFIED_', 'ADDRESS_')):
+                raise
+            continue
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if type(native) is not dict:
+            continue
+        if (native.get('order') not in (None, row['order_id'])
+                or native.get('account_verified') is False):
+            j.fail('PENDING_LEGACY_BASKET_EVIDENCE_INVALID')
         if (native.get('order') != row['order_id'] or native.get('account_verified') is not True
                 or native.get('items_complete') is not True):
-            j.fail('PENDING_LEGACY_BASKET_EVIDENCE_INVALID')
-        items = [{key:r['item_code'] if vertical=='minutes' else r['sku_config'],'quantity':r['qty']} for r in native['items']]
+            continue
+        manifest = native.get('items')
+        if type(manifest) is not list or any(type(item) is not dict for item in manifest):
+            continue
+        items = [{key:item.get('item_code' if vertical=='minutes' else 'sku_config'),
+                  'quantity':item.get('qty')} for item in manifest]
+        try:
+            basket_hash(vertical, items)
+        except j.JournalError:
+            continue
+        # No metadata is published for unavailable merchandise. matching() then
+        # uses its unresolved legacy warning and explicit acknowledgement path.
         candidates = legacy_scopes(vertical,items,snapshot.address_ref)
         card = native.get('card_last4') or candidates.get(row['scope_hash']) or 'unknown'
         register(row['id'],vertical,account,items,card_last4=card)
