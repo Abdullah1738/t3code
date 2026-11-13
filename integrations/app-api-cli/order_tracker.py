@@ -50,8 +50,6 @@ ALIASES = {'minutes': 'noon', 'nownow': 'noon', 'noon-minutes': 'noon',
 DOMAINS = {'talabat': ('talabat.com',), 'noon': ('noon.com',),
            'careem': ('careem.com',), 'amazon': ('amazon.ae', 'amazon.com')}
 TERMINAL = {'delivered', 'cancelled'}
-# A quiet run this long after the terminal wake retires the tracker (not Amazon).
-RETIRE_AFTER_S = 30 * 60
 # Talabat emails the account's "service charges Receipt" when an order completes
 # (8 Oct 2026: 12:36:16 for an owner-reported 12:36 arrival). The order ID is only
 # in the PDF attachment, which Gmail's X-GM-RAW search indexes.
@@ -142,6 +140,17 @@ def eta_open(cfg, result, now, state=None):
         except (AttributeError, TypeError, ValueError):
             pass
     return bool(etas) and now <= max(etas) + 300
+
+
+def eta_elapsed_due(cfg, state, now):
+    return (bool(cfg.get('eta')) and now > epoch(cfg['eta']) + 300
+            and state.get('status') not in TERMINAL and not state.get('delay_sent'))
+
+
+def terminal_order(cfg, result, status=None):
+    status = result.get('status') if status is None else status
+    return (status in TERMINAL and result.get('whole_order_complete') is not False
+            and (cfg['app'] != 'amazon' or result.get('whole_order_complete') is True))
 
 
 def part_delivered(result, state):
@@ -526,7 +535,8 @@ def amazon_proof(event):
 def amazon_fetch(cfg, state, now):
     """Email manifest/shipments own Amazon completion; pushes are candidates only."""
     from amazon_email_orders import track
-    if now - state.get('amazon_checked', 0) >= 300 or 'amazon_cache' not in state:
+    if (eta_elapsed_due(cfg, state, now) or now - state.get('amazon_checked', 0) >= 300
+            or 'amazon_cache' not in state):
         state['amazon_checked'] = now
         try:
             state['amazon_cache'] = track(cfg['order'], since=cfg['placed_at'][:10], timeout=35)
@@ -717,7 +727,8 @@ def fetch(cfg, state, now):
             errors.append('native_' + str(exc).lower())
     if cfg['app'] == 'talabat':
         # Fallback only when authenticated native tracking did not return a known stage.
-        if not state.get('receipt') and now - state.get('receipt_checked', 0) >= RECEIPT_POLL_S:
+        if not state.get('receipt') and (eta_elapsed_due(cfg, state, now)
+                or now - state.get('receipt_checked', 0) >= RECEIPT_POLL_S):
             state['receipt_checked'] = now
             try:
                 state['receipt'], state['receipt_errors'] = talabat_receipt(cfg)
@@ -726,7 +737,9 @@ def fetch(cfg, state, now):
         if state.get('receipt'):
             evidence.append(state['receipt'])
         errors.extend(state.get('receipt_errors', []))
-    if now - state.get('mail_checked', 0) >= 300 and not state.get('receipt'):
+    # Reuse the normal read budget for a pre-alert refresh, rather than running
+    # a second native/mail fetch after a potentially 35-second fallback.
+    if (eta_elapsed_due(cfg, state, now) or now - state.get('mail_checked', 0) >= 300) and not state.get('receipt'):
         try:
             verified = state.setdefault('mail_bodies_verified', {})
             if len(verified) > 200:
@@ -814,6 +827,8 @@ def transition(result, state, cfg, now):
                 seen.append(key)
                 events.append({'kind': 'aftercare', 'status': proof['stage'], **proof})
     current = result['status']
+    if cfg.get('app') != 'amazon' and current in TERMINAL and result.get('whole_order_complete') is False:
+        result['status'] = current = 'unknown'
     if cfg.get('app') == 'amazon' and current == 'delivered' and result.get('whole_order_complete') is not True:
         proof = (result.get('evidence') or [{}])[0]
         key = proof.get('mail_key') or proof.get('observed_at')
@@ -845,7 +860,7 @@ def transition(result, state, cfg, now):
             if signature not in state.setdefault(key + '_seen', []):
                 state[key + '_seen'].append(signature)
                 events.append({'kind': key, **item})
-    if cfg.get('eta') and now > epoch(cfg['eta']) + 300 and state.get('status') not in TERMINAL and not state.get('delay_sent'):
+    if eta_elapsed_due(cfg, state, now):
         state['delay_sent'] = True
         if not arrival_only(cfg):
             events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed by 5 minutes; delivery is not confirmed. This is not proof the order is still undelivered.'})
@@ -905,6 +920,10 @@ def _check(cfg):
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = folder / 'order-tracker-state.json'
         state = read(path)
+        if terminal_order(cfg, state.get('last_result', {}), state.get('status', 'unknown')):
+            retire_terminal(cfg, folder, path, state)
+            return {'ok': not bool(state.get('retire_error') or state.get('card_error')),
+                    'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
         now = time.time()
         result = fetch(cfg, state, now)
         previous = state.get('status','unknown')
@@ -923,7 +942,7 @@ def _check(cfg):
             toollog.emit('order-watch','track.eta_elapsed',ids={'orderId':cfg.get('order')})
         if folder.resolve() == (Path.home() / '.local/share/robob-watch/watchers' / cfg['watcher']).resolve():
             proof = result.get('evidence', [{}])[0] if result.get('evidence') else {}
-            if result['status'] == 'delivered':
+            if result['status'] == 'delivered' and terminal_order(cfg, result):
                 store.reconcile(cfg, detected=stamp(now), source=proof.get('source'),
                                 evidence_time=proof.get('email_date') or proof.get('observed_at'))
         state['last_result'] = result
@@ -950,23 +969,35 @@ def _check(cfg):
                                 'email_status': result.get('email_status'),
                                 'aftercare_evidence': result.get('aftercare_evidence', []),
                                 'whole_order_complete': result.get('whole_order_complete')}))
-        # Retire only after a quiet live run, so the terminal wake always goes out first.
-        if (folder.resolve() == (WATCHERS / cfg['watcher']).resolve() and not events
-                and state.get('status') in TERMINAL and cfg['app'] != 'amazon'
-                and result.get('whole_order_complete') is not False):
-            if 'terminal_at' not in state:
-                # Legacy terminal state without a stamp: start the clock now and persist it.
-                state['terminal_at'] = now
-                write(path, state)
-            elif now - state['terminal_at'] >= RETIRE_AFTER_S:
-                try:
-                    retire(cfg, ROOT / 'orders' / (cfg['watcher'] + '.json'))
-                except (RuntimeError, subprocess.TimeoutExpired) as exc:
-                    state['retire_error'] = str(exc)[:200]
-                    write(path, state)
 
     return {'ok': not bool(result.get('errors')), 'error': 'TRACK_POLL_SOURCE_ERROR' if result.get('errors') else None,
             'logProps': {'merchant':cfg.get('app'),'state':current,'changed':current != previous}}
+
+
+def retire_terminal(cfg, folder, path, state):
+    if folder.resolve() != (WATCHERS / cfg['watcher']).resolve():
+        return
+    # Direct checks can race the runner before it stores or delivers an event.
+    # Primes must finish registration before the watcher can be archived.
+    run_id = os.environ.get('WATCH_RUN', '')
+    if (not run_id or run_id.startswith('prime-')
+            or (cfg.get('delivery_card') or {}).get('ready') is False
+            or read(folder / 'state.json').get('pending')):
+        return
+    if state.get('card_error') and cfg.get('delivery_card'):
+        # Retry the terminal render from retained evidence, without provider I/O.
+        card = delivery_cards.safe_sync(cfg, state['last_result'], send=False)
+        if card.get('status', '').startswith('failed'):
+            state['card_error'] = card['status']
+            write(path, state)
+            return
+        state.pop('card_error', None)
+        write(path, state)
+    try:
+        retire(cfg, ROOT / 'orders' / (cfg['watcher'] + '.json'))
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        state['retire_error'] = str(exc)[:200]
+        write(path, state)
 
 
 def card_enrollment(new, cfg, args):

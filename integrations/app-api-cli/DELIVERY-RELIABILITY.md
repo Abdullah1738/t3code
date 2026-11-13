@@ -39,7 +39,17 @@ stay in Keychain; no raw notification dumps or mail bodies are stored.
   Moni Inbox, one-day search overlap, 35s total mail budget. Per-account errors
   named; a coverage problem alerts when a new error appears or the confirmed
   stage changes, otherwise it repeats at most daily while unresolved.
-- Amazon package events dedupe per message, do not mark whole-order terminal.
+- An ETA+5 check bypasses the email status caches before deciding whether to
+  emit `eta_elapsed`. Native reads remain fresh on every poll; no second fetch
+  is added to the check's native/mail budget.
+- Exact whole-order delivered/cancelled confirmation stops provider polling.
+  The terminal event is handed to robob-watch first, then the next scheduled check archives
+  the watcher without reading providers. Registration primes, direct checks and
+  pending wake deliveries cannot retire it. Failed final card refreshes retry
+  from the saved terminal result before retirement, without provider reads. Removing during the event check would
+  make the runner discard that event. The order registration and archived state
+  remain available. Amazon requires explicit whole-order completion; package
+  events do not retire a tracker.
 
 ## Verification
 

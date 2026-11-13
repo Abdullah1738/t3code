@@ -170,11 +170,16 @@ class Logs(unittest.TestCase):
             fetch.return_value={'status':'delivered','errors':[]}
             tracker.check(cfg)
             fetch.side_effect=RuntimeError('secret body ignored')
+            tracker.check(cfg)
+            self.assertEqual(fetch.call_count, 2)
+            tracker.write(folder/'order-tracker-state.json',{'primed':True,'status':'preparing'})
             with self.assertRaises(RuntimeError):tracker.check(cfg)
         rows=self.rows();names={r['name'] for r in rows}
         self.assertTrue({'track.poll','track.transition','track.eta_elapsed','track.delivered','track.error'} <= names)
         poll=[r for r in rows if r['name']=='track.poll']
-        self.assertEqual([r['ok'] for r in poll],[False,True,False])
+        self.assertEqual([r['ok'] for r in poll],[False,True,True,False])
+        self.assertEqual(poll[2]['props']['state'],'delivered')
+        self.assertFalse(poll[2]['props']['changed'])
         self.assertEqual(poll[1]['props']['state'],'delivered')
         self.assertTrue(poll[1]['props']['changed'])
         self.assertNotIn('secret body ignored',json.dumps(rows))
