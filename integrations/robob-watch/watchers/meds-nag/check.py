@@ -91,7 +91,9 @@ def main():
           if "test" in m and (last is None or d > last[0]): last = (d, m["test"])
       if not last: return " (log which side you pin, e.g. test:L)"
       nxt = "R" if last[1] == "L" else "L"
-      return " (pin %s VG, last was %s on %s)" % ({"L": "left", "R": "right"}[nxt], {"L": "left", "R": "right"}[last[1]], last[0])
+      # owner 2 Nov 2026: Test E goes subQ (belly / love-handle fat, 27G 1/2") from Fri 6 Nov
+      where = "subQ glute (upper-outer)" if day.isoformat() >= "2026-11-06" else "VG"
+      return " (pin %s %s, last was %s on %s)" % ({"L": "left", "R": "right"}[nxt], where, {"L": "left", "R": "right"}[last[1]], last[0])
   left = [i + site_hint() if i.lower().startswith("test") else i for i in left]
   print("💊 Meds check: still need to take " + ", ".join(left) + ". Text me when done and I'll stop.")
 if __name__ == "__main__": main()

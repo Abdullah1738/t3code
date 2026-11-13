@@ -48,7 +48,7 @@ t = json.load(open(p)) if os.path.exists(p) else {}
 sites = {}
 for i, x in enumerate(a):
     if ":" in x:
-        n, s = x.split(":", 1); s = s.upper().replace("-VG", "")
+        n, s = x.split(":", 1); s = s.upper().replace("-VG", "").replace("-SQ", "")
         if s not in ("L", "R"): sys.exit("site must be L or R: " + x)
         a[i] = n; sites["test"] = s
 names = ["dutasteride","tadalafil","arimidex","reta","test"] if [x.lower() for x in a] == ["all"] else [x.lower() for x in a]
@@ -59,5 +59,5 @@ if sites:
     import subprocess
     r = subprocess.run(["/usr/bin/python3", os.path.expanduser("~/health-data/abdullah/hlog.py"), "site", "log", sites["test"], day,
                         "--source", "took.py"], capture_output=True, text=True)
-    print("site", day, sites["test"] + "-VG", (r.stdout.strip() or r.stderr.strip()[-200:]))
+    print("site", day, sites["test"], (r.stdout.strip() or r.stderr.strip()[-200:]))
 show_open(day, t)
