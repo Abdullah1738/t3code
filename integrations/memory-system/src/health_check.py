@@ -921,7 +921,7 @@ def notify(severity, text, key):
         return False
 
 
-def notify_capture_imessage(key):
+def notify_capture_imessage(key, *, retire=False):
     """Queue one plain line on the owner's current conversation route."""
     try:
         with closing(ro(SPECTRUM_DB)) as db:
@@ -935,10 +935,17 @@ def notify_capture_imessage(key):
             session = f"{session}@{generation}"
         env = os.environ.copy()
         env.pop("BUN_INSPECT", None)
-        r = subprocess.run([BUN, SPECTRUM_CLI, "send", "--session", session, "--key", key,
-                            "--text", "Memory capture has not completed successfully for 6 hours; new sessions may not be saved."],
+        command = [BUN, SPECTRUM_CLI, "cancel-send" if retire else "send", "--session", session, "--key", key]
+        if not retire:
+            command += ["--text", "Memory capture has not completed successfully for 6 hours; new sessions may not be saved."]
+        r = subprocess.run(command,
                            capture_output=True, text=True, timeout=60, env=env)
-        return r.returncode == 0
+        if r.returncode != 0:
+            return False
+        if not retire:
+            return True
+        outcome = json.loads(r.stdout)
+        return isinstance(outcome, dict) and (outcome.get("cancelled") is True or outcome.get("settled") is True)
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
         return False
 
@@ -946,8 +953,11 @@ def notify_capture_imessage(key):
 def telegram_delivered(key):
     # Queue acceptance is not delivery: the bridge may send later items while
     # an earlier one is in backoff. Gate each recovery on provider acceptance.
+    return telegram_operation_delivered("notify:" + hashlib.sha256(key.encode()).hexdigest())
+
+
+def telegram_operation_delivered(outbox_id):
     try:
-        outbox_id = "notify:" + hashlib.sha256(key.encode()).hexdigest()
         with closing(ro(TG_DB)) as db:
             db.execute("BEGIN")
             row = db.execute("SELECT state FROM outbox WHERE id = ?", (outbox_id,)).fetchone()
@@ -964,8 +974,11 @@ def telegram_delivered(key):
 
 def muse_problem_safe_to_skip(key):
     """A definite failed/cancelled send cannot put a late problem after recovery."""
+    return telegram_operation_safe_to_skip("notify:" + hashlib.sha256(key.encode()).hexdigest())
+
+
+def telegram_operation_safe_to_skip(outbox_id):
     try:
-        outbox_id = "notify:" + hashlib.sha256(key.encode()).hexdigest()
         with closing(ro(TG_DB)) as db:
             db.execute("BEGIN")
             row = db.execute("SELECT state, attempts FROM outbox WHERE id = ?", (outbox_id,)).fetchone()
@@ -980,6 +993,42 @@ def muse_problem_safe_to_skip(key):
         return row[0] == "failed" and mark is not None and json.loads(mark[0]) is False
     except (OSError, ValueError, sqlite3.Error):
         return False
+
+
+def legacy_muse_problems():
+    # Legacy alerts grouped checks under a hashed key and overwrote their
+    # messages daily. Retain the latest operation and any older backoffs,
+    # so no queued legacy problem can arrive after the rollout's recovery.
+    try:
+        with closing(ro(TG_DB)) as db:
+            rows = db.execute("SELECT id, payload, state FROM outbox WHERE id LIKE 'notify:%' ORDER BY rowid DESC").fetchall()
+        operations = []
+        for operation_id, payload, status in rows:
+            operation = json.loads(payload)
+            text = operation.get("text", "")
+            if (operation.get("kind") == "notification"
+                    and text.startswith("[Memory health] Memory system problem:\n")
+                    and any(line.startswith("- muse_lag:") for line in text.splitlines())):
+                if not operations or status in ("pending", "sending", "uncertain"):
+                    operations.append(operation_id)
+        return operations
+    except (OSError, ValueError, sqlite3.Error):
+        return []
+
+
+def muse_problem_status(incident):
+    if incident.get("legacy_notified"):
+        if not incident.get("legacy_problem_ids"):
+            incident["legacy_problem_ids"] = legacy_muse_problems()
+        operations = incident["legacy_problem_ids"]
+        if not operations:
+            return False, False  # no delivery evidence, not permission to recover
+        delivered = [telegram_operation_delivered(operation) for operation in operations]
+        settled = all(sent or telegram_operation_safe_to_skip(operation)
+                      for operation, sent in zip(operations, delivered))
+        return settled and any(delivered), settled and not any(delivered)
+    key = incident.get("problem_key") or f"memory-health:muse_lag:{incident['incident_id']}"
+    return telegram_delivered(key), muse_problem_safe_to_skip(key)
 
 
 def capture_last_success(now):
@@ -1021,13 +1070,18 @@ def capture_notice(state, now):
     observed = prev.get("last_ok")
     first_seen = prev.get("first_seen", since)
     # Discovering an old marker after an unmarked outage is evidence of the
-    # same outage, not a new capture success.
-    if since is not None and observed is None and last_ok is not None and last_ok <= first_seen:
+    # same outage, not a new capture success. Equality can be a real success
+    # in the first observation's second; stage timestamps have second precision.
+    if since is not None and observed is None and last_ok is not None and last_ok < first_seen:
         prev["last_ok"] = last_ok
         prev["since"] = min(since, last_ok)
         since = prev["since"]
         observed = last_ok
     if since is None or (last_ok is not None and (observed is None or last_ok > observed)):
+        if prev.get("incident_id") and (prev.get("sent") or prev.get("attempted")
+                or ("attempted" not in prev and now - prev["since"] >= CAPTURE_IMESSAGE_AGE)):
+            # Even a lost enqueue acknowledgement can leave a pending warning.
+            state.setdefault("capture_retirements", []).append(prev["incident_id"])
         # No success marker at startup: count from first observation, not epoch.
         since = last_ok if last_ok is not None else now
         # Existing watcher/health state may already prove a long outage.
@@ -1039,7 +1093,7 @@ def capture_notice(state, now):
             since = min((v for v in candidates if isinstance(v, (int, float))
                          and math.isfinite(v) and 0 < v <= now), default=now)
         prev = {"since": since, "last_ok": last_ok, "first_seen": now,
-                "incident_id": uuid.uuid4().hex, "sent": False}
+                "incident_id": uuid.uuid4().hex, "sent": False, "attempted": False}
     state["capture_imessage"] = prev
     return prev if now - since >= CAPTURE_IMESSAGE_AGE and not prev.get("sent") else None
 
@@ -1123,7 +1177,7 @@ def run_checks(args):
                 # Existing notified_day records are already open incidents.
                 notified = prev.get("notified", bool(prev.get("notified_day")))
                 count = prev.get("consecutive_failures", 1 if prev else 0) + 1
-                failing[name] = {"since": prev.get("since", now), "msg": r["msg"],
+                failing[name] = {**prev, "since": prev.get("since", now), "msg": r["msg"],
                                  "incident_id": prev.get("incident_id") or uuid.uuid4().hex,
                                  "consecutive_failures": count, "notified": notified,
                                  "attempted": prev.get("attempted", notified),
@@ -1133,7 +1187,7 @@ def run_checks(args):
                 notified = prev.get("notified", bool(prev.get("notified_day")))
                 if notified or prev.get("attempted", False) or prev.get("consecutive_failures", 0) >= 2:
                     incident_id = prev.get("incident_id") or uuid.uuid4().hex
-                    state.setdefault("muse_recoveries", []).append({"incident_id": incident_id,
+                    state.setdefault("muse_recoveries", []).append({**prev, "incident_id": incident_id,
                         "msg": prev.get("notice_msg") or prev.get("msg", "Muse capture was behind"), "notified": notified,
                         "legacy_notified": prev.get("legacy_notified", bool(prev.get("notified_day")))})
                 failing.pop(name)
@@ -1200,13 +1254,14 @@ def run_checks(args):
             # the client did not get the response. Replay the same key before
             # its recovery, even if the check has already become healthy.
             if not notify("attention", f"Memory system problem:\n- muse_lag: {recovery['msg']}",
-                          f"memory-health:muse_lag:{incident_id}"):
+                          recovery.get("problem_key") or f"memory-health:muse_lag:{incident_id}"):
                 break
             recovery["notified"] = True
             save_incidents()
-        problem_key = f"memory-health:muse_lag:{incident_id}"
-        if not recovery.get("legacy_notified") and not telegram_delivered(problem_key):
-            if not muse_problem_safe_to_skip(problem_key):
+        delivered, safe_to_skip = muse_problem_status(recovery)
+        save_incidents()
+        if not delivered:
+            if not safe_to_skip:
                 break
             state["muse_recoveries"].remove(recovery)
             save_incidents()
@@ -1227,6 +1282,15 @@ def run_checks(args):
         state["muse_recoveries"].remove(recovery)
         save_incidents()
     muse = failing.get("muse_lag")
+    if muse and not state.get("muse_recoveries") and muse["consecutive_failures"] >= 2:
+        delivered, safe_to_skip = muse_problem_status(muse)
+        if not delivered and safe_to_skip:
+            # Only a terminal, definite rejection permits a new operation.
+            # Persist its key before enqueue; a timeout must replay this key.
+            muse["problem_key"] = f"memory-health:muse_lag:{muse['incident_id']}:{uuid.uuid4().hex}"
+            muse["notified"] = False
+            muse["legacy_notified"] = False
+        save_incidents()
     if muse and not state.get("muse_recoveries") and muse["consecutive_failures"] >= 2 and not muse["notified"]:
         # Record the attempt first: the process may die after the bridge accepts
         # it, then see a recovery on the next run.
@@ -1234,7 +1298,7 @@ def run_checks(args):
         muse["notice_msg"] = muse.get("notice_msg") or muse["msg"]
         save_incidents()
         if notify("attention", f"Memory system problem:\n- muse_lag: {muse['notice_msg']}",
-                  f"memory-health:muse_lag:{muse['incident_id']}"):
+                  muse.get("problem_key") or f"memory-health:muse_lag:{muse['incident_id']}"):
             muse["notified"] = True
             save_incidents()
 
@@ -1251,9 +1315,16 @@ def run_checks(args):
             capture["incident_id"] = uuid.uuid4().hex
             capture["sent"] = False
         save_state(state)
-        if capture and notify_capture_imessage(f"memory-capture-stall:{capture['incident_id']}"):
-            capture["sent"] = True
+        for incident_id in list(state.get("capture_retirements", [])):
+            if notify_capture_imessage(f"memory-capture-stall:{incident_id}", retire=True):
+                state["capture_retirements"].remove(incident_id)
+                save_state(state)
+        if capture:
+            capture["attempted"] = True
             save_state(state)
+            if notify_capture_imessage(f"memory-capture-stall:{capture['incident_id']}"):
+                capture["sent"] = True
+                save_state(state)
     except Exception as e:
         print(f"capture iMessage check failed: {type(e).__name__}: {e}")
 

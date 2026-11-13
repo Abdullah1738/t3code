@@ -11,6 +11,9 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import health_check as hc
 
+REAL_TELEGRAM_DELIVERED = hc.telegram_delivered
+REAL_PROBLEM_SAFE_TO_SKIP = hc.muse_problem_safe_to_skip
+
 
 class HealthIncidents(unittest.TestCase):
     def setUp(self):
@@ -28,6 +31,8 @@ class HealthIncidents(unittest.TestCase):
             mock.patch.object(hc, "LOGS", self.tmp.name),
             mock.patch.object(hc, "STATE", os.path.join(self.tmp.name, "state.json")),
             mock.patch.object(hc, "LAST", os.path.join(self.tmp.name, "last.json")),
+            mock.patch.object(hc, "TG_DB", os.path.join(self.tmp.name, "telegram.sqlite")),
+            mock.patch.object(hc, "SPECTRUM_DB", os.path.join(self.tmp.name, "spectrum.sqlite")),
             mock.patch.object(hc.time, "time", side_effect=lambda: self.now),
             mock.patch.object(hc.time, "strftime", side_effect=lambda *_: self.day),
             mock.patch.object(hc, "notify", side_effect=self.notify),
@@ -51,8 +56,9 @@ class HealthIncidents(unittest.TestCase):
         self.notices.append((severity, text, key))
         return self.send_ok
 
-    def imessage(self, key):
-        self.messages.append(key)
+    def imessage(self, key, *, retire=False):
+        if not retire:
+            self.messages.append(key)
         return self.imessage_ok
 
     def run_check(self, *args):
@@ -178,15 +184,15 @@ class HealthIncidents(unittest.TestCase):
         self.assertEqual([n[1] for n in self.notices], ["Memory system problem:\n- sync: sync is down"])
         self.ok = True
         self.run_check()
-        self.assertEqual(self.notices[-1][1], "Memory system recovered: muse_lag.")
+        self.assertFalse(any(n[0] == "info" for n in self.notices))
 
-    def test_legacy_muse_migration_recovery_does_not_wait_on_new_problem_key(self):
+    def test_legacy_muse_migration_waits_without_delivery_evidence(self):
         with open(hc.STATE, "w") as f:
             json.dump({"failing": {"muse_lag": {"since": 1, "msg": "old", "notified_day": "20261104"}}}, f)
         with mock.patch.object(hc, "telegram_delivered", side_effect=lambda key: ":recovered:" in key):
             self.run_check()
-        self.assertEqual([n[0] for n in self.notices], ["info"])
-        self.assertEqual(self.state()["muse_recoveries"], [])
+        self.assertEqual(self.notices, [])
+        self.assertTrue(self.state()["muse_recoveries"])
 
     def test_legacy_failing_muse_keeps_migration_flag_until_recovery(self):
         with open(hc.STATE, "w") as f:
@@ -196,8 +202,8 @@ class HealthIncidents(unittest.TestCase):
         self.ok = True
         with mock.patch.object(hc, "telegram_delivered", side_effect=lambda key: ":recovered:" in key):
             self.run_check()
-        self.assertEqual([n[0] for n in self.notices], ["info"])
-        self.assertEqual(self.state()["muse_recoveries"], [])
+        self.assertEqual(self.notices, [])
+        self.assertTrue(self.state()["muse_recoveries"][0]["legacy_notified"])
 
     def test_failed_recovery_is_requeued_with_new_key_only_after_definite_failure(self):
         self.ok = False
@@ -522,6 +528,45 @@ class HealthIncidents(unittest.TestCase):
         self.run_check()
         self.assertEqual(len(self.messages), 1)
 
+    def test_same_second_success_rearms_an_unmarked_outage(self):
+        with open(hc.STATE, "w") as f:
+            json.dump({"failing": {"sync": {"since": self.now - 8 * 3600,
+                       "notified_day": self.day, "msg": "down"}}}, f)
+        self.other_ok = False
+        self.run_check()
+        first = self.messages[-1]
+        self.set_capture(self.now)
+        self.run_check()
+        self.now += hc.CAPTURE_IMESSAGE_AGE
+        self.run_check()
+        self.assertEqual(len(self.messages), 2)
+        self.assertNotEqual(first, self.messages[-1])
+
+    def test_capture_recovery_retires_a_pending_warning_and_retries_cancellation(self):
+        self.set_capture(self.now - hc.CAPTURE_IMESSAGE_AGE)
+        self.imessage_ok = False  # an enqueue can land even if its acknowledgement is lost
+        self.run_check()
+        first = self.messages[-1]
+        self.now += 1
+        self.set_capture(self.now)
+        calls = []
+
+        def bridge(key, *, retire=False):
+            self.assertTrue(retire)
+            calls.append(key)
+            return len(calls) > 1
+
+        with mock.patch.object(hc, "notify_capture_imessage", side_effect=bridge):
+            self.run_check("--dry-run")
+            self.assertEqual(calls, [])
+            self.run_check()
+            self.assertTrue(self.state()["capture_retirements"])
+            self.run_check()
+            self.run_check()
+        self.assertEqual(calls, [first, first])
+        self.assertEqual(self.state()["capture_retirements"], [])
+        self.assertEqual(self.messages, [first])
+
     def test_fresh_success_during_earlier_notice_prevents_stale_alert(self):
         self.set_capture(self.now - 8 * 3600)
         self.other_ok = False
@@ -586,7 +631,169 @@ class HealthIncidents(unittest.TestCase):
         self.assertNotEqual(first, self.messages[1])
 
 
+class OutboxIncidents(unittest.TestCase):
+    sync = HealthIncidents.sync
+    muse = HealthIncidents.muse
+    run_check = HealthIncidents.run_check
+    state = HealthIncidents.state
+    set_capture = HealthIncidents.set_capture
+    notify = HealthIncidents.notify
+    imessage = HealthIncidents.imessage
+
+    def setUp(self):
+        HealthIncidents.setUp(self)
+        self.db_path = os.path.join(self.tmp.name, "telegram.sqlite")
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("CREATE TABLE outbox (id TEXT PRIMARY KEY, payload TEXT, state TEXT, attempts INTEGER)")
+            db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+        patches = [mock.patch.object(hc, "TG_DB", self.db_path),
+                   mock.patch.object(hc, "telegram_delivered", REAL_TELEGRAM_DELIVERED),
+                   mock.patch.object(hc, "muse_problem_safe_to_skip", REAL_PROBLEM_SAFE_TO_SKIP),
+                   mock.patch.object(hc, "notify", side_effect=self.enqueue)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def row_id(self, key):
+        import hashlib
+        return "notify:" + hashlib.sha256(key.encode()).hexdigest()
+
+    def enqueue(self, severity, text, key):
+        self.notices.append((severity, text, key))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?, 'pending', 0)",
+                       (self.row_id(key), json.dumps({"id": self.row_id(key), "kind": "notification",
+                                                    "text": "[Memory health] " + text})))
+        return True
+
+    def transition(self, key, state, ambiguity=None, checkpoint=False):
+        row_id = self.row_id(key)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE outbox SET state=?, attempts=1 WHERE id=?", (state, row_id))
+            db.execute("DELETE FROM kv")
+            if ambiguity is not None:
+                db.execute("INSERT INTO kv VALUES (?, ?)", (f"sendAmbiguous:{row_id}", json.dumps(ambiguity)))
+            if checkpoint:
+                db.execute("INSERT INTO kv VALUES (?, ?)", (f"chunk:{row_id}:0", '{"accepted":true}'))
+
+    def test_active_problem_renews_only_a_definitely_undelivered_key(self):
+        self.ok = False
+        self.run_check()
+        self.run_check()
+        first = self.notices[-1][2]
+        for state, ambiguity, checkpoint in [
+            ("pending", False, False), ("sending", True, False),
+            ("uncertain", True, False), ("failed", True, False),
+            ("failed", None, False), ("failed", False, True), ("sent", False, False),
+        ]:
+            with self.subTest(state=state, ambiguity=ambiguity, checkpoint=checkpoint):
+                self.transition(first, state, ambiguity, checkpoint)
+                self.run_check()
+                self.assertEqual(len(self.notices), 1)
+        self.transition(first, "failed", False)
+        self.run_check()
+        renewed = self.notices[-1][2]
+        self.assertNotEqual(first, renewed)
+        for _ in range(5):
+            self.run_check()
+        self.assertEqual(len(self.notices), 2)
+        self.ok = True
+        self.run_check()
+        self.assertEqual(len(self.notices), 2)
+        self.transition(renewed, "sent")
+        self.run_check()
+        self.assertEqual(self.notices[-1][0], "info")
+
+    def test_legacy_recovery_waits_for_the_actual_grouped_problem(self):
+        key = f"memory-health:{self.day}:muse_lag@1,sync@2"
+        self.enqueue("attention", "Memory system problem:\n- sync: down\n- muse_lag: old age", key)
+        self.transition(key, "pending", False)
+        with open(hc.STATE, "w") as f:
+            json.dump({"failing": {"muse_lag": {"since": 1, "msg": "newer age",
+                       "notified_day": self.day}}}, f)
+        self.notices.clear()
+        self.run_check()
+        self.assertEqual(self.notices, [])
+        self.transition(key, "sent")
+        self.run_check()
+        self.assertEqual([n[0] for n in self.notices], ["info"])
+
+    def test_legacy_rollout_keeps_older_backoffs_ahead_of_recovery(self):
+        old = "old-legacy-problem"
+        latest = "latest-legacy-problem"
+        text = "Memory system problem:\n- muse_lag: earlier age"
+        self.enqueue("attention", text, old)
+        self.enqueue("attention", text, latest)
+        self.transition(latest, "sent")
+        with open(hc.STATE, "w") as f:
+            json.dump({"failing": {"muse_lag": {"since": 1, "msg": "new age",
+                       "notified_day": self.day}}}, f)
+        self.notices.clear()
+        self.ok = False
+        self.run_check()
+        self.ok = True
+        self.run_check()
+        self.assertEqual(self.notices, [])
+        self.transition(old, "sent")
+        self.run_check()
+        self.assertEqual([n[0] for n in self.notices], ["info"])
+
+    def test_active_legacy_definite_failure_is_replaced_and_tracks_delivery(self):
+        old = "legacy-problem"
+        self.enqueue("attention", "Memory system problem:\n- muse_lag: old", old)
+        self.transition(old, "failed", False)
+        with open(hc.STATE, "w") as f:
+            json.dump({"failing": {"muse_lag": {"since": 1, "msg": "old",
+                       "notified_day": self.day}}}, f)
+        self.notices.clear()
+        self.ok = False
+        self.run_check()
+        renewed = self.notices[-1][2]
+        self.assertNotEqual(old, renewed)
+        self.ok = True
+        self.run_check()
+        self.assertEqual(len(self.notices), 1)
+        self.transition(renewed, "sent")
+        self.run_check()
+        self.assertEqual(self.notices[-1][0], "info")
+
+    def test_renewed_problem_key_survives_a_lost_enqueue_acknowledgement(self):
+        self.ok = False
+        self.run_check()
+        self.run_check()
+        original = self.notices[-1][2]
+        self.transition(original, "failed", False)
+
+        def lost_ack(severity, text, key):
+            self.assertEqual(self.state()["failing"]["muse_lag"]["problem_key"], key)
+            self.enqueue(severity, text, key)
+            raise RuntimeError("lost enqueue acknowledgement")
+
+        with mock.patch.object(hc, "notify", side_effect=lost_ack):
+            with self.assertRaises(RuntimeError):
+                self.run_check()
+        renewed = self.notices[-1][2]
+        self.run_check()
+        self.assertEqual(self.notices[-1][2], renewed)
+        self.assertNotEqual(original, renewed)
+
+
 class SpectrumSend(unittest.TestCase):
+    def test_cancel_command_preserves_the_key_and_waits_for_a_settled_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.sqlite")
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+                db.execute("INSERT INTO kv VALUES ('route', ?)", (json.dumps({"id": "owner-thread", "generation": 7}),))
+            with mock.patch.object(hc, "SPECTRUM_DB", path):
+                for outcome, expected in [({"cancelled": True}, True), ({"cancelled": False}, False),
+                                          ({"cancelled": False, "settled": True}, True), ({}, False)]:
+                    with self.subTest(outcome=outcome), mock.patch.object(hc.subprocess, "run",
+                            return_value=mock.Mock(returncode=0, stdout=json.dumps(outcome))) as run:
+                        self.assertEqual(hc.notify_capture_imessage("original-key", retire=True), expected)
+                        self.assertEqual(run.call_args.args[0], [hc.BUN, hc.SPECTRUM_CLI, "cancel-send",
+                                         "--session", "owner-thread@7", "--key", "original-key"])
+
     def test_reads_owner_route_and_calls_session_bound_send(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "state.sqlite")
