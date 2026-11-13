@@ -382,18 +382,26 @@ class MonitorTests(unittest.TestCase):
 
     def test_shim_exemption_passthrough_and_expiry(self):
         import os
+        import shlex
         import subprocess
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake = root / "docker"
             fake.write_text("#!/bin/zsh\nprint -r -- fake-real-docker \"$@\"\n")
             fake.chmod(0o755)
-            shim = Path(monitor.__file__).parent / "blockers/docker"
+            scripts = Path(monitor.__file__).parent
+            shim = root / "guard/docker"
+            shim.parent.mkdir()
+            # The installed shim uses macOS's Python path; keep its policy code but use the test interpreter.
+            shim.write_text((scripts / "blockers/docker").read_text().replace(
+                "/opt/homebrew/bin/python3", shlex.quote(sys.executable)))
+            shim.chmod(0o755)
             # The shim only enforces when offbox is installed (~/.local/bin/offbox); give it a home that has one.
             (root / ".local/bin").mkdir(parents=True)
             (root / ".local/bin/offbox").write_text("#!/bin/sh\n")
             (root / ".local/bin/offbox").chmod(0o755)
             env = clean_env(HOME=directory, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
+                       PYTHONPATH=str(scripts),
                        OPENCODE_SESSION_ID="ses_test", OFFBOX_STATE_DIR=directory, OFFBOX_GATE_MODE="enforce")
             for expiry, expected in (("2030-01-01T00:00:00Z", 0), ("2000-01-01T00:00:00Z", 3)):
                 (root / "exemptions.json").write_text(json.dumps([{"session_id": "ses_test", "expires_at": expiry}]))

@@ -16,6 +16,7 @@ import {
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -27,7 +28,7 @@ import * as Asks from "../engine/asks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
-import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
+import { WAITS_ENGINE_WIRED, waitingFor } from "../engine/waits.ts";
 import {
   AGENT_READ_BYTES,
   MESSAGE_PAGE_MAX,
@@ -37,6 +38,7 @@ import {
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
+import * as Activity from "../engine/activity.ts";
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -409,6 +411,28 @@ const handlers = {
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
         );
+        if (input.since !== undefined) {
+          const window = Activity.parseWindow(input.since, undefined, yield* Clock.currentTimeMillis);
+          if (typeof window === "string") return yield* invalid(window);
+          const read = yield* service.activity(board.id, window);
+          const byCard = Activity.groupEvents(read.events);
+          const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
+            Activity.compactRow(card, byCard.get(card.id) ?? [], window),
+          );
+          return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
+            board: {
+              id: board.id,
+              name: board.name,
+              window,
+              legend: Activity.COMPACT_LEGEND,
+              activeCards: rows.length,
+              pools: read.pools.map((pool) => ({ key: pool.key, slots: pool.slots })),
+              cards,
+              page: { limit, ...cursor },
+            },
+            prompts: "omitted; card_get returns a card's prompt",
+          }));
+        }
         const snapshot = yield* service.replySnapshot(board.id, {
           after: input.after ?? 0,
           limit: limit + 1,
@@ -426,11 +450,29 @@ const handlers = {
     ),
   ),
 
+  board_activity: McpToolAccess.readsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId, true);
+        const window = Activity.parseWindow(
+          input.since,
+          input.until,
+          yield* Clock.currentTimeMillis,
+        );
+        if (typeof window === "string") return yield* invalid(window);
+        const read = yield* service.activity(board.id, window);
+        return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
+      }),
+    ),
+  ),
+
   card_search: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
-        const cards = yield* service.cards(board.id);
+        const cards = yield* service.cards(board.id, {
+          includeSettled: input.includeSettled === true,
+        });
         const found = cards
           .filter(
             (card) =>
@@ -465,7 +507,15 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
-        return { card: detail.card, events: detail.events, threads: detail.threads };
+        return {
+          card: detail.card,
+          threads: detail.threads,
+          ...Activity.pageCardEvents(
+            { card: detail.card, threads: detail.threads },
+            detail.events,
+            input.events,
+          ),
+        };
       }),
     ),
   ),
@@ -502,15 +552,37 @@ const handlers = {
           input.to,
           isCardThread(caller) ? "cardThread" : "evaluator",
           caller.actor,
-          { note: input.note ?? null, question: input.question ?? null },
+          {
+            note: input.note ?? null,
+            question: input.question ?? null,
+            ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
+          },
         );
+        const dependency = card.wait?.card
+          ? yield* service.card(KanbanCardId.make(card.wait.card)).pipe(
+              Effect.map((detail) => detail.card),
+              Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
+            )
+          : null;
+        const waitMessage =
+          card.wait !== undefined &&
+          (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
+            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+                moved.wait === undefined
+                  ? "cleared by this move; set it again with card_wait or pass keepWait"
+                  : "kept"
+              }`
+            : null;
         return {
           card: moved,
-          ...(moved.stage === card.stage
+          ...(waitMessage === null ? {} : { message: waitMessage }),
+          ...(moved.stage === card.stage && waitMessage === null
             ? {
                 message:
                   input.to === moved.stage
-                    ? `already in ${moved.stage}; nothing changed`
+                    ? moved.stage === "needs_review" && caller.link?.role === "work"
+                      ? "already queued for review; note added"
+                      : `already in ${moved.stage}; nothing changed`
                     : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
               }
             : {}),
@@ -776,19 +848,21 @@ const handlers = {
         );
         let messages: ReadonlyArray<KanbanMessage>;
         let note: string | undefined;
+        const readBytes =
+          input.limit === undefined ? AGENT_READ_BYTES : Activity.COMPACT_READ_CHARS;
         if (input.seq !== undefined) {
           messages = [yield* service.message(discussion.id, input.seq)];
         } else {
           messages = yield* service.messages(discussion.id, {
             ...(input.afterSeq === undefined ? {} : { afterSeq: input.afterSeq }),
             ...(input.beforeSeq === undefined ? {} : { beforeSeq: input.beforeSeq }),
-            limit: MESSAGE_PAGE_MAX,
+            limit: Math.min(input.limit ?? MESSAGE_PAGE_MAX, MESSAGE_PAGE_MAX),
             full: true,
-            maxBytes: AGENT_READ_BYTES,
+            maxBytes: readBytes,
           });
           // One message alone past the cap comes as a stub; seq reads it whole.
           const only = messages.length === 1 ? messages[0]! : undefined;
-          if (only !== undefined && messageBytes(only) > AGENT_READ_BYTES) {
+          if (only !== undefined && messageBytes(only) > readBytes) {
             messages = [stubMessage(only)];
             note = `Message ${only.seq} is too big for a list read; read it alone with seq: ${only.seq}.`;
           }
@@ -1029,6 +1103,23 @@ const handlers = {
             replaces: input.replaces,
           }),
         };
+      }),
+    ),
+  ),
+
+  board_instructions_set: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card = yield* cardFor(service, caller, input.card);
+        return yield* service.applyApprovedInstructions(
+          board.id,
+          input.field,
+          input.text,
+          card.id,
+          input.ask,
+          caller.actor,
+        );
       }),
     ),
   ),

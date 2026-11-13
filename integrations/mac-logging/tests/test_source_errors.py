@@ -25,6 +25,9 @@ class SourceTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        probes = patch.object(jobs, 'storage_probes', return_value={})
+        probes.start()
+        self.addCleanup(probes.stop)
 
     def rows(self, name):
         return [row for path in self.logs.glob('*.ndjson')

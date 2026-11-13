@@ -208,10 +208,12 @@ class Instrumentation(Isolated):
         self.assertEqual(self.rows('ssh.drop')[0]['error']['tag'],'ssh_drop')
 
     def test_health_failover_reaper_and_install_detach(self):
+        from offbox_lib import api
         for result in (None,'home down'):
             with patch.object(home,'_probe',return_value=result): home.probe()
         self.outcomes('home.probe')
-        with patch.object(home,'record_failure'),patch.object(home.os,'execve',side_effect=RuntimeError('exec replaced')):
+        with patch.object(home,'record_failure'), patch.object(api,'probe_backend',return_value=None), \
+                patch.object(home.os,'execve',side_effect=RuntimeError('exec replaced')):
             with self.assertRaises(RuntimeError): home.fail_over('private reason', ['run'], 'run-fixture')
         self.assertEqual(self.rows('backend.failover')[0]['props']['from'],'home')
         with patch.object(reap,'_reap_logged',return_value=['stop bx_fixture']): reap.reap()

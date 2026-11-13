@@ -578,3 +578,31 @@ it("refuses worker cutover restoration while an evaluator step precedes work", (
   );
   assert.isFalse(result.ok);
 });
+
+
+it("cutover reconciliation re-stamps an existing wait with its restored move", () => {
+  const wait = {
+    on: "time" as const,
+    pr: null,
+    card: null,
+    ask: null,
+    until: "2026-12-01T00:00:00.000Z",
+    sinceHead: null,
+    note: "After cutover",
+    by: { _tag: "owner" as const },
+    at,
+    wakeRole: "evaluator" as const,
+    expiredAt: null,
+    script: null,
+    args: null,
+    status: null,
+    lastCheckedAt: null,
+    failures: 0,
+    problem: null,
+  };
+  const result = planCutoverCardRestore(fixture({ card: { ...stopped, wait } }));
+  assert.isTrue(result.ok);
+  if (!result.ok) return;
+  assert.deepStrictEqual(result.card.wait, { ...wait, at: later });
+  assert.strictEqual(result.card.movedAt, later);
+});

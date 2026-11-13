@@ -185,8 +185,17 @@ def select(cwd, base_path, home, helper):
         if m:
             wanted = {'9': [10, 9], '6': [8], '5': [7, 6]}.get(m[1], [])
     paths = base_path.split(':')
+    # Repo toolchain pins must not outrank command guards inherited from the
+    # harness. Preserve only guards already present on the caller's PATH.
+    managed = [os.path.join(home, rel) for rel in [
+        '.config/opencode/skills/remote-compute/scripts/blockers',
+        '.local/share/harness-hooks/coord-blockers',
+        '.local/share/quint-guard/bin',
+    ]]
+    prefix = [entry for entry in managed if entry in paths]
+    paths = prefix + [entry for entry in paths if entry not in prefix]
     if node_dir:
-        paths.insert(0, node_dir)
+        paths.insert(len(prefix), node_dir)
     node = next((os.path.join(p, 'node') for p in paths if os.access(os.path.join(p, 'node'), os.X_OK)), '')
     cli = hint = ''
     if wanted:
@@ -209,7 +218,7 @@ def select(cwd, base_path, home, helper):
         else:
             hint = f'no cached/installed pnpm {wanted[0]}.x; install explicitly: corepack prepare pnpm@{wanted[0]} --activate'
             warnings.append(hint)
-        paths.insert(0, os.path.join(helper, 'pnpm-bin'))
+        paths.insert(len(prefix), os.path.join(helper, 'pnpm-bin'))
     return ':'.join(paths), node, cli, hint, warnings, node_dir
 
 

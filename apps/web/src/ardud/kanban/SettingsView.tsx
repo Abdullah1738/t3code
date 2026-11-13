@@ -514,6 +514,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onChange={(defaultCardModel) => update({ defaultCardModel })}
         />
       </Section>
+      <Section title="Guess approval gates">
+        <GuessedGateSettings board={board} disabled={!canEdit} disabledReason={editNote} />
+      </Section>
       <Section title="Review">
         {board.reviewChains.map((chain, chainIndex) => {
           const isDefault = chain.name === board.defaultReviewChain;
@@ -1092,4 +1095,47 @@ function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean })
       ) : null}
     </div>
   );
+}
+
+function GuessedGateSettings(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  disabledReason?: string | undefined;
+}) {
+  const gates = ["deploy", "money", "secret"] as const;
+  const selected = props.board.guessedGates ?? gates;
+  const [pending, setPending] = useState(false);
+  const save = async (gate: (typeof gates)[number], checked: boolean) => {
+    setPending(true);
+    try {
+      await runAction("Couldn't save approval gates", () =>
+        kanban.updateBoard({
+          boardId: props.board.id,
+          guessedGates: gates.filter((kind) => (kind === gate ? checked : selected.includes(kind))),
+        }),
+      );
+    } finally {
+      setPending(false);
+    }
+  };
+  return gates.map((gate) => (
+    <label
+      key={gate}
+      htmlFor={`guess-${props.board.id}-${gate}`}
+      className="flex min-h-12 items-center justify-between gap-4 not-last:border-b not-last:border-(--m-rule)"
+    >
+      <span className="font-medium">
+        {{ deploy: "Deploy", money: "Money", secret: "Secret" }[gate]}
+      </span>
+      <Switch
+        id={`guess-${props.board.id}-${gate}`}
+        name={`guess-${gate}`}
+        aria-label={`Guess ${gate} approval gates from wording`}
+        checked={selected.includes(gate)}
+        disabled={props.disabled || pending}
+        title={props.disabledReason}
+        onCheckedChange={(checked) => void save(gate, checked)}
+      />
+    </label>
+  ));
 }

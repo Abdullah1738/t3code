@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -44,12 +46,25 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
   log(watcher.id, `status -> ${status}`);
 }
 
+async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false): Promise<void> {
+  if (!watcher.pending_check) return;
+  await slots.run(async () => {
+    const current = loadWatcher(watcher.id);
+    if (!current || held(current) || current.paused || !current.pending_check) return;
+    const result = await runCheck({ ...current, check: current.pending_check }, watcherDir(watcher.id),
+      { WATCH_RUN: `pending-${at.toString(36)}`, ...(mainChecked ? { WATCH_MAIN_CHECKED: "1" } : {}) },
+      checkTimeout(current, sampleLoad()));
+    log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
+  });
+}
+
 /** Returns true once the event is delivered (or had been already). */
 async function deliverPending(watcher: Watcher, state: State): Promise<boolean> {
   // A held event keeps its key and is retried each minute, so it goes out once the quiet hours end.
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(watcher, pending.event, pending.key, state);
+  await recordHealthDelivery(watcher.id, pending.healthRun, delivery);
   toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: watcher.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!delivery.ok) return false;
@@ -179,6 +194,7 @@ export async function tickOne(id: string): Promise<void> {
     if (!(await deliverPending(watcher, state)) && !held(watcher)) {
       state.next_at = now() + Math.min(watcher.interval_s, 60) * 1_000;
       saveState(id, state);
+      await runPendingCheck(watcher, t);
     }
     return;
   }
@@ -186,6 +202,7 @@ export async function tickOne(id: string): Promise<void> {
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
   const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const healthRun = isHealthNag(id) ? randomUUID().replaceAll("-", "") : undefined;
   let startLoad = 0;
   let timeoutMs = 0;
   const result = await slots.run(async () => {
@@ -197,7 +214,7 @@ export async function tickOne(id: string): Promise<void> {
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId }, timeoutMs);
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs);
   });
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
@@ -301,13 +318,14 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.last_error_sources;
   delete fresh.failing_since;
   const event = result.stdout.trim();
-  if (!event) { saveState(id, fresh); ackRun(); return; }
-  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso() };
+  if (!event) { saveState(id, fresh); ackRun(); await runPendingCheck(watcher, t, true); return; }
+  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), ...(healthRun ? { healthRun } : {}) };
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
   if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
   await deliverPending(watcher, fresh);
+  await runPendingCheck(watcher, t, true);
 }
 
 let previousMaintenance: Maintenance | undefined;

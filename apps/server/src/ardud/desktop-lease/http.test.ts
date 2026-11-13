@@ -4,6 +4,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { AuthSessionId, type AuthEnvironmentScope } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Etag from "effect/http/Etag";
@@ -11,6 +12,7 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import { DesktopLease, QUIET_MS } from "./DesktopLease.ts";
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
@@ -74,7 +76,19 @@ const makeHarness = (
         if (options.failFirstOpen && opens === 1) throw new Error("simulated open failure");
         return new DesktopLease(storeOptions);
       },
-    }).pipe(Layer.provide(identity));
+    }).pipe(
+      Layer.provide(identity),
+      Layer.provide(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRunningTurnContext: () =>
+            Effect.succeed({
+              run: undefined,
+              providerThread: undefined,
+              providerTurn: undefined,
+            }),
+        }),
+      ),
+    );
     const web = yield* Effect.acquireRelease(
       Effect.sync(() =>
         HttpRouter.toWebHandler(
@@ -125,7 +139,14 @@ const makeHarness = (
               state: string;
             } | null;
             status: {
-              lease: { childThreadId: string; rootThreadId: string; ticket: string } | null;
+              lease: {
+                childThreadId: string;
+                rootThreadId: string;
+                ticket: string;
+                staleAfterMs?: number;
+                heartbeatAt: string;
+                heartbeatBy?: string;
+              } | null;
             };
             error: { code: string; message: string };
           },
@@ -191,6 +212,15 @@ describe("desktop lease HTTP", () => {
         assert.deepStrictEqual(resolvedInputs[0], holder);
         assert.strictEqual(acquired.body.status.lease?.childThreadId, "thread-holder-native");
         assert.strictEqual(acquired.body.status.lease?.rootThreadId, "root-holder-native");
+        assert.strictEqual(acquired.body.status.lease?.staleAfterMs, 120_000);
+        assert.strictEqual(
+          acquired.body.status.lease?.heartbeatBy,
+          DateTime.formatIso(
+            DateTime.add(DateTime.makeUnsafe(acquired.body.status.lease!.heartbeatAt), {
+              milliseconds: 120_000,
+            }),
+          ),
+        );
 
         const status = yield* request("GET", "");
         assert.strictEqual(status.status, 200);

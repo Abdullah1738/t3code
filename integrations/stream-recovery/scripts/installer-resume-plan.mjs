@@ -7,6 +7,9 @@ import { cutoverOwns, parseCutoverStatus } from '../lib/harness.mjs';
 // The installer owns pending.json. This helper only classifies its snapshot;
 // an active cutover's entries must remain pending until its durable completion.
 export function planInstallerResume(snapshot, cutover) {
+  if (cutover.threadClaimsIncluded === false) {
+    throw new Error('installer requires full harness-cutover thread claims (?claims=1)');
+  }
   if (!Array.isArray(snapshot?.threads) || !snapshot.threads.every((t) => typeof t?.threadId === 'string')) {
     throw new Error('invalid installer snapshot');
   }
@@ -27,7 +30,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   try {
     const [snapshotPath, statusPath, ...extra] = process.argv.slice(2);
     if (!snapshotPath || extra.length) throw new Error('usage: installer-resume-plan.mjs SNAPSHOT.json [STATUS.json]');
-    const status = statusPath ? parseCutoverStatus(JSON.parse(readFileSync(statusPath, 'utf8'))) : await harnessCutoverStatus();
+    const status = statusPath ? parseCutoverStatus(JSON.parse(readFileSync(statusPath, 'utf8'))) : await harnessCutoverStatus({ withClaims: true });
     console.log(JSON.stringify(planInstallerResume(JSON.parse(readFileSync(snapshotPath, 'utf8')), status)));
   } catch (error) {
     console.error(error.message);

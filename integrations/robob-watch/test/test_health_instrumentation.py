@@ -276,12 +276,12 @@ class InstrumentationTests(unittest.TestCase):
             g['client_creds'] = lambda: ('private', 'private')
             g['token_request'] = lambda form: {}
             g['save_tokens'] = lambda *a, **kw: {'access_token': 'private', 'expires_at': 9999999999}
-            def collection(path, start):
+            def collection(path, start, diagnostic=None):
                 g['valid_access_token']()
                 return {'/activity/sleep': [{'end': '2020-01-01T00:00:00Z'}] * 2,
                         '/recovery': [{'score_state': 'PENDING_SCORE'}], '/cycle': [{}, {}, {}]}[path]
             g['collection'] = collection
-            g['api_get'] = lambda *a: {'max_heart_rate': 200}
+            g['api_get'] = lambda *a, **kw: {'max_heart_rate': 200}
         script = self.vault / 'whoop/whoop.py'
         self.assertEqual(self.run_script(script, ['sync'], fixture), 0)
         self.assert_run('whoop-sync', 0, 'sync.run')
@@ -305,7 +305,7 @@ class InstrumentationTests(unittest.TestCase):
         for states, expected in cases:
             def fixture(g):
                 # Stop after real recovery-state accounting, before DB writes.
-                def collection(path, start):
+                def collection(path, start, diagnostic=None):
                     if path == '/cycle':
                         raise RuntimeError('fixture stop')
                     return [{'score_state': state} for state in states]

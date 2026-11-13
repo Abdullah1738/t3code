@@ -389,8 +389,8 @@ export async function ctl(method, path, body) {
   return api(method, `/api/ardud/control${path}`, body);
 }
 
-export async function harnessCutoverStatus() {
-  return parseCutoverStatus(await ctl('GET', '/harness-cutover/status'));
+export async function harnessCutoverStatus({ withClaims = false } = {}) {
+  return parseCutoverStatus(await ctl('GET', `/harness-cutover/status${withClaims ? '?claims=1' : ''}`));
 }
 
 async function api(method, path, body) {

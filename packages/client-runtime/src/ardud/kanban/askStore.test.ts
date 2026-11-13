@@ -83,6 +83,7 @@ const lost = (number: number, patch: Partial<AskUnreadable> = {}): AskUnreadable
 
 function harness(analyticsEnvironmentId?: string) {
   let feed: AskFeedRead = feedOf([]);
+  let visible = true;
   const boards = new Set<() => void>();
   const foreground = new Set<() => void>();
   const calls: Array<{ readonly name: string; readonly args: ReadonlyArray<unknown> }> = [];
@@ -99,7 +100,7 @@ function harness(analyticsEnvironmentId?: string) {
     feed: async (...args: ReadonlyArray<unknown>) => {
       calls.push({ name: "feed", args });
       if (fail.feed !== undefined) throw fail.feed;
-      return feed;
+      return (results.feed as AskFeedRead | undefined) ?? feed;
     },
     detail: call("detail", {}),
     answer: call("answer", { card: {}, ask: null }),
@@ -126,7 +127,7 @@ function harness(analyticsEnvironmentId?: string) {
         foreground.add(run);
         return () => void foreground.delete(run);
       },
-      isForeground: () => true,
+      isForeground: () => visible,
     },
   });
   return {
@@ -137,6 +138,9 @@ function harness(analyticsEnvironmentId?: string) {
     results,
     boards,
     foreground,
+    setVisible: (value: boolean) => {
+      visible = value;
+    },
     named: (name: string) => calls.filter((entry) => entry.name === name),
     setFeed: (open: ReadonlyArray<KanbanAskFeedItem>) => {
       feed = feedOf(open);
@@ -1275,22 +1279,90 @@ describe("the feed", () => {
     expect(h.cell.getState().error).toBe("Robob did not answer.");
   });
 
-  it("is read again when a board changes or the app comes back, until nothing watches", async () => {
+  it("coalesces board pushes and foreground signals into one shared 30-second poll", async () => {
     const h = harness();
+    const sidebar = h.store.watchAsks(false);
+    const page = h.store.watchAsks(true);
+    const otherPage = h.store.watchAsks(true);
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
+    expect(h.boards.size).toBe(1);
+    expect(h.foreground.size).toBe(1);
+    for (let second = 0; second < 29; second++) {
+      for (const run of h.boards) run();
+      for (const run of h.foreground) run();
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(h.named("feed")).toHaveLength(1);
+    page();
+    page(); // Stopping the same consumer twice cannot stop another one's poll.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.named("feed")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.named("feed")).toHaveLength(3);
+    otherPage();
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(h.named("feed")).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.named("feed")).toHaveLength(4);
+    sidebar();
+    expect(h.boards.size + h.foreground.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.named("feed")).toHaveLength(4);
+  });
+
+  it("pauses initial, timed and pushed reads while hidden and refreshes on return", async () => {
+    const h = harness();
+    h.setVisible(false);
     const stop = h.store.watchAsks(true);
+    for (const run of h.boards) run();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(h.named("feed")).toHaveLength(0);
+    h.setVisible(true);
+    for (const run of h.foreground) run();
     await settle();
     expect(h.named("feed")).toHaveLength(1);
     for (const run of h.boards) run();
+    h.setVisible(false);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(h.named("feed")).toHaveLength(1);
+    h.setVisible(true);
     for (const run of h.foreground) run();
-    await vi.advanceTimersByTimeAsync(400);
+    await settle();
     expect(h.named("feed")).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(15_000);
+    stop();
+  });
+
+  it("keeps explicit action refreshes immediate without a second passive read", async () => {
+    const h = harness();
+    const stop = h.store.watchAsks(true);
+    await settle();
+    await vi.advanceTimersByTimeAsync(25_000);
+    await h.store.refreshAsks();
+    expect(h.named("feed")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.named("feed")).toHaveLength(2);
+    for (const run of h.boards) run();
+    await vi.advanceTimersByTimeAsync(25_000);
     expect(h.named("feed")).toHaveLength(3);
     stop();
-    expect(h.boards.size).toBe(0);
-    expect(h.foreground.size).toBe(0);
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(h.named("feed")).toHaveLength(3);
+  });
+
+  it("does not queue another passive read behind a slow request", async () => {
+    const h = harness();
+    let finish!: (feed: AskFeedRead) => void;
+    h.results.feed = new Promise<AskFeedRead>((resolve) => {
+      finish = resolve;
+    });
+    const stop = h.store.watchAsks(true);
+    await vi.advanceTimersByTimeAsync(90_000);
+    for (const run of h.boards) run();
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
+    stop();
+    finish(feedOf([]));
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
   });
 });
 

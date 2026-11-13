@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 // @effect-diagnostics nodeBuiltinImport:off - Atomic fsync/rename and byte-preserving fixture verification require native file handles.
+import * as NodeZlib from "node:zlib";
+import * as NodeUtil from "node:util";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
@@ -22,8 +24,11 @@ const decodeText = (bytes: Uint8Array): string => {
     throw new Error("Redaction requires valid UTF-8 text.");
   }
 };
+const decompress = NodeUtil.promisify(NodeZlib.gunzip);
+const compress = NodeUtil.promisify(NodeZlib.gzip);
 export async function readTextFile(file: string): Promise<string> {
-  return decodeText(await NodeFSP.readFile(file));
+  const bytes = await NodeFSP.readFile(file);
+  return decodeText(file.endsWith(".gz") ? await decompress(bytes) : bytes);
 }
 
 export async function filesBelow(root: string): Promise<string[]> {
@@ -85,12 +90,30 @@ const validateTranscript = (file: string, text: string, before?: string) => {
 
 export interface RewritePlan {
   path: string;
-  before: string;
-  after: string;
+  beforeHash: string;
+  afterHash: string;
+  matchedBefore: number;
   mode: number;
   ino: number;
   mtimeMs: number;
 }
+
+const textHash = (text: string) =>
+  NodeCrypto.createHash("sha256").update(text, "utf8").digest("hex");
+const replaceFileText = (
+  file: string,
+  before: string,
+  needles: readonly string[],
+  marker: string,
+) => {
+  const replacement = (file.endsWith(".jsonl") ? replaceText : replaceScalarText)(
+    before,
+    needles,
+    marker,
+  );
+  validateTranscript(file, replacement.text, before);
+  return replacement;
+};
 
 export async function planFile(
   file: string,
@@ -101,20 +124,41 @@ export async function planFile(
   if (!stat.isFile() || stat.nlink !== 1)
     throw new Error("Redaction requires an unlinked regular file.");
   const before = await readTextFile(file);
-  const after = (file.endsWith(".jsonl") ? replaceText : replaceScalarText)(
-    before,
-    needles,
-    marker,
-  ).text;
-  validateTranscript(file, after, before);
+  const replacement = replaceFileText(file, before, needles, marker);
+  // Preflight spans all archives. Retain proofs, never their expanded bodies.
   return {
     path: file,
-    before,
-    after,
+    beforeHash: textHash(before),
+    afterHash: textHash(replacement.text),
+    matchedBefore: replacement.count,
     mode: stat.mode & 0o777,
     ino: stat.ino,
     mtimeMs: stat.mtimeMs,
   };
+}
+
+async function readPlannedText(plan: RewritePlan) {
+  const before = await readTextFile(plan.path);
+  const stat = await NodeFSP.lstat(plan.path);
+  if (
+    !stat.isFile() ||
+    stat.nlink !== 1 ||
+    stat.ino !== plan.ino ||
+    stat.mtimeMs !== plan.mtimeMs ||
+    textHash(before) !== plan.beforeHash
+  ) {
+    throw new Error("Redaction file changed; retry after stopping its writer.");
+  }
+  return before;
+}
+
+async function prepareRewrite(plan: RewritePlan, needles: readonly string[], marker: string) {
+  const before = await readPlannedText(plan);
+  const replacement = replaceFileText(plan.path, before, needles, marker);
+  if (replacement.count !== plan.matchedBefore || textHash(replacement.text) !== plan.afterHash) {
+    throw new Error("Redaction rewrite no longer matches its preflight.");
+  }
+  return replacement;
 }
 
 async function rewriteFileNative(
@@ -122,31 +166,21 @@ async function rewriteFileNative(
   needles: readonly string[],
   marker: string,
 ): Promise<ThreadRedactionCount> {
-  validateTranscript(plan.path, plan.after, plan.before);
-  const count = (plan.path.endsWith(".jsonl") ? replaceText : replaceScalarText)(
-    plan.before,
-    needles,
-    marker,
-  ).count;
-  if (plan.before !== plan.after) {
+  const { text: after, count } = await prepareRewrite(plan, needles, marker);
+  if (plan.beforeHash !== plan.afterHash) {
     const temp = NodePath.join(
       NodePath.dirname(plan.path),
       `.redaction-${NodeCrypto.randomUUID()}`,
     );
     const handle = await NodeFSP.open(temp, "wx", 0o600);
     try {
-      await handle.writeFile(plan.after);
+      await handle.writeFile(
+        plan.path.endsWith(".gz") ? await compress(after, { level: 6 }) : after,
+      );
       await handle.chmod(plan.mode);
       await handle.sync();
       await handle.close();
-      const stat = await NodeFSP.lstat(plan.path);
-      if (
-        stat.ino !== plan.ino ||
-        stat.mtimeMs !== plan.mtimeMs ||
-        (await readTextFile(plan.path)) !== plan.before
-      ) {
-        throw new Error("Redaction file changed; retry after stopping its writer.");
-      }
+      await readPlannedText(plan);
       await NodeFSP.rename(temp, plan.path);
       const directory = await NodeFSP.open(NodePath.dirname(plan.path), "r");
       try {

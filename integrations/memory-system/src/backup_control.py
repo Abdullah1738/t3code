@@ -10,6 +10,17 @@ import time
 LAUNCH_INTERVAL_S = 14400  # StartInterval in com.abdullah.memory-backup.plist
 
 
+def log_skip(start, reason, lock, exit_code=0):
+    # The shell execs this guard, so its EXIT trap cannot see admission skips.
+    try:
+        helper = Path(os.environ.get('MAC_LOG_HOME', Path.home()/'.local/lib/mac-logging'))/'jobs.py'
+        subprocess.run([sys.executable, str(helper), 'backup', 'memory', str(start), '',
+                        str(exit_code), '0', reason, str(lock)], input='', text=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+    except Exception:
+        pass
+
+
 def load_per_core():
     override = os.environ.get('MEMORY_BACKUP_LOAD_OVERRIDE')
     if override is not None:
@@ -50,6 +61,7 @@ def defer(status):
 
 
 def guard(lock, command):
+    start = time.time()
     lock.parent.mkdir(parents=True, exist_ok=True)
     def record(message):
         print(message, flush=True)
@@ -60,6 +72,7 @@ def guard(lock, command):
         try:
             fcntl.flock(fence, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            log_skip(start, 'lock_held', lock)
             record('already running')
             return 0
         pidfile = lock / 'pid'
@@ -72,6 +85,7 @@ def guard(lock, command):
         except (FileNotFoundError, ValueError, ProcessLookupError):
             pass
         except PermissionError:
+            log_skip(start, 'lock_held', lock)
             record('already running (holder inaccessible)')
             return 0
         else:
@@ -80,6 +94,7 @@ def guard(lock, command):
             if identity.returncode not in (0, 1) or identity.stderr.strip():
                 raise RuntimeError('cannot identify backup lock holder')
             if 'memory_backup.sh' in identity.stdout:
+                log_skip(start, 'lock_held', lock)
                 record(f'already running: skip: backup {holder} still running')
                 return 0
         if lock.exists():
@@ -101,4 +116,9 @@ def guard(lock, command):
 if __name__ == '__main__':
     if sys.argv[1] == 'defer':
         sys.exit(10 if defer(Path(sys.argv[2])) else 0)
-    sys.exit(guard(Path(sys.argv[2]), sys.argv[3:]))
+    try:
+        result = guard(Path(sys.argv[2]), sys.argv[3:])
+    except Exception:
+        log_skip(time.time(), 'other', Path(sys.argv[2]), 1)
+        raise
+    sys.exit(result)

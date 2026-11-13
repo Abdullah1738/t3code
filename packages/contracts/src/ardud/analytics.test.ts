@@ -18,7 +18,23 @@ const event = {
   props: { count: 1 },
 };
 const decode = Schema.decodeUnknownSync(AnalyticsIngestInput);
+const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
+const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
 describe("analytics ingest contract", () => {
+  it("accepts MCP filters and rejects unhashed request ids", () => {
+    const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
+    expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));
+    expect(() => decodeEvent({ ...call, clientRequestId: "private-request-id" })).toThrow();
+    expect(
+      decodeRead({
+        day: "2026-11-13",
+        kind: "mcp.call",
+        tool: "card_update",
+        outcome: "timeout",
+      }),
+    ).toMatchObject({ tool: "card_update", outcome: "timeout" });
+    expect(() => decodeRead({ day: "2026-11-13", outcome: "maybe" })).toThrow();
+  });
   it("accepts bounded batches and strips unrecognized content", () => {
     const input = decode({
       events: [

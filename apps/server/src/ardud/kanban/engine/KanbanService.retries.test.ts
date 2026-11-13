@@ -15,6 +15,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KanbanError,
   kanbanRetryNotBefore,
   kanbanRetrying,
   kanbanWaiting,
@@ -168,11 +169,11 @@ const makeFake = () => {
   return { layer, fail, recover, messages, readsOf, start, finish, interrupted, sendControl };
 };
 
-const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
+const testLayer = (fake: Layer.Layer<KanbanThreads>, storeLayer = KanbanStore.layer) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(storeLayer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -1217,6 +1218,214 @@ it.effect(
         assert.isUndefined(detail.card.retries);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+// Current gate policy exempts review subtasks. Inject the historical approval denial
+// at the store boundary so this exercises refusal recovery without changing that policy.
+it.effect.each(["approval", "conflict", "early conflict"] as const)(
+  "a %s refusal is recorded once and flags the review without a nudge or restart",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      let refuse = false;
+      const reason =
+        kind === "approval"
+          ? "subtask s3 (secret) needs Abdullah's approval after 2026-11-13T17:42:20.609Z"
+          : "Board changed during this operation. Re-read its state before retrying.";
+      const denied = new KanbanError({
+        code: kind === "approval" ? "denied" : "conflict",
+        detail: reason,
+      });
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            board: (id) =>
+              Effect.suspend(() => {
+                if (!refuse || kind === "early conflict") return real.board(id);
+                refuse = false;
+                return Effect.die(denied);
+              }),
+            threadLink: (id) =>
+              Effect.suspend(() => {
+                if (!refuse || kind !== "early conflict") return real.threadLink(id);
+                refuse = false;
+                return Effect.die(denied);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, reviewer, now } = yield* reviewingCard;
+        const before = (yield* now).card;
+        const sent = fake.messages(reviewer).length;
+        const head = "ae5250595442502b641614ae15e04d02bb7a1926";
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          refuse = true;
+          assert.strictEqual(
+            yield* Effect.flip(
+              kanban.reviewResult(
+                reviewer,
+                "clear",
+                [],
+                attempt === 0 ? head : ` ${head.toUpperCase()} `,
+              ),
+            ),
+            denied,
+          );
+        }
+        let detail = yield* now;
+        assert.deepStrictEqual(detail.card, before);
+        const events = detail.events.filter((event) =>
+          event.body?.startsWith(Retries.REFUSED_VERDICT_PREFIX),
+        );
+        assert.lengthOf(events, 1);
+        assert.deepStrictEqual(events[0]?.actor, { _tag: "thread", threadId: reviewer });
+        assert.strictEqual(events[0]?.head, head);
+        assert.strictEqual(events[0]?.kind, "comment");
+        assert.strictEqual(events[0]?.body, `Review verdict refused: clear at ae525059: ${reason}`);
+        yield* kanban.turnEnded(reviewer);
+        yield* kanban.turnEnded(reviewer);
+        yield* kanban.dispatchNow;
+        detail = yield* now;
+        assert.strictEqual(detail.card.stage, "needs_review");
+        assert.strictEqual(detail.card.stalled?.reason, `Review verdict refused: ${reason}`);
+        assert.deepStrictEqual(detail.card.stalled?.by, {
+          _tag: "system",
+          component: "dispatcher",
+        });
+        assert.isNull(detail.card.activeThreadId);
+        assert.isNull(detail.card.activeRole);
+        assert.isNull(detail.card.activePool);
+        assert.isNull(detail.card.nudgedAt);
+        assert.strictEqual(detail.card.reviewThreadId, reviewer);
+        assert.isUndefined(detail.card.retries);
+        assert.lengthOf(fake.messages(reviewer), sent);
+        assert.isFalse(
+          detail.events.some((event) => event.body === Retries.NO_VERDICT_RESTARTED_EVENT),
+        );
+        const store = yield* KanbanStore.KanbanStore;
+        assert.isNotNull((yield* store.threadLink(reviewer))?.endedAt);
+        // The evaluator can clear the flag and retry with the same reviewer.
+        yield* kanban.flagCard(detail.card.id, null, owner);
+        yield* TestClock.adjust("1 second");
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* now).card.activeThreadId, reviewer);
+        yield* kanban.reviewResult(reviewer, "clear", [], head);
+        assert.isNull((yield* now).card.stalled);
+        assert.lengthOf(
+          (yield* now).events.filter((event) => event.kind === "review"),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer, storeLayer)));
+    }),
+);
+
+it.effect.each(["stage", "link role", "head", "findings"] as const)(
+  "records the active reviewer's %s refusal without changing its error",
+  (edge) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, reviewer, now } = yield* reviewingCard;
+        const store = yield* KanbanStore.KanbanStore;
+        if (edge === "stage") yield* store.putCard({ ...(yield* now).card, stage: "needs_review" });
+        if (edge === "link role")
+          yield* store.putThreadLink({ ...(yield* store.threadLink(reviewer))!, role: "work" });
+        const error = yield* Effect.flip(
+          kanban.reviewResult(
+            reviewer,
+            edge === "findings" ? "findings" : "clear",
+            [],
+            edge === "head" ? "bad-head" : "abcdef1234",
+          ),
+        );
+        assert.strictEqual(
+          error.code,
+          edge === "stage" ? "conflict" : edge === "link role" ? "denied" : "invalid",
+        );
+        const detail = yield* now;
+        assert.lengthOf(
+          detail.events.filter((event) => event.kind === "review"),
+          0,
+        );
+        assert.strictEqual(
+          Retries.refusedVerdict(detail.card, detail.events, reviewer),
+          error.detail,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["other thread", "other role"] as const)(
+  "a refusal from %s does not record a review refusal",
+  (edge) =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, reviewer, now } = yield* reviewingCard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = (yield* now).card;
+        yield* store.putCard(
+          edge === "other thread"
+            ? { ...card, activeThreadId: ThreadId.make("another-reviewer") }
+            : { ...card, activeRole: "work" },
+        );
+        yield* Effect.flip(kanban.reviewResult(reviewer, "findings", [], "abcdef1234"));
+        assert.lengthOf(
+          (yield* now).events.filter((event) =>
+            event.body?.startsWith(Retries.REFUSED_VERDICT_PREFIX),
+          ),
+          0,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  { label: "omitted", head: undefined, display: "unknown head" },
+  { label: "null", head: null, display: "unknown head" },
+  { label: "empty", head: "", display: "unknown head" },
+  { label: "blank", head: " \n ", display: "unknown head" },
+  { label: "short SHA", head: "abcdef1", display: "abcdef1" },
+  { label: "full SHA", head: "ae5250595442502b641614ae15e04d02bb7a1926", display: "ae525059" },
+  { label: "uppercase padded SHA", head: " ABCDEF1234 ", display: "abcdef12" },
+  { label: "colon", head: "sha:1234", display: "invalid head" },
+  { label: "several colons", head: "sha:1234:5678", display: "invalid head" },
+  { label: "newline", head: "sha\n1234", display: "invalid head" },
+  { label: "newline and colon", head: "sha\n:1234", display: "invalid head" },
+  { label: "nonhex", head: "bad-head", display: "invalid head" },
+  { label: "nonascii", head: "révision", display: "invalid head" },
+  { label: "too short", head: "abcdef", display: "invalid head" },
+  { label: "too long", head: "a".repeat(41), display: "invalid head" },
+])("a refusal with $label head skips no-verdict recovery", ({ head, display }) =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, reviewer, now } = yield* reviewingCard;
+      const sent = fake.messages(reviewer).length;
+      const sha = head?.trim().toLowerCase() || null;
+      const verdict = sha !== null && !/^[0-9a-f]{7,40}$/.test(sha) ? "clear" : "findings";
+      const error = yield* Effect.flip(kanban.reviewResult(reviewer, verdict, [], head));
+      const event = (yield* now).events.findLast((event) => event.kind === "comment");
+      assert.strictEqual(event?.head, sha);
+      assert.strictEqual(
+        event?.body,
+        `Review verdict refused: ${verdict} at ${display}: ${error.detail}`,
+      );
+      yield* kanban.turnEnded(reviewer);
+      const detail = yield* now;
+      assert.strictEqual(detail.card.stage, "needs_review");
+      assert.strictEqual(detail.card.stalled?.reason, `Review verdict refused: ${error.detail}`);
+      assert.strictEqual(detail.card.reviewThreadId, reviewer);
+      assert.lengthOf(fake.messages(reviewer), sent);
+      assert.isUndefined(detail.card.retries);
+      assert.isFalse(
+        detail.events.some((event) => event.body === Retries.NO_VERDICT_RESTARTED_EVENT),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect("a verdict ends the review's retry: the next step starts with a clean count", () =>

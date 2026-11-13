@@ -23,6 +23,7 @@ import {
   KanbanScriptAcknowledgeInput,
   KanbanScriptTrigger,
   KanbanStage,
+  KanbanMoveOptions,
   ProviderOptionSelections,
   ProjectId,
 } from "@t3tools/contracts";
@@ -130,7 +131,7 @@ const CreateCardBody = Schema.Struct({
   reviewChain: Text,
 });
 
-const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
+const MoveBody = Schema.Struct({ to: KanbanStage, ...KanbanMoveOptions.fields });
 
 const PostBody = Schema.Struct({
   revision: Schema.optional(Schema.Number),
@@ -215,6 +216,7 @@ const BoardBody = Schema.Struct({
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
   ),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
 });
 
 const PoolBody = Schema.Struct({
@@ -475,6 +477,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(evaluatorModel ? { evaluatorModel } : {}),
           ...(defaultCardModel ? { defaultCardModel } : {}),
           ...(reviewChains ? { reviewChains } : {}),
+          ...(input.guessedGates !== undefined ? { guessedGates: input.guessedGates } : {}),
           ...(input.defaultReviewChain !== undefined
             ? { defaultReviewChain: input.defaultReviewChain }
             : {}),
@@ -516,6 +519,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         return yield* service.moveCard(card.id, input.to, "owner", OWNER, {
           note: input.note ?? null,
           question: input.question ?? null,
+          ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
         });
       }),
     );

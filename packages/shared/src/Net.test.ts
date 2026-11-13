@@ -46,6 +46,30 @@ const openServer = (host?: string): Effect.Effect<NodeNet.Server, NetService.Net
 
 it.layer(NetService.layer)("NetService", (it) => {
   describe("Net helpers", () => {
+    it.effect.each(["127.0.0.1", "0.0.0.0"])(
+      "hasListenerOnHost detects a listener bound to %s through loopback",
+      (host) =>
+        Effect.acquireUseRelease(
+          openServer(host),
+          (server) =>
+            Effect.gen(function* () {
+              const net = yield* NetService.NetService;
+
+              assert.equal(yield* net.hasListenerOnHost(getPort(server), "127.0.0.1"), true);
+            }),
+          closeServer,
+        ),
+    );
+
+    it.effect("hasListenerOnHost reports false for an unused port", () =>
+      Effect.gen(function* () {
+        const net = yield* NetService.NetService;
+        const port = yield* net.reserveLoopbackPort();
+
+        assert.equal(yield* net.hasListenerOnHost(port, "127.0.0.1"), false);
+      }),
+    );
+
     it.effect("reserveLoopbackPort returns a positive loopback port", () =>
       Effect.gen(function* () {
         const net = yield* NetService.NetService;

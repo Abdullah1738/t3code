@@ -93,6 +93,7 @@ export const layer = HttpApiBuilder.group(
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
+          bounded: paged,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(omitIdleSubagents ? { omitIdleSubagents: true } : {}),

@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   type OrchestratorMcpFailure,
+  type OrchestrationV2ThreadShell,
   type ScheduledTask,
   type OrchestrationV2ThreadProjection,
   RunId,
@@ -12,6 +13,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -95,7 +97,7 @@ it.effect("capabilities and listings read caller limits and selection without an
               recordReads++;
               return idleThreadProjection(shell);
             }),
-          listProjectThreads: () => Effect.succeed([]),
+          getThreadListCandidates: () => Effect.succeed([]),
         }),
       ),
     );
@@ -400,4 +402,184 @@ it.effect.each([
       ),
     );
   }),
+);
+
+it.effect(
+  "listThreads filters candidates before hydrating only its page, with the existing order and cursor",
+  () =>
+    Effect.gen(function* () {
+      const shells = Array.from({ length: 123 }, (_, i): OrchestrationV2ThreadShell => ({
+        ...liveThreadShell(ThreadId.make(`list-${i}`)),
+        title: i % 2 === 0 ? `ÉTAPE ${i}` : `Other ${i}`,
+        status: i % 3 === 0 ? "completed" : "idle",
+        activityRunStatus: i % 5 === 0 ? "waiting" : null,
+        settledOverride: i % 7 === 0 ? "settled" : null,
+        lineage: {
+          parentThreadId: i % 4 === 0 ? callerId : null,
+          relationshipToParent: i % 4 === 0 ? "subagent" : null,
+          rootThreadId: callerId,
+        },
+        visibleItemCount: i + 10,
+      }));
+      const hydrated: string[][] = [];
+      const cases = [
+        { input: {}, expected: shells },
+        { input: { includeSubagents: false }, expected: shells.filter((_, i) => i % 4 !== 0) },
+        {
+          input: { statuses: ["waiting" as const] },
+          expected: shells.filter((_, i) => i % 5 === 0),
+        },
+        { input: { statuses: [] }, expected: [] },
+        { input: { settled: true }, expected: shells.filter((_, i) => i % 7 === 0) },
+        { input: { snoozed: true }, expected: [] },
+        { input: { titleContains: "étape" }, expected: shells.filter((_, i) => i % 2 === 0) },
+        { input: { titleContains: "" }, expected: shells },
+        { input: { cursor: 11, limit: 1 }, expected: shells },
+        { input: { cursor: 500 }, expected: shells },
+      ];
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+        for (const { input, expected } of cases) {
+          const sorted = expected.toSorted((a, b) => b.id.localeCompare(a.id));
+          const offset = input.cursor ?? 0;
+          const page = sorted.slice(offset, offset + (input.limit ?? 50));
+          const before = hydrated.length;
+          const result = yield* mcp.listThreads(scope, input);
+          assert.deepEqual(
+            result.threads.map((t) => t.threadId),
+            page.map((t) => t.id),
+          );
+          assert.equal(result.total, expected.length);
+          assert.equal(
+            result.nextCursor,
+            offset + page.length < sorted.length ? offset + page.length : null,
+          );
+          assert.deepEqual(
+            hydrated.slice(before),
+            page.length === 0 ? [] : [page.map((t) => t.id)],
+          );
+          for (const item of result.threads) {
+            const shell = shells.find((t) => t.id === item.threadId)!;
+            assert.equal(item.itemCount, shell.visibleItemCount);
+            assert.equal(item.status, shell.activityRunStatus ?? shell.status);
+            assert.equal(item.title, shell.title);
+            assert.equal(item.model, shell.modelSelection.model);
+          }
+        }
+      }).pipe(
+        Effect.provide(
+          layer({
+            getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+            getThreadListCandidates: () => Effect.succeed(shells),
+            getShellSnapshot: (options) =>
+              Effect.sync(() => {
+                const ids = [...(options?.threadIds ?? [])];
+                hydrated.push(ids);
+                return {
+                  schemaVersion: 2,
+                  snapshotSequence: 0,
+                  threads: shells.filter((shell) => ids.includes(shell.id)),
+                  archivedThreads: [],
+                };
+              }),
+          }),
+        ),
+      );
+    }),
+);
+
+const listTransitionCases: ReadonlyArray<{
+  readonly name: string;
+  readonly changed: Partial<OrchestrationV2ThreadShell>;
+}> = [
+  { name: "status", changed: { status: "completed", activityRunStatus: null } },
+  { name: "title", changed: { title: "No longer matches" } },
+  { name: "settlement", changed: { settledOverride: "settled" } },
+  { name: "snooze", changed: { snoozedUntil: null } },
+  {
+    name: "lineage",
+    changed: {
+      lineage: {
+        parentThreadId: callerId,
+        relationshipToParent: "subagent",
+        rootThreadId: callerId,
+      },
+    },
+  },
+  { name: "recency", changed: { updatedAt: DateTime.makeUnsafe("2020-01-01T00:00:00Z") } },
+  { name: "run identity", changed: { latestRunId: RunId.make("later-run") } },
+  {
+    name: "model",
+    changed: {
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "later-model" },
+    },
+  },
+];
+it.effect.each(listTransitionCases)(
+  "listThreads keeps candidate metadata across a $name transition",
+  ({ changed }) =>
+    Effect.gen(function* () {
+      const candidates: OrchestrationV2ThreadShell[] = [
+        {
+          ...liveThreadShell(ThreadId.make("transition-first")),
+          title: "Matching first",
+          activityRunStatus: "running",
+          latestRunId: RunId.make("original-run"),
+          snoozedUntil: DateTime.makeUnsafe("2030-01-01T00:00:00Z"),
+        },
+        {
+          ...liveThreadShell(ThreadId.make("transition-second")),
+          title: "Matching second",
+          activityRunStatus: "running",
+          updatedAt: DateTime.makeUnsafe("2025-01-01T00:00:00Z"),
+          snoozedUntil: DateTime.makeUnsafe("2030-01-01T00:00:00Z"),
+        },
+      ];
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+        const result = yield* mcp.listThreads(scope, {
+          statuses: ["running"],
+          titleContains: "Matching",
+          settled: false,
+          snoozed: true,
+          includeSubagents: false,
+        });
+        assert.deepEqual(
+          result.threads.map((thread) => thread.threadId),
+          candidates.map((thread) => thread.id),
+        );
+        assert.equal(result.total, 2);
+        assert.isNull(result.nextCursor);
+        for (const [i, item] of result.threads.entries()) {
+          const original = candidates[i]!;
+          assert.equal(item.status, original.activityRunStatus);
+          assert.equal(item.title, original.title);
+          assert.isFalse(item.settled);
+          assert.isTrue(item.snoozed);
+          assert.isNull(item.parentThreadId);
+          assert.equal(item.updatedAt, DateTime.formatIso(original.updatedAt));
+          assert.equal(item.latestRunId, original.latestRunId);
+          assert.equal(item.model, original.modelSelection.model);
+          assert.equal(item.itemCount, 700 + i);
+        }
+      }).pipe(
+        Effect.provide(
+          layer({
+            getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+            getThreadListCandidates: () => Effect.succeed(candidates),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                schemaVersion: 2,
+                snapshotSequence: 0,
+                threads: candidates.map((shell, i) => ({
+                  ...shell,
+                  ...(i === 0 ? changed : {}),
+                  visibleItemCount: 700 + i,
+                })),
+                archivedThreads: [],
+              }),
+          }),
+        ),
+      );
+    }),
 );

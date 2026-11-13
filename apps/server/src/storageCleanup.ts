@@ -294,13 +294,16 @@ const make = Effect.gen(function* () {
     Effect.orElseSucceed(() => null),
   );
 
-  // The snapshot takes seconds on large databases, so it runs on the reader
-  // worker instead of the event loop.
   const readThreads = Effect.fn("StorageCleanup.readThreads")(function* () {
-    const snapshot = yield* projections.getShellSnapshot().pipe(NodeSqliteClient.readOnly);
+    const worktrees = yield* projections
+      .getThreadWorktreePaths({ includeArchived: true })
+      .pipe(NodeSqliteClient.readOnly);
+    const shells = yield* Effect.forEach(worktrees, ({ threadId }) =>
+      projections.getThreadShell(threadId).pipe(NodeSqliteClient.readOnly),
+    );
     const projects = yield* projectStore.listShells();
-    return { projects, threads: [...snapshot.threads, ...snapshot.archivedThreads] };
-  });
+    return { projects, threads: shells.filter((shell) => shell !== null) };
+  }, NodeSqliteClient.backgroundReads);
 
   const containsProjectRoot = Effect.fn("StorageCleanup.containsProjectRoot")(function* (
     worktreePath: string,

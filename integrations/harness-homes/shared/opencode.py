@@ -11,7 +11,7 @@ SHARED_IDS = ("flighty", "inbody")
 
 
 def remote_entries(manifest):
-    return {s["id"]: {"type": "remote", "url": s["url"], "timeout": s["toolTimeoutSec"] * 1000}
+    return {s["id"]: {"type": "remote", "url": s["url"], "timeout": s["opencodeTimeoutMs"]}
             for s in manifest["mcpServers"] if s["id"] in SHARED_IDS}
 
 

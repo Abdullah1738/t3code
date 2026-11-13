@@ -1,11 +1,35 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, ThreadId } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as McpDeadline from "./McpDeadline.ts";
+
+it.effect("a fail-fast caller error retains the same-key retry instruction", () =>
+  Effect.gen(function* () {
+    const error = yield* McpDeadline.withDeadline(
+      Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "caller_unresolved",
+          message: "Reader unavailable. Nothing was saved; retry the same call.",
+        }),
+      ),
+      {
+        code: "caller_unresolved",
+        threadId: ThreadId.make("caller"),
+        stage: "caller",
+        requestKey: "same-key",
+      },
+    ).pipe(Effect.flip);
+    assert.equal(error.code, "caller_unresolved");
+    assert.equal(
+      error.message,
+      "Reader unavailable. Nothing was saved; retry the same call. Retry only with the same clientRequestId: same-key.",
+    );
+  }),
+);
 
 it.effect("an outer deadline reports the nested caller read that is still pending", () =>
   Effect.gen(function* () {
@@ -50,6 +74,7 @@ it.effect("an outer deadline reports the nested caller read that is still pendin
           code: "caller_unresolved",
           stage: "caller",
           threadId: "caller",
+          threadKind: "thread",
           elapsedMs: 10000,
           wait: "statev2 background caller shell",
           waitElapsedMs: 8000,
@@ -59,7 +84,7 @@ it.effect("an outer deadline reports the nested caller read that is still pendin
   }),
 );
 
-it.effect.each(["caller", "dispatch", "receipt"] as const)(
+it.effect.each(["caller", "parent_records", "dispatch", "receipt"] as const)(
   "logs elapsed time and the pending operation when $stage expires",
   (stage) =>
     Effect.gen(function* () {
@@ -85,6 +110,12 @@ it.effect.each(["caller", "dispatch", "receipt"] as const)(
       yield* TestClock.adjust("10 seconds");
       const failure = yield* Fiber.join(pending);
       assert.equal(failure.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
+      if (stage === "parent_records") {
+        assert.equal(
+          failure.message,
+          "delegate_task timed out during parent_records for thread caller. Nothing was saved; retry the same call.",
+        );
+      }
       assert.deepEqual(logs, [
         [
           "MCP operation timed out",
@@ -92,6 +123,7 @@ it.effect.each(["caller", "dispatch", "receipt"] as const)(
             code: failure.code,
             stage,
             threadId: "caller",
+            threadKind: "thread",
             elapsedMs: 10000,
             wait: stage === "caller" ? "caller identity" : `threadManagement.${stage}`,
             waitElapsedMs: 10000,
@@ -123,6 +155,50 @@ it.effect("returns a typed deadline even while cancellation is deferred", () =>
       error.message,
       "Caller resolution timed out during caller for thread caller. Nothing was saved; retry the same call.",
     );
+  }),
+);
+
+it.effect("logs a delegated caller's pending foreground read without changing its deadline", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    const threadId = ThreadId.make("thread:delegated-task:caller");
+    const pending = yield* McpDeadline.withDeadline(
+      McpDeadline.waitingOn(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        "statev2 foreground caller row",
+      ),
+      { code: "caller_unresolved", threadId, stage: "caller" },
+    ).pipe(
+      Effect.flip,
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust("10 seconds");
+    const failure = yield* Fiber.join(pending);
+    assert.equal(failure.code, "caller_unresolved");
+    assert.equal(
+      failure.message,
+      `Caller resolution timed out during caller for thread ${threadId}. Nothing was saved; retry the same call.`,
+    );
+    assert.deepEqual(logs, [
+      [
+        "MCP operation timed out",
+        {
+          code: "caller_unresolved",
+          stage: "caller",
+          threadId,
+          threadKind: "delegated-task",
+          elapsedMs: 10000,
+          wait: "statev2 foreground caller row",
+          waitElapsedMs: 10000,
+        },
+      ],
+    ]);
   }),
 );
 

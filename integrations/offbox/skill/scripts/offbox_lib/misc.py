@@ -724,6 +724,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     data = (page.get('data') or '').encode()
                     nxt = page.get('nextOffset')
                     nxt = offsets[i] + len(data) if nxt is None else int(nxt)
+                    # Older home servers omit size; an empty live page can mean the command is quiet.
+                    if live and not data and nxt == offsets[i] and not page.get('done') and page.get('size') is None:
+                        break
                     if nxt <= offsets[i] and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
                         if not live and r['mode'] == 'bg' and not length and not data and nxt == offsets[i] and empty_pages < 2:
                             empty_pages += 1

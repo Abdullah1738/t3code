@@ -116,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--note")
     bs = sp.add_parser("bases")
     bs.add_argument("--json", action="store_true")
+    bs.add_argument("--all", action="store_true", help="include expired bases")
     b = sp.add_parser("base")
     b.add_argument("action", choices=["rm"])
     b.add_argument("name")
@@ -157,7 +158,7 @@ def _outage_wait_applies(a, e: OffboxError) -> bool:
 
 def _log_request(a, me):
     backend = "home" if common.backend() == "server" else "boat"
-    reason = "unreachable" if os.environ.get("OFFBOX_FAILOVER") else "pinned" if common.backend_pinned() else "home_up" if backend == "home" else "home_down" if common.standby() else "boat_only"
+    reason = "boat_only_base" if common._BACKEND_REASON == "boat-only-base" else "unreachable" if os.environ.get("OFFBOX_FAILOVER") else "pinned" if common.backend_pinned() else "home_up" if backend == "home" else "home_down" if common.standby() else "boat_only"
     props = dict(repo=toollog.repo_id(me.get("repo_key", me["repo_root"])), backend=backend, reason=reason,
                  size=a.size, sizeGiven=bool(a.size), baseGiven=bool(a.base), templateGiven=bool(a.template), bg=a.bg, noSync=a.no_sync, git=a.git, noFallback=a.no_fallback, noRetry=getattr(a, "no_retry", False),
                  remote=a.remote, fresh=a.fresh, envCount=len(a.env), pullCount=len(a.pull),
@@ -199,11 +200,9 @@ def _cmd_run(a, me) -> int:
     from . import home
     home.WAIT_STARTED = time.monotonic()
     if home.may_fail_over():
-        # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.
-        down = home.probe()
-        if down:
-            home.fail_over(down, getattr(a, "argv", None) or sys.argv[1:])
-    elif home.on_standby() and not os.environ.get(home.FAILOVER_ENV):
+        home.before_run(getattr(a, "argv", None) or sys.argv[1:])
+    elif (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
+          and common._BACKEND_REASON != "boat-only-base"):
         st = common.home_state()
         toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
         say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
@@ -213,6 +212,7 @@ def _cmd_run(a, me) -> int:
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
+    reprobed = False
     try:
         while True:
             try:
@@ -239,6 +239,10 @@ def _cmd_run(a, me) -> int:
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
                     if home.may_fail_over():
+                        if not reprobed and not home.recent_failure() and home.network_failure(e):
+                            reprobed = True
+                            if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
+                                continue
                         home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
@@ -352,7 +356,10 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "reap":
             toollog.rollup_previous()
         me = whoami()
-        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()} "
+        reason = f" reason={common._BACKEND_REASON}" if common._BACKEND_REASON else ""
+        if a.sub == "run" and common._BACKEND_REASON == "boat-only-base":
+            say(f"running on Boat because base '{a.base}' lives only on the Boat standby")
+        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()}{reason} "
             f"argv={redact_argv(argv)[:12]}")
         if a.sub == "run":
             _log_request(a, me)
@@ -360,6 +367,9 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub not in LOCAL_ONLY:
             home.person_gate()   # a person's box lives on the home server only: stop here while it is down
         if a.sub == "run":
+            if a.base and not a.fresh:
+                from . import base_catalog
+                base_catalog.validate(a.base, me["repo_key"])
             warn_env_values(a.env)
             a.argv = list(argv)
             return cmd_run(a, me)
@@ -399,7 +409,7 @@ def _main(argv: list[str] | None = None) -> int:
         elif a.sub == "save":
             print(json.dumps(bases.save(me, a.name, a.make_default, a.note), indent=1))
         elif a.sub == "bases":
-            bases.list_bases(a.json)
+            bases.list_bases(a.json, include_expired=a.all)
         elif a.sub == "base":
             bases.rm_base(me, a.name)
         elif a.sub == "keep":

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Local Android emulators are blocked on this Mac (owner rule 2026-10-09).
+# Emulators run on Run Cloud: load the run-cloud skill and use `rcsim`.
+# Non-creating avdmanager commands (list, delete, move) pass through.
+REAL=/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin/avdmanager
+if [ -z "$RCSIM_ALLOW_LOCAL_SIM" ]; then
+  for a in "$@"; do
+    case "$a" in
+      create)
+        cat >&2 <<'EOF'
+avdmanager: local Android emulators are disabled on this Mac.
+Use Run Cloud instead: load the run-cloud skill, then
+  rcsim create android --name "<what>" --purpose "<why>"     # blank Pixel emulator
+  rcsim create android --install app-debug.apk ...           # build the APK through offbox (remote-compute skill)
+Heartbeat with `rcsim heartbeat` every 15 min and `rcsim release` when done (billed per minute).
+EOF
+        exit 69 ;;
+    esac
+  done
+fi
+exec "$REAL" "$@"

@@ -39,6 +39,9 @@ class LoggingTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        probes = patch.object(jobs, 'storage_probes', return_value={})
+        probes.start()
+        self.addCleanup(probes.stop)
 
     def rows(self):
         return [json.loads(line) for p in sorted(self.logs.glob('*.ndjson')) for line in p.read_text().splitlines()]
@@ -129,7 +132,8 @@ class LoggingTests(unittest.TestCase):
         a,b=self.rows()
         self.assertEqual(a['props']['bytes'],123)
         self.assertEqual(a['props']['files'],4)
-        self.assertEqual(b['props']['snapshotAgeS'],11)
+        self.assertEqual(a['props']['snapshotAgeS'],1)
+        self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
         self.assertNotIn('password',str(self.rows()))
 
@@ -182,7 +186,7 @@ class LoggingTests(unittest.TestCase):
         for name in ['kernel.panic','Finder_2026-11-13.ips','app.spin']:
             p=reports/name;p.write_text('{"app_name":"Finder","bug_type":"309"}\nprivate stack')
             os.utime(p,(now-100,now-100))
-        reader=lambda a,b: {} if a==now else {('restart','kernel'):1}
+        reader=lambda a,b: {('restart','kernel'):1} if a==now-3600 else {}
         self.assertTrue(collector.collect(now, [reports], reader))
         observed=[r for r in self.rows() if r['name']=='crash.observed']
         self.assertEqual(sum(r['props']['count'] for r in observed),4)
@@ -314,7 +318,9 @@ class LoggingTests(unittest.TestCase):
         calls=[]
         def run(cmd,**kwargs):
             calls.append(cmd)
-            return SimpleNamespace(returncode=0,stdout=json.dumps([{'eventMessage':'=== system boot'},{'eventMessage':'PMU wdog'}]))
+            return SimpleNamespace(returncode=0,stdout=json.dumps([
+                {'timestamp':'1970-01-01T00:02:30Z','eventMessage':'=== system boot'},
+                {'timestamp':'1970-01-01T00:02:30Z','eventMessage':'PMU wdog'}]))
         self.assertEqual(sum(collector.unified(100,200,run).values()),2)
         self.assertEqual(calls[0][:3],['/usr/bin/log','show','--style'])
         self.assertNotIn('private',str(self.rows()))

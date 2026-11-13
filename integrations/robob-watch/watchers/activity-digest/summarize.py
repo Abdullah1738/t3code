@@ -1,12 +1,12 @@
 #!/usr/bin/python3
-"""Short wake text for activity-digest: totals, counts per topic, path to the full list.
+"""Render activity counts and their entries from the same grouped list.
 
-stdin: unreported activity-log lines. argv[1]: path of the full digest file. Prints at most ~15 lines.
+stdin: unreported activity-log lines. argv[1]: path of the full digest file.
 Topic = the field after the first " · " (the log format); lines without it use the first word after the time.
 """
 import re
 import sys
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from pathlib import Path
 # robob-watch test copies the watcher into scratch, while helpers stay installed.
 REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
@@ -15,7 +15,7 @@ if not (REDACT_HELPERS / 'redact.py').is_file():
 sys.path.insert(0, str(REDACT_HELPERS))
 from redact import redact
 
-SHOW = 11  # topic lines; header + path + "By topic:" + 11 + "other topics" = 15 lines max
+WAKE_BUDGET = 5500  # UTF-16 units; robob-watch clips JavaScript strings at 6000.
 
 STAMP = re.compile(r"^(?:- )?(\d{4}-\d{2}-\d{2}) ~?(\d{2}:[0-9x]{2})")
 
@@ -41,33 +41,34 @@ def topic(line):
     return main, sub
 
 
-def main():
-    lines = [l for l in redact(sys.stdin.read()).splitlines() if l.strip()]
+def render(raw):
+    lines = [l for l in redact(raw).splitlines() if l.strip()]
     if not lines:
-        return
+        return ''
     groups = OrderedDict()
-    for l in lines:
-        m, s = topic(l)
-        groups.setdefault(m, Counter())[s] += 1
-    n = len(lines)
+    for line in lines:
+        name, _ = topic(line)
+        groups.setdefault(name, []).append(line)
+    n = sum(len(items) for items in groups.values())
     (d0, t0), (d1, t1) = stamp(lines[0]), stamp(lines[-1])
     span = f"{d0} {t0} to {t1}" if d0 == d1 else f"{d0} {t0} to {d1} {t1}"
-    print(f"Activity log: {n} unreported entr{'y' if n == 1 else 'ies'} ({span} Dubai).")
-    print(f"Full list (read it before writing the catch-up): {sys.argv[1]}")
-    ranked = sorted(groups.items(), key=lambda kv: -sum(kv[1].values()))
-    shown, rest = ranked[:SHOW], ranked[SHOW:]
-    if len(rest) == 1:
-        shown, rest = ranked, []
-    print("By topic:")
-    for name, subs in shown:
-        total = sum(subs.values())
-        named = [(s, c) for s, c in subs.most_common() if s and c >= 2]
-        detail = ""
-        if len(named) > 1 or (named and named[0][1] < total):
-            detail = " (" + ", ".join(f"{s} {c}" for s, c in named[:3]) + (", …" if len(named) > 3 else "") + ")"
-        print(f"- {name} {total}{detail}")
-    if rest:
-        print(f"- {len(rest)} other topics: {sum(sum(s.values()) for _, s in rest)} entries")
+    output = [f"Activity log: {n} unreported entr{'y' if n == 1 else 'ies'} ({span} Dubai)."]
+    for name, items in sorted(groups.items(), key=lambda pair: -len(pair[1])):
+        output.extend(['', f'## {name} ({len(items)})'])
+        output.extend('- ' + item.removeprefix('- ') for item in items)
+    return '\n'.join(output) + '\n'
+
+
+def main():
+    digest = render(sys.stdin.read())
+    if not digest:
+        return
+    Path(sys.argv[1]).write_text(digest)
+    # Never send counts whose entries would be clipped out of the wake.
+    if len(digest.encode('utf-16-le')) // 2 <= WAKE_BUDGET:
+        print(digest, end='')
+    else:
+        print(f'Activity digest: {sys.argv[1]}')
 
 
 if __name__ == "__main__":

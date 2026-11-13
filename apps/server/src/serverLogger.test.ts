@@ -68,6 +68,7 @@ const layerConfig = (overrides: Partial<ServerConfig.ServerConfig["Service"]>) =
       return ServerConfig.make({
         logLevel: "Info",
         traceMinLevel: "Info",
+        traceFileMinDurationMs: 2,
         traceTimingEnabled: false,
         traceBatchWindowMs: 200,
         traceMaxBytes: 1024,

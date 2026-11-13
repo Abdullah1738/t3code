@@ -15,14 +15,25 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
+NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
+                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
+for prefix in ('internal', 'external'):
+    NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
+SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
+NULLABLE.update(('internalFreeGbDelta', 'externalFreeGbDelta'))
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
+for i in range(1, 4):
+    TEXT.add('topMover%dPath' % i)
+    NUMBERS.add('topMover%dGbDelta' % i)
+PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
+                for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
@@ -36,7 +47,13 @@ def directory():
 def safe_fields(values):
     result = {}
     for key, value in (values or {}).items():
-        if key in NULLABLE and value is None:
+        if key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
+            result[key] = value
+        elif key in ('previousTs', 'sampleTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
+            result[key] = value
+        elif key == 'skipReason' and isinstance(value, str) and value in SKIP_REASONS:
+            result[key] = value
+        elif key in NULLABLE and value is None:
             result[key] = None
         elif key in BOOLEANS and type(value) is bool:
             result[key] = value

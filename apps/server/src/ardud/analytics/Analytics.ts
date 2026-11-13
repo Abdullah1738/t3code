@@ -95,6 +95,7 @@ export class Analytics extends Context.Service<
   Analytics,
   {
     readonly record: (event: AnalyticsEvent) => Effect.Effect<void>;
+    readonly flush: Effect.Effect<void, AnalyticsError>;
     readonly ingest: (input: {
       readonly events: readonly AnalyticsEvent[];
     }) => Effect.Effect<void, AnalyticsError>;
@@ -174,7 +175,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   ) {
     const full = makeAccumulator();
     const filtered =
-      filter?.kind !== undefined || filter?.boardId !== undefined || filter?.cardId !== undefined
+      filter?.kind !== undefined ||
+      filter?.boardId !== undefined ||
+      filter?.cardId !== undefined ||
+      filter?.tool !== undefined ||
+      filter?.outcome !== undefined
         ? makeAccumulator()
         : full;
     const samples: AnalyticsEvent[] = [];
@@ -203,7 +208,9 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       if (
         (filter?.kind !== undefined && filter.kind !== event.kind) ||
         (filter?.boardId !== undefined && filter.boardId !== event.boardId) ||
-        (filter?.cardId !== undefined && filter.cardId !== event.cardId)
+        (filter?.cardId !== undefined && filter.cardId !== event.cardId) ||
+        (filter?.tool !== undefined && filter.tool !== event.tool) ||
+        (filter?.outcome !== undefined && filter.outcome !== event.outcome)
       )
         return;
       if (filtered !== full) accumulate(filtered, event);
@@ -543,7 +550,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }),
   );
 
-  return Analytics.of({ record, ingest, read });
+  const flush = disk
+    .withPermit(drain(true))
+    .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "write", cause })));
+  return Analytics.of({ record, flush, ingest, read });
 });
 
 export const layerWith = (options: Partial<AnalyticsOptions>) =>
