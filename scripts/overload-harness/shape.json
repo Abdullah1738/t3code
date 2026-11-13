@@ -66,6 +66,30 @@
         "p99": 63806,
         "sum": 53569049
       },
+      "linkLabelBytes": {
+        "max": 101,
+        "min": 0,
+        "n": 5651,
+        "p25": 16,
+        "p50": 23,
+        "p75": 35,
+        "p90": 45,
+        "p95": 53,
+        "p99": 67,
+        "sum": 148750
+      },
+      "linkUrlBytes": {
+        "max": 157,
+        "min": 27,
+        "n": 5651,
+        "p25": 57,
+        "p50": 64,
+        "p75": 69,
+        "p90": 92,
+        "p95": 103,
+        "p99": 121,
+        "sum": 371751
+      },
       "linksPerCard": {
         "max": 16,
         "min": 0,
@@ -140,6 +164,30 @@
         "todo": 1095,
         "verified": 920,
         "working": 13
+      },
+      "subtaskNoteBytes": {
+        "max": 1204,
+        "min": 0,
+        "n": 12783,
+        "p25": 0,
+        "p50": 13,
+        "p75": 182,
+        "p90": 319,
+        "p95": 403,
+        "p99": 632,
+        "sum": 1305113
+      },
+      "subtaskTextBytes": {
+        "max": 501,
+        "min": 1,
+        "n": 12783,
+        "p25": 166,
+        "p50": 235,
+        "p75": 295,
+        "p90": 371,
+        "p95": 424,
+        "p99": 467,
+        "sum": 3031409
       },
       "subtasksPerCard": {
         "max": 19,
@@ -237,6 +285,30 @@
         "p99": 33598,
         "sum": 6468445
       },
+      "linkLabelBytes": {
+        "max": 140,
+        "min": 4,
+        "n": 1035,
+        "p25": 19,
+        "p50": 27,
+        "p75": 40,
+        "p90": 51,
+        "p95": 61,
+        "p99": 84,
+        "sum": 32009
+      },
+      "linkUrlBytes": {
+        "max": 140,
+        "min": 19,
+        "n": 1035,
+        "p25": 69,
+        "p50": 69,
+        "p75": 90,
+        "p90": 140,
+        "p95": 140,
+        "p99": 140,
+        "sum": 86553
+      },
       "linksPerCard": {
         "max": 97,
         "min": 0,
@@ -309,6 +381,30 @@
         "needs_review": 13,
         "todo": 207,
         "verified": 186
+      },
+      "subtaskNoteBytes": {
+        "max": 1203,
+        "min": 0,
+        "n": 2802,
+        "p25": 0,
+        "p50": 13,
+        "p75": 187,
+        "p90": 352,
+        "p95": 462,
+        "p99": 653,
+        "sum": 318362
+      },
+      "subtaskTextBytes": {
+        "max": 497,
+        "min": 6,
+        "n": 2802,
+        "p25": 105,
+        "p50": 166,
+        "p75": 244,
+        "p90": 312,
+        "p95": 353,
+        "p99": 430,
+        "sum": 502818
       },
       "subtasksPerCard": {
         "max": 16,
@@ -406,6 +502,30 @@
         "p99": 45988,
         "sum": 1984185
       },
+      "linkLabelBytes": {
+        "max": 107,
+        "min": 10,
+        "n": 186,
+        "p25": 18,
+        "p50": 25,
+        "p75": 36,
+        "p90": 46,
+        "p95": 50,
+        "p99": 73,
+        "sum": 5222
+      },
+      "linkUrlBytes": {
+        "max": 89,
+        "min": 33,
+        "n": 186,
+        "p25": 69,
+        "p50": 69,
+        "p75": 69,
+        "p90": 69,
+        "p95": 75,
+        "p99": 82,
+        "sum": 12848
+      },
       "linksPerCard": {
         "max": 9,
         "min": 0,
@@ -477,6 +597,30 @@
         "todo": 3,
         "verified": 43,
         "working": 3
+      },
+      "subtaskNoteBytes": {
+        "max": 872,
+        "min": 0,
+        "n": 713,
+        "p25": 78,
+        "p50": 175,
+        "p75": 302,
+        "p90": 452,
+        "p95": 600,
+        "p99": 769,
+        "sum": 149064
+      },
+      "subtaskTextBytes": {
+        "max": 499,
+        "min": 1,
+        "n": 713,
+        "p25": 110,
+        "p50": 146,
+        "p75": 198,
+        "p90": 275,
+        "p95": 346,
+        "p99": 467,
+        "sum": 116797
       },
       "subtasksPerCard": {
         "max": 21,
@@ -574,6 +718,30 @@
         "p99": 18686,
         "sum": 264415
       },
+      "linkLabelBytes": {
+        "max": 40,
+        "min": 19,
+        "n": 6,
+        "p25": 26,
+        "p50": 26,
+        "p75": 31,
+        "p90": 40,
+        "p95": 40,
+        "p99": 40,
+        "sum": 169
+      },
+      "linkUrlBytes": {
+        "max": 83,
+        "min": 17,
+        "n": 6,
+        "p25": 52,
+        "p50": 66,
+        "p75": 79,
+        "p90": 83,
+        "p95": 83,
+        "p99": 83,
+        "sum": 364
+      },
       "linksPerCard": {
         "max": 2,
         "min": 0,
@@ -642,6 +810,30 @@
       "stages": {
         "completed": 1,
         "verified": 21
+      },
+      "subtaskNoteBytes": {
+        "max": 1214,
+        "min": 13,
+        "n": 121,
+        "p25": 161,
+        "p50": 245,
+        "p75": 339,
+        "p90": 430,
+        "p95": 652,
+        "p99": 864,
+        "sum": 31215
+      },
+      "subtaskTextBytes": {
+        "max": 401,
+        "min": 36,
+        "n": 121,
+        "p25": 88,
+        "p50": 108,
+        "p75": 165,
+        "p90": 204,
+        "p95": 238,
+        "p99": 335,
+        "sum": 15951
       },
       "subtasksPerCard": {
         "max": 8,
@@ -856,6 +1048,40 @@
     "privacy": "Aggregate numeric statistics only; no row identifiers, payloads or card text."
   },
   "syntheticLoad": {
+    "backupPoolSlotsByRank": [
+      [
+        10,
+        0,
+        5,
+        1,
+        0,
+        2
+      ],
+      [
+        1,
+        0,
+        1,
+        30,
+        0,
+        1
+      ],
+      [
+        0,
+        0,
+        0,
+        9,
+        0,
+        2
+      ],
+      [
+        0,
+        0,
+        1,
+        1,
+        0,
+        3
+      ]
+    ],
     "boardCountSource": "Trace-measured .9 cumulative board cache entries=17; sanctioned evaluator clarification 13 Nov ~17:50Z",
     "boards": 17,
     "largeBoards": [
@@ -868,14 +1094,315 @@
       {
         "cards": 1320,
         "discussions": null,
-        "openCards": null,
-        "settledCards": null
+        "openCards": 1048,
+        "settledCards": 272
       }
     ],
+    "parkedPerBoardByRank": [
+      98,
+      64,
+      11,
+      5,
+      4,
+      4,
+      3,
+      3,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "parkedSource": "Latest .9 trace tickLocalWaits parked count per board, sorted descending; assigned by synthetic board rank (no private board IDs exported).",
+    "poolSource": "Backup totals18/33/11/5, evaluator approved67global slots. Last two totals apportioned over8rank3-shaped and7rank4-shaped small boards, preserving11+5.",
+    "secondBoardOpenSource": "Largest per-operation open-card read on the second-ranked board in the copied .9 trace:1048; total1320 remains packet override.",
     "seed": 20261113,
     "sensitivityBoards": 260,
     "smallBoards": 15,
     "source": "Card #1352 live-shape requirements, 2026-11-13; kept separate from measured backup statistics.",
+    "totalPoolSlots": 67,
+    "traceTickShapeSource": "All completed tickBoard spans in the .9 copied trace, ranked by largest open-card read within that tick. Per-step maxima across observed ticks; counters only, no board IDs.",
+    "traceTickShapes": [
+      {
+        "maxOpenCardRows": 3909,
+        "maxStepCounts": {
+          "landing": 95,
+          "localWait": 2,
+          "missingThread": 19,
+          "nativeQuestion": 1,
+          "ownerReminder": 13,
+          "reviewerBackstop": 2,
+          "scribe": 1,
+          "settleDiscussion": 56,
+          "silentRunBackstop": 33,
+          "typing": 9,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "wakeRecovered": 1,
+          "workerBackstop": 17
+        },
+        "maxTickSeconds": 88.886963125,
+        "observedTicks": 4,
+        "rank": 1
+      },
+      {
+        "maxOpenCardRows": 1048,
+        "maxStepCounts": {
+          "landing": 2,
+          "missingThread": 13,
+          "nativeQuestion": 13,
+          "ownerReminder": 1,
+          "scribe": 1,
+          "settleDiscussion": 92,
+          "silentRunBackstop": 20,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 13
+        },
+        "maxTickSeconds": 28.280248542000002,
+        "observedTicks": 6,
+        "rank": 2
+      },
+      {
+        "maxOpenCardRows": 169,
+        "maxStepCounts": {
+          "scribe": 1,
+          "settleDiscussion": 3,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1
+        },
+        "maxTickSeconds": 3.380577792,
+        "observedTicks": 6,
+        "rank": 3
+      },
+      {
+        "maxOpenCardRows": 97,
+        "maxStepCounts": {
+          "missingThread": 2,
+          "nativeQuestion": 1,
+          "reviewerBackstop": 2,
+          "scribe": 1,
+          "settleDiscussion": 19,
+          "silentRunBackstop": 2,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 2
+        },
+        "maxTickSeconds": 5.5546950409999996,
+        "observedTicks": 6,
+        "rank": 4
+      },
+      {
+        "maxOpenCardRows": 94,
+        "maxStepCounts": {
+          "landing": 1,
+          "missingThread": 3,
+          "scribe": 1,
+          "settleDiscussion": 7,
+          "silentRunBackstop": 3,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 3
+        },
+        "maxTickSeconds": 6.313562542,
+        "observedTicks": 6,
+        "rank": 5
+      },
+      {
+        "maxOpenCardRows": 74,
+        "maxStepCounts": {
+          "missingThread": 4,
+          "nativeQuestion": 3,
+          "scribe": 1,
+          "settleDiscussion": 11,
+          "silentRunBackstop": 2,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 4
+        },
+        "maxTickSeconds": 6.874363542,
+        "observedTicks": 6,
+        "rank": 6
+      },
+      {
+        "maxOpenCardRows": 44,
+        "maxStepCounts": {
+          "scribe": 1,
+          "settleDiscussion": 2,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1
+        },
+        "maxTickSeconds": 3.27037325,
+        "observedTicks": 6,
+        "rank": 7
+      },
+      {
+        "maxOpenCardRows": 33,
+        "maxStepCounts": {
+          "missingThread": 2,
+          "scribe": 1,
+          "settleDiscussion": 7,
+          "silentRunBackstop": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "workerBackstop": 2
+        },
+        "maxTickSeconds": 5.306040166,
+        "observedTicks": 6,
+        "rank": 8
+      },
+      {
+        "maxOpenCardRows": 32,
+        "maxStepCounts": {
+          "missingThread": 2,
+          "scribe": 1,
+          "settleDiscussion": 1,
+          "silentRunBackstop": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 2
+        },
+        "maxTickSeconds": 4.916514166,
+        "observedTicks": 6,
+        "rank": 9
+      },
+      {
+        "maxOpenCardRows": 29,
+        "maxStepCounts": {
+          "evaluatorStep": 1,
+          "missingThread": 1,
+          "nativeQuestion": 1,
+          "scribe": 1,
+          "settleDiscussion": 3,
+          "silentRunBackstop": 5,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 1
+        },
+        "maxTickSeconds": 4.060514125,
+        "observedTicks": 6,
+        "rank": 10
+      },
+      {
+        "maxOpenCardRows": 29,
+        "maxStepCounts": {
+          "missingThread": 2,
+          "nativeQuestion": 2,
+          "scribe": 1,
+          "settleDiscussion": 4,
+          "silentRunBackstop": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 2
+        },
+        "maxTickSeconds": 4.712400792,
+        "observedTicks": 6,
+        "rank": 11
+      },
+      {
+        "maxOpenCardRows": 22,
+        "maxStepCounts": {
+          "scribe": 1,
+          "settleDiscussion": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1
+        },
+        "maxTickSeconds": 1.670206416,
+        "observedTicks": 6,
+        "rank": 12
+      },
+      {
+        "maxOpenCardRows": 21,
+        "maxStepCounts": {
+          "missingThread": 1,
+          "nativeQuestion": 1,
+          "reviewerBackstop": 1,
+          "scribe": 1,
+          "settleDiscussion": 2,
+          "silentRunBackstop": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1
+        },
+        "maxTickSeconds": 3.930725333,
+        "observedTicks": 6,
+        "rank": 13
+      },
+      {
+        "maxOpenCardRows": 19,
+        "maxStepCounts": {
+          "scribe": 1,
+          "settleDiscussion": 8,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1
+        },
+        "maxTickSeconds": 2.024016708,
+        "observedTicks": 6,
+        "rank": 14
+      },
+      {
+        "maxOpenCardRows": 18,
+        "maxStepCounts": {
+          "missingThread": 2,
+          "nativeQuestion": 2,
+          "ownerReminder": 1,
+          "reviewerBackstop": 1,
+          "scribe": 1,
+          "settleDiscussion": 2,
+          "silentRunBackstop": 2,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1,
+          "workerBackstop": 2
+        },
+        "maxTickSeconds": 4.841932875,
+        "observedTicks": 6,
+        "rank": 15
+      },
+      {
+        "maxOpenCardRows": 15,
+        "maxStepCounts": {
+          "reconcileHeldDiscussions": 1,
+          "scribe": 1,
+          "settleDiscussion": 5,
+          "silentRunBackstop": 2,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1,
+          "wakeDiscussionNudges": 1
+        },
+        "maxTickSeconds": 2.039827333,
+        "observedTicks": 6,
+        "rank": 16
+      },
+      {
+        "maxOpenCardRows": 15,
+        "maxStepCounts": {
+          "scribe": 1,
+          "settleDiscussion": 4,
+          "silentRunBackstop": 1,
+          "unlistedPools": 1,
+          "wakeBoardNudges": 1
+        },
+        "maxTickSeconds": 3.466381042,
+        "observedTicks": 6,
+        "rank": 17
+      }
+    ],
     "unspecifiedCounts": "Scale the measured rank-specific structure and open/settled ratios; do not present these as measured live counts."
   },
   "tables": {
