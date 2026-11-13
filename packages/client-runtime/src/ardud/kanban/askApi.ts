@@ -16,6 +16,7 @@ import {
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { analyticsForEnvironment } from "../analytics.ts";
 
 import type { AskAnswerBody } from "./askAnswer.ts";
 import {
@@ -85,6 +86,7 @@ const revisionIn = (error: unknown): number | null => {
 
 /** Where the ask routes are and how this client proves who it is. */
 export interface AskApiTarget {
+  readonly environmentId?: string;
   readonly base: string;
   readonly headers: Readonly<Record<string, string>>;
   /** The session rides in a cookie (the web app on its own server). */
@@ -383,7 +385,9 @@ export function createAskApi(host: AskApiHost): AskApi {
     path: string,
     options: CallOptions = {},
   ): Promise<T> {
-    const { base, headers, cookies } = host.target();
+    const { base, headers, cookies, environmentId } = host.target();
+    const analytics = analyticsForEnvironment(environmentId);
+    const context = analytics?.context();
     const send = host.fetch ?? fetch;
     let response: Response;
     try {
@@ -427,6 +431,28 @@ export function createAskApi(host: AskApiHost): AskApi {
         revisionIn(error),
         typeof error?.reason === "string" ? error.reason : null,
       );
+    }
+    if (method === "POST" && analytics) {
+      const action = path.endsWith("/answer")
+        ? "asks.answer"
+        : path.endsWith("/reply")
+          ? "asks.reply"
+          : path.endsWith("/hand")
+            ? "asks.hand"
+            : "asks.snooze";
+      const result = json as {
+        card?: { id?: string };
+        answered?: number;
+        discussionId?: string;
+      } | null;
+      const details = {
+        ...context,
+        ...(result?.card?.id ? { cardId: result.card.id } : {}),
+        ...(result?.discussionId ? { discussionId: result.discussionId } : {}),
+        props: { method: action, count: result?.answered ?? 1 },
+      };
+      analytics.record("owner.action", details);
+      if (action === "asks.reply") analytics.record("discussion.post", details);
     }
     return json as T;
   }

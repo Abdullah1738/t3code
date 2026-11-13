@@ -31,6 +31,7 @@ type Options = {
   shares?: Shares;
   /** Standing chat-rule check on agent sends; absent where no rules apply. */
   replyCheck?: (text: string) => { rule: string; reason: string } | undefined;
+  foldText?: (text: string, operationId: string) => Promise<string>;
   /** Receives rule names only, never message text. */
   log?: (event: string, code?: string) => void;
 };
@@ -124,7 +125,7 @@ type SessionContent = Omit<OutboxOperation, "id" | "kind" | "sessionId" | "gener
 
 /** Session-bound, idempotent enqueue shared by every agent-authored conversation route. */
 function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId: string,
-  content: SessionContent, prepare?: () => void): { id: string; created: boolean } {
+  content: SessionContent, prepare?: () => void, output: SessionContent = content): { id: string; created: boolean } {
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
@@ -136,8 +137,10 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
     const spec = JSON.stringify(operation);
     const saved = store.get<{ spec: string; queuedAt?: number }>(key);
     if (saved && saved.spec !== spec) throw new ApiError(409);
+    // Concurrent callers may finish folding after the turn has closed; the accepted original spec owns its stored text.
+    if (saved && store.getOperation(id)) return false;
     prepare?.();
-    const created = store.enqueue(operation);
+    const created = store.enqueue({ ...operation, ...output });
     store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
@@ -194,7 +197,7 @@ function sendConflict(store: Store, dedupeKey: string, route: { id: string; gene
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, foldText, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
     // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
@@ -337,7 +340,13 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           log?.("reply-bounced", hit.rule);
           return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
         }
-        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content);
+        const operationId = `send:${hash(dedupeKey)}`;
+        if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
+        let folded = text;
+        try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
+        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
+          if (liveSendRoute(store, sessionId).generation !== route.generation) throw new ApiError(409);
+        }, { ...content, text: folded });
         if (created) noteSent(store, turnKey, text);
         return json({ id, created }, created ? 202 : 200);
       }

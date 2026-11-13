@@ -5,12 +5,16 @@ import {
   type AuthEnvironmentScope,
   ScheduledTaskError,
   ScheduledTaskId,
+  ThreadId,
   WS_METHODS,
   WsRpcGroup,
+  type AnalyticsEvent,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as ErrorReporter from "effect/ErrorReporter";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -19,11 +23,19 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as RpcTest from "effect/rpc/RpcTest";
+import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as TestClock from "effect/testing/TestClock";
 
 import { RPC_REQUIRED_SCOPES } from "../auth/RpcAuthorization.ts";
 import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
-import { RpcInstrumentation, rpcInstrumentationLayer } from "./RpcInstrumentation.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import {
+  AnalyticsOriginKind,
+  RpcInstrumentation,
+  rpcInstrumentationLayer,
+  rpcAnalyticsSerialization,
+  layerServerAnalyticsErrors,
+} from "./RpcInstrumentation.ts";
 
 type WsRpcMethod = keyof typeof RPC_REQUIRED_SCOPES;
 
@@ -99,6 +111,151 @@ const requestDuration = (snapshots: ReadonlyArray<Metric.Metric.Snapshot>, metho
   )?.state;
 
 describe("WS RPC instrumentation middleware", () => {
+  it.effect("captures unhandled defects and omits expected failures and raw error text", () =>
+    Effect.gen(function* () {
+      const captured = yield* Deferred.make<AnalyticsEvent>();
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        yield* ErrorReporter.report(
+          Cause.fail({ _tag: "ExpectedError", message: "private expected" }),
+        );
+        assert.equal(events.length, 0);
+        yield* ErrorReporter.report(Cause.die(new Error("private defect"))).pipe(
+          Effect.withSpan("server.operation"),
+        );
+        const event = yield* Deferred.await(captured);
+        assert.equal(event.props?.span, "server.operation");
+        assert.equal(event.props?.errorTag, "Defect");
+        assert.equal(event.kind, "server.error");
+        assert.isFalse(JSON.stringify(events).includes("private"));
+      }).pipe(
+        Effect.provide(
+          layerServerAnalyticsErrors.pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }).pipe(Effect.andThen(Deferred.succeed(captured, event)), Effect.asVoid),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+  );
+
+  it.effect("records metadata for successful and rejected calls using the connection origin", () =>
+    withTelemetry(() =>
+      Effect.gen(function* () {
+        const events: AnalyticsEvent[] = [];
+        const group = groupOf(
+          WS_METHODS.serverProbe,
+          WS_METHODS.scheduledTasksList,
+          WS_METHODS.serverRetryResourceTelemetry,
+          WS_METHODS.analyticsIngest,
+          WS_METHODS.terminalClose,
+        );
+        const client = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              group.toLayerHandler(WS_METHODS.serverProbe, () => Effect.succeed({})),
+              group.toLayerHandler(WS_METHODS.scheduledTasksList, () =>
+                Effect.fail(new ScheduledTaskError({ message: "private failure text" })),
+              ),
+              group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
+                Effect.die("must be rejected"),
+              ),
+              group.toLayerHandler(WS_METHODS.analyticsIngest, () => Effect.void),
+              group.toLayerHandler(WS_METHODS.terminalClose, () => Effect.die("must be rejected")),
+              connectionMiddleware([AuthOrchestrationReadScope]),
+            ).pipe(
+              Layer.provide(
+                Layer.merge(
+                  Layer.succeed(AnalyticsOriginKind, "owner"),
+                  Layer.mock(Analytics.Analytics)({
+                    record: (event) =>
+                      Effect.sync(() => {
+                        events.push(event);
+                      }),
+                  }),
+                ),
+              ),
+            ),
+          ),
+        );
+        yield* client[WS_METHODS.serverProbe]({});
+        yield* Effect.exit(client[WS_METHODS.scheduledTasksList]({}));
+        yield* Effect.exit(client[WS_METHODS.serverRetryResourceTelemetry]({}));
+        yield* Effect.exit(
+          client[WS_METHODS.analyticsIngest]({
+            events: [
+              { ts: "2026-11-13T00:00:00.000Z", kind: "test", route: "test", surface: "web" },
+            ],
+          }),
+        );
+        yield* Effect.exit(
+          client[WS_METHODS.terminalClose]({ threadId: ThreadId.make("thread-analytics") }),
+        );
+        assert.equal(events.length, 4);
+        assert.equal(events.at(-1)?.threadId, "thread-analytics");
+        assert.deepStrictEqual(
+          events.map((event) => [event.kind, event.props?.originKind, event.props?.errorTag]),
+          [
+            ["rpc.request", "owner", undefined],
+            ["rpc.request", "owner", "ScheduledTaskError"],
+            ["rpc.request", "owner", "EnvironmentAuthorizationError"],
+            ["rpc.request", "owner", "EnvironmentAuthorizationError"],
+          ],
+        );
+        assert.isFalse(JSON.stringify(events).includes("private failure text"));
+        assert.isTrue(
+          events.every(
+            (event) =>
+              event.durationMs !== undefined && event.props?.span === `ws.rpc.${event.route}`,
+          ),
+        );
+      }),
+    ),
+  );
+
+  it("totals encoded bytes per request, releases interrupted requests, and skips ingest", () => {
+    const measured: Array<[string, number]> = [];
+    const parser = rpcAnalyticsSerialization(RpcSerialization.json, (method, bytes) => {
+      measured.push([method, bytes]);
+    }).makeUnsafe();
+    parser.decode(
+      JSON.stringify({ _tag: "Request", id: "1", tag: WS_METHODS.serverProbe, payload: {} }),
+    );
+    const chunk = { _tag: "Chunk", requestId: "1", values: ["أ"] };
+    const encodedChunk = parser.encode(chunk)!;
+    assert.equal(measured.length, 0);
+    const encodedExit = parser.encode({
+      _tag: "Exit",
+      requestId: "1",
+      exit: { _tag: "Success", value: {} },
+    })!;
+    assert.deepStrictEqual(measured, [
+      [WS_METHODS.serverProbe, Buffer.byteLength(encodedChunk) + Buffer.byteLength(encodedExit)],
+    ]);
+    parser.decode(
+      JSON.stringify({ _tag: "Request", id: "2", tag: WS_METHODS.serverProbe, payload: {} }),
+    );
+    const interruptedChunk = parser.encode({ ...chunk, requestId: "2" })!;
+    parser.decode(JSON.stringify({ _tag: "Interrupt", requestId: "2" }));
+    parser.encode({ _tag: "Exit", requestId: "2", exit: { _tag: "Success", value: {} } });
+    assert.deepStrictEqual(measured[1], [
+      WS_METHODS.serverProbe,
+      Buffer.byteLength(interruptedChunk),
+    ]);
+    assert.equal(measured.length, 2);
+    parser.decode(
+      JSON.stringify({ _tag: "Request", id: "3", tag: WS_METHODS.analyticsIngest, payload: {} }),
+    );
+    parser.encode({ _tag: "Exit", requestId: "3", exit: { _tag: "Success", value: null } });
+    assert.equal(measured.length, 2);
+  });
+
   it.effect("records one span and request metric per call, including rejected calls", () =>
     withTelemetry((ended) =>
       Effect.gen(function* () {
@@ -245,6 +402,7 @@ describe("WS RPC instrumentation middleware", () => {
   it.effect("keeps a stream's span and duration open until the subscription is interrupted", () =>
     withTelemetry((ended) =>
       Effect.gen(function* () {
+        const events: AnalyticsEvent[] = [];
         const waiting = yield* Deferred.make<void>();
         const group = groupOf(WS_METHODS.pullRequestsSubscribeRefreshes);
         const client = yield* RpcTest.makeClient(group).pipe(
@@ -262,6 +420,15 @@ describe("WS RPC instrumentation middleware", () => {
                 ),
               ),
               readOnlyConnection,
+            ).pipe(
+              Layer.provide(
+                Layer.mock(Analytics.Analytics)({
+                  record: (event) =>
+                    Effect.sync(() => {
+                      events.push(event);
+                    }),
+                }),
+              ),
             ),
           ),
         );
@@ -277,6 +444,9 @@ describe("WS RPC instrumentation middleware", () => {
         assert.deepStrictEqual(appSpans(ended), []);
 
         yield* Fiber.interrupt(consumer);
+        assert.equal(events.length, 1);
+        assert.equal(events[0]?.props?.phase, "stream-lifetime");
+        assert.equal(events[0]?.durationMs, 250);
 
         const [rpcSpan] = rpcSpans(ended);
         assert.equal(rpcSpan?.name, "ws.rpc.pullRequests.subscribeRefreshes");

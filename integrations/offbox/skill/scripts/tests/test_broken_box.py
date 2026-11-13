@@ -59,7 +59,7 @@ class BrokenBoxRunTests(Isolated):
         a = cli.build_parser().parse_args(['run', '--remote', '--', 'go', 'test', './...'])
         err = io.StringIO()
         stop = MagicMock(return_value=True)
-        finish = MagicMock()
+        finish = MagicMock(side_effect=lambda run_id, exit_code, *args, **kwargs: exit_code)
         with patch.object(runs.Runner, 'start', fake_start), patch.object(runs, 'follow', side_effect=follow), \
                 patch.object(runs, 'recorded_exit', return_value=None), patch.object(lease, 'stop_box', stop), \
                 patch.object(runs, 'finish', finish), contextlib.redirect_stderr(err):

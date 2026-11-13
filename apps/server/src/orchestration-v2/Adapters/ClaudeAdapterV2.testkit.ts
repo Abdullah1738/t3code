@@ -1388,36 +1388,6 @@ function requireAssistantCursor(input: {
   );
 }
 
-async function recordMessagesUntilTurnResults(input: {
-  readonly iterator: AsyncIterator<SDKMessage>;
-  readonly entries: Array<ProviderReplayEntry>;
-  readonly scenario: string;
-  readonly resultCount: number;
-}): Promise<boolean> {
-  let seenResults = 0;
-  while (true) {
-    const next = await input.iterator.next();
-    if (next.done === true) {
-      return false;
-    }
-    const replayMessage = sanitizeSdkMessageForReplay({
-      message: next.value,
-      scenario: input.scenario,
-    });
-    input.entries.push({
-      type: "emit_inbound",
-      label: replayMessage.type,
-      frame: replayMessage,
-    });
-    if (replayMessage.type === "result") {
-      seenResults += 1;
-      if (seenResults >= input.resultCount) {
-        return true;
-      }
-    }
-  }
-}
-
 async function recordMessagesUntilIteratorDone(input: {
   readonly iterator: AsyncIterator<SDKMessage>;
   readonly entries: Array<ProviderReplayEntry>;
@@ -1714,9 +1684,15 @@ async function recordClaudeActiveSteeringQuery(input: {
 
   const promptQueue = new RecordingPromptQueue();
   const offeredPrompts = new Set<number>();
+  const promptUuids = await Effect.runPromise(
+    Effect.forEach(input.prompts, () =>
+      randomUuidV4.pipe(Effect.filterOrFail(ClaudeAdapterV2.isClaudePromptUuid)),
+    ),
+  );
   const offerPrompt = (index: number, priority?: SDKUserMessage["priority"]) => {
     const message = ClaudeAdapterV2.makeClaudeUserMessage({
       text: input.prompts[index]!,
+      uuid: promptUuids[index]!,
       ...(priority === undefined ? {} : { priority }),
     });
     input.entries.push({
@@ -1730,7 +1706,7 @@ async function recordClaudeActiveSteeringQuery(input: {
   const offerSteeringPrompts = () => {
     for (let index = 1; index < input.prompts.length; index += 1) {
       if (!offeredPrompts.has(index)) {
-        offerPrompt(index, "now");
+        offerPrompt(index, "next");
       }
     }
   };
@@ -1797,12 +1773,19 @@ async function recordClaudeActiveSteeringQuery(input: {
   try {
     offerPrompt(0);
     offerSteeringPrompts();
-    const completed = await recordMessagesUntilTurnResults({
-      iterator,
-      entries: input.entries,
-      scenario: input.scenario,
-      resultCount: input.prompts.length,
-    });
+    // Several priority-next sends can be consumed by one SDK turn. Its
+    // result echoes every consumed uuid, so counting results would hang.
+    const consumed = new Set<string>();
+    let completed = false;
+    while (!completed) {
+      const next = await iterator.next();
+      if (next.done) break;
+      const frame = sanitizeSdkMessageForReplay({ message: next.value, scenario: input.scenario });
+      input.entries.push({ type: "emit_inbound", label: frame.type, frame });
+      if (frame.type !== "result") continue;
+      for (const uuid of frame.user_message_uuids ?? []) consumed.add(uuid);
+      completed = promptUuids.every((uuid) => consumed.has(uuid));
+    }
     if (!completed) {
       throw new Error("Claude active steering query ended before the turn completed.");
     }

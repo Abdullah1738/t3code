@@ -150,8 +150,10 @@ class EngineTests(unittest.TestCase):
             db.commit()
 
     def run_adapter(self, harness, event, **env):
+        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        child_env.update(env)
         run = subprocess.run([sys.executable, str(SRC / (harness + ".py"))], input=json.dumps(event),
-                             text=True, capture_output=True, env={**os.environ, **env}, timeout=5, check=True)
+                             text=True, capture_output=True, env=child_env, timeout=5, check=True)
         self.assertEqual(run.stderr, "")
         return json.loads(run.stdout) if run.stdout else None
 
@@ -161,8 +163,8 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Why: installation [rule pkg-install].", result["reason"])
         self.assertIn("offbox run -- npm ci", result["reason"])
         self.assertEqual(engine.decide(self.event("pytest tests/a.py::test_one"), "claude")["decision"], "allow")
-        os.environ["OFFBOX_GATE_MODE"] = "observe"
-        self.assertEqual(engine.decide(self.event("npm ci"), "claude")["decision"], "allow")
+        with patch.dict(os.environ, {"OFFBOX_GATE_MODE": "observe"}):
+            self.assertEqual(engine.decide(self.event("npm ci"), "claude")["decision"], "allow")
 
     def test_parent_exemption_does_not_grant_sibling(self):
         entry = {"session_id": "shared", "thread_id": "sibling", "expires_at": time.time() + 120}
@@ -303,7 +305,8 @@ class EngineTests(unittest.TestCase):
         command = result["context"].get("updatedInput", {}).get("command", "")
         # Read the token through the shell exactly as offbox does, including the
         # wrapper's per-command export and restoration of inherited context.
-        env = {**os.environ, "CLAUDE_CODE_SESSION_ID": session}
+        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        env["CLAUDE_CODE_SESSION_ID"] = session
         run = subprocess.run(["/bin/bash", "-c", command], env=env, text=True, capture_output=True, check=True)
         return run.stdout.strip()
 
@@ -353,13 +356,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(row["identity_source"], "cache")
 
     def test_cached_hook_token_proves_offbox_child_owner_during_stall(self):
+        # Offbox's command-identity lookup can also prepend a hooks source path.
+        self.enterContext(patch.object(sys, "path", sys.path.copy()))
         sys.path.insert(0, str(SRC.parents[1] / "offbox/skill/scripts"))
         from offbox_lib import identity as offbox_identity
         engine.decide(self.identity_probe(), "claude")
         self.age_identity_cache(3600)
         with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
             token = self.command_token(engine.decide(self.identity_probe(), "claude"))
-            env = {engine.COMMAND_IDENTITY_ENV: token, "CLAUDE_CODE_SESSION_ID": "session",
+            env = {engine.COMMAND_IDENTITY_ENV: token, "HARNESS_HOOKS_SRC": str(SRC),
+                   "CLAUDE_CODE_SESSION_ID": "session",
                    "CODEX_THREAD_ID": "", "CODEX_SESSION_ID": "", "OPENCODE_SESSION_ID": "", "OFFBOX_THREAD": ""}
             with patch.dict(os.environ, env), \
                  patch.object(offbox_identity, "identity_for", return_value={"resolution": "unavailable"}), \
@@ -782,8 +788,7 @@ class EngineTests(unittest.TestCase):
         token_file = self.root / "credential.json"
         token_file.write_text(json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}", "token": "synthetic-token"}))
         token_file.chmod(0o600)
-        with patch.dict(os.environ, {"HARNESS_HOOKS_TOKEN_FILE": str(token_file)}):
-            del os.environ["HARNESS_HOOKS_CONTROL_URL"]
+        with patch.dict(os.environ, {"HARNESS_HOOKS_TOKEN_FILE": str(token_file), "HARNESS_HOOKS_CONTROL_URL": ""}):
             self.assertEqual(engine.resolve_identity(self.event("echo", session="cred", agent=None), "claude")["robobThreadId"], "cred-thread")
             self.assertTrue(self.state.calls[-1].startswith("/api/ardud/control/identity/resolve?"))
 
@@ -909,7 +914,8 @@ class EngineTests(unittest.TestCase):
         real_psql.write_text("#!/bin/sh\nprintf 'real-psql\\n'\n")
         real_psql.chmod(0o755)
         env = dict(os.environ)
-        for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
+        # Agent shells export the repo-node pin; fake HOMEs make its startup noisy.
+        for name in ("BASH_ENV", "ENV", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
                      "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED", engine.COMMAND_IDENTITY_ENV):
             env.pop(name, None)
         blockers = self.root / "harness-hooks/coord-blockers"

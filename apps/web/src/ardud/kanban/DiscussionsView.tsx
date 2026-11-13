@@ -1,3 +1,5 @@
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAnalyticsSearch } from "../useAnalytics";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
@@ -185,6 +187,7 @@ export function DiscussionsView(props: {
   const groups = discussionRows(state, props.nowMs, { query, hideCards, unreadOnly });
   const total =
     groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
+  useAnalyticsSearch(usePrimaryEnvironmentId(), "discussion", query.length, total, props.boardId);
   const searching = query.trim().length > 0;
   const narrow = useMediaQuery("max-md");
   const drafting = props.discussionId === NEW_DISCUSSION;
@@ -673,18 +676,30 @@ function DiscussionMenu(props: {
           </>
         ) : null}
         {settled ? (
-          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: false })}>
+          <MenuItem
+            disabled={!canUpdate}
+            title={updateNote}
+            onClick={() => update({ settled: false })}
+          >
             <Undo2Icon />
             Unsettle
           </MenuItem>
         ) : (
-          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ settled: true })}>
+          <MenuItem
+            disabled={!canUpdate}
+            title={updateNote}
+            onClick={() => update({ settled: true })}
+          >
             <CircleCheckIcon />
             Settle
           </MenuItem>
         )}
         {snoozed ? (
-          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ snoozedUntil: null })}>
+          <MenuItem
+            disabled={!canUpdate}
+            title={updateNote}
+            onClick={() => update({ snoozedUntil: null })}
+          >
             <AlarmClockOffIcon />
             Unsnooze
           </MenuItem>
@@ -717,12 +732,20 @@ function DiscussionMenu(props: {
           </MenuSub>
         )}
         {pinned ? (
-          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: false })}>
+          <MenuItem
+            disabled={!canUpdate}
+            title={updateNote}
+            onClick={() => update({ pinned: false })}
+          >
             <PinOffIcon />
             Unpin
           </MenuItem>
         ) : (
-          <MenuItem disabled={!canUpdate} title={updateNote} onClick={() => update({ pinned: true })}>
+          <MenuItem
+            disabled={!canUpdate}
+            title={updateNote}
+            onClick={() => update({ pinned: true })}
+          >
             <PinIcon />
             Pin
           </MenuItem>

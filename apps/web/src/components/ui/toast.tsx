@@ -1,11 +1,13 @@
 "use client";
 
 import { Spinner } from "~/components/ui/spinner";
+import { activeAnalytics, analyticsForEnvironment } from "@t3tools/client-runtime/ardud/analytics";
 
 import { Toast } from "@base-ui/react/toast";
 import {
   useEffect,
   useState,
+  useRef,
   type CSSProperties,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
@@ -514,6 +516,25 @@ function ToastProvider({ children, position = "top-right", ...props }: ToastProv
   );
 }
 
+type AnalyticsToast = ReturnType<typeof Toast.useToastManager<ThreadToastData>>["toasts"][number];
+function useAnalyticsToasts(toasts: ReadonlyArray<AnalyticsToast>) {
+  const seen = useRef(new Set<AnalyticsToast["id"]>());
+  useEffect(() => {
+    const present = new Set(toasts.map((toast) => toast.id));
+    for (const id of seen.current) if (!present.has(id)) seen.current.delete(id);
+    for (const toast of toasts) {
+      if (seen.current.has(toast.id)) continue;
+      seen.current.add(toast.id);
+      const ref = toast.data?.threadRef;
+      const collector = ref ? analyticsForEnvironment(ref.environmentId) : activeAnalytics();
+      collector?.record("toast.show", {
+        ...(ref ? { threadId: ref.threadId } : {}),
+        props: { status: toast.type === "error" ? 1 : 0 },
+      });
+    }
+  }, [toasts]);
+}
+
 function Toasts({ position }: { position: ToastPosition }) {
   const { toasts } = Toast.useToastManager<ThreadToastData>();
   const activeThreadRef = useActiveThreadRefFromRoute();
@@ -522,6 +543,7 @@ function Toasts({ position }: { position: ToastPosition }) {
     shouldRenderThreadScopedToast(toast.data, activeThreadRef),
   );
   const visibleToastLayout = buildVisibleToastLayout(visibleToasts);
+  useAnalyticsToasts(visibleToasts);
 
   useEffect(() => {
     const activeToastIds = new Set(toasts.map((toast) => toast.id));
@@ -676,6 +698,12 @@ function AnchoredToastProvider({ children, ...props }: Toast.Provider.Props) {
 function AnchoredToasts() {
   const { toasts } = Toast.useToastManager<ThreadToastData>();
   const activeThreadRef = useActiveThreadRefFromRoute();
+  useAnalyticsToasts(
+    toasts.filter(
+      (toast) =>
+        shouldRenderThreadScopedToast(toast.data, activeThreadRef) && toast.positionerProps?.anchor,
+    ),
+  );
 
   return (
     <Toast.Portal data-slot="toast-portal-anchored">

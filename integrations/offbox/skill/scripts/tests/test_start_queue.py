@@ -12,6 +12,7 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import allocation, api, capacity, cli, common, fallback, lease, outage, pool, runs
 from test_capacity import Isolated
 from test_exit_and_queue import FakeClock
@@ -57,7 +58,7 @@ class AllocationWaitTests(Isolated):
         holder = subprocess.Popen([sys.executable, '-c',
             'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); '
             'print("home held",flush=True); sys.stdin.read()', str(path)],
-            env=dict(os.environ, OFFBOX_BACKEND='server'),
+            env=clean_env(OFFBOX_BACKEND='server'),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         code = """
 import sys
@@ -77,7 +78,7 @@ with allocation.scope('repo'), allocation.guard():
             self.assertEqual(holder.stdout.readline().strip(),'home held')
             waiter = subprocess.Popen([sys.executable, '-c', code,
                 str(Path(__file__).resolve().parents[1]), self.tmp.name],
-                env=dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_POOL_WAIT_SECONDS='5'),
+                env=clean_env(OFFBOX_BACKEND='boat', OFFBOX_POOL_WAIT_SECONDS='5'),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 status = waiter.stderr.readline()
@@ -147,6 +148,11 @@ with allocation.scope('repo'), allocation.guard():
 class ResumeQueueTests(Isolated):
     def setUp(self):
         super().setUp()
+        # Pool interleavings need the mocked clock/API in this process; real detachment has separate coverage.
+        def inline_background(a, me):
+            with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}):
+                return runs.background_client(a, me)
+        self.stack.enter_context(patch.object(runs, '_background', side_effect=inline_background))
         self.clock = FakeClock()
         self.stack.enter_context(patch.object(pool, 'time', self.clock.time))
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':'server','OFFBOX_POOL_WAIT_SECONDS':'12'}))
@@ -203,7 +209,7 @@ class ResumeQueueTests(Isolated):
                 with patch.object(self.clock.time, 'sleep', sleep), \
                         patch.object(lease, '_bring_up'), \
                         patch.object(lease, 'acquire_private') as create, patch.object(runs.Runner, 'start', start), \
-                        patch.object(runs, 'follow', return_value=0), patch.object(runs, 'finish'), \
+                        patch.object(runs, 'follow', return_value=0), patch.object(runs, 'finish', return_value=0), \
                         patch.object(api, 'get', side_effect=lambda *a,**k: {'state':'stopping' if phase[0]=='stopping' else 'running', 'type':'xlarge'}), \
                         patch.object(lease, 'ensure_ttl'), \
                         patch.object(fallback, 'run_local') as local, contextlib.redirect_stdout(io.StringIO()):

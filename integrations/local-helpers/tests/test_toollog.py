@@ -16,7 +16,20 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_missing_override_uses_private_temp_root(self):
+        with patch.dict(os.environ):
+            os.environ.pop('TOOLLOG_ROOT', None)
+            root = toollog.root()
+            self.assertTrue(root.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()))
+            self.assertFalse(root.is_relative_to(Path.home() / '.robob'))
+            self.assertEqual(toollog.root(), root)
+            toollog.emit('fixture', 'event', 'test.start', board='imessage')
+            self.assertTrue(list((root / 'imessage').glob('*.ndjson')))
+
     def setUp(self):
+        sampling = patch.object(toollog.random, 'random', return_value=0)
+        sampling.start()
+        self.addCleanup(sampling.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.env = patch.dict(os.environ, {'TOOLLOG_ROOT': self.tmp.name + '/logs'})
@@ -54,7 +67,7 @@ class ToolLogTests(unittest.TestCase):
         directory = toollog.board_dir('agent-tools')
         directory.mkdir(parents=True)
         old = (datetime.now(timezone.utc) - timedelta(days=31)).strftime('%Y-%m-%d')
-        for name in (old + '.ndjson', 'rollup-' + old + '.json', '.cap-' + old):
+        for name in (old + '.ndjson', 'rollup-' + old + '.json', '.cap-' + old, '.cap-hooks-' + old):
             (directory / name).touch()
         (directory / 'unrelated').touch()
         toollog.emit('test', 'event', 'test.start')
@@ -71,6 +84,95 @@ class ToolLogTests(unittest.TestCase):
             if row['name'] == 'log.cap': print('TOOLLOG_SAMPLE ' + json.dumps(row, separators=(',', ':')))
         self.assertEqual(names.count('test.kept'), 3)
         self.assertNotIn('test.dropped', names)
+
+    def test_component_caps_keep_other_components_and_errors(self):
+        toollog.emit('rcsim', 'perf', 'sim.start')
+        with patch.object(toollog, 'HOOKS_CAP_BYTES', 1), patch.object(toollog, 'CAP_BYTES', 100_000):
+            for _ in range(3):
+                toollog.emit('hooks', 'perf', 'hook.dropped')
+                toollog.emit('rcsim', 'perf', 'sim.kept')
+                toollog.hook('codex', 'shell', 'denied', 'fixture.denied', 0)
+        rows = self.rows()
+        self.assertNotIn('hook.dropped', [r['name'] for r in rows])
+        self.assertEqual(sum(r['name'] == 'sim.kept' for r in rows), 3)
+        self.assertEqual(sum(r['kind'] == 'error' and r['name'] == 'hook.decision' for r in rows), 3)
+        caps = [r for r in rows if r['name'] == 'log.cap']
+        self.assertEqual([r['props'] for r in caps], [{'component': 'hooks', 'capBytes': 1}])
+        with patch.object(toollog, 'HOOKS_CAP_BYTES', 1), patch.object(toollog, 'CAP_BYTES', 1):
+            toollog.emit('rcsim', 'perf', 'sim.dropped')
+            toollog.emit('hooks', 'error', 'hook.kept', props={'sampleRate': 16})
+            toollog.emit('rcsim', 'error', 'sim.error')
+        self.assertEqual([r['props']['component'] for r in self.rows() if r['name'] == 'log.cap'], ['hooks', 'all'])
+        self.assertNotIn('sim.dropped', [r['name'] for r in self.rows()])
+        self.assertEqual(self.rows()[-1]['name'], 'sim.error')
+        self.assertEqual(toollog.rollup('agent-tools', self.day)['logCaps'][0]['component'], 'hooks')
+
+    def test_slim_hook_sampling_and_weighted_roundtrip(self):
+        for decision in ('allowed', 'rewritten'):
+            with patch.object(toollog.random, 'random', side_effect=[0, 1 / toollog.HOOK_SAMPLE_RATE, .99]):
+                for _ in range(3):
+                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'fixture'})
+        with patch.object(toollog.random, 'random', return_value=.99):
+            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'fixture'})
+            toollog.hook('codex', 'shell', 'allowed', 'failure', 4, error_tag='fixture.error')
+        rows = self.rows()
+        self.assertEqual(len(rows), 4)
+        for row in rows[:2]:
+            self.assertEqual(row['durationMs'], 2)
+            self.assertEqual(row['ids']['threadId'], 'fixture')
+            self.assertEqual(row['props']['sampleRate'], toollog.HOOK_SAMPLE_RATE)
+            for key in ('cwdClass', 'matchedRoot', 'argv0Class'):
+                self.assertNotIn(key, row['props'])
+        self.assertEqual(rows[0]['props'].get('repeatCount', 1), 1)
+        self.assertEqual(rows[1]['props']['repeatCount'], 4)
+        for row in rows[2:]:
+            self.assertIn('repeatCount', row['props'])
+            self.assertEqual(row['props']['argv0Class'], 'none')
+            self.assertNotIn('sampleRate', row['props'])
+        result = toollog.rollup('agent-tools', self.day)
+        self.assertEqual(result['total'], 2 * toollog.HOOK_SAMPLE_RATE + 2)
+        self.assertEqual(result['recordedRows'], 4)
+        self.assertTrue(result['sampled'])
+        self.assertEqual(result['okCount'], 2 * toollog.HOOK_SAMPLE_RATE)
+        self.assertEqual(result['failedCount'], 2)
+        self.assertEqual(result['countsByKind'], {'perf': 2 * toollog.HOOK_SAMPLE_RATE, 'error': 2})
+        self.assertEqual(result['durationMsByName']['hook.decision'], {'p50': 2, 'p95': 2, 'max': 4})
+        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'fixture', 'count': 2 * toollog.HOOK_SAMPLE_RATE + 1}])
+        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], 2 * toollog.HOOK_SAMPLE_RATE + 1)
+        self.assertEqual(result['logCaps'], [])
+
+    def test_rollup_legacy_caps_and_sample_rate_shapes(self):
+        path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
+        path.parent.mkdir(parents=True)
+        rows = [{'kind': 'error', 'name': 'log.cap'},
+                {'kind': 'error', 'name': 'fixture.error', 'props': {'sampleRate': 128}}]
+        for rate in [None, True, False, 0, -1, 1.5, '128', 2**53, 1, 128]:
+            rows.append({'kind': 'perf', 'name': 'fixture.run', 'props': {'sampleRate': rate}})
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('agent-tools', self.day)
+        self.assertEqual(result['total'], 2 + 9 + 128)
+        self.assertEqual(result['recordedRows'], 12)
+        self.assertEqual(result['logCaps'], [{'component': 'all', 'capBytes': None, 'ts': None}])
+
+    def test_hook_prop_defaults_and_nondefaults(self):
+        for decision in ('allowed', 'rewritten', 'denied'):
+            for key, defaults, nondefault in [
+                    ('argv0Class', ['none', '', None], 'search'),
+                    ('matchedRoot', ['none', '', None], 'filesystem'),
+                    ('repeatCount', [0, 1, None], 2),
+                    ('firstWord', ['', None], 'rg'),
+                    ('commandLength', [0, None], 10),
+                    ('cwdClass', ['other', '', None], 'worktree')]:
+                for value in defaults + [nondefault]:
+                    with self.subTest(decision=decision, key=key, value=value):
+                        props = {'harness': 'codex', 'guard': 'shell', 'decision': decision, 'rule': 'fixture', key: value}
+                        result = toollog.hook_props(props)
+                        if decision == 'denied' or value == nondefault:
+                            self.assertEqual(result[key], value)
+                        else:
+                            self.assertNotIn(key, result)
+                        self.assertEqual({k: result[k] for k in ('harness', 'guard', 'decision', 'rule')},
+                                         {k: props[k] for k in ('harness', 'guard', 'decision', 'rule')})
 
     def test_reader_and_rollup_two_boards(self):
         for board in ('agent-tools', 'orders'):
@@ -229,6 +331,30 @@ class AttributionTests(unittest.TestCase):
             for offset, expected in [(0,1),(20,2),(81,1)]:
                 with patch.object(toollog.time,'time',return_value=base+offset):
                     self.assertEqual(toollog._repeat_count('codex',ids,'shell','retry','rg'),expected)
+
+    def test_midnight_sampled_loop_estimates(self):
+        cases = [
+            ('previous-sampled', 128, 1, -10, 'fixture', 129, True),
+            ('current-sampled', 1, 128, -10, 'fixture', 129, True),
+            ('both-unsampled', 1, 1, -10, 'fixture', 2, False),
+            ('outside-window', 128, 1, -3601, 'fixture', 1, False),
+            ('unrelated-thread', 128, 1, -10, 'other', 1, False),
+        ]
+        for label, previous_rate, current_rate, offset, thread, peak, sampled in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp}):
+                directory = toollog.board_dir('agent-tools')
+                directory.mkdir()
+                base = datetime(2026, 11, 14, tzinfo=timezone.utc)
+                for at, rate, identity in [(base + timedelta(seconds=offset), previous_rate, thread),
+                                           (base, current_rate, 'fixture')]:
+                    row = {'ts': at.isoformat(), 'name': 'hook.decision', 'kind': 'perf',
+                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate}}
+                    (directory / (at.strftime('%Y-%m-%d') + '.ndjson')).write_text(json.dumps(row) + '\n')
+                result = toollog.rollup('agent-tools', '2026-11-14')
+                self.assertEqual(result['sampled'], sampled)
+                self.assertEqual(result['total'], current_rate)
+                self.assertEqual(result['repeatLoops'][0]['maxCountInHour'] if peak > 20 else len(result['repeatLoops']),
+                                 peak if peak > 20 else 0)
 
     def test_loop_window_boundaries_and_utc_day_attribution(self):
         cases=[('same-day',20,10,False),('midnight',21,10,True),('hour-edge',21,180,True),

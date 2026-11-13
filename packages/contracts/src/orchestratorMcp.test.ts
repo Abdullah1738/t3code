@@ -37,6 +37,8 @@ describe("orchestrator MCP contracts", () => {
     const partial = {
       taskId: "node:task",
       partial: true,
+      stoppedAt: "result",
+      retryHint: "Retry task_status in a few seconds, or read childThreadId with t3_thread_read.",
       childThreadId: "thread:child",
       currentRunId: "run:resumed",
       currentRunStatus: "starting",
@@ -44,15 +46,23 @@ describe("orchestrator MCP contracts", () => {
       latestTerminalStatus: "cancelled",
     };
     expect(decode(partial)).toEqual(partial);
-    expect(decode({ taskId: "node:task", partial: true, callerResolved: true })).toEqual({
-      taskId: "node:task",
-      partial: true,
-      callerResolved: true,
-    });
-    expect(decode({ taskId: "node:task", partial: true })).toEqual({
-      taskId: "node:task",
-      partial: true,
-    });
+    for (const stoppedAt of ["caller", "parent_records", "child_records", "result"]) {
+      const minimal = {
+        taskId: "node:task",
+        partial: true,
+        stoppedAt,
+        retryHint: "Retry task_status in a few seconds.",
+      };
+      expect(decode(minimal)).toEqual(minimal);
+      expect(decode({ ...minimal, callerResolved: true })).toEqual({
+        ...minimal,
+        callerResolved: true,
+      });
+      expect(() => decode({ ...minimal, stoppedAt: undefined })).toThrow();
+      expect(() => decode({ ...minimal, retryHint: undefined })).toThrow();
+    }
+    expect(() => decode({ ...partial, stoppedAt: "unknown" })).toThrow();
+    expect(() => decode({ taskId: "node:task", partial: true })).toThrow();
     expect(() => decode({ ...partial, partial: false })).toThrow();
     expect(() => decode({ taskId: "node:task" })).toThrow();
   });

@@ -1,3 +1,4 @@
+import { prepareShortcutRecording } from "../ardud/keybindingAnalytics";
 import { useAtomValue } from "@effect/atom-react";
 import {
   scopeProjectRef,
@@ -77,7 +78,7 @@ export function ReopenClosedViewShortcut() {
   const openPreview = useAtomCommand(previewEnvironment.open);
   const pending = useRef(Promise.resolve());
 
-  const reopenNext = useEffectEvent(async () => {
+  const reopenNext = useEffectEvent(async (onReopened?: () => void) => {
     const catalog = appAtomRegistry.get(environmentCatalog.catalogValueAtom);
     const drafts = useComposerDraftStore.getState();
     const panelsByThread = useRightPanelStore.getState().byThreadKey;
@@ -115,6 +116,7 @@ export function ReopenClosedViewShortcut() {
       return;
     }
     useClosedViewStore.getState().remove(restore.id);
+    onReopened?.();
     if (globalPullRequests) {
       const selected = selectSelectedRightPanelSurface(
         useRightPanelStore.getState().byThreadKey,
@@ -132,9 +134,9 @@ export function ReopenClosedViewShortcut() {
     }
   });
 
-  const enqueueReopen = useEffectEvent(() => {
+  const enqueueReopen = useEffectEvent((onReopened?: () => void) => {
     pending.current = pending.current
-      .then(() => reopenNext())
+      .then(() => reopenNext(onReopened))
       .catch((error: unknown) => {
         toastManager.add({
           type: "error",
@@ -166,7 +168,7 @@ export function ReopenClosedViewShortcut() {
       if (command !== "view.reopenClosed") return;
       event.preventDefault();
       event.stopPropagation();
-      if (!event.repeat) enqueueReopen();
+      if (!event.repeat) enqueueReopen(prepareShortcutRecording(event, command));
     };
     window.addEventListener("keydown", onKeyDown, true);
     const unsubscribe = window.desktopBridge?.onMenuAction((action) => {

@@ -30,8 +30,28 @@ export function guardHttpResponseWriteErrors<T extends NodeHttp.Server>(
  * between would hang. Install this after the write-error guards so only the
  * serving handlers trigger the handoff.
  */
-export function rejectRequestsUntilServing<T extends NodeHttp.Server>(server: T): T {
-  const rejectRequest = (_request: NodeHttp.IncomingMessage, response: NodeHttp.ServerResponse) => {
+export function rejectRequestsUntilServing<T extends NodeHttp.Server>(
+  server: T,
+  mcpStarting?: () => { readonly bootId: string; readonly phase: string },
+): T {
+  const rejectRequest = (request: NodeHttp.IncomingMessage, response: NodeHttp.ServerResponse) => {
+    if (request.url?.split("?", 1)[0] === "/mcp" && mcpStarting) {
+      const data = { reason: "server_starting", ...mcpStarting() };
+      response
+        .writeHead(503, {
+          "retry-after": "5",
+          connection: "close",
+          "content-type": "application/json",
+        })
+        .end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32000, message: "Robob is restarting", data },
+          }),
+        );
+      return;
+    }
     response.writeHead(503, { "retry-after": "1", connection: "close" }).end();
   };
   const rejectUpgrade = (_request: NodeHttp.IncomingMessage, socket: NodeStream.Duplex) => {

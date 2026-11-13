@@ -174,12 +174,12 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
           const live = host.target(id);
           kept = live;
           keptUsed = false;
-          return live;
+          return { ...live, environmentId: id };
         } catch (error) {
           const offline = error instanceof AskApiError && error.code === "offline";
           if (!offline || kept === null || host.connection(id) !== "waiting") throw error;
           keptUsed = true;
-          return kept;
+          return { ...kept, environmentId: id };
         }
       },
       fetch: (async (...call: Parameters<typeof fetch>) => {
@@ -216,6 +216,7 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       },
     };
     const asks = createAskStore({
+      analyticsEnvironmentId: () => environmentId,
       api,
       cell,
       watch: host.watch,

@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import {
   applyPullRequestDraftFilterChange,
   parsePullRequestQuery,
@@ -1589,6 +1590,7 @@ function PullRequestsRouteView() {
     event.preventDefault();
     event.stopPropagation();
     if (event.repeat) return;
+    recordConsumedShortcut(event, "thread.copyReference");
     const url = openPanelPullRequestUrl;
     void writeTextToClipboard(url, "pull request link").then(
       (didCopy) => {
@@ -1608,19 +1610,28 @@ function PullRequestsRouteView() {
     if (activePullRequestSurface === null) return;
     event.preventDefault();
     event.stopPropagation();
-    if (!event.repeat) closeSurface(activePullRequestSurface);
+    if (!event.repeat) {
+      closeSurface(activePullRequestSurface);
+      recordConsumedShortcut(event, "rightPanel.close");
+    }
   });
   const toggleRightPanelFromShortcut = useEffectEvent((event: KeyboardEvent) => {
     if (!rightPanelAvailable) return;
     event.preventDefault();
     event.stopPropagation();
-    if (!event.repeat) toggleRightPanel();
+    if (!event.repeat) {
+      toggleRightPanel();
+      recordConsumedShortcut(event, "rightPanel.toggle");
+    }
   });
   const toggleRightPanelMaximizedFromShortcut = useEffectEvent((event: KeyboardEvent) => {
     if (!rightPanelState.isOpen) return;
     event.preventDefault();
     event.stopPropagation();
-    if (!event.repeat) toggleRightPanelMaximized();
+    if (!event.repeat) {
+      toggleRightPanelMaximized();
+      recordConsumedShortcut(event, "rightPanel.toggleMaximized");
+    }
   });
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

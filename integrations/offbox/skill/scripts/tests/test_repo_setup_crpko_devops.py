@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import bases, identity, runs
 from test_capacity import Isolated
 
@@ -286,7 +287,7 @@ class CrpkoSetupTests(unittest.TestCase):
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
+        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
         self.env.pop('BASH_ENV',None)
 

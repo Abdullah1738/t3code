@@ -1,0 +1,330 @@
+import type { AnalyticsEvent, AnalyticsRollup as ContractRollup } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+
+const MAX_GROUPS = 128;
+const EXACT_DURATIONS = 512;
+const HISTOGRAM_RATIO = 1.02;
+const OTHER = "__other__";
+
+interface Durations {
+  count: number;
+  max: number;
+  exact: number[];
+  histogram: Map<number, number> | undefined;
+}
+
+interface AnalyticsLatency {
+  readonly count: number;
+  readonly p50Ms: number | null;
+  readonly p95Ms: number | null;
+  readonly maxMs: number | null;
+  readonly approximate: boolean;
+}
+
+export type AnalyticsRollup = ContractRollup;
+
+interface McpGroup {
+  tool: string;
+  hour: string;
+  build: string;
+  bootId: string;
+  durations: Durations;
+  failures: number;
+  outcomes: Map<string, number>;
+  savedCounts: Map<string, number>;
+  errors: Map<
+    string,
+    { errorTag: string; errorPhase: NonNullable<AnalyticsEvent["errorPhase"]>; count: number }
+  >;
+}
+interface RetryAttempt {
+  ts: string;
+  group: string;
+  ok: boolean;
+}
+
+const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
+
+export const makeAccumulator = () => ({
+  total: 0,
+  invalidLines: 0,
+  kinds: new Map<string, number>(),
+  errors: new Map<string, number>(),
+  rpcs: new Map<string, Durations>(),
+  answers: durations(),
+  tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
+  mcp: new Map<string, McpGroup>(),
+  retries: new Map<string, RetryAttempt[]>(),
+  retryAttempts: 0,
+  mcpOverflow: { groups: 0, retryAttempts: 0 },
+});
+
+function boundedKey<T>(groups: Map<string, T>, key: string): string {
+  return groups.has(key) || groups.size < MAX_GROUPS ? key : OTHER;
+}
+
+function increment(groups: Map<string, number>, key: string): void {
+  const bounded = boundedKey(groups, key);
+  groups.set(bounded, (groups.get(bounded) ?? 0) + 1);
+}
+
+function bucket(value: number): number {
+  return value === 0
+    ? -Infinity
+    : Math.ceil(Math.log(Math.max(0.000001, value)) / Math.log(HISTOGRAM_RATIO));
+}
+
+function addDuration(target: Durations, value: number): void {
+  target.count++;
+  target.max = Math.max(target.max, value);
+  if (!target.histogram && target.exact.length < EXACT_DURATIONS) {
+    target.exact.push(value);
+    return;
+  }
+  if (!target.histogram) {
+    target.histogram = new Map();
+    for (const existing of target.exact) {
+      const key = bucket(existing);
+      target.histogram.set(key, (target.histogram.get(key) ?? 0) + 1);
+    }
+    target.exact = [];
+  }
+  const key = bucket(value);
+  target.histogram.set(key, (target.histogram.get(key) ?? 0) + 1);
+}
+
+export function accumulate(
+  target: ReturnType<typeof makeAccumulator>,
+  event: AnalyticsEvent,
+): void {
+  target.total++;
+  increment(target.kinds, event.kind);
+  if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
+  else if (event.errorTag) increment(target.errors, event.errorTag);
+  else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
+  else if ((event.props?.status ?? 0) >= 400)
+    increment(target.errors, `status.${event.props!.status}`);
+
+  if (
+    event.kind === "kanban.tick_phase" &&
+    event.surface === "server" &&
+    event.boardId &&
+    event.props?.phase &&
+    event.durationMs !== undefined
+  ) {
+    const identity = JSON.stringify([event.boardId, event.props.phase]);
+    const key = boundedKey(target.tickPhases, identity);
+    let group = target.tickPhases.get(key);
+    if (!group) {
+      group = {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        phase: key === OTHER ? OTHER : event.props.phase,
+        durations: durations(),
+      };
+      target.tickPhases.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+  }
+
+  if (
+    /(^|[._-])rpc([._-]|$)/i.test(event.kind) &&
+    event.props?.method &&
+    event.durationMs !== undefined &&
+    event.props?.phase !== "stream-lifetime"
+  ) {
+    const key = boundedKey(target.rpcs, event.props.method);
+    let summary = target.rpcs.get(key);
+    if (!summary) {
+      summary = durations();
+      target.rpcs.set(key, summary);
+    }
+    addDuration(summary, event.durationMs);
+  }
+
+  if (/ask/i.test(event.kind) && /answer|respond|resolv/i.test(event.kind)) {
+    const duration =
+      event.durationMs ??
+      (event.props?.createdAt
+        ? DateTime.toEpochMillis(DateTime.makeUnsafe(event.ts)) -
+          DateTime.toEpochMillis(DateTime.makeUnsafe(event.props.createdAt))
+        : undefined);
+    if (duration !== undefined && duration >= 0) addDuration(target.answers, duration);
+  }
+
+  if (event.kind === "mcp.call" && event.tool && event.outcome) {
+    const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
+    const build = event.build ?? "unknown";
+    const bootId = event.bootId ?? "unknown";
+    const key = JSON.stringify([event.tool, hour, build, bootId]);
+    let group = target.mcp.get(key);
+    if (!group) {
+      // Bound both high-cardinality build groups and retry identities on damaged/untrusted logs.
+      if (target.mcp.size >= 16_384) {
+        target.mcpOverflow.groups++;
+        return;
+      }
+      group = {
+        tool: event.tool,
+        hour,
+        build,
+        bootId,
+        durations: durations(),
+        failures: 0,
+        outcomes: new Map(),
+        savedCounts: new Map(),
+        errors: new Map(),
+      };
+      target.mcp.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs ?? 0);
+    increment(group.outcomes, event.outcome);
+    increment(group.savedCounts, String(event.saved ?? "unknown"));
+    if (event.outcome !== "ok") {
+      group.failures++;
+      const errorTag = event.errorTag ?? "unknown";
+      const errorPhase = event.errorPhase ?? "handler";
+      const errorKey = boundedKey(group.errors, JSON.stringify([errorTag, errorPhase]));
+      const entry = group.errors.get(errorKey) ?? {
+        errorTag: errorKey === OTHER ? OTHER : errorTag,
+        errorPhase,
+        count: 0,
+      };
+      entry.count++;
+      group.errors.set(errorKey, entry);
+    }
+    if (event.clientRequestId) {
+      if (target.retryAttempts >= 100_000) target.mcpOverflow.retryAttempts++;
+      else {
+        const identity = JSON.stringify([
+          event.tool,
+          event.callerThreadId ?? "",
+          event.clientRequestId,
+        ]);
+        const attempts = target.retries.get(identity) ?? [];
+        attempts.push({ ts: event.ts, group: key, ok: event.outcome === "ok" });
+        target.retries.set(identity, attempts);
+        target.retryAttempts++;
+      }
+    }
+  }
+}
+
+function summarize(values: Durations): AnalyticsLatency {
+  const sorted = values.histogram
+    ? [...values.histogram].sort(([a], [b]) => a - b)
+    : values.exact.toSorted((a, b) => a - b).map((value) => [value, 1] as const);
+  const percentile = (quantile: number): number | null => {
+    const rank = Math.ceil(values.count * quantile);
+    let seen = 0;
+    for (const [key, count] of sorted) {
+      seen += count;
+      if (seen >= rank) {
+        return values.histogram
+          ? Math.min(values.max, key === -Infinity ? 0 : HISTOGRAM_RATIO ** key)
+          : key;
+      }
+    }
+    return null;
+  };
+  return {
+    count: values.count,
+    p50Ms: percentile(0.5),
+    p95Ms: percentile(0.95),
+    maxMs: values.count === 0 ? null : values.max,
+    approximate: values.histogram !== undefined,
+  };
+}
+
+export function finishRollup(
+  target: ReturnType<typeof makeAccumulator>,
+  day: string,
+  generatedAt: string,
+): AnalyticsRollup {
+  const retries = new Map<string, { failedThenRetried: number; retrySucceeded: number }>();
+  for (const attempts of target.retries.values()) {
+    // Detached emission and overlapping calls can arrive out of order, including across segments.
+    const ordered = attempts.toSorted((a, b) => a.ts.localeCompare(b.ts));
+    for (let index = 1; index < ordered.length; index++) {
+      const previous = ordered[index - 1]!;
+      if (previous.ok) continue;
+      const count = retries.get(previous.group) ?? { failedThenRetried: 0, retrySucceeded: 0 };
+      count.failedThenRetried++;
+      if (ordered[index]!.ok) count.retrySucceeded++;
+      retries.set(previous.group, count);
+    }
+  }
+  return {
+    day,
+    generatedAt,
+    scope: "retained-events",
+    total: target.total,
+    invalidLines: target.invalidLines,
+    kindCounts: Object.fromEntries(target.kinds),
+    errorCounts: Object.fromEntries(target.errors),
+    topSlowRpcs: [...target.rpcs]
+      .map(([method, values]) => ({ method, ...summarize(values) }))
+      .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
+      .slice(0, 20),
+    askAnswerLatency: summarize(target.answers),
+    tickPhases: [...target.tickPhases.values()]
+      .map((group) => ({
+        boardId: group.boardId,
+        phase: group.phase,
+        ...summarize(group.durations),
+      }))
+      .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.phase.localeCompare(b.phase)),
+    mcpCalls: [...target.mcp]
+      .map(([key, group]) => ({
+        tool: group.tool,
+        hour: group.hour,
+        build: group.build,
+        bootId: group.bootId,
+        ...summarize(group.durations),
+        failures: group.failures,
+        failureRate: group.failures / group.durations.count,
+        outcomes: Object.fromEntries(group.outcomes),
+        savedCounts: Object.fromEntries(group.savedCounts),
+        errors: [...group.errors.values()],
+        ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
+      }))
+      .sort(
+        (a, b) =>
+          a.hour.localeCompare(b.hour) ||
+          a.tool.localeCompare(b.tool) ||
+          a.build.localeCompare(b.build) ||
+          a.bootId.localeCompare(b.bootId),
+      ),
+    mcpOverflow: { ...target.mcpOverflow },
+  };
+}
+
+// A damaged file without newlines must not grow the reader's pending string indefinitely.
+export function boundedLines(maxLength: number) {
+  let pending = "";
+  let oversized = false;
+  return {
+    push(chunk: string): ReadonlyArray<string | null> {
+      const lines: Array<string | null> = [];
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf("\n", start);
+        const end = newline === -1 ? chunk.length : newline;
+        if (!oversized) {
+          if (pending.length + end - start > maxLength) {
+            pending = "";
+            oversized = true;
+          } else pending += chunk.slice(start, end);
+        }
+        if (newline === -1) break;
+        lines.push(oversized ? null : pending);
+        pending = "";
+        oversized = false;
+        start = newline + 1;
+      }
+      return lines;
+    },
+    finish(): ReadonlyArray<string | null> {
+      return oversized ? [null] : pending.length === 0 ? [] : [pending];
+    },
+  };
+}

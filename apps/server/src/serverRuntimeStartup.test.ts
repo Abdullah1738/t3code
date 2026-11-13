@@ -113,6 +113,7 @@ it.effect.each([
           baseDir: "/bootstrap-project",
           logLevel: "Error",
           traceMinLevel: "Info",
+          traceFileMinDurationMs: 2,
           traceTimingEnabled: false,
           traceBatchWindowMs: 200,
           traceMaxBytes: 1024,

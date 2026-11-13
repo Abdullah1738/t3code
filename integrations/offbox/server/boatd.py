@@ -58,6 +58,11 @@ CMDS = VAR / "cmds"
 DB_PATH = VAR / "boatd.db"
 CG_ROOT = Path("/sys/fs/cgroup")
 SELF = Path(__file__).resolve()
+_mgmt_config = SELF.with_name("offbox_mgmt_sshd_config")
+if not _mgmt_config.is_file():
+    _mgmt_config = SELF.parents[1] / "skill/templates/home/offbox_mgmt_sshd_config"
+# Use the image's actual configuration, including when installed separately on the host.
+MGMT_PORT = int(next(line.split()[1] for line in _mgmt_config.read_text().splitlines() if line.startswith("Port ")))
 VERSION = "2.0"
 STARTED = time.time()
 
@@ -169,6 +174,8 @@ def _cols(con, table: str) -> set:
 def migrate(con) -> None:
     """Idempotent: owner columns, per-owner saved states, run attempts, hashed tokens."""
     con.executescript(SCHEMA_V2)
+    if "mgmt_ssh_port" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
     owner = CFG.get("default_owner") or "ardud"
     if "owner" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN owner TEXT")
@@ -455,10 +462,12 @@ def new_box_id(con) -> str:
 
 
 def next_ssh_port(con) -> int:
-    used = {r[0] for r in con.execute("SELECT ssh_port FROM boxes WHERE deleted_at IS NULL AND ssh_port IS NOT NULL")}
+    used = {p for r in con.execute("SELECT ssh_port, mgmt_ssh_port FROM boxes WHERE deleted_at IS NULL") for p in r if p}
     p = CFG["ssh_port_base"]
     while p in used:
         p += 1
+    if p > 65535:
+        raise Fail(503, "ssh_ports_exhausted", "no free SSH proxy port")
     return p
 
 
@@ -528,6 +537,28 @@ def _ensure_proxy(box_id: str, port: int) -> None:
               "connect=tcp:127.0.0.1:22", "bind=host", timeout=30)
 
 
+def _ensure_mgmt_proxy(con, box_id: str) -> int:
+    # Old boxes get a second proxy on demand; their stock SSH endpoint is never repointed.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        port = box_row(con, box_id)["mgmt_ssh_port"]
+        if port is None:
+            port = next_ssh_port(con)
+            con.execute("UPDATE boxes SET mgmt_ssh_port=? WHERE id=?", (port, box_id))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    devs = incus("config", "device", "list", ct(box_id), timeout=30).stdout.decode().split()
+    if "offbox-mgmt-ssh" in devs:
+        incus("config", "device", "set", ct(box_id), "offbox-mgmt-ssh",
+              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", timeout=30)
+    else:
+        incus("config", "device", "add", ct(box_id), "offbox-mgmt-ssh", "proxy",
+              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", "bind=host", timeout=30)
+    return port
+
+
 def _fresh_identity(box_id: str) -> None:
     """A copied box gets its own ssh host keys and hostname, and drops the source's authorized key list.
     The base image ships without host keys, so on a box's first boot sshd fails until systemd's start limit
@@ -538,13 +569,17 @@ def _fresh_identity(box_id: str) -> None:
                     "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; "
                     "systemctl is-active -q ssh.socket ssh.service sshd.service || systemctl start ssh.socket 2>/dev/null || true",
             timeout=60)
+    ct_exec(box_id, "if test -f /etc/ssh/offbox_mgmt_sshd_config; then "
+                    "systemctl reset-failed offbox-mgmt-ssh.service; systemctl restart offbox-mgmt-ssh.service; fi",
+            timeout=60)
 
 
 def _wait_boot(box_id: str, timeout: float = 120, ssh: bool = True) -> None:
-    """Wait for systemd inside the box to finish booting, then (ssh=True) for sshd on port 22."""
+    """Wait for systemd and management SSH; older images still use stock port 22."""
     end = now() + timeout
     probe = ("s=$(systemctl is-system-running 2>/dev/null); case $s in running|degraded) echo BOOTED;; esac; "
-             "ss -Hltn 'sport = :22' | grep -q . && echo SSHUP")
+             f"p=22; test ! -f /etc/ssh/offbox_mgmt_sshd_config || p={MGMT_PORT}; "
+             "ss -Hltn \"sport = :$p\" | grep -q . && echo SSHUP")
     while now() < end:
         out = ct_exec(box_id, probe, timeout=20, check=False).stdout.decode()
         if "BOOTED" in out and (not ssh or "SSHUP" in out):
@@ -568,6 +603,7 @@ def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
         apply_size(box_id, t)
         r = box_row(con, box_id)
         _ensure_proxy(box_id, r["ssh_port"])
+        _ensure_mgmt_proxy(con, box_id)
         incus("start", name, timeout=300)
         _wait_boot(box_id, ssh=False)
         _fresh_identity(box_id)
@@ -694,6 +730,7 @@ def resume_box(con, box_id: str, body: dict) -> None:
         try:
             apply_size(box_id, box_row(c2, box_id)["type"])
             _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
+            _ensure_mgmt_proxy(c2, box_id)
             if not ct_running(box_id):
                 incus("start", ct(box_id), timeout=300)
             _wait_boot(box_id)
@@ -1198,6 +1235,7 @@ def start_container(box_id: str) -> str | None:
         if not ct_running(box_id):
             apply_size(box_id, r["type"])
             _ensure_proxy(box_id, r["ssh_port"])
+            _ensure_mgmt_proxy(c2, box_id)
             incus("start", ct(box_id), timeout=300)
         _wait_boot(box_id)
         set_box(c2, box_id, state="ready", last_active=now(), error=None)
@@ -1341,7 +1379,7 @@ def snap_rotate(con, kind: str) -> dict:
 # ---------------------------------------------------------------- reaper + sampler
 
 def ssh_sessions(box_id: str) -> int:
-    """Established TCP connections on the box's port 22 (offbox tunnels and ssh keep a box warm, like boat)."""
+    """Guest and management SSH sessions keep a box warm, including offbox tunnels."""
     st = ct_state(box_id)
     p = st.get("pid")
     n = 0
@@ -1349,7 +1387,7 @@ def ssh_sessions(box_id: str) -> int:
         try:
             for line in Path(f"/proc/{p}/net/{f}").read_text().splitlines()[1:]:
                 parts = line.split()
-                if parts[1].endswith(":0016") and parts[3] == "01":
+                if parts[1].rsplit(":", 1)[-1] in ("0016", f"{MGMT_PORT:04X}") and parts[3] == "01":
                     n += 1
         except (OSError, IndexError):
             pass
@@ -1718,9 +1756,10 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     f.seek(off)
                     data = f.read(1 << 20)
+                    size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
-                return {"ok": True, "data": data, "nextOffset": nxt,
-                        "done": r["status"] not in ("queued", "running") and nxt >= p.stat().st_size}
+                return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
+                        "done": r["status"] not in ("queued", "running") and nxt >= size}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
         raise Fail(404, "not_found", path)
 
@@ -1766,8 +1805,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(hk) < 2:
             raise Fail(503, "ssh_host_key_unavailable", "no host key yet")
         set_box(con, bid, last_active=now())
+        mgmt_port = _ensure_mgmt_proxy(con, bid)
         return {"ok": True, "sshEndpoint": f"{CFG['ssh_host']}:{r['ssh_port']}", "hostKey": f"{hk[0]} {hk[1]}",
-                "sshUser": "user"}
+                "sshUser": "user", "managementSshEndpoint": f"{CFG['ssh_host']}:{mgmt_port}"}
 
     def _commands(self, con, method: str, bid: str, rest: list[str], q: dict):
         if not rest and method == "POST":

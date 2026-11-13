@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from unittest.mock import patch
 from offbox_lib import runs
 from offbox_lib.runs import GO_REPAIR, remote_script
@@ -26,7 +27,7 @@ class RepairFixture:
         self.toolchain(self.root)
         self.script = GO_REPAIR.replace('/usr/local', str(self.local)).replace(
             '/tmp/offbox-go-repair.lock', str(self.home / 'repair.lock')) + '\necho USER_COMMAND\n'
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin',
+        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin',
                         FAKE_GOROOT=str(self.root), CALLS=str(self.calls), FIXTURE=str(self.home))
         self.tool('go', '#!/bin/bash\nexec "$FAKE_GOROOT/bin/go" "$@"\n')
         self.tool('sudo', '#!/bin/bash\nshift; exec "$@"\n')
@@ -425,7 +426,7 @@ class GoRepairTests(unittest.TestCase):
             sudo.chmod(0o755)
             (home / 'w').mkdir()
             (home / 'w/go.mod').write_text('module repair-fixture\n')
-            env = dict(os.environ, HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
+            env = clean_env(HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
             with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
                     patch.object(runs.userns, 'setup', return_value=':'):
                 script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test', repo_root=home / 'w')

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import cli, lease, misc, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
@@ -822,7 +823,7 @@ class MissingDepsTests(unittest.TestCase):
                     with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                             patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                         script = runs.remote_script('w/repo', 'sub', [f'node -e \"process.exit({code})\"; cd /; exit {code}'], None, 'r', repo_root=root)
-                    p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                    p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                        capture_output=True, text=True, timeout=10)
                     self.assertEqual(p.returncode, code)
                     self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER),
@@ -836,7 +837,7 @@ class MissingDepsTests(unittest.TestCase):
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['node -e \"process.exit(127)\"', 'true'], repo_root=root)
-            p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+            p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                capture_output=True, text=True, timeout=10)
             self.assertEqual(p.returncode, 127)
             self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 1)

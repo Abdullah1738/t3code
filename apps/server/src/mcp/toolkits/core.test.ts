@@ -1,3 +1,4 @@
+import { AnalyticsToolkit } from "./analytics/tools.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -96,6 +97,7 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
 it("publishes unique tool names with reference-free object-root inputs", () => {
   const names = new Set<string>();
   for (const toolkit of [
+    AnalyticsToolkit,
     OrchestratorToolkit,
     PreviewToolkit,
     WorktreeToolkit,
@@ -315,6 +317,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
               } as OrchestrationV2ThreadShell),
             getThreadShell: () =>
               Effect.succeed({
@@ -323,6 +326,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
               } as OrchestrationV2ThreadShell),
             // No run in the projection, so the tool result alone carries the page.
             getThreadRecords: () => Effect.succeed({ runs: [] } as never),
@@ -403,6 +407,7 @@ it.effect("records the calling agent and the agent a tool acted on", () => {
       archivedAt: null,
       deletedAt: null,
       activeRunId: "mcp-core-run",
+      forkedFrom: null,
       createdBy: "agent",
       creationSource: "mcp",
       lineage: {

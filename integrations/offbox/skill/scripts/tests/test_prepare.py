@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_capacity import Isolated
+from tests._env import clean_env
 from test_exit_and_queue import FakeClock
 from offbox_lib import api, cli, common, home, lease, pool, prepare, runs
 
@@ -345,7 +346,7 @@ with patch.object(bases, 'recipe', return_value=('true', 'sha')), \\
         print('bounded cleanup')
 '''
         result = subprocess.run([sys.executable, '-c', code], cwd=Path(__file__).resolve().parents[1],
-                                env=dict(os.environ, OFFBOX_PREPARE_DEADLINE_SECONDS='1'),
+                                env=clean_env(OFFBOX_PREPARE_DEADLINE_SECONDS='1'),
                                 capture_output=True, text=True, timeout=4)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('bounded cleanup', result.stdout)

@@ -3,6 +3,7 @@ import * as Crypto from "effect/Crypto";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as RpcClient from "effect/rpc/RpcClient";
+import { recordAnalytics } from "./analytics.ts";
 
 export type ActionPhase =
   | "board-painted"
@@ -23,6 +24,7 @@ export interface Action {
   id: string;
   name: string;
   started: number;
+  environmentId?: string;
 }
 export const ACTION_HEADER = "x-robob-action-id";
 let sink: ((mark: ActionMark) => void) | undefined;
@@ -32,13 +34,28 @@ export const setActionTelemetrySink = (next?: (mark: ActionMark) => void) => {
 };
 let sequence = 0;
 const namespace = Math.random().toString(36).slice(2);
-export function startAction(name: string, id = `action-${namespace}-${++sequence}`): Action {
-  const action = { id, name, started: performance.now() };
+export function startAction(
+  name: string,
+  id = `action-${namespace}-${++sequence}`,
+  environmentId?: string,
+): Action {
+  const action: Action = {
+    id,
+    name,
+    started: performance.now(),
+    ...(environmentId ? { environmentId } : {}),
+  };
   markAction(action, "send");
   return action;
 }
 export function markAction(action: Action, phase: ActionPhase) {
   try {
+    if (action.name !== "analytics.ingest" && phase !== "send" && phase !== "state-ready") {
+      recordAnalytics(action.environmentId, "performance.action", {
+        durationMs: performance.now() - action.started,
+        props: { method: action.name, phase },
+      });
+    }
     sink?.({
       actionId: action.id,
       action: action.name,
@@ -62,15 +79,15 @@ export function withAction<A, E, R>(effect: Effect.Effect<A, E, R>, action: Acti
   );
 }
 
-export const allocateAction = (name: string) =>
-  Effect.gen(function* () {
-    const crypto = yield* Effect.serviceOption(Crypto.Crypto);
-    const id =
-      crypto._tag === "Some"
-        ? yield* crypto.value.randomUUIDv4().pipe(Effect.orElseSucceed(() => undefined))
-        : undefined;
-    return startAction(name, id);
-  });
+// Action allocation is a hot path; the request already owns the tracing span.
+export const allocateAction = Effect.fnUntraced(function* (name: string, environmentId?: string) {
+  const crypto = yield* Effect.serviceOption(Crypto.Crypto);
+  const id =
+    crypto._tag === "Some"
+      ? yield* crypto.value.randomUUIDv4().pipe(Effect.orElseSucceed(() => undefined))
+      : undefined;
+  return startAction(name, id, environmentId);
+});
 
 // Hosts call this after their render commit; mobile supplies its frame scheduler.
 // Weak keys keep telemetry from retaining snapshots or message payloads.
@@ -91,11 +108,13 @@ export function paintActionValue(
   schedule: (callback: () => void) => () => void,
 ): () => void {
   const action = actionForValue(value);
-  return action ? schedule(() => {
-    const phases = completedPaints.get(action) ?? new Set<ActionPhase>();
-    if (phases.has(phase)) return;
-    phases.add(phase);
-    completedPaints.set(action, phases);
-    markAction(action, phase);
-  }) : () => {};
+  return action
+    ? schedule(() => {
+        const phases = completedPaints.get(action) ?? new Set<ActionPhase>();
+        if (phases.has(phase)) return;
+        phases.add(phase);
+        completedPaints.set(action, phases);
+        markAction(action, phase);
+      })
+    : () => {};
 }

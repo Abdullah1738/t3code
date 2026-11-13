@@ -317,7 +317,7 @@ describe("local file payloads (temporary fixtures only)", () => {
         if (outcome === "invalid-ack") { status = 200; reply = { id: "PRIVATE_ID", created: true }; }
         if (outcome === "control-ack") { status = 200; reply = { id: id + "\n", created: true }; }
         const child = Bun.spawn([process.execPath, "run", cli, "send-file", `--file=${path}`, "--key=k", "--session=s", "--text=Caption"], {
-          env: { HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+          env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
         });
         const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         expect(exitCode).toBe(outcome === "accepted" ? 0 : 1);
@@ -347,7 +347,7 @@ describe("CLI entry point (no live socket)", () => {
     { args: ["health"], socket: `${cli}/missing-private-socket`, error: "Bridge socket is unavailable" },
   ] as { args: string[]; socket: string; error: string }[])("emits only sanitized JSON for %j", async ({ args, socket, error }) => {
     const child = Bun.spawn([process.execPath, "run", cli, ...args], {
-      env: { SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+      env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
     });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,

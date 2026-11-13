@@ -4,8 +4,10 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 export const CAP_BYTES = 50 * 1024 * 1024;
+export const HOOKS_CAP_BYTES = 35 * 1024 * 1024;
+export const HOOK_SAMPLE_RATE = 128;
 const label = /^[A-Za-z0-9_.:-]{1,120}$/;
-const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource']);
+const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource','sampleRate']);
 const idFields = new Set(['sessionId','threadId','cardNumber','serverId','home','sampleId']);
 const words = new Set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split(' '));
 export function commandProps(command?: unknown) {
@@ -19,6 +21,18 @@ export function commandProps(command?: unknown) {
     ['go','cargo','rustc','make'].includes(firstWord) ? 'build' :
     ['git','docker','offbox','sqlite3'].includes(firstWord) ? firstWord : 'other';
   return {firstWord, argv0Class, commandLength: command.length};
+}
+export function hookProps(props: Record<string, unknown>, error = false) {
+  const result = {...props};
+  if (error || !['allowed', 'rewritten'].includes(String(props.decision))) return result;
+  const defaults: Record<string, unknown[]> = {argv0Class:['none',''], matchedRoot:['none',''],
+    repeatCount:[0,1], firstWord:[''], commandLength:[0], cwdClass:['other','']};
+  for (const [key, values] of Object.entries(defaults)) {
+    if (result[key] == null || values.includes(result[key])) delete result[key];
+  }
+  // Independent sampling also works for one-shot native hook processes.
+  result.sampleRate = HOOK_SAMPLE_RATE;
+  return result;
 }
 const cwdCache = new Map<string, string>();
 export function cwdClass(cwd?: unknown) {
@@ -98,7 +112,7 @@ export function emit(component: string, kind: 'event' | 'perf' | 'error', name: 
     if (claim(join(dir, '.retained-' + day))) {
       const cutoff = new Date(now.getTime() - 30 * 86400_000).toISOString().slice(0, 10);
       for (const file of readdirSync(dir)) {
-        const date = /^(?:rollup-|\.retained-|\.cap-|\.repeat-)?(\d{4}-\d{2}-\d{2})(?:-[a-f0-9]{32})?(?:\.ndjson|\.json|\.bin)?$/.exec(file);
+        const date = /^(?:rollup-|\.retained-|\.cap-(?:hooks-)?|\.repeat-)?(\d{4}-\d{2}-\d{2})(?:-[a-f0-9]{32})?(?:\.ndjson|\.json|\.bin)?$/.exec(file);
         if (date && date[1] < cutoff) { try { unlinkSync(join(dir, file)); } catch {} }
       }
     }
@@ -111,10 +125,19 @@ export function emit(component: string, kind: 'event' | 'perf' | 'error', name: 
     if (options.errorTag) { const tag = label.test(options.errorTag) ? options.errorTag : 'other'; row.error = {tag, message: tag}; }
     const path = join(dir, day + '.ndjson');
     const append = (record: unknown) => { appendFileSync(path, JSON.stringify(record) + '\n', {mode: 0o600}); chmodSync(path, 0o600); };
-    if (existsSync(path) && statSync(path).size >= CAP_BYTES) {
-      if (claim(join(dir, '.cap-' + day))) append({ts: row.ts, tool: board, component, kind: 'error', name: 'log.cap', ok: false, error: {tag:'log.cap', message:'Daily log cap reached'}});
-      if (kind !== 'error') return;
+    let size = 0;
+    try { size = statSync(path).size; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    const caps: [string, number, string][] = [['all', CAP_BYTES, '.cap-']];
+    if (component === 'hooks') caps.push(['hooks', HOOKS_CAP_BYTES, '.cap-hooks-']);
+    for (const [scope, cap, prefix] of caps) {
+      if (size >= cap && claim(join(dir, prefix + day))) append({ts: row.ts, tool: board, component,
+        kind: 'error', name: 'log.cap', ok: false, props: {component:scope, capBytes:cap},
+        error: {tag:'log.cap', message:'Daily log cap reached'}});
     }
+    if (kind !== 'error' && (size >= CAP_BYTES || component === 'hooks' && size >= HOOKS_CAP_BYTES)) return;
+    const rate = options.props?.sampleRate;
+    if (kind !== 'error' && typeof rate === 'number' && Number.isSafeInteger(rate) && rate > 1 && Math.random() >= 1 / rate) return;
     append(row);
   } catch {}
 }
@@ -123,9 +146,9 @@ export function hook(guard: string, decision: string, rule: string, started: num
     const identity = hookIds(ids), commandFields = commandProps(command);
     emit('hooks', decision === 'denied' || errorTag ? 'error' : 'perf', 'hook.decision', {
       durationMs: performance.now() - started, ok: decision !== 'denied' && !errorTag, ids:identity.ids,
-      props: {harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
+      props: hookProps({harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
         cwdClass:cwdClass(context.cwd), matchedRoot:matchedRoot(context.matchedRoot), argv0Class:'none',
-        repeatCount:repeatCount(identity.ids, guard, rule, commandFields.firstWord ?? 'none'), ...commandFields},
+        repeatCount:repeatCount(identity.ids, guard, rule, commandFields.firstWord ?? 'none'), ...commandFields}, decision === 'denied' || !!errorTag),
       errorTag: errorTag ?? (decision === 'denied' ? rule : undefined),
     });
   } catch {}

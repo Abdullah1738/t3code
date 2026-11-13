@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import capacity, prepare
+from . import common, capacity, prepare
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -426,6 +426,9 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
         data["ids"] = {"run": run_id, "box": row["box_id"]}
         data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
         data["props"]["size"] = row.get("size")
+        if data["props"]["leaseKind"] == "reused":
+            from . import lease
+            lease.report_reused_template(me, row, template)
         return row
 
 
@@ -1084,14 +1087,19 @@ def try_warm(me, size, source, exclude, run_id):
                         ready = ssh_sync.ssh(got['box_id'], 'true', timeout=min(10, left) if left is not None else 10)
                         if ready.returncode != 0:
                             return None
+                except common.SshHostKeyMismatch:
+                    raise
                 except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
                     return None
                 _claim(con, me, got, run_id)
                 claimed = True
+                lease.report_reused_template(me, got)
                 return got
             finally:
                 if not claimed:
                     release_guard(got)
+    except common.SshHostKeyMismatch:
+        raise
     except OffboxError:
         # A contended pool is optional here: keep the already-held cold box.
         return None
@@ -1124,6 +1132,8 @@ def _recheck_prune_holds(con, key) -> bool:
                 kv_set(con, check_key, now())
                 checks += 1
                 released = prune.recheck(con, bid, row['run_id'], deadline - time.monotonic()) or released
+        except common.SshHostKeyMismatch:
+            raise
         except OffboxError:
             pass
     return released

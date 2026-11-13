@@ -1,5 +1,5 @@
 import { toolError } from "./toollog.ts";
-import { IMESSAGE_ORIGIN, isDelegatedCompletionText, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -54,7 +54,7 @@ const runOrdinal = (runId: string) => Number(/:ordinal:(\d+)$/.exec(runId)?.[1] 
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
  * shape the router reads turns from: each run's user prompt, its assistant
  * steps, then an `idle` marker once the run has settled. User messages the
- * agent or server sent to itself are left out, except delegated completions:
+ * agent or server sent to itself are left out, except completion and native progress notices:
  * the router needs their boundaries when a completion races a sealed wake. The bridge's
  * own prompts stay in even when Robob did not record them as the owner's (a
  * relay it could not verify is attributed to the bridge, not to him).
@@ -80,10 +80,10 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
-        const completion = isDelegatedCompletionText(message.text);
-        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !completion) continue;
+        const notice = isCompletionNoticeText(message.text) || subagentNoticeState(message.text) !== undefined;
+        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !notice) continue;
         records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created },
-          ...(completion && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });
+          ...(notice && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });
         continue;
       }
       const done = settled || !message.streaming;
@@ -374,9 +374,10 @@ export class RobobBackend implements ChatBackend {
     return this.record(id, await this.detail(id));
   }
 
-  async children(id: string, _directory?: string): Promise<SessionRecord[]> {
+  async children(id: string, _directory?: string, complete = false): Promise<SessionRecord[]> {
     const threadId = await this.resolve(id);
-    const { threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
+    const { total, threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
+    if (complete && total > threads.length) throw new Error("Incomplete child discovery");
     return Promise.all(threads.filter(thread => thread.parentThreadId === threadId).map(thread => this.record(thread.threadId, thread, id)));
   }
 
@@ -627,12 +628,21 @@ export class RobobBackend implements ChatBackend {
    * `mode: "steer"` never queues: with no steerable run Robob answers 409 and
    * dispatches nothing. A retried POST replays under the same `clientRequestId`.
    */
-  async steer(id: string, _directory: string, messageId: string, text: string, guidance = ""): Promise<SteerDelivery> {
+  async steer(id: string, _directory: string, messageId: string, text: string, guidance = "", files: readonly FilePart[] = [], guard?: SteerGuard): Promise<SteerDelivery> {
+    if (guard?.signal.aborted) return "refused";
     const threadId = await this.resolve(id);
+    const attachments = [];
+    for (const [index, file] of files.entries()) {
+      if (guard?.signal.aborted) return "refused";
+      const { mimeType, bytes } = dataUrl(file.url);
+      attachments.push(await this.client.upload({ name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes }, guard?.signal));
+    }
+    if (guard && (guard.signal.aborted || !await guard.beforeSend() || guard.signal.aborted)) return "refused";
     try {
       const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
         text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
-      }, { timeoutMs: 60_000 });
+        ...(attachments.length ? { attachments } : {}),
+      }, { timeoutMs: 60_000, signal: guard?.signal });
       return delivery === "started" || delivery === "queued" ? delivery : "steered";
     } catch (error) { toolError("robob", "robob.catch8");
       if (error instanceof ControlError && error.status === 409) return "refused";
@@ -647,8 +657,9 @@ export class RobobBackend implements ChatBackend {
   }
 
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
-  async statuses(): Promise<Record<string, SessionStatus>> {
-    const { threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+  async statuses(complete = false): Promise<Record<string, SessionStatus>> {
+    const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+    if (complete && total > threads.length) throw new Error("Incomplete active family discovery");
     const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
     const statuses: Record<string, SessionStatus> = {};
     for (const thread of threads) {

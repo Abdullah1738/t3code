@@ -19,6 +19,7 @@ import {
 } from "../../state/runtime.ts";
 import type { Unsubscribe } from "../common/store.ts";
 import type { PermissionStatus } from "../../state/commandPermissions.ts";
+import { analyticsForEnvironment, type AnalyticsCollector } from "../analytics.ts";
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
 export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe | typeof KANBAN_WS_METHODS.boards;
@@ -32,6 +33,7 @@ export type KanbanStreamValue<TTag extends KanbanStreamTag> = WsRpcProtocolClien
   : never;
 
 export interface KanbanTransport {
+  readonly analytics?: () => AnalyticsCollector | undefined;
   /** Calls `onValue` for every item; follows reconnects, so a new snapshot follows a drop. */
   stream<TTag extends KanbanStreamTag>(
     tag: TTag,
@@ -92,7 +94,7 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
               ) => Stream.Stream<unknown, unknown>;
               return Stream.unwrap(
                 Effect.gen(function* () {
-                  const action = yield* allocateAction(tag);
+                  const action = yield* allocateAction(tag, supervisor.target.environmentId);
                   let ready = false;
                   return method(input, { headers: { "x-robob-action-id": action.id } }).pipe(
                     Stream.tap((value) =>
@@ -141,6 +143,7 @@ export function createAtomKanbanTransport<R, ER>(
   };
 
   return {
+    analytics: () => analyticsForEnvironment(registry.get(environmentId)),
     permissionStatus(tag) {
       const { permissionStatusAtom } = commandFor(tag);
       return Atom.make((get) => get(permissionStatusAtom(get(environmentId)))).pipe(

@@ -60,6 +60,248 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
 
+    def test_heredoc_delimiters_follow_shell_quote_removal(self):
+        rows = [
+            (r'\EOF', 'EOF', True),
+            (r'\"EOF\"', '"EOF"', True),
+            ('E"O"F', 'EOF', True),
+            ("'E'OF", 'EOF', True),
+            ('EOF', 'EOF', False),
+            ('"E\\OF"', r'E\OF', True),
+            ('"E\\$OF"', 'E$OF', True),
+            ('"E\\`OF"', 'E`OF', True),
+            ('"E\\\\OF"', r'E\OF', True),
+            ('"E\\\"OF"', 'E"OF', True),
+            ('E\\\nOF', 'EOF', False),
+            ('"E\\\nOF"', 'EOF', True),
+            ("''", '', True),
+        ]
+        for raw, delimiter, quoted in rows:
+            with self.subTest(raw=raw):
+                command = 'cat <<' + raw + '\nhi\n' + delimiter + '\n'
+                shell, bodies = guard._heredocs(command)
+                self.assertEqual(bodies, {'__guard_heredoc_0__': ('hi\n', quoted)})
+                self.assertIn('<< __guard_heredoc_0__', shell)
+                # Compare the delimiter with the shell without running fixture payloads.
+                result = subprocess.run(['/bin/bash', '--noprofile', '--norc'], input=command,
+                                        text=True, capture_output=True, check=True)
+                self.assertEqual((result.stdout, result.stderr), ('hi\n', ''))
+        self.assertEqual(guard._heredocs('cat <<-\\EOF\n\thi\n\tEOF\n')[1],
+                         {'__guard_heredoc_0__': ('hi\n', True)})
+        for raw in ['"EOF', "E'OF", 'E"OF']:
+            with self.subTest(raw=raw):
+                with self.assertRaises(guard.AmbiguousScript) as error:
+                    guard._heredocs('cat <<' + raw + '\n')
+                self.assertIn(repr(raw), str(error.exception))
+        with self.assertRaises(guard.AmbiguousScript):
+            guard._heredocs('cat <<\\EOF\nhi\nMISSING\n')
+        with self.assertRaises(guard.AmbiguousScript):
+            guard._heredocs('cat <<\\"EOF\\"\nhi\nEOF\n')
+
+    def test_wrapped_heredoc_reporters(self):
+        fixtures = Path(__file__).with_name('fixtures') / 'heredoc-delims'
+        for name in ['robob-1182-bash-c.sh', 'robob-639-offbox.sh']:
+            with self.subTest(reporter=name):
+                self.assertEqual(guard.classify_detail((fixtures / name).read_text(), str(self.root)),
+                                 (None, None))
+        minimal = "node --input-type=module <<'NODE'\nconsole.log(1)\nNODE\n"
+        self.assertEqual(guard.classify_detail('offbox run -- ' + shlex.quote(minimal), str(self.root)),
+                         (None, None))
+
+    def test_heredocs_unwrap_before_parsing_and_still_check_bodies(self):
+        wrappers = [
+            lambda payload: 'offbox run -- ' + shlex.quote(payload),
+            lambda payload: 'bash -c ' + shlex.quote(payload),
+            lambda payload: 'bash -c "' + payload.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`') + '"',
+            lambda payload: 'ssh box ' + shlex.quote(payload),
+            lambda payload: 'python3 /abs/offbox.py ssh box bash -c "' + payload.replace('"', '\\"') + '"',
+        ]
+        for wrapper in wrappers:
+            for raw in ['EOF', r'\EOF', 'E"O"F', "'E'OF"]:
+                with self.subTest(wrapper=wrapper, delimiter=raw):
+                    safe = 'bash <<' + raw + '\necho hi\nEOF\n'
+                    self.assertIsNone(self.classify(wrapper(safe)))
+                    self.assertEqual(self.classify(wrapper(safe.replace('echo hi', 'sqlite3 ' + LIVE))), READ)
+            for payload in ['bash <<"EOF\necho hi\nEOF\n', 'bash <<EOF\necho hi\n']:
+                with self.subTest(wrapper=wrapper, payload=payload):
+                    self.assertEqual(self.classify(wrapper(payload)), UNRESOLVED)
+        self.table([
+            ('bash <<EOF\nsqlite3 ' + LIVE + '\nEOF\n', READ),
+            ('cat <<EOF\n$(sqlite3 ' + LIVE + ')\nEOF\n', READ),
+            ('cat <<E"O"F\n$(sqlite3 ' + LIVE + ')\nEOF\n', None),
+            ('cat <<E\\\nOF\n$(sqlite3 ' + LIVE + ')\nEOF\n', READ),
+            ('bash <<E"O"F\nsqlite3 ' + LIVE + '\nEOF\n', READ),
+            ("offbox run -- bash <<'EOF'\nsqlite3 " + LIVE + '\nEOF\n', READ),
+        ])
+
+    def test_stdin_argv_reporter_regressions(self):
+        for arg in ['"$results_dir"', '"$task_pr_dir/body.md"']:
+            command = "results_dir=$(mktemp -d)\npython3 -I - " + arg + " <<'PY'\nimport sys; print(sys.argv[1])\nPY\n"
+            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.assertIsNone(self.classify('bash -s "$x" <<\'SH\'\necho hi\nSH\n'))
+        self.assertEqual(self.classify('python3 -I - "$x" <<\'PY\'\nimport sqlite3; sqlite3.connect(' + repr(LIVE) + ')\nPY\n'), READ)
+
+    def test_remote_payloads_cannot_replace_caller_proofs(self):
+        wrappers = [
+            ('offbox', lambda text: 'offbox run -- ' + shlex.quote(text)),
+            ('offbox argv', lambda text: 'offbox run -- bash -c ' + shlex.quote(text)),
+            ('offbox stdin', lambda text: "offbox run -- bash <<'REMOTE'\n" + text + '\nREMOTE\n'),
+            ('ssh', lambda text: 'ssh box ' + shlex.quote(text)),
+            ('python ssh', lambda text: 'python3 /abs/offbox.py ssh box ' + shlex.quote(text)),
+            ('nested shell', lambda text: 'offbox run -- ' + shlex.quote('bash -c ' + shlex.quote(text))),
+        ]
+        for name, wrapper in wrappers:
+            for payload in ['cd /', "cat > tmp/live.py <<'EOF'\nprint(1)\nEOF\n",
+                            'S=tmp/t.py']:
+                with self.subTest(wrapper=name, payload=payload):
+                    self.assertEqual(self.classify('S=tmp/live.py; ' + wrapper(payload) + '; python3 "$S"'), SCRIPT)
+                    self.assertEqual(self.classify(wrapper(payload) + '; python3 tmp/live.py'), SCRIPT)
+                    self.assertIsNone(self.classify(wrapper(payload) + '; python3 tmp/t.py'))
+            self.assertEqual(self.classify(wrapper('python3 tmp/live.py')), SCRIPT)
+            self.assertEqual(self.classify("cat > tmp/p.py <<'EOF'\nopen(" + repr(LIVE) + ").read()\nEOF\n" + wrapper('python3 tmp/p.py')), SCRIPT)
+        self.assertEqual(self.classify("cat > tmp/p.py <<'EOF'\nprint(1)\nEOF\noffbox run -- 'echo hi' > tmp/p.py\npython3 tmp/p.py"), UNRESOLVED)
+        self.assertEqual(self.classify('offbox run -- cd /; python3 tmp/live.py'), SCRIPT)
+
+    def test_remote_argv_preserves_caller_expansion(self):
+        self.write('safe.py', 'print(1)')
+        self.write('with space/safe.py', 'print(1)')
+        self.write('safe__suffix__.py', 'print(1)')
+        rows = [
+            ('quoted reader', 'DB=' + LIVE, 'cat "$DB"', READ),
+            ('braced reader', 'DB=' + LIVE, 'cat "${DB}"', READ),
+            ('bare reader', 'DB=' + LIVE, 'cat $DB', READ),
+            ('reader suffix', 'D=/Users/x/.robob/userdata', 'cat "$D"/statev2.sqlite', READ),
+            ('conditional reader', 'DB=' + LIVE + '; if true; then DB=tmp/t.py; fi', 'cat "$DB"', READ),
+            ('quoted script', 'S=safe.py', 'python3 "$S"', None),
+            ('braced script', 'S=safe.py', 'python3 "${S}"', None),
+            ('bare script', 'S=safe.py', 'python3 $S', None),
+            ('script suffix', 'D=tmp', 'python3 "$D"/t.py', None),
+            ('live script', 'S=tmp/live.py', 'python3 "$S"', SCRIPT),
+            ('unknown script', '', 'python3 "$UNKNOWN"', UNRESOLVED),
+            ('conditional script', 'S=tmp/live.py; if true; then S=safe.py; fi', 'python3 "$S"', SCRIPT),
+            ('double-quoted prefix', 'S=tmp/li; Sve=tmp/t', 'python3 "$S"ve.py', SCRIPT),
+            ('single-quoted suffix', 'S=tmp/li; Sve=tmp/t', 'python3 $S\'ve.py\'', SCRIPT),
+            ('double-quoted suffix', 'S=tmp/li; Sve=tmp/t', 'python3 $S"ve.py"', SCRIPT),
+            ('escaped suffix', 'S=tmp/li; Sve=tmp/t', r'python3 $S\ve.py', SCRIPT),
+            ('home reader', '', 'cat "$HOME/.t3/userdata/statev2.sqlite"', READ),
+            ('braced home reader', '', 'cat "${HOME}/.t3/userdata/statev2.sqlite"', READ),
+            ('pwd live script', '', 'python3 "$PWD/tmp/live.py"', SCRIPT),
+            ('pwd safe script', '', 'python3 "${PWD}/safe.py"', None),
+        ]
+        for wrapper in ['offbox run -- ', 'ssh box ', 'python3 /abs/offbox.py ssh box ']:
+            for label, prefix, command, expected in rows:
+                with self.subTest(wrapper=wrapper, form=label):
+                    self.assertEqual(self.classify((prefix + '; ' if prefix else '') + wrapper + command), expected)
+        self.table([
+            ('S="with space/safe.py"; offbox run -- python3 "$S"', None),
+            ('S="cat ' + LIVE + '"; offbox run -- $S', UNRESOLVED),
+            ('S="tmp/live.py extra"; offbox run -- python3 ${S}', UNRESOLVED),
+            ('S="tmp/live.py extra"; offbox run -- python3 $S', UNRESOLVED),
+            ('S="with space/safe.py"; offbox run -- python3 "${S}"', None),
+            ('S=safe; offbox run -- python3 "$S"__suffix__.py', None),
+            ('S=tmp/t; python3 "$S"\'.py\'', None),
+            ('S=tmp/live; python3 "$S"\'.py\'', SCRIPT),
+            ('S=safe.py; offbox run -- python3 "$S"; python3 tmp/live.py', SCRIPT),
+            ('S=safe.py; offbox run -- bash -c \'S=tmp/live.py; python3 "$S"\'', SCRIPT),
+            ('S=tmp/live.py; offbox run -- bash -c \'S=safe.py; python3 "$S"\'', None),
+            ('S=tmp/live.py; offbox run -- \'S=safe.py; python3 "$S"\'', None),
+            ('S="python3 safe.py"; offbox run -- "$S"', None),
+            ('DB=' + LIVE + '; offbox run -- bash -c "echo \\$S; cat $DB"', READ),
+            ('DB=safe.py; offbox run -- bash -c "echo \\$S; python3 $DB"', None),
+            ('CODE=\'S=safe.py; python3 "$S"\'; offbox run -- "$CODE"', None),
+            ('results_dir=$(mktemp -d); offbox run -- python3 -I - "$results_dir" <<\'PY\'\nimport sys; print(sys.argv[1])\nPY\n', None),
+            ('offbox run -- python3 -I - "$(mktemp -d)" <<\'PY\'\nprint(1)\nPY\n', None),
+            ('results_dir=$(mktemp -d); offbox run -- python3 -I - "$results_dir" <<\'PY\'\nimport sqlite3; sqlite3.connect(' + repr(LIVE) + ')\nPY\n', READ),
+            ('DB=' + LIVE + '; offbox run -- cat \'$DB\' "$DB"', READ),
+            ('S=; offbox run -- $S python3 tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- ${S} python3 tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- python3 $S tmp/live.py', UNRESOLVED),
+            ('S=; offbox run -- "$S" python3 tmp/live.py', None),
+            ('S=; offbox run -- ""$S python3 tmp/live.py', None),
+            ('S=; offbox run -- python3 -I - "$S" <<\'PY\'\nprint(1)\nPY\n', None),
+        ])
+
+    def test_remote_argv_keeps_literal_dollar_segments(self):
+        self.write('$S', 'print(1)')
+        self.write('tmp/$S.py', 'print(1)')
+        for operand in ["'$S'", r'\$S', r'"\$S"']:
+            with self.subTest(operand=operand):
+                self.assertEqual(self.classify('S=tmp/live.py; offbox run -- python3 ' + operand), UNRESOLVED)
+        self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/\'$S.py\''), UNRESOLVED)
+        self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/"$S.py"'), SCRIPT)
+        self.assertIsNone(self.classify('S=tmp/live.py; offbox run -- cat \'$S\''))
+
+    def test_remote_declarations_keep_conservative_reader_bindings(self):
+        declarations = [
+            'export DB=' + LIVE,
+            'readonly DB=' + LIVE,
+            'declare DB=' + LIVE,
+            'typeset DB=' + LIVE,
+            'local DB=' + LIVE,
+            'export -x DB=' + LIVE,
+            'declare -x DB=' + LIVE,
+            'declare -r DB=' + LIVE,
+            'declare -- DB=' + LIVE,
+            'DB=' + LIVE + '; export DB',
+            'DB=' + LIVE + '; readonly DB',
+            'DB=' + LIVE + '; declare DB',
+            'DB=' + LIVE + '; export -p',
+            'DB=' + LIVE + '; readonly DB; declare X=unrelated',
+            'DB=' + LIVE + '; export DB; read DB',
+            'readonly DB=' + LIVE + '; DB=tmp/t.py',
+            'declare -r DB=' + LIVE + '; DB=tmp/t.py',
+        ]
+        for wrapper in ['offbox run -- ', 'ssh box ', 'python3 /abs/offbox.py ssh box ']:
+            for declaration in declarations:
+                for operand in ['"$DB"', '"${DB}"']:
+                    with self.subTest(wrapper=wrapper, declaration=declaration, operand=operand):
+                        self.assertEqual(self.classify(declaration + '; ' + wrapper + 'cat ' + operand), READ)
+            for root in ['/Users/x/.robob/userdata', str(Path.home() / '.t3/userdata')]:
+                with self.subTest(wrapper=wrapper, root=root):
+                    self.assertEqual(self.classify('export D=' + shlex.quote(root) + '; ' + wrapper + 'cat "$D/statev2.sqlite"'), READ)
+                    self.assertEqual(self.classify('export D=' + shlex.quote(root) + '; DB="$D/statev2.sqlite"; ' + wrapper + 'cat "$DB"'), READ)
+            alias = 'DB=' + LIVE + '; declare -n REF=DB; ' + wrapper + 'cat "$REF"'
+            self.assertIn(self.classify(alias), (READ, UNRESOLVED))
+        for declaration in ['export', 'readonly', 'declare', 'typeset', 'local']:
+            self.assertIsNone(self.classify(declaration + ' S=tmp/t.py; offbox run -- cat "$S"'))
+            self.assertEqual(self.classify(declaration + ' S=tmp/t.py; offbox run -- python3 "$S"'), UNRESOLVED)
+        prefix = 'export DB=' + LIVE + '; offbox run -- '
+        self.assertIsNone(self.classify(prefix + "cat '$DB'"))
+        self.assertIsNone(self.classify(prefix + shlex.quote('DB=tmp/t.py; cat "$DB"')))
+        self.assertEqual(self.classify('offbox run -- ' + shlex.quote('export DB=' + LIVE + '; cat "$DB"')), READ)
+        self.assertIsNone(self.classify('export DB=' + LIVE + '; CODE=\'REMOTE=tmp/t.py; cat "$REMOTE"\'; offbox run -- "$CODE"'))
+        self.assertIsNone(self.classify('export DB=' + LIVE + '; CODE=\'DB=tmp/t.py; cat "$DB"\'; offbox run -- "$CODE"'))
+        for assignment in ["S='$DB'", r'S=\$DB', r'S="\$DB"', "export S='$DB'"]:
+            with self.subTest(literal_assignment=assignment):
+                self.assertIsNone(self.classify('DB=' + LIVE + '; ' + assignment + '; offbox run -- cat "$S"'))
+        self.assertIsNone(self.classify('DB=' + LIVE + '; S=\'$DB\'; T="$S"; offbox run -- cat "$T"'))
+        self.assertEqual(self.classify('DB=' + LIVE + '; URI="file:$DB?\\$q"; offbox run -- sqlite3 "$URI" .tables'), READ)
+
+    def test_substitution_quotes_cannot_hide_later_documents(self):
+        prefixes = [
+            "echo \"`printf '\"'`\"",
+            "echo `printf '\"'`",
+            'echo "`printf "x"`"',
+            'echo "$(printf \'"\')"',
+            'echo "`printf \'x\'`"',
+        ]
+        for prefix in prefixes:
+            for interpreter, marker, body in [
+                ('python3 -', 'PY', 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')'),
+                ('bash -s', 'SH', 'sqlite3 ' + LIVE),
+            ]:
+                with self.subTest(prefix=prefix, interpreter=interpreter):
+                    command = prefix + '\n' + interpreter + " <<'" + marker + "'\n" + body + '\n' + marker + '\n'
+                    self.assertEqual(self.classify(command), READ)
+        self.assertEqual(self.classify('echo "`python3 - <<\'PY\'\nopen(' + repr(LIVE) + ').read()\nPY\n`"'), READ)
+
+    def test_unsupported_dollar_quotes_fail_closed_in_delimiters(self):
+        for raw in ["$'EOF'", '$"EOF"', "E$'OF'", 'E$"OF"', "$'E\\x4fF'"]:
+            with self.subTest(raw=raw):
+                with self.assertRaises(guard.AmbiguousScript):
+                    guard._heredocs('cat <<' + raw + '\nhi\nEOF\n')
+                self.assertEqual(self.classify('cat <<' + raw + '\nhi\nEOF\nsqlite3 ' + LIVE + '\n$EOF\n'), UNRESOLVED)
+
     def test_stdin_programs_keep_positional_arguments_out_of_script_resolution(self):
         rows = [
             ('python3 - "$X"', 'print(1)'),
@@ -460,6 +702,188 @@ class GuardTests(unittest.TestCase):
             self.write('tmp/fixture.sh', source)
             with self.subTest(source=source):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
+
+    def test_mktemp_fixture_plain_subpaths(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text()
+        path = 'tmp/fixture.sh'
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                    'offbox run --bg -- bash ' + path)
+        for directory in ('fixture-live/userdata', 'fixture', 'fixture_2/a.b-c_0/7'):
+            for database in ('statev2', 'statev2.sqlite', 'statev2.sqlite-wal',
+                             'statev2.sqlite-shm', 'statev2.sqlite-journal', 'statev2-wal'):
+                source = original.replace('/.robob/userdata/statev2.sqlite', '/' + directory + '/' + database)
+                self.write(path, source)
+                for command in commands:
+                    with self.subTest(directory=directory, database=database, command=command):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_mktemp_fixture_plain_subpath_near_misses(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite')
+        path = 'tmp/fixture.sh'
+        variants = [(assignment, original.replace('T=$(mktemp -d "$TOP/case.XXXXXX")', assignment))
+                    for assignment in ('T=tmp', 'T=$HOME', 'T="$ROBOB_HOME"')]
+        for suffix in ('../../.robob/userdata/statev2.sqlite', './fixture/statev2.sqlite',
+                       'fixture/../userdata/statev2.sqlite', '$X/statev2.sqlite',
+                       'fixture*/statev2.sqlite', 'fixture?/statev2.sqlite',
+                       'fixture[ab]/statev2.sqlite', r'fixt\ure/statev2.sqlite',
+                       'fixt"ure"/statev2.sqlite', "fixt'ure'/statev2.sqlite",
+                       'fixture/statev2.sqlite/../../real', 'fixture/statev2.sqlite$X',
+                       'fixture/statev2.sqlite*', 'fixture/statev2.sqlite.backup'):
+            variants.append((suffix, original.replace('fixture-live/userdata/statev2.sqlite', suffix)))
+        for statement in ('cat ~/.robob/userdata/statev2.sqlite',
+                          'cat "$HOME/.ro""bob/userdata/state""v2.sqlite"',
+                          'grep needle "$HOME/robob-""data/userdata/state""v2.sqlite"',
+                          'cat "$HOME/.local/share/open""code/open""code.db"',
+                          'sqlite3 "$HOME/.robob/userdata/statev2.sqlite"',
+                          'cat "$T/fixture-live/userdata/statev2.sqlite"'):
+            variants.append(('after-reset-lifetime:' + statement, original + '\n' + statement + '\n'))
+        live = '"$HOME/.ro""bob/userdata/state""v2.sqlite"'
+        for statement in ('cat "$(cat ' + live + ')"',
+                          'cat `cat ' + live + '`',
+                          'cat "${UNSET:-$(cat ' + live + ')}"',
+                          'cat "${UNSET:-$HOME/.ro""bob/userdata/state""v2.sqlite}"',
+                          'cat harmless#suffix ' + live,
+                          'cat harmless\\#suffix ' + live,
+                          'cat harmless\\ #suffix "$(cat ' + live + ')"'):
+            variants.append(('split-live-expression:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('X=\ncat "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X=\ngrep needle "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X="$HOME/.ro""bob"\ncat "${X}/userdata/state""v2.sqlite"',
+                          'cat "$(printf \'%b\' \'\\057Users\\057x\\057.ro\\142ob\\057userdata\\057statev2.sqli\\164e\')"',
+                          '"$PYTHON" -c \'import sys; open(sys.argv[1]).read()\' ' + live,
+                          'X=\n"$PYTHON" - "$HOME/.ro${X}bob/userdata/state""v2.sqlite" <<\'PY\'\nimport sys\nopen(sys.argv[1]).read()\nPY'):
+            variants.append(('unproved-reader:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('cat "$HOME/.ro""bob/userdata/state\\\nv2.sqlite"',
+                          'cat "$HOME/.ro""bob/userdata/"$\'statev2.sqli\\x74e\'',
+                          'cat "$HOME/.ro""bob/userdata/"$"statev2.sqlite"'):
+            variants.append(('bash-quoting:' + statement, original + '\n' + statement + '\n'))
+        for program in ('open("/Users/x/.ro" + "bob/userdata/state" + "v2.sqlite").read()',
+                        'open(b"/Users/x/.ro" + b"bob/userdata/state" + b"v2.sqlite").read()',
+                        'open(f"/Users/x/.{\"ro\"}{\"bob\"}/user{\"data\"}/state{\"v2\"}.sqli{\"te\"}").read()',
+                        'open("".join(["/Users/x/.", "ro", "bob/user", "data/state", "v2.sqli", "te"])).read()'):
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-built-target:' + statement, original + '\n' + statement + '\n'))
+        for update in ('p += segment', 'p = p + segment'):
+            program = ('p = ""\nfor segment in ["/Users/synthetic/.", "ro", "bob/user", "data/state", "v2.sqli", "te"]:\n'
+                       '    ' + update + '\nopen(p).read()')
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-accumulated-target:' + update, original + '\n' + statement + '\n'))
+            if update == 'p = p + segment':
+                statement = ('"$PYTHON" - "$HERE/src" <<\'PY\'\nimport sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+                variants.append(('manifest-string-accumulation', original + '\n' + statement + '\n'))
+                spoofed = ('for directory, p, segment in os.walk(sys.argv[2]):\n    pass\n' + program)
+                statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + spoofed + '\nPY')
+                variants.append(('manifest-list-binding-reassigned', original + '\n' + statement + '\n'))
+        for program in ('p = "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1]\nopen(p).read()',
+                        'p = sys.argv[2][::-1]\nopen(p).read()',
+                        'p = os.path.join(sys.argv[2], "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1])\nopen(p).read()',
+                        'p = json.loads(' + repr('"' + ''.join('\\u%04x' % ord(char) for char in '/Users/synthetic/.robob/userdata/statev2.sqlite') + '"') + ')\nopen(p).read()'):
+            statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys, json\nsys.path.insert(0, sys.argv[1])\n'
+                         'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+            variants.append(('manifest-unproved-read-target', original + '\n' + statement + '\n'))
+        for value in ('$HOME', '$T/restore$HOME/stage', '$T/restore$T/../../stage'):
+            variants.append(('snapshot-root:' + value, original.replace('SNAPROOT="$T/restore$T/stage"', 'SNAPROOT="' + value + '"')))
+        # A heredoc body run as a child script has no mktemp root: an empty $T
+        # turns a plain subpath into an absolute one.
+        for target in ('$T/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '${T}/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '$T/Users/synthetic/robob-data/userdata/statev2.sqlite-wal'):
+            body = '/bin/cat "' + target + '" > "$HOME/leak"\n'
+            variants.append(('heredoc-quoted-body:' + target, original.replace(
+                'echo "$$" > "$HOME/sync-pid"\n', 'echo "$$" > "$HOME/sync-pid"\n' + body, 1)))
+            variants.append(('heredoc-unquoted-body:' + target, original.replace(
+                '"$REAL_RSYNC" "\\$@" || exit \\$?\n', '"$REAL_RSYNC" "\\$@" || exit \\$?\n' + body.replace('$T', '\\$T'), 1)))
+            variants.append(('heredoc-tab-body:' + target, original + "\ncat > \"$R/bin/extra\" <<-'SH'\n\t#!/bin/bash\n\t" + body + "\tSH\n"))
+        # Discounting one root's main-shell words must not shift where the
+        # heredoc bodies are when another root's words are checked.
+        opener = 'cat > "$R/bin/sqlite3_rsync" <<\'SH\'\n#!/bin/bash\necho "$$" > "$HOME/sync-pid"\n'
+        for padding in ('echo "$TOP/fixture/statev2.sqlite" "$T/fixture/statev2.sqlite"\n',
+                        'echo "$T/fixture/statev2.sqlite" "$TOP/fixture/statev2.sqlite"\n',
+                        'echo "$TOP/fixture/statev2.sqlite"\n', 'echo "$T/fixture/statev2.sqlite"\n'):
+            for count in (1, 10, 100):
+                for reader in ('T', 'TOP'):
+                    body = '/bin/cat "$' + reader + '/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite" > "$HOME/leak"\n'
+                    variants.append(('heredoc-after-discounts:%s:%d:%s' % (padding.strip(), count, reader),
+                                     original.replace(opener, padding * count + opener + body, 1)))
+        variants.append(('before-setup', original.replace('# 1. sync', 'cat "$T/fixture-live/userdata/statev2.sqlite"\n# 1. sync')))
+        variants.append(('quote-concatenated-tail', original.replace(
+            '"$T/fixture-live/userdata/statev2.sqlite"', '"$T/fixture-live/userdata/statev2.sqlite"/../../real')))
+        variants.append(('string-built-home', original + "\n/opt/homebrew/bin/python3 - <<'PY'\nimport os\nroot = os.path.join(os.environ['HOME'], '.ro' + 'bob', 'userdata', 'statev2.sqlite')\nopen(root).read()\nPY\n"))
+        for label, source in variants:
+            self.assertNotEqual(source, original, label)
+            self.write(path, source)
+            for command in ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                            'offbox run --bg -- bash ' + path):
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, original)
+        for command in ('sed -i "s/mktemp/echo/g" ' + path + '; bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh offbox run --bg -- bash ' + path):
+            with self.subTest(command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+        # offbox can fall back to a local run, so its payload inherits the
+        # caller's startup bindings however they were set.
+        for wrapper in ('offbox run -- ', 'offbox run --bg -- ', 'offbox run --remote --no-fallback -- '):
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'ENV=/tmp/preload.sh ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'export BASH_ENV=/tmp/preload.sh; ', 'BASH_ENV=/tmp/preload.sh; export BASH_ENV; ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace '):
+                command = prefix + wrapper + 'bash ' + path
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+            with self.subTest(command=wrapper + 'bash ' + path):
+                self.assertIsNone(self.classify(wrapper + 'bash ' + path))
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+            self.assertEqual(self.classify('bash ' + path), SCRIPT)
+            self.assertEqual(self.classify('offbox run --bg -- bash ' + path), SCRIPT)
+        # The snapshot root repeats $T, so an inherited temp prefix with parent
+        # segments (or one the script reassigns) must void the fixture proof.
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path), 'offbox run --bg -- bash ' + path)
+        for prefix in ('relative/tmp', '/tmp/../..', '/tmp/x/../../Users'):
+            with patch.dict(os.environ, {'TMPDIR': prefix}):
+                for command in commands:
+                    with self.subTest(tmpdir=prefix, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, 'TMPDIR=/tmp/../..\n' + original)
+        for command in commands:
+            with self.subTest(case='script-assigns-tmpdir', command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_fixture_plain_subpath_straight_line(self):
+        for root in ('$T', '${T}'):
+            # Keep a live-root marker so both cases exercise the source fallback.
+            source = '# .robob\nT=$(mktemp -d)\ncat "' + root + '/fixture-live/userdata/statev2.sqlite"\n'
+            self.write('tmp/fixture.sh', source)
+            self.assertIsNone(self.classify('bash tmp/fixture.sh'))
+            self.write('tmp/fixture.sh', 'cat "' + root + '/fixture-live/userdata/statev2.sqlite"\n' + source)
+            self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
+            self.write('tmp/fixture.sh', source.replace('"' + root + '/fixture-live/userdata/statev2.sqlite"',
+                                                       "'" + root + "/fixture-live/userdata/statev2.sqlite'"))
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(root=root, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_fixture_quoted_traversal_tails(self):
+        rows = [('"', separator) for separator in (')', '(', ' ', '\t', '\n', '\r', '\v', '\f', ';', '&', '|', '<', '>')]
+        rows += [('', separator) for separator in ('\r', '\v', '\f', '\u00a0', '\u2028')]
+        for quote, separator in rows:
+            source = ('TOP=$(mktemp -d "${TMPDIR:-/tmp}/fixture.XXXXXX") || exit 1\n'
+                      'setup() {\n  T=$(mktemp -d "$TOP/case.XXXXXX")\n'
+                      '  mkdir -p "$T/.robob" ' + quote + '$T/fixture/statev2.sqlite' + separator + quote + '\n}\n'
+                      'setup fake\ncat ' + quote + '$T/fixture/statev2.sqlite' + separator + '/'
+                      + '../' * 32 + '$HOME/.ro""bob/userdata/state""v2.sqlite' + quote + '\n')
+            self.write('tmp/fixture.sh', source)
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(quote=quote, separator=separator, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
 
     def test_mktemp_fixture_tool_identity(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
