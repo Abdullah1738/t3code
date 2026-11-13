@@ -74,17 +74,28 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Missing optional database/WAL files are skipped. `crash.source` errors
-leave that source's cursor unchanged so the next run retries it. The filtered
-unified log query has a 60 s timeout and a one-hour maximum window. Both its
-source event/error and `crash.collect` record `windowStart` and `windowEnd`
-(Unix seconds), `windowS`, and `skippedS` (older time omitted by the cap).
-On failure, `unifiedRetry` retains the exact window until it succeeds; then
-the cursor advances to its end. Readable report sources advance independently.
-During a collector run, each report source gets its own share of a five-second
-enumeration budget before the unified query. A slow source does not expire
-the later sources' allowances. Command budgets leave ten seconds for state/log overhead
-within the five-minute run budget.
+Missing optional database/WAL files are skipped. The filtered unified-log query
+has a one-hour maximum window and a timeout of at most 60 s, shortened to the
+collector's remaining absolute budget. Its source event/error and
+`crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
+and `skippedS` (older time omitted by the cap). On failure, `unifiedRetry`
+retains the exact window until it succeeds; then the cursor advances to its end.
+
+Report sources have independent checkpoints. Each attempt allows up to 10 s per
+source, capped by the collector's absolute deadline. Directory enumeration,
+stat calls and the small IPS header read are interrupted at that deadline with
+a scoped Unix alarm. The alarm is cancelled before updating counts or marking
+a filename complete. A timeout emits a named `crash.source` error with
+`partial=true` when work has completed, while completed crash counts are still
+emitted. `<source>Pending` state holds the frozen start/end and completed
+filenames (metadata only); retries skip those filenames, retaining progress
+without counting them again. The source cursor advances to that window's end
+only after enumeration completes. Reports arriving after that end remain for
+the next window. Healthy sources continue independently.
+
+`collector.main` sets a 290 s absolute work deadline, leaving ten seconds for
+state/log overhead within five minutes. Report work, the log query and daily
+rollup share that deadline; no log command starts once the budget is exhausted.
 
 ## diskutil hangs
 
