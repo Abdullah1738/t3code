@@ -29054,3 +29054,166 @@ it.effect.each([true, false])(
       );
     }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect("slot ledger completes a committed card release despite pending cancellation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const committed = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let armed = false;
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) => ({
+        ...real,
+        putCard: (card: Parameters<typeof real.putCard>[0]) =>
+          real
+            .putCard(card)
+            .pipe(
+              Effect.andThen(
+                Effect.suspend(() =>
+                  armed && card.stage === "completed"
+                    ? Deferred.succeed(committed, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                      )
+                    : Effect.void,
+                ),
+              ),
+            ),
+      })),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      armed = true;
+      const writing = yield* Effect.forkChild(
+        kanban.moveCard(card.id, "completed", "owner", owner),
+      );
+      yield* Deferred.await(committed);
+      const cancel = yield* Effect.forkChild(Fiber.interrupt(writing));
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cancel);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "completed");
+      assert.deepStrictEqual(
+        (yield* slotRows(board.id)).map((row) => [row.kind, row.why]),
+        [
+          ["take", "start"],
+          ["release", "card_left"],
+        ],
+      );
+      yield* assertSlotReplay(board.id);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+  }),
+);
+
+it.effect.each(["bulk", "pinned", "rollback"] as const)(
+  "slot ledger follows selection migration %s transactions",
+  (mode) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* BoardsDatabase.client;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const model = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+        yield* kanban.setPool(board.id, model, 1);
+        const pools = yield* store.pools(board.id);
+        const moved = { ...card, model, activePool: Rules.poolKey(model) };
+        const write = (value: typeof card) =>
+          mode === "pinned"
+            ? store.putCard(value)
+            : store.migrateBoardSelections({
+                board,
+                pools,
+                oldPoolKeys: pools.map((pool) => pool.key),
+                cards: [value],
+                threadLinks: [],
+              });
+        const before = yield* slotRows(board.id);
+        if (mode === "rollback") {
+          yield* kanban
+            .withSelectionMigrationLock(
+              sql.withTransaction(write(moved).pipe(Effect.andThen(Effect.fail("rollback")))),
+            )
+            .pipe(Effect.ignore);
+          assert.deepStrictEqual(yield* slotRows(board.id), before);
+        } else {
+          yield* kanban.withSelectionMigrationLock(sql.withTransaction(write(moved)));
+          yield* assertSlotReplay(board.id);
+          yield* kanban.withSelectionMigrationLock(sql.withTransaction(write(card)));
+          assert.deepStrictEqual(
+            (yield* slotRows(board.id)).map((row) => [row.kind, row.poolKey, row.why]),
+            [
+              ["take", card.activePool, "start"],
+              ["release", card.activePool, "pool_moved"],
+              ["take", moved.activePool, "pool_moved"],
+              ["release", moved.activePool, "pool_moved"],
+              ["take", card.activePool, "pool_moved"],
+            ],
+          );
+        }
+        yield* assertSlotReplay(board.id);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("slot ledger completes a committed pool move despite pending cancellation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const committed = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let armed = false;
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          rekeyBoard: (...args) =>
+            real
+              .rekeyBoard(...args)
+              .pipe(
+                Effect.andThen(
+                  Effect.suspend(() =>
+                    armed
+                      ? Deferred.succeed(committed, undefined).pipe(
+                          Effect.andThen(Deferred.await(release)),
+                        )
+                      : Effect.void,
+                  ),
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const oldKey = Rules.poolKey(board.defaultCardModel);
+      const model = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
+      armed = true;
+      const writing = yield* Effect.forkChild(
+        kanban.setPool(board.id, model, undefined, { replaces: oldKey }),
+      );
+      yield* Deferred.await(committed);
+      const cancel = yield* Effect.forkChild(Fiber.interrupt(writing));
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cancel);
+      assert.strictEqual((yield* kanban.card(card.id)).card.activePool, Rules.poolKey(model));
+      assert.deepStrictEqual(
+        (yield* slotRows(board.id)).map((row) => [row.kind, row.poolKey, row.why]),
+        [
+          ["take", oldKey, "start"],
+          ["release", oldKey, "pool_moved"],
+          ["take", Rules.poolKey(model), "pool_moved"],
+        ],
+      );
+      yield* assertSlotReplay(board.id);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+  }),
+);

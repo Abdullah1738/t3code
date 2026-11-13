@@ -88,6 +88,12 @@ interface IdJsonRow extends JsonRow {
 export type NewCardEvent = Omit<KanbanCardEvent, "id">;
 export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
+// Scoped by the migration lock; the service reconciles only these threads after
+// the caller's outer transaction commits or rolls back.
+export const cardWrites = Context.Reference<
+  ((cards: ReadonlyArray<KanbanCard>) => void) | undefined
+>("KanbanCardWrites", { defaultValue: () => undefined });
+
 export type SlotEventWhy =
   | "start"
   | "join"
@@ -562,6 +568,8 @@ const make = Effect.gen(function* () {
     run(
       "write card",
       Effect.gen(function* () {
+        const observe = yield* cardWrites;
+        const previous = observe === undefined ? null : yield* card(value.id);
         const json = yield* Card.encode(value);
         yield* sql`
           INSERT INTO ardud_kanban_cards (id, board_id, number, stage, active_thread_id, json)
@@ -571,6 +579,7 @@ const make = Effect.gen(function* () {
             active_thread_id = excluded.active_thread_id,
             json = excluded.json
         `;
+        observe?.(previous === null ? [value] : [previous, value]);
       }),
     );
   const slotColumns = sql.literal(
@@ -735,12 +744,15 @@ const make = Effect.gen(function* () {
             if (survivingKeys.has(key)) continue;
             yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
           }
-          for (const card of input.cards) {
-            const json = yield* Card.encode(card);
+          const observe = yield* cardWrites;
+          for (const value of input.cards) {
+            const previous = observe === undefined ? null : yield* card(value.id);
+            const json = yield* Card.encode(value);
             yield* sql`
-              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
-              WHERE id = ${card.id}
+              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${value.activeThreadId}, stage = ${value.stage}
+              WHERE id = ${value.id}
             `;
+            observe?.(previous === null ? [value] : [previous, value]);
           }
           for (const link of input.threadLinks) {
             const json = yield* ThreadLink.encode(link);

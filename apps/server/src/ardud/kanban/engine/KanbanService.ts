@@ -90,6 +90,7 @@ import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import {
   actorKey,
+  cardWrites,
   KanbanStore,
   KanbanStoreError,
   type SlotEventWhy,
@@ -2157,7 +2158,7 @@ const make = Effect.gen(function* () {
       return next;
     });
     yield* syncSlot(held.boardId, threadId, why, cardId);
-  });
+  }, Effect.uninterruptible);
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
@@ -2500,23 +2501,25 @@ const make = Effect.gen(function* () {
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
         yield* SavedWrite.record({ kind: "card", card });
         if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
+
+        if (
+          slotWhy !== false &&
+          (previous?.activePool !== card.activePool ||
+            previous?.activeThreadId !== card.activeThreadId)
+        ) {
+          const why =
+            slotWhy ??
+            (previous?.activeThreadId === card.activeThreadId &&
+            previous?.activePool !== null &&
+            card.activePool !== null
+              ? "pool_moved"
+              : "card_left");
+          for (const threadId of new Set([previous?.activeThreadId, card.activeThreadId])) {
+            if (threadId != null) yield* syncSlot(card.boardId, threadId, why, card.id);
+          }
+        }
       }),
     );
-    if (
-      slotWhy !== false &&
-      (previous?.activePool !== card.activePool || previous?.activeThreadId !== card.activeThreadId)
-    ) {
-      const why =
-        slotWhy ??
-        (previous?.activeThreadId === card.activeThreadId &&
-        previous?.activePool !== null &&
-        card.activePool !== null
-          ? "pool_moved"
-          : "card_left");
-      for (const threadId of new Set([previous?.activeThreadId, card.activeThreadId])) {
-        if (threadId != null) yield* syncSlot(card.boardId, threadId, why, card.id);
-      }
-    }
     yield* SavedWrite.bestEffort(
       publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by }),
       undefined,
@@ -11561,36 +11564,49 @@ const make = Effect.gen(function* () {
         // Take the card's board permit before acquiring its SQLite writer.
         yield* cardOf(input.cardId);
         yield* refusePendingStop(input.threadId);
-        const restored = yield* boardSql.withTransaction(
-          Effect.gen(function* () {
-            const card = (yield* upgradeFindings([yield* cardOf(input.cardId)]))[0]!;
-            const board = yield* boardOf(card.boardId);
-            const plan = planCutoverCardRestore({
-              restore: input,
-              board,
-              card,
-              link: yield* store.threadLink(input.threadId),
-              threadCards: yield* store.threadCards(input.threadId),
-              cards: yield* store.cards(board.id),
-              pools: yield* store.pools(board.id),
-              holds: yield* boardHolds(board.id),
-              at: yield* nowIso,
-            });
-            if (!plan.ok) return yield* Effect.fail(plan.error);
-            if (!plan.changed) return null;
-            yield* store.putCard(plan.card);
-            yield* store.putThreadLink(plan.link);
-            yield* logEvent(plan.card, { _tag: "system", component: "harness-cutover" }, "thread", {
-              fromStage: card.stage,
-              toStage: plan.card.stage,
-              body: `Restored existing ${plan.link.role} thread after cutover`,
-            });
-            return plan.card;
-          }),
+        const restored = yield* Effect.uninterruptible(
+          boardSql
+            .withTransaction(
+              Effect.gen(function* () {
+                const card = (yield* upgradeFindings([yield* cardOf(input.cardId)]))[0]!;
+                const board = yield* boardOf(card.boardId);
+                const plan = planCutoverCardRestore({
+                  restore: input,
+                  board,
+                  card,
+                  link: yield* store.threadLink(input.threadId),
+                  threadCards: yield* store.threadCards(input.threadId),
+                  cards: yield* store.cards(board.id),
+                  pools: yield* store.pools(board.id),
+                  holds: yield* boardHolds(board.id),
+                  at: yield* nowIso,
+                });
+                if (!plan.ok) return yield* Effect.fail(plan.error);
+                if (!plan.changed) return null;
+                yield* store.putCard(plan.card);
+                yield* store.putThreadLink(plan.link);
+                yield* logEvent(
+                  plan.card,
+                  { _tag: "system", component: "harness-cutover" },
+                  "thread",
+                  {
+                    fromStage: card.stage,
+                    toStage: plan.card.stage,
+                    body: `Restored existing ${plan.link.role} thread after cutover`,
+                  },
+                );
+                return plan.card;
+              }),
+            )
+            .pipe(
+              Effect.tap((restored) =>
+                restored?.activeThreadId != null
+                  ? syncSlot(restored.boardId, restored.activeThreadId, "restore", restored.id)
+                  : Effect.void,
+              ),
+            ),
         );
         if (restored !== null) {
-          if (restored.activeThreadId !== null)
-            yield* syncSlot(restored.boardId, restored.activeThreadId, "restore", restored.id);
           yield* publish(restored.boardId, { _tag: "card", card: restored });
         }
       }),
@@ -13180,32 +13196,37 @@ const make = Effect.gen(function* () {
         work,
       });
     }
-    yield* store.rekeyBoard(
-      board.id,
-      [{ from: from.key, pool: to }],
-      moved.map((entry) => entry.card),
+    const movedThreads = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        yield* store.rekeyBoard(
+          board.id,
+          [{ from: from.key, pool: to }],
+          moved.map((entry) => entry.card),
+        );
+        const movedThreads = new Map<string, string | null>();
+        for (const { card } of moved) {
+          if (card.activeThreadId !== null) movedThreads.set(card.activeThreadId, card.id);
+        }
+        for (const [threadId, held] of yield* Ref.get(holds)) {
+          if (held.boardId === board.id && held.pool === from.key && !movedThreads.has(threadId))
+            movedThreads.set(threadId, null);
+        }
+        yield* Ref.update(
+          holds,
+          (all) =>
+            new Map(
+              [...all].map(([threadId, held]) =>
+                held.boardId === board.id && held.pool === from.key
+                  ? [threadId, { ...held, pool: to.key }]
+                  : [threadId, held],
+              ),
+            ),
+        );
+        for (const [threadId, cardId] of movedThreads)
+          yield* syncSlot(board.id, threadId, "pool_moved", cardId);
+        return movedThreads;
+      }),
     );
-    const movedThreads = new Map<string, string | null>();
-    for (const { card } of moved) {
-      if (card.activeThreadId !== null) movedThreads.set(card.activeThreadId, card.id);
-    }
-    for (const [threadId, held] of yield* Ref.get(holds)) {
-      if (held.boardId === board.id && held.pool === from.key && !movedThreads.has(threadId))
-        movedThreads.set(threadId, null);
-    }
-    yield* Ref.update(
-      holds,
-      (all) =>
-        new Map(
-          [...all].map(([threadId, held]) =>
-            held.boardId === board.id && held.pool === from.key
-              ? [threadId, { ...held, pool: to.key }]
-              : [threadId, held],
-          ),
-        ),
-    );
-    for (const [threadId, cardId] of movedThreads)
-      yield* syncSlot(board.id, threadId, "pool_moved", cardId);
     const actor: KanbanActor = { _tag: "system", component: "pools" };
     const level = Rules.modelLevel(to.model) ?? "default";
     const switched = new Set<string>();
@@ -14174,9 +14195,33 @@ const make = Effect.gen(function* () {
     withSelectionMigrationLock: (effect) =>
       Deferred.await(startupReady).pipe(
         Effect.andThen(
-          locks
-            .exclusive(effect)
-            .pipe(Effect.provideService(BoardLocks.operationName, "selectionMigration")),
+          Effect.suspend(() => {
+            const changed = new Map<string, Map<string, string>>();
+            // Migrations may nest transactions. Collect writes inside, then read the
+            // committed result (or rollback) before giving up the exclusive permit.
+            return locks
+              .exclusive(
+                effect.pipe(
+                  Effect.provideService(cardWrites, (cards) => {
+                    for (const card of cards) {
+                      if (card.activeThreadId === null) continue;
+                      const threads = changed.get(card.boardId) ?? new Map<string, string>();
+                      threads.set(card.activeThreadId, card.id);
+                      changed.set(card.boardId, threads);
+                    }
+                  }),
+                  Effect.ensuring(
+                    Effect.gen(function* () {
+                      for (const [boardId, threads] of changed) {
+                        for (const [threadId, cardId] of threads)
+                          yield* syncSlot(boardId, threadId, "pool_moved", cardId);
+                      }
+                    }),
+                  ),
+                ),
+              )
+              .pipe(Effect.provideService(BoardLocks.operationName, "selectionMigration"));
+          }),
         ),
       ),
     ensureBoard,
