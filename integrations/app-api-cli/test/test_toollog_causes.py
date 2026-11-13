@@ -1,5 +1,6 @@
 """Diagnostics fixtures never use credentials, network, or the real log directory."""
 import datetime as dt
+import contextlib
 import io
 import json
 import os
@@ -87,6 +88,106 @@ class CauseLogs(unittest.TestCase):
         for value in secrets:
             self.assertNotIn(value, self.lines())
 
+    def test_noon_200_schema_failures_keep_request_metadata_and_safe_reason(self):
+        import noon_order_details as details
+        import noon_vertical_reads as vertical
+        forms = [
+            ({}, 'SCHEMA_CHANGED'),
+            ([], 'SCHEMA_CHANGED'),
+            ({'status': 'success', 'data': {}}, 'ORDER_MISMATCH_OR_SCHEMA_CHANGED'),
+            ({'status': 'success', 'data': {'orderNr': 'FTEST', 'items': [
+                {'itemCode': 'FIXTURE', 'qty': 0}]}}, 'ORDER_ITEM_SCHEMA_CHANGED'),
+        ]
+        for body, reason in forms:
+            with self.subTest(reason=reason, body=body):
+                response = unittest.mock.MagicMock(code=200)
+                response.__enter__.return_value = response
+                response.read.return_value = json.dumps(body).encode()
+                opener = SimpleNamespace(open=unittest.mock.Mock(return_value=response))
+                with patch.object(vertical, '_headers', return_value={'authorization': 'private-token'}), \
+                        patch.object(vertical.urllib.request, 'build_opener', return_value=opener):
+                    with self.assertRaisesRegex(details.core.NoonError, '^' + reason + '$'):
+                        details.details('FTEST', 'food')
+                opener.open.assert_called_once()
+                response.read.assert_called_once()
+                row = self.rows()[-1]
+                self.assertEqual(row['error']['cause'], {
+                    'httpStatus': 200, 'endpoint': '/_svc/mp-food-api-mpnoon/order/details',
+                    'attempt': 1, 'retryable': False, 'upstreamCode': None,
+                    'exceptionClass': 'NoonError'})
+                self.assertEqual(row['error']['message'], 'HTTP 200: ' + reason)
+        self.assertNotIn('private-token', self.lines())
+
+    def test_amazon_result_failures_reach_actual_tracker_error_and_poll(self):
+        import amazon_email_orders as amazon
+        import order_tracker as tracker
+        from test_amazon_email_orders import OID
+        folder = self.folder.parent / 'watcher'
+        folder.mkdir(parents=True)
+        now = tracker.time.time()
+        cfg = {'app': 'amazon', 'order': OID, 'watcher': 'fixture', 'for': 'owner', 'eta': None,
+               'placed_at': tracker.stamp(now - 3600), 'registered_at': tracker.stamp(now)}
+        forms = [('timeout private-token', 'account_timeout'),
+                 ('private-token unavailable', 'account_unavailable'),
+                 ('', 'account_unavailable')]
+        for source_error, code in forms:
+            with self.subTest(code=code, source_error=source_error):
+                tracker.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'unknown'})
+                payload = {'hits': [], 'status': {
+                    account: {'ok': False, 'error': source_error} for account in amazon.ACCOUNTS}}
+                runner = unittest.mock.Mock(return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(payload)))
+                start = len(self.rows())
+                with patch.dict(os.environ, {'WATCH_DIR': str(folder)}), \
+                        patch.object(amazon.subprocess, 'run', runner), \
+                        patch.object(tracker.store, 'evidence', return_value=([], [])), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    tracker.check(cfg)
+                runner.assert_called_once()
+                rows = {row['name']: row for row in self.rows()[start:]}
+                self.assertTrue({'provider.track', 'track.error', 'track.poll'} <= rows.keys())
+                for name in ('provider.track', 'track.error', 'track.poll'):
+                    row = rows[name]
+                    self.assertEqual(row['props']['merchant'], 'amazon')
+                    self.assertEqual(row['error']['cause']['upstreamCode'], code)
+                    self.assertEqual(row['error']['message'], code)
+                state = tracker.read(folder / 'order-tracker-state.json')
+                self.assertEqual(state['status'], 'unknown')
+                self.assertEqual(state['last_result']['errors'], ['amazon_' + code] * len(amazon.ACCOUNTS))
+        self.assertNotIn('private-token', self.lines())
+
+    def test_result_error_shapes_keep_observed_request_and_reach_parent(self):
+        forms = [
+            {'ok': False, 'error': 'ACCOUNT_TIMEOUT'},
+            {'ok': False, 'error': {'code': 'ACCOUNT_TIMEOUT', 'message': 'private-token'}},
+            {'errors': ['ACCOUNT_TIMEOUT']},
+            {'errors': [{'code': 'ACCOUNT_TIMEOUT', 'message': 'private-token'}]},
+            {'ok': False, 'code': 'ACCOUNT_TIMEOUT'},
+            {'ok': False, 'errorCode': 'ACCOUNT_TIMEOUT'},
+            {'ok': False, 'error_code': 'ACCOUNT_TIMEOUT'},
+        ]
+        for result in forms:
+            with self.subTest(result=result):
+                @log.timed('amazon', 'provider.track')
+                def provider():
+                    with log.request('/userinfo'):
+                        log.response(200, {})
+                    return result
+                @log.timed('order-watch', 'track.poll')
+                def poll(cfg):
+                    provider_result = provider()
+                    log.emit('order-watch', 'track.error', kind='error', error='TRACK_POLL_SOURCE_ERROR')
+                    return provider_result
+                start = len(self.rows())
+                poll({'app': 'amazon'})
+                for row in self.rows()[start:]:
+                    self.assertEqual(row['error']['cause']['httpStatus'], 200)
+                    self.assertEqual(row['error']['cause']['endpoint'], '/userinfo')
+                    self.assertEqual(row['error']['cause']['attempt'], 1)
+                    self.assertEqual(row['error']['cause']['upstreamCode'], 'ACCOUNT_TIMEOUT')
+                    self.assertEqual(row['error']['message'], 'HTTP 200: ACCOUNT_TIMEOUT')
+        self.assertNotIn('private-token', self.lines())
+
     def test_timeout_forms_are_retryable_and_have_a_safe_message(self):
         import noon_http_orders
         import noon_minutes_checkout
@@ -148,7 +249,8 @@ class CauseLogs(unittest.TestCase):
         log.emit('noon', 'provider.details', kind='error', error='SECRET_BEARER_VALUE', cause={
             'httpStatus': 500, 'endpoint': endpoints[0][0], 'attempt': 2,
             'retryable': True, 'upstreamCode': 'SECRET_BEARER_VALUE',
-            'exceptionClass': 'SECRET_BEARER_VALUE', 'body': '4242424242424242'})
+            'exceptionClass': 'SECRET_BEARER_VALUE', 'reason': 'SECRET_BEARER_VALUE',
+            'body': '4242424242424242'})
         self.assertNotIn('SECRET_BEARER_VALUE', self.lines())
         self.assertNotIn('4242424242424242', self.lines())
         self.assertEqual(self.rows()[0]['error']['cause']['attempt'], 2)

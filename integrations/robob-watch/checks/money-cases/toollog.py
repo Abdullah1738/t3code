@@ -185,6 +185,9 @@ OSError TimeoutError ConnectionError ConnectionResetError ConnectionRefusedError
 HTTPError URLError HTTPException RemoteDisconnected JSONDecodeError
 TimeoutExpired NoonError MinutesError CareemError AccountError BrowserOrdersError
 OrderError'''.split())
+_SCHEMA_REASONS = frozenset('''SCHEMA_CHANGED RESPONSE_SCHEMA_CHANGED
+ORDER_MISMATCH_OR_SCHEMA_CHANGED ORDER_ITEM_SCHEMA_CHANGED ORDER_MISMATCH
+ORDER_IDENTITY_UNVERIFIED INCOMPLETE_MANIFEST DUPLICATE_JSON_KEY'''.split())
 
 
 def _endpoint(value):
@@ -237,11 +240,33 @@ def _cause(exc=None, *, endpoint=None, status=None, attempt=None, upstream_code=
                       'NATIVE_READ_TIMEOUT', 'REQUEST_TIMEOUT', 'HTTP_TIMEOUT', 'DIA_TIMEOUT'}) for item in chain)
     retryable = timeout or status in {408, 425, 429} or (status is not None and 500 <= status <= 599)
     cls = type(chain[-1]).__name__ if chain else None
-    return {'httpStatus': status if type(status) is int and 100 <= status <= 599 else None,
+    cause = {'httpStatus': status if type(status) is int and 100 <= status <= 599 else None,
             'endpoint': _endpoint(endpoint),
             'attempt': attempt if type(attempt) is int and 1 <= attempt <= 10000 else None,
             'retryable': bool(retryable), 'upstreamCode': _upstream_code(upstream_code),
             'exceptionClass': cls if cls in _EXCEPTIONS else 'Exception' if cls else None}
+    for item in chain:
+        reason = item.args[0] if item.args else None
+        if type(reason) is str and reason in _SCHEMA_REASONS:
+            cause['reason'] = reason
+            break
+    return cause
+
+
+def _record_failure(scope, *, exc=None, result=None):
+    observed = scope.get('failure') or scope.get('last') or {}
+    cause = _cause(exc, endpoint=observed.get('endpoint'), status=observed.get('httpStatus'),
+                   attempt=observed.get('attempt'),
+                   upstream_code=observed.get('upstreamCode') or (
+                       _body_code(result) if 'failure' not in scope else None))
+    cause['exceptionClass'] = observed.get('exceptionClass') or cause['exceptionClass']
+    cause['retryable'] |= observed.get('retryable') is True
+    if 'reason' not in cause and observed.get('reason'):
+        cause['reason'] = observed['reason']
+    # Tracker rows are emitted after provider wrappers return or their errors
+    # are caught, so both failure forms must reach the enclosing scopes.
+    for active in _SCOPES.get():
+        active['failure'] = cause
 
 
 def error_recorder():
@@ -254,6 +279,8 @@ def error_recorder():
 
 
 def _error(code, cause):
+    reason = cause.get('reason')
+    reason = reason if type(reason) is str and reason in _SCHEMA_REASONS else None
     safe = _cause(endpoint=cause.get('endpoint'), status=cause.get('httpStatus'),
                   attempt=cause.get('attempt'), upstream_code=cause.get('upstreamCode'))
     safe['exceptionClass'] = cause.get('exceptionClass') if cause.get('exceptionClass') in _EXCEPTIONS else None
@@ -262,13 +289,13 @@ def _error(code, cause):
     message = code
     if cause['httpStatus'] is not None:
         message = 'HTTP ' + str(cause['httpStatus'])
-        if cause['upstreamCode']:
-            message += ': ' + cause['upstreamCode']
+        if reason or cause['upstreamCode']:
+            message += ': ' + (reason or cause['upstreamCode'])
     elif cause['retryable'] and cause['exceptionClass']:
         # Without an HTTP status, only a recognized timeout is retryable.
         message = 'Upstream request timed out'
-    elif cause['upstreamCode']:
-        message = cause['upstreamCode']
+    elif reason or cause['upstreamCode']:
+        message = reason or cause['upstreamCode']
     return {'tag': code, 'message': message[:200], 'cause': cause}
 
 
@@ -522,7 +549,7 @@ def timed(component, name, *, lane=None):
                     ok = not (isinstance(result, dict) and (result.get('ok') is False or bool(result.get('errors'))))
                     if not ok:
                         code = tag(result.get('error'))
-                        scope.setdefault('failure', scope.get('last') or _cause(upstream_code=_body_code(result)))
+                        _record_failure(scope, result=result)
                     if name == 'step.bank_approval_wait' and isinstance(result, dict) and (
                             result.get('paid') is False or result.get('verification_confirmed') is False
                             or result.get('timed_out') is True):
@@ -531,9 +558,7 @@ def timed(component, name, *, lane=None):
                     return result
                 except Exception as exc:
                     code = tag(getattr(exc, 'code', str(exc)))
-                    scope.setdefault('failure', _cause(exc))
-                    if scope['failure']['exceptionClass'] is None:
-                        scope['failure']['exceptionClass'] = _cause(exc)['exceptionClass']
+                    _record_failure(scope, exc=exc)
                     raise
                 finally:
                     try:
