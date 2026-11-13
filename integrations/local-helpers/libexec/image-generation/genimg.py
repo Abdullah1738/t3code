@@ -18,14 +18,9 @@ except Exception:
         pass
 
 
-def error_tag(error):
+def error_tag(error, body=b''):
     if isinstance(error, urllib.error.HTTPError):
-        # Classify a known provider code in memory; never retain the response text.
-        try:
-            body = error.read(4096).lower()
-        except Exception:
-            body = b''
-        return 'http_' + str(error.code) + ('_not_entitled' if b'not_entitled' in body else '')
+        return 'http_' + str(error.code) + ('_not_entitled' if b'not_entitled' in body.lower() else '')
     return 'image_failed'
 
 
@@ -43,12 +38,24 @@ def request_image(model, size, prompt, n, opener=urllib.request.urlopen, fallbac
         emit('image', 'img.result', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000, props=fields)
         return data
     except Exception as error:
-        tag = error_tag(error)
+        error_body = b''
+        if isinstance(error, urllib.error.HTTPError):
+            try:
+                with error:
+                    error_body = error.read(4096)
+            except Exception:
+                pass
+        tag = error_tag(error, error_body)
         emit('image', 'img.result', kind='error', ok=False, durationMs=(time.monotonic() - start) * 1000, props=fields, error={'tag': tag})
         # The CLI has no paid fallback. A caller that already owns an authorized
         # OpenRouter fallback may supply it; logging does not enable one.
         if fallback is None:
-            raise RuntimeError(tag) from None
+            # Provider text is for CLI stderr only; logs keep the stable tag.
+            if isinstance(error, urllib.error.HTTPError):
+                message = f'error {error.code}: {error_body.decode(errors="replace")[:500]}'
+            else:
+                message = str(error)[:300] or tag
+            raise RuntimeError(message) from None
         fallback_start = time.monotonic()
         emit('image', 'img.fallback', props={**fields, 'tag': tag, 'source': 'openrouter'})
         try:
