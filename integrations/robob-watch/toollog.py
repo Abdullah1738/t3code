@@ -26,6 +26,7 @@ TAGS = {'exit_nonzero', 'invalid_arguments', 'not_authorized', 'reauth_needed', 
         'subprocess_failed', 'renderer_failed', 'headless_chrome', 'database_error',
         'io_error', 'interrupted', 'internal_error', 'cap_reached'}
 SCHEMAS = {
+    'food.warning': {'warning': {'no_time', 'macro_drift'}, 'count': int},
     'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'help'}},
     'watcher.run': {}, 'sync.run': {'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool},
