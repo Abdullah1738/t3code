@@ -833,7 +833,7 @@ class DueDates(Base):
         self.assertIn('OVERDUE since Mon 2 Nov', self.check('2026-11-02T10:00', 'r4'))
 
     def test_due_does_not_hide_unasked_charges_from_daily_list(self):
-        self.case(due='2026-11-01', deadline='2026-11-10')
+        self.case(due='2026-11-01', deadline='2026-11-10', reference='card ending 1111')
         self.assertIn('1 unasked charges older than 24 h', self.check('2026-10-31T10:00'))
         self.assertEqual([c['id'] for c in mc.unasked_candidates(self.data, at('2026-10-31T10:00'))], ['acme'])
 
