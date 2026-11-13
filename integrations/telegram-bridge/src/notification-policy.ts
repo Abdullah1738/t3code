@@ -14,7 +14,7 @@ type Notice = { id: string; source: string; text: string; severity: string; askK
 function saveLogSeverity(store: Store, id: string, severity: string): void {
   // Delivery can happen after a restart, so retain only the severity alongside the immutable operation.
   try { store.set(`log:severity:${id}`, severity); }
-  catch { toolError("telegram", "tg.send.severityStore", { operation: id }); }
+  catch (error) { toolError("telegram", "tg.send.severityStore", { operation: id }, error); }
 }
 
 const hasAcceptedChunk = (store: Store, id: string) => store.db.query<{ key: string }, [string, string]>(

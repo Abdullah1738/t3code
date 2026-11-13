@@ -75,7 +75,7 @@ export class Attention {
     if (this.stopped || this.wakeTimer) return;
     this.wakeTimer = setTimeout(() => {
       this.wakeTimer = undefined;
-      void this.tick().catch(() => { toolError("telegram", "tg.attention.wake"); });
+      void this.tick().catch(error => { toolError("telegram", "tg.attention.wake", undefined, error); });
     }, 250);
     this.wakeTimer.unref?.();
   }
@@ -154,8 +154,8 @@ export class Attention {
       try {
         if (update.type === "callback") await this.handleCallback(update);
         else await this.handleMessage(update);
-      } catch {
-        toolError("telegram", "tg.attention.update", { chat: update.chatId, update: update.type === "callback" ? update.callbackId : update.messageId });
+      } catch (error) {
+        toolError("telegram", "tg.attention.update", { chat: update.chatId, update: update.type === "callback" ? update.callbackId : update.messageId }, error);
         this.options.log?.("update-handling-failed");
       }
       await sleep(50);
@@ -186,7 +186,7 @@ export class Attention {
     if (existing?.state === "sent" && chatId !== undefined && notice.kind !== "review" && operation?.providerId !== undefined && text !== undefined) {
       // The prompt is already visible; retire its buttons with the final suffix.
       void this.transport.editMessageText(chatId, operation.providerId,
-        `${text}\n\n${suffix}`, { remove: true }).catch(() => { toolError("telegram", "tg.attention.cancelPrompt", { operation: notice.id }); });
+        `${text}\n\n${suffix}`, { remove: true }).catch(error => { toolError("telegram", "tg.attention.cancelPrompt", { operation: notice.id }, error); });
     }
   }
 
@@ -224,7 +224,7 @@ export class Attention {
   private async run(): Promise<void> {
     const epoch = this.epoch;
     const boardVersions = new Map(this.sessionEpochs);
-    const board = await this.backend.sessionBoard().catch(() => { toolError("telegram", "tg.attention.board"); return undefined; });
+    const board = await this.backend.sessionBoard().catch(error => { toolError("telegram", "tg.attention.board", undefined, error); return undefined; });
     if (epoch !== this.epoch || this.stopped) return;
     if (board?.migrationComplete) this.observeBoard(board, boardVersions);
     // Settled sessions are not announced: agents use `notify` when they need the owner.
@@ -246,15 +246,15 @@ export class Attention {
       if (!shared || shared.at <= since) {
         const at = Date.now();
         const read = this.readRequests();
-        read.then(() => { this.requestsReadAt = Math.max(this.requestsReadAt, at); }, () => { toolError("telegram", "tg.attention.requests"); });
+        read.then(() => { this.requestsReadAt = Math.max(this.requestsReadAt, at); }, error => { toolError("telegram", "tg.attention.requests", undefined, error); });
         shared = { at, read };
       }
       return shared.read;
     };
     if (sharedReads && !quiet) {
       // A request can sit in a folder the board does not list, such as a subagent in its own worktree.
-      for (const directory of await requests().then(reader => reader.directories?.() ?? [], () => {
-        toolError("telegram", "tg.attention.directories"); return [];
+      for (const directory of await requests().then(reader => reader.directories?.() ?? [], error => {
+        toolError("telegram", "tg.attention.directories", undefined, error); return [];
       })) directories.add(directory);
       if (epoch !== this.epoch || this.stopped) return;
     }
@@ -267,7 +267,7 @@ export class Attention {
       if (epoch !== this.epoch || this.stopped) return;
       for (const [index, kind] of (["approval", "question"] as const).entries()) {
         const result = results[index]!;
-        if (result.status !== "fulfilled") { toolError("telegram", "tg.attention.pendingRequests"); continue; }
+        if (result.status !== "fulfilled") { toolError("telegram", "tg.attention.pendingRequests", { directory }, result.reason); continue; }
         if (!result.value) continue;
         for (const request of result.value) {
           const identity = `${directory}\0${request.sessionID}`;
@@ -291,7 +291,7 @@ export class Attention {
         if (result === "cancel") { this.cancel(notice); continue; }
         if (result === "wait" || notice.state === "queued") continue;
         this.claim({ ...notice, signature: result.signature }, result.text, result.keyboard);
-      } catch { toolError("telegram", "tg.attention.checkNotice", { operation: notice.id, thread: notice.sessionId }); }
+      } catch (error) { toolError("telegram", "tg.attention.checkNotice", { operation: notice.id, thread: notice.sessionId }, error); }
     }
   }
 
@@ -338,8 +338,8 @@ export class Attention {
       const key: string = `${current.directory}\0${parentID}`;
       let read: Promise<SessionRecord | undefined> | undefined = parents?.get(key);
       if (!read) {
-        read = this.backend.getSession(parentID, current.directory).catch(() => {
-          toolError("telegram", "tg.attention.lineage", { thread: parentID }); return undefined;
+        read = this.backend.getSession(parentID, current.directory).catch(error => {
+          toolError("telegram", "tg.attention.lineage", { thread: parentID }, error); return undefined;
         });
         parents?.set(key, read);
       }
@@ -394,8 +394,8 @@ export class Attention {
       // A configured policy alone is never proof of a successful reply.
       if (automatic !== false && age < AUTO_ACCEPT_GRACE) return "wait";
     }
-    const parent = session.parentID ? await this.backend.getSession(session.parentID, session.directory).catch(() => {
-      toolError("telegram", "tg.attention.parent", { thread: session.parentID }); return undefined;
+    const parent = session.parentID ? await this.backend.getSession(session.parentID, session.directory).catch(error => {
+      toolError("telegram", "tg.attention.parent", { thread: session.parentID }, error); return undefined;
     }) : undefined;
     const context = this.contextOf(session, parent);
     const freshRequests = await pending();
@@ -485,7 +485,7 @@ export class Attention {
       if (result === "cancel") return "cancel";
       if (result === "wait") return "wait";
       return "send";
-    } catch { toolError("telegram", "tg.attention.beforeSend", { operation: item.id }); return "wait"; }
+    } catch (error) { toolError("telegram", "tg.attention.beforeSend", { operation: item.id }, error); return "wait"; }
   }
 
   private ack(messageId: number, text: string): void {
@@ -530,8 +530,8 @@ export class Attention {
             this.ack(update.messageId, "Use /reminders, /cancel ID, or /snooze ID 5m|1h|2d (at most 365 days).");
           }
         }).immediate();
-      } catch {
-        toolError("telegram", "tg.reminder.command", { update: update.messageId, chat: update.chatId });
+      } catch (error) {
+        toolError("telegram", "tg.reminder.command", { update: update.messageId, chat: update.chatId }, error);
         this.ack(update.messageId, "Reminder command failed. Check the ID with /reminders; an uncertain notification delivery must be resolved first.");
       }
       return;
@@ -550,7 +550,7 @@ export class Attention {
   private async handleCallback(update: Extract<TelegramUpdate, { type: "callback" }>): Promise<void> {
     const match = /^([aq]):([0-9a-f]{16}):(?:(once|reject)|(send)|(\d+):(\d+)|done:(\d+))$/.exec(update.data);
     const fail = async (reason: string) => { await this.transport.answerCallback(update.callbackId, reason)
-      .catch(() => { toolError("telegram", "tg.attention.answerCallback"); }); };
+      .catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); }); };
     if (!match) return fail("This prompt expired.");
     const token = match[2]!;
     const noticeId = this.store.get<string>(`callback:${token}`);
@@ -616,7 +616,7 @@ export class Attention {
     questionIndex: number,
     optionIndex: number,
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     const sequence = this.sequence(notice.id);
     if (questionIndex !== sequence.answers.length) {
       // A stale tap, such as a replayed update; redraw the current question.
@@ -647,7 +647,7 @@ export class Attention {
     request: QuestionRequest,
     step: number,
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     const sequence = this.sequence(notice.id);
     const question = request.questions[step];
     if (step !== sequence.answers.length || question?.multiple !== true) {
@@ -684,7 +684,7 @@ export class Attention {
     const chatId = this.options.chatId();
     if (chatId === undefined) return;
     await this.transport.editMessageText(chatId, messageId, this.summaryText(notice.id, request, answers), { remove: true })
-      .catch(() => { toolError("telegram", "tg.attention.summaryEdit", { operation: notice.id }); });
+      .catch(error => { toolError("telegram", "tg.attention.summaryEdit", { operation: notice.id }, error); });
   }
 
   private summaryText(noticeId: string, request: QuestionRequest, answers: string[][]): string {
@@ -707,8 +707,8 @@ export class Attention {
     try {
       const result = await this.backend.questionReply(request, notice.directory, answers);
       if (result !== true) throw new Error();
-    } catch {
-      toolError("telegram", "tg.attention.questionReply", { operation: notice.id, thread: notice.sessionId });
+    } catch (error) {
+      toolError("telegram", "tg.attention.questionReply", { operation: notice.id, thread: notice.sessionId }, error);
       return "failed";
     }
     this.markAnswered(notice);
@@ -721,12 +721,12 @@ export class Attention {
     request: PermissionRequest,
     decision: "once" | "reject",
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     try {
       const result = await this.backend.permissionReply(request.sessionID, request.id, notice.directory, decision);
       if (result !== true) throw new Error();
-    } catch {
-      toolError("telegram", "tg.attention.approvalReply", { operation: notice.id, thread: notice.sessionId });
+    } catch (error) {
+      toolError("telegram", "tg.attention.approvalReply", { operation: notice.id, thread: notice.sessionId }, error);
       await answer("The reply failed; try again.");
       return;
     }
@@ -742,7 +742,7 @@ export class Attention {
     questionIndex: number,
     optionIndex: number,
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     if (request.unsupported) return answer(`Answer this form in ${this.app}.`);
     const question = request.questions[questionIndex];
     if (!question || !question.options[optionIndex]) return answer("That option is no longer current.");
@@ -766,7 +766,7 @@ export class Attention {
     if (text === undefined) return answer("Selection recorded.");
     await this.transport.editMessageText(chatId, update.messageId, text, this.questionKeyboard(request, token, selection))
       .then(() => answer(current.includes(optionIndex) ? "Cleared." : "Selected."))
-      .catch(() => { toolError("telegram", "tg.attention.selectionEdit", { operation: notice.id }); return answer("Selection recorded."); });
+      .catch(error => { toolError("telegram", "tg.attention.selectionEdit", { operation: notice.id }, error); return answer("Selection recorded."); });
   }
 
   private async submitSelection(
@@ -774,7 +774,7 @@ export class Attention {
     notice: SessionNotice,
     request: QuestionRequest,
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     const selection = this.store.get<Selection>(`selection:${notice.id}`) ?? {};
     const missing = request.questions.findIndex((_, questionIndex) => !(selection[questionIndex]?.length));
     if (missing >= 0) return answer(`Select an option for question ${missing + 1} first.`);
@@ -789,7 +789,7 @@ export class Attention {
     request: QuestionRequest,
     answers: string[][],
   ): Promise<void> {
-    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => { toolError("telegram", "tg.attention.answerCallback"); });
+    const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(error => { toolError("telegram", "tg.attention.answerCallback", undefined, error); });
     const result = await this.submit(notice, request, answers);
     if (result === "invalid") return answer(INVALID_ANSWERS);
     if (result === "failed") return answer("The reply failed; try again.");
@@ -841,7 +841,7 @@ export class Attention {
     const prompt = this.store.getOperation(notice.id);
     if (chatId !== undefined && prompt?.providerId !== undefined) {
       await this.transport.editMessageText(chatId, prompt.providerId, `${prompt.text}\n\n[Answered]`, { remove: true })
-        .catch(() => { toolError("telegram", "tg.attention.replyEdit", { operation: notice.id }); });
+        .catch(error => { toolError("telegram", "tg.attention.replyEdit", { operation: notice.id }, error); });
     }
   }
 
@@ -855,8 +855,8 @@ export class Attention {
     try {
       parsed = JSON.parse(match[2]!);
       if (!Array.isArray(parsed) || !parsed.every(value => Array.isArray(value) && value.every(item => typeof item === "string"))) throw new Error();
-    } catch {
-      toolError("telegram", "tg.attention.answerJson", { update: update.messageId });
+    } catch (error) {
+      toolError("telegram", "tg.attention.answerJson", { update: update.messageId }, error);
       this.ack(update.messageId, 'Use /answer REQUESTID with a JSON array of string arrays, for example [["choice"]].');
       return;
     }
@@ -884,7 +884,7 @@ export class Attention {
     const prompt = this.store.getOperation(notice.id);
     if (chatId !== undefined && prompt?.providerId !== undefined && text !== undefined) {
       await this.transport.editMessageText(chatId, prompt.providerId, `${text}\n\n[Answered]`, { remove: true })
-        .catch(() => { toolError("telegram", "tg.attention.answerEdit", { operation: notice.id }); });
+        .catch(error => { toolError("telegram", "tg.attention.answerEdit", { operation: notice.id }, error); });
     }
   }
 
@@ -897,6 +897,6 @@ export class Attention {
     const text = this.store.getOperation(notice.id)?.text;
     if (chatId === undefined || text === undefined) return;
     await this.transport.editMessageText(chatId, update.messageId, `${text}\n\n${suffix}`, { remove: true })
-      .catch(() => { toolError("telegram", "tg.attention.finishPrompt", { operation: notice.id }); });
+      .catch(error => { toolError("telegram", "tg.attention.finishPrompt", { operation: notice.id }, error); });
   }
 }

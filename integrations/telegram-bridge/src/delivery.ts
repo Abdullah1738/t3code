@@ -194,7 +194,7 @@ export class Delivery {
         try {
           severity = this.store.get<{ severity: string }>(`api:notification:${item.id}`)?.severity
             ?? this.store.get<string>(`log:severity:${item.id}`) ?? severity;
-        } catch { toolError("telegram", "tg.send.severityRead", ids); }
+        } catch (error) { toolError("telegram", "tg.send.severityRead", ids, error); }
         const started = performance.now();
         try {
           if (item.attachment && index === chunks.length) {

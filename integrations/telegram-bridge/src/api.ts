@@ -40,7 +40,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || !Number.isSafeInteger(Number(length)))) throw new ApiError(400);
   if (length !== null && Number(length) > maxBytes) {
-    void request.body?.cancel().catch(() => { toolError("telegram", "tg.api.cancelBody"); });
+    void request.body?.cancel().catch(error => { toolError("telegram", "tg.api.cancelBody", undefined, error); });
     throw new ApiError(413);
   }
   if (!request.body) return {};
@@ -56,7 +56,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
       size += value.byteLength;
       if (size > maxBytes) {
         // Do not wait for an untrusted stream's cancellation callback.
-        void reader.cancel().catch(() => { toolError("telegram", "tg.api.cancelReader"); });
+        void reader.cancel().catch(error => { toolError("telegram", "tg.api.cancelReader", undefined, error); });
         throw new ApiError(413);
       }
       text += decoder.decode(value, { stream: true });
@@ -66,7 +66,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400);
     return body as Record<string, unknown>;
   } catch (error) {
-    toolError("telegram", "tg.api.readBody");
+    toolError("telegram", "tg.api.readBody", undefined, error);
     throw error instanceof ApiError ? error : new ApiError(400);
   } finally {
     reader.releaseLock();
@@ -150,7 +150,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
         const notification = /^\/notifications\/([^/]+)$/.exec(path);
         if (notification) {
           let id: string;
-          try { id = decodeURIComponent(notification[1]!); } catch { toolError("telegram", "tg.api.notificationId"); throw new ApiError(400); }
+          try { id = decodeURIComponent(notification[1]!); } catch (error) { toolError("telegram", "tg.api.notificationId", undefined, error); throw new ApiError(400); }
           if (!string(id, 200) || /[\x00-\x1f\x7f]/.test(id)) throw new ApiError(400);
           const operation = store.findOutbox(id);
           if (!operation || operation.kind !== "notification") throw new ApiError(404);
@@ -230,7 +230,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
         if (!string(text, 12_000) || !string(at, 100) || !string(idempotencyKey, 200) || !string(zone, 128)) throw new ApiError(400);
         try {
           parseCommand(["remind", `--text=${text}`, `--at=${at}`, `--key=${idempotencyKey}`, `--timezone=${zone}`]);
-        } catch { toolError("telegram", "tg.reminder.invalidCreate"); throw new ApiError(400); }
+        } catch (error) { toolError("telegram", "tg.reminder.invalidCreate", undefined, error); throw new ApiError(400); }
         const digest = hash(idempotencyKey);
         const id = `R${digest.slice(0, 12)}`;
         const spec = JSON.stringify({ text, at, timezone: zone });
@@ -259,14 +259,14 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
 
       fields(body, reminderAction![2] === "cancel" ? [] : ["at"]);
       let id: string;
-      try { id = decodeURIComponent(reminderAction![1]!); } catch { toolError("telegram", "tg.reminder.invalidId"); throw new ApiError(400); }
+      try { id = decodeURIComponent(reminderAction![1]!); } catch (error) { toolError("telegram", "tg.reminder.invalidId", undefined, error); throw new ApiError(400); }
       if (!string(id, 200) || /[\x00-\x1f\x7f]/.test(id)) throw new ApiError(400);
       let reminder: ReminderRecord;
       if (reminderAction![2] === "cancel") {
         reminder = store.cancelReminder(id);
       } else {
         if (!string(body.at, 100)) throw new ApiError(400);
-        try { parseCommand(["snooze", id, `--at=${body.at}`]); } catch { toolError("telegram", "tg.reminder.invalidSnooze"); throw new ApiError(400); }
+        try { parseCommand(["snooze", id, `--at=${body.at}`]); } catch (error) { toolError("telegram", "tg.reminder.invalidSnooze", undefined, error); throw new ApiError(400); }
         const dueAt = Date.parse(body.at);
         if (!Number.isSafeInteger(dueAt) || dueAt <= 0 || dueAt <= Date.now()) throw new ApiError(400);
         reminder = store.snoozeReminder(id, dueAt);
@@ -274,7 +274,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
       // Pre-existing reminders may not have been created through this bounded API.
       return json({ id: reminder.id, status: reminder.status, dueAt: reminder.dueAt, revision: reminder.revision });
     } catch (error) {
-      toolError("telegram", "tg.api.requestFailed");
+      toolError("telegram", "tg.api.requestFailed", undefined, error);
       const status = error instanceof ApiError ? error.status : 409;
       return json({ error: errors[status] }, status);
     }
