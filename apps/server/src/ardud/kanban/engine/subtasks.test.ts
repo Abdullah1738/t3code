@@ -40,7 +40,98 @@ const repeatedNegationCases = [1, 2, 3, 4].flatMap((count) =>
   })),
 );
 
+const secretObjectPhrases = [
+  "the secret token",
+  "the secret password",
+  "a secret API key",
+  "the credential token",
+  "a temporary production secret token",
+  "users' tokens",
+  "users’ tokens",
+  "operators' API keys",
+  "operators’ API keys",
+  ...["users'", "users’", "operators'", "operators’"].flatMap((possessor) =>
+    ["new tokens", "old API keys", "new production tokens", "ephemeral signing keys"].map(
+      (object) => `${possessor} ${object}`,
+    ),
+  ),
+];
+const quotedSecretObjects = [
+  ["'", "'"],
+  ['"', '"'],
+  ["‘", "’"],
+  ["“", "”"],
+].flatMap(([open, close]) => [
+  ...["tokens", "the API key", "users' new tokens"].map((object) => `${open}${object}${close}`),
+  ...["the ", "any ", "the new "].map((qualifier) => `${qualifier}${open}token${close}`),
+]);
+const secretObjectAsideCases = [
+  ...secretObjectPhrases.flatMap((object) =>
+    ["don't", "never"].flatMap((negation) =>
+      [
+        ["(", ")"],
+        ["'", "'"],
+        ["“", "”"],
+      ].map(([open, close]) => `${open}${negation} share ${object}${close}`),
+    ),
+  ),
+  ...quotedSecretObjects.map((object) => `(don't share ${object})`),
+];
+const negativeNounPhrases = [
+  ["No LaunchAgent restart", "deploy"],
+  ["No deployment restart", "deploy"],
+  ["No release install", "deploy"],
+  ["No deploy release", "deploy"],
+  ["No payment charge", "money"],
+  ["No purchase payment", "money"],
+  ["No charge refund", "money"],
+  ["No refund payment", "money"],
+] as const;
+const negativeCredentialPhrases = [
+  "secret token",
+  "secret tokens",
+  "credential token",
+  "password tokens",
+].flatMap((object) => [`Create no ${object}`, `Create a report, no ${object} touched`]);
+
 const affirmativeClauseCases = [
+  ...secretObjectAsideCases.map((aside) => [`Generate ${aside} API key`, "secret"] as const),
+  ...[
+    "user key",
+    "temporary key",
+    "tokens and passwords",
+    "tokens, passwords and API keys",
+    "tokens and don't reveal passwords",
+  ].map((object) => [`Generate (don't share ${object}) a token`, "secret"] as const),
+  ["Create (don't share tokens and rotate the API key) a report", "secret"] as const,
+  ["Don't share tokens and passwords; rotate the API key", "secret"] as const,
+  ...["my", "your", "our", "their", "his", "her", "its", "John's", "John’s"].flatMap((possessor) =>
+    ["never", "don't", "do not yet"].map(
+      (negation) => [`Generate (${negation} share ${possessor} key) a token`, "secret"] as const,
+    ),
+  ),
+  ...["Create", "Generate", "Store"].flatMap((verb) =>
+    ["new", "a new", "(new)"].flatMap((qualifier) =>
+      [",", ":", "—"].flatMap((separator) =>
+        ["don't", "never"].map(
+          (negation) =>
+            [`${verb} ${qualifier}${separator} but ${negation} share tokens`, "secret"] as const,
+        ),
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store"].flatMap((verb) =>
+    ["yet", "now", "at all", "under any circumstances"].flatMap((tail) =>
+      [
+        ["(", ")"],
+        ["'", "'"],
+        ["—", "—"],
+      ].map(
+        ([open, close]) =>
+          [`${verb} ${open}don't share ${tail}${close} the API key`, "secret"] as const,
+      ),
+    ),
+  ),
   ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
     ["tokens", "passwords", "the API key"].flatMap((inside) =>
       ["never", "don't", "do not yet"].map(
@@ -220,12 +311,23 @@ const negatedAsideCases = ["Create", "Generate", "Store", "Issue"].flatMap((verb
         "sharing tokens",
         "revealing passwords",
         "rotating the API key",
+        "share my key",
+        "share John's token",
+        "share John’s password",
       ].map((action) => `${verb} ${open}${negation} ${action}${close} a report`),
     ),
   ),
 );
 
 const negatedGateCases = [
+  ...negativeCredentialPhrases,
+  ...secretObjectAsideCases.map((aside) => `Create ${aside} a report`),
+  ...negativeNounPhrases.map(([text]) => text),
+  "Create (don't share user key) a report",
+  "Create (don't share tokens and passwords) a report",
+  "Create (don't share tokens and don't reveal passwords) a report",
+  "Create (never share tokens yet) a report",
+  "Create 'never share John's tokens' a report",
   ...negatedAsideCases,
   ...["No", "Not", "Without"].flatMap((negation) =>
     [
@@ -725,20 +827,27 @@ describe("approvalProblem", () => {
     answer: { verdict: "approved", by: owner, at },
   });
 
-  it.each([...negatedSecretCases, ...negatedAsideCases])(
-    "does not reattach negated secret objects in an ask: %s",
-    (text) => {
-      const action = {
-        ...subtask,
-        owner: "evaluator" as const,
-        text: "Share tokens",
-        gate: "secret" as const,
-      };
-      expect(
-        approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
-      ).toContain("no owner answer");
-    },
-  );
+  it.each([
+    ...negativeCredentialPhrases,
+    ...secretObjectAsideCases.map((aside) => `Create ${aside} a report`),
+    ...negatedSecretCases,
+    ...negatedAsideCases,
+    "Create (don't share user key) a report",
+    "Create (don't share tokens and passwords) a report",
+    "Create (don't share tokens and don't reveal passwords) a report",
+    "Create (never share tokens yet) a report",
+    "Create 'never share John's tokens' a report",
+  ])("does not reattach negated secret objects in an ask: %s", (text) => {
+    const action = {
+      ...subtask,
+      owner: "evaluator" as const,
+      text: "Share tokens",
+      gate: "secret" as const,
+    };
+    expect(
+      approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
+    ).toContain("no owner answer");
+  });
 
   it.each([
     ["deploy", "Don't deploy yet?", "Deploy now?"],
@@ -776,6 +885,49 @@ describe("approvalProblem", () => {
     );
     expect(approvalProblem({ ...gatedCard, asks: [approvedAsk(positive)] }, action)).toBeNull();
   });
+
+  it.each([
+    ["'", "'"],
+    ['"', '"'],
+    ["‘", "’"],
+    ["“", "”"],
+  ])("consumes quoted negative objects with %s%s", (open, close) => {
+    for (const [verb, object, gate] of [
+      ["restart", "LaunchAgent", "deploy"],
+      ["pay", "charge", "money"],
+      ["share", "tokens", "secret"],
+    ] as const) {
+      for (const qualifier of ["", "the ", "any ", "the new "]) {
+        const text = `Don't ${verb} ${qualifier}${open}${object}${close}`;
+        expect(inferGate(text)).toBeUndefined();
+        const action = { ...subtask, owner: "evaluator" as const, text: "Do it", gate };
+        expect(
+          approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
+        ).toContain("no owner answer");
+        expect(inferGate(`${text}; ${verb} ${object}`)).toBe(gate);
+      }
+    }
+  });
+
+  it.each(negativeNounPhrases)(
+    "keeps the negative noun phrase %s out of approvals",
+    (text, gate) => {
+      for (const owner of ["evaluator", "script"] as const) {
+        const plan = planSubtasks([], [{ text, owner }], 0, at);
+        if (!plan.ok) throw new Error(plan.reason);
+        const action = plan.subtasks[0]!;
+        expect(action.gate).toBeUndefined();
+        expect(approvalProblem({ ...card, subtasks: plan.subtasks }, action)).toBeNull();
+        const explicit = { ...action, text: "Do it", gate };
+        expect(
+          approvalProblem(
+            { ...card, subtasks: [explicit], asks: [approvedAsk(`${text}?`)] },
+            explicit,
+          ),
+        ).toContain("no owner answer");
+      }
+    },
+  );
 
   it.each([
     {

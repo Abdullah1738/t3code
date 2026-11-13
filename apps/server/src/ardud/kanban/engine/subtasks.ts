@@ -35,7 +35,11 @@ const negatableSecretAction = new RegExp(
 );
 const secretKeyword =
   /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
-const negatableSecretKeyword = /\b(?:secrets?|passwords?|credentials?|tokens?|keys?)\b/i;
+const secretNoun = String.raw`(?:secrets?|passwords?|credentials?|tokens?|keys?)`;
+const negatableSecretKeyword = new RegExp(
+  String.raw`\b${secretNoun}(?:[ \t]+${secretNoun})*\b`,
+  "i",
+);
 const secretMention = new RegExp(
   `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
   "i",
@@ -54,30 +58,50 @@ const inlinePairs = new Map([
   ["--", "--"],
 ]);
 
-const closesInlineAside = (prefix: string, suffix: string): boolean | undefined => {
-  const expected: string[] = [];
-  for (let i = 0; i < prefix.length; i++) {
-    let char = prefix[i]!;
+const inlineClosers = new Set(inlinePairs.values());
+
+function* inlineDelimiters(text: string) {
+  for (let i = 0; i < text.length; i++) {
+    const index = i;
+    let char = text[i]!;
     if (
       (char === "'" || char === "’") &&
-      /\w/.test(prefix[i - 1] ?? "") &&
-      /\w/.test(prefix[i + 1] ?? "")
+      /\w/.test(text[i - 1] ?? "") &&
+      /^(?:s|t|re|ve|ll|d|m)\b/i.test(text.slice(i + 1))
     )
       continue;
-    if (char === "-" && prefix[i + 1] === "-") {
+    if (char === "-" && text[i + 1] === "-") {
       char = "--";
       i++;
     }
+    if (inlinePairs.has(char) || inlineClosers.has(char)) yield { char, index };
+  }
+}
+
+const closesInlineAside = (prefix: string, suffix: string): boolean | undefined => {
+  const expected: string[] = [];
+  for (const { char, index } of inlineDelimiters(prefix)) {
     if (expected.at(-1) === char) expected.pop();
     else {
       const closing = inlinePairs.get(char);
       const dash = char === "—" || char === "–" || char === "--";
-      if (closing && (!dash || prefix.includes(char, i + 1) || suffix.includes(char)))
+      if (closing && (!dash || prefix.includes(char, index + char.length) || suffix.includes(char)))
         expected.push(closing);
     }
   }
-  const closing = expected.at(-1);
-  return closing === undefined ? undefined : suffix.trimStart().startsWith(closing);
+  const depth = expected.length;
+  if (depth === 0) return undefined;
+  for (const { char, index } of inlineDelimiters(suffix)) {
+    if (expected.at(-1) === char) {
+      expected.pop();
+      if (expected.length < depth) return !negatableSecretKeyword.test(suffix.slice(0, index));
+    } else {
+      const closing = inlinePairs.get(char);
+      const dash = char === "—" || char === "–" || char === "--";
+      if (closing && (!dash || suffix.includes(char, index + char.length))) expected.push(closing);
+    }
+  }
+  return false;
 };
 
 const withoutNegated = (
@@ -87,16 +111,38 @@ const withoutNegated = (
 ): string => {
   const gap = String.raw`(?:[ \t]+|-(?!-))`;
   // Unknown words stay gated: arbitrary fillers can turn "don't delay deployment" into permission.
-  const filler = String.raw`(?:a|an|the|any|new|old|existing|further|additional|more|actual|real|live|prod|production|dev|test|local|remote|planned|scheduled|required|manual|automatic|immediate|full|api|private|signing|ssh)${gap}`;
+  const qualifierWord = String.raw`(?:a|an|the|any|my|your|our|their|his|her|its|\w+[’']s|\w+s[’']|new|old|existing|further|additional|more|actual|real|live|prod|production|dev|test|local|remote|planned|scheduled|required|manual|automatic|immediate|full|api|private|signing|ssh)`;
+  const filler = String.raw`${qualifierWord}${gap}`;
   const qualifiers = String.raw`(?:(?:just|quite)${gap}yet${gap}|yet${gap}(?:${filler})?|(?:${filler}){0,2}?)`;
   const negation = String.raw`(?:no|not|without|never|don[’']?t|do[ \t]+not|doesn[’']?t|won[’']?t|nothing[ \t]+to)`;
-  const object = options.object ? String.raw`(?:${gap}${qualifiers}${options.object.source})?` : "";
+  const objectStop = String.raw`(?:${negatableSecretAction.source}|${negation}|and|or|but|then|yet|so|however|instead|except)\b`;
+  const objectQualifier = String.raw`(?!${objectStop})\w+(?:[’']s)?${gap}`;
+  const pluralPossessive = String.raw`(?!(?:${negatableSecretKeyword.source})[’'])\w+s[’'](?=${gap}(?:${objectQualifier})*${secretKeyword.source}[^.;\r\n]*[)\]}"'”’–—])`;
+  const objectWord = String.raw`(?:\w+[’']s|${pluralPossessive}|\w+)`;
+  const objectFiller = String.raw`(?!${objectStop})${objectWord}${gap}`;
+  // Consume the whole noun phrase: stopping at "secret" strands "token" inside an aside.
+  const objectQualifiers = options.boundary ? String.raw`(?:${objectFiller})*` : qualifiers;
+  const bareObject = options.object ? `${objectQualifiers}${options.object.source}` : "";
+  const quotedObjects = (
+    [
+      ["'", "'"],
+      ['"', '"'],
+      ["‘", "’"],
+      ["“", "”"],
+    ] as const
+  ).map(([open, close]) => String.raw`${objectQualifiers}${open}[ \t]*${bareObject}[ \t]*${close}`);
+  const objectItem = options.object ? `(?:${[bareObject, ...quotedObjects].join("|")})` : "";
+  const objectSeparator = String.raw`(?:[ \t]*,[ \t]*(?:(?:and|or)[ \t]+)?|[ \t]+(?:and|or)[ \t]+)`;
+  const objectList = options.boundary ? String.raw`(?:${objectSeparator}${objectItem})*` : "";
+  const object = options.object ? String.raw`(?:${gap}${objectItem}${objectList})?` : "";
   const precedingNegation = new RegExp(String.raw`\b${negation}${gap}$`, "i");
   const sharedObject = new RegExp(
-    String.raw`${secretAction.source}[ \t]*(?:${filler}){0,2}?(?:(?:[,:([{"'“‘–—-]|(?:and|but|or|then|also)\b)[ \t]*)*$`,
+    String.raw`${secretAction.source}(?:[ \t,:()\[\]{}"'“”‘’–—-]|\b(?:${qualifierWord}|and|but|or|then|also)\b)*$`,
     "i",
   );
-  return text.replace(
+  const boundaries: number[] = [];
+  let delta = 0;
+  const stripped = text.replace(
     new RegExp(
       String.raw`\b(?:${negation}${gap}${qualifiers}|non${gap})(${keyword.source})(${object})`,
       "gi",
@@ -123,12 +169,28 @@ const withoutNegated = (
       const shared = options.boundary ? (aside ?? sharedObject.test(prefix)) : false;
       const replacement = options.boundary && !modifier && !shared ? ";" : " ";
       // "No-restart deployment" negates the modifier, unlike "don't restart the deployment".
-      const nounModifier = /^no[ \t]/i.test(match) && !/ing$/i.test(action);
-      return modifier || nounModifier || (options.boundary && shared && aside === undefined)
-        ? replacement + directObject
-        : replacement;
+      const nounModifier =
+        !options.boundary &&
+        /^no[ \t]/i.test(match) &&
+        !/ing$/i.test(action) &&
+        /\b(?:a|an|the)[ \t]+$/i.test(prefix);
+      const value =
+        modifier || nounModifier || (options.boundary && shared && aside === undefined)
+          ? replacement + directObject
+          : replacement;
+      if (options.boundary && value.startsWith(";")) boundaries.push(offset + delta);
+      delta += value.length - match.length;
+      return value;
     },
   );
+  if (boundaries.length === 0) return stripped;
+  // Resolve an aside after all its negated actions have lost their objects.
+  const characters = stripped.split("");
+  for (const position of boundaries) {
+    if (closesInlineAside(stripped.slice(0, position), stripped.slice(position + 1)) === true)
+      characters[position] = " ";
+  }
+  return characters.join("");
 };
 
 export const inferGate = (text: string): KanbanSubtask["gate"] => {
