@@ -111,10 +111,13 @@ def before_run(argv: list[str]) -> None:
         return
     from . import api
     recent = recent_failure()
-    why = api.probe_backend("server", PROBE_TIMEOUT_S) if recent else probe()
-    if why and not recent and why.startswith("no answer"):
-        # /health or the network may blip while the authenticated API remains usable.
+    why = None if recent else probe()
+    health_ok = not recent and why is None
+    if recent or health_ok or (why or "").startswith("no answer"):
+        # /health can stay green while authenticated allocation reads stop answering.
         why = api.probe_backend("server", PROBE_TIMEOUT_S)
+        if why and health_ok:
+            why = api.probe_backend("server", PROBE_TIMEOUT_S)
     if why:
         fail_over(why, argv)
 

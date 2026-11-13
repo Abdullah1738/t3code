@@ -287,7 +287,7 @@ class Failover(HomeFiles):
         self.configure()
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         self.execs = []
-        self.stack.enter_context(patch.object(api, "probe_backend", side_effect=lambda name, timeout: "no answer" if name == "server" else None))
+        self.stack.enter_context(patch.object(api, "probe_backend", return_value=None))
 
         def execve(path, argv, env):
             self.execs.append((argv, env))
@@ -323,7 +323,7 @@ class Failover(HomeFiles):
                 resume.assert_not_called()
                 self.assertEqual(probe.call_args_list[0].args, ("server", home.PROBE_TIMEOUT_S))
 
-    def test_old_malformed_future_and_non_outage_failures_do_not_probe(self):
+    def test_old_malformed_future_and_non_outage_failures_use_normal_preflight(self):
         import time
         for row in ("{broken", "[]", {"ts": "bad", "reason": "unreachable"},
                     {"ts": time.time() - home.RECENT_FAILURE_S - 1, "reason": "unreachable"},
@@ -332,9 +332,10 @@ class Failover(HomeFiles):
             with self.subTest(row=row):
                 common.HOME_FAILURES.write_text(row if isinstance(row, str) else json.dumps(row))
                 with patch.object(home, "probe", return_value=None), \
-                        patch.object(api, "probe_backend", side_effect=AssertionError("no recent outage")), \
+                        patch.object(api, "probe_backend", return_value=None) as probe, \
                         patch.object(runs, "run_remote", return_value=0):
                     self.assertEqual(self.run_cmd("--remote", "--", "true")[0], 0)
+                probe.assert_called_once_with("server", home.PROBE_TIMEOUT_S)
 
     def test_one_network_blip_and_good_reprobe_stays_home(self):
         for wrapped in (False, True):
@@ -352,8 +353,18 @@ class Failover(HomeFiles):
                     patch.object(runs, "run_remote", side_effect=[error, 7]) as run:
                 self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
                 self.assertEqual(run.call_count, 2)
-                probe.assert_called_once_with("server", home.PROBE_TIMEOUT_S)
+                self.assertEqual([call.args for call in probe.call_args_list], [("server", home.PROBE_TIMEOUT_S)] * 2)
         self.assertEqual(self.execs, [])
+
+    def test_green_health_authenticated_preflight_reprobes_once_before_failover(self):
+        for answers, expected in ((["no answer", None], 7), (["no answer", "no answer", None], "exec")):
+            with self.subTest(answers=answers), patch.object(home, "probe", return_value=None), \
+                    patch.object(api, "probe_backend", side_effect=answers) as probe, \
+                    patch.object(runs, "run_remote", return_value=7) as run:
+                self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], expected)
+                self.assertEqual(run.call_count, 0 if expected == "exec" else 1)
+                self.assertEqual([call.args[0] for call in probe.call_args_list],
+                                 ["server", "server", "boat"] if expected == "exec" else ["server", "server"])
 
     def test_boat_down_does_not_accept_failover(self):
         with patch.object(api, "probe_backend", return_value="no answer"), \
@@ -385,6 +396,7 @@ class Failover(HomeFiles):
 
     def test_server_does_not_answer_the_run_goes_to_boat_and_the_monitor_hears_of_it(self):
         with patch.object(home, "probe", return_value="no answer (TimeoutError)"), \
+                patch.object(api, "probe_backend", side_effect=lambda name, timeout: "no answer" if name == "server" else None), \
                 patch.object(runs, "run_remote", side_effect=AssertionError("nothing may be sent home")):
             rc, err = self.run_cmd("--size", "large", "--", "go", "test", "./...")
         self.assertEqual(rc, "exec")
@@ -478,15 +490,18 @@ class BoxReadinessFailover(Isolated):
         self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
                                                         if k not in ("OFFBOX_BACKEND", "OFFBOX_THREAD")}, clear=True))
         self.execs = []
-        self.stack.enter_context(patch.object(api, "probe_backend", side_effect=lambda name, timeout: "no answer" if name == "server" else None))
+        self.auth_probe = api.probe_backend
+        self.stack.enter_context(patch.object(api, "probe_backend", return_value=None))
         self.clock = Clock()
         for mod in (pool, prepare, api):
             self.stack.enter_context(patch.object(mod, "time", self.clock.time))
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         self.stack.enter_context(patch.object(home, "probe", return_value=None))
         self.stack.enter_context(patch.object(lease, "cap_check"))
+        self.refresh_background = pool._refresh_background
         self.stack.enter_context(patch.object(pool, "_refresh_background"))
         self.stack.enter_context(patch.object(lease, "_new_box", return_value=({"id": "new"}, "fresh", None, "large")))
+        self.status_get = api.get
         self.stack.enter_context(patch.object(api, "get", return_value={"state": "error", "error": "500 incus_failed: incus start failed"}))
         self.start_command = api.cmd_start
         self.command = self.stack.enter_context(patch.object(api, "cmd_start", side_effect=AssertionError("no command before readiness")))
@@ -529,11 +544,82 @@ class BoxReadinessFailover(Isolated):
             self.clock.sleep(5)
             raise api.NetworkError("GET /sandboxes/cold timed out")
         with patch.object(api, "get", side_effect=silent) as get, \
+                patch.object(api, "probe_backend", side_effect=[None, "no answer", None]), \
                 patch.object(lease, "acquire_private") as create:
             self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
         create.assert_not_called()
         self.assertEqual(get.call_count, 1)
         self.command.assert_not_called()
+
+    def test_detached_status_refresh_cannot_delay_new_run_failover(self):
+        self.box("cold", "stopped", member=True)
+        for index in range(3):
+            box = f"busy-{index}"
+            self.box(box, member=True)
+            self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,process_id,command_id) VALUES (?,?,'running','bg',1234,'cmd-bg')",
+                             (f"bg-{index}", box))
+        self.con.commit()
+        before = [dict(row) for row in self.con.execute("SELECT * FROM runs ORDER BY run_id")]
+        self.assertFalse(home.recent_failure())
+        requests = []
+        def silent(req, timeout):
+            requests.append(req.full_url)
+            self.clock.sleep(timeout)
+            raise TimeoutError("authenticated API silent while health stays green")
+        start = self.clock.t
+        def probe(name, timeout):
+            return self.auth_probe(name, timeout) if name == "server" else None
+        with patch.object(pool, "_refresh_background", self.refresh_background), \
+                patch.object(api, "get", self.status_get), patch.object(api, "_key", return_value="fixture"), \
+                patch.object(api, "BACKEND", "server"), patch.object(api, "probe_backend", side_effect=probe), \
+                patch.object(api, "_open", side_effect=silent):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        self.assertLess(self.clock.t - start, 60)
+        self.assertLessEqual(self.clock.t - start, 7)
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(url.endswith("/limits") for url in requests))
+        self.assertEqual([dict(row) for row in self.con.execute("SELECT * FROM runs ORDER BY run_id")], before)
+        self.command.assert_not_called()
+
+    def test_detached_refresh_policy_unchanged_for_boat_pins_and_person(self):
+        self.box("busy", member=True)
+        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,process_id,command_id) VALUES ('bg','busy','running','bg',1234,'cmd-bg')")
+        self.con.commit()
+        for backend, env in (("boat", {}), ("server", {"OFFBOX_BACKEND": "server"}),
+                             ("server", {"OFFBOX_THREAD": "person:moni"})):
+            self.con.execute("UPDATE leases SET token_owner=? WHERE box_id='busy'",
+                             ("moni" if env.get("OFFBOX_THREAD") else "ardud",))
+            with self.subTest(backend=backend, env=env), patch.object(common, "_BACKEND", backend), \
+                    patch.dict(os.environ, env), patch.object(api, "cmd_status", return_value={"running": True}) as status:
+                self.refresh_background(self.con, self.me['repo_key'])
+                status.assert_called_once_with("busy", 1234)
+                self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='bg'").fetchone()[0], "running")
+
+    def test_slow_answering_detached_statuses_keep_new_run_on_home(self):
+        for index in range(3):
+            box = f"busy-{index}"
+            self.box(box, member=True)
+            self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,process_id,command_id) VALUES (?,?,'running','bg',1234,'cmd-bg')",
+                             (f"bg-{index}", box))
+        self.con.commit()
+        before = [dict(row) for row in self.con.execute("SELECT * FROM runs ORDER BY run_id")]
+        requests = []
+        def answering(req, timeout):
+            requests.append(req.full_url)
+            self.clock.sleep(min(2, timeout))
+            if timeout < 2:
+                raise TimeoutError("healthy status needs two seconds")
+            return io.BytesIO(b'{"running":true}')
+        def run(*args):
+            self.refresh_background(self.con, self.me['repo_key'])
+            return 7
+        with patch.object(api, "_key", return_value="fixture"), patch.object(api, "_open", side_effect=answering), \
+                patch.object(runs, "run_remote", side_effect=run) as remote:
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 7)
+        self.assertEqual(len(requests), 3)
+        remote.assert_called_once()
+        self.assertEqual(self.execs, [])
+        self.assertEqual([dict(row) for row in self.con.execute("SELECT * FROM runs ORDER BY run_id")], before)
 
     def test_boat_box_500_still_exits_90(self):
         with patch.object(common, "_BACKEND", "boat"):
