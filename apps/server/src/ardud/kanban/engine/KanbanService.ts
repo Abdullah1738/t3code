@@ -8328,7 +8328,8 @@ const make = Effect.gen(function* () {
   const localWaitPasses = new Set<string>();
   // These checks only need board state. In particular, do not put them behind
   // evaluator delivery, thread reads, or the running maintenance tick's guard.
-  const tickLocalWaits = Effect.fn("KanbanService.tickLocalWaits")(function* (boardId: string) {
+  const tickLocalWaits = Effect.fn("KanbanService.tickLocalWaits")(function* (board: KanbanBoard) {
+    const boardId = board.id;
     if (!Waits.WAITS_ENGINE_WIRED || localWaitPasses.has(boardId)) return;
     localWaitPasses.add(boardId);
     const started = yield* nowMillis;
@@ -8337,8 +8338,7 @@ const make = Effect.gen(function* () {
     const failedCards: number[] = [];
     const overdueCards: number[] = [];
     yield* Effect.gen(function* () {
-      const board = yield* store.board(KanbanBoardId.make(boardId));
-      if (!board || board.archivedAt !== null) return;
+      if (board.archivedAt !== null) return;
       const all = yield* store.cards(board.id);
       const parked = all.filter((card) => card.wait !== undefined && card.activeThreadId === null);
       stats.parked = parked.length;
@@ -9990,14 +9990,15 @@ const make = Effect.gen(function* () {
 
   const runningTicks = new Set<string>();
   const tickBoard = Effect.fn("KanbanService.tickBoard")(function* (
-    boardId: string,
+    board: KanbanBoard,
     turnEndLinks: ReadonlyMap<string, KanbanThreadLink>,
   ) {
+    const boardId = board.id;
     yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
     const busy = runningTicks.has(boardId);
     if (!busy) runningTicks.add(boardId);
     const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
-    yield* tickLocalWaits(boardId).pipe(
+    yield* tickLocalWaits(board).pipe(
       Effect.andThen(
         busy ? Effect.void : serialEach(ticking, boardId, tickSteps(boardId, turnEndLinks), false),
       ),
@@ -10031,7 +10032,7 @@ const make = Effect.gen(function* () {
     );
     const results = yield* Effect.forEach(
       yield* store.boards,
-      (board) => Effect.exit(tickBoard(board.id, turnEndLinks)),
+      (board) => Effect.exit(tickBoard(board, turnEndLinks)),
       {
         concurrency: "unbounded",
         discard: false,
