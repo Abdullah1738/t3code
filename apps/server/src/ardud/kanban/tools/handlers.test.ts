@@ -3337,7 +3337,7 @@ it.effect.each(["card", "discussion"] as const)(
 );
 
 it.effect.each(["card", "discussion"] as const)(
-  "discussion_post to %s reports an error when its reply times out before a save",
+  "discussion_post to %s says not saved when its reply times out before a save",
   (target) =>
     Effect.gen(function* () {
       const saved = yield* Deferred.make<void>();
