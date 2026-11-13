@@ -30,6 +30,8 @@ export const CHECK_TIMEOUT_MS = Number(process.env.ROBOB_WATCH_CHECK_TIMEOUT_MS 
 /** After SIGKILL, stop waiting for the process to report exit (a throttled process can take minutes to be reaped). */
 export const KILL_GRACE_MS = 5_000;
 export const FAILURE_ALERT_AFTER = 5;
+/** One failed tick that recovers is noise; the second in a row notifies. */
+export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
@@ -91,6 +93,8 @@ export type Watcher = {
   paused: boolean;
   /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
   max_consecutive_failures?: number;
+  /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
+  failure_notice_after?: number;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -260,6 +264,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  const noticeAfter = input.failure_notice_after;
+  if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
   if (depends !== undefined && !validDepends(depends)) errors.push('depends must be an array of "ssd" or "phone"');
   const quiet = input.quiet;
@@ -285,6 +291,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
+    ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -682,6 +689,11 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
+}
+
+export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
