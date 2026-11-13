@@ -134,7 +134,7 @@ class ToolLogTests(unittest.TestCase):
                     self.assertEqual(record['error']['tag'], result['tag'])
 
     def test_hook_errors_keep_ids_in_rollups(self):
-        native = 'thread:project:/fixture%2Frepo:thread-id'
+        native = 'thread:project:fixture%2Frepo:thread-id'
         toollog.hook('codex', 'shell', 'denied', 'fixture.denied', 1, ids={'threadId': native})
         self.assertEqual(toollog.rollup('agent-tools', self.day)['topErrorTags'][0]['sampleId'], {'threadId': native})
 
@@ -152,3 +152,100 @@ class ToolLogTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AttributionTests(unittest.TestCase):
+    def test_classes_and_private_identity(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp + '/logs',
+                'ROBOB_THREAD_ID': '', 'ROBOB_CARD_NUMBER': ''}):
+            root = Path(temp)
+            (root / 'repo/.git').mkdir(parents=True)
+            (root / 'wt').mkdir()
+            (root / 'wt/.git').write_text('gitdir: private-path')
+            for cwd, expected in [(str(root/'repo'), 'repo-root'), (str(root/'wt'), 'worktree'),
+                                  (str(Path.home()), 'home'), (temp, 'other')]:
+                self.assertEqual(toollog.cwd_class(cwd), expected)
+            for path, expected in [('/', 'filesystem'), ('/Users/ardud', 'home'),
+                    ('/Volumes/ExternalSSD', 'external'), ('/Volumes/ExternalSSD/board-wt', 'board-worktrees'),
+                    ('/private-fixture', 'other'), (None, 'none')]:
+                self.assertEqual(toollog.matched_root(path), expected)
+            for command, expected in [('rg private-fixture /', 'search'), ('/private/bin/python3 script', 'interpreter'),
+                    ('npm install secret', 'package-manager'), ('go test ./...', 'build'),
+                    ('git status', 'git'), ('secret-fixture --token', 'other')]:
+                self.assertEqual(toollog.command_props(command)['argv0Class'], expected)
+            toollog.hook('codex', 'shell', 'denied', 'privacy', 0, ids={'threadId': '/private-fixture',
+                         'sessionId': '/secret-session', 'cardNumber': 'secret'}, cwd='/private-fixture', matched='/private-fixture')
+            row = next(toollog.read('agent-tools', datetime.now(timezone.utc).strftime('%Y-%m-%d')))
+            self.assertNotIn('/private-fixture', json.dumps(row))
+            self.assertNotIn('/secret-session', json.dumps(row))
+            self.assertNotIn('cardNumber', row['ids'])
+
+    def test_repeats_survive_processes_and_expire(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp + '/logs',
+                'ROBOB_THREAD_ID': '', 'ROBOB_CARD_NUMBER': ''}):
+            script = "import sys; sys.path.insert(0, sys.argv[1]); import toollog; toollog.hook('claude','shell','denied','retry',0,'rg private-fixture /',ids={'sessionId':sys.argv[2]})"
+            for session in ['same', 'same', 'other']:
+                subprocess.run([sys.executable, '-I', '-c', script, str(Path(toollog.__file__).parent), session], check=True)
+            day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            self.assertEqual([r['props']['repeatCount'] for r in toollog.read('agent-tools', day)], [1, 2, 1])
+            with patch.object(toollog.time, 'time', return_value=time.time() + 61):
+                toollog.hook('claude','shell','denied','retry',0,'rg private-fixture /',ids={'sessionId':'same'})
+            self.assertEqual(list(toollog.read('agent-tools', day))[-1]['props']['repeatCount'], 1)
+
+    def test_rollup_sliding_loop_and_top_threads(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
+            day = '2026-11-13'
+            directory = toollog.board_dir('agent-tools')
+            directory.mkdir()
+            rows = []
+            base = datetime(2026, 11, 13, 0, 59, tzinfo=timezone.utc)
+            for thread, count, spacing in [('loop',21,10), ('quiet',20,10), ('spread',21,181)]:
+                for i in range(count):
+                    rows.append({'ts':(base+timedelta(seconds=i*spacing)).isoformat(), 'name':'hook.decision',
+                        'kind':'error', 'ids':{'threadId':thread}, 'props':{'rule':'rootwide-search','decision':'denied'}})
+            rows.append({'name':'other.event', 'ids':{'threadId':'loop'}, 'props':{'rule':'other'}})
+            (directory/(day+'.ndjson')).write_text('\n'.join(json.dumps(r) for r in reversed(rows))+'\n')
+            result = toollog.rollup('agent-tools',day,2)
+            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':'loop','count':21},{'threadId':'spread','count':21}])
+            self.assertEqual(result['repeatLoops'], [{'threadId':'loop','rule':'rootwide-search','maxCountInHour':21,'repeatLoop':True}])
+
+    def test_attributed_hook_under_point_one_ms(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
+            def call():
+                toollog.hook('claude','shell','denied','retry',0,'rg private-fixture /',ids={'sessionId':'perf-fixture'},cwd=temp,matched='/')
+            call()
+            started = time.perf_counter()
+            for _ in range(500):
+                call()
+            ms = (time.perf_counter()-started)*1000/500
+            print(f'attributed hook cost: {ms:.3f} ms/call')
+            self.assertLess(ms, .1)
+
+    def test_repeat_window_crosses_utc_midnight(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
+            ids={'threadId':'fixture', 'sessionId':'midnight-session'}
+            base=datetime(2026,11,13,23,59,50,tzinfo=timezone.utc).timestamp()
+            for offset, expected in [(0,1),(20,2),(81,1)]:
+                with patch.object(toollog.time,'time',return_value=base+offset):
+                    self.assertEqual(toollog._repeat_count('codex',ids,'shell','retry','rg'),expected)
+
+    def test_loop_window_boundaries_and_utc_day_attribution(self):
+        cases=[('same-day',20,10,False),('midnight',21,10,True),('hour-edge',21,180,True),
+               ('over-hour',21,181,False)]
+        for label, count, spacing, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ,{'TOOLLOG_ROOT':temp}):
+                directory=toollog.board_dir('agent-tools')
+                directory.mkdir()
+                base=datetime(2026,11,13,23,59,tzinfo=timezone.utc)
+                for i in range(count):
+                    at=base+timedelta(seconds=i*spacing)
+                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'loop'},'props':{'rule':'retry'}}
+                    with (directory/(at.strftime('%Y-%m-%d')+'.ndjson')).open('a') as dest:
+                        dest.write(json.dumps(row)+'\n')
+                result=toollog.rollup('agent-tools','2026-11-14')
+                self.assertEqual(bool(result['repeatLoops']),expected)
+                current_count=sum(1 for i in range(count) if (base+timedelta(seconds=i*spacing)).day==14)
+                self.assertEqual(result['total'],current_count)
+                self.assertEqual(result['topThreadsByRule']['retry'][0]['count'],current_count)
+                self.assertEqual(toollog.rollup('agent-tools','2026-11-13')['repeatLoops'],[])

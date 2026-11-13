@@ -1,4 +1,5 @@
 import { toolLog, toolError } from "./toollog.ts";
+import { StderrCause, stderrCause } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -76,6 +77,8 @@ export type Watcher = {
   id: string;
   title: string;
   check: string;
+  /** Side-effect-only check after a committed run or while delivery is pending; it must not consume ordinary events. */
+  pending_check?: string;
   interval_s: number;
   timeout_s?: number;
   mode: Mode;
@@ -209,7 +212,12 @@ export const watcherDir = (id: string) => join(WATCHERS, id);
 export function triggerSig(watcher: Watcher): string | undefined {
   if (!watcher.triggers?.length) return undefined;
   return watcher.triggers.map(path => {
-    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch { toolError("runner", "watch.trigger_stat_failed"); return "missing"; }
+    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch (error) {
+      toolError("runner", "watch.trigger_stat_failed", { watcher: watcher.id }, {
+        errnoCode: (error as NodeJS.ErrnoException).code ?? "UNKNOWN", triggerKind: path.endsWith("-wal") ? "wal" : "file",
+      });
+      return "missing";
+    }
   }).join("|");
 }
 
@@ -229,6 +237,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
   if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  if (input.pending_check !== undefined && (typeof input.pending_check !== "string" || !input.pending_check.trim())) errors.push("pending_check must be a nonempty command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
   const timeout = input.timeout_s;
@@ -273,6 +282,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
@@ -324,7 +334,7 @@ export function log(id: string | null, message: string): void {
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
-export type CheckResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
+export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -339,32 +349,35 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    const cause = new StderrCause();
     let grace: ReturnType<typeof setTimeout> | undefined;
-    const finish = (code: number | null, extra = "") => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null, extra = "") => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       clearTimeout(grace);
       const ms = now() - started;
-      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
-      resolve({ code, stdout, stderr: stderr + extra, timedOut, ms });
+      cause.add(extra);
+      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
+      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
       env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
-    child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
       try { process.kill(-child.pid!, "SIGKILL"); } catch { toolError("runner", "watch.kill_failed", { watcher: watcher.id }); }
       grace = setTimeout(() => {
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { toolError("runner", "watch.pipe_cleanup_failed", { watcher: watcher.id }); }
-        finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+        finish(child.exitCode, child.signalCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
-    child.on("close", code => finish(code));
-    child.on("error", error => finish(127, String(error)));
+    child.on("close", (code, signal) => finish(code, signal));
+    child.on("error", error => finish(127, null, String(error)));
   });
 }
 
@@ -373,10 +386,10 @@ async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; o
   try {
     const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
+    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
     return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
   } catch (error) {
-    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, error: { tag: "helper.spawn_failed" } });
+    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
     throw error;
   }
 }

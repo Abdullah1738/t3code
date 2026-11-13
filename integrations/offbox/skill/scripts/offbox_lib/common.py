@@ -44,6 +44,7 @@ BACKEND_STATE = _HOME_STATE / "backend-state.json"
 HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
 PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
 DEFAULT_OWNER = "ardud"
+_BACKEND_REASON: str | None = None
 _BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
 
 
@@ -147,6 +148,12 @@ def owner_of_root(repo_root: str | None) -> str:
     return DEFAULT_OWNER
 
 
+def base_owner(created_by: str | None) -> str:
+    by = created_by or ""
+    name = by[len(PERSON_PREFIX):] if by.startswith(PERSON_PREFIX) else ""
+    return name if _owner_name(name) else DEFAULT_OWNER
+
+
 def backend_pinned() -> str | None:
     """A backend somebody chose on purpose (environment or the pin file); automatic choice and failover are off."""
     b = os.environ.get("OFFBOX_BACKEND") or ""
@@ -185,8 +192,7 @@ def db_path_for(name: str) -> Path:
 
 
 def select_backend(name: str) -> str:
-    """Fix this process's backend. Call it before any other offbox_lib module is imported: api and capacity
-    read the backend once, at import."""
+    """Fix this process's backend before importing api or capacity, which bind it at import time."""
     global _BACKEND, DB_PATH
     if name not in ("server", "boat"):
         raise ValueError(name)
@@ -195,10 +201,16 @@ def select_backend(name: str) -> str:
     return name
 
 
+# Value-taking options on the run/box lookup commands; keep in sync with cli.build_parser.
+_ENTRY_VALUE_OPTIONS = {"--timeout", "--local", "--box"}
+
+
 def entry_backend(argv: list[str]) -> str:
     """The backend for one `offbox ...` call. Without a home server: boat, with no lookups at all.
     Otherwise: spend is Boat's meter and stats is the home server's; a command that names a run or a box goes to
-    the backend that run or box lives on; everything else follows default_backend()."""
+    the backend that run or box lives on. An unpinned Boat-only base uses Boat; other runs follow default_backend()."""
+    global _BACKEND_REASON
+    _BACKEND_REASON = None
     pin = backend_pinned()
     if pin:
         return pin
@@ -210,10 +222,36 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
+    if sub == "run" and first == "server" and person() is None:
+        # The CLI parser has no backend-bound imports. Use it so equals, abbreviations, repeated options and
+        # command arguments have exactly the same meaning here as when the run starts.
+        from .cli import build_parser
+        a = build_parser().parse_args(argv)
+        if a.base and not a.fresh:
+            from . import base_catalog
+            from .identity import repo_key, repo_root
+            full = a.base if ":" in a.base else base_catalog.full_name(a.base, repo_key(repo_root()))
+            if (any(r["name"] == full for r in base_catalog.rows("boat"))
+                    and not any(r["name"] == full for r in base_catalog.rows("server"))):
+                _BACKEND_REASON = "boat-only-base"
+                return "boat"
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
-        named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
-                                                                      and not x.startswith("-"))]
-        if sub == 'keep':
+        named = [x for x in argv if x.startswith(("run-", "bx_"))]
+        if sub in ("logs", "wait", "kill"):
+            named = []
+            args = iter(argv[argv.index(sub) + 1:])
+            for arg in args:
+                if arg == "--":
+                    arg = next(args, "")
+                elif arg.startswith("-"):
+                    option, equals, _ = arg.partition("=")
+                    # argparse also accepts unambiguous long-option abbreviations.
+                    if not equals and any(flag.startswith(option) for flag in _ENTRY_VALUE_OPTIONS):
+                        next(args, None)
+                    continue
+                named = [arg] if arg else []
+                break
+        elif sub == 'keep':
             # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
             import argparse
             selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
@@ -223,13 +261,14 @@ def entry_backend(argv: list[str]) -> str:
             except argparse.ArgumentError:
                 return first  # The full command parser reports malformed input.
             named = [selected.box] if selected.box else []
-        for name in (first, "boat" if first == "server" else "server"):
-            if any(_known(name, x) for x in named):
-                return name
+        for suffix in (False, True):
+            for name in (first, "boat" if first == "server" else "server"):
+                if any(_known(name, x, suffix=suffix) for x in named):
+                    return name
     return first
 
 
-def _known(name: str, ident: str) -> bool:
+def _known(name: str, ident: str, *, suffix: bool) -> bool:
     """Does this backend's database know the run or box? Read-only; a missing database knows nothing."""
     path = db_path_for(name)
     if not path.exists():
@@ -238,9 +277,11 @@ def _known(name: str, ident: str) -> bool:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
         try:
             if ident.startswith("bx_"):
+                if suffix:
+                    return False  # Box IDs only support exact lookup.
                 return con.execute("SELECT 1 FROM leases WHERE box_id=?", (ident,)).fetchone() is not None
-            return con.execute("SELECT 1 FROM runs WHERE run_id=? OR run_id LIKE ?",
-                               (ident, f"%{ident}")).fetchone() is not None
+            op, value = ("LIKE", f"%{ident}") if suffix else ("=", ident)
+            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ?", (value,)).fetchone() is not None
         finally:
             con.close()
     except sqlite3.Error:
@@ -635,10 +676,8 @@ def _owner_columns(con) -> None:
         con.executemany("UPDATE leases SET token_owner=? WHERE box_id=? AND token_owner IS NULL",
                         [(owner_of_root(r["repo_root"]), r["box_id"]) for r in leases])
         for r in bases:
-            by = r["created_by"] or ""
-            name = by[len(PERSON_PREFIX):] if by.startswith(PERSON_PREFIX) else ""
             con.execute("UPDATE bases SET token_owner=? WHERE name=? AND token_owner IS NULL",
-                        (name if _owner_name(name) else DEFAULT_OWNER, r["name"]))
+                        (base_owner(r["created_by"]), r["name"]))
         con.execute("UPDATE templates SET token_owner=? WHERE token_owner IS NULL", (DEFAULT_OWNER,))
         con.commit()
     except sqlite3.OperationalError as e:

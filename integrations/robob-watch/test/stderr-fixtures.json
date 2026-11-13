@@ -1,0 +1,17 @@
+[
+  {"class":"usage_error","stderr":"usage: PRIVATE helper --trip 123\n","lines":1},
+  {"class":"usage_error","stderr":"PRIVATE: unrecognized arguments: --secret\n","lines":1},
+  {"class":"usage_error","stderr":"ride-card: not a bridge chat slug: 'PRIVATE' (list them with cli.ts chats)\n","lines":1},
+  {"class":"usage_error","stderr":"ride-card: not an exact trip UUID: 'PRIVATE'\n","lines":1},
+  {"class":"missing_file","stderr":"PRIVATE: No such file or directory: /Users/private/health123.json\n","lines":1},
+  {"class":"missing_file","stderr":"Traceback (most recent call last):\nFileNotFoundError: [Errno 2] PRIVATE /data/private.json\n","lines":2},
+  {"class":"permission","stderr":"PRIVATE: Permission denied /Users/private/key\n","lines":1},
+  {"class":"permission","stderr":"PRIVATE: Operation not permitted\n","lines":1},
+  {"class":"timeout","stderr":"PRIVATE: command timed out after 123s\n","lines":1},
+  {"class":"timeout","stderr":"PRIVATE: subprocess.TimeoutExpired\n","lines":1},
+  {"class":"python_traceback","stderr":"Traceback (most recent call last):\n  File \"/Users/private/check.py\", line 123\nRuntimeError: PRIVATE\n","lines":3},
+  {"class":"unknown","stderr":"PRIVATE unexpected failure 123\n","lines":1},
+  {"class":"unknown","stderr":"PRIVATE partial line","lines":1},
+  {"class":"unknown","stderr":"PRIVATE first\r\n\r\nPRIVATE last\r\n","lines":3},
+  {"class":"unknown","stderr":"","lines":0}
+]

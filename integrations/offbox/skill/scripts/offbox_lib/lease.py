@@ -18,6 +18,7 @@ from .identity import remote_dir_for
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
 RESUME_STUCK_S = 90
+HOME_RESUME_LOCK_WAIT_S = 15
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
@@ -502,7 +503,8 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                     "using the repo template or recipe for this run")
                 base = None
             elif not brow:
-                raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
+                from .base_catalog import missing
+                raise missing(full)
         elif not template:
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
                                f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
@@ -931,6 +933,7 @@ def _wait_unanswered_resume(con, box_id):
         con.execute('INSERT INTO kv VALUES (?,?,?)', (key, str(end), time.time()))
         con.commit()
     with outage.accepted_machine():
+        network_failures = 0
         while True:
             left = end - time.time()
             budget_left = api.left()
@@ -944,10 +947,15 @@ def _wait_unanswered_resume(con, box_id):
                 raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
                                              "nothing ran; set aside and trying a new box")
             try:
-                state = api.get(box_id, deadline=time.time() + left)
-            except OffboxError:
+                state = api.readiness_get(box_id, deadline=time.time() + left)
+            except OffboxError as error:
+                network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
+                from . import home
+                if home.may_fail_over() and network_failures >= api.HOME_NETWORK_FAILURES:
+                    raise ResumeUnresolved(f"resume of {box_id} could not be confirmed; nothing ran: {error}", error) from error
                 state = None
             else:
+                network_failures = 0
                 if state is None or state.get('dataExpiredAt'):
                     _forget_expired(con, box_id, 'confirmed missing or expired during resume provisioning')
                     raise _ResumeExpired
@@ -966,7 +974,9 @@ def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: boo
                       confirm_only: bool = False):
     from . import allocation, prepare
     allocation.check_queue()
-    with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending):
+    from . import home
+    lock_wait = HOME_RESUME_LOCK_WAIT_S if home.may_fail_over() else None
+    with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending, lock_wait=lock_wait):
         return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
 
 
@@ -1003,6 +1013,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         unreadable = False
         observations = 0
         previous_read = time.monotonic()
+        network_failures = 0
         while True:
             allocation.check_queue()
             left = end - time.monotonic()
@@ -1020,12 +1031,17 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             if left <= 0:
                 break
             try:
-                last = api.get(box_id, deadline=time.time() + left)
-            except OffboxError:
+                last = api.readiness_get(box_id, deadline=time.time() + left)
+            except OffboxError as error:
+                network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
+                from . import home
+                if home.may_fail_over() and network_failures >= api.HOME_NETWORK_FAILURES:
+                    raise ResumeUnresolved(f"resume of {box_id} could not be confirmed; nothing ran: {error}", error) from error
                 last = None
                 observed = False
                 unreadable = True
             else:
+                network_failures = 0
                 if last is None or last.get('dataExpiredAt'):
                     _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
                     raise _ResumeExpired
@@ -1235,11 +1251,15 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
     try:
-        s = api.get(box_id)
-    except api.NetworkError:
+        s = api.readiness_get(box_id)
+    except api.NetworkError as error:
         if allocation.in_queue() and pending_grow and api.left() is not None and api.left() <= 0:
             raise ArchivingSkip(f"{box_id} status read reached its affinity deadline; waiting in the pool queue",
                                 code=EXIT_BUSY) from None
+        from . import home
+        if home.may_fail_over():
+            # A silent server is not evidence that another box in the same pool will work.
+            raise ResumeUnresolved(f"could not read {box_id} before resume; nothing ran: {error}", error) from error
         raise
     if s is None or s.get("state") in ("error", "cancelled"):
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")

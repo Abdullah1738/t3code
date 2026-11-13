@@ -1,4 +1,5 @@
 import { toolLog, toolError, rollup } from "./toollog.ts";
+import { stderrCause } from "./cause.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -145,13 +146,14 @@ async function main(argv: string[]): Promise<void> {
       // outside watcher.json, so no replace can lift one.
       if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
       if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
+      if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
       if (values.json === undefined && previous?.depends) input.depends = previous.depends;
       if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;
       if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
       if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
       let watcher: Watcher;
-      try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition"); throw new CliError((error as Error).message); }
+      try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
       const dir = watcherDir(watcher.id);
       const replacingExisting = existsSync(join(dir, "watcher.json"));
       if (replacingExisting) {
@@ -356,7 +358,8 @@ async function main(argv: string[]): Promise<void> {
 try {
   await main(process.argv.slice(2));
 } catch (error) {
-  toolError("cli", "watch.command_failed");
+  const cause = stderrCause(error instanceof Error ? error.message : "");
+  toolError("cli", "watch.command_failed", undefined, { stderrClass: error instanceof CliError ? "usage_error" : cause.stderrClass });
   console.error(`robob-watch: ${error instanceof CliError ? error.message : String((error as Error)?.message ?? error)}`);
   process.exitCode = 1;
 }

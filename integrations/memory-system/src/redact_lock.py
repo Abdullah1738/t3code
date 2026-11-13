@@ -25,9 +25,20 @@ def fence(root=None, *, exclusive=False, blocking=True):
 
 
 if __name__ == '__main__':
-    with fence():
-        env = dict(os.environ, RECALL_FENCED='1')
-        # The backup guard's flock must survive this intermediate wrapper.
-        lock_fd = os.environ.get('MEMORY_BACKUP_LOCK_FD')
-        inherited = (int(lock_fd),) if lock_fd is not None else ()
-        sys.exit(subprocess.run(sys.argv[1:], env=env, pass_fds=inherited).returncode)
+    try:
+        with fence():
+            env = dict(os.environ, RECALL_FENCED='1')
+            # The backup guard's flock must survive this intermediate wrapper.
+            lock_fd = os.environ.get('MEMORY_BACKUP_LOCK_FD')
+            inherited = (int(lock_fd),) if lock_fd is not None else ()
+            result = subprocess.run(sys.argv[1:], env=env, pass_fds=inherited).returncode
+    except Exception:
+        if os.environ.get('MEMORY_BACKUP_GUARDED') == '1':
+            try:
+                import time
+                from backup_control import log_skip
+                log_skip(time.time(), 'other', lock_path().parents[1]/'backup.lock', 1)
+            except Exception:
+                pass
+        raise
+    sys.exit(result)

@@ -752,7 +752,10 @@ export function useThreadActions() {
     return result;
   };
 
-  const confirmAndUnpinThread = async (target: ScopedThreadRef) => {
+  const confirmAndUnpinThread = async (
+    target: ScopedThreadRef,
+    opts: { onUnpinned?: () => void } = {},
+  ) => {
     const permissionFailure = threadOperationFailure(target);
     if (permissionFailure) return permissionFailure;
     const localApi = readLocalApi();
@@ -768,7 +771,9 @@ export function useThreadActions() {
     if (!confirmationResult.value) {
       return AsyncResult.success(undefined);
     }
-    return unpinThread(target);
+    const result = await unpinThread(target);
+    if (result._tag === "Success") opts.onUnpinned?.();
+    return result;
   };
 
   const reorderPinnedThread = async (target: ScopedThreadRef, orderKey: string) => {

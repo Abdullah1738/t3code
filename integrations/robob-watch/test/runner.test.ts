@@ -140,6 +140,37 @@ test("an undelivered event is kept and retried under the same key before the che
   expect(events("watch.retry", "retry").length).toBeGreaterThan(0);
 }, 20_000);
 
+test("pending side checks run during quiet hours without consuming or replacing the held event", async () => {
+  for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone: "Asia/Dubai" }).format());
+  const checked = join(sandbox, "pending-side-check");
+  const definition = join(sandbox, "pending-side.json");
+  writeFileSync(definition, JSON.stringify({ id: "pending-side", title: "Pending side", check: "echo ordinary-stage", interval_s: 10,
+    pending_check: `test -f .run-ok && grep -q ordinary-stage state.json && echo "\${WATCH_MAIN_CHECKED:-pending}" >> '${checked}'`, mode: "notify", context: "x", expires_at: "1d", max_fires: 0,
+    quiet: { start: hour, end: (hour + 1) % 24, time_zone: "Asia/Dubai" } }));
+  expect(cli("add", "--json", definition).exitCode).toBe(0);
+  await runnerFor(2_500);
+  const held = state("pending-side").pending;
+  expect(held.event).toBe("ordinary-stage");
+  expect(readFileSync(checked, "utf8").trim()).toBe("1");
+  writeFileSync(join(sandbox, "root/watchers/pending-side/state.json"), JSON.stringify({ ...state("pending-side"), next_at: 0 }));
+  await runnerFor(2_500);
+  expect(readFileSync(checked, "utf8").trim()).toBe("1\npending");
+  expect(state("pending-side").pending).toEqual(held);
+  expect(state("pending-side").fires).toBe(0);
+  expect(readCalls().some(call => call.args.join(" ").includes("ordinary-stage"))).toBe(false);
+  const file = join(sandbox, "root/watchers/pending-side/watcher.json");
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  delete saved.quiet;
+  writeFileSync(file, JSON.stringify(saved));
+  writeFileSync(join(sandbox, "root/watchers/pending-side/state.json"), JSON.stringify({ ...state("pending-side"), next_at: 0 }));
+  await runnerFor(2_500);
+  expect(state("pending-side").pending).toBeUndefined();
+  expect(readCalls().filter(call => call.args.join(" ").includes("ordinary-stage"))).toHaveLength(1);
+  expect(readFileSync(checked, "utf8").trim()).toBe("1\npending");
+  cli("remove", "pending-side");
+}, 20_000);
+
 test("quiet hours hold an event, new or retried, under its key and deliver it once they end", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
@@ -205,6 +236,10 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   await runnerFor(2_000);
   expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(0);
   expect(state("esc").next_at - Date.now()).toBeLessThanOrEqual(300_000);
+  expect(events("watch.run", "esc")).toContainEqual(expect.objectContaining({
+    error: { tag: "watch.check_failed", message: "watch.check_failed" },
+    props: expect.objectContaining({ exitCode: 1, signal: null, timedOut: false }),
+  }));
   // Failing 16 min: one wake with the error and repair instructions.
   writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0, failing_since: new Date(Date.now() - 16 * 60_000).toISOString() }));
   await runnerFor(2_000);
@@ -353,7 +388,7 @@ test("timeouts alert into the burst immediately but pause only after ten minutes
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
   expect(state("slow").failure_paused_at).toBeUndefined();
-  expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout" }), ok: false }));
+  expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout", exitCode: null, signal: "SIGKILL", timedOut: true }), ok: false }));
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
   expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));

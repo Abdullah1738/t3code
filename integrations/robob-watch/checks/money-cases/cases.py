@@ -37,12 +37,15 @@ An optional due date uses the same format; deadline remains the follow-up ping d
 """
 import argparse
 import calendar
+import contextvars
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr
 import fcntl
 import faulthandler
+import functools
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -58,6 +61,10 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charges  # noqa: E402
 import payments  # noqa: E402
+# Inbox triage already uses the watcher helper named toollog in this process.
+_log_spec = importlib.util.spec_from_file_location('money_cases_orders_log', Path(__file__).resolve().with_name('toollog.py'))
+toollog = importlib.util.module_from_spec(_log_spec)
+_log_spec.loader.exec_module(toollog)
 
 # robob-watch test copies the watcher into scratch, while helpers stay installed.
 REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
@@ -108,7 +115,124 @@ LABELLED = re.compile(
 
 
 class CaseError(Exception):
+    def __init__(self, message, tag='OPERATION_FAILED'):
+        super().__init__(message)
+        self.tag = tag
+
+
+_LOG_EVENTS = contextvars.ContextVar('money_cases_events', default=None)
+_CLI_WATCHDOG = contextvars.ContextVar('money_cases_watchdog', default=False)
+
+
+class LogTimeout(BaseException):
+    # Bypass the shared logger's Exception handlers so one slow write ends the entire flush.
     pass
+
+
+def record_event(name, **values):
+    # Nested case changes can run under the question book's lock. Only queue facts here;
+    # the outer operation calls the logger after all its books have been released.
+    try:
+        pending = _LOG_EVENTS.get()
+        if pending is not None:
+            pending.append((name, values))
+    except Exception:
+        pass
+
+
+def log_scope(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        if _LOG_EVENTS.get() is not None:
+            return fn(*args, **kwargs)
+        events = []
+        token = _LOG_EVENTS.set(events)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _LOG_EVENTS.reset(token)
+            try:
+                remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+                # An earlier caller deadline uses an Exception that the logger could swallow.
+                # Leave that timer alone and drop diagnostics when it is already near expiry.
+                if not remaining or remaining > 0.25:
+                    with within(time.time() + 0.25, LogTimeout()):
+                        for name, values in events:
+                            try:
+                                toollog.emit('money-cases', name, **values)
+                            except Exception:
+                                pass
+            except (LogTimeout, Exception):
+                pass
+    return wrapped
+
+
+def case_operation(name):
+    def decorate(fn):
+        @log_scope
+        @functools.wraps(fn)
+        def wrapped(data, case_id, *args, **kwargs):
+            try:
+                return fn(data, case_id, *args, **kwargs)
+            except Exception as exc:
+                record_event(name, kind='error', ok=False, ids={'caseId': case_id},
+                             error=getattr(exc, 'tag', 'OPERATION_FAILED'))
+                raise
+        return wrapped
+    return decorate
+
+
+def record_closed(case, at):
+    try:
+        opened = moment(case.get('opened'))
+        age = max(0, ((at or now_dubai()) - opened).days) if opened else 0
+        record_event('case.close', ok=True, ids={'caseId': case['id']},
+                     props={'kind': case.get('kind', 'charge'), 'ageDays': age})
+    except Exception:
+        pass
+
+
+def log_ask(fn):
+    @log_scope
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            result = fn(*args, **kwargs)
+        except Exception:
+            record_event('question.ask', kind='error', ok=False, error='OPERATION_FAILED',
+                         props={'outcome': 'failed'})
+            raise
+        outcome = {0: 'ask_now', DONT_ASK: 'dont_ask', 4: 'unverified'}.get(result[0], 'failed')
+        record_event('question.ask', kind='error' if result[0] == 4 else 'event',
+                     ok=result[0] in (0, DONT_ASK), props={'outcome': outcome},
+                     error='OPERATION_FAILED' if result[0] == 4 else None)
+        return result
+    return wrapped
+
+
+def log_cli(fn):
+    @log_scope
+    @functools.wraps(fn)
+    def logged(*args, **kwargs):
+        record_event('cmd.start')
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException:
+            record_event('cmd.end', ok=False)
+            raise
+        record_event('cmd.end', ok=result == 0)
+        return result
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        token = _CLI_WATCHDOG.set(False)
+        try:
+            return logged(*args, **kwargs)
+        finally:
+            if _CLI_WATCHDOG.get():
+                faulthandler.cancel_dump_traceback_later()
+            _CLI_WATCHDOG.reset(token)
+    return wrapped
 
 
 def luhn(digits):
@@ -400,6 +524,7 @@ def corroborate_in(book, case_id, text, at=None):
     return case
 
 
+@case_operation('case.corroborate')
 def corroborate(data, case_id, merchant, amount, currency, charged, kind, observation, at=None):
     """Record that another channel (say SMS after mail) saw the same charge. Counts it once.
 
@@ -410,9 +535,11 @@ def corroborate(data, case_id, merchant, amount, currency, charged, kind, observ
         case = find(book, case_id)
         if case.get('merchant') == UNMATCHED or charge_key(case) != charge_key(candidate) \
                 or case.get('kind', 'charge') != kind:
-            raise CaseError(f'{case_id!r} is not this charge (merchant, amount, currency, day or kind differ)')
+            raise CaseError(f'{case_id!r} is not this charge (merchant, amount, currency, day or kind differ)',
+                            tag='CORROBORATE_MISMATCH')
         corroborate_in(book, case_id, 'seen again: ' + check_text('observation', observation), at)
         merge_state(case, observation, at)
+    record_event('case.corroborate', ok=True, ids={'caseId': case_id})
     return case
 
 
@@ -823,6 +950,7 @@ def find(book, case_id):
     raise CaseError(f'no case {case_id!r}')
 
 
+@case_operation('case.open')
 def add(data, case_id, merchant, amount, currency, state, next_action, deadline, who,
         reference='', why='', watchers=(), at=None, root=None, charged='', kind='charge', unmatched=False,
         repeat=None, distinct=False, end=None, due=None):
@@ -856,7 +984,8 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
         if candidates and not (repeat or distinct):
             raise CaseError(f'a charge with this merchant, amount, currency and day is already recorded as '
                             f'{", ".join(map(repr, candidates))}. Say --repeat ID if it is the same charge, or '
-                            f'--distinct if it is a second transaction; nothing was added.')
+                            f'--distinct if it is a second transaction; nothing was added.',
+                            tag='CHARGE_DUPLICATE_CANDIDATE')
         if repeat:
             if repeat not in candidates:
                 raise CaseError(f'--repeat {repeat!r} is not a charge matching this one')
@@ -864,16 +993,22 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
                 raise CaseError('give --repeat or --distinct, not both')
             corroborate_in(book, repeat, f"seen again: {check_text('reference', reference, False) or 'repeat'}", at)
             merge_state(find(book, repeat), state, at)
-            return find(book, repeat)
-        book['cases'].append(case)
+            case = find(book, repeat)
+        else:
+            book['cases'].append(case)
+    record_event('case.corroborate' if repeat else 'case.open', ok=True, ids={'caseId': case['id']},
+                 props={} if repeat else {'kind': case.get('kind', 'charge'), 'unmatched': unmatched})
     return case
 
 
+@case_operation('case.update')
 def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None,
            because='', reply='', source='', cascade_questions=True):
     checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline, 'due': check_deadline}
     with Locked(data) as book:
         case = find(book, case_id)
+        before = {key: case.get(key) for key in FIELDS}
+        before['watchers'] = list(case['watchers'])
         old_state = case['state']
         said = []
         moved = False
@@ -898,9 +1033,10 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
         reply = check_text('reply', reply, False)
         source = check_source(source) if source else ''
         if moved and not (source or reply):
-            raise CaseError('deadline changes need --source (mail:, sms:, imessage: or statement:) or --reply (his reply id); nothing was changed')
+            raise CaseError('deadline changes need --source (mail:, sms:, imessage: or statement:) or --reply (his reply id); nothing was changed',
+                            tag='DEADLINE_REASON_REQUIRED')
         if due_moved and not (because or reply):
-            raise CaseError('due changes need --because or --reply; nothing was changed')
+            raise CaseError('due changes need --because or --reply; nothing was changed', tag='DEADLINE_REASON_REQUIRED')
         if because:
             said.append(f'because: {because}')
         if reply:
@@ -940,6 +1076,9 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
             if (reply or source) and not re.search(r'\boverdue\b', changes['state'], re.I):
                 case.pop('urgency', None)
             merge_state(case, changes['state'], at)
+        changed_fields = sorted(key for key in (*FIELDS, 'watchers') if before.get(key) != case.get(key))
+    record_event('case.update', ok=True, ids={'caseId': case_id},
+                 props={'fields': ','.join(changed_fields), 'deadlineMoved': moved, 'answered': bool(reply)})
     if reply and cascade_questions:
         with Locked(data, 'questions') as questions:
             for q in questions['questions']:
@@ -1483,7 +1622,9 @@ def follow_payments(data, now, deadline, find=None, stats=None, end=None):
     return errors
 
 
+@case_operation('case.close')
 def close(data, case_id, outcome, at=None, source=''):
+    closed_cases = []
     if case_id.startswith('q-'):
         source, outcome = check_source(source), check_text('outcome', outcome)
         with Locked(data, 'questions') as questions:
@@ -1496,6 +1637,9 @@ def close(data, case_id, outcome, at=None, source=''):
                     if active(parent):
                         payment_close(parent, outcome, at)
                         parent['history'][-1]['source'] = source
+                        closed_cases.append(parent)
+                for case in closed_cases:
+                    record_closed(case, at)
                 for other in questions['questions']:
                     if linked_case(other) == q['case'] and active(other):
                         settle(other, outcome, source, at or now_dubai())
@@ -1510,6 +1654,7 @@ def close(data, case_id, outcome, at=None, source=''):
         if case.get('status') == 'awaiting_answer' and not source:
             raise CaseError('closing an awaiting_answer case needs --source; use answered for his answer')
         case.update(status='closed', closed=stamp(at), outcome=outcome, updated=stamp(at))
+        closed_cases.append(case)
         # A pre-auth hold that drops off was released, not refunded.
         word = 'released' if case.get('kind') == 'hold' else 'closed'
         case['history'].append({'at': stamp(at), 'text': f'{word}: {outcome}', 'owner': True, 'source': source})
@@ -1521,6 +1666,9 @@ def close(data, case_id, outcome, at=None, source=''):
                         (deadline_of(other) and deadline_of(case) and
                          abs(deadline_of(other) - deadline_of(case)) <= dt.timedelta(days=1))):
                     payment_close(other, outcome, at, owner=True)
+                    closed_cases.append(other)
+    for closed_case in closed_cases:
+        record_closed(closed_case, at)
     with Locked(data, 'questions') as questions:
         for q in questions['questions']:
             if linked_case(q) == case_id:
@@ -1528,6 +1676,7 @@ def close(data, case_id, outcome, at=None, source=''):
     return case
 
 
+@case_operation('case.reopen')
 def reopen(data, case_id, deadline, note, at=None):
     with Locked(data) as book:
         case = find(book, case_id)
@@ -1539,6 +1688,7 @@ def reopen(data, case_id, deadline, note, at=None):
         case.update(status='open', closed=None, outcome=None, deadline=check_deadline(deadline), updated=stamp(at),
                     rev=case.get('rev', 0) + 1, cycle=case.get('cycle', 0) + 1)
         case['history'].append({'at': stamp(at), 'text': 'reopened: ' + note, 'owner': True})
+    record_event('case.reopen', ok=True, ids={'caseId': case_id})
     return case
 
 
@@ -2032,6 +2182,7 @@ def case_from(data, q, now, by, root=None, end=None):
     return cid
 
 
+@case_operation('case.close')
 def close_untouched(data, cid, outcome, now, end=None):
     """Close a money case a charge question opened, unless someone has worked on it since."""
     with Locked(data, wait=lock_wait(end)) as book:
@@ -2046,7 +2197,8 @@ def close_untouched(data, cid, outcome, now, end=None):
         outcome = clip(redact(outcome), 200)
         case.update(status='closed', closed=stamp(now), outcome=outcome, updated=stamp(now))
         case['history'].append({'at': stamp(now), 'text': 'closed: ' + outcome})
-        return True
+    record_closed(case, now)
+    return True
 
 
 def explain_question(data, q, result, by, now, end=None):
@@ -2059,6 +2211,7 @@ def explain_question(data, q, result, by, now, end=None):
     q['explanation'] = redact_all(result)
 
 
+@log_scope
 def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=None, said=None, record=True,
            item=None):
     """For inbox triage: None when the text isn't a card alert this reads, else {verdict, why, id,
@@ -2143,6 +2296,7 @@ def triaged(data, outcomes, now=None):
                 settle(q, 'already answered in a chat', 'triage', now)
 
 
+@log_ask
 def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadline=None, root=None,
         find=None, said=None, daily=False, daily_run=None):
     """The gate before anyone asks him about a charge: (0, message) means ask now and the ask is
@@ -2231,6 +2385,7 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
                    f"money-cases answered {q['id']} --note '<his answer>'.")
 
 
+@log_scope
 def answered(data, qid, note, now=None):
     """His answer settles the question. A money case it opened stays open with his answer noted: he may
     have said it isn't his."""
@@ -2257,6 +2412,7 @@ def answered(data, qid, note, now=None):
         return q
 
 
+@log_scope
 def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, stats=None):
     """Close questions a receipt or his words now explain, including ones already turned into money
     cases (FOLLOW_CASE). Asked questions remain awaiting_answer indefinitely. Least recently checked
@@ -2677,8 +2833,27 @@ def payment_entries(cases, now, sent, pending=False):
     return entries
 
 
+@log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
+    diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False, 'slowest': 'reconcile'}
+    try:
+        return _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
+    finally:
+        try:
+            # The check owns the start and timing samples; logging adds no second timer.
+            duration = diagnostic.get('total_s')
+            if duration is None:
+                duration = time.time() - diagnostic['started']
+            record_event('check.run', kind='perf', duration_ms=duration * 1000, ok=diagnostic['ok'],
+                         props={key: diagnostic[key] for key in ('budgetHit', 'openCases', 'fired')} |
+                               {'slowestPhase': diagnostic['slowest']})
+        except Exception:
+            pass
+
+
+def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, diagnostic):
     started = time.time()
+    diagnostic['started'] = started
     end = started + CHECK_BUDGET
     # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
@@ -2694,6 +2869,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     retained_outbox = state.get('outbox')
     try:
         with within(work_end, CheckTimeout('out of time; the rest next check')):
+            diagnostic['openCases'] = sum(active(c) for c in load(data)['cases'])
             out = state.pop('outbox', None)
             if out:
                 for key in out['keys']:
@@ -2742,6 +2918,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                 state.pop('question_errors', None)
             # Only new keys may produce another event, even when delivery is never acknowledged.
             cases = load(data)['cases']
+            diagnostic['openCases'] = sum(active(c) for c in cases)
             cutoff = stamp(now - KEEP_SENT)
             live = live_keys(cases)
             state['sent'] = {k: v for k, v in state['sent'].items() if v >= cutoff or k in live or k.startswith(live)}
@@ -2839,6 +3016,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                     state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
                                        'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
     except CheckTimeout as e:
+        diagnostic['budgetHit'] = time.time() >= work_end
         errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
         errors.append(str(e))
         # A partly built event was never handed to the runner. Keep only a previously owned outbox.
@@ -2865,9 +3043,12 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             write_json(pings, state, timing=timing)
             saved = True
     except CheckTimeout:
+        diagnostic['budgetHit'] = diagnostic['budgetHit'] or time.time() >= end
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()
+    diagnostic.update(result, ok=saved and not state.get('question_errors', {}).get('errors'),
+                      fired=int(bool(event)))
     if not saved or result['total_s'] > 20:
         print('money-cases timing: ' + json.dumps({**result, 'pings_saved': saved}, sort_keys=True), file=sys.stderr)
     return event
@@ -2953,6 +3134,7 @@ def table(cases):
     return redact('\n'.join(rows)) or 'No cases.'
 
 
+@log_cli
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(prog='money-cases', description=__doc__.split('\n')[0])
@@ -3116,30 +3298,28 @@ def main(argv=None):
             faulthandler.enable(file=sys.stderr)
             faulthandler.dump_traceback_later(float(os.environ.get('MONEY_CASES_HARD_STOP', CHECK_BUDGET + 8)),
                                              exit=True)
-            try:
-                wd = Path(os.environ.get('WATCH_DIR', LIVE))
-                wd.mkdir(parents=True, exist_ok=True)
-                data = DATA
-                if wd.resolve() != LIVE.resolve():
-                    # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
-                    data = wd / 'scratch-books'
-                    if not data.exists():
-                        data.mkdir(mode=0o700)
-                        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
-                            if (DATA / name).exists():
-                                shutil.copy2(DATA / name, data / name)
-                with (wd / 'check.lock').open('a') as lock:
-                    try:
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        # Nonzero so the runner keeps its last .run-ok acknowledgement.
-                        print('money-cases check already running', file=sys.stderr)
-                        return 75
-                    event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
-                if event:
-                    print(event)
-            finally:
-                faulthandler.cancel_dump_traceback_later()
+            _CLI_WATCHDOG.set(True)
+            wd = Path(os.environ.get('WATCH_DIR', LIVE))
+            wd.mkdir(parents=True, exist_ok=True)
+            data = DATA
+            if wd.resolve() != LIVE.resolve():
+                # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
+                data = wd / 'scratch-books'
+                if not data.exists():
+                    data.mkdir(mode=0o700)
+                    for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
+                        if (DATA / name).exists():
+                            shutil.copy2(DATA / name, data / name)
+            with (wd / 'check.lock').open('a') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # Nonzero so the runner keeps its last .run-ok acknowledgement.
+                    print('money-cases check already running', file=sys.stderr)
+                    return 75
+                event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
+            if event:
+                print(event)
         elif args.command == 'brief':
             line = brief(visible_cases(DATA))
             if line:

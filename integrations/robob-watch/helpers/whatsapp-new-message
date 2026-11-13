@@ -1,5 +1,5 @@
 #!/bin/zsh -f
-source "${0:A:h}/toollog.zsh" whatsapp-new-message 2>/dev/null || true
+source "${0:A:h}/toollog.zsh" whatsapp-new-message "$0" "$@" || true
 # whatsapp-new-message JID [--from NAME]
 # Prints new incoming WhatsApp messages (not "Me:") in that chat since the last run, one
 # "(dd-mm-yy HH:MM:SS) Name: text" line each. First run records a baseline and prints nothing.

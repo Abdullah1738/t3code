@@ -4,6 +4,8 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import * as NodeTimersPromises from "node:timers/promises";
+import * as Console from "effect/Console";
+import * as Effect from "effect/Effect";
 
 const { values } = NodeUtil.parseArgs({
   options: {
@@ -75,15 +77,17 @@ try {
       db.exec("ROLLBACK");
     }
     if (result) {
-      console.log(JSON.stringify(result));
+      Effect.runSync(Console.log(JSON.stringify(result)));
       process.exitCode = result.lagMs <= 5_000 ? 0 : 1;
       break;
     }
     await NodeTimersPromises.setTimeout(100);
   }
   if (process.exitCode === undefined) {
-    console.error(
-      JSON.stringify({ error: "identity_not_visible", elapsedMs: Date.now() - started }),
+    Effect.runSync(
+      Console.error(
+        JSON.stringify({ error: "identity_not_visible", elapsedMs: Date.now() - started }),
+      ),
     );
     process.exitCode = 2;
   }

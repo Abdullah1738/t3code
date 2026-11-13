@@ -8,6 +8,8 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import api, cli, common, lease, misc, pool, reap, runs, ssh_sync, start_check
 from test_capacity import Isolated
 
@@ -110,7 +112,7 @@ class BackgroundOutputTests(Isolated):
                             patch.object(misc.subprocess, 'run', wraps=subprocess.run) as ssh:
                         # ssh passes the remote command after the hostname; execute that command in a real shell.
                         ssh.side_effect = lambda argv, **kw: real_run(['bash', '-c', argv[-1]],
-                                                                 env=dict(os.environ, HOME=str(home)), **kw)
+                                                                 env=clean_env(HOME=str(home)), **kw)
                         code, out, err = self.invoke()
                     self.assertEqual((code, out), (0, remote.read_text()))
                     self.assertEqual(self.path.read_bytes(), remote.read_bytes())
@@ -139,7 +141,7 @@ class BackgroundOutputTests(Isolated):
                     commands = []
                     def ssh(argv, **kw):
                         commands.append(argv[-1])
-                        return real_run(['bash', '-c', argv[-1]], env=dict(os.environ, HOME=str(home)), **kw)
+                        return real_run(['bash', '-c', argv[-1]], env=clean_env(HOME=str(home)), **kw)
                     with patch.object(ssh_sync, 'ssh_base', return_value=['ssh']), \
                             patch.object(misc.subprocess, 'run', side_effect=ssh):
                         code, out, _ = self.invoke()

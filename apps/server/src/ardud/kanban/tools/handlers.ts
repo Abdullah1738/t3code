@@ -470,7 +470,9 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId, true);
-        const cards = yield* service.cards(board.id);
+        const cards = yield* service.cards(board.id, {
+          includeSettled: input.includeSettled === true,
+        });
         const found = cards
           .filter(
             (card) =>

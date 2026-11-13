@@ -7,6 +7,7 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import containers, runs
 from test_capacity import Isolated
 
@@ -45,7 +46,7 @@ class StaleContainersTests(Isolated):
             p=bins/name; p.write_text(body); p.chmod(0o755)
         self.state=self.home/'state'; self.state.write_text(json.dumps([item('a')]))
         self.calls=self.home/'calls'
-        self.env=dict(os.environ,HOME=str(self.home),PATH=str(bins)+os.pathsep+os.environ['PATH'],
+        self.env=clean_env(HOME=str(self.home),PATH=str(bins)+os.pathsep+os.environ['PATH'],
                       FAKE_STATE=str(self.state),FAKE_CALLS=str(self.calls))
         self.box('bx',member=True)
         self.con.execute("INSERT INTO runs(run_id,box_id,status,end_at,docker) VALUES ('r','bx','killed',?,0)",(1794528000,))

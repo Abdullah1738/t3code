@@ -116,3 +116,14 @@ export function completeChoiceDraft(
       : null;
   store.set(key, result);
 }
+
+/** Offset zero is the newest end of an inverted list; row intersection is insufficient. */
+export function newestEndVisible(offset: number, viewportHeight: number): boolean {
+  return (
+    Number.isFinite(offset) &&
+    Number.isFinite(viewportHeight) &&
+    viewportHeight > 0 &&
+    offset >= 0 &&
+    offset <= 2
+  );
+}

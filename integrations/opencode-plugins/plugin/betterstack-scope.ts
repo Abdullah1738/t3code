@@ -46,7 +46,7 @@ export default {
     const allowed = isCrpkoDirectory(directory)
     await ctx.permission.hook("evaluate", (event: Evaluation) => {
       if (!event.action.startsWith("betterstack_")) return
-      toolLogHook('betterstack-scope', allowed ? 'allowed' : 'denied', 'betterstack-scope', performance.now(), undefined, undefined, {sessionId:event.sessionID})
+      toolLogHook('betterstack-scope', allowed ? 'allowed' : 'denied', 'betterstack-scope', performance.now(), undefined, undefined, {sessionId:event.sessionID}, {cwd:directory})
       if (allowed) return
       event.effect = "deny"
       event.message = message

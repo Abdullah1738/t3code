@@ -1,3 +1,4 @@
+import { prepareShortcutRecording, recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import { AuthPreviewOperateScope } from "@t3tools/contracts";
 import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
@@ -93,6 +94,7 @@ function ChatRouteGlobalShortcuts() {
         if (undoLatestThreadAction()) {
           event.preventDefault();
           event.stopPropagation();
+          recordConsumedShortcut(event, command);
         }
         return;
       }
@@ -106,11 +108,14 @@ function ChatRouteGlobalShortcuts() {
       if (command === "chat.newLocal") {
         event.preventDefault();
         event.stopPropagation();
+        const record = prepareShortcutRecording(event, command);
         void startNewThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
           defaultProjectRef,
           handleNewThread,
+        }).then((executed) => {
+          if (executed) record();
         });
         return;
       }
@@ -123,6 +128,7 @@ function ChatRouteGlobalShortcuts() {
         event.preventDefault();
         event.stopPropagation();
         void startScratchThread(environmentId);
+        recordConsumedShortcut(event, command);
         return;
       }
 
@@ -131,13 +137,17 @@ function ChatRouteGlobalShortcuts() {
         event.stopPropagation();
         if (!legacySidebarEnabled && projectChoiceCount > 1) {
           openCommandPalette({ open: "new-thread-in" });
+          recordConsumedShortcut(event, command);
           return;
         }
+        const record = prepareShortcutRecording(event, command);
         void startNewThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
           defaultProjectRef,
           handleNewThread,
+        }).then((executed) => {
+          if (executed) record();
         });
         return;
       }
@@ -156,7 +166,7 @@ function ChatRouteGlobalShortcuts() {
           );
           return;
         }
-        dispatchPreviewAction("toggle-panel");
+        if (dispatchPreviewAction("toggle-panel")) recordConsumedShortcut(event, command);
         return;
       }
 
@@ -180,7 +190,7 @@ function ChatRouteGlobalShortcuts() {
                 : command === "preview.zoomOut"
                   ? "zoom-out"
                   : "reset-zoom";
-        dispatchPreviewAction(action);
+        if (dispatchPreviewAction(action)) recordConsumedShortcut(event, command);
       }
     };
 

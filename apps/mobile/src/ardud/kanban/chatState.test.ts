@@ -9,6 +9,7 @@ import {
   invertedAnswerOffset,
   nearHistoryEnd,
   newestFirst,
+  newestEndVisible,
   type ChoiceDraft,
 } from "./chatState";
 
@@ -69,12 +70,9 @@ describe("discussion pages", () => {
     [5, false, false],
     [0, true, false],
     [200, false, false],
-  ])(
-    "only follows incoming messages at rest at the newest edge",
-    (offset, dragging, following) => {
-      expect(followingNewest(offset, dragging)).toBe(following);
-    },
-  );
+  ])("only follows incoming messages at rest at the newest edge", (offset, dragging, following) => {
+    expect(followingNewest(offset, dragging)).toBe(following);
+  });
 
   it.each([
     [500, 40, 460],
@@ -92,12 +90,9 @@ describe("discussion pages", () => {
     [0, 1200, 600, false],
     [420, 1200, 600, true],
     [419, 1200, 600, false],
-  ])(
-    "detects a drag ending near the inverted history edge",
-    (offset, content, viewport, near) => {
-      expect(nearHistoryEnd(offset, content, viewport)).toBe(near);
-    },
-  );
+  ])("detects a drag ending near the inverted history edge", (offset, content, viewport, near) => {
+    expect(nearHistoryEnd(offset, content, viewport)).toBe(near);
+  });
 
   it("requests each cursor once, ignores duplicate end events and stops at the first page", async () => {
     let resolve!: (value: boolean) => void;
@@ -211,5 +206,22 @@ describe("virtualized row state", () => {
     expect(expanded.get("10:0")).toBe(true);
     expect(expanded.get("10:1")).toBe(false);
     expect(expanded.get("11:0")).toBeNull();
+  });
+});
+
+describe("discussion read end", () => {
+  it.each([
+    ["newest end", 0, 600, true],
+    ["native rounding", 2, 600, true],
+    ["tall message partly visible", 700, 600, false],
+    ["history offset", 10, 600, false],
+    ["bounce", -1, 600, false],
+    ["no layout", 0, 0, false],
+    ["invalid layout", 0, -1, false],
+    ["unknown offset", NaN, 600, false],
+    ["unbounded offset", Infinity, 600, false],
+    ["invalid viewport", 0, NaN, false],
+  ] as const)("%s", (_name, offset, height, expected) => {
+    expect(newestEndVisible(offset, height)).toBe(expected);
   });
 });

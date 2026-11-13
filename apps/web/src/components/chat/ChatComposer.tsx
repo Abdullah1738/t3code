@@ -1,3 +1,4 @@
+import { prepareShortcutRecording, recordConsumedShortcut } from "../../ardud/keybindingAnalytics";
 import { formatProviderSkillDisplayName } from "@t3tools/shared/inlineSkills";
 import { useComposerTypingGuard } from "./useComposerTypingGuard";
 import { insertAttachmentReferencesForDraft } from "./composerAttachmentReferences";
@@ -1451,9 +1452,9 @@ export interface ChatComposerHandle {
     sourceAnchor: AssistantCitationSourceAnchor,
   ) => boolean;
   openModelPicker: () => void;
-  stepReasoningEffort: (direction: 1 | -1) => void;
+  stepReasoningEffort: (direction: 1 | -1) => boolean | void;
   toggleModelPicker: () => void;
-  openControl: (command: KeybindingCommand) => void;
+  openControl: (command: KeybindingCommand) => boolean | void;
   isModelPickerOpen: () => boolean;
   isCaretAtStart: () => boolean;
   compactContext: () => void;
@@ -4056,6 +4057,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (shouldBlurMobileComposerOnSubmit()) {
       blurMobileComposerAfterSend();
     }
+    return true;
   };
   const submitComposerStable = useStableCallback(submitComposer);
   const handleSubmitMessage = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -4236,7 +4238,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       return navigatePromptHistory(key === "ArrowUp" ? "backward" : "forward", event);
     }
     if (submissionIntent) {
-      submitComposer(
+      const dispatched = submitComposer(
         undefined,
         resolveComposerDispatchMode({
           running: phase === "running",
@@ -4246,6 +4248,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         }),
         submissionIntent,
       );
+      if (dispatched) {
+        recordConsumedShortcut(
+          event,
+          submissionIntent === "alternate"
+            ? "composer.sendAlternate"
+            : submissionIntent === "background"
+              ? routeKind === "draft"
+                ? "composer.sendBackground"
+                : "composer.sendAndNewThread"
+              : null,
+        );
+      }
       return true;
     }
     if (key === "Enter" && isTaskItem) return false;
@@ -4299,7 +4313,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }, 1200);
   };
 
-  const restoreStashEntry = async (menuEntry: PromptStashEntry) => {
+  const restoreStashEntry = async (menuEntry: PromptStashEntry, onExecute?: () => void) => {
     const filesToVerify = menuEntry.files ?? [];
     if (filesToVerify.some((file) => file.environmentId !== environmentId)) {
       toastManager.add({
@@ -4338,6 +4352,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
     const { entry, durable } = takeStashEntry(menuEntry.id);
     if (!entry) return;
+    onExecute?.();
     if (!durable) {
       toastManager.add({
         type: "warning",
@@ -4587,7 +4602,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   };
   const deleteStashEntryStable = useStableCallback(deleteStashEntry);
 
-  const stashCurrentPrompt = async () => {
+  const stashCurrentPrompt = async (onExecute?: () => void) => {
     // Stashing clears the draft. A pasted attachment still downloading would then land in the
     // emptied composer instead of travelling with the entry it belongs to.
     if (pendingDraftWork.has(attachmentTargetKeyRef.current)) {
@@ -4617,9 +4632,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       const entries = usePromptStashStore.getState().entries;
       const entry = entries.length === 1 ? entries[0] : undefined;
       if (entry && !entry.pendingImageCount) {
-        await restoreStashEntry(entry);
+        await restoreStashEntry(entry, onExecute);
       } else {
         setIsStashMenuOpen((open) => !open);
+        onExecute?.();
       }
       return;
     }
@@ -4695,6 +4711,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
         return;
       }
+      onExecute?.();
       if (!durable) {
         toastManager.add({
           type: "warning",
@@ -5363,12 +5380,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       if (pendingUserInputs.length > 0 && !isComposerApprovalState) {
         setIsStashMenuOpen((open) => !open);
+        recordConsumedShortcut(event, command);
         return;
       }
       if (isComposerApprovalState || projectSelectionRequired || activePendingProgress !== null) {
         return;
       }
-      void stashCurrentPromptStable();
+      void stashCurrentPromptStable(prepareShortcutRecording(event, command));
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
@@ -6189,6 +6207,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             expandedCursorAfterReplace: change.cursor,
           });
         }
+        return true;
       },
       toggleModelPicker: () => {
         if (isComposerModelPickerOpen) {
@@ -6218,6 +6237,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (!trigger) return;
         trigger.focus({ preventScroll: true });
         trigger.click();
+        return true;
       },
       compactContext: compactThreadContextStable,
       isModelPickerOpen: () => isComposerModelPickerOpen,

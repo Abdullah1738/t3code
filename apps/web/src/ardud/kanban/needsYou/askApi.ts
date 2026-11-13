@@ -39,9 +39,16 @@ export const askApi = createAskApi({
     const connection = environmentId === null ? null : readPreparedConnection(environmentId);
     if (connection === null) throw new AskApiError(0, "offline", "Not connected to Robob.");
     const authorization = connection.httpAuthorization;
-    if (authorization === null) return { base: connection.httpBaseUrl, headers: {}, cookies: true };
+    if (authorization === null)
+      return {
+        environmentId: environmentId!,
+        base: connection.httpBaseUrl,
+        headers: {},
+        cookies: true,
+      };
     if (authorization._tag === "Bearer") {
       return {
+        environmentId: environmentId!,
         base: connection.httpBaseUrl,
         headers: { authorization: `Bearer ${authorization.token}` },
         cookies: false,

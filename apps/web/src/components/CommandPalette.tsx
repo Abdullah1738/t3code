@@ -1,4 +1,6 @@
 "use client";
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
+import { activeAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
@@ -492,6 +494,9 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     openIntent: null,
   });
   const setOpen = (open: boolean) => dispatch({ _tag: "SetOpen", open });
+  useEffect(() => {
+    if (state.open) activeAnalytics()?.record("command.palette", { props: { phase: "start" } });
+  }, [state.open]);
   const toggleMode = (mode: SearchOverlayMode) => dispatch({ _tag: "ToggleMode", mode });
   const openAddProject = () => dispatch({ _tag: "OpenAddProject" });
   const openNewThreadIn = () => dispatch({ _tag: "OpenNewThreadIn" });
@@ -542,6 +547,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.preventDefault();
         event.stopPropagation();
         if (event.repeat) return;
+        recordConsumedShortcut(event, command);
         const nextMode =
           appearanceMode === "system" ? "light" : appearanceMode === "light" ? "dark" : "system";
         if (!setAppearanceMode(nextMode)) {
@@ -560,6 +566,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         if (event.repeat) return;
         dispatch({ _tag: "OpenChangeTheme" });
+        recordConsumedShortcut(event, command);
         return;
       }
       if (command === "themeEditor.toggle") {
@@ -570,6 +577,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           themeHalves,
           initialAppearance: resolvedTheme,
         });
+        recordConsumedShortcut(event, command);
         return;
       }
       if (command === "usage.open") {
@@ -577,6 +585,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         setOpen(false);
         void navigate({ to: "/usage" });
+        recordConsumedShortcut(event, command);
         return;
       }
       const mode = overlayModeForCommand(command);
@@ -586,6 +595,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
       event.preventDefault();
       event.stopPropagation();
       toggleMode(mode);
+      recordConsumedShortcut(event, command);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2897,6 +2907,7 @@ function OpenCommandPaletteDialog(props: {
       event.stopPropagation();
       if (matchingItem) {
         executeItem(matchingItem);
+        if (!matchingItem.disabled) recordConsumedShortcut(event, command);
       }
       return;
     }
@@ -2906,6 +2917,7 @@ function OpenCommandPaletteDialog(props: {
       if (activeThreadReferenceCopyTarget === null) return;
       setOpen(false);
       void copyActiveThreadReference();
+      recordConsumedShortcut(event, command);
       return;
     }
     // ChatView ignores shortcuts while the palette is open, so handle find here
@@ -2915,6 +2927,7 @@ function OpenCommandPaletteDialog(props: {
       event.stopPropagation();
       setOpen(false);
       requestThreadFindOpen();
+      recordConsumedShortcut(event, command);
       return;
     }
 
@@ -2999,6 +3012,9 @@ function OpenCommandPaletteDialog(props: {
     if (item.disabled) {
       return;
     }
+    activeAnalytics()?.record("command.palette", {
+      props: { phase: "complete", ...(item.shortcutCommand ? { key: item.shortcutCommand } : {}) },
+    });
 
     if (item.kind === "submenu") {
       pushPaletteView(item);

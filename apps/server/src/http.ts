@@ -8,8 +8,11 @@ import { isDevProxiedPath } from "@t3tools/shared/devProxy";
 import { injectMcpAppCookieBootstrap, injectMcpAppThemeBootstrap } from "@t3tools/shared/mcpApp";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as ByteSize from "effect/ByteSize";
+import * as Clock from "effect/Clock";
 import * as Data from "effect/Data";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -20,6 +23,8 @@ import { cast } from "effect/Function";
 import {
   HttpClient,
   HttpClientResponse,
+  HttpBody,
+  HttpEffect,
   HttpMiddleware,
   HttpRouter,
   HttpServerResponse,
@@ -30,6 +35,13 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import { OtlpTracer, OtlpSerialization } from "effect/observability";
 
 import * as ServerConfig from "./config.ts";
+import * as Analytics from "./ardud/analytics/Analytics.ts";
+import {
+  analyticsErrorTag,
+  AnalyticsOriginKind,
+  recordServerAnalytics,
+  safeAnalyticsLabel,
+} from "./observability/RpcInstrumentation.ts";
 import * as ReplyMiddleware from "./ardud/http/replyMiddleware.ts";
 import { ASSET_ROUTE_PREFIX, readMcpAppHtml, resolveAsset } from "./assets/AssetAccess.ts";
 import { githubMediaResponse } from "./assets/GitHubMediaFetch.ts";
@@ -252,11 +264,105 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
   return yield* HttpServerResponse.file(asset.path, { status, offset, bytesToRead, headers });
 });
 
-export const layerHttpCompression = HttpRouter.middleware(
-  (app) => ReplyMiddleware.middleware(HttpMiddleware.compression()(app)),
-  {
-    global: true,
-  },
+// RouteContext contains registered patterns, never the request's URL, tokens or query string.
+export const httpAnalyticsMiddleware = Effect.gen(function* () {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  return HttpMiddleware.make(
+    <E, R>(app: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
+      Effect.gen(function* () {
+        if (Option.isNone(analytics)) return yield* app;
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const clock = yield* Clock.Clock;
+        const started = clock.monotonicTimeNanosUnsafe();
+        const originKind = yield* AnalyticsOriginKind;
+        let errorTag: string | undefined;
+        let recorded = false;
+        yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+          Effect.gen(function* () {
+            const matched = yield* Effect.serviceOption(HttpRouter.RouteContext);
+            const path = Option.isSome(matched) ? matched.value.route.path : "unmatched";
+            if (path === OTLP_TRACES_PROXY_PATH || path.startsWith("/api/ardud/analytics"))
+              return response;
+            const route = safeAnalyticsLabel(path.replaceAll("*", ":rest"), "unmatched");
+            // The stream finalizer owns streamed responses; known bodies are already encoded.
+            const record = (bytes: number | undefined, failure?: string) =>
+              Effect.suspend(() => {
+                if (recorded) return Effect.void;
+                recorded = true;
+                const responseErrorTag = failure ?? errorTag;
+                return Effect.flatMap(DateTime.now, (now) =>
+                  recordServerAnalytics(analytics.value, {
+                    ts: DateTime.formatIso(now),
+                    kind: "server.http",
+                    surface: "server",
+                    route,
+                    durationMs: Math.max(
+                      0,
+                      Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6,
+                    ),
+                    props: {
+                      method: request.method,
+                      status: response.status,
+                      originKind,
+                      span: safeAnalyticsLabel(`http.${request.method}.${route}`, "http.request"),
+                      ...(responseErrorTag !== undefined
+                        ? { errorTag: responseErrorTag }
+                        : response.status >= 400
+                          ? { errorTag: response.status >= 500 ? "Http5xx" : "Http4xx" }
+                          : {}),
+                      ...(bytes === undefined ? {} : { bytes }),
+                    },
+                  }),
+                );
+              });
+            const body = response.body;
+            if (body._tag === "Stream" && request.method !== "HEAD") {
+              let bytes = 0;
+              return HttpServerResponse.setBody(
+                response,
+                HttpBody.stream(
+                  body.stream.pipe(
+                    Stream.tap((chunk) =>
+                      Effect.sync(() => {
+                        bytes += chunk.byteLength;
+                      }),
+                    ),
+                    Stream.onExit((exit) =>
+                      record(
+                        bytes,
+                        Exit.isFailure(exit) ? analyticsErrorTag(exit.cause) : undefined,
+                      ),
+                    ),
+                  ),
+                  body.contentType,
+                  body.contentLength,
+                ),
+              );
+            }
+            yield* record(
+              request.method === "HEAD" || body._tag === "Empty" ? 0 : body.contentLength,
+            );
+            return response;
+          }),
+        );
+        return yield* app.pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => {
+              if (Exit.isFailure(exit)) errorTag = analyticsErrorTag(exit.cause);
+            }),
+          ),
+        );
+      }),
+  );
+});
+
+export const layerHttpCompression = Layer.unwrap(
+  Effect.map(httpAnalyticsMiddleware, (analyticsMiddleware) =>
+    HttpRouter.middleware(
+      (app) => ReplyMiddleware.middleware(HttpMiddleware.compression()(analyticsMiddleware(app))),
+      { global: true },
+    ),
+  ),
 );
 
 export const layerBrowserApiCors = Layer.unwrap(

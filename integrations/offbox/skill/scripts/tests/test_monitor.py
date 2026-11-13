@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 import monitor
 import monitor_sample as sample
 import monitor_support as support
@@ -392,7 +393,7 @@ class MonitorTests(unittest.TestCase):
             (root / ".local/bin").mkdir(parents=True)
             (root / ".local/bin/offbox").write_text("#!/bin/sh\n")
             (root / ".local/bin/offbox").chmod(0o755)
-            env = dict(os.environ, HOME=directory, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
+            env = clean_env(HOME=directory, PATH=str(shim.parent) + ":" + str(root) + ":/usr/bin:/bin",
                        OPENCODE_SESSION_ID="ses_test", OFFBOX_STATE_DIR=directory, OFFBOX_GATE_MODE="enforce")
             for expiry, expected in (("2030-01-01T00:00:00Z", 0), ("2000-01-01T00:00:00Z", 3)):
                 (root / "exemptions.json").write_text(json.dumps([{"session_id": "ses_test", "expires_at": expiry}]))

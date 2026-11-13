@@ -11,6 +11,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
@@ -56,7 +57,7 @@ const monitor = (
   );
 
 it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
-  it.effect("samples every 30 seconds and writes only once at 1.4 GiB on a 4 GiB limit", () =>
+  it.effect("ignores the normal boot peak and captures sustained growth only once", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const logsDir = yield* fs.makeTempDirectoryScoped();
@@ -64,18 +65,70 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
         .mocked(NodeV8.writeHeapSnapshot)
         .mockReset()
         .mockImplementation((path) => path!);
-      let used = 1.4 * GiB - 1;
+      let used = 2.3 * GiB;
       const read = vi.fn(() => stats(used));
       yield* monitor(logsDir, read);
       yield* TestClock.adjust("29 seconds");
       assert.strictEqual(read.mock.calls.length, 0);
       yield* TestClock.adjust("1 second");
       assert.strictEqual(write.mock.calls.length, 0);
-      used = 1.4 * GiB;
+      yield* TestClock.adjust("5 minutes");
+      assert.strictEqual(write.mock.calls.length, 0);
+      used = 2.5 * GiB - 1;
+      yield* TestClock.adjust("30 seconds");
+      used = 2.5 * GiB;
+      yield* TestClock.adjust("60 seconds");
+      assert.strictEqual(write.mock.calls.length, 0);
       yield* TestClock.adjust("30 seconds");
       assert.strictEqual(write.mock.calls.length, 1);
       assert.strictEqual(NodePath.dirname(write.mock.calls[0]![0]!), logsDir);
       yield* TestClock.adjust("60 seconds");
+      assert.strictEqual(write.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("resets the sustained-growth check when a spike recovers", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const logsDir = yield* fs.makeTempDirectoryScoped();
+      const write = vi
+        .mocked(NodeV8.writeHeapSnapshot)
+        .mockReset()
+        .mockImplementation((path) => path!);
+      let used = 3 * GiB;
+      yield* monitor(logsDir, () => stats(used));
+      yield* TestClock.adjust("60 seconds");
+      assert.strictEqual(write.mock.calls.length, 0);
+      used = 2.3 * GiB;
+      yield* TestClock.adjust("30 seconds");
+      used = 3 * GiB;
+      yield* TestClock.adjust("60 seconds");
+      assert.strictEqual(write.mock.calls.length, 0);
+      yield* TestClock.adjust("30 seconds");
+      assert.strictEqual(write.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("requires consecutive successful heap samples", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const logsDir = yield* fs.makeTempDirectoryScoped();
+      const write = vi
+        .mocked(NodeV8.writeHeapSnapshot)
+        .mockReset()
+        .mockImplementation((path) => path!);
+      let fail = false;
+      yield* monitor(logsDir, () => {
+        if (fail) throw new Error("heap stats failed");
+        return stats(3 * GiB);
+      });
+      yield* TestClock.adjust("60 seconds");
+      fail = true;
+      yield* TestClock.adjust("30 seconds");
+      fail = false;
+      yield* TestClock.adjust("60 seconds");
+      assert.strictEqual(write.mock.calls.length, 0);
+      yield* TestClock.adjust("30 seconds");
       assert.strictEqual(write.mock.calls.length, 1);
     }),
   );
@@ -101,6 +154,8 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
         yield* TestClock.adjust("30 seconds");
         assert.strictEqual(write.mock.calls.length, 0);
         used = boundary;
+        yield* TestClock.adjust("60 seconds");
+        assert.strictEqual(write.mock.calls.length, 0);
         yield* TestClock.adjust("30 seconds");
         assert.strictEqual(write.mock.calls.length, 1);
       }),
@@ -117,7 +172,7 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
       let available = 2 * GiB - 1;
       const free = vi.fn(() => Effect.succeed(available));
       yield* monitor(logsDir, () => stats(GiB, GiB), free);
-      yield* TestClock.adjust("60 seconds");
+      yield* TestClock.adjust("120 seconds");
       assert.strictEqual(write.mock.calls.length, 0);
       assert.strictEqual(free.mock.calls.length, 2);
       available = 2 * GiB;
@@ -145,7 +200,9 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
         )
         .mockReturnValue(Effect.succeed(10 * GiB));
       yield* monitor(logsDir, () => stats(GiB, GiB), free);
-      yield* TestClock.adjust("30 seconds");
+      yield* TestClock.adjust("90 seconds");
+      assert.strictEqual(write.mock.calls.length, 0);
+      yield* TestClock.adjust("60 seconds");
       assert.strictEqual(write.mock.calls.length, 0);
       yield* TestClock.adjust("30 seconds");
       assert.strictEqual(write.mock.calls.length, 1);
@@ -163,7 +220,7 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
           throw new Error("write failed");
         });
       yield* monitor(logsDir, () => stats(GiB, GiB));
-      yield* TestClock.adjust("90 seconds");
+      yield* TestClock.adjust("3 minutes");
       assert.strictEqual(write.mock.calls.length, 1);
     }),
   );
@@ -196,7 +253,7 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
             .listeners("SIGUSR2")
             .find((listener) => !listeners.includes(listener));
           assert.isDefined(handler);
-          yield* TestClock.adjust("30 seconds");
+          yield* TestClock.adjust("90 seconds");
           yield* Deferred.await(checkingDisk);
           yield* Effect.promise(
             () =>
@@ -233,9 +290,119 @@ it.layer(NodeServices.layer)("heap snapshot watcher", (it) => {
         yield* TestClock.adjust("30 seconds");
         assert.strictEqual(write.mock.calls.length, 0);
         used = 0.7 * GiB;
+        yield* TestClock.adjust("60 seconds");
+        assert.strictEqual(write.mock.calls.length, 0);
         yield* TestClock.adjust("30 seconds");
         assert.strictEqual(write.mock.calls.length, 1);
       }),
+  );
+
+  it.effect("keeps only the two newest server snapshots on startup, ordered by mtime", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const logsDir = yield* fs.makeTempDirectoryScoped();
+      const now = Date.UTC(2026, 10, 13);
+      yield* TestClock.setTime(now);
+      for (const [name, age] of [
+        ["server-z.heapsnapshot", 3_000],
+        ["server-a.heapsnapshot", 0],
+        ["server-m.heapsnapshot", 1_000],
+        ["server-b.heapsnapshot", 2_000],
+        ["other.heapsnapshot", 4_000],
+        ["server-old.log", 4_000],
+      ] as const) {
+        const path = NodePath.join(logsDir, name);
+        yield* fs.writeFileString(path, "test");
+        yield* fs.utimes(path, (now - age) / 1_000, (now - age) / 1_000);
+      }
+      yield* fs.makeDirectory(NodePath.join(logsDir, "server-directory.heapsnapshot"));
+      yield* monitor(logsDir, () => stats(1), undefined, { T3CODE_HEAP_SNAPSHOT_AT: "0" });
+      assert.deepEqual((yield* fs.readDirectory(logsDir)).sort(), [
+        "other.heapsnapshot",
+        "server-a.heapsnapshot",
+        "server-directory.heapsnapshot",
+        "server-m.heapsnapshot",
+        "server-old.log",
+      ]);
+    }),
+  );
+
+  it.effect("enforces retention after automatic capture without waiting for a restart", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const logsDir = yield* fs.makeTempDirectoryScoped();
+      const now = Date.UTC(2026, 10, 13);
+      yield* TestClock.setTime(now);
+      for (const [name, age] of [
+        ["server-old.heapsnapshot", 2_000],
+        ["server-recent.heapsnapshot", 1_000],
+      ] as const) {
+        const path = NodePath.join(logsDir, name);
+        yield* fs.writeFileString(path, "test");
+        yield* fs.utimes(path, (now - age) / 1_000, (now - age) / 1_000);
+      }
+      const write = vi
+        .mocked(NodeV8.writeHeapSnapshot)
+        .mockReset()
+        .mockImplementation((path) => {
+          NodeFS.writeFileSync(path!, "snapshot");
+          NodeFS.utimesSync(path!, now / 1_000, now / 1_000);
+          return path!;
+        });
+      const completed = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        if ((Array.isArray(message) ? message[0] : message) === "Wrote heap snapshot.") {
+          Deferred.doneUnsafe(completed, Effect.void);
+        }
+      });
+      yield* monitor(logsDir, () => stats(3 * GiB)).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
+      yield* TestClock.adjust("90 seconds");
+      yield* Deferred.await(completed);
+      const captured = NodePath.basename(write.mock.calls[0]![0]!);
+      assert.deepEqual(
+        (yield* fs.readDirectory(logsDir)).sort(),
+        [captured, "server-recent.heapsnapshot"].sort(),
+      );
+    }),
+  );
+
+  it.effect("manual signals capture immediately even when automatic capture is disabled", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const logsDir = yield* fs.makeTempDirectoryScoped();
+      const listeners = process.listeners("SIGUSR2");
+      const write = vi.mocked(NodeV8.writeHeapSnapshot).mockReset();
+      yield* Effect.gen(function* () {
+        yield* Layer.build(HeapSnapshot.layerWith(logsDir, () => stats(1))).pipe(
+          Effect.provide(
+            ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_HEAP_SNAPSHOT_AT: "0" } })),
+          ),
+          Effect.provideService(HostProcess.Platform, "darwin"),
+        );
+        const handler = process
+          .listeners("SIGUSR2")
+          .find((listener) => !listeners.includes(listener));
+        assert.isDefined(handler);
+        for (let index = 0; index < 3; index++) {
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                write.mockImplementation((path) => {
+                  resolve();
+                  return path!;
+                });
+                handler!("SIGUSR2");
+              }),
+          );
+        }
+        assert.strictEqual(write.mock.calls.length, 3);
+        yield* TestClock.adjust("3 minutes");
+        assert.strictEqual(write.mock.calls.length, 3);
+      }).pipe(Effect.scoped);
+      assert.deepEqual(process.listeners("SIGUSR2"), listeners);
+    }),
   );
 
   it.effect("0 disables sampling, but startup still removes only expired server snapshots", () =>

@@ -1,6 +1,7 @@
 import * as McpDeadline from "./McpDeadline.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
@@ -239,6 +240,7 @@ export class OrchestratorMcpService extends Context.Service<
 type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
   return new OrchestratorMcpFailure({ code, message });
@@ -268,6 +270,7 @@ export const isLiveCallerShell = (
       false));
 
 function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
+  if (isOrchestratorMcpFailure(error)) return error;
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
     case "ThreadManagementThreadNotFoundError":
@@ -2832,6 +2835,12 @@ const make = Effect.gen(function* () {
           completionWake: input.mode === "wait" ? "settled_only" : "always",
         })
         .pipe(
+          Effect.tapError((error) =>
+            error._tag === "OrchestratorCommandRejectedError" ||
+            error._tag === "OrchestratorCommandPreviouslyRejectedError"
+              ? McpCallAnalytics.setSaved(false)
+              : Effect.void,
+          ),
           Effect.mapError((error) =>
             error._tag === "ThreadManagementProviderInstanceDisabledError"
               ? threadManagementFailure(error)
@@ -2852,6 +2861,8 @@ const make = Effect.gen(function* () {
           "Delegated task command did not produce a task projection.",
         );
       }
+      // Receipt existence includes rejections; the persisted task proves this delegation was saved.
+      yield* McpCallAnalytics.setSaved(true);
       const taskId = taskEvent.event.payload.id;
       const childThreadId = taskEvent.event.payload.childThreadId;
       const childRunEvent = result.storedEvents.find(
@@ -2973,11 +2984,15 @@ const make = Effect.gen(function* () {
           "Task result acknowledgement requires write access.",
         );
       }
-      let partial: Omit<Partial<OrchestratorMcpDelegateTaskResult>, "partial"> & {
-        taskId: NodeId;
-        partial: true;
-        callerResolved?: true;
-      } = { taskId, partial: true };
+      const startedAt = yield* Clock.monotonicTimeNanos;
+      let partial: Omit<
+        Extract<OrchestratorMcpTaskStatusResult, { partial: true }>,
+        "retryHint"
+      > = {
+        taskId,
+        partial: true,
+        stoppedAt: "caller",
+      };
       const read = Effect.gen(function* () {
         const caller = yield* readCallerIdentity(
           threadManagement,
@@ -2991,9 +3006,14 @@ const make = Effect.gen(function* () {
             "parent_not_active",
             "The calling provider no longer owns an active thread run.",
           );
-        partial = { ...partial, callerResolved: true };
+        partial = { ...partial, callerResolved: true, stoppedAt: "parent_records" };
         return yield* readTask(scope, taskId, false, "background", undefined, (progress) => {
-          partial = { ...partial, ...progress, partial: true };
+          partial = {
+            ...partial,
+            ...progress,
+            partial: true,
+            stoppedAt: progress.childThreadId === undefined ? "result" : "child_records",
+          };
         });
       });
       // SQLite snapshot acquisition masks interruption. Let the service finish
@@ -3003,7 +3023,23 @@ const make = Effect.gen(function* () {
         (reader) => Fiber.join(reader).pipe(Effect.timeoutOption("10 seconds")),
         (reader) => Fiber.interrupt(reader).pipe(Effect.forkIn(serviceScope), Effect.asVoid),
       );
-      return Option.isSome(result) ? result.value : partial;
+      if (Option.isSome(result)) return result.value;
+      const answer = {
+        ...partial,
+        retryHint:
+          `Robob was busy and this read stopped at ${partial.stoppedAt}. The task itself is unaffected. Retry task_status in a few seconds` +
+          (partial.childThreadId === undefined
+            ? "."
+            : ", or read childThreadId with t3_thread_read."),
+      };
+      const now = yield* Clock.monotonicTimeNanos;
+      yield* Effect.logWarning("orchestrator-mcp.task-status.partial", {
+        taskId,
+        stoppedAt: answer.stoppedAt,
+        elapsedMs: Number(now - startedAt) / 1_000_000,
+        callerThreadId: scope.thread.threadId,
+      });
+      return answer;
     }, untilShutdown),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");

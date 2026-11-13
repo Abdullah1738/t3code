@@ -1,3 +1,11 @@
+import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
+import * as DateTime from "effect/DateTime";
+import { AnalyticsToolkit } from "./toolkits/analytics/tools.ts";
+import * as AnalyticsHandlers from "./toolkits/analytics/handlers.ts";
 import * as RedactionTools from "../ardud/redaction/tools.ts";
 import * as SavedBoardReply from "../ardud/kanban/tools/savedReply.ts";
 import * as Cause from "effect/Cause";
@@ -897,6 +905,9 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const ownerAnalytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
+    const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+    const build = Option.isSome(config) ? (config.value.robobBuildCommit ?? "unknown") : "unknown";
     const largeRepliesForTools = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
     const boardReplyReady = yield* ReplyReadiness.boardReadiness;
     const controlReplyReady = yield* ReplyReadiness.controlReadiness;
@@ -1021,11 +1032,28 @@ const withToolAnalytics =
                 "mcp.request.namespace": invocation?.requestNamespace ?? null,
               });
               const startedAt = yield* Clock.currentTimeMillis;
+              const started = yield* Clock.monotonicTimeNanos;
+              const callState: McpCallAnalytics.McpCall["Service"] = {
+                callerResolved: false,
+                callerResolveMs: 0,
+                readerLane: yield* NodeSqliteClient.ReaderLane,
+                phase: "handler",
+                saved: "unknown",
+              };
+              const parentSaved = yield* SavedWrite.observer;
+              const parentCommitting = yield* SavedWrite.commitObserver;
+              const identifiers = McpCallAnalytics.callIdentifiers(
+                payload,
+                invocation?.thread?.threadId ?? invocation?.requestNamespace,
+              );
               const rejection = { exceeded: false };
-              if (BOARD_READ_TOOLS.has(options.tool.name)) yield* boardReplyReady;
-              else if (options.tool.name === "list_scheduled_tasks") yield* controlReplyReady;
-              const result = options
-                .handle(payload)
+              const readiness = BOARD_READ_TOOLS.has(options.tool.name)
+                ? boardReplyReady
+                : options.tool.name === "list_scheduled_tasks"
+                  ? controlReplyReady
+                  : Effect.void;
+              const result = readiness
+                .pipe(Effect.andThen(options.handle(payload)))
                 .pipe(Effect.provideService(ReplyRejection, rejection));
               // Large reads run on their own "mcp" lane (whole call, so at most
               // PERMITS.mcp large results are built at once). They queue only behind
@@ -1074,23 +1102,86 @@ const withToolAnalytics =
                     );
                   },
                 ),
-                Effect.onExit((exit) => {
-                  const result = exit._tag === "Success" ? exit.value : undefined;
-                  // A call that asks for input is retried with it, and that call is the one counted.
-                  if (result instanceof McpSchema.InputRequired) return Effect.void;
-                  // Handoff tools look up threads to record; the response must not wait on them.
-                  return Clock.currentTimeMillis.pipe(
-                    Effect.flatMap((endedAt) =>
-                      record(options.tool.name, payload, result, endedAt - startedAt),
-                    ),
-                    Effect.forkDetach,
-                    Effect.asVoid,
-                  );
-                }),
               );
-              return yield* SavedBoardReply.TOOLS.has(options.tool.name)
+              const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
                 ? SavedBoardReply.protect(completed, options.tool.name)
                 : completed;
+              return yield* protectedCall.pipe(
+                Effect.provideService(McpCallAnalytics.McpCall, callState),
+                Effect.provideService(SavedWrite.observer, (receipt) => {
+                  callState.saved = true;
+                  parentSaved(receipt);
+                }),
+                Effect.provideService(SavedWrite.commitObserver, () => {
+                  if (callState.saved !== true) callState.saved = "unknown";
+                  parentCommitting();
+                }),
+                Effect.onExit((exit) => {
+                  const result = exit._tag === "Success" ? exit.value : undefined;
+                  // Handoff tools look up threads to record; the response must not wait on them.
+                  return Effect.gen(function* () {
+                    const endedAt = yield* Clock.currentTimeMillis;
+                    const ended = yield* Clock.monotonicTimeNanos;
+                    const ledger = {
+                      ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                      kind: "mcp.call",
+                      surface: "server" as const,
+                      route: "mcp",
+                      tool: options.tool.name,
+                      build,
+                      ...identifiers,
+                      ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
+                      callerResolved: callState.callerResolved,
+                      callerResolveMs:
+                        callState.callerResolveMs +
+                        (callState.callerStarted === undefined
+                          ? 0
+                          : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
+                      readerLane: callState.readerLane,
+                      durationMs: Math.max(0, Number(ended - started) / 1e6),
+                      ...McpCallAnalytics.callOutcome(exit, callState),
+                    };
+                    yield* Effect.gen(function* () {
+                      if (Option.isSome(ownerAnalytics))
+                        yield* recordServerAnalytics(ownerAnalytics.value, ledger).pipe(
+                          Effect.timeout("1 second"),
+                          Effect.ignoreCause,
+                        );
+                      // The anonymous analytics event counts the completed input retry only.
+                      if (result instanceof McpSchema.InputRequired) return;
+                      if (Option.isSome(ownerAnalytics) && options.tool.name !== "analytics_read") {
+                        const failed =
+                          exit._tag === "Failure" ||
+                          (result !== undefined && "isError" in result && result.isError === true);
+                        yield* recordServerAnalytics(ownerAnalytics.value, {
+                          ts: DateTime.formatIso(DateTime.makeUnsafe(endedAt)),
+                          kind: failed ? "server.mcp.error" : "server.mcp",
+                          surface: "server",
+                          route: "mcp",
+                          ...(invocation?.thread === undefined
+                            ? {}
+                            : { threadId: invocation.thread.threadId }),
+                          durationMs: Math.max(0, endedAt - startedAt),
+                          props: {
+                            method: options.tool.name,
+                            span: "mcp.tools.call",
+                            originKind: invocation?.thread === undefined ? "mcp-client" : "agent",
+                            ...(failed
+                              ? {
+                                  errorTag:
+                                    exit._tag === "Failure"
+                                      ? analyticsErrorTag(exit.cause)
+                                      : "McpToolError",
+                                }
+                              : {}),
+                          },
+                        });
+                      }
+                      yield* record(options.tool.name, payload, result, endedAt - startedAt);
+                    }).pipe(Effect.ignoreCause, Effect.forkDetach);
+                  }).pipe(Effect.asVoid);
+                }),
+              );
             }),
         }),
     });
@@ -1225,6 +1316,7 @@ export const layerMcpTransport = McpServer.layerHttp({
 }).pipe(Layer.provide(layerMcpAuthMiddleware));
 
 export const layer = Layer.mergeAll(
+  toolkitRegistration(AnalyticsToolkit, AnalyticsHandlers.layer),
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,

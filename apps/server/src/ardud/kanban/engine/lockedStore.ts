@@ -47,6 +47,7 @@ export const wrap = (
     putBoardWithPools: (row, pools) =>
       locks.access(row.id, store.putBoardWithPools(row, pools), true, "board"),
     cards: (id) => locks.access(id, store.cards(id)),
+    openCards: (id) => locks.access(id, store.openCards(id)),
     summaryCards: (id) => locks.access(id, store.summaryCards(id)),
     card: (id) => card(id, store.card(id)),
     cardByNumber: (id, number) => locks.access(id, store.cardByNumber(id, number)),

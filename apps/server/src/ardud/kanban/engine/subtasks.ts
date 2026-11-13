@@ -10,15 +10,41 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
+// Unknown continuations need approval, including nouns and possessives after a resource name.
+const resourceReleaseClause =
+  /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|devices?)(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;!?](?=\s|$))/i;
+
+const hasReleaseGate = (text: string): boolean => {
+  for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
+    const tail = text.slice(release.index + release[0].length);
+    if (!resourceReleaseClause.test(tail)) return true;
+  }
+  return false;
+};
+
 export const inferGate = (text: string): KanbanSubtask["gate"] => {
-  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?|releases?)\b/i.test(text)) return "deploy";
+  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(text) || hasReleaseGate(text))
+    return "deploy";
   if (
     /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
   )
     return "money";
-  if (/\b(secrets?|tokens?|keys?)\b/i.test(text)) return "secret";
+  if (
+    /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b[^.;\r\n]{0,40}\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i.test(
+      text,
+    )
+  )
+    return "secret";
   return undefined;
 };
+
+export const gateOf = (
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
+): KanbanSubtask["gate"] =>
+  // Older plans stored inferred gates on coding and review checklists too.
+  subtask.owner === "work" || subtask.owner === "review"
+    ? undefined
+    : (subtask.gate ?? inferGate(subtask.text));
 
 export const isNegativeOption = (label: string): boolean =>
   /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
@@ -71,7 +97,11 @@ const approvesGate = (
   const command = words
     .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
     .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
-  if (/^(?:yes|approve|approved|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(command))
+  if (
+    /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
+      command,
+    )
+  )
     return true;
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
   const normalized = approvalAction(action);
@@ -104,10 +134,10 @@ const approvesGate = (
 
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
-  card: Pick<KanbanCard, "number" | "asks" | "createdAt">,
+  card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
 ): string | null => {
-  const gate = subtask.gate ?? inferGate(subtask.text);
+  const gate = gateOf(subtask);
   if (gate === undefined) return null;
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
@@ -117,9 +147,17 @@ export const approvalProblem = (
       if (answer.verdict === "dropped") return true;
       if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
       if (ask.draft) return false;
+      const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
+      const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
+      if (ids.size > 0) return ids.has(subtask.id);
+      const candidates = card.subtasks.filter(
+        (entry) =>
+          gateOf(entry) === gate &&
+          entry.state !== "skipped" &&
+          (entry.createdAt ?? card.createdAt) <= answer.at,
+      );
       return (
-        inferGate(`${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`) === gate ||
-        (ask.text.match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id)
+        inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id
       );
     })
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
@@ -133,9 +171,24 @@ export const approvalProblem = (
         const option = latest?.options?.find((entry) => entry.id === id);
         return option !== undefined && approvesGate(option.label, gate, subtask.text);
       }));
-  return approved
-    ? null
-    : `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval after it was created; a dropped ask is not approval`;
+  if (approved) return null;
+  let reason: string;
+  if (!latest || !answer) {
+    reason = `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+  } else if (answer.verdict === "dropped") {
+    reason = `the latest decision, ${latest.id}, was dropped (a dropped ask is not approval)`;
+  } else if (answer.verdict === "picked") {
+    const labels = (answer.optionIds ?? [])
+      .map((id) => latest.options?.find((option) => option.id === id)?.label ?? id)
+      .join(", ");
+    reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
+  } else {
+    reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
+  }
+  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}`.replace(
+    /[\r\n]+/g,
+    " ",
+  );
 };
 
 export const MAX_SUBTASKS = 30;
@@ -148,7 +201,7 @@ export interface SubtaskInput {
   readonly step?: number | undefined;
   readonly text: string;
   readonly owner: KanbanSubtask["owner"];
-  readonly gate?: KanbanSubtask["gate"];
+  readonly gate?: KanbanSubtask["gate"] | null;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -213,6 +266,13 @@ export function planSubtasks(
     if (text.length > MAX_TEXT) {
       return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
     }
+    if (input.owner === "work" && input.gate != null) {
+      return {
+        ok: false,
+        reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
+      };
+    }
+    const inputGate = gateOf({ owner: input.owner, text, gate: input.gate ?? undefined });
     const script = input.script?.trim() || undefined;
     if (script && input.owner !== "script") {
       return {
@@ -234,26 +294,26 @@ export function planSubtasks(
         };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
-      const { script: _old, ...rest } = known;
-      const gate = known.gate ?? inferGate(known.text) ?? input.gate ?? inferGate(text);
+      const { script: _old, gate: _oldGate, ...rest } = known;
+      const previousGate = gateOf(known);
+      const gate =
+        input.owner === "work" || input.owner === "review"
+          ? undefined
+          : (previousGate ?? inputGate);
       planned.push({
         ...rest,
         step,
         text,
         owner: input.owner,
         ...(gate === undefined ? {} : { gate }),
-        ...((text !== known.text ||
-          script !== known.script ||
-          !(known.gate ?? inferGate(known.text))) &&
-        (input.gate ?? inferGate(text) ?? known.gate ?? inferGate(known.text)) &&
-        at
+        ...((text !== known.text || script !== known.script || !previousGate) && gate && at
           ? { createdAt: at }
           : {}),
         ...(script ? { script } : {}),
       });
     } else {
       nextId += 1;
-      const gate = input.gate ?? inferGate(text);
+      const gate = inputGate;
       planned.push({
         id: `s${nextId}`,
         step,
@@ -269,7 +329,13 @@ export function planSubtasks(
       });
     }
   }
-  const kept = existing.filter((subtask) => !listed.has(subtask.id) && subtask.state !== "open");
+  const kept = existing
+    .filter((subtask) => !listed.has(subtask.id) && subtask.state !== "open")
+    .map((subtask) => {
+      if (subtask.owner !== "work") return subtask;
+      const { gate: _oldGate, ...rest } = subtask;
+      return rest;
+    });
   const subtasks = [...planned, ...kept].toSorted((a, b) => a.step - b.step);
   if (subtasks.length > MAX_SUBTASKS) {
     return { ok: false, reason: `a card has at most ${MAX_SUBTASKS} subtasks` };

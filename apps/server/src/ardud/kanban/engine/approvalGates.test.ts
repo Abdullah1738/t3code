@@ -1,8 +1,9 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId, type KanbanActor } from "@t3tools/contracts";
+import { ThreadId, type KanbanActor, type KanbanCard } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
-import { inferGate, isNegativeOption } from "./subtasks.ts";
+import * as KanbanStore from "../store/KanbanStore.ts";
+import { approvalProblem, inferGate, isNegativeOption } from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
@@ -20,6 +21,28 @@ const consentReplies = [
   { task: "Restart the bridge LaunchAgent", label: "Yes, go for it", reply: "yes", approved: true },
   { task: "Restart the bridge LaunchAgent", label: "Yes, do it", reply: "yes", approved: true },
   { task: "Share the token", label: "Yes, share it", reply: "yes", approved: true },
+  ...["Sign off", "Yes, sign off", "Ok, sign off", "Sign-off", "Signoff", "Signed off"].map(
+    (label) => ({
+      task: "Merge the pair and deploy both to dev",
+      label,
+      reply: label,
+      approved: true,
+    }),
+  ),
+  ...[
+    "Sign off later",
+    "Don't sign off",
+    "Sign off once CI is green",
+    "Sign off after the readback",
+    "Confirm",
+    "Accept",
+    "Ship it",
+  ].map((label) => ({
+    task: "Merge the pair and deploy both to dev",
+    label,
+    reply: label,
+    approved: false,
+  })),
   ...[
     " and read back its version",
     ", then read back its version",
@@ -217,7 +240,7 @@ it.effect.each(
         yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
         yield* kanban.askOwner(
           card.id,
-          { question: `${task}?`, blocking: false, options: [label, "No"] },
+          { question: `${task} (s1)?`, blocking: false, options: [label, "No"] },
           evaluator,
           "evaluator",
         );
@@ -263,7 +286,7 @@ it.effect.each([
   { task: "Install the release", neutral: "Staging", approve: "Install the release" },
   { task: "Restart LaunchAgent", neutral: "Check status first", approve: "Restart now" },
   { task: "Share the token", neutral: "Explain the token permissions", approve: "Share the token" },
-  { task: "Use the API key", neutral: "Check the key", approve: "Use the API key" },
+  { task: "Provide the API key", neutral: "Check the key", approve: "Provide the API key" },
   { task: "Purchase the license", neutral: "Purchase after review", approve: "Approve" },
   { task: "Deploy the release", neutral: "Deploy if tests pass", approve: "Yes" },
   { task: "Deploy the release", neutral: "Deploy later", approve: "Go" },
@@ -363,6 +386,184 @@ it.effect.each([
   }),
 );
 
+it.effect("#3917: a Sign off decision after a dropped draft allows verification", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Pair merge", prompt: "Work" },
+        owner,
+      );
+      const draft = { text: "Ready to merge.", format: "markdown" as const };
+      const ask = {
+        text: "Approve the dev deploy draft?",
+        blocking: false,
+        by: evaluator,
+        at: "2026-11-11T00:00:00.000Z",
+        seq: null,
+        closedAt: "2026-11-12T09:27:00.000Z",
+      };
+      const subtask = {
+        id: "s4",
+        step: 4,
+        text: "Pair merge: merge bf#258 first, then bc#546, and dev-deploy both",
+        owner: "evaluator" as const,
+        state: "done" as const,
+        note: null,
+        doneBy: evaluator,
+        doneAt: "2026-11-12T10:00:00.000Z",
+      };
+      const legacy: KanbanCard = {
+        ...card,
+        number: 3917,
+        createdAt: "2026-11-11T00:00:00.000Z",
+        stage: "deployed",
+        subtasks: [subtask],
+        subtaskSeq: 4,
+        asks: [
+          {
+            ...ask,
+            id: "q1",
+            draft,
+            answer: { verdict: "approved", by: owner, at: "2026-11-12T09:26:00.000Z" },
+          },
+          {
+            ...ask,
+            id: "q2",
+            draft,
+            answer: { verdict: "dropped", by: evaluator, at: "2026-11-12T09:27:00.000Z" },
+          },
+          {
+            ...ask,
+            id: "q3",
+            text: "Merge the pair?",
+            kind: "action",
+            title: "Pair merge",
+            // oxlint-disable-next-line unicorn/no-thenable -- The action contract's string field must not count as gate approval.
+            action: { summary: "Merge bf#258 and bc#546", then: "Dev deploy both" },
+            closedAt: "2026-11-12T09:29:00.000Z",
+            answer: { verdict: "approved", by: owner, at: "2026-11-12T09:29:00.000Z" },
+          },
+        ],
+      };
+      assert.include(approvalProblem(legacy, subtask)!, "the latest decision, q2, was dropped");
+      const signedOff: KanbanCard = {
+        ...legacy,
+        asks: [
+          ...legacy.asks,
+          {
+            ...ask,
+            id: "q4",
+            kind: "decision",
+            text: "Will you sign off the merge and dev deploy of backoffice-frontend#258 and backoffice-core#546 so card #3917 can be marked verified?",
+            at: "2026-11-13T14:00:00.000Z",
+            options: [
+              {
+                id: "o1",
+                label: "Sign off",
+                detail: "Counts as the s4 approval.",
+                recommended: true,
+              },
+              { id: "o2", label: "Leave it" },
+            ],
+            closedAt: "2026-11-13T14:08:00.000Z",
+            answer: {
+              verdict: "picked",
+              optionIds: ["o1"],
+              by: owner,
+              at: "2026-11-13T14:08:00.000Z",
+            },
+          },
+        ],
+      };
+      assert.isNull(approvalProblem(signedOff, subtask));
+      yield* store.putCard(signedOff);
+      assert.strictEqual(
+        (yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator)).stage,
+        "verified",
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a missing decision names the gate and the subtask's time bound", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "No answer", prompt: "Work", subtasks: [{ text: "Deploy", owner: "evaluator" }] },
+        owner,
+      );
+      const refused = yield* kanban
+        .markSubtask(card.id, "s1", "done", null, evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.strictEqual(
+        refused.detail,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask`,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  { verdict: "rejected", suffix: "was rejected" },
+  {
+    verdict: "picked",
+    suffix:
+      'picked "Show status, Leave it", which doesn\'t read as approving deploy; ask again with an Approve option or an action ask',
+  },
+])("the refusal names the deciding ask for $verdict", ({ verdict, suffix }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Refusal", prompt: "Work", subtasks: [{ text: "Deploy", owner: "evaluator" }] },
+        owner,
+      );
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Deploy?", blocking: false },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.changeAsk(card.id, "q1", "drop", evaluator, "evaluator");
+      yield* TestClock.adjust("1 second");
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Deploy?",
+          blocking: false,
+          ...(verdict === "picked"
+            ? { multi: true, options: ["Show status", "Leave it"] }
+            : { action: { summary: "Deploy" } }),
+        },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.answerAsk(
+        card.id,
+        "q2",
+        { verdict, ...(verdict === "picked" ? { optionIds: ["o1", "o2"] } : {}), revision: 0 },
+        owner,
+      );
+      const refused = yield* kanban
+        .markSubtask(card.id, "s1", "done", null, evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.strictEqual(
+        refused.detail,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: the latest decision, q2, ${suffix}`,
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect.each([owner, evaluator])(
   "$_tag drop cannot complete, skip, remove or verify a deploy gate",
   (dropper) =>
@@ -396,7 +597,10 @@ it.effect.each([owner, evaluator])(
           const refused = yield* kanban
             .markSubtask(card.id, "s1", state, "Dropped", evaluator, "evaluator")
             .pipe(Effect.flip);
-          assert.include(refused.detail, "needs Abdullah's approval");
+          assert.strictEqual(
+            refused.detail,
+            `card #${card.number} subtask s1 (deploy: Restart LaunchAgent) needs Abdullah's approval: the latest decision, q1, was dropped (a dropped ask is not approval)`,
+          );
         }
         const verify = yield* kanban
           .moveCard(card.id, "verified", "evaluator", evaluator)
@@ -449,9 +653,9 @@ it.each([
   ["purchase", "money"],
   ["charge", "money"],
   ["refund", "money"],
-  ["secret", "secret"],
-  ["token", "secret"],
-  ["key", "secret"],
+  ["secret", undefined],
+  ["token", undefined],
+  ["key", undefined],
   ["Read back", undefined],
 ] as const)("infers %s", (text, gate) => assert.strictEqual(inferGate(text), gate));
 
