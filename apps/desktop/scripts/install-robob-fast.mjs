@@ -12,7 +12,7 @@ import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
-import { acquireInstallHold } from "./robob-install-hold.mjs";
+import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
 
 const exec = promisify(execFile);
 export const INSTALL_PLAN = [
@@ -704,7 +704,7 @@ async function main(args) {
       );
     },
   };
-  const releaseHold = await acquireInstallHold();
+  const hold = await acquireInstallHold();
   try {
     await install(ops, { rollback });
   } catch (e) {
@@ -768,7 +768,35 @@ async function main(args) {
         await fs.rmdir(mount).catch(() => {});
       }
     } finally {
-      await releaseHold();
+      await finishInstallHold({
+        release: hold.release,
+        quitStarted: quitAt !== undefined,
+        healthy: async () => {
+          const health = await get("/api/ardud/control/health");
+          if (health.ok !== true || health.status !== "healthy") return false;
+          if (!swapped) return true;
+          const report = await get("/api/ardud/control/install-report");
+          return Boolean(report.bootId && report.bootId !== oldBootId);
+        },
+        onWaiting: async () => {
+          await phase("recovery_waiting", {
+            swapped,
+            message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
+            holdBy: hold.by,
+            holdPid: hold.pid,
+          });
+          await exec(
+            "/Users/ardud/.bun/bin/bun",
+            [
+              "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
+              "notify", "--source", "Robob install", "--severity", "attention",
+              "--key", `robob-install:${stamp}:recovery`,
+              "--text", "Robob install needs recovery. Its heartbeat is still held. Keep the installer running while repairing or completing a compatible rollback, then reopen Robob. Check the install log for the hold PID.",
+            ],
+            { timeout: 5000 },
+          ).catch(() => {});
+        },
+      });
     }
   }
 }

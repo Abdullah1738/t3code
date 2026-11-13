@@ -148,12 +148,46 @@ class IOTests(unittest.TestCase):
                 home=Path(d);bin_dir=home/'.local/bin';bin_dir.mkdir(parents=True)
                 helper=bin_dir/'robob-install-hold'
                 helper.write_text('#!/bin/zsh -f\nprint -r -- "$*" >> "$HOME/calls"\n');helper.chmod(0o755)
-                script='source "$1"; robob_hold_begin repair; n=0; ready() { (( n++ )); print probe >> "$HOME/calls"; (( n > '+str(failures)+' )); }; sleep() { print wait >> "$HOME/calls"; }; robob_hold_wait_for_repair ready; print healthy >> "$HOME/calls"'
+                (home/'probes').write_text('0')
+                script='source "$1"; robob_hold_begin repair; ready() { local n=$(cat "$HOME/probes"); (( n++ )); print "$n" > "$HOME/probes"; print probe >> "$HOME/calls"; (( n > '+str(failures)+' )) || return 1; print \'{"ok":true,"status":"healthy"}\'; }; sleep() { print wait >> "$HOME/calls"; }; robob_hold_wait_for_repair ready; print healthy >> "$HOME/calls"'
                 env=dict(os.environ,HOME=d);env.pop('ROBOB_INSTALL_HOLD_BY',None);env.pop('ROBOB_INSTALL_HOLD_PID',None)
                 subprocess.run(['/bin/zsh','-f','-c',script,'test',str(library)],check=True,env=env,capture_output=True,timeout=10)
                 calls=(home/'calls').read_text().splitlines()
                 self.assertTrue(calls[0].startswith('start '));self.assertTrue(calls[-1].startswith('stop '))
                 self.assertEqual(calls[-2],'healthy');self.assertEqual(calls.count('wait'),failures)
+    def test_external_supervisor_exit_gates(self):
+        import re
+        blocks=re.findall(r'```zsh\n(.*?)```',Path('release-supervisor.md').read_text(),re.S)
+        setup=blocks[0].replace('/Volumes/ExternalSSD/t3code-fork/integrations/robob-guard/scripts/install-hold.zsh',str(Path('scripts/install-hold.zsh').resolve()))
+        for exit_code,tail in [(0,blocks[1]),(7,blocks[1]),(1,blocks[2])]:
+            with self.subTest(exit_code=exit_code),tempfile.TemporaryDirectory() as d:
+                home=Path(d);bin_dir=home/'.local/bin';bin_dir.mkdir(parents=True)
+                helper=bin_dir/'robob-install-hold'
+                helper.write_text('#!/bin/zsh -f\nprint -r -- "$*" >> "$HOME/calls"\n');helper.chmod(0o755)
+                (home/'probes').write_text('0')
+                (home/'responses').write_text('null\n<html>not health</html>\n{"ok":true,"status":"healthy"}\n')
+                mocks='node() { local n=$(cat "$HOME/probes"); (( n++ )); print "$n" > "$HOME/probes"; print probe >> "$HOME/calls"; /usr/bin/sed -n "${n}p" "$HOME/responses"; }; sleep() { print wait >> "$HOME/calls"; };'
+                env=dict(os.environ,HOME=d);env.pop('ROBOB_INSTALL_HOLD_BY',None);env.pop('ROBOB_INSTALL_HOLD_PID',None)
+                result=subprocess.run(['/bin/zsh','-f','-c',mocks+setup+'\nrc='+str(exit_code)+'\n'+tail],env=env,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode,exit_code)
+                calls=(home/'calls').read_text().splitlines()
+                self.assertTrue(calls[0].startswith('start '));self.assertTrue(calls[-1].startswith('stop '))
+                self.assertEqual(calls[1:-1],['probe','wait','probe','wait','probe'])
+    def test_shell_health_response_corpus(self):
+        library=Path('scripts/install-hold.zsh').resolve()
+        rows=[('<html>login</html>',False),('null',False),('[]',False),('{}',False),
+              ('{"ok":true,"status":"starting"}',False),('{"ok":false,"status":"healthy"}',False),
+              ('{"ok":"true","status":"healthy"}',False),('',False),('{"ok":',False),
+              ('true',False),('1',False),('"healthy"',False),
+              ('{"ok":true,"status":"healthy"}',True)]
+        script='source "$1"; probe() { print -r -- "$1"; }; robob_hold_health probe "$2"'
+        for response,healthy in rows:
+            with self.subTest(response=response):
+                result=subprocess.run(['/bin/zsh','-f','-c',script,'test',str(library),response],capture_output=True,timeout=10)
+                self.assertEqual(result.returncode==0,healthy)
+        script='source "$1"; probe() { print \'{"ok":true,"status":"healthy"}\'; return 5; }; robob_hold_health probe'
+        result=subprocess.run(['/bin/zsh','-f','-c',script,'test',str(library)],capture_output=True,timeout=10)
+        self.assertNotEqual(result.returncode,0)
 
 class HoldTests(unittest.TestCase):
     def setUp(self):

@@ -19,7 +19,7 @@ export async function acquireInstallHold({
     if (env.ROBOB_INSTALL_HOLD_BY && env.ROBOB_INSTALL_HOLD_PID) {
       try {
         await call("beat", env.ROBOB_INSTALL_HOLD_BY, env.ROBOB_INSTALL_HOLD_PID);
-        return async () => {};
+        return { release: async () => {}, by: env.ROBOB_INSTALL_HOLD_BY, pid: Number(env.ROBOB_INSTALL_HOLD_PID) };
       } catch (error) {
         if (error.code === "ENOENT") throw error;
       }
@@ -28,7 +28,37 @@ export async function acquireInstallHold({
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     warn("WARNING: robob-install-hold missing; Robob guard may reopen mid-install.");
-    return async () => {};
+    return { release: async () => {}, by: null, pid: null };
   }
-  return () => call("stop", by, pid);
+  return { release: () => call("stop", by, pid), by, pid };
+}
+
+/** An install timeout ends the attempt, not its recovery window. */
+export async function finishInstallHold({
+  release,
+  quitStarted,
+  healthy,
+  onWaiting = async () => {},
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  if (quitStarted) {
+    let announced = false;
+    for (;;) {
+      try {
+        if (await healthy()) break;
+      } catch {
+        // A refused connection or stalled read is still an unfinished recovery.
+      }
+      if (!announced) {
+        announced = true;
+        try {
+          await onWaiting();
+        } catch {
+          // Reporting an outage cannot release the hold for that outage.
+        }
+      }
+      await sleep(5000);
+    }
+  }
+  await release();
 }

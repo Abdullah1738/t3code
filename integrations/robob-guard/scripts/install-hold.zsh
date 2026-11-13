@@ -18,12 +18,25 @@ robob_hold_end() {
   "$HOME/.local/bin/robob-install-hold" stop --by "$ROBOB_INSTALL_HOLD_BY" --pid "$ROBOB_INSTALL_HOLD_PID" || true
 }
 
-# Status 70 means files could not be restored. Keep the installer and its
-# heartbeat alive while the operator repairs them and reopens a healthy app.
+robob_hold_health() {
+  local response
+  response=$("$@") || return 1
+  print -r -- "$response" | /usr/bin/python3 -c '
+import json, sys
+try:
+    health = json.load(sys.stdin)
+    healthy = isinstance(health, dict) and health.get("ok") is True and health.get("status") == "healthy"
+except (ValueError, TypeError):
+    healthy = False
+sys.exit(0 if healthy else 1)
+'
+}
+
+# An unsuccessful attempt still owns recovery until healthy JSON confirms it.
 robob_hold_wait_for_repair() {
   print -u2 'Recovery needs manual repair. Keeping the install heartbeat alive until Robob is healthy.'
   print -u2 'Keep this installer running; repair the files, then reopen Robob.'
-  until "$@" >/dev/null 2>&1; do
+  until robob_hold_health "$@" >/dev/null 2>&1; do
     sleep 30
   done
 }

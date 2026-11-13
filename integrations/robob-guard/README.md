@@ -48,6 +48,16 @@ failure-relaunch window. If the deployed helper is missing, scripts warn and
 continue: **the guard may then reopen Robob mid-install**. Any other hold
 acquisition failure aborts before quitting.
 
+After any quit, the release installer releases its hold only when authenticated
+health succeeds (and, after a swap, a new boot identity is present). A failed
+launch, readiness timeout or failed fallback relaunch keeps the installer alive
+with its heartbeat beyond the attempt timeout. Its recovery log and one attention
+alert request repair or compatible rollback from another Terminal. Keep the
+owner running and pass its logged `holdBy`/`holdPid` as `ROBOB_INSTALL_HOLD_BY`
+and `ROBOB_INSTALL_HOLD_PID` to a rollback. Recovery preserves the original
+failure exit code. The external supervisor must gate both successful and failed
+child exits, including exhausted retries; see `release-supervisor.md`.
+
 If the legacy before-launch hook returns 70 (files could not be restored),
 the installer stays alive and keeps its heartbeat while waiting for manual
 repair and a healthy Robob. Keep that installer running until repair is done.

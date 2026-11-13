@@ -8,36 +8,62 @@ It writes `~/.robob/install-20261111.2.ndjson` and
 That release clone predates the hold support added here. Do not edit or run
 this live supervisor as part of building the guard.
 
-Before enabling the guard, apply these exact additions to the supervisor
-(or its next release copy). After `cd /Volumes/ExternalSSD/tmp/release-20261111b/clone`,
-before `for i in 1 2 3 4 5 6; do`, insert:
+Before enabling the guard, apply all three edits below to that supervisor
+(or its next release copy). These cover success, failure and retry exhaustion.
+After `cd /Volumes/ExternalSSD/tmp/release-20261111b/clone`, before the loop,
+insert this block:
 
 ```zsh
 source /Volumes/ExternalSSD/t3code-fork/integrations/robob-guard/scripts/install-hold.zsh
 robob_hold_begin release-supervisor || exit $?
+T3CTL=/Volumes/ExternalSSD/t3code-fork/apps/server/src/ardud/control/t3ctl.mjs
+supervisor_finish() {
+  local install_rc=$1
+  print -u2 "Install attempt ended ($install_rc). Keeping supervisor $$ and its heartbeat until Robob is healthy."
+  print -u2 "If recovery is needed, repair or run a compatible rollback from another Terminal with ROBOB_INSTALL_HOLD_BY=$ROBOB_INSTALL_HOLD_BY ROBOB_INSTALL_HOLD_PID=$ROBOB_INSTALL_HOLD_PID. Keep this supervisor running."
+  robob_hold_wait_for_repair node "$T3CTL" health
+  exit "$install_rc"
+}
 ```
 
-The `zshexit` hook releases the hold at supervisor exit, not child exit or
-between attempts. Its beater watches the supervisor PID, so preflight and
-all attempts share one window. The main fork installer now holds internally
-as well and will reuse this parent hold when run by an updated supervisor.
-
-The existing `exit $rc` must be preceded by this post-launch health gate,
-so a successful child exit alone does not end the install window:
+Replace the indented `exit $rc` inside the loop with:
 
 ```zsh
-if (( rc == 0 )); then
-  until node /Volumes/ExternalSSD/t3code-fork/apps/server/src/ardud/control/t3ctl.mjs health >/dev/null 2>&1; do
-    sleep 5
-  done
-fi
+  supervisor_finish "$rc"
 ```
 
-On a failed child the supervisor owns recovery: keep the same shell and hold
-alive through rollback and its post-launch health check. Do not drop the
-hold just to start another attempt. If the supervisor itself dies, the guard
-will ignore its hold and recover Robob. #943 owns strengthening the release
-installer's readiness definition; this guard adds no separate health policy.
+Replace the final `exit 1` after `done` with:
+
+```zsh
+supervisor_finish 1
+```
+
+`robob_hold_wait_for_repair` validates the command's JSON body: `ok` must
+be the boolean `true` and `status` must be `healthy`. Exit 0 with `null`,
+HTML, malformed JSON or an unhealthy response does not release the hold.
+
+Do not put an `rc == 0` condition around the health wait. If a child fails
+at launch, times out on readiness, cannot relaunch the previous app, or
+exhausts its pre-quit retries, the owning supervisor stays alive with its
+heartbeat. It keeps waiting until the authenticated health command succeeds,
+including after a manually completed compatible rollback. The child's
+original exit code is preserved after recovery; healthy does not turn a
+failed install into a successful install.
+
+The existing pre-quit clone-race `continue` keeps the same hold between
+attempts. The `zshexit` hook releases it only after `supervisor_finish`
+observes health. The helper's beater watches the supervisor PID. If the
+supervisor is killed or crashes, its PID dies and the guard recovers Robob;
+there is no permanent hold switch.
+
+The fork installer also checks authenticated health before releasing its own
+hold after any quit, outside its three-minute attempt clock. Post-swap checks
+require a new boot identity. If it is waiting after a failed launch, the log
+and Telegram alert request repair or compatible rollback from another
+Terminal while the installer remains alive. Pass the hold name/PID printed
+in its recovery log to that rollback so it reuses the live owner instead of
+fighting it. Rollback compatibility still uses the installer's existing
+migration preflight; this change does not roll back automatically.
 
 Other entry points: `missions-cutover.zsh` and `missions-rollback.zsh` both
 call `install-robob-resume.zsh`, so the leaf installer covers their quit window.
