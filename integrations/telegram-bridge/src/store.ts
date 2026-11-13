@@ -108,7 +108,7 @@ export class Store {
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
     } catch (error) {
-      toolError("telegram", "tg.store.open");
+      toolError("telegram", "tg.store.open", undefined, error);
       this.db.close();
       throw error;
     }
@@ -219,7 +219,7 @@ export class Store {
         name: "tg.reminder", ok: state !== "failed" && state !== "uncertain", ids: { reminder: reminder.reminderId, operation: id },
         props: { action: state === "sent" ? "sent" : state === "pending" ? "retry" : state === "cancelled" ? "cancel" : "send", state },
         ...(state === "failed" || state === "uncertain" ? { error: { tag: "tg.reminder.deliveryFailed" } } : {}) });
-    } catch { toolError("telegram", "tg.reminder.deliveryLog", { operation: id }); }
+    } catch (error) { toolError("telegram", "tg.reminder.deliveryLog", { operation: id }, error); }
   }
 
   byProviderId(id: number): OutboxRecord | undefined {

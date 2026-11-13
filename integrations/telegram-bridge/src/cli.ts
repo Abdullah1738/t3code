@@ -51,8 +51,8 @@ export function parseCommand(args: string[]): Command {
       allowPositionals: true,
       tokens: true,
     });
-  } catch {
-    toolError("telegram", "tg.cli.arguments");
+  } catch (error) {
+    toolError("telegram", "tg.cli.arguments", undefined, error);
     // parseArgs errors can quote arbitrary argument values.
     throw new CliError("Invalid command arguments");
   }
@@ -127,8 +127,8 @@ export function parseCommand(args: string[]): Command {
         try {
           if (/^[+-]/.test(timezone)) throw new Error();
           new Intl.DateTimeFormat("en-US", { timeZone: timezone });
-        } catch {
-          toolError("telegram", "tg.cli.timezone");
+        } catch (error) {
+          toolError("telegram", "tg.cli.timezone", undefined, error);
           throw new CliError("--timezone must be a valid IANA timezone");
         }
         body.timezone = timezone;
@@ -175,7 +175,7 @@ export async function loadCommandPayload(command: Command): Promise<Record<strin
     for (const path of protectedPaths) {
       const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") toolLog({ component: "telegram", kind: "event", name: "tg.cli.protectedFileAbsent", ok: true });
-        else { toolError("telegram", "tg.cli.protectedFileStat"); throw error; }
+        else { toolError("telegram", "tg.cli.protectedFileStat", undefined, error); throw error; }
       });
       if (secret && secret.dev === before.dev && secret.ino === before.ino) throw new CliError("Bridge credentials and state cannot be attached");
     }
@@ -197,10 +197,10 @@ export async function loadCommandPayload(command: Command): Promise<Record<strin
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey };
   } catch (error) {
-    toolError("telegram", "tg.cli.attachmentRead");
+    toolError("telegram", "tg.cli.attachmentRead", undefined, error);
     throw error instanceof CliError ? error : new CliError("Attachment could not be read safely");
   } finally {
-    await handle?.close().catch(() => { toolError("telegram", "tg.cli.attachmentClose"); });
+    await handle?.close().catch(error => { toolError("telegram", "tg.cli.attachmentClose", undefined, error); });
   }
 }
 
@@ -210,8 +210,8 @@ async function sendCommand(command: Command): Promise<unknown> {
   try {
     if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
     socket = await lstat(socketPath);
-  } catch {
-    toolError("telegram", "tg.cli.socketStat");
+  } catch (error) {
+    toolError("telegram", "tg.cli.socketStat", undefined, error);
     throw new CliError("Bridge socket is unavailable");
   }
   // The daemon owns the private parent directory; never follow a socket symlink.
@@ -252,8 +252,8 @@ async function sendCommand(command: Command): Promise<unknown> {
           let data: unknown;
           try {
             data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
-          } catch {
-            toolError("telegram", "tg.cli.responseJson");
+          } catch (error) {
+            toolError("telegram", "tg.cli.responseJson", undefined, error);
             reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
             return;
           }
@@ -289,7 +289,7 @@ if (import.meta.main) {
   try {
     console.log(JSON.stringify(await sendCommand(parseCommand(process.argv.slice(2)))));
   } catch (error) {
-    toolError("telegram", "tg.cli.commandFailed");
+    toolError("telegram", "tg.cli.commandFailed", undefined, error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
   }

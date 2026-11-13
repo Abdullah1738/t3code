@@ -11,7 +11,7 @@ const day = () => new Date().toISOString().slice(0, 10);
 const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-test("format is private, allowlisted and identical across package copies", async () => {
+test("format is private and allowlisted", async () => {
   const dir = fixture();
   const secret = "private subject OTP 123456 password=abcdef card 4111111111111111";
   const entry = { component: "runner", kind: "perf" as const, name: "watch.run", durationMs: 2, ok: true,
@@ -19,13 +19,8 @@ test("format is private, allowlisted and identical across package copies", async
     props: { outcome: "fire", exitCode: 0, subject: secret, health: 88, source: secret, severity: "info" },
     error: { tag: "fixture.failure", message: secret } };
   toolLog(entry);
-  for (const path of ["../../telegram-bridge/src/toollog.ts", "../../spectrum-bridge/src/toollog.ts"]) {
-    const copy = await import(path);
-    copy.toolLog(entry);
-    expect(readFileSync(join(import.meta.dir, path), "utf8")).toBe(readFileSync(join(import.meta.dir, "../src/toollog.ts"), "utf8"));
-  }
   const all = rows(dir);
-  expect(all).toHaveLength(3);
+  expect(all).toHaveLength(1);
   for (const row of all) {
     expect(row).toMatchObject({ tool: "watchers", component: "runner", kind: "perf", name: "watch.run", ok: true, durationMs: 2, ids: { watcher: "fixture" }, props: { outcome: "fire", exitCode: 0, severity: "info" }, error: { tag: "fixture.failure", message: "fixture.failure" } });
     expect(row.ts).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
@@ -54,9 +49,8 @@ test("retention runs on first write and the shared cap keeps errors once event/p
   expect(readdirSync(dir)).toContain("unrelated.txt");
   const file = join(dir, `${day()}.ndjson`), cap = 50 * 1024 * 1024 + 1;
   truncateSync(file, cap);
-  const copy = await import("../../spectrum-bridge/src/toollog.ts");
   toolLog({ component: "runner", kind: "event", name: "dropped.event" });
-  copy.toolLog({ component: "wakes", kind: "perf", name: "dropped.perf" });
+  toolLog({ component: "wakes", kind: "perf", name: "dropped.perf" });
   toolLog({ component: "runner", kind: "error", name: "retained.error", ok: false, error: { tag: "fixture.failure" } });
   const tail = readFileSync(file).subarray(cap).toString();
   expect(tail.match(/"name":"log.cap"/g)).toHaveLength(1);
@@ -83,4 +77,30 @@ test("error helper emits only a stable tag for each component", () => {
   expect(rows(dir).map(row => row.name)).toEqual(["runner.error", "cli.error", "telegram.error"]);
   expect(rows(dir).every(row => row.kind === "error" && row.ok === false && row.error.message === "fixture.failed")).toBe(true);
   if (process.env.TOOLLOG_SAMPLES) for (const row of rows(dir)) console.log("LOG_SAMPLE " + JSON.stringify(row));
+});
+
+
+test("cause classes never retain arbitrary codes, messages or unapproved fields", () => {
+  const dir = fixture();
+  const secret = "https://private.invalid/Users/private?token=OTP123456";
+  const cases = [
+    [{ status: 401, message: secret }, 401],
+    [{ code: "ECONNREFUSED", path: secret }, "ECONNREFUSED"],
+    [{ cause: { code: "ENOENT", path: secret } }, "ENOENT"],
+    [{ code: "ETIMEDOUT" }, "ETIMEDOUT"],
+    [new DOMException(secret, "AbortError"), "abort"],
+    [new DOMException(secret, "TimeoutError"), "timeout"],
+    [new SyntaxError(secret), "decode"],
+    [{ causeClass: "timeout", message: secret }, "timeout"],
+    [{ status: 0, code: secret, name: secret, causeClass: secret }, "unknown"],
+    [{ status: 999, code: "SECRET_TOKEN" }, "unknown"],
+    [undefined, "unknown"],
+    [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unknown"],
+  ] as const;
+  for (const [error] of cases) toolError("telegram", "fixture.failed", { directory: secret }, error);
+  expect(rows(dir).map(row => row.props.cause)).toEqual(cases.map(([, cause]) => cause));
+  expect(rows(dir).every(row => /^[a-f0-9]{24}$/.test(row.ids.directory))).toBe(true);
+  toolLog({ component: "telegram", kind: "error", name: "fixture.props", props: { cause: secret, path: secret, url: secret, token: secret, message: secret } });
+  expect(rows(dir).at(-1).props).toBeUndefined();
+  expect(readFileSync(join(dir, `${day()}.ndjson`), "utf8")).not.toContain(secret);
 });

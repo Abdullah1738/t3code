@@ -95,8 +95,8 @@ export class Telegram {
     try {
       const me = await this.#client().api.getMe();
       return me?.is_bot === true && typeof me.id === "number";
-    } catch {
-      toolError("telegram", "tg.transport.ping");
+    } catch (error) {
+      toolError("telegram", "tg.transport.ping", undefined, error);
       return false;
     }
   }
@@ -160,7 +160,7 @@ export class Telegram {
   async start(options: StartOptions): Promise<void> {
     const bot = this.#client();
     const log = options.log;
-    bot.catch(error => { toolError("telegram", "tg.transport.polling"); log?.("polling-error", classifySendFailure(error.error).code); });
+    bot.catch(error => { toolError("telegram", "tg.transport.polling", undefined, error.error); log?.("polling-error", classifySendFailure(error.error).code); });
     const accepted = (from: { id?: number } | undefined): number | undefined => {
       const id = from?.id;
       if (!Number.isSafeInteger(id)) return undefined;
@@ -207,13 +207,13 @@ export class Telegram {
       try {
         await bot.start({ allowed_updates: ["message", "callback_query"] });
         backoff = 2_000;
-      } catch {
-        toolError("telegram", "tg.transport.start");
+      } catch (error) {
+        toolError("telegram", "tg.transport.start", undefined, error);
         // grammY resolves or rejects; both mean polling ended without stop().
         if (!this.#stopping) backoff = Math.min(60_000, backoff * 2);
       }
       if (this.#stopping) break;
-      try { await bot.stop(); } catch { toolError("telegram", "tg.transport.reconnectStop"); }
+      try { await bot.stop(); } catch (error) { toolError("telegram", "tg.transport.reconnectStop", undefined, error); }
       await sleep(backoff);
     }
   }
@@ -221,6 +221,6 @@ export class Telegram {
   stop(): Promise<void> {
     this.#stopping = true;
     const bot = this.#bot;
-    return (bot ? bot.stop() : Promise.resolve()).catch(() => { toolError("telegram", "tg.transport.stop"); }) as Promise<void>;
+    return (bot ? bot.stop() : Promise.resolve()).catch(error => { toolError("telegram", "tg.transport.stop", undefined, error); }) as Promise<void>;
   }
 }
