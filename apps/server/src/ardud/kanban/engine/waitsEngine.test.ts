@@ -170,6 +170,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
   const threadsLayer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view,
       find: view,
       lastFailure: () => Effect.succeed(null),
