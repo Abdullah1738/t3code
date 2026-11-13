@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("name")
     k = sp.add_parser("keep", help="pin this lease so the reaper never deletes it")
     k.add_argument("--days", type=float, default=30)
+    k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
 
     t = sp.add_parser("template")
     t.add_argument("action", choices=["build", "list"])
@@ -344,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         elif a.sub == "base":
             bases.rm_base(me, a.name)
         elif a.sub == "keep":
-            bases.keep(me, a.days)
+            bases.keep(me, a.days, box_id=a.box)
         elif a.sub == "template":
             if a.action == "list":
                 bases.list_templates(a.json)

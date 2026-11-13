@@ -10,7 +10,7 @@ import time
 
 from . import capacity, prepare
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
-                     kv_get, kv_set, now, say)
+                     iso, kv_get, kv_set, now, say)
 from .common import backend
 from .common import mine as token_mine  # `mine` is a local name here (the caller's own boxes)
 from .identity import normalize_repo_name, remote_dir_for
@@ -722,8 +722,9 @@ def try_warm(me, size, source, exclude, run_id):
                     if con.execute("SELECT 1 FROM events WHERE box_id=? AND kind='cold_home' AND ts>? LIMIT 1",
                                    (bid, now() - 15 * 60)).fetchone():
                         continue
-                    if con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
-                                   (f'resume_unanswered:{bid}', f'resume_provision:{bid}')).fetchone():
+                    if con.execute("SELECT 1 FROM kv WHERE k IN (?,?,?)",
+                                   (f'resume_unanswered:{bid}', f'resume_provision:{bid}',
+                                    f'delete_pending:{bid}')).fetchone():
                         continue
                     got = dict(row)
                     con.execute('INSERT OR REPLACE INTO pool_members VALUES (?,?)', (bid, key))
@@ -812,9 +813,16 @@ def _claim(con, me, row, run_id):
                            "AND run_id<>? ORDER BY start_at DESC LIMIT 1",
                            (me["owner"], me["repo_root"], run_id or "")).fetchone()
     if last and last[0] != bid:
-        old = con.execute("SELECT state FROM leases WHERE box_id=?", (last[0],)).fetchone()
+        old = con.execute("SELECT state, pinned_until FROM leases WHERE box_id=?", (last[0],)).fetchone()
         state = old[0] if old else "gone"
         state = state if state in ("stopped", "archived") else "busy" if state == "running" else "gone"
+        if state == 'gone' and old and old['pinned_until']:
+            deletion = con.execute("SELECT ts, kind, detail FROM events WHERE box_id=? AND kind IN "
+                                   "('delete','reap_forget','reap_expired','lease_gone','lease_expired') "
+                                   "ORDER BY ts DESC LIMIT 1", (last[0],)).fetchone()
+            evidence = (f"{deletion['kind']} at {iso(deletion['ts'])}: {deletion['detail']}" if deletion else
+                        "no deletion event recorded; data loss unconfirmed")
+            state += f" (was pinned; {evidence})"
         detail = ("new checkout there, dependencies not carried over" if row["_new_checkout"]
                   else "existing checkout there")
         say(f"your last box {last[0]} is {state}; using {bid} ({detail})")

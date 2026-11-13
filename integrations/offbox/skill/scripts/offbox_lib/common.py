@@ -209,9 +209,19 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
         named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
                                                                       and not x.startswith("-"))]
+        if sub == 'keep':
+            # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
+            import argparse
+            selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+            selector.add_argument('--box')
+            try:
+                selected, _ = selector.parse_known_args(argv)
+            except argparse.ArgumentError:
+                return first  # The full command parser reports malformed input.
+            named = [selected.box] if selected.box else []
         for name in (first, "boat" if first == "server" else "server"):
             if any(_known(name, x) for x in named):
                 return name

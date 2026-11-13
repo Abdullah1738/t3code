@@ -70,16 +70,23 @@ def _bringup_lock(row) -> str:
 
 
 def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
+    if lease.pinned_until(con, box_id) > now():
+        actions.append(f"keep {box_id}: pinned; backend miss does not retire its lease")
+        return
     actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from {api.NAME}")
     if not dry:
-        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        con.commit()
-        event(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        try:
+            lease.forget_box(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        except lease.PinnedLeaseError as pin:
+            actions[-1] = f"keep {box_id}: {pin}"
 
 
 def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
     """Delete a quarantined or abandoned bring-up box. The bring-up lock is taken first (no wait), then the row is
     re-read: a live acquisition that finished meanwhile is left alone. act() takes the box lock itself."""
+    if lease.pinned_until(con, bid) > now():
+        actions.append(f"keep {bid}: pinned recipe box")
+        return
     if dry:
         actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
         return
@@ -184,14 +191,19 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         if bid in protected:
             continue
+        if (b is None or b.get('dataExpiredAt')) and lease.pinned_until(con, bid) > now():
+            actions.append(f"keep {bid}: pinned; backend miss does not retire its lease")
+            continue
         if b is None:
             if not dry:
                 # Release first. The lease is retired only once no hold remains: a busy lock or a failed read keeps
                 # the hold and the lease state, so a later pass finds it again and retries.
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    try:
+                        lease.forget_box(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: gone from {api.NAME}")
                 else:
                     actions.append(f"hold kept {bid}: gone from {api.NAME}, not yet confirmed")
@@ -203,9 +215,11 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             # hold goes only after a locked, fresh confirmation; a busy lock leaves it for a later pass.
             if not dry:
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    try:
+                        lease.forget_box(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: {api.NAME} deleted its data")
                 else:
                     actions.append(f"hold kept {bid}: {api.NAME} deleted its data, not yet confirmed")
