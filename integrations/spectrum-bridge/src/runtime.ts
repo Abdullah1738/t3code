@@ -209,7 +209,7 @@ export type SbApiOptions<P extends { api: Handler }> = {
 };
 
 /** Session-bound routes the per-chat Photon-era API already implements. */
-const FORWARDED = ["/files", "/poll", "/secret-request"];
+const FORWARDED = ["/files", "/poll", "/secret-request", "/cancel-send"];
 const TAPBACKS = ["like", "love", "dislike", "laugh", "emphasize", "question"];
 const RESERVED_TARGET = /^(?:secret|wake|reset):/;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });

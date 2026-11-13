@@ -98,8 +98,8 @@ test('stallScan interrupts a child stuck in execute at three minutes, not before
   assert.deepEqual(calls.interrupts, ['ses_child']);
   active = new Set();
   await stallScan({ state, now: T0 + 4 * 60_000, log }, io);
-  assert.equal(calls.summaries.length, 1);
-  assert.match(calls.summaries[0].text, /execute \(code awaits a promise that never resolves\)/);
+  assert.equal(calls.summaries.length, 0);
+  assert.match(Object.values(state.stalls)[0].summary, /execute \(code awaits a promise that never resolves\)/);
   assert.equal(Object.values(state.stalls)[0].outcome, 'cleared');
 });
 

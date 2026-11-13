@@ -280,7 +280,12 @@ def prepared_result(flow, prepared):
             or not isinstance(prepared.get('readback'),dict)
             or not prepared['readback']):
         journal.fail('PREPARE_ONLY_READBACK_UNCONFIRMED')
-    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED',
+    from commerce_pending import warnings
+    import owner_go
+    pending = warnings(flow.flow_id)
+    approval_item=owner_go.commerce_item(journal.binding(flow.flow_id))
+    return {**prepared,**({'warnings':pending} if pending else {}),'ok':True,'state':'PREPARED_NOT_ORDERED',
+            'owner_go_item':approval_item,
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 
@@ -320,6 +325,8 @@ def order_minutes(args):
         flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra,use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
     try:
+        from commerce_pending import cli_review
+        cli_review(flow,args)
         prepared=flow.prepare_only()
         verified=prepared_result(flow,prepared)
         review=prepared['review']
@@ -405,6 +412,8 @@ def order_nownow(args):
     else:
         flow=NowNowOrderFlow(store_code=args.store_code,items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
     prepared=flow.prepare_only()
     verified=prepared_result(flow,prepared)
     review=prepared['review']
@@ -467,6 +476,8 @@ def order_main(args):
     else:
         flow=MainOrderFlow(items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
     prepared=flow.prepare_only()
     verified=prepared_result(flow,prepared)
     review=prepared['review']
@@ -522,6 +533,8 @@ def order_supermall(args):
     else:
         flow = SupermallOrderFlow(items=items, auth=auth)
         print(json.dumps({'flow_id': flow.flow_id, 'phase': 'created'}), flush=True)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
     prepared=flow.prepare_only()
     verified=prepared_result(flow,prepared)
     review=prepared['review']
@@ -647,13 +660,22 @@ def await_payment_flow(args):
 
 
 def release_flow(args):
+    if getattr(args,'dry_run',False):
+        with journal.read_only():
+            return _release_flow(args)
+    return _release_flow(args)
+
+
+def _release_flow(args):
     """Evidence-reviewed release of a fenced never-paid flow (noon minutes / talabat)."""
     from commerce_minutes import exact_failed_evidence
     binding=journal.binding(args.flow_id)
     local=journal.inspect(args.flow_id)
     if binding['app']=='noon' and binding['vertical']=='nownow':
-        from commerce_preorder_release import release
-        return release(args.flow_id)
+        from commerce_nownow_release import release
+        return release(args.flow_id, dry_run=getattr(args,'dry_run',False))
+    if getattr(args,'dry_run',False):
+        journal.fail('RELEASE_DRY_RUN_NOWNOW_ONLY')
     if binding['app']=='noon' and binding['vertical'] in ('food','main','supermall'):
         # These lanes place before paying; no pre-order intent contract exists.
         journal.fail('RELEASE_EXACT_ORDER_RECONCILIATION_REQUIRED')
@@ -916,6 +938,7 @@ def basket_arguments(parser, flag):
         help='basket JSON array or {"items":[...]}; use - for stdin')
     parser.add_argument('--quantity',type=int,default=None,
         help='quantity for the single-item flag (default 1); not combined with --items-file')
+    parser.add_argument('--ack-pending',action='append',default=[],metavar='FLOW_UUID')
     parser.add_argument('--prepare-only',action='store_true',
         help='create/review the basket with exact readback, without ordering or paying (not read-only)')
     recipient_argument(parser)
@@ -1081,6 +1104,7 @@ def main(argv=None):
     food_order=order_commands.add_parser('food', help='Journalled Food automatic saved-card order; explicit payment requirements need app')
     food_order.add_argument('--outlet-code',required=True)
     food_order.add_argument('--items-file',required=True)
+    food_order.add_argument('--ack-pending',action='append',default=[],metavar='FLOW_UUID')
     food_order.add_argument('--prepare-only',action='store_true')
     food_order.add_argument('--resume-flow')
     talabat_order=order_commands.add_parser('talabat',
@@ -1135,6 +1159,7 @@ def main(argv=None):
     release=commands.add_parser('release-flow',
         help='Evidence-reviewed local release: failed Talabat quote with no financial send, or verified never-paid order')
     release.add_argument('flow_id')
+    release.add_argument('--dry-run',action='store_true',help='NowNow: evaluate evidence without closing the flow')
     abandon=commands.add_parser('abandon-flow',
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')

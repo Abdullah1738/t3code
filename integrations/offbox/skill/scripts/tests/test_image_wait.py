@@ -200,7 +200,7 @@ class ImageWaitTests(unittest.TestCase):
             fx.tool('systemctl', '#!/bin/bash\necho systemctl >> "$CALLS"\nexit 0\n')
             fx.env['HOME'] = d
             with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
-                 patch.object(runs, 'GO_REPAIR', ':'):
+                 patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('missing-dir', '.', ['echo USER_COMMAND'], None, 'r', wait_images=True)
             script = script.replace(runs.IMAGE_WAIT, fx.script())
             result = subprocess.run(['bash', '-c', runs.exit_recording_command(script, 'r').replace('bash -lc', 'bash -c')],

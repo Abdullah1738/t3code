@@ -350,7 +350,8 @@ test("typing starts when a batch is taken, before the prompt, refreshes every 20
 });
 
 test("a slow thread list never sits between a text and its prompt or a finished run and its reply", async () => {
-  setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
+  const start = Date.parse("2026-10-21T12:00:00Z");
+  setSystemTime(start);
   const h = live(context("owner"));
   let lists = 0;
   let release!: (statuses: Record<string, never>) => void;
@@ -371,8 +372,10 @@ test("a slow thread list never sits between a text and its prompt or a finished 
   expect(h.backend.prompts).toHaveLength(2);
   expect(lists).toBe(1);
   expect(h.logs.filter(([event]) => !event.startsWith("typing"))).toEqual([
-    ["batch-sealed", "owner a"], ["prompt-accepted", "owner a"], ["run-completed-seen", "owner a"], ["reply-enqueued", "owner a"],
-    ["batch-sealed", "owner b"], ["prompt-accepted", "owner b"],
+    ["batch-sealed", "owner a"],
+    ["inbound-latency", `id=a receivedAt=${new Date(start).toISOString()} deliveredAt=${new Date(start).toISOString()} ms=0`], ["prompt-accepted", "owner a"], ["run-completed-seen", "owner a"], ["reply-enqueued", "owner a"],
+    ["batch-sealed", "owner b"],
+    ["inbound-latency", `id=b receivedAt=${new Date(start).toISOString()} deliveredAt=${new Date(start).toISOString()} ms=0`], ["prompt-accepted", "owner b"],
   ]);
   release({});
   await list;

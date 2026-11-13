@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import json
 from pathlib import Path
@@ -6,8 +7,8 @@ import unittest
 from unittest.mock import patch
 
 import talabat_order_adapter as adapter
-from test import test_talabat_fresh_review as fixtures
-from test import test_talabat_payment_route as route_fixtures
+import test_talabat_fresh_review as fixtures
+import test_talabat_payment_route as route_fixtures
 
 
 def snapshot():
@@ -31,6 +32,9 @@ def run_rehearsal(original=None, data=None, **responses):
 
 
 class OrderAdapterTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_complete_no_send_rehearsal_even_success_and_delivery_never_paid(self):
         tracking = {'type':'OrderTrackingScreen', 'common_tracking_event_attributes':{
             'order_id':'1234567890', 'delivery_status':'order_delivered'}}

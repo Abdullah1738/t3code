@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,17 +10,19 @@ OTHER='10000000-0000-4000-8000-000000000002'
 
 
 class AccountFenceTests(unittest.TestCase):
-    def test_existing_account_cannot_create_new_flow_or_reopen_fenced_one(self):
+    def setUp(self):
+        approve_test_flows(self)
+
+    def test_new_noon_flow_allowed_but_fenced_flow_stays_closed(self):
         with tempfile.TemporaryDirectory() as temp,patch.object(j,'ROOT',Path(temp).resolve()/'commerce'):
             self.assertTrue(j.require_account_available('noon','1'*64))
             j.open_flow(flow_id=FLOW,app='noon',vertical='minutes',account_hash='1'*64,scope_hash='2'*64)
-            with self.assertRaisesRegex(j.JournalError,'RECONCILIATION_REQUIRED'):
-                j.require_account_available('noon','1'*64,flow_id=OTHER)
+            self.assertTrue(j.require_account_available('noon','1'*64,flow_id=OTHER))
             self.assertTrue(j.require_account_available('noon','1'*64,flow_id=FLOW))
             j.consume(FLOW,'place',kind='place',request_hash='3'*64,cart_hash='4'*64,
                       review_hash='5'*64,payable_minor=1725)
             j.observe(FLOW,'place',outcome='UNKNOWN',evidence_hash='6'*64)
-            with self.assertRaisesRegex(j.JournalError,'RECONCILIATION_REQUIRED'):
+            with self.assertRaisesRegex(j.JournalError,'JOURNAL_FLOW_FENCED'):
                 j.require_account_available('noon','1'*64,flow_id=FLOW)
             self.assertEqual(j.inspect(FLOW)['campaign_reserved_minor'],1725)
 

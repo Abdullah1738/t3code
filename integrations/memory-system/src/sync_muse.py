@@ -32,6 +32,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_mask import mask_json_text, mask_recall_value, mask_text
 import backend  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
@@ -256,6 +257,7 @@ def project(rec, st, rel):
             return []
         return [(rid, ts, "assistant", "text", clip(text), model, dict(base, kind="reasoning"))]
     if kind == "assistant_tool_calls_committed":
+        ev, _ = mask_recall_value(ev)
         rows = []
         for i, c in enumerate(_l(ev.get("tool_calls"))):
             if not isinstance(c, dict):
@@ -268,6 +270,7 @@ def project(rec, st, rel):
                          model, dict(base, kind="tool_call", tool=name, call_id=cid)))
         return rows
     if kind == "tool_result_batch_committed":
+        ev, _ = mask_recall_value(ev)
         rows = []
         tools = st.setdefault("tools", {})
         for i, r in enumerate(_l(ev.get("results"))):
@@ -464,7 +467,7 @@ class MuseSync:
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, sid, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                    [(SOURCE, sid, tid, ts, spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
                      for tid, ts, spk, ctype, content, model, m in rows
                      for safe_content, safe_meta in [self.redactor.event(
                          SOURCE, sid, tid, content, json.dumps(m, ensure_ascii=False))]],
@@ -473,7 +476,7 @@ class MuseSync:
                 "INSERT OR REPLACE INTO muse_sync_files(path, session_id, root_id, offset, size, mtime_ns, head_sha,"
                 " skip, state_json, synced_at, ino) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (path, sid, root_id, offset, size, stt.st_mtime_ns, sha, skip,
-                 json.dumps(state, ensure_ascii=False), int(time.time()), stt.st_ino),
+                 mask_json_text(json.dumps(state, ensure_ascii=False)), int(time.time()), stt.st_ino),
             )
             if meta:
                 self._upsert_meta(meta)
@@ -489,7 +492,7 @@ class MuseSync:
             " cwd=coalesce(excluded.cwd, cwd), model=coalesce(excluded.model, model),"
             " robob_thread_id=coalesce(excluded.robob_thread_id, robob_thread_id),"
             " path=excluded.path, updated_at=excluded.updated_at",
-            dict(meta, now=int(time.time())),
+            dict(meta, title=mask_text(meta["title"]) if meta.get("title") is not None else None, now=int(time.time())),
         )
 
     def late_metadata(self):
@@ -512,7 +515,7 @@ class MuseSync:
                 self.mem.execute(
                     "UPDATE muse_sessions SET robob_thread_id=coalesce(?, robob_thread_id), title=coalesce(title, ?),"
                     " parent_id=coalesce(parent_id, ?), updated_at=? WHERE session_id=?",
-                    (t_id, t_title, t_parent, int(time.time()), sid),
+                    (t_id, mask_text(t_title) if t_title is not None else None, t_parent, int(time.time()), sid),
                 )
 
         with_retry(self.mem, write, budget=self.budget)

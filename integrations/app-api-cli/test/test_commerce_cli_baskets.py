@@ -16,10 +16,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import commerce_cli as cli
+from owner_go_support import approve_test_flows
 
 
 class BasketCLITests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
+        binding = patch.object(cli.journal, 'binding', return_value={
+            'app':'noon', 'vertical':'minutes', 'scope_hash':'b'*64})
+        binding.start(); self.addCleanup(binding.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'basket.json'
@@ -28,7 +33,7 @@ class BasketCLITests(unittest.TestCase):
         self.flow.prepare_only.return_value = {
             'flow_id': self.flow.flow_id,
             'prepared_only': True,
-            'review': {'payable_minor': 123456, 'quantity': 42},
+            'review': {'payable_minor': 123456, 'quantity': 42, 'card_last4':'2342'},
             'readback': {'manifest_verified': True},
         }
 
@@ -82,7 +87,7 @@ class BasketCLITests(unittest.TestCase):
                 with patch(target) as cls, patch.object(cli, 'CommerceAuth'), \
                      patch('commerce_minutes.readback_active_orders', return_value=SimpleNamespace(
                          projection={'count': 0, 'active': []})), \
-                     patch.object(cli.journal, 'inspect', return_value={'order_id': None}):
+                     patch.object(cli.journal, 'inspect', return_value={'order_id': None, 'state':'ACTIVE'}):
                     cls.resume_active.return_value = self.flow
                     code, result = self.run_cli(['order', name, '--items-file', str(self.path),
                         '--resume-flow', self.flow.flow_id, '--prepare-only', *extra])
@@ -142,6 +147,24 @@ class BasketCLITests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result['error'], 'PREPARE_ONLY_FLOW_ALREADY_ORDERED')
         cls.resume_paid.assert_not_called()
+
+
+
+# Metadata checks run even when a transport is stubbed.
+_journal_temp = tempfile.TemporaryDirectory()
+_journal_patch = patch.object(cli.journal, 'ROOT', Path(_journal_temp.name).resolve()/'commerce')
+_original_setup = globals().get('setUpModule', lambda: None)
+_original_teardown = globals().get('tearDownModule', lambda: None)
+def setUpModule():
+    _journal_patch.start()
+    _original_setup()
+    import order_card, card_status
+    if order_card.LAST4=='2342':
+        card_status.record_declined('9546',reason='synthetic issuer decline',source='test')
+def tearDownModule():
+    _original_teardown()
+    _journal_patch.stop()
+    _journal_temp.cleanup()
 
 
 if __name__ == '__main__':

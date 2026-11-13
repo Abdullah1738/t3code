@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -19,7 +20,7 @@ from . import api, capacity, lease, ssh_sync
 from .identity import require_proven
 from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, DEFAULT_OWNER, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError,
                      ago, db, event, file_lock, iso, iso_ts, kv_get, kv_set, mine, new_id, now, owner_scoped, say,
-                     token_owner)
+                     require_mine, token_owner)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
 
@@ -31,6 +32,7 @@ def _caller_lease(me: dict):
     row = lease.find_lease(con, me["owner"], me["repo_root"])
     if not row:
         raise OffboxError("no lease for this thread + repo yet. Run something with `offbox run -- ...` first.", code=2)
+    lease.check_deletion(con, row['box_id'])
     return con, row
 
 
@@ -98,7 +100,7 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
     keep_saved(con, "bases", full, bid, (old and old["saved"]) or saved_name("base", full))
     if old and old["box_id"] != bid:
         try:
-            api.delete(old["box_id"])
+            lease.delete_box(con, old["box_id"], f"base replaced: {full}", usage=False)
             event(con, old["box_id"], "base_replaced", f"{full} -> {bid}")
         except OffboxError as e:
             say(f"old base box {old['box_id']} not deleted: {e}")
@@ -330,7 +332,7 @@ def rm_base(me: dict, name: str) -> None:
     _refuse_other_owner(con, "bases", full)
     busy = con.execute("SELECT COUNT(*) FROM leases WHERE state IN ('running','stopped') AND source=?",
                        (f"base:{full}",)).fetchone()[0]
-    api.delete(r["box_id"])
+    lease.delete_box(con, r["box_id"], f"base rm: {full}", usage=False)
     if r["saved"]:
         try:
             api.delete_saved(r["saved"])
@@ -342,13 +344,49 @@ def rm_base(me: dict, name: str) -> None:
     print(f"removed base {full} ({r['box_id']})")
 
 
-def keep(me: dict, days: float) -> None:
-    con, row = _caller_lease(me)
+def keep(me: dict, days: float, box_id: str | None = None) -> None:
+    if not math.isfinite(days) or days < 0:
+        raise OffboxError("keep --days must be finite and nonnegative (0 clears your pin)", code=2)
     until = now() + days * 86400
-    con.execute("UPDATE leases SET pinned_until=? WHERE box_id=?", (until, row["box_id"]))
-    con.commit()
-    event(con, row["box_id"], "keep", f"{days}d")
-    print(f"pinned {row['box_id']} for {days:g} days (it still stops when idle, which is free; it won't be deleted)")
+    try:
+        iso(until)
+    except (OverflowError, OSError, ValueError):
+        raise OffboxError("keep --days expiry is out of range", code=2) from None
+    if box_id:
+        require_proven(me, "clear pin")
+        if days != 0:
+            raise OffboxError("keep --box clears a previous pin; pass --days 0", code=2)
+        con = db()
+        require_mine(con, box_id)
+        row = con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone()
+        if not row:
+            raise OffboxError(f"no lease for {box_id}", code=2)
+    else:
+        con, row = _caller_lease(me)
+    with file_lock('pin-' + row['box_id'], timeout=120):
+        current = con.execute("SELECT state FROM leases WHERE box_id=?", (row['box_id'],)).fetchone()
+        if not current or (days and current['state'] not in ('running', 'stopped')):
+            raise OffboxError(f"{row['box_id']} is no longer available to pin", code=2)
+        lease.check_deletion(con, row['box_id'])
+        by = kv_get(con, 'pin_owner:' + row['box_id'])
+        current_until = lease.pinned_until(con, row['box_id'])
+        if current_until > now() and days and not by:
+            raise OffboxError(f"{row['box_id']} pin setter is unknown; refusing to change its active legacy pin "
+                              f"until {iso(current_until)} (keep --days 0 explicitly clears the current pin)", code=2)
+        if current_until > now() and (by or box_id) and by != me['owner']:
+            raise OffboxError(f"{row['box_id']} is pinned by {by or 'an unknown thread (legacy pin)'} until {iso(current_until)}; "
+                              "only that thread can change or clear its pin", code=2)
+        con.execute("UPDATE leases SET pinned_until=? WHERE box_id=?", (until if days else None, row["box_id"]))
+        if days:
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", ('pin_owner:' + row['box_id'], json.dumps(me['owner']), now()))
+        else:
+            con.execute("DELETE FROM kv WHERE k=?", ('pin_owner:' + row['box_id'],))
+        con.commit()
+        event(con, row["box_id"], "keep" if days else "unpin", f"{days}d owner={me['owner']}")
+    if days:
+        print(f"pinned {row['box_id']} for {days:g} days (it still stops when idle, which is free; it won't be deleted)")
+    else:
+        print(f"cleared pin on {row['box_id']}")
 
 
 # ---------------------------------------------------------------- templates
@@ -443,7 +481,7 @@ def build_template(name: str) -> dict:
     keep_saved(con, "templates", name, bid, (old and old["saved"]) or saved_name("template", name))
     if old and old["box_id"] != bid:
         try:
-            api.delete(old["box_id"])
+            lease.delete_box(con, old["box_id"], f"template replaced: {name}", usage=False)
             event(con, old["box_id"], "template_replaced", f"{name} -> {bid}")
         except OffboxError as e:
             say(f"old template box {old['box_id']} not deleted: {e}")

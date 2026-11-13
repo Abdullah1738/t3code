@@ -592,6 +592,16 @@ export const OrchestrationV2Run = Schema.Struct({
       planId: PlanId,
     }),
   ),
+  launchRecovery: Schema.optional(
+    Schema.Struct({
+      kind: Schema.Literals(["model_access", "relay"]),
+      replayAllowed: Schema.optional(Schema.Boolean),
+      retriesOnModel: Schema.Number,
+      attempt: PositiveInt,
+      delayMs: Schema.Number,
+      since: IsoDateTime,
+    }),
+  ),
   transientRecovery: Schema.optional(
     Schema.Struct({
       firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
@@ -903,6 +913,7 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
   seededHistory: Schema.optional(OrchestrationV2SeededHistory),
   successfulModels: Schema.optional(Schema.Array(Schema.String)),
+  claudeRefusalObserved: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -1352,6 +1363,14 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
+  claudeAccess: Schema.optional(
+    Schema.Struct({
+      status: Schema.NullOr(Schema.Number),
+      beforeResponse: Schema.Boolean,
+      refusalFree: Schema.Boolean,
+      refused: Schema.Boolean,
+    }),
+  ),
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   category: Schema.optional(OrchestrationV2ProviderFailureCategory).pipe(
     Schema.withDecodingDefault(Effect.succeed("unknown" as const)),

@@ -209,9 +209,19 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
         named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
                                                                       and not x.startswith("-"))]
+        if sub == 'keep':
+            # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
+            import argparse
+            selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+            selector.add_argument('--box')
+            try:
+                selected, _ = selector.parse_known_args(argv)
+            except argparse.ArgumentError:
+                return first  # The full command parser reports malformed input.
+            named = [selected.box] if selected.box else []
         for name in (first, "boat" if first == "server" else "server"):
             if any(_known(name, x) for x in named):
                 return name
@@ -409,7 +419,7 @@ CREATE INDEX IF NOT EXISTS leases_owner ON leases(owner, repo_root, state);
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, box_id TEXT, owner TEXT, session_id TEXT, thread_id TEXT,
   repo_root TEXT, cwd TEXT, cmd TEXT, size TEXT, mode TEXT,   -- fg | bg | local
-  process_id INTEGER, command_id TEXT,
+  process_id INTEGER, command_id TEXT, wrapper_pid INTEGER,
   status TEXT,                     -- starting | running | done | failed | killed | lost | infra
   exit_code INTEGER, start_at REAL, end_at REAL,
   sync_s REAL, setup_s REAL, sent_bytes INTEGER, log_path TEXT, error TEXT,
@@ -441,9 +451,15 @@ def db() -> sqlite3.Connection:
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER"):
+                "client_pid INTEGER", "wrapper_pid INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    if 'wrapper_pid' not in have:
+        # Recovery used to copy the wrapper's OS PID into the API ID column. A command_id proves API provenance.
+        con.execute("UPDATE runs SET wrapper_pid=process_id,process_id=NULL WHERE process_id IS NOT NULL "
+                    "AND command_id IS NULL AND EXISTS (SELECT 1 FROM kv WHERE k IN "
+                    "('start_unattached:' || runs.run_id, 'start_unknown:' || runs.run_id))")
+        con.commit()
     # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
     for table in ("templates", "bases"):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}

@@ -273,11 +273,6 @@ async function main(): Promise<void> {
         if (await retireUnresolvedRoute(store, backend).catch(() => false)) log("route-unresolved-retired");
       }
       if (ready()) {
-        const revision = ingressRevision;
-        try {
-          await router?.tick();
-          if (revision === ingressRevision && synchronized) controlsPending = false;
-        } catch { log("router-tick-failed"); }
         if (Date.now() - backendCheckedAt >= 30_000) {
           backendCheckedAt = Date.now();
           await backend.health().then(() => { health.backendLastOk = Date.now(); }, () => {});
@@ -286,8 +281,18 @@ async function main(): Promise<void> {
       await sleep(1_000);
     }
   }
+  let routerBusy = false;
   const timer = setInterval(() => {
     void delivery.tick().catch(() => log("sender-failed"));
+    if (ready()) void router?.checkInboundLatency().catch(() => log("inbound-latency-check-failed"));
+    if (ready() && router && !routerBusy) {
+      routerBusy = true;
+      const currentRouter = router;
+      const revision = ingressRevision;
+      void currentRouter.tick().then(() => {
+        if (revision === ingressRevision && synchronized) controlsPending = false;
+      }, () => log("router-tick-failed")).finally(() => { routerBusy = false; });
+    }
     if (ready()) void router?.checkFailedInbound().catch(() => log("failed-inbound-check-failed"));
   }, 1_000);
   const stop = async () => {

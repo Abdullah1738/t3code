@@ -7,6 +7,8 @@ import * as Cause from "effect/Cause";
 import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
 
+import { KanbanError } from "@t3tools/contracts";
+
 import * as BoardLocks from "./boardLocks.ts";
 import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
@@ -41,7 +43,10 @@ it.effect("#566 a committed re-acquire timeout never advertises a safe retry", (
     const result = yield* Fiber.join(first);
     assert.isTrue(Exit.isFailure(result));
     if (Exit.isFailure(result)) {
-      const message = String(Cause.squash(result.cause));
+      const error = Cause.squash(result.cause);
+      assert.instanceOf(error, KanbanError);
+      assert.strictEqual((error as KanbanError).saved, null);
+      const message = String(error);
       assert.include(message, "may have been applied");
       assert.notInclude(message, "Safe to retry");
     }

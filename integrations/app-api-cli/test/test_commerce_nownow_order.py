@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 from decimal import Decimal
@@ -146,6 +147,7 @@ def make_flow(responses, **kwargs):
 
 class FixtureTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         for module in (j, c.receipts):
@@ -275,6 +277,7 @@ class GuardTests(FixtureTests):
 
 class BankFixtureTests(FixtureTests):
     def setUp(self):
+        approve_test_flows(self)
         super().setUp()
         p = patch('commerce_food_capture.find_bank_capture', return_value={'source_id': 123, 'source': 'msgs'})
         p.start()
