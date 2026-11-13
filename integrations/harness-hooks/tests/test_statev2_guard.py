@@ -1808,7 +1808,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         with patch.object(Path, "open", side_effect=AssertionError("must not read database symlink")):
             self.assertEqual(guard.classify("python3 linked.py", str(self.root)), "live-database-read")
 
-    def test_policy_runs_before_identity_offbox_or_coord_and_does_not_log_sql(self):
+    def test_policy_runs_before_identity_or_offbox_and_does_not_log_sql(self):
         command = "sqlite3 ~/.robob/userdata/statev2.sqlite 'select private_sql'"
         for harness in ("claude", "codex"):
             for tool in ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__exec_command", "mcp__test__shell"):
