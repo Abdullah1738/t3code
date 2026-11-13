@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -41,9 +42,9 @@ elif name=='sqlite3':
 
 
 class ShellJobsTests(unittest.TestCase):
- def fixture(self):
+ def fixture(self,home_name='home'):
   temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
-  root=Path(temp.name);home=root/'home';home.mkdir();fake=root/'bin';fake.mkdir()
+  root=Path(temp.name);home=root/home_name;home.mkdir();fake=root/'bin';fake.mkdir()
   for name in ['python3','restic','rsync','df','stat','getconf','nice','bun','rm','sqlite3']:
    p=fake/name;p.write_text(FAKE.replace('PYTHON',sys.executable));p.chmod(0o755)
   logs=root/'logs'
@@ -104,21 +105,37 @@ class ShellJobsTests(unittest.TestCase):
 
  @unittest.skipUnless(shutil.which('zsh'),'installer uses zsh')
  def test_installer_check_verifies_rendered_plist_and_modes(self):
-  root,home,fake,logs,env=self.fixture()
-  git=fake/'git'
-  git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
-  git.chmod(0o755)
-  command=['zsh',str(HERE/'install.zsh')]
-  installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
-  self.assertEqual(installed.returncode,0,installed.stderr)
-  plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
-  original=plist.read_text()
-  def check():
-   return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
-  self.assertEqual(check(),0)
-  plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
-  plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)
-  plist.rename(plist.with_suffix('.saved'));self.assertNotEqual(check(),0)
+  for home_name in ('home','home with spaces'):
+   with self.subTest(home=home_name):
+    root,home,fake,logs,env=self.fixture(home_name)
+    git=fake/'git'
+    git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
+    git.chmod(0o755)
+    command=['zsh',str(HERE/'install.zsh')]
+    dry_run=subprocess.run(command+['--dry-run'],env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(dry_run.returncode,0,dry_run.stderr)
+    self.assertFalse((home/'.local').exists())
+    self.assertFalse((home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist').exists())
+    installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(installed.returncode,0,installed.stderr)
+    plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
+    original=plist.read_text()
+    rendered=plistlib.loads(original.encode())
+    collector=home/'.local/lib/mac-logging/collector.py'
+    arguments=['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}"']
+    self.assertEqual(rendered,dict(Label='com.abdullah.mac-log-collector',ProgramArguments=arguments,
+                                   StartInterval=3600,RunAtLoad=True,ProcessType='Background'))
+    self.assertNotIn('__HOME__',original)
+    def check():
+     return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
+    self.assertEqual(check(),0)
+    plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
+    plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)
+    plist.rename(plist.with_suffix('.saved'));self.assertNotEqual(check(),0)
+    collector.write_text('import sys\nprint(sys.argv[0])\n')
+    launched=subprocess.run(rendered['ProgramArguments'],env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(launched.returncode,0,launched.stderr)
+    self.assertEqual(launched.stdout.strip(),str(collector))
 
  @unittest.skipUnless(shutil.which('zsh'),'installers use zsh')
  def test_each_job_installer_rejects_missing_executable_permissions(self):
