@@ -35,6 +35,28 @@ are omitted rather than reported as zero. A restic exit code of -1 means it
 was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
 
+Samples also include `internalFreeGbDelta`/`externalFreeGbDelta` (null on the
+first measurement), and optional `internal`/`external` `PurgeableGb` and
+`LocalSnapshotCount`. Four read-only diskutil/tmutil calls run concurrently
+under one five-second budget, including cleanup. Missing purgeable keys are
+`PurgeableError=unsupported`, never zero; command failures carry short error
+enums and omit the unavailable number. Snapshot names and volume labels are
+discarded. A timed-out batch emits one `disk.probe_slow`; an already eight-second
+sample skips probing. A lock inherited by probe children prevents accumulating
+processes if a kernel wait survives SIGKILL.
+
+`topMover1Path`/`topMover1GbDelta` show the largest absolute tracked size change,
+including shrinkage. Movers require fresh inventories in both samples and
+exclude partial totals. Confirmed missing tracked roots and database/WAL files
+are recorded as zero, so creation and deletion contribute to mover deltas.
+An unavailable backing mount, failed reads and older states without an explicit
+measurement remain unknown; an omitted path is never assumed to be zero.
+Changes of at least 20 GB on either volume emit one
+`disk.swing` event with `previousTs`, `sampleTs`, both free-space deltas and up
+to three flattened `topMover` pairs. These events never alert. The inventory is
+hourly and covers selected roots, so movers are evidence of tracked changes,
+not a complete accounting of each free-space delta.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
@@ -42,7 +64,8 @@ counts. Each unavailable source also emits an error-kind `disk.inventory.source`
 or `crash.source` with `source` (root path or `unified`), `failure` (`timeout`,
 `exit`, `permission`, `parse`, `missing-total`, or `partial`), `exitCode` (null when no
 exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
-timeout line without launching another command. Missing inventory paths are skipped.
+timeout line without launching another command. Confirmed missing inventory
+paths retain a zero total without a source error.
 
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
@@ -74,7 +97,7 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Missing optional database/WAL files are skipped. The filtered unified-log query
+Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
 has a one-hour maximum window and a timeout of at most 60 s, shortened to the
 collector's remaining absolute budget. Its source event/error and
 `crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,

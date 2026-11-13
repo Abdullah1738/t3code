@@ -66,6 +66,9 @@ class SharedMcpTests(unittest.TestCase):
     def test_all_harnesses_keep_ids_and_use_remote_transports(self):
         servers = self.manifest["mcpServers"]
         claude = gh.claude_mcp(servers)
+        env = gh.claude_settings_owned(self.manifest)["env"]
+        self.assertEqual(env["MCP_TIMEOUT"], "15000")
+        self.assertEqual(env["MCP_CONNECT_TIMEOUT_MS"], "15000")
         for name, port in (("flighty", 18766), ("inbody", 18767)):
             url = f"http://127.0.0.1:{port}/mcp"
             self.assertEqual(claude[name], {"type": "http", "url": url, "timeout": 120000})
@@ -143,6 +146,7 @@ class SharedMcpTests(unittest.TestCase):
             self.assertEqual(data["Label"], label)
             self.assertTrue(data["KeepAlive"])
             self.assertTrue(data["RunAtLoad"])
+            self.assertEqual(data["ProcessType"], "Standard")
             self.assertEqual(data["ProgramArguments"][-3:], [name, "--port", str(port)])
             self.assertEqual(data["ProgramArguments"][0], interpreters[name])
             self.assertTrue(data["StandardErrorPath"].startswith("/Users/ardud/Library/Logs/"))

@@ -426,6 +426,9 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
         data["ids"] = {"run": run_id, "box": row["box_id"]}
         data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
         data["props"]["size"] = row.get("size")
+        if data["props"]["leaseKind"] == "reused":
+            from . import lease
+            lease.report_reused_template(me, row, template)
         return row
 
 
@@ -1090,6 +1093,7 @@ def try_warm(me, size, source, exclude, run_id):
                     return None
                 _claim(con, me, got, run_id)
                 claimed = True
+                lease.report_reused_template(me, got)
                 return got
             finally:
                 if not claimed:

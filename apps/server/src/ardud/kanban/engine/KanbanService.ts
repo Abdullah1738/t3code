@@ -90,7 +90,12 @@ import * as Stream from "effect/Stream";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { actorKey, KanbanStore, KanbanStoreError } from "../store/KanbanStore.ts";
+import {
+  actorKey,
+  KanbanStore,
+  KanbanStoreError,
+  type InstructionApplication,
+} from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
@@ -267,6 +272,7 @@ export type BoardPatch = {
     | "defaultCardModel"
     | "reviewChains"
     | "defaultReviewChain"
+    | "guessedGates"
     | "instructions"
   >
 >;
@@ -364,6 +370,17 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
   ) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly applyApprovedInstructions: (
+    boardId: KanbanBoardId,
+    field: keyof KanbanBoard["instructions"],
+    text: string,
+    cardId: KanbanCard["id"],
+    askId: string,
+    actor: KanbanActor,
+  ) => Effect.Effect<
+    { readonly board: KanbanBoard; readonly applied: boolean; readonly reason?: string },
+    KanbanError
+  >;
   readonly setNightlyReview: (
     boardId: KanbanBoard["id"],
     input: {
@@ -2465,18 +2482,39 @@ const make = Effect.gen(function* () {
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
       readonly head?: string | null;
+      readonly instructionApplication?: InstructionApplication;
     } = {},
   ) {
-    return yield* store.addCardEvent({
-      cardId: card.id,
-      at: extra.at ?? (yield* nowIso),
-      actor,
-      kind,
-      fromStage: extra.fromStage ?? null,
-      toStage: extra.toStage ?? null,
-      body: extra.body ?? null,
-      head: extra.head ?? null,
-    });
+    const write = store.addCardEvent(
+      {
+        cardId: card.id,
+        at: extra.at ?? (yield* nowIso),
+        actor,
+        kind,
+        fromStage: extra.fromStage ?? null,
+        toStage: extra.toStage ?? null,
+        body: extra.body ?? null,
+        head: extra.head ?? null,
+      },
+      extra.instructionApplication?.id,
+    );
+    if (extra.instructionApplication === undefined) return yield* write;
+    const application = extra.instructionApplication;
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const event = yield* write;
+        yield* Effect.logInfo("kanban board instructions applied", {
+          boardId: application.boardId,
+          board: application.boardSlug,
+          field: application.field,
+          cardId: application.cardId,
+          askId: application.askId,
+          threadId: application.threadId,
+          applicationId: application.id,
+        });
+        return event;
+      }),
+    );
   });
 
   /**
@@ -2747,6 +2785,7 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
     options: KanbanMoveOptions = {},
   ) {
+    const board = yield* boardOf(card.boardId);
     const check = Rules.checkMove(role, card, to);
     if (!check.ok) return yield* failWith("denied", check.reason);
     const at = yield* nowIso;
@@ -2812,7 +2851,9 @@ const make = Effect.gen(function* () {
       (ask) => ask.by._tag === "thread" && ask.by.threadId === next.workThreadId,
     );
     if (to === "todo" && workerDropped.length > 0) {
-      const texts = workerDropped.map((ask) => Asks.droppedText(next, ask, actor._tag === "owner"));
+      const texts = workerDropped.map((ask) =>
+        Asks.droppedText(next, ask, actor._tag === "owner", board.guessedGates),
+      );
       next = { ...next, wakeNote: [next.wakeNote, ...texts].filter(Boolean).join("\n\n") };
     }
     yield* logEvent(next, actor, "moved", {
@@ -2824,7 +2865,7 @@ const make = Effect.gen(function* () {
     for (const ask of dropped) {
       if (ask.by._tag !== "evaluator") continue;
       const evaluator = ask.by.threadId;
-      const text = Asks.droppedText(next, ask, actor._tag === "owner");
+      const text = Asks.droppedText(next, ask, actor._tag === "owner", board.guessedGates);
       yield* later(
         next.boardId,
         cardLane(next),
@@ -4810,6 +4851,7 @@ const make = Effect.gen(function* () {
       Asks.openBlockingAsk(next) === undefined &&
       (answered.some((ask) => ask.blocking) || !open.some((ask) => ask.blocking));
     if (unblock) {
+      const board = yield* boardOf(card.boardId);
       const asked = yield* askedBy(card);
       const asker = Asks.openBlockingAsk(card)?.by ?? asked?.actor;
       const back = asked?.fromStage ?? "todo";
@@ -4818,14 +4860,12 @@ const make = Effect.gen(function* () {
       // waiting, so the last reviewer isn't woken for a step it cleared.
       const reviewed =
         back === "in_review" &&
-        Rules.reviewFinished(
-          card,
-          Rules.chainFor(yield* boardOf(card.boardId), card)?.steps.length ?? 1,
-        );
+        Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1);
       const gated = next.subtasks.some(
         (subtask) =>
-          Subtasks.gateOf(subtask) !== undefined &&
-          (subtask.state === "open" || Subtasks.approvalProblem(next, subtask) !== null),
+          Subtasks.gateOf(subtask, board.guessedGates) !== undefined &&
+          (subtask.state === "open" ||
+            Subtasks.approvalProblem(next, subtask, board.guessedGates) !== null),
       );
       const stage =
         back === "verified" && gated
@@ -10755,6 +10795,7 @@ const make = Effect.gen(function* () {
       defaultCardModel,
       reviewChains: [],
       defaultReviewChain: null,
+      guessedGates: undefined,
       instructions: Defaults.DEFAULT_INSTRUCTIONS,
       setup: null,
       pause: null,
@@ -10784,6 +10825,7 @@ const make = Effect.gen(function* () {
   const updateBoardUnlocked = Effect.fn("KanbanService.updateBoardUnlocked")(function* (
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
+    application?: InstructionApplication,
   ) {
     yield* checkText([
       ["name", patch.name],
@@ -10864,7 +10906,7 @@ const make = Effect.gen(function* () {
       }
     }
     const pools = missingPools(yield* store.pools(board.id), boardModels(next));
-    yield* store.putBoardWithPools(next, pools);
+    yield* store.putBoardWithPools(next, pools, application);
     if (pools.length > 0) {
       yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
     }
@@ -10875,6 +10917,117 @@ const make = Effect.gen(function* () {
 
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
     guard("board.update", updateBoardUnlocked(boardId, patch));
+
+  const applyApprovedInstructions: KanbanServiceShape["applyApprovedInstructions"] = Effect.fn(
+    "KanbanService.applyApprovedInstructions",
+  )(function* (boardId, field, text, cardId, askId, actor) {
+    if (actor._tag !== "evaluator") {
+      return yield* failWith("denied", "Only evaluators use this tool.");
+    }
+    const result = yield* guard(
+      "board.applyApprovedInstructions",
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        if (!ask.closedAt) return yield* failWith("denied", `ask ${askId} is still open`);
+        if (ask.answer?.verdict === "dropped") {
+          return yield* failWith("denied", `ask ${askId} was dropped`);
+        }
+        if (ask.answer?.verdict === "rejected") {
+          return yield* failWith("denied", `ask ${askId} was rejected`);
+        }
+        if (ask.answer?.by._tag !== "owner") {
+          return yield* failWith("denied", `ask ${askId} was not answered by the owner`);
+        }
+        if (ask.answer.verdict !== "approved") {
+          return yield* failWith("denied", `ask ${askId} does not have the owner's approval`);
+        }
+        const board = yield* boardOf(boardId);
+        const namesField = {
+          escalation: ["escalation", "when to ask"],
+          modelRouting: ["model routing", "modelRouting"],
+          reviewerRouting: ["reviewer routing", "reviewerRouting"],
+        }[field];
+        const names = (label: string, name: string) => {
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}($|[^\\p{L}\\p{N}_])`, "iu").test(label);
+        };
+        const changes = [ask.change, ...(ask.changes ?? [])]
+          .filter((entry) => entry !== undefined)
+          .filter(
+            (entry) =>
+              (names(entry.label, board.slug) || names(entry.label, board.name)) &&
+              namesField.some((name) => names(entry.label, name)),
+          );
+        if (changes.length === 0) {
+          return yield* failWith(
+            "denied",
+            `ask ${askId} has no change entry labelled for board ${board.slug} and field ${field}`,
+          );
+        }
+        const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
+        const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
+        if (approved.length === 0) {
+          return yield* failWith("denied", `text differs from the approved after in ask ${askId}`);
+        }
+        if (normalized(board.instructions[field]) === normalized(text)) {
+          return { board, applied: false, reason: "already set" };
+        }
+        if (
+          !approved.some(
+            (entry) => normalized(entry.before) === normalized(board.instructions[field]),
+          )
+        ) {
+          return yield* failWith(
+            "denied",
+            "the board's text changed since he approved it; ask again",
+          );
+        }
+        const application: InstructionApplication = {
+          id: NodeCrypto.randomUUID(),
+          boardId: board.id,
+          boardSlug: board.slug,
+          cardId,
+          field,
+          askId,
+          threadId: actor.threadId,
+        };
+        const next = yield* updateBoardUnlocked(
+          board.id,
+          {
+            instructions: { ...board.instructions, [field]: text },
+          },
+          application,
+        );
+        return { board: next, applied: true };
+      }),
+    );
+    // Receipts commit with the board write. A fresh card operation drains them
+    // independently, so failed audits can retry without hiding later applications.
+    yield* guard(
+      "board.auditApprovedInstructions",
+      Effect.gen(function* () {
+        for (const application of yield* store.pendingInstructionApplications(
+          cardId,
+          boardId,
+          field,
+          askId,
+        )) {
+          yield* editCard(
+            cardId,
+            {
+              comment: `Applied ${application.field} on board ${application.boardSlug} from ${application.askId} (by ${application.threadId})`,
+            },
+            { _tag: "evaluator", threadId: application.threadId },
+            application,
+          );
+        }
+      }),
+      cardId,
+    );
+    return result;
+  });
 
   const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
@@ -10960,7 +11113,7 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const stage = input.stage ?? "todo";
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
-    const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at);
+    const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
     yield* checkScriptNames(boardId, plan.subtasks);
     return {
@@ -11405,7 +11558,12 @@ const make = Effect.gen(function* () {
     return paused;
   });
 
-  const editCard: KanbanServiceShape["editCard"] = (cardId, patch, actor) => {
+  const editCard = (
+    cardId: KanbanCard["id"],
+    patch: CardPatch,
+    actor: KanbanActor,
+    instructionApplication?: InstructionApplication,
+  ): ReturnType<KanbanServiceShape["editCard"]> => {
     let lockedWork: ThreadId | null = null;
     let releaseModel: Effect.Effect<void> = Effect.void;
     let confirmingModel = false;
@@ -11422,10 +11580,17 @@ const make = Effect.gen(function* () {
             "Card work thread changed before the model edit; re-read and retry.",
           );
         }
-        // A retry of an already saved edit must not emit another event or update the card.
+        // Instruction audits deduplicate by receipt: two real applications can
+        // have identical comments, even from the same evaluator.
         const events =
-          isRetryActor(actor) && patch.comment?.trim() ? yield* store.cardEvents(card.id) : [];
-        if (editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)) return card;
+          instructionApplication === undefined && isRetryActor(actor) && patch.comment?.trim()
+            ? yield* store.cardEvents(card.id)
+            : [];
+        if (
+          instructionApplication === undefined &&
+          editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)
+        )
+          return card;
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
@@ -11442,16 +11607,24 @@ const make = Effect.gen(function* () {
           : patch.model
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
+        const board = yield* boardOf(card.boardId);
         const plan = patch.subtasks
-          ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq, at)
+          ? Subtasks.planSubtasks(
+              card.subtasks,
+              patch.subtasks,
+              card.subtaskSeq,
+              at,
+              board.guessedGates,
+            )
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
             if (subtask.state !== "open") continue;
             const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
-            if (replacement && Subtasks.gateOf(replacement) !== undefined) continue;
-            const missing = Subtasks.approvalProblem(card, subtask);
+            if (replacement && Subtasks.gateOf(replacement, board.guessedGates) !== undefined)
+              continue;
+            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
             if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
           }
           yield* checkScriptNames(card.boardId, plan.subtasks);
@@ -11513,7 +11686,10 @@ const make = Effect.gen(function* () {
             body: changed.join(", "),
           });
         if (patch.comment?.trim())
-          yield* logEvent(next, actor, "comment", { body: patch.comment.trim() });
+          yield* logEvent(next, actor, "comment", {
+            body: patch.comment.trim(),
+            ...(instructionApplication === undefined ? {} : { instructionApplication }),
+          });
         const paused = yield* pauseIfBacklog(card, next, actor, at);
         // An open work thread now runs the new model's pool, so the card's slot moves with it.
         const saved =
@@ -11672,9 +11848,10 @@ const make = Effect.gen(function* () {
           }
         }
         if (to === "verified" && role !== "owner") {
+          const board = yield* boardOf(card.boardId);
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           const missing = card.subtasks
-            .map((subtask) => Subtasks.approvalProblem(card, subtask))
+            .map((subtask) => Subtasks.approvalProblem(card, subtask, board.guessedGates))
             .find((problem) => problem !== null);
           if (open.length > 0) {
             const reason = `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`;
@@ -11938,7 +12115,12 @@ const make = Effect.gen(function* () {
           const result = yield* answerAsks(
             discussion,
             fresh,
-            Asks.droppedText(fresh, ask, actor._tag === "owner"),
+            Asks.droppedText(
+              fresh,
+              ask,
+              actor._tag === "owner",
+              (yield* boardOf(fresh.boardId)).guessedGates,
+            ),
             (open) => open.id === ask.id,
             actor,
             true,
@@ -12783,8 +12965,12 @@ const make = Effect.gen(function* () {
         const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
         const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
         if (!check.ok) return yield* failWith("denied", check.reason);
+        const board = yield* boardOf(card.boardId);
         const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
-        const missing = gated && state !== "open" ? Subtasks.approvalProblem(card, gated) : null;
+        const missing =
+          gated && state !== "open"
+            ? Subtasks.approvalProblem(card, gated, board.guessedGates)
+            : null;
         if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
         const at = yield* nowIso;
         const subtasks = Subtasks.markSubtask(card.subtasks, subtaskId, state, note, actor, at);
@@ -13029,7 +13215,7 @@ const make = Effect.gen(function* () {
           const passed = verdict === "clear" && !outcome.continueReview;
           if (passed) {
             for (const subtask of kanbanStepSubtasks(card, "review")) {
-              const missing = Subtasks.approvalProblem(card, subtask);
+              const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
               if (missing) return yield* failWith("denied", missing);
             }
           }
@@ -14416,6 +14602,7 @@ const make = Effect.gen(function* () {
     openBoard,
     createBoard,
     updateBoard,
+    applyApprovedInstructions,
     setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {
       return yield* guard(
         "board.setNightlyReview",

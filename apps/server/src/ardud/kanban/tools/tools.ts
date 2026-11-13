@@ -848,6 +848,21 @@ const PoolSet = tool(
   { readonly: false },
 );
 
+const BoardInstructionsSet = tool(
+  "board_instructions_set",
+  "Apply approved board instructions",
+  "Evaluators: set one of a board's instructions (escalation, modelRouting, reviewerRouting) to text Abdullah approved. The ask must be closed with his approval, and one of its change/changes entries must have a label naming the board (slug or name) and the field, before equal to the board's current text and after equal to text. Text he didn't approve is refused.",
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting"]),
+    text: Schema.String,
+    card: CardRef,
+    ask: TrimmedNonEmptyString,
+  },
+  { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
+  { readonly: false, destructive: true },
+);
+
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
@@ -1044,6 +1059,7 @@ export const KanbanToolkit = Toolkit.make(
   SubtaskDone,
   CardThread,
   PoolSet,
+  BoardInstructionsSet,
   PoolRemove,
   GoalSet,
   GroupSet,

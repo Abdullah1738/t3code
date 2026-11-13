@@ -177,6 +177,8 @@ const annotateAcquired = (
   span.attribute("db.lock_wait_ms", acquired.lockWaitMs);
   span.attribute("db.reader.acquired", true);
   span.attribute("db.reader.wait_ms", acquired.lockWaitMs);
+  if (acquired.connection === "reader")
+    span.attribute("db.reader.acquire_wait_ms", acquired.lockWaitMs);
   span.attribute("db.reader.waiting", false);
   if (acquired.lane !== undefined) span.attribute("db.reader.lane", acquired.lane);
   if (acquired.slot !== undefined) span.attribute("db.reader.slot", acquired.slot);
@@ -506,6 +508,7 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
   }
   parentPort.postMessage({ started: id });
   let operation = "open";
+  const executionStarted = performance.now();
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
     operation = "prepare";
@@ -514,14 +517,16 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
     statement.setReadBigInts(safeIntegers);
     if (statement.columns().length > 0) {
       statement.setReturnArrays(values);
-      parentPort.postMessage({ id, rows: collect(statement, params) });
+      const rows = collect(statement, params);
+      parentPort.postMessage({ id, rows, executionMs: performance.now() - executionStarted });
     } else {
       const result = statement.run(...params);
-      parentPort.postMessage({ id, rows: raw ? result : [] });
+      parentPort.postMessage({ id, rows: raw ? result : [], executionMs: performance.now() - executionStarted });
     }
   } catch (error) {
     parentPort.postMessage({
       id,
+      executionMs: performance.now() - executionStarted,
       error: {
         operation,
         message: String(error && error.message ? error.message : error),
@@ -551,9 +556,10 @@ type ReaderStartup =
   | { readonly type: "unavailable"; readonly message: string };
 
 type ReaderReply =
-  | { readonly id: number; readonly rows: ReadonlyArray<any> }
+  | { readonly id: number; readonly rows: ReadonlyArray<any>; readonly executionMs?: number }
   | {
       readonly id: number;
+      readonly executionMs?: number;
       readonly error: {
         readonly operation: "open" | "prepare" | "execute";
         readonly message: string;
@@ -826,6 +832,15 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
             endsTransaction,
             sql: input.sql,
             resume: (reply) => {
+              if (
+                reply.executionMs !== undefined &&
+                fiber.getRef(References.TracerEnabled) &&
+                fiber.getRef(Statement.SpanPropagationEnabled)
+              ) {
+                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                if (span?._tag === "Span")
+                  span.attribute("db.statement.execution_ms", reply.executionMs);
+              }
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;
@@ -2017,10 +2032,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const borrower: Borrower = <A, E, R>(use: (connection: Connection) => Effect.Effect<A, E, R>) =>
     Effect.withFiber((requestFiber) => {
       const span = Context.getOrUndefined(requestFiber.context, Tracer.ParentSpan);
+      const clock = requestFiber.getRef(Clock.Clock);
+      const start = clock.monotonicTimeNanosUnsafe();
       return Effect.flatMap(route(span?._tag === "Span" ? span : undefined), (target) =>
         Effect.withFiber<A, E | SqlError, R>((fiber) => {
-          const clock = fiber.getRef(Clock.Clock);
-          const start = clock.monotonicTimeNanosUnsafe();
           const useConnection = Effect.suspend(() => {
             const grant = acquired(target, clock, start);
             const traced =
@@ -2073,60 +2088,62 @@ const make = Effect.fn("makeWithDatabase")(function* (
         }),
       );
     });
-  const transactionAcquirer = Effect.flatMap(route(), (target) =>
-    Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!;
-      const scope = Context.getUnsafe(fiber.context, Scope.Scope);
-      const clock = fiber.getRef(Clock.Clock);
-      const start = clock.monotonicTimeNanosUnsafe();
-      const pending = pendingForClient(fiber);
-      if (pending !== undefined) pending.permitStarted = start;
-      if (
-        pending !== undefined &&
-        target.name === "reader" &&
-        target.lane !== undefined &&
-        isReservedLane(target.lane)
-      )
-        pending.retire = retireAuthReader(
-          originalReaders.get(target.connection) ?? target.connection,
-        );
-      const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
-        const grant = acquired(target, clock, start);
-        if (pending !== undefined) pending.acquired = grant;
+  const transactionAcquirer = Effect.withFiber((requestFiber) => {
+    const clock = requestFiber.getRef(Clock.Clock);
+    const start = clock.monotonicTimeNanosUnsafe();
+    return Effect.flatMap(route(), (target) =>
+      Effect.uninterruptibleMask((restore) => {
+        const fiber = Fiber.getCurrent()!;
+        const scope = Context.getUnsafe(fiber.context, Scope.Scope);
+        const pending = pendingForClient(fiber);
+        if (pending !== undefined) pending.permitStarted = start;
         if (
           pending !== undefined &&
-          fiber.getRef(References.TracerEnabled) &&
-          fiber.getRef(Statement.SpanPropagationEnabled)
+          target.name === "reader" &&
+          target.lane !== undefined &&
+          isReservedLane(target.lane)
         )
-          annotateAcquired(fiber, grant, pending?.span);
-        if (pending?.span !== undefined)
-          pending.span.attribute("db.reader.acquire_stage", "acquired");
-        const granted = clock.monotonicTimeNanosUnsafe();
-        // The snapshot is pinned to this slot from BEGIN to COMMIT; its permit is the hold.
-        return Effect.andThen(
-          observeReader(target, readerWait, grant.lockWaitMs),
-          Scope.addFinalizer(
-            scope,
-            target.lock.release(1).pipe(
-              Effect.andThen(
-                Effect.suspend(() => {
-                  const held = holdMs(clock, granted);
-                  if (pending?.span !== undefined)
-                    pending.span.attribute("db.reader.hold_ms", held);
-                  return observeReader(target, readerHold, held);
-                }),
+          pending.retire = retireAuthReader(
+            originalReaders.get(target.connection) ?? target.connection,
+          );
+        const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
+          const grant = acquired(target, clock, start);
+          if (pending !== undefined) pending.acquired = grant;
+          if (
+            pending !== undefined &&
+            fiber.getRef(References.TracerEnabled) &&
+            fiber.getRef(Statement.SpanPropagationEnabled)
+          )
+            annotateAcquired(fiber, grant, pending?.span);
+          if (pending?.span !== undefined)
+            pending.span.attribute("db.reader.acquire_stage", "acquired");
+          const granted = clock.monotonicTimeNanosUnsafe();
+          // The snapshot is pinned to this slot from BEGIN to COMMIT; its permit is the hold.
+          return Effect.andThen(
+            observeReader(target, readerWait, grant.lockWaitMs),
+            Scope.addFinalizer(
+              scope,
+              target.lock.release(1).pipe(
+                Effect.andThen(
+                  Effect.suspend(() => {
+                    const held = holdMs(clock, granted);
+                    if (pending?.span !== undefined)
+                      pending.span.attribute("db.reader.hold_ms", held);
+                    return observeReader(target, readerHold, held);
+                  }),
+                ),
               ),
             ),
-          ),
+          );
+        });
+        return Effect.as(
+          // A scheduler yield after taking the permit must not precede its release finalizer.
+          Effect.provideService(acquire, Scheduler.PreventSchedulerYield, true),
+          target.connection,
         );
-      });
-      return Effect.as(
-        // A scheduler yield after taking the permit must not precede its release finalizer.
-        Effect.provideService(acquire, Scheduler.PreventSchedulerYield, true),
-        target.connection,
-      );
-    }),
-  ).pipe(
+      }),
+    );
+  }).pipe(
     Effect.onExit((exit) =>
       Effect.withFiber((fiber) =>
         Effect.sync(() => {
@@ -2142,10 +2159,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
               ) / 1e6,
             );
             pending.span.attribute("db.reader.wait_interrupted", Exit.hasInterrupts(exit));
-            pending.span.attribute(
-              "db.lock_wait_ms",
-              Number(fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe() - pending.started) / 1e6,
-            );
+            const waited =
+              Number(fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe() - pending.started) / 1e6;
+            pending.span.attribute("db.lock_wait_ms", waited);
+            pending.span.attribute("db.reader.acquire_wait_ms", waited);
           }
         }),
       ),

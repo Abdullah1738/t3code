@@ -39,6 +39,9 @@ class LoggingTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        probes = patch.object(jobs, 'storage_probes', return_value={})
+        probes.start()
+        self.addCleanup(probes.stop)
 
     def rows(self):
         return [json.loads(line) for p in sorted(self.logs.glob('*.ndjson')) for line in p.read_text().splitlines()]

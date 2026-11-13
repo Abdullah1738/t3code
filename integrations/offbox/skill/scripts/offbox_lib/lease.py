@@ -318,25 +318,44 @@ def cap_check() -> None:
                           code=EXIT_CAP)
 
 
-def pick_template(root: Path, repo_key: str) -> str:
+def pick_template(root: Path, repo_key: str) -> tuple[str, str]:
     if repo_key == "crpko-devops":
-        return "crpko-go"
+        return "crpko-go", "crpko-devops"
     if "harness" in repo_key:
-        return "crpko-harness"
-    for n in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
-        if (root / n).is_file():
-            return "crpko-harness"
+        return "crpko-harness", "repo_key-harness"
     gomod = root / "go.mod"
     if gomod.is_file():
         try:
             if "testcontainers" in gomod.read_text(errors="replace"):
-                return "crpko-harness"
+                return "crpko-harness", "testcontainers"
         except OSError:
             pass
-        return "crpko-go"
+        return "crpko-go", "go.mod"
     if (root / "package.json").is_file():
-        return "crpko-node"
-    return "generic"
+        return "crpko-node", "package.json"
+    return "generic", "generic"
+
+
+def report_template(repo_key: str, template: str, reason: str) -> None:
+    log(f"template_pick repo_key={repo_key} template={template} reason={reason}")
+    say(f"template {template} ({reason}; --template to override)")
+
+
+def report_reused_template(me: dict, row, template: str | None = None) -> None:
+    source = row["source"] or "fresh"
+    if source.startswith("base:"):
+        name, reason = source, source
+    elif source.startswith(("template:", "recipe:")):
+        name = source.split(":", 1)[1]
+        picked, reason = pick_template(Path(me["repo_root"]), me["repo_key"])
+        if template == name:
+            reason = "explicit"
+        elif picked != name:
+            # Pools may reuse a box built before the repository's manifests or selection rules changed.
+            reason = "reuse:" + source
+    else:
+        name, reason = "fresh", "reuse:fresh"
+    report_template(me["repo_key"], name, reason)
 
 
 def find_lease(con, owner: str, root: str):
@@ -515,13 +534,16 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
             if s:
+                report_template(rk, f"base:{brow['name']}", f"base:{brow['name']}")
                 return s, f"base:{brow['name']}", brow["remote_dir"], sz
             if base:
                 raise OffboxError(f"saved base '{brow['name']}' is gone: boat deletes a stopped box's data after 14 "
                                   f"days. Run without --base and `offbox save` again; `offbox base rm "
                                   f"{brow['short'] or brow['name']}` drops the entry.", code=2)
             say(f"default base {brow['name']} is gone (boat deleted its data); using the repo template")
-    tname = template or (None if fresh else pick_template(root, rk))
+    tname, reason = ((template, "explicit") if template else
+                     (None, "explicit") if fresh else pick_template(root, rk))
+    report_template(rk, "fresh" if fresh else tname, reason)
     if tname and not fresh:
         # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
         # which would mark it gone. Such a caller builds its own box from the recipe instead.
@@ -716,6 +738,7 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
         if row:
             got = _reuse(con, row, size)
             if got:
+                report_reused_template(me, got, template)
                 return got
         t = now()
         s, source, base_dir, sz = _new_box(con, me, size, template, base, fresh)

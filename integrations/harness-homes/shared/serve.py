@@ -13,12 +13,23 @@ import sys
 from pathlib import Path
 
 
-def configure(mcp, port):
+def configure(mcp, port, server=None):
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = port
     mcp.settings.stateless_http = True
     mcp.settings.json_response = True
     mcp.settings.log_level = "WARNING"
+    if server is not None:
+        from request_log import RequestLogMiddleware
+        factory = mcp.streamable_http_app
+        tools = frozenset(tool.name for tool in mcp._tool_manager.list_tools())
+
+        def logged_app():
+            app = factory()
+            app.add_middleware(RequestLogMiddleware, server=server, tools=tools)
+            return app
+
+        mcp.streamable_http_app = logged_app
     return mcp
 
 
@@ -76,7 +87,7 @@ def main():
         mcp = importlib.import_module("inbody_api_mcp.server").mcp
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-tools") as executor:
         offload_sync_tools(mcp, executor)
-        configure(mcp, args.port).run(transport="streamable-http")
+        configure(mcp, args.port, args.server).run(transport="streamable-http")
 
 
 if __name__ == "__main__":
