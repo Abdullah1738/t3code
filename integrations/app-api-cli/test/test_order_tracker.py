@@ -736,6 +736,53 @@ class RetireTest(unittest.TestCase):
         self.assertIs(write.call_args.args[1], self.cfg)
         self.assertEqual(out, '')
 
+    def test_food_terminal_read_emits_once_and_retires_at_thirty_minutes(self):
+        import noon_vertical_reads as vertical
+
+        for raw, expected in [('canceled', 'cancelled'), ('delivered', 'delivered')]:
+            with self.subTest(raw=raw):
+                cfg = dict(self.cfg, app='noon', order='FTEST', vertical='food',
+                           watcher='order-noon-ftest', active=True)
+                state = {'primed': True, 'status': 'preparing', 'tracking_problem_streak': 3}
+                response = {'status': 'success', 'data': {'orderNr': cfg['order'], 'status': raw}}
+                watchers = Path('/fixture/watchers')
+                output = io.StringIO()
+                with mock.patch.dict(t.os.environ, WATCH_DIR=str(watchers / cfg['watcher'])), \
+                     mock.patch.object(t, 'WATCHERS', watchers), \
+                     mock.patch.object(Path, 'open', mock.mock_open()), \
+                     mock.patch.object(Path, 'exists', return_value=True), \
+                     mock.patch.object(t.fcntl, 'flock'), \
+                     mock.patch.object(t, 'read', return_value=state), \
+                     mock.patch.object(t, 'write'), \
+                     mock.patch.object(t.time, 'time', return_value=self.now) as clock, \
+                     mock.patch.object(vertical, '_headers', return_value={}), \
+                     mock.patch.object(vertical, '_read', return_value=response), \
+                     mock.patch('noon_order_details.details', return_value={}), \
+                     mock.patch.object(t.delivery_cards, 'safe_sync', return_value={}), \
+                     mock.patch.object(t, 'run', return_value='') as run, \
+                     redirect_stdout(output):
+                    t.check(cfg)
+                    self.assertEqual(json.loads(output.getvalue())['events'],
+                                     [{'kind': 'stage_change', 'status': expected}])
+                    self.assertEqual(state['terminal_at'], self.now)
+                    self.assertEqual(state['last_result']['errors'], [])
+                    self.assertEqual(state['tracking_problem_streak'], 0)
+                    run.assert_not_called()
+
+                    output.seek(0)
+                    output.truncate(0)
+                    clock.return_value = self.now + 1799
+                    t.check(cfg)
+                    run.assert_not_called()
+                    self.assertTrue(cfg['active'])
+                    self.assertEqual(output.getvalue(), '')
+
+                    clock.return_value = self.now + 1800
+                    t.check(cfg)
+                    run.assert_called_once_with(['robob-watch', 'remove', cfg['watcher']])
+                    self.assertFalse(cfg['active'])
+                    self.assertEqual(output.getvalue(), '')
+
     def test_delivered_tracker_waits_out_the_first_half_hour(self):
         state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 600}
         run, _, out = self.check(state, {'status': 'delivered', 'errors': []})
