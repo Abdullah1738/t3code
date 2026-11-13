@@ -40,6 +40,7 @@ const makeHarness = Effect.fn("makeWatchFailureHarness")(function* (
   let watch: ThreadPullRequestWatch | undefined = {
     startedAt: "2026-11-12T00:00:00.000Z",
     headSha: null,
+    observedHeadSha: initial.headSha ?? null,
     failedChecks: [],
     passed: false,
     passedChecks: [],
@@ -294,17 +295,18 @@ it.effect.each(["success", "failure"] as const)(
       const harness = yield* makeHeadHarness();
       const stale = greenDetail();
       harness.setDetail({ ...stale, checks: stale.checks.map((check) => ({ ...check, status })) });
-      const before = harness.watch();
+      const before = harness.watch()!;
       yield* harness.reactor.sweep;
-      assert.deepStrictEqual(harness.commands, []);
-      assert.deepStrictEqual(harness.watch(), before);
+      assert.strictEqual(harness.commands.length, 1);
+      assert.isUndefined(harness.commands[0]?.wake);
+      assert.deepStrictEqual(harness.watch(), { ...before, observedHeadSha: NEW_HEAD });
       harness.setDetail({ ...stale, headSha: NEW_HEAD, checksHeadSha: NEW_HEAD });
       yield* harness.reactor.sweep;
       assert.strictEqual(harness.reads(), 2);
-      assert.strictEqual(harness.commands.length, 1);
-      assert.include(harness.commands[0]!.wake?.text ?? "", "passed on 048997a");
+      assert.strictEqual(harness.commands.length, 2);
+      assert.include(harness.commands[1]!.wake?.text ?? "", "passed on 048997a");
       yield* harness.reactor.sweep;
-      assert.strictEqual(harness.commands.length, 1);
+      assert.strictEqual(harness.commands.length, 2);
     }),
 );
 
@@ -321,9 +323,28 @@ it.effect("keeps a new required check from growing the reported gate on a settli
   Effect.gen(function* () {
     const harness = yield* makeHeadHarness({ passed: true, passedChecks: ["test"] });
     yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
+    assert.strictEqual(harness.commands.length, 1);
+    assert.isUndefined(harness.commands[0]?.wake);
+    assert.strictEqual(harness.watch()?.observedHeadSha, NEW_HEAD);
     assert.deepStrictEqual(harness.watch()?.passedChecks, ["test"]);
   }),
+);
+
+it.effect(
+  "persists a newly observed head while its check checkpoint stays put, without waking twice",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ passed: true, passedChecks: ["test"] });
+      harness.setDetail({ ...greenDetail(), headSha: NEW_HEAD, checksHeadSha: OLD_HEAD });
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.length, 1);
+      assert.isUndefined(harness.commands[0]?.wake);
+      assert.strictEqual(harness.watch()?.headSha, OLD_HEAD);
+      assert.strictEqual(harness.watch()?.observedHeadSha, NEW_HEAD);
+      assert.deepStrictEqual(harness.watch()?.passedChecks, ["test"]);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.length, 1);
+    }),
 );
 
 it.effect("still reports green checks when the branch ref cannot be read", () =>
@@ -543,12 +564,16 @@ it.effect("ends visibly when the PR head never settles, without giving a stale v
   Effect.gen(function* () {
     const harness = yield* makeHeadHarness();
     for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
+    assert.deepStrictEqual(
+      harness.commands.filter((command) => command.wake),
+      [],
+    );
     yield* harness.reactor.sweep;
-    assert.strictEqual(harness.commands.length, 1);
-    assert.isNull(harness.commands[0]!.watch);
-    assert.include(harness.commands[0]!.wake?.text ?? "", "head");
-    assert.notInclude(harness.commands[0]!.wake?.text ?? "", "checks passed");
+    const wakes = harness.commands.filter((command) => command.wake);
+    assert.strictEqual(wakes.length, 1);
+    assert.isNull(wakes[0]!.watch);
+    assert.include(wakes[0]!.wake?.text ?? "", "head");
+    assert.notInclude(wakes[0]!.wake?.text ?? "", "checks passed");
   }),
 );
 
@@ -564,9 +589,12 @@ it.effect("clears the unsuccessful-read count once a settled head can be evaluat
     yield* harness.reactor.sweep;
     harness.setDetail(greenDetail());
     for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
+    assert.deepStrictEqual(
+      harness.commands.filter((command) => command.wake),
+      [],
+    );
     yield* harness.reactor.sweep;
-    assert.isNull(harness.commands[0]!.watch);
+    assert.isNull(harness.commands.at(-1)!.watch);
   }),
 );
 
@@ -642,10 +670,13 @@ it.effect("measures project listing and identity spawns across watch sweeps", ()
     yield* TestClock.adjust("2 minutes");
     yield* reactor.sweep;
     const second = workspace.counts();
-    assert.deepStrictEqual({ first, second }, {
-      first: { listShells: 1, gitSpawns: 180 },
-      second: { listShells: 1, gitSpawns: 0 },
-    });
+    assert.deepStrictEqual(
+      { first, second },
+      {
+        first: { listShells: 1, gitSpawns: 180 },
+        second: { listShells: 1, gitSpawns: 0 },
+      },
+    );
     assert.strictEqual(commands.length, 40);
   }),
 );

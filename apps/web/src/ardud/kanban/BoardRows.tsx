@@ -7,6 +7,8 @@ import type { BoardGroupState, BoardRow } from "@t3tools/client-runtime/ardud/ka
 import { cn } from "../../lib/utils";
 import { CardTile } from "./CardTile";
 import { Glyph, stageGlyph } from "./parts";
+import { useAnalyticsCounts } from "../useAnalytics";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 
 export const HIDE_SCROLLBAR = "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden";
 
@@ -227,6 +229,11 @@ export const BoardRows = memo(function BoardRows(props: {
   count?: number | undefined;
 }) {
   const variant = props.variant ?? "tile";
+  useAnalyticsCounts(
+    usePrimaryEnvironmentId(),
+    "board",
+    props.rows.reduce((count, row) => count + (row.kind === "card" ? 1 : 0), 0),
+  );
   const dense = variant === "shipped";
   const selected = props.selectedCardId;
 

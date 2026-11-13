@@ -89,27 +89,28 @@ export const componentSpec = (component: string): ComponentSpec | null =>
  * Issues a component's bearer token. The origin row is written before the
  * token is returned, so the first request with it is already the component.
  */
-export const issueComponentSession = (input: {
+export const issueComponentSession = Effect.fn("Components.issueComponentSession")(function* (input: {
   readonly component: string;
   readonly ttl?: Duration.Duration;
-}) =>
-  Effect.gen(function* () {
-    const spec = componentSpec(input.component);
-    if (spec === null) return yield* new UnknownComponentError({ component: input.component });
-    const auth = yield* EnvironmentAuth.EnvironmentAuth;
-    const origins = yield* SessionOrigins;
-    const issued = yield* auth.issueSession({
-      subject: `${COMPONENT_SUBJECT_PREFIX}${input.component}`,
-      scopes: spec.scopes,
-      label: `component ${input.component}`,
-      ttl: input.ttl ?? DEFAULT_COMPONENT_TOKEN_TTL,
-    });
-    yield* origins.record(issued.sessionId, { _tag: "component", component: input.component }).pipe(
+}) {
+  const spec = componentSpec(input.component);
+  if (spec === null) return yield* new UnknownComponentError({ component: input.component });
+  const auth = yield* EnvironmentAuth.EnvironmentAuth;
+  const origins = yield* SessionOrigins;
+  const issued = yield* auth.issueSession({
+    subject: `${COMPONENT_SUBJECT_PREFIX}${input.component}`,
+    scopes: spec.scopes,
+    label: `component ${input.component}`,
+    ttl: input.ttl ?? DEFAULT_COMPONENT_TOKEN_TTL,
+  });
+  yield* origins
+    .record(issued.sessionId, { _tag: "component", component: input.component })
+    .pipe(
       // Without its row the token is a plain session; never hand that out.
       Effect.tapError(() => auth.revokeSession(issued.sessionId).pipe(Effect.ignore)),
     );
-    return issued;
-  });
+  return issued;
+});
 
 /** Active component sessions, newest first. */
 export const listComponentSessions = Effect.gen(function* () {

@@ -104,6 +104,8 @@ export function enqueueNotice(store: Store, notice: Notice, now = Date.now()): b
     }
     const askKey = notice.askKey ?? boardAskKey(notice.source, notice.text);
     if (askKey !== undefined) {
+      if (/^[a-z0-9-]+:\d+:q\d+$/.test(askKey.toLowerCase()))
+        store.set(`ask-timing-key:${notice.id}`, askKey.toLowerCase());
       const key = `notice-ask:${hash(askKey)}`;
       if (!reserveAsk(store, key, notice.id, now)) {
         store.set(receiptKey, spec);

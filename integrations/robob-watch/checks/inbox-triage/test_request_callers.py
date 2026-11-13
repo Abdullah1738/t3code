@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -13,20 +14,85 @@ import test_fastpath as delivery
 item, t = delivery.item, delivery.t
 
 APP = Path(__file__).resolve().parents[3] / 'app-api-cli'
-sys.path.insert(0, str(APP))
-sys.path.insert(0, str(APP / 'test'))
-import careem_account_auth as careem
-import card_status
-import commerce_journal as journal
-import commerce_receipts as receipts
-import inbox_auth
-import test_careem_account_auth as careem_fixture
-import test_commerce_main_order as main_fixture
+
+
+def disabled_keychain(*args, **kwargs):
+    raise RuntimeError('keychain disabled in tests')
+
+
+keychain_stub = types.ModuleType('keychain')
+keychain_stub.load = keychain_stub.store = disabled_keychain
+
+
+def app_modules():
+    return {name: module for name, module in sys.modules.copy().items()
+            if getattr(module, '__file__', None)
+            and Path(module.__file__).resolve().is_relative_to(APP)}
+
+
+@contextlib.contextmanager
+def app_imports():
+    with patch.object(sys, 'path', [str(APP / 'test'), str(APP), *sys.path]), \
+         patch.dict(sys.modules):
+        for name in app_modules():
+            sys.modules.pop(name)
+        # Each integration owns a different bare toollog; restore the triage one even on failure.
+        sys.modules.pop('toollog', None)
+        # The complete merchant fixture graph must never read the login Keychain, including on Mac.
+        sys.modules['keychain'] = keychain_stub
+        yield
+
+
+with app_imports():
+    import careem_account_auth as careem
+    import card_status
+    import commerce_journal as journal
+    import commerce_receipts as receipts
+    import inbox_auth
+    import test_careem_account_auth as careem_fixture
+    import test_commerce_main_order as main_fixture
+    merchant_modules = app_modules()
+    merchant_modules.pop('toollog')
+    merchant_modules['keychain'] = keychain_stub
+
+assert Path(journal.toollog.__file__).resolve() == APP / 'toollog.py'
+assert Path(t.tool_log.__code__.co_filename).resolve() == APP.parent / 'robob-watch/helpers/toollog.py'
+assert t.tool_log is t.fastpath.tool_log is sys.modules['toollog'].tool_log
+
+
+class ImportIsolationTests(unittest.TestCase):
+    def test_keychain_bindings_are_disabled(self):
+        for boundary in (careem.load, careem.store, main_fixture.c.core.load):
+            self.assertIs(boundary, disabled_keychain)
+            with self.assertRaisesRegex(RuntimeError, '^keychain disabled in tests$'):
+                boundary('fixture')
+
+    def test_import_success_and_failure_restore_paths_and_cached_modules(self):
+        with patch.dict(sys.modules, {'careem_account_auth': careem,
+                                     'keychain': types.ModuleType('keychain')}):
+            before_modules, before_path = sys.modules.copy(), sys.path[:]
+            for fail in (False, True):
+                with self.subTest(fail=fail):
+                    try:
+                        with app_imports():
+                            import careem_account_auth as isolated
+                            self.assertIsNot(isolated, careem)
+                            self.assertIs(isolated.load, disabled_keychain)
+                            if fail:
+                                raise ImportError('fixture import failure')
+                    except ImportError:
+                        if not fail:
+                            raise
+                    self.assertEqual(sys.path, before_path)
+                    self.assertEqual(sys.modules, before_modules)
 
 
 class RequestCallerTests(unittest.TestCase):
     def setUp(self):
         delivery.DeliveryTests.setUp(self)
+        # Lazy merchant imports need the same isolated module graph while a request runs.
+        self.stack.enter_context(patch.object(sys, 'path', [str(APP), *sys.path]))
+        self.stack.enter_context(patch.dict(sys.modules, merchant_modules))
         self.owner_ledger = journal.owner_go.Ledger(self.root.resolve() / 'owner-go')
         self.stack.enter_context(patch.object(journal.owner_go, 'Ledger', return_value=self.owner_ledger))
         self.stack.enter_context(patch.dict(os.environ, {

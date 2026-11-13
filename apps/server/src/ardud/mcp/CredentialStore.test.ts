@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as Fs from "node:fs";
-import * as Os from "node:os";
-import * as Path from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -33,8 +33,8 @@ const record: CredentialStore.CredentialRecord = {
 it.effect(
   "reopens hash-only records with their exact scope and applies conditional updates and revocation",
   () => {
-    const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "mcp-credential-store-"));
-    const file = Path.join(dir, "state.sqlite");
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "mcp-credential-store-"));
+    const file = NodePath.join(dir, "state.sqlite");
     const persistence = () => NodeSqliteClient.layer({ filename: file });
     const run = <A, E>(
       effect: Effect.Effect<A, E, CredentialStore.CredentialStore | SqlClient.SqlClient>,
@@ -73,7 +73,7 @@ it.effect(
           expect(yield* store.load(otherEnvironmentId)).toEqual([]);
         }),
       );
-    }).pipe(Effect.ensuring(Effect.sync(() => Fs.rmSync(dir, { recursive: true, force: true }))));
+    }).pipe(Effect.ensuring(Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true }))));
   },
 );
 

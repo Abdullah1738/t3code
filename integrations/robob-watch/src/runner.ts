@@ -1,10 +1,12 @@
+import { randomUUID } from "node:crypto";
+import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -62,6 +64,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(watcher, pending.event, pending.key, state);
+  await recordHealthDelivery(watcher.id, pending.healthRun, delivery);
   toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: watcher.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!delivery.ok) return false;
@@ -199,6 +202,7 @@ export async function tickOne(id: string): Promise<void> {
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
   const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const healthRun = isHealthNag(id) ? randomUUID().replaceAll("-", "") : undefined;
   let startLoad = 0;
   let timeoutMs = 0;
   const result = await slots.run(async () => {
@@ -210,7 +214,7 @@ export async function tickOne(id: string): Promise<void> {
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId }, timeoutMs);
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs);
   });
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
@@ -269,7 +273,7 @@ export async function tickOne(id: string): Promise<void> {
       return;
     }
     saveState(id, fresh);
-    {
+    if (shouldNotifyFailure(watcher, fresh, timedOut)) {
       const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
       const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
         `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
@@ -282,6 +286,11 @@ export async function tickOne(id: string): Promise<void> {
       fresh.failure_alerted = sent.ok;
       saveState(id, fresh);
       log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
+    } else {
+      const count = fresh.consecutive_failures;
+      const threshold = watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER;
+      log(id, `failure notice held (${count}/${threshold})`);
+      toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
     }
     if (shouldEscalate(watcher, fresh)) {
       const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
@@ -304,8 +313,10 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.load_timeouts;
   delete fresh.load_timeout_since;
   if (fresh.consecutive_failures) {
-    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: fresh.consecutive_failures } });
-    log(id, `check recovered after ${fresh.consecutive_failures} failures`);
+    const failures = fresh.consecutive_failures;
+    const notified = fresh.failure_alerted;
+    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: failures, failures, notified } });
+    log(id, `check recovered after ${failures} failures (${notified ? "notified" : "not notified"})`);
   }
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
@@ -315,7 +326,7 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.failing_since;
   const event = result.stdout.trim();
   if (!event) { saveState(id, fresh); ackRun(); await runPendingCheck(watcher, t, true); return; }
-  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso() };
+  fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), ...(healthRun ? { healthRun } : {}) };
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);

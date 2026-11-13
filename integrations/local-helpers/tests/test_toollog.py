@@ -16,6 +16,16 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_missing_override_uses_private_temp_root(self):
+        with patch.dict(os.environ):
+            os.environ.pop('TOOLLOG_ROOT', None)
+            root = toollog.root()
+            self.assertTrue(root.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()))
+            self.assertFalse(root.is_relative_to(Path.home() / '.robob'))
+            self.assertEqual(toollog.root(), root)
+            toollog.emit('fixture', 'event', 'test.start', board='imessage')
+            self.assertTrue(list((root / 'imessage').glob('*.ndjson')))
+
     def setUp(self):
         sampling = patch.object(toollog.random, 'random', return_value=0)
         sampling.start()
@@ -29,6 +39,61 @@ class ToolLogTests(unittest.TestCase):
 
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
+
+    def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, status, duration in [('noon', 401, 10), ('noon', 401, 20),
+                                           ('noon', 500, 30), ('amazon', 500, 5000),
+                                           (None, None, 40)]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                'name': 'track.poll', 'kind': 'error', 'durationMs': duration, 'ok': False,
+                'props': {'merchant': merchant},
+                'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual({(row['httpStatus'], row['merchant']): row['count'] for row in result['topErrors']},
+                         {(401, 'noon'): 2, (500, 'noon'): 1, (500, 'amazon'): 1, (None, 'unknown'): 1})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant']['noon'],
+                         {'count': 3, 'p50': 20, 'p95': 30, 'max': 30})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 30, 'p95': 5000, 'max': 5000})
+        self.assertEqual(result['topErrorTags'][0]['count'], 5)
+
+    def test_sampled_orders_rollup_weights_merchant_durations_and_groups_errors(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, kind, duration, rate, status in [
+            ('noon', 'perf', 10, 20, None), ('noon', 'perf', 100, 1, None),
+            ('noon', 'error', 1000, 128, 401), ('noon', 'error', 2000, 32, 401),
+            ('careem', 'perf', 25, 2, None), ('amazon', 'perf', 50, 1, None),
+            ('amazon', 'error', 3000, 64, 500), (None, 'error', 4000, 1, None),
+        ]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders',
+                'name': 'track.poll', 'kind': kind, 'durationMs': duration, 'ok': kind != 'error',
+                'props': {'merchant': merchant, 'sampleRate': rate},
+                **({'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}}
+                   if kind == 'error' else {})})
+        records.append({'ts': self.day + 'T12:00:01Z', 'kind': 'error', 'name': 'log.cap',
+            'props': {'component': 'hooks', 'capBytes': 100}, 'error': {'tag': 'LOG_CAP'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual(result['recordedRows'], 9)
+        self.assertEqual(result['total'], 29)
+        self.assertTrue(result['sampled'])
+        self.assertEqual(result['countsByName'], {'track.poll': 28, 'log.cap': 1})
+        self.assertEqual(result['logCaps'], [{'component': 'hooks', 'capBytes': 100,
+                                              'ts': self.day + 'T12:00:01Z'}])
+        self.assertEqual({(r['tag'], r['httpStatus'], r['merchant']): r['count'] for r in result['topErrors']},
+            {('OPERATION_FAILED', 401, 'noon'): 2, ('OPERATION_FAILED', 500, 'amazon'): 1,
+             ('OPERATION_FAILED', None, 'unknown'): 1, ('LOG_CAP', None, 'unknown'): 1})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 10, 'p95': 3000, 'max': 4000})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant'], {
+            'noon': {'count': 23, 'p50': 10, 'p95': 1000, 'max': 2000},
+            'careem': {'count': 2, 'p50': 25, 'p95': 25, 'max': 25},
+            'amazon': {'count': 2, 'p50': 50, 'p95': 3000, 'max': 3000},
+            'unknown': {'count': 1, 'p50': 4000, 'p95': 4000, 'max': 4000}})
 
     def test_format_privacy_modes_and_fail_open(self):
         os.chmod(self.tmp.name, 0o755)

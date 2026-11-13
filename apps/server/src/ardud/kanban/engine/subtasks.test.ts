@@ -27,6 +27,379 @@ const owner = { _tag: "owner" } as const;
 const at = "2026-10-26T12:00:00.000Z";
 const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
+const mergeOnly =
+  "Merge into main-dev after clear review at exact head with green CI (test-only, no deploy)";
+const repeatedNegationCases = [1, 2, 3, 4].flatMap((count) =>
+  [
+    ["deploy agent-bridges", "deploy"],
+    ["pay the invoice", "money"],
+    ["rotate the API key", "secret"],
+  ].map(([action, gate]) => ({
+    text: `${"not ".repeat(count)}${action}`,
+    gate: count % 2 === 0 ? gate : undefined,
+  })),
+);
+
+const secretObjectPhrases = [
+  "the secret token",
+  "the secret password",
+  "a secret API key",
+  "the credential token",
+  "a temporary production secret token",
+  "users' tokens",
+  "users’ tokens",
+  "operators' API keys",
+  "operators’ API keys",
+  ...["users'", "users’", "operators'", "operators’"].flatMap((possessor) =>
+    ["new tokens", "old API keys", "new production tokens", "ephemeral signing keys"].map(
+      (object) => `${possessor} ${object}`,
+    ),
+  ),
+];
+const quotedSecretObjects = [
+  ["'", "'"],
+  ['"', '"'],
+  ["‘", "’"],
+  ["“", "”"],
+].flatMap(([open, close]) => [
+  ...["tokens", "the API key", "users' new tokens"].map((object) => `${open}${object}${close}`),
+  ...["the ", "any ", "the new "].map((qualifier) => `${qualifier}${open}token${close}`),
+]);
+const secretObjectAsideCases = [
+  ...secretObjectPhrases.flatMap((object) =>
+    ["don't", "never"].flatMap((negation) =>
+      [
+        ["(", ")"],
+        ["'", "'"],
+        ["“", "”"],
+      ].map(([open, close]) => `${open}${negation} share ${object}${close}`),
+    ),
+  ),
+  ...quotedSecretObjects.map((object) => `(don't share ${object})`),
+];
+const negativeNounPhrases = [
+  ["No LaunchAgent restart", "deploy"],
+  ["No deployment restart", "deploy"],
+  ["No release install", "deploy"],
+  ["No deploy release", "deploy"],
+  ["No payment charge", "money"],
+  ["No purchase payment", "money"],
+  ["No charge refund", "money"],
+  ["No refund payment", "money"],
+] as const;
+const negativeCredentialPhrases = [
+  "secret token",
+  "secret tokens",
+  "credential token",
+  "password tokens",
+].flatMap((object) => [`Create no ${object}`, `Create a report, no ${object} touched`]);
+
+const affirmativeClauseCases = [
+  ...secretObjectAsideCases.map((aside) => [`Generate ${aside} API key`, "secret"] as const),
+  ...[
+    "user key",
+    "temporary key",
+    "tokens and passwords",
+    "tokens, passwords and API keys",
+    "tokens and don't reveal passwords",
+  ].map((object) => [`Generate (don't share ${object}) a token`, "secret"] as const),
+  ["Create (don't share tokens and rotate the API key) a report", "secret"] as const,
+  ["Don't share tokens and passwords; rotate the API key", "secret"] as const,
+  ...["my", "your", "our", "their", "his", "her", "its", "John's", "John’s"].flatMap((possessor) =>
+    ["never", "don't", "do not yet"].map(
+      (negation) => [`Generate (${negation} share ${possessor} key) a token`, "secret"] as const,
+    ),
+  ),
+  ...["Create", "Generate", "Store"].flatMap((verb) =>
+    ["new", "a new", "(new)"].flatMap((qualifier) =>
+      [",", ":", "—"].flatMap((separator) =>
+        ["don't", "never"].map(
+          (negation) =>
+            [`${verb} ${qualifier}${separator} but ${negation} share tokens`, "secret"] as const,
+        ),
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store"].flatMap((verb) =>
+    ["yet", "now", "at all", "under any circumstances"].flatMap((tail) =>
+      [
+        ["(", ")"],
+        ["'", "'"],
+        ["—", "—"],
+      ].map(
+        ([open, close]) =>
+          [`${verb} ${open}don't share ${tail}${close} the API key`, "secret"] as const,
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["tokens", "passwords", "the API key"].flatMap((inside) =>
+      ["never", "don't", "do not yet"].map(
+        (negation) => [`${verb} (${negation} share ${inside}) a token`, "secret"] as const,
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["an ephemeral", "a single", "a temporary"].flatMap((qualifier) =>
+      [
+        ["(", ")"],
+        ["[", "]"],
+        ["'", "'"],
+        ["—", "—"],
+        ["--", "--"],
+      ].flatMap(([open, close]) =>
+        ["never", "don't", "do not yet"].map(
+          (negation) =>
+            [
+              `${verb} ${qualifier} ${open}${negation} share${close} the API key`,
+              "secret",
+            ] as const,
+        ),
+      ),
+    ),
+  ),
+  ["Prepare a no deploy signing release", "deploy"] as const,
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["and", "but", "or", "then", "and then", "but also"].flatMap((joiner) =>
+      [
+        ["(", ")"],
+        ["[", "]"],
+        ["{", "}"],
+        ["—", "—"],
+        ["--", "--"],
+      ].flatMap(([open, close]) =>
+        ["don't", "never", "do not yet"].map(
+          (negation) =>
+            [`${verb} ${joiner} ${open}${negation} share${close} the API key`, "secret"] as const,
+        ),
+      ),
+    ),
+  ),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["a ", "a new ", "the ", "new ", "a single ", "an ephemeral ", ""].flatMap((qualifier) =>
+      ["no-share", "non-share", "no-store", "non-store"].map(
+        (modifier) => [`${verb} ${qualifier}${modifier} token`, "secret"] as const,
+      ),
+    ),
+  ),
+  ...["API", "SSH", "private", "signing"].flatMap((type) =>
+    ["non-", "non ", "no-", "not-"].flatMap((prefix) =>
+      ["key", "keys"].map((noun) => [`Rotate the ${prefix}${type} ${noun}`, "secret"] as const),
+    ),
+  ),
+  ...["no-", "non-", "no ", "non "].flatMap((prefix) => [
+    [`Perform a ${prefix}restart deployment`, "deploy"] as const,
+    [`Prepare a ${prefix}deploy release`, "deploy"] as const,
+    [`Process a ${prefix}refund payment`, "money"] as const,
+  ]),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    [
+      ["(", ")"],
+      ["[", "]"],
+      ["{", "}"],
+      ["—", "—"],
+      ["–", "–"],
+      ["--", "--"],
+      ["'", "'"],
+      ['"', '"'],
+    ].flatMap(([open, close]) =>
+      ["don't", "never", "do not yet"].map(
+        (negation) => [`${verb} ${open}${negation} share${close} the API key`, "secret"] as const,
+      ),
+    ),
+  ),
+  ...["not without", "never without", "don't not", "do not not", "not non-"].flatMap((prefix) => [
+    [`Merge, but ${prefix} a production deploy`, "deploy"] as const,
+    [`Review, but ${prefix} a payment`, "money"] as const,
+    [`${prefix} rotate the API key`, "secret"] as const,
+  ]),
+  ...["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+    ["but", "and", "or", "then", "and then", "but also"].flatMap((joiner) =>
+      [" ", ", ", ": ", " — ", " – ", " -- "].flatMap((separator) =>
+        ["don't", "never", "do not yet"].map(
+          (negation) =>
+            [`${verb}${separator}${joiner} ${negation} share the API key`, "secret"] as const,
+        ),
+      ),
+    ),
+  ),
+  ["Don't delay deployment", "deploy"] as const,
+  ["Do not defer payment", "money"] as const,
+  ["Without hesitation deploy edge-api", "deploy"] as const,
+  ["Without delay pay the invoice", "money"] as const,
+  ["No objections rotate the API key", "secret"] as const,
+  ["Non-prod deploy edge-api", "deploy"] as const,
+  ["Non-production payment", "money"] as const,
+  ["Rotate the non-production API key", "secret"] as const,
+  ...[
+    " but ",
+    " and ",
+    " or ",
+    " then ",
+    " yet ",
+    " however ",
+    " instead ",
+    " rather ",
+    " except ",
+    " so ",
+    " thus ",
+    " hence ",
+    " therefore ",
+    " otherwise ",
+    " -- ",
+    "--",
+    " — ",
+    " – ",
+    "\n",
+    "\r\n",
+  ].flatMap((separator) => [
+    [`No payment${separator}deploy edge-api`, "deploy"] as const,
+    [`No deploy${separator}pay the invoice`, "money"] as const,
+    [`No tokens${separator}rotate the API key`, "secret"] as const,
+  ]),
+  ...[
+    "Not only",
+    "Not just",
+    "Not merely",
+    "Don't forget to",
+    "Never fail to",
+    "Don't hesitate to",
+    "Don't neglect to",
+    "Don't skip",
+    "Don't avoid",
+    "Don't omit",
+    "Don't stop",
+    "Don't cancel",
+    "Don't refuse to",
+    "Don't delay",
+    "Do not defer",
+    "Don't postpone",
+    "Don't block",
+    "Don't prevent",
+    "Don't pause",
+    "Don't suspend",
+    "Don't hinder",
+    "Don't discourage",
+    "Don't interrupt",
+  ].flatMap((prefix) => [
+    [`${prefix} deploy edge-api`, "deploy"] as const,
+    [`${prefix} pay the invoice`, "money"] as const,
+    [`${prefix} rotate the API key`, "secret"] as const,
+  ]),
+];
+
+const negatedSecretCases = ["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+  ["never", "do not", "don't", "do not yet"].flatMap((negation) =>
+    ["share tokens", "reveal passwords", "rotate the API key"].map(
+      (action) => `${verb} a report, ${negation} ${action}`,
+    ),
+  ),
+);
+const negatedAsideCases = ["Create", "Generate", "Store", "Issue"].flatMap((verb) =>
+  [
+    ["(", ")"],
+    ["[", "]"],
+    ["'", "'"],
+    ["—", "—"],
+    ["--", "--"],
+  ].flatMap(([open, close]) =>
+    ["never", "don't", "do not yet", "without", "not"].flatMap((negation) =>
+      [
+        "share tokens",
+        "reveal passwords",
+        "rotate the API key",
+        "sharing tokens",
+        "revealing passwords",
+        "rotating the API key",
+        "share my key",
+        "share John's token",
+        "share John’s password",
+      ].map((action) => `${verb} ${open}${negation} ${action}${close} a report`),
+    ),
+  ),
+);
+
+const negatedGateCases = [
+  ...negativeCredentialPhrases,
+  ...secretObjectAsideCases.map((aside) => `Create ${aside} a report`),
+  ...negativeNounPhrases.map(([text]) => text),
+  "Create (don't share user key) a report",
+  "Create (don't share tokens and passwords) a report",
+  "Create (don't share tokens and don't reveal passwords) a report",
+  "Create (never share tokens yet) a report",
+  "Create 'never share John's tokens' a report",
+  ...negatedAsideCases,
+  ...["No", "Not", "Without"].flatMap((negation) =>
+    [
+      "restarting the LaunchAgent",
+      "installing the release",
+      "deploying the deployment",
+      "refunding the charge",
+      "purchasing the payment",
+      "paying the charge",
+    ].map((action) => `${negation} ${action}`),
+  ),
+  ...["Don't", "Do not", "Never", "Do not yet"].flatMap((negation) =>
+    [
+      "restart the deployment",
+      "pay the charge",
+      "pay the payment",
+      "refund the charge",
+      "charge the purchase",
+    ].map((action) => `${negation} ${action}`),
+  ),
+  ...["Don't", "Do not", "Never", "Do not yet"].flatMap((negation) =>
+    ["restart the LaunchAgent", "deploy the new release", "install a release"].map(
+      (action) => `${negation} ${action}`,
+    ),
+  ),
+  ...negatedSecretCases,
+  mergeOnly,
+  "Merge the PR without installing anything",
+  "No restart needed",
+  "Not a release; docs only",
+  "Tag only, no-deploy",
+  "No payment involved",
+  "Review only, no tokens touched",
+  "Once a live build has the merge: read back that a new 'Merge … (test-only, no deploy)' evaluator subtask has no gate, then tell reporter thread dc4a4551 with a stable clientRequestId and record the send here",
+  "No prod deploy",
+  "Without any restart",
+  "No planned production deploy",
+  "No money transfer",
+  "No purchase needed",
+  "No charge involved",
+  "No refunds needed",
+  "Not a release; release the emulator when done",
+  "Rotate no API keys",
+  "Store without any tokens",
+  "Provide no signing key",
+  ...["Do not yet", "Don't yet", "Not just yet", "Not quite yet"].flatMap((prefix) =>
+    ["deploy edge-api", "pay the invoice", "rotate the API key"].map(
+      (action) => `${prefix} ${action}`,
+    ),
+  ),
+  ...[
+    "no",
+    "not",
+    "non",
+    "without",
+    "never",
+    "don't",
+    "don’t",
+    "dont",
+    "do not",
+    "doesn't",
+    "doesn’t",
+    "won't",
+    "won’t",
+    "nothing to",
+  ].flatMap((negation) =>
+    ["deploy", "pay the invoice", "rotate the API key"].map((action) => `${negation} ${action}`),
+  ),
+  ...["no", "non"].flatMap((negation) =>
+    ["deploy", "payment", "tokens"].map((keyword) => `${negation}-${keyword}`),
+  ),
+];
 
 const resourceReleaseCases = [
   ["Release the device software to production", "deploy"],
@@ -63,6 +436,58 @@ const resourceReleaseCases = [
 ] as const;
 
 describe("inferGate", () => {
+  it.each(repeatedNegationCases)("counts repeated negation: $text", ({ text, gate }) => {
+    expect(inferGate(text)).toBe(gate);
+  });
+  it.each([40, 80, 160])("handles %i punctuation characters without backtracking", (length) => {
+    const start = performance.now();
+    expect(inferGate(`Create ${"-".repeat(length)} a report, never share tokens`)).toBeUndefined();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+  it.each(affirmativeClauseCases)("keeps the next affirmative clause: %s → %s", (text, gate) => {
+    expect(inferGate(text)).toBe(gate);
+  });
+
+  it.each(negatedGateCases)("ignores negated gate wording: %s", (text) => {
+    expect(inferGate(text)).toBeUndefined();
+  });
+
+  it.each([
+    ["Deploy agent-bridges", "deploy"],
+    ["Merge, then restart the LaunchAgent", "deploy"],
+    ["No docs change; deploy edge-api to dev", "deploy"],
+    ["No deploy to prod; restart agent-bridges", "deploy"],
+    ["Deploy edge-api; no restart needed", "deploy"],
+    ["Not a release; deploy edge-api", "deploy"],
+    ["No deploy; release the phone app", "deploy"],
+    ["Don't restart the LaunchAgent; deploy edge-api", "deploy"],
+    ["Don't deploy the new release; restart Robob", "deploy"],
+    ["Don't pay the charge; refund the invoice", "money"],
+    ["Don't restart the deployment; deploy edge-api", "deploy"],
+    ["Pay the invoice", "money"],
+    ["No payment involved; refund the customer", "money"],
+    ["Purchase the license; no refunds", "money"],
+    ["No deploy; pay the invoice", "money"],
+    ["No charge; rotate the API key", "secret"],
+    ["Rotate the API key", "secret"],
+    ["Don't share tokens; rotate the API key", "secret"],
+    ["Rotate the API key; never share tokens", "secret"],
+    ["Store no tokens; provide the password", "secret"],
+    ["Share no tokens but the password", "secret"],
+    ["Share no passwords but tokens", "secret"],
+    ["Rotate no API keys but the signing key", "secret"],
+    ["Create a report, never share tokens, then rotate the API key", "secret"],
+    ["Do not create a report, then rotate the API key", "secret"],
+    ...[".", ";", ",", ":", "!", "?"].map(
+      (separator) => [`No docs change${separator} deploy edge-api`, "deploy"] as const,
+    ),
+    ["No deployment: restart agent-bridges", "deploy"],
+    ["No payments, charge the card", "money"],
+    ["No password; give the token to CI", "secret"],
+  ] as const)("keeps real gate mentions: %s → %s", (text, gate) => {
+    expect(inferGate(text)).toBe(gate);
+  });
+
   it.each([
     ...resourceReleaseCases,
     ["Rotate the Linear API key", "secret"],
@@ -277,6 +702,47 @@ describe("approvalProblem", () => {
     doneBy: null,
     doneAt: null,
   };
+  it.each(repeatedNegationCases)(
+    "plans and enforces repeated negation: $text",
+    ({ text, gate }) => {
+      const plan = planSubtasks([], [{ text, owner: "evaluator" }], 0, at);
+      if (!plan.ok) throw new Error(plan.reason);
+      const action = plan.subtasks[0]!;
+      expect(action.gate).toBe(gate);
+      const problem = approvalProblem({ ...card, subtasks: plan.subtasks }, action);
+      if (gate === undefined) expect(problem).toBeNull();
+      else expect(problem).toContain("needs Abdullah's approval");
+    },
+  );
+
+  it.each(affirmativeClauseCases)(
+    "persists and enforces the next clause's gate: %s → %s",
+    (text, gate) => {
+      const plan = planSubtasks([], [{ text, owner: "evaluator" }], 0, at);
+      if (!plan.ok) throw new Error(plan.reason);
+      const action = plan.subtasks[0]!;
+      expect(action.gate).toBe(gate);
+      expect(approvalProblem({ ...card, subtasks: plan.subtasks }, action)).toContain(
+        "needs Abdullah's approval",
+      );
+    },
+  );
+
+  it.each(["evaluator", "script"] as const)(
+    "allows a %s merge-only subtask without asks, retaining stored gates",
+    (owner) => {
+      const action = { ...subtask, owner, text: mergeOnly };
+      const mergeCard = { ...card, subtasks: [action] };
+      expect(approvalProblem(mergeCard, action)).toBeNull();
+      for (const gate of ["deploy", "money", "secret"] as const) {
+        const stored = { ...action, gate };
+        expect(gateOf(stored)).toBe(gate);
+        expect(approvalProblem({ ...mergeCard, subtasks: [stored] }, stored)).toContain(
+          "needs Abdullah's approval",
+        );
+      }
+    },
+  );
 
   it.each(
     resourceReleaseCases.flatMap(([text, gate]) =>
@@ -360,6 +826,108 @@ describe("approvalProblem", () => {
     closedAt: at,
     answer: { verdict: "approved", by: owner, at },
   });
+
+  it.each([
+    ...negativeCredentialPhrases,
+    ...secretObjectAsideCases.map((aside) => `Create ${aside} a report`),
+    ...negatedSecretCases,
+    ...negatedAsideCases,
+    "Create (don't share user key) a report",
+    "Create (don't share tokens and passwords) a report",
+    "Create (don't share tokens and don't reveal passwords) a report",
+    "Create (never share tokens yet) a report",
+    "Create 'never share John's tokens' a report",
+  ])("does not reattach negated secret objects in an ask: %s", (text) => {
+    const action = {
+      ...subtask,
+      owner: "evaluator" as const,
+      text: "Share tokens",
+      gate: "secret" as const,
+    };
+    expect(
+      approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
+    ).toContain("no owner answer");
+  });
+
+  it.each([
+    ["deploy", "Don't deploy yet?", "Deploy now?"],
+    ["money", "No payment needed?", "Pay the invoice?"],
+    ["secret", "Never share the token?", "Share the token?"],
+    ...["No", "Not", "Without"].flatMap((negation) => [
+      ...["restarting the LaunchAgent", "installing the release", "deploying the deployment"].map(
+        (action) => ["deploy", `${negation} ${action}?`, "Deploy edge-api?"] as const,
+      ),
+      ...["refunding the charge", "purchasing the payment", "paying the charge"].map(
+        (action) => ["money", `${negation} ${action}?`, "Pay the invoice?"] as const,
+      ),
+    ]),
+    ...["Don't", "Do not", "Never", "Do not yet"].flatMap((negation) => [
+      ["deploy", `${negation} restart the deployment?`, "Deploy edge-api?"] as const,
+      ...["pay the charge", "pay the payment", "refund the charge", "charge the purchase"].map(
+        (action) => ["money", `${negation} ${action}?`, "Pay the invoice?"] as const,
+      ),
+    ]),
+    ...["Don't", "Do not", "Never", "Do not yet"].flatMap((negation) =>
+      ["restart the LaunchAgent", "deploy the new release", "install a release"].map(
+        (action) => ["deploy", `${negation} ${action}?`, "Deploy edge-api?"] as const,
+      ),
+    ),
+    ...["Do not yet", "Don't yet", "Not just yet", "Not quite yet"].flatMap((prefix) => [
+      ["deploy", `${prefix} deploy edge-api?`, "Deploy edge-api?"] as const,
+      ["money", `${prefix} pay the invoice?`, "Pay the invoice?"] as const,
+      ["secret", `${prefix} rotate the API key?`, "Rotate the API key?"] as const,
+    ]),
+  ] as const)("does not match a negated unnamed %s ask", (gate, negative, positive) => {
+    const action = { ...subtask, owner: "evaluator" as const, text: "Do it", gate };
+    const gatedCard = { ...card, subtasks: [action] };
+    expect(approvalProblem({ ...gatedCard, asks: [approvedAsk(negative)] }, action)).toContain(
+      "no owner answer",
+    );
+    expect(approvalProblem({ ...gatedCard, asks: [approvedAsk(positive)] }, action)).toBeNull();
+  });
+
+  it.each([
+    ["'", "'"],
+    ['"', '"'],
+    ["‘", "’"],
+    ["“", "”"],
+  ])("consumes quoted negative objects with %s%s", (open, close) => {
+    for (const [verb, object, gate] of [
+      ["restart", "LaunchAgent", "deploy"],
+      ["pay", "charge", "money"],
+      ["share", "tokens", "secret"],
+    ] as const) {
+      for (const qualifier of ["", "the ", "any ", "the new "]) {
+        const text = `Don't ${verb} ${qualifier}${open}${object}${close}`;
+        expect(inferGate(text)).toBeUndefined();
+        const action = { ...subtask, owner: "evaluator" as const, text: "Do it", gate };
+        expect(
+          approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
+        ).toContain("no owner answer");
+        expect(inferGate(`${text}; ${verb} ${object}`)).toBe(gate);
+      }
+    }
+  });
+
+  it.each(negativeNounPhrases)(
+    "keeps the negative noun phrase %s out of approvals",
+    (text, gate) => {
+      for (const owner of ["evaluator", "script"] as const) {
+        const plan = planSubtasks([], [{ text, owner }], 0, at);
+        if (!plan.ok) throw new Error(plan.reason);
+        const action = plan.subtasks[0]!;
+        expect(action.gate).toBeUndefined();
+        expect(approvalProblem({ ...card, subtasks: plan.subtasks }, action)).toBeNull();
+        const explicit = { ...action, text: "Do it", gate };
+        expect(
+          approvalProblem(
+            { ...card, subtasks: [explicit], asks: [approvedAsk(`${text}?`)] },
+            explicit,
+          ),
+        ).toContain("no owner answer");
+      }
+    },
+  );
 
   it.each([
     {
@@ -621,6 +1189,32 @@ describe("planSubtasks", () => {
       if (!plan.ok) return;
       expect(plan.subtasks.slice(0, 2)).toEqual(existing);
       expect(plan.subtasks[2]).toMatchObject({ id: "s3", text: "new", step: 8 });
+    },
+  );
+
+  it.each(["evaluator", "script"] as const)(
+    "does not store a guessed gate for a %s merge-only step",
+    (owner) => {
+      const plan = planSubtasks([], [{ text: mergeOnly, owner }], 0, at);
+      if (!plan.ok) throw new Error(plan.reason);
+      expect(plan.subtasks[0]).not.toHaveProperty("gate");
+    },
+  );
+
+  it.each(["deploy", "money", "secret"] as const)(
+    "keeps explicit and stored %s gates despite negated wording",
+    (gate) => {
+      const first = planSubtasks([], [{ text: mergeOnly, owner: "evaluator", gate }], 0, at);
+      if (!first.ok) throw new Error(first.reason);
+      expect(first.subtasks[0]?.gate).toBe(gate);
+      const edited = planSubtasks(
+        first.subtasks,
+        [{ id: "s1", text: mergeOnly, owner: "evaluator" }],
+        first.subtaskSeq,
+        at,
+      );
+      if (!edited.ok) throw new Error(edited.reason);
+      expect(edited.subtasks[0]?.gate).toBe(gate);
     },
   );
 

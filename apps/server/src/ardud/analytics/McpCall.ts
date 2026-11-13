@@ -16,6 +16,10 @@ export class McpCall extends Context.Service<
     boardId?: string;
     cardId?: string;
     cardNumber?: number;
+    delegation?: {
+      readonly taskId: string;
+      readonly readCommitted: Effect.Effect<boolean | "unknown">;
+    };
     callerResolved: boolean;
     callerResolveMs: number;
     callerStarted?: bigint;
@@ -122,6 +126,15 @@ export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   if (call._tag === "Some") call.value.saved = saved;
 });
 
+// Capture the receipt lookup before dispatch so interruption cannot hide a committed command.
+export const trackDelegation = Effect.fnUntraced(function* (
+  taskId: string,
+  readCommitted: Effect.Effect<boolean | "unknown">,
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") call.value.delegation = { taskId, readCommitted };
+});
+
 // The toolkit erases defects and some typed errors while encoding the MCP reply.
 export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause<E>) {
   const call = yield* Effect.serviceOption(McpCall);
@@ -143,6 +156,13 @@ export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
 ): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
+  if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
+    return {
+      outcome: "interrupted",
+      saved: state.saved,
+      errorPhase: state.phase,
+      props: { code: "unknown", ...interruptionProps(exit.cause) },
+    };
   const output =
     exit._tag === "Success" && !(exit.value instanceof McpSchema.InputRequired)
       ? exit.value
@@ -199,8 +219,7 @@ export function callOutcome(
     state.replyFailure === "reply_timeout" ||
     code === "caller_unresolved" ||
     code === "delegation_timeout" ||
-    code === "send_timeout" ||
-    (exit._tag === "Failure" && Cause.hasInterrupts(exit.cause));
+    code === "send_timeout";
   const busy = code === "board_busy" || BOARD_BUSY.test(text);
   const refused =
     typedOutcome === "refused" ||

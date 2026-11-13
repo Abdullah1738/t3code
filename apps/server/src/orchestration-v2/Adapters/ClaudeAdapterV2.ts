@@ -9145,7 +9145,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 message.api_error_status < 500 &&
                 message.api_error_status !== 404);
             const cause =
-              (currentPermanentFailure ? (turnFailure ?? undefined) : undefined) ??
+              (currentPermanentFailure ? turnFailure : undefined) ??
               transcriptFailure ??
               (selectedModelAfterSuccess
                 ? latestFailure

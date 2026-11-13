@@ -68,10 +68,10 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual((props['chunks'], props['chunksDone'], props['windowS']), (4,4,3600))
 
     def test_budget_preserves_completed_chunks_and_retries_only_unfinished_suffix(self):
-        self.cost = 28
+        self.cost = 42
         self.assertFalse(self.collect())
         state = jobs.read_state('crashes')
-        self.assertEqual(self.clock, 90)
+        self.assertEqual(self.clock, 135)
         self.assertEqual(state['unified'], 9100)
         self.assertEqual((state['unifiedRetry']['windowStart'], state['unifiedRetry']['windowEnd']), (9100,10000))
         self.assertEqual(self.rows('crash.source')[-1]['props']['chunksDone'], 3)
@@ -129,7 +129,7 @@ class UnifiedChunkTests(unittest.TestCase):
 
     def test_reported_coverage_gap_is_cleared_before_normal_suffix_retry(self):
         jobs.save_state('crashes', {'unified':10000-86400, 'rollupDay':'1969-12-31'})
-        self.cost = 28
+        self.cost = 42
         self.assertFalse(self.collect())
         self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 82800)
         self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 82800)

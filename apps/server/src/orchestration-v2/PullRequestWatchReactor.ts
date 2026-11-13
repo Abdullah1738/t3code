@@ -173,6 +173,7 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
   return (
     left.startedAt === right.startedAt &&
     left.headSha === right.headSha &&
+    left.observedHeadSha === right.observedHeadSha &&
     left.failedChecks.join("\n") === right.failedChecks.join("\n") &&
     left.passed === right.passed &&
     left.passedChecks.join("\n") === right.passedChecks.join("\n") &&

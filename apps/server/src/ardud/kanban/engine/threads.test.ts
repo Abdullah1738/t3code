@@ -208,6 +208,51 @@ describe("prWatchesOf", () => {
     ).toBe(2);
   });
 
+  it.effect.each(["current", "legacy", "ended"] as const)(
+    "find keeps the observed PR head separate from its CI checkpoint (%s)",
+    (state) =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make("thread-pr-heads");
+        const checkpoint = "aaaaaaa111111111";
+        const observed = "bbbbbbb222222222";
+        const watch = {
+          ...watchedPr().watch!,
+          headSha: checkpoint,
+          ...(state === "current" ? { observedHeadSha: observed } : {}),
+        };
+        const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: () =>
+            Effect.succeed({
+              ...shell({}),
+              id: threadId,
+              projectId: ProjectId.make("project-1"),
+              deletedAt: null,
+              activeRunId: null,
+              activityRunStartedAt: null,
+              archivedAt: null,
+              title: "Watched PR",
+              pullRequests: [
+                watchedPr(state === "ended" ? { watch: undefined, endedWatch: watch } : { watch }),
+              ],
+            } as never),
+        });
+        yield* Effect.gen(function* () {
+          const threads = yield* KanbanThreads;
+          const view = yield* threads.find(threadId);
+          expect(view?.prs[0]?.head).toBe(state === "ended" ? null : checkpoint);
+          expect(view?.prs[0]?.observedHead).toBe(state === "current" ? observed : null);
+        }).pipe(
+          Effect.provide(
+            layer.pipe(
+              Layer.provide(management),
+              Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+              Layer.provide(Sqlite.layerMemory),
+            ),
+          ),
+        );
+      }),
+  );
+
   it("is zero for an empty or missing roster", () => {
     expect(prWatchesOf({ pullRequests: [] })).toBe(0);
     expect(prWatchesOf({})).toBe(0);

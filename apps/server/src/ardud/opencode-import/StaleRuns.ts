@@ -34,8 +34,8 @@ export const layer = Layer.effect(
     // ardud: avoid waiting three seconds for every projection when OpenCode is down.
     const gaveUp = yield* Ref.make(false);
     return StaleOpenCodeSessions.of({
-      abort: (sessions) =>
-        Effect.gen(function* () {
+      abort: Effect.fn("StaleOpenCodeSessions.abort")(
+        function* (sessions) {
           if (sessions.length === 0) return { aborted: 0, failed: 0 };
           if (yield* Ref.get(gaveUp)) {
             yield* Effect.logWarning(
@@ -117,13 +117,16 @@ export const layer = Layer.effect(
             aborted: results.filter((result) => result === "aborted").length,
             failed: results.filter((result) => result === "failed").length + skippedByBreaker,
           };
-        }).pipe(
-          // ardud: recovery must continue even if settings or the abort service defects.
-          Effect.catchCauseIf(
-            (cause) => !Cause.hasInterruptsOnly(cause),
-            () => Effect.succeed({ aborted: 0, failed: sessions.length }),
+        },
+        // Recovery must continue even if settings or the abort service defects.
+        (effect, sessions) =>
+          effect.pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              () => Effect.succeed({ aborted: 0, failed: sessions.length }),
+            ),
           ),
-        ),
+      ),
     });
   }),
 );

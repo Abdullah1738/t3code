@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsError, type AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsError, LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -10,6 +10,9 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Sqlite from "../../persistence/Sqlite.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
@@ -41,9 +44,13 @@ function open(
   setup: Effect.Success<typeof fixture>,
   options: Partial<Analytics.AnalyticsOptions> = {},
   fs = setup.fs,
+  boards?: BoardsDatabase.BoardsDatabase["Service"],
 ) {
   return Layer.build(
     Analytics.layerWith(options).pipe(
+      Layer.provide(
+        boards === undefined ? Layer.empty : Layer.succeed(BoardsDatabase.BoardsDatabase, boards),
+      ),
       Layer.provide(Layer.succeed(ServerConfig.ServerConfig, setup.config)),
       Layer.provide(Layer.succeed(FileSystem.FileSystem, fs)),
     ),
@@ -51,6 +58,275 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads filtered tick phase percentiles and persists the complete day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [boardId, durationMs] of [
+        ["a", 10],
+        ["a", 20],
+        ["a", 90],
+        ["b", 1_000],
+      ] as const)
+        yield* analytics.record(
+          event({
+            kind: "kanban.tick_phase",
+            surface: "server",
+            route: "kanban",
+            boardId,
+            durationMs,
+            props: { tickId: "tick-1", phase: "thread_status", count: 1 },
+          }),
+        );
+      yield* analytics.record(
+        event({
+          kind: "kanban.tick_overlap",
+          surface: "server",
+          route: "kanban",
+          boardId: "a",
+          props: { tickId: "tick-2", activeTickId: "tick-1", reason: "local_waits_only" },
+        }),
+      );
+      const result = yield* analytics.read({
+        day,
+        kind: "kanban.tick_phase",
+        boardId: "a",
+        limit: 1,
+      });
+      assert.equal(result.rollup.total, 3);
+      assert.lengthOf(result.samples, 1);
+      assert.deepEqual(result.rollup.tickPhases, [
+        {
+          boardId: "a",
+          phase: "thread_status",
+          count: 3,
+          p50Ms: 20,
+          p95Ms: 90,
+          maxMs: 90,
+          approximate: false,
+        },
+      ]);
+      const full = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(full.total, 5);
+      assert.equal(full.tickPhases?.length, 2);
+      assert.equal(full.kindCounts["kanban.tick_overlap"], 1);
+      assert.isFalse(yield* setup.fs.exists(`${setup.directory}/rollup-${day}.json.tmp`));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("incremental summaries match cold rebuilds for main and error rollups", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      let scans = 0;
+      const tracked = FileSystem.FileSystem.of({
+        ...setup.fs,
+        stream: (file, options) => {
+          if (file.endsWith(".ndjson")) scans++;
+          return setup.fs.stream(file, options);
+        },
+      });
+      const batch = (durationMs: number): AnalyticsEvent[] => [
+        event({
+          kind: "performance.long-task-summary",
+          surface: "desktop",
+          props: {
+            count: 2,
+            totalMs: durationMs * 2,
+            maxMs: durationMs,
+            wallTimeMs: 60_000,
+            histogram: [[Math.ceil(Math.log(durationMs) / Math.log(LONG_TASK_HISTOGRAM_RATIO)), 2]],
+          },
+        }),
+        event({
+          kind: "kanban.tick_phase",
+          surface: "server",
+          boardId: "board-a",
+          durationMs,
+          props: { phase: "thread_status" },
+        }),
+        event({ kind: "ask.answered", surface: "server", durationMs }),
+        event({ kind: "ask.answer_sent", durationMs: 999_999 }),
+        event({
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          tool: "delegate_task",
+          outcome: "interrupted_by_shutdown",
+          committed: true,
+          taskId: "task-committed",
+          durationMs,
+          props: { code: "unknown", cause: "shutdown" },
+        }),
+        event({
+          kind: "server.http",
+          surface: "server",
+          route: "api.cards",
+          durationMs,
+          props: { method: "POST", status: 503, errorTag: "Http5xx" },
+        }),
+        event({
+          kind: "db.slow",
+          surface: "server",
+          durationMs,
+          props: { span: "Kanban.get", key: "reader", phase: "execute", waitMs: durationMs / 2 },
+        }),
+      ];
+      const warm = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const analytics = yield* open(setup, {}, tracked);
+          for (const row of batch(100)) yield* analytics.record(row);
+          yield* analytics.read({ day });
+          yield* analytics.read({ day, boardId: "board-a" });
+          const before = scans;
+          for (const row of batch(500)) yield* analytics.record(row);
+          const full = yield* analytics.read({ day });
+          const filtered = yield* analytics.read({ day, boardId: "board-a" });
+          assert.equal(scans, before);
+          assert.deepInclude(full.rollup.longTasksByRoute[0], {
+            count: 4,
+            totalMs: 1200,
+            maxMs: 500,
+            p95Ms: 500,
+            wallTimeMs: 120_000,
+            wallTimeShare: 0.01,
+          });
+          assert.deepInclude(full.rollup.tickPhases?.[0], { count: 2, p95Ms: 500 });
+          assert.deepInclude(full.rollup.askAnswerLatency, { count: 2, p95Ms: 500 });
+          assert.deepInclude(full.rollup.mcpCalls[0], {
+            count: 2,
+            outcomes: { interrupted_by_shutdown: 2 },
+          });
+          assert.deepInclude(full.rollup.errorsByRoute[0], { count: 2, status: 503 });
+          assert.deepInclude(full.rollup.mcpErrorsByCode[0], { count: 2, code: "unknown" });
+          assert.deepInclude(full.rollup.dbSlowBySpan[0], { count: 2, totalWaitMs: 300 });
+          assert.lengthOf(filtered.rollup.longTasksByRoute, 0);
+          assert.equal(filtered.rollup.tickPhases?.[0]?.count, 2);
+          const persisted = JSON.parse(
+            yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+          ) as AnalyticsRollup;
+          assert.deepEqual(persisted, full.rollup);
+          return { full, filtered };
+        }),
+      );
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read({ day })).rollup, warm.full.rollup);
+      assert.deepEqual(
+        (yield* cold.read({ day, boardId: "board-a" })).rollup,
+        warm.filtered.rollup,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps a minute summary delivered after midnight in the task's UTC day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      yield* TestClock.setTime(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-14T00:00:01.000Z")),
+      );
+      yield* analytics.ingest({
+        events: [
+          event({
+            ts: "2026-11-13T23:59:00.000Z",
+            kind: "performance.long-task-summary",
+            surface: "desktop",
+            route: "board",
+            props: {
+              count: 1,
+              totalMs: 500,
+              maxMs: 500,
+              wallTimeMs: 60_000,
+              histogram: [[Math.ceil(Math.log(500) / Math.log(LONG_TASK_HISTOGRAM_RATIO)), 1]],
+            },
+          }),
+        ],
+      });
+      const previous = yield* analytics.read({ day });
+      assert.deepInclude(previous.rollup.longTasksByRoute[0], {
+        route: "board",
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        p95Ms: 500,
+        wallTimeShare: 500 / 60_000,
+      });
+      assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+  it.effect(
+    "reads the ask split from existing records and filters by board without recording text",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, json TEXT)`;
+        const ask = {
+          id: "q1",
+          text: "private question",
+          at: `${day}T01:00:00.000Z`,
+          blocking: true,
+          closedAt: `${day}T03:00:00.000Z`,
+          answer: {
+            at: `${day}T03:00:00.000Z`,
+            by: { _tag: "owner" },
+            verdict: "approved",
+            text: "private answer",
+          },
+          timing: {
+            kind: "approve",
+            notified: { telegram: `${day}T01:10:00.000Z` },
+            firstSeen: { web: `${day}T02:00:00.000Z`, mobile: `${day}T02:30:00.000Z` },
+          },
+        };
+        for (const board of ["board-a", "board-b"])
+          yield* sql`INSERT INTO ardud_kanban_cards VALUES (${board}, ${board}, ${JSON.stringify({ asks: [ask] })})`;
+        const boards = { sql, ready: Effect.void, path: ":memory:" };
+        let scans = 0;
+        const tracked = FileSystem.FileSystem.of({
+          ...setup.fs,
+          stream: (file, options) => {
+            if (file.endsWith(".ndjson")) scans++;
+            return setup.fs.stream(file, options);
+          },
+        });
+        const analytics = yield* open(setup, {}, tracked, boards);
+        yield* analytics.record(event());
+        yield* analytics.ingest({
+          events: [event({ kind: "ask.answered" }), event({ kind: "ask.seen" })],
+        });
+        const result = yield* analytics.read({ day, boardId: "board-a" });
+        assert.equal(result.rollup.askLatency.createdToAnswered.count, 1);
+        assert.equal(result.rollup.askLatency.sentToSeen.p50Ms, 50 * 60_000);
+        assert.equal(result.rollup.askLatency.seenToAnswered.p50Ms, 60 * 60_000);
+        assert.equal(result.rollup.askLatency.source, "stored-asks");
+        assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 2);
+        assert.lengthOf(result.samples, 0);
+        assert.isFalse(JSON.stringify(result).includes("private"));
+        const before = scans;
+        const updated = {
+          ...ask,
+          timing: {
+            ...ask.timing,
+            firstSeen: { web: `${day}T01:30:00.000Z` },
+          },
+        };
+        yield* sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ asks: [updated] })} WHERE board_id = 'board-a'`;
+        const warm = yield* analytics.read({ day, boardId: "board-a" });
+        assert.equal(scans, before);
+        assert.equal(warm.rollup.askLatency.sentToSeen.p50Ms, 20 * 60_000);
+        assert.equal(warm.rollup.askLatency.seenToAnswered.p50Ms, 90 * 60_000);
+        const cold = yield* open(setup, {}, setup.fs, boards);
+        assert.deepEqual((yield* cold.read({ day, boardId: "board-a" })).rollup, warm.rollup);
+        const persisted = JSON.parse(
+          yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+        ) as AnalyticsRollup;
+        assert.equal(persisted.askLatency.createdToAnswered.count, 2);
+        assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
+        assert.isFalse(JSON.stringify(persisted).includes("private"));
+      }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
+  );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>

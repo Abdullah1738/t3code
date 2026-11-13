@@ -103,6 +103,7 @@ class BigRootTests(unittest.TestCase):
         def crashes(**kw):
             return collect(10000, [], lambda a,b: collector.unified(a,b,run), **kw)
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(collector, 'disk_wait'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=lambda **kw: inventory([self.big]+roots, run, **kw)), \
              patch.object(collector, 'collect', side_effect=crashes):
@@ -122,7 +123,7 @@ class BigRootTests(unittest.TestCase):
                     def __exit__(inner, *args):
                         return False
                     def __iter__(inner):
-                        yield SimpleNamespace(path=str(self.big/'fast'))
+                        yield SimpleNamespace(path=str(self.big/'fast'), is_dir=lambda **kwargs: True)
                         raise failure
                 def run(cmd, **kw):
                     return SimpleNamespace(returncode=0, stdout='42\t'+cmd[-1], stderr='')
@@ -146,12 +147,12 @@ class BigRootTests(unittest.TestCase):
         (roots[1]/'Finder.crash').write_text('private')
         os.utime(roots[1]/'Finder.crash', (9990,9990))
         reports = collector.reports
-        def read(root, since, until, deadline=None, completed=None):
+        def read(root, since, until, deadline=None, completed=None, stats=None):
             calls.append((root, deadline))
             if root == roots[0]:
                 clock[0] = 6
                 raise jobs.SourceFailure('timeout', 'report budget exhausted')
-            return reports(root, since, until, deadline, completed)
+            return reports(root, since, until, deadline, completed, stats)
         with patch.object(collector.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(collector, 'reports', side_effect=read):
             self.assertFalse(collector.collect(10000, roots, lambda a,b: {}, deadline=65))

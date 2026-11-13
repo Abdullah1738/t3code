@@ -340,3 +340,31 @@ it.effect(
     }).pipe(Effect.provide(f.layer));
   },
 );
+
+it.effect.each(["direct", "continuation"] as const)(
+  "a %s run with a running timestamp still holds before provider acceptance",
+  (kind) => {
+    const f = makeFixture();
+    const starting = {
+      ...run,
+      status: "running" as const,
+      startedAt: now,
+      completedAt: null,
+      ...(kind === "continuation"
+        ? {
+            id: RunId.make("run:continued-before-provider"),
+            restartContinuationOfRunId: run.id,
+          }
+        : {}),
+    };
+    f.set({
+      ...f.get(),
+      runs: kind === "continuation" ? [run, starting] : [starting],
+      providerTurns: [],
+    });
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      assert.isTrue(yield* state.active(source));
+    }).pipe(Effect.provide(f.layer));
+  },
+);

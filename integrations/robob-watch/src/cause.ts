@@ -2,10 +2,13 @@ import { createHash } from "node:crypto";
 
 // Keep these patterns and normalization in sync with helpers/toollog.py.
 const patterns = [
-  ["usage_error", /(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name/i],
-  ["missing_file", /no such file or directory|filenotfounderror|\bENOENT\b/i],
+  ["usage_error", /(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)/i],
+  ["missing_file", /no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror/i],
   ["permission", /permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b/i],
   ["timeout", /timed? out|timeoutexpired|timeouterror|\bETIMEDOUT\b/i],
+  ["auth", /authentication[ _-]*failed|invalid credentials|invalid[_ -]grant|login failed|unauthori[sz]ed|forbidden|HTTP[ :]+(?:401|403)\b/i],
+  ["connect", /connection[ _-]*(?:refused|reset|aborted)|\b(?:ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN)\b|network is (?:unreachable|down)|no route to host|temporary failure in name resolution|bridge socket is unavailable|bridge request failed/i],
+  ["json", /jsondecodeerror|invalid json|json (?:parse|decode) error|unexpected (?:token|end).*json/i],
   ["python_traceback", /traceback \(most recent call last\):/i],
 ] as const;
 

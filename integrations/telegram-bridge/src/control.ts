@@ -142,12 +142,12 @@ export class ControlClient {
     this.token = token;
   }
 
-  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal; kanban?: boolean } = {}): Promise<T> {
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 15_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
     let response: Response;
     try {
-      response = await fetch(`${this.url}${PREFIX}${path}`, {
+      response = await fetch(`${this.url}${options.kanban ? "/api/ardud/kanban" : PREFIX}${path}`, {
         method,
         headers: {
           authorization: `Bearer ${this.token}`,
@@ -173,10 +173,22 @@ export class ControlClient {
       toolError("telegram", "tg.control.responseJson", undefined, failure);
       throw failure;
     }
-    if (!response.ok || data?.ok !== true) {
+    if (!response.ok || (!options.kanban && data?.ok !== true)) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", response.ok ? "decode" : response.status);
     }
     return data as T;
+  }
+
+  async askNotified(key: string, at: number): Promise<void> {
+    const match = /^([a-z0-9-]+):(\d+):(q\d+)$/.exec(key);
+    if (!match) return;
+    try {
+      await this.request("POST", `/cards/${encodeURIComponent(`${match[1]}:${match[2]}`)}/asks/${match[3]}/notified`,
+        { channel: "telegram", at: new Date(at).toISOString() }, { kanban: true, timeoutMs: 5_000 });
+    } catch (error) {
+      if (error instanceof ControlError && error.status === 404) return;
+      throw error;
+    }
   }
 
   thread(threadId: string): Promise<{ thread: ThreadDetail }> {

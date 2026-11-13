@@ -133,7 +133,7 @@ test("the CLI prints secret values raw and other secret responses as projected J
     res.end(JSON.stringify(reply));
   });
   const run = async (...args: string[]) => {
-    const child = Bun.spawn([process.execPath, "run", cli, ...args], { env: { HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn([process.execPath, "run", cli, ...args], { env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     return { stdout, stderr, exitCode };
   };

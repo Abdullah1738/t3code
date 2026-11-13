@@ -315,7 +315,7 @@ assert 'BUN_INSPECT' not in os.environ
 with Path(os.environ['CALLS']).open('a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')
 if os.environ.get('FAIL_CHANNEL') == sys.argv[1]: sys.exit(1)
 if sys.argv[1] == 'send':
-    key = sys.argv[sys.argv.index('--key') + 1]
+    key = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--key='))
     state = os.environ.get('SEND_STATE', 'sent')
     attempts = int(os.environ.get('SEND_ATTEMPTS', '1' if state == 'sent' else '0'))
     with sqlite3.connect(os.environ['BRIDGE_DB_FIXTURE']) as connection:
@@ -360,7 +360,7 @@ if sys.argv[1] == 'send':
                 self.run_items([msg])
                 self.assertEqual(len(self.notifications()) - before, 2)
                 for call in self.notifications()[before:]:
-                    self.assertNotIn(code, call[call.index('--text') + 1])
+                    self.assertNotIn(code, next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
         with patch.object(t.time, 'time', return_value=990):
             t.expect_auth('Bank')
         before = len(self.notifications())
@@ -401,7 +401,7 @@ if sys.argv[1] == 'send':
                 self.run_items([msg])
                 self.assertEqual(len(self.notifications()) - before, 0 if bulk or expected else 2)
         for call in self.notifications():
-            self.assertNotIn('fixture', call[call.index('--text') + 1])
+            self.assertNotIn('fixture', next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
 
     def test_bank_portal_footer_never_suppresses_a_debit(self):
         helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))
@@ -427,7 +427,7 @@ if sys.argv[1] == 'send':
                     self.run_items([msg])
                     self.assertEqual(len(self.notifications()) - before, 2)
                     for call in self.notifications()[before:]:
-                        self.assertIn('Bank debit: AED 1,200.00', call[call.index('--text') + 1])
+                        self.assertIn('Bank debit: AED 1,200.00', next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
 
     def test_explicit_link_subject_survives_hidden_html_target(self):
         helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))
@@ -451,7 +451,7 @@ if sys.argv[1] == 'send':
                 self.run_items([msg])
                 self.assertEqual(len(self.notifications()) - before, 2)
                 for call in self.notifications()[before:]:
-                    self.assertNotIn('fixture', call[call.index('--text') + 1])
+                    self.assertNotIn('fixture', next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
 
     def test_each_class_sends_both_channels_once_and_leaves_batch_state_unchanged(self):
         rows = [item(sender, text, id=f'imsg:{n}') for n, (sender, text, kind) in enumerate(CORPUS) if kind]
@@ -463,9 +463,9 @@ if sys.argv[1] == 'send':
         self.assertEqual((self.live / 'cursor.json').read_bytes(), before)
         for a in self.notifications():
             if a[0] == 'send':
-                self.assertEqual(a[a.index('--session') + 1], 'ardud-control:thread:owner')
+                self.assertEqual(next(arg.split('=', 1)[1] for arg in a if arg.startswith('--session=')), 'ardud-control:thread:owner')
         for channel in ('notify', 'send'):
-            keys = [a[a.index('--key') + 1] for a in self.notifications() if a[0] == channel]
+            keys = [next(arg.split('=', 1)[1] for arg in a if arg.startswith('--key=')) for a in self.notifications() if a[0] == channel]
             self.assertEqual(len(keys), len(set(keys)))
 
     def test_requested_and_small_debits_remain_batch_only(self):
@@ -556,7 +556,7 @@ if sys.argv[1] == 'send':
         self.run_items([])
         sends = [a for a in self.notifications() if a[0] == 'send']
         self.assertEqual(len(sends), 2)
-        self.assertEqual(sends[1][sends[1].index('--key') + 1], sends[0][sends[0].index('--key') + 1] + ':r1')
+        self.assertEqual(next(arg.split('=', 1)[1] for arg in sends[1] if arg.startswith('--key=')), next(arg.split('=', 1)[1] for arg in sends[0] if arg.startswith('--key=')) + ':r1')
         self.assertEqual(t.read_json(self.wd / 'cursor.json')['pending'], {})
 
     def test_uncertain_or_dispatched_cancellation_never_gets_a_new_key(self):
@@ -594,8 +594,8 @@ if sys.argv[1] == 'send':
             t.urgent_alerts({}, {'hits': [msg]}, self.live, 1001)
         self.run_items([item()])
         self.assertEqual([a[0] for a in self.notifications()], ['notify', 'send'])
-        self.assertEqual(self.notifications()[0][self.notifications()[0].index('--text') + 1],
-                         self.notifications()[1][self.notifications()[1].index('--text') + 1])
+        self.assertEqual(next(arg.split('=', 1)[1] for arg in self.notifications()[0] if arg.startswith('--text=')),
+                         next(arg.split('=', 1)[1] for arg in self.notifications()[1] if arg.startswith('--text=')))
 
     def test_dry_and_scratch_runs_never_send_or_change_live_files(self):
         before = (self.live / 'cursor.json').read_bytes()
@@ -683,7 +683,7 @@ if sys.argv[1] == 'send':
         real_run = t.subprocess.run
         def slow_telegram(command, **kw):
             if command[2] == 'notify':
-                attempted.add(command[command.index('--key') + 1])
+                attempted.add(next(arg.split('=', 1)[1] for arg in command if arg.startswith('--key=')))
                 clock[0] += kw['timeout']
                 raise TimeoutExpired('telegram', kw['timeout'])
             return real_run(command, **kw)

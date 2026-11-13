@@ -1,3 +1,4 @@
+import { askTimingRef } from "./useAskTiming";
 import {
   askUnreadableCard,
   askUnreadableLine,
@@ -323,6 +324,7 @@ function Row(props: {
     <li>
       <button
         type="button"
+        ref={askTimingRef(item.cardId, item.ask.id)}
         data-ny-row={item.key}
         aria-current={focused ? "true" : undefined}
         tabIndex={focused || props.focusKey === null ? 0 : -1}

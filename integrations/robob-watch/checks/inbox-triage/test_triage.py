@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
 import time
 import types
@@ -18,6 +19,49 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('triage', Path(__file__).with_name('triage.py'))
 t = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(t)
+
+
+@contextlib.contextmanager
+def parsed_notifiers(root):
+    """Use each bridge's real parser, recording delivery without opening its socket."""
+    calls = root / 'deliveries.ndjson'
+    env = {'ROBOB_TEST': '1', 'TOOLLOG_DIR': str(root / 'logs'), 'TEST_DELIVERIES': str(calls)}
+    for channel, variable, bridge in (('telegram', 'ROBOB_WATCH_TELEGRAM_CLI', 'telegram-bridge'),
+                                      ('imessage', 'INBOX_TRIAGE_SPECTRUM_CLI', 'spectrum-bridge')):
+        cli = Path(__file__).resolve().parents[3] / bridge / 'src/cli.ts'
+        stub = root / f'{channel}.ts'
+        stub.write_text('import { parseCommand } from ' + json.dumps(str(cli)) + ";\n" +
+                        'import { appendFileSync } from "node:fs";\n' +
+                        'const command = parseCommand(process.argv.slice(2));\n' +
+                        'appendFileSync(process.env.TEST_DELIVERIES, JSON.stringify(command) + "\\n");\n')
+        env[variable] = str(stub)
+    with patch.dict(os.environ, env), patch.object(t, 'BUN', shutil.which('bun') or t.BUN):
+        yield calls
+
+
+class NotifierParserTests(unittest.TestCase):
+    def test_health_and_item_text_reaches_real_parsers_intact_once(self):
+        texts = ('- outlook: down', '-- outlook: down', '-', '--', '--key=mail text',
+                 'Bank debit: AED 12.00 at Example', '- first\n-- second=value')
+        for text in texts:
+            for kind in ('health', 'telegram', 'imessage'):
+                with self.subTest(text=text, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    with parsed_notifiers(root) as calls, patch.object(t, 'LIVE', root):
+                        if kind == 'health':
+                            state = {'health_pending': {'text': text, 'key': '--health-key', 'sources': []}}
+                            self.assertEqual(t.send_health(state, [], root, 10600), {'health_alerts': []})
+                            self.assertEqual(t.send_health(state, [], root, 10900), {})
+                        else:
+                            with patch.object(t, 'owner_route', return_value='fixture-session'), \
+                                 patch.object(t, 'imessage_status', side_effect=[None, ('sent', 1, 'fixture')]):
+                                self.assertEqual(t.send_urgent('item', text, kind, 10600), 10600)
+                                self.assertEqual(t.send_urgent('item', text, kind, 10900), 10600)
+                        delivered = [json.loads(line) for line in calls.read_text().splitlines()]
+                        self.assertEqual(len(delivered), 1)
+                        self.assertEqual(delivered[0]['body']['text'], text)
+                        if kind == 'health':
+                            self.assertEqual(delivered[0]['body']['dedupeKey'], '--health-key')
 
 
 class TriageTests(unittest.TestCase):
@@ -1227,6 +1271,45 @@ class DegradedRunTests(unittest.TestCase):
                 self.assertEqual(code, expected)
                 self.assertIn('degraded:' if expected == 0 else 'source failure:', err)
 
+    def test_twenty_fastpath_outlook_timeouts_deliver_one_parsed_notice(self):
+        data = self.wd / 'data'
+        data.mkdir()
+        normal = self.wd / 'inbox-triage'
+        normal.mkdir()
+        fast = self.wd / 'inbox-triage-fastpath'
+        fast.mkdir()
+        self.wd = fast
+        t.atomic(fast / 'cursor.json', self.initial)
+        clock = [10000]
+
+        def mail(account, request):
+            if account == 'outlook':
+                raise t.subprocess.TimeoutExpired(['python3', 'triage.py', '--mail-worker'], 19)
+            return {**self.good(), 'items': []}
+        chat = {'cursor': 42, 'items': [], 'drops': {}, 'scanned': 0}
+        with parsed_notifiers(data) as calls, patch.object(t, 'LIVE', normal), patch.object(t, 'DATA', data), \
+             patch.object(t, 'money_books', return_value=data / 'money'), \
+             patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
+             patch.object(t, 'run_mail', side_effect=mail), \
+             patch.object(t, 'collect_whatsapp', return_value=chat), patch.object(t, 'collect_imessage', return_value=chat):
+            for n in range(20):
+                clock[0] = 10000 + n * 300
+                code, out, err = self.run_check(f'replay-{n}', fast=True)
+                self.assertEqual((code, out), (0, ''), err)
+                self.assertIn('inbox-triage-fastpath degraded: outlook: TimeoutExpired', err)
+            delivered = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(delivered), 1)
+            self.assertTrue(delivered[0]['body']['text'].startswith('- outlook: 3 run(s)'))
+            state = t.read_json(fast / 'cursor.json')
+            self.assertNotIn('health_pending', state)
+            self.assertEqual(state['source_health']['outlook']['alerted_at'], 10600)
+            self.assertEqual(state['cursors']['outlook'], self.initial['cursors']['outlook'])
+            self.assertEqual(state['cursors']['gmail']['uid'], 3)
+            rows = [json.loads(line) for f in (data / 'logs').glob('*.ndjson') for line in f.read_text().splitlines()]
+            for tag in ('health.delivery_failed', 'tg.cli.arguments'):
+                self.assertEqual(sum(row.get('error', {}).get('tag') == tag for row in rows), 0, tag)
+            print('Outlook replay: runs=20 degraded_notices=1 health.delivery_failed=0 tg.cli.arguments=0')
+
 
 class SourceHealthTests(unittest.TestCase):
     # Card #14: these tests mock subprocess.run, but a test run still needs the Telegram stub override to send.
@@ -1284,7 +1367,7 @@ class SourceHealthTests(unittest.TestCase):
                 self.tick(state, wd, bad, 10_000 + n * 300)
             self.assertEqual(run.call_count, 1)
             first = run.call_args.args[0]
-            text = first[first.index('--text') + 1]
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
             self.assertIn('outlook', text)
             self.assertIn('provider/network', text)
             self.assertIn('Other sources are still being read', text)
@@ -1293,14 +1376,14 @@ class SourceHealthTests(unittest.TestCase):
                 self.tick(state, wd, bad, 10_000 + t.HEALTH_TRANSIENT_ESCALATE + n * 300)
             self.assertEqual(run.call_count, 2)
             escalation = run.call_args.args[0]
-            self.assertIn('outlook still failing after 180 min', escalation[escalation.index('--text') + 1])
-            self.assertIn('attention', escalation)
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in escalation if v.startswith('--text=')))
+            self.assertIn('--severity=attention', escalation)
             self.tick(state, wd, bad, 10_000 + t.HEALTH_REALERT + 900)
             self.assertEqual(run.call_count, 2)
             self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1200)
             self.assertEqual(run.call_count, 3)
             recovery = run.call_args.args[0]
-            self.assertIn('outlook reading again after', recovery[recovery.index('--text') + 1])
+            self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in recovery if v.startswith('--text=')))
             self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1500)
             self.assertEqual(run.call_count, 3)
 
@@ -1315,7 +1398,7 @@ class SourceHealthTests(unittest.TestCase):
                         self.tick(state, t.LIVE, errors, 10_000 + n * 300)
                     # These sends succeeded; one outage and one recovery, no repeat at five/hour.
                     self.assertEqual(run.call_count, 2)
-                    texts = [c.args[0][c.args[0].index('--text') + 1] for c in run.call_args_list]
+                    texts = [next(v.split('=', 1)[1] for v in c.args[0] if v.startswith('--text=')) for c in run.call_args_list]
                     self.assertNotIn('reading again', texts[0])
                     self.assertIn('outlook reading again', texts[1])
                     self.assertEqual(state['source_health']['outlook']['last_notice_at'], 10_600)
@@ -1340,7 +1423,7 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE)
             self.assertEqual(run.call_count, 3)
             args = run.call_args.args[0]
-            self.assertIn('outlook still failing after 180 min', args[args.index('--text') + 1])
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 300)
             self.assertEqual(run.call_count, 3)
             self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 600)
@@ -1363,8 +1446,8 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, bad, 11_200)
             self.assertEqual(state['source_health']['outlook']['since'], 11_200)
             args = run.call_args.args[0]
-            self.assertEqual(args[args.index('--key') + 1], pending['key'])
-            self.assertEqual(args[args.index('--text') + 1], pending['text'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--key=')), pending['key'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), pending['text'])
             self.tick(state, t.LIVE, bad, 11_500)
             self.tick(state, t.LIVE, bad, 11_800)
             self.assertEqual(run.call_count, 2)  # recovery retries do not erase the outage cooldown
@@ -1373,7 +1456,7 @@ class SourceHealthTests(unittest.TestCase):
             for now in (later + 300, later + 600, later + 900):
                 self.tick(state, t.LIVE, bad, now)
             self.assertEqual(run.call_count, 3)
-            self.assertNotIn('reading again', run.call_args.args[0][run.call_args.args[0].index('--text') + 1])
+            self.assertNotIn('reading again', next(v.split('=', 1)[1] for v in run.call_args.args[0] if v.startswith('--text=')))
 
     def test_outage_notice_retry_after_health_window_still_has_one_recovery(self):
         state = {}
@@ -1390,12 +1473,12 @@ class SourceHealthTests(unittest.TestCase):
         with patch.object(t.subprocess, 'run', return_value=sent) as run:
             self.tick(state, t.LIVE, {}, 14_800)
             args = run.call_args.args[0]
-            self.assertEqual(args[args.index('--key') + 1], original['key'])
-            self.assertEqual(args[args.index('--text') + 1], original['text'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--key=')), original['key'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), original['text'])
             self.tick(state, t.LIVE, {}, 15_100)
             self.assertEqual(run.call_count, 2)
             args = run.call_args.args[0]
-            self.assertIn('outlook reading again after 15 min', args[args.index('--text') + 1])
+            self.assertIn('outlook reading again after 15 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, {}, 15_400)
             self.assertEqual(run.call_count, 2)
             self.assertEqual(state['source_health']['outlook']['last_notice_at'], 14_800)
@@ -1456,11 +1539,11 @@ class SourceHealthTests(unittest.TestCase):
                 with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
                     self.tick(state, t.LIVE, bad, 11_200)
                     self.assertNotIn('alerted_at', state['source_health']['outlook'])
-                    self.assertEqual(run.call_args.args[0][run.call_args.args[0].index('--key') + 1], original['key'])
+                    self.assertEqual(next(v.split('=', 1)[1] for v in run.call_args.args[0] if v.startswith('--key=')), original['key'])
                     self.tick(state, t.LIVE, {}, 11_500)
                     self.assertEqual(run.call_count, 2)
                     args = run.call_args.args[0]
-                    self.assertIn('outlook reading again after', args[args.index('--text') + 1])
+                    self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
                     self.tick(state, t.LIVE, {}, 11_800)
                     self.assertEqual(run.call_count, 2)
 
@@ -1480,7 +1563,7 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, {}, 22_700)
             self.assertEqual(run.call_count, 2)
             args = run.call_args.args[0]
-            self.assertIn('outlook reading again', args[args.index('--text') + 1])
+            self.assertIn('outlook reading again', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 23_000)
             self.assertEqual(run.call_count, 2)
 
@@ -1531,16 +1614,16 @@ class SourceHealthTests(unittest.TestCase):
             lost = t.subprocess.TimeoutExpired('bun', 4)
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
             with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
-                self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
+                self.assertEqual(self.tick(state, wd, bad, 10_600)['health_alert_error'], 'telegram-bridge notify failed: timeout')
                 self.assertNotIn('alerted_at', state['source_health']['gmail'])
                 # The next run counts another failure, but resends the same text under the same key.
                 self.assertEqual(self.tick(state, wd, bad, 10_900), {'health_alerts': ['gmail', 'outlook']})
                 self.assertEqual(self.tick(state, wd, bad, 11_200), {})
             first, second = (c.args[0] for c in run.call_args_list)
             self.assertEqual(first, second)
-            self.assertEqual(first[2:4], ['notify', '--source'])
-            self.assertEqual(first[first.index('--severity') + 1], 'attention')
-            text = first[first.index('--text') + 1]
+            self.assertEqual(first[2:4], ['notify', '--source=Inbox triage'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in first if v.startswith('--severity=')), 'attention')
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
             self.assertIn('- outlook: 3 run(s) in a row, 3 in the last hour. Last error: IMAP auth failed', text)
             self.assertIn('- gmail:', text)
             self.assertEqual(state['source_health']['outlook']['alerted_at'], 10_900)
@@ -1562,10 +1645,10 @@ class SourceHealthTests(unittest.TestCase):
                 self.assertEqual(self.tick(state, wd, both, 11_200), {'health_alerts': ['outlook']})
                 self.assertEqual(self.tick(state, wd, both, 11_500), {'health_alerts': ['gmail']})
                 self.assertEqual(self.tick(state, wd, both, 11_800), {})
-            keys = [c.args[0][c.args[0].index('--key') + 1] for c in run.call_args_list]
+            keys = [next(v.split('=', 1)[1] for v in c.args[0] if v.startswith('--key=')) for c in run.call_args_list]
             self.assertEqual(len(set(keys[:3])), 1)
             self.assertNotEqual(keys[2], keys[3])
-            self.assertNotIn('gmail', run.call_args_list[2].args[0][run.call_args_list[2].args[0].index('--text') + 1])
+            self.assertNotIn('gmail', next(v.split('=', 1)[1] for v in run.call_args_list[2].args[0] if v.startswith('--text=')))
 
     def test_an_alert_the_bridge_never_takes_is_dropped_after_six_hours(self):
         with tempfile.TemporaryDirectory() as tmp:
