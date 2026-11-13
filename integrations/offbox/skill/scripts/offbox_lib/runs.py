@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
-from . import containers, prune, prepare
+from . import containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
@@ -1144,6 +1144,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
+              userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
               CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),
