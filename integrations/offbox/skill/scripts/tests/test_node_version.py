@@ -118,6 +118,118 @@ class WantTests(unittest.TestCase):
         other.mkdir()
         self.assertEqual(node_version.want(self.root, other)[0], [(K(18), K(19))])
 
+    def test_ci_literal_forms(self):
+        for value, expected in [
+            ('22', [(K(22), K(23))]),
+            ("'22.x'", [(K(22), K(23))]),
+            ('"22.13"', [(K(22, 13), K(22, 14))]),
+            ('"22.13.0"', [(K(22, 13), K(22, 13, 1))]),
+            ('[20, 22]', [(K(20), K(21)), (K(22), K(23))]),
+            ("['20', '22.x'] # supported versions", [(K(20), K(21)), (K(22), K(23))]),
+            ('[22]', [(K(22), K(23))]),
+            ('[20, "${{ matrix.node }}", 22]', [(K(20), K(21)), (K(22), K(23))]),
+            ('22 # CI', [(K(22), K(23))]),
+            ('\n          - 20\n          - 22', [(K(20), K(21)), (K(22), K(23))]),
+        ]:
+            with self.subTest(value=value):
+                self.write('.github/workflows/ci.yml', f'        node-version: {value}\n')
+                ranges, label = node_version.want(self.root, self.root / 'sub')
+                self.assertEqual(ranges, expected)
+                self.assertIn('.github/workflows/ci.yml node-version', label)
+
+    def test_ci_ignored_forms_and_no_files(self):
+        self.assertIsNone(node_version.want(self.root, self.root))
+        self.assertIn('no pin;', node_version.block(None))
+        for content in [
+            'node-version: ${{ matrix.node }}',
+            'node-version: "${{ env.NODE_VERSION }}"',
+            'node-version-file: .nvmrc',
+            '# node-version: 22',
+            'node-version: not-a-version',
+            'node-version: []',
+        ]:
+            with self.subTest(content=content):
+                self.write('.github/workflows/ci.yml', content)
+                self.assertIsNone(node_version.want(self.root, self.root))
+
+    def test_repo_pins_beat_ci(self):
+        self.write('.github/workflows/ci.yml', 'node-version: 20')
+        for name, content in [('.nvmrc', '22'), ('.node-version', '22'),
+                              ('package.json', '{"engines":{"node":"22"}}')]:
+            with self.subTest(name=name):
+                self.write(name, content)
+                ranges, label = node_version.want(self.root, self.root)
+                self.assertEqual(ranges, [(K(22), K(23))])
+                self.assertNotIn('.github/', label)
+                (self.root / name).unlink()
+
+    def test_disjoint_pin_does_not_fall_through_to_ci(self):
+        self.write('.nvmrc', '20')
+        self.pkg('22')
+        self.write('.github/workflows/ci.yml', 'node-version: 24')
+        self.assertEqual(node_version.want(self.root, self.root)[0], [])
+
+    def test_conflicting_workflows_prefer_highest_major(self):
+        self.write('.github/workflows/old.yml', 'node-version: 20')
+        self.write('.github/workflows/ci.yaml', "node-version: '22.x'")
+        ranges, label = node_version.want(self.root, self.root)
+        self.assertEqual(ranges, [(K(22), K(23))])
+        self.assertIn('.github/workflows/ci.yaml node-version 22.x', label)
+        self.assertIn('workflows disagree, highest major 22', label)
+
+    def test_ci_unreadable_workflow_does_not_hide_other_signals(self):
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        (self.root / '.github/workflows/bad.yaml').write_bytes(b'\xff')
+        self.assertEqual(node_version.want(self.root, self.root)[0], [(K(22), K(23))])
+
+
+class NoPinTests(unittest.TestCase):
+    def run_no_pin(self, home, before=''):
+        bindir = Path(home) / 'box/bin'
+        bindir.mkdir(parents=True)
+        node = bindir / 'node'
+        node.write_text('#!/bin/sh\necho v24.22.1\n')
+        node.chmod(0o755)
+        path = f'{bindir}:/usr/bin:/bin'
+        script = before + node_version.block(None) + '\nprintf "%s\\n" "$PATH"; node --version; compgen -A variable | /usr/bin/grep ^__offbox_ || :'
+        return subprocess.run(['bash', '-c', script], env={'HOME': home, 'PATH': path},
+                              capture_output=True, text=True, timeout=15), path
+
+    def test_default_alias_or_newest_nvm(self):
+        for alias, expected, reason in [('22', 'v22.13.0', 'nvm default'),
+                                         ('v22.13.0', 'v22.13.0', 'nvm default'),
+                                         ('22.x', 'v22.13.0', 'nvm default'),
+                                         (None, 'v24.1.0', 'newest nvm'),
+                                         ('18', 'v24.1.0', 'newest nvm')]:
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as home:
+                fake_nvm(home, ('v22.13.0', 'v24.1.0', 'v24.1.0-rc'))
+                if alias:
+                    path = Path(home) / '.nvm/alias/default'
+                    path.parent.mkdir(parents=True)
+                    path.write_text(alias + '\n')
+                result, original = self.run_no_pin(home, before='hash node 2>/dev/null || :\n')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [f'{home}/.nvm/versions/node/{expected}/bin:{original}', expected])
+                self.assertIn(f'offbox: node {expected} (no pin; {reason})', result.stderr)
+
+    def test_alias_chain_and_cycle(self):
+        for target, expected in [('lts/jod', 'v22.13.0'), ('default', 'v24.1.0')]:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as home:
+                fake_nvm(home, ('v22.13.0', 'v24.1.0'))
+                alias = Path(home) / '.nvm/alias'
+                (alias / 'lts').mkdir(parents=True)
+                (alias / 'default').write_text(target + '\n')
+                (alias / 'lts/jod').write_text('v22.13.0\n')
+                result, _ = self.run_no_pin(home)
+                self.assertEqual(result.stdout.splitlines()[-1], expected)
+
+    def test_box_default_keeps_path_and_names_executable(self):
+        with tempfile.TemporaryDirectory() as home:
+            result, original = self.run_no_pin(home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [original, 'v24.22.1'])
+            self.assertIn(f'offbox: node v24.22.1 (no pin; box default {home}/box/bin/node)', result.stderr)
+
 
 FAKE = '#!/bin/sh\necho "{v}"\n'
 
@@ -142,7 +254,7 @@ class BlockRunTests(unittest.TestCase):
             if nvm:
                 fake_nvm(home, versions)
             w = node_version.want(repo, repo)
-            blk = node_version.block(w) if w else ''
+            blk = node_version.block(w)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
@@ -184,11 +296,17 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 99)
 
 class ProvisionTests(unittest.TestCase):
-    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False):
+    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / 'repo'; repo.mkdir()
-            (repo / '.nvmrc').write_text(pin)
-            (repo / 'package.json').write_text(json.dumps({'engines': {'node': engine}}))
+            if workflow is None:
+                (repo / '.nvmrc').write_text(pin)
+                (repo / 'package.json').write_text(json.dumps({'engines': {'node': engine}}))
+            else:
+                (repo / 'package.json').write_text('{}')
+                workflows = repo / '.github/workflows'
+                workflows.mkdir(parents=True)
+                (workflows / 'terraform-dev.yml').write_text(workflow)
             fake_nvm(tmp, installed)
             bindir = root / 'bin'; bindir.mkdir()
             node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
@@ -241,6 +359,24 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
                 self.assertIn('COMMAND_MARKER', result.stdout)
                 self.assertEqual(result.stdout.splitlines()[-1], expected)
                 self.assertEqual(count, 5)
+
+    def test_crpko_devops_ci_only_provisions_22_over_box_24(self):
+        result, count = self.run_provision(workflow='jobs:\n  test:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('offbox: node v22.23.2 (installed: .github/workflows/terraform-dev.yml node-version 22)', result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['COMMAND_MARKER', 'v22.23.2'])
+        self.assertEqual(count, 5)
+
+    def test_ci_unpublished_version_stops_before_command(self):
+        result, _ = self.run_provision(workflow='node-version: 19')
+        self.assertEqual(result.returncode, 99)
+        self.assertIn('no published Node satisfies', result.stderr)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
+
+    def test_ci_install_failure_stops_before_command(self):
+        result, _ = self.run_provision(workflow='node-version: 22', fail=True)
+        self.assertEqual(result.returncode, 99)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
 
     def test_checksum_mismatch_cannot_reach_nvm_or_command(self):
         result, _ = self.run_provision(checksum_bad=True)

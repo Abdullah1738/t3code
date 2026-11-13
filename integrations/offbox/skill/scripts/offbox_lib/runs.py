@@ -1499,7 +1499,7 @@ class Runner:
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
         w = node_version.want(self.root, self.cwd)
-        node_block = node_version.block(w) if w else ""
+        node_block = node_version.block(w)
         pm = pnpm_version.want(self.root, self.cwd)
         if pm:
             node_block += "\n" + pnpm_version.block(pm)
