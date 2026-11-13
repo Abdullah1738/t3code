@@ -3244,6 +3244,46 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  it.effect("uses the settled completion index for the prune subquery", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      let pruneQuery: string | undefined;
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            const query = span.attributes.get("db.query.text");
+            if (
+              typeof query === "string" &&
+              query.includes("DELETE FROM orchestration_v2_effect_outbox")
+            ) {
+              pruneQuery = query;
+            }
+          };
+          return span;
+        },
+      });
+      assert.equal(yield* outbox.pruneSettled.pipe(Effect.withTracer(tracer)), 0);
+      assert.isDefined(pruneQuery);
+      const cutoff = DateTime.formatIso(
+        DateTime.subtractDuration(yield* DateTime.now, EffectOutbox.SETTLED_EFFECT_RETENTION),
+      );
+      const plan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${pruneQuery}`,
+        [cutoff, 200],
+      );
+      const details = plan.map((row) => row.detail).join("\n");
+      assert.match(
+        details,
+        /USING INDEX orchestration_v2_effect_outbox_settled_idx \(completed_at<\?\)/,
+      );
+      assert.notInclude(details, "orchestration_v2_effect_outbox_claim_idx");
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
   it.effect("prunes settled effects past retention in batches and keeps the rest", () =>
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -3277,19 +3317,42 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       yield* insert("succeeded-old:", 1_201, "succeeded", old);
       yield* insert("cancelled-old:", 2, "cancelled", old);
       yield* insert("succeeded-recent:", 1, "succeeded", recent);
+      yield* insert("cancelled-recent:", 1, "cancelled", recent);
+      yield* insert("succeeded-boundary:", 1, "succeeded", EffectOutbox.SETTLED_EFFECT_RETENTION);
+      yield* insert("cancelled-boundary:", 1, "cancelled", EffectOutbox.SETTLED_EFFECT_RETENTION);
+      yield* insert("succeeded-incomplete:", 1, "succeeded", null);
+      yield* insert("cancelled-incomplete:", 1, "cancelled", null);
       yield* insert("failed-old:", 1, "failed", old);
       yield* insert("pending:", 1, "pending", null);
+      yield* insert("pending-old:", 1, "pending", old);
       yield* insert("running:", 1, "running", null);
+      yield* insert("running-old:", 1, "running", old);
 
-      assert.equal(yield* outbox.pruneSettled, 1_203);
+      const pruning = yield* outbox.pruneSettled.pipe(Effect.forkChild);
+      yield* TestClock.adjust("300 millis");
+      assert.equal(yield* Fiber.join(pruning), 1_203);
 
       const remaining = yield* sql<{ readonly effect_id: string }>`
         SELECT effect_id FROM orchestration_v2_effect_outbox ORDER BY effect_id
       `;
       assert.deepEqual(
         remaining.map((row) => row.effect_id),
-        ["failed-old:1", "pending:1", "running:1", "succeeded-recent:1"],
+        [
+          "cancelled-boundary:1",
+          "cancelled-incomplete:1",
+          "cancelled-recent:1",
+          "failed-old:1",
+          "pending-old:1",
+          "pending:1",
+          "running-old:1",
+          "running:1",
+          "succeeded-boundary:1",
+          "succeeded-incomplete:1",
+          "succeeded-recent:1",
+        ],
       );
+      // Advancing through the batch pauses also ages the exact-cutoff rows.
+      assert.equal(yield* outbox.pruneSettled, 2);
       assert.equal(yield* outbox.pruneSettled, 0);
     }).pipe(Effect.provide(layerIsolatedOutbox)),
   );
