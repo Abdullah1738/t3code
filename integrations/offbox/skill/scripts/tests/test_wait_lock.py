@@ -577,6 +577,51 @@ class WaitLockTests(Isolated):
                 row = misc._run_row('run-x')
                 self.assertEqual((row['status'], row['exit_code']), ('failed', 7))
 
+    def test_reporting_uses_the_last_step_validation(self):
+        complete = 'offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
+        retry = ('\noffbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                 'it is queued again as attempt 2\n')
+        cases = [('partial-retry', retry + 'offbox step 1 rc=0: a\n', 90),
+                 ('unavailable', None, 90), ('unchanged', '', 0),
+                 ('failed-retry', retry + 'offbox step 1 rc=0: a\noffbox step 2 rc=7: b\n', 7)]
+        log = common.LOGS_DIR / 'run-x.log'
+        for path in ('foreground', 'wait'):
+            for name, appended, expected in cases:
+                with self.subTest(path=path, history=name):
+                    self.con.execute("UPDATE runs SET status='running',exit_code=NULL,known_exit_code=NULL,"
+                                     "step_count=2,command_id='cmd-x',mode=? WHERE run_id='run-x'",
+                                     ('fg' if path == 'foreground' else 'bg',))
+                    self.con.commit()
+                    log.write_text(complete)
+                    calls = []
+                    def catch_up(*args, **kw):
+                        calls.append(None)
+                        if len(calls) == 1:
+                            log.write_text(complete)
+                            return 'complete'
+                        if appended is None:
+                            return 'incomplete:history unavailable'
+                        log.write_text(complete + appended)
+                        return 'caught_up'
+                    rn = runs.Runner(types.SimpleNamespace(bg=False,steps=['a','b'],cmd=['a;b'],pull=[]), self.me)
+                    rn.run_id, rn.log_path, rn.box, rn.pid, rn.started = 'run-x', log, 'bx_a', 7, True
+                    rn.start, rn.stream = lambda: None, lambda: 0
+                    err, out = io.StringIO(), io.StringIO()
+                    with patch.object(api, 'BACKEND', 'server'), \
+                            patch.object(misc, '_catch_up_log', side_effect=catch_up), \
+                            patch.object(runs, 'follow', return_value=0), \
+                            contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                        rc = runs._run_remote(rn.a, rn) if path == 'foreground' else misc.wait('run-x', None)
+                    self.assertEqual(rc, expected)
+                    self.assertGreaterEqual(len(calls), 2)
+                    row = misc._run_row('run-x')
+                    self.assertEqual((row['status'], row['exit_code']),
+                                     ('infra', None) if expected == 90 else ('done' if expected == 0 else 'failed', expected))
+                    if expected == 90:
+                        self.assertIn('steps incomplete:', err.getvalue())
+                        self.assertNotIn('remote exit 0', err.getvalue())
+                        self.assertNotIn('exit=0', out.getvalue())
+
     def test_logs_follow_tails_the_holders_log(self):
         self.hold_box()
         log = common.LOGS_DIR / 'run-x.log'
@@ -1057,7 +1102,7 @@ class TakeoverPublishTests(unittest.TestCase):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
-        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'finish', side_effect=lambda rid, code, **kw: code))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
         self.row = {'run_id': 'run-p', 'box_id': 'bx_a', 'process_id': 7, 'pulls': '[]', 'status': 'running',
                     'exit_code': None}
@@ -1116,10 +1161,11 @@ class TakeoverPublishTests(unittest.TestCase):
         frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
         seen = {}
 
-        def pause_at_finish(run_id, code, status=None, *, until=None):
+        def pause_at_finish(run_id, code, status=None, *, until=None, report=False):
             # Runs after the replacement log is published and before the row is marked settled. The second waiter
             # runs now: it must see the replacement, because the row is not settled yet.
             seen['log_at_finish'] = log.read_bytes()
+            return code
         with patch.object(runs.api, 'cmd_attach', return_value=iter(frames)), \
                 patch.object(runs, 'finish', side_effect=pause_at_finish), \
                 contextlib.redirect_stdout(_bytes_stdout()):
@@ -1144,7 +1190,7 @@ class LiveAndEchoTests(unittest.TestCase):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
-        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'finish', side_effect=lambda rid, code, **kw: code))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
         self.row = {'run_id': 'run-l', 'box_id': 'bx_a', 'process_id': 7, 'pulls': '[]', 'status': 'running',
                     'exit_code': None}
@@ -1223,7 +1269,7 @@ class LockBlockedFollowerTests(Isolated):
         self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
-        self.stack.enter_context(patch.object(runs, 'finish'))
+        self.stack.enter_context(patch.object(runs, 'finish', side_effect=lambda rid, code, **kw: code))
         # logs --follow refreshes TTL even when a peer holds the lock; keep that API call offline too.
         self.stack.enter_context(patch.object(api, 'set_ttl'))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))

@@ -2162,19 +2162,20 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
 
 
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
-           until: float | None = None) -> int | None:
+           until: float | None = None, report: bool = False) -> int | None:
     con = db()
     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if not r:
-        return
-    code = settled_steps_code(r, code, locked=True, until=until, catch_up=catch_up, report=False)
+        return code
+    code = settled_steps_code(r, code, locked=True, until=until, catch_up=catch_up, report=report)
     st = ('infra' if code is None and planned_steps(r) else
           status or ("lost" if code is None else ("done" if code == 0 else "failed")))
     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? AND status IN ('starting','running')",
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
-        if catch_up and (r['mode'] == 'bg' or con.execute(
+        # Step validation fetched the final output; another append could invalidate the saved result.
+        if catch_up and not planned_steps(r) and (r['mode'] == 'bg' or con.execute(
                 'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()):
             from .misc import _catch_up_finished
             _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))
@@ -2388,7 +2389,7 @@ def _run_remote(a, rn) -> int:
             con.close()
         step_run = row if row is not None else dict(run_id=rn.run_id, box_id=rn.box, command_id=None, mode='fg')
         code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True)
-    finish(rn.run_id, code)
+    code = finish(rn.run_id, code, report=True)
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")

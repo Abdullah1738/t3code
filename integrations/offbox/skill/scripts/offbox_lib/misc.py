@@ -1294,7 +1294,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     if until is not None and now() >= until:
         raise _wait_timeout(r)
     code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
-    finish(r['run_id'], code, until=until)
+    code = finish(r['run_id'], code, until=until, report=True)
     if dict(r).get('mode') == 'bg' and not _has_data(log_path):
         settled = _run_row(r['run_id'])
         result = _catch_up_log(settled, budget=None if until is None else max(0, until-now()),

@@ -976,7 +976,7 @@ class CliStepTests(Isolated):
                     with self.subTest(code=code, steps=steps, marked=marked, settled=settled):
                         err, out = io.StringIO(), io.StringIO()
                         with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
-                                patch.object(runs, 'finish'), patch.object(runs, 'go_std_glitch'), \
+                                patch.object(runs, 'finish', side_effect=lambda rid, code, **kw: code), patch.object(runs, 'go_std_glitch'), \
                                 patch.object(runs, 'settle_box_wedged', return_value=None), \
                                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
                             rc = misc._settled(row) if settled else misc._finalize(row, code, log)
