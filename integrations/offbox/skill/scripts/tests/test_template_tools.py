@@ -1,0 +1,136 @@
+"""Home template prerequisites without apt, network access or a running database service."""
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from offbox_lib import bases, common  # noqa: E402
+
+TEMPLATES = Path(__file__).resolve().parents[2] / "templates"
+
+
+class TemplateTools(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.log = self.root / "calls"
+        self.env = dict(os.environ, HOME=str(self.root), NVM_DIR=str(self.root / ".nvm"),
+                        PATH=f"{self.bin}:/usr/bin:/bin", CALLS=str(self.log))
+
+    def shim(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/bash\nset -eu\n" + body)
+        path.chmod(0o755)
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def run_fdb(self, client="7.3.63-1", server="7.3.63", version="7.3.63", fail=False, banner=None):
+        self.shim("dpkg-query", 'printf "%s" "$CLIENT"\n')
+        self.shim("fdbserver", 'printf "%s\\n" "$BANNER"\n')
+        self.shim("curl", 'echo "$*" >> "$CALLS"\n[ "$FAIL" = no ] || exit 22\n')
+        self.shim("dpkg-deb", 'echo "$*" >> "$CALLS"\n')
+        self.shim("sudo", 'echo "$*" >> "$CALLS"\n')
+        env = dict(self.env, CLIENT=client, BANNER=banner if banner is not None else f"FoundationDB 7.3 (v{server})",
+                   OFFBOX_FDB_VERSION=version, FAIL="yes" if fail else "no")
+        script = (TEMPLATES / "tools/foundationdb.sh").read_text() + "\noffbox_foundationdb\n"
+        return subprocess.run(["/bin/bash", "-c", script], env=env, text=True, capture_output=True, timeout=10)
+
+    def test_matching_fdb_binaries_need_no_download_or_install(self):
+        result = self.run_fdb()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_server_banner_version_forms(self):
+        cases = (
+            ("FoundationDB 7.3 (v7.3.63)", False),
+            ("FoundationDB 7.3 (v7.3.63)\nsource version abc\nprotocol fdb00b073000000", False),
+            ("FoundationDB 7.3 (v7.3.62)", True),
+            ("FoundationDB 7.3 (v7.3.630)", True),
+            ("FoundationDB 7.3 (v7.3.63-prerelease)", True),
+            ("", True),
+        )
+        for banner, download in cases:
+            with self.subTest(banner=banner):
+                self.log.write_text("")
+                result = self.run_fdb(banner=banner)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(any("foundationdb-server_" in c for c in self.calls()), download)
+                self.assertFalse(any("foundationdb-clients_" in c for c in self.calls()))
+
+    def test_missing_fdb_installs_client_and_extracts_server_without_apt_installing_it(self):
+        result = self.run_fdb(client="", server="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = "\n".join(self.calls())
+        for package in ("clients", "server"):
+            self.assertIn(f"/7.3.63/foundationdb-{package}_7.3.63-1_amd64.deb", calls)
+        self.assertIn("apt-get install -y -qq", calls)
+        self.assertIn("/clients.deb", calls)
+        self.assertIn("-x ", calls)
+        self.assertIn("install -m 0755", calls)
+        self.assertIn("/usr/local/bin/fdbserver", calls)
+        self.assertFalse(any("apt-get" in c and "server.deb" in c for c in self.calls()))
+
+    def test_fdb_version_override_updates_mismatched_client_and_server(self):
+        result = self.run_fdb(version="7.3.64")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum("--retry 5" in c for c in self.calls()), 2)
+        self.assertIn("/7.3.64/foundationdb-clients_7.3.64-1_amd64.deb", "\n".join(self.calls()))
+
+    def test_fdb_download_failure_stops_setup(self):
+        result = self.run_fdb(client="", server="", fail=True)
+        self.assertEqual(result.returncode, 22)
+        self.assertFalse(any("apt-get" in c or "install -m" in c for c in self.calls()))
+
+    def run_node(self, nvm_exists):
+        nvm = 'nvm() { echo "nvm $*" >> "$CALLS"; }\n'
+        if nvm_exists:
+            (self.root / ".nvm").mkdir()
+            (self.root / ".nvm/nvm.sh").write_text(nvm)
+        self.shim("curl", 'echo "curl $*" >> "$CALLS"\n'
+                  'while [ "$1" != -o ]; do shift; done\nshift\n'
+                  f"printf '%s' {shlex.quote('printf %s ' + shlex.quote(nvm) + ' > "$NVM_DIR/nvm.sh"')} > \"$1\"\n")
+        for tool in ("corepack", "node", "npm"):
+            self.shim(tool, f'echo "{tool} $*" >> "$CALLS"\n')
+        script = (TEMPLATES / "crpko-node.sh").read_text().split("sudo apt-get update -qq", 1)[0]
+        return subprocess.run(["/bin/bash", "-c", script], env=self.env, text=True, capture_output=True, timeout=10)
+
+    def test_node_bootstraps_missing_nvm_and_provisions_all_three_majors(self):
+        result = self.run_node(False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(sum(c.startswith("curl ") for c in calls), 1)
+        for major in (20, 22, 24):
+            self.assertIn(f"nvm install {major}", calls)
+            self.assertIn(f"nvm use {major}", calls)
+        self.assertEqual(calls.count("corepack prepare pnpm@10 --activate"), 3)
+        self.assertEqual(calls[-1], "nvm use default")
+
+    def test_node_reuses_existing_nvm(self):
+        result = self.run_node(True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("curl ") for c in self.calls()))
+
+    def test_composed_recipes_have_their_required_tools_and_valid_shell(self):
+        with patch.object(bases, "TEMPLATES_DIR", TEMPLATES):
+            for name in common.TEMPLATES:
+                with self.subTest(name=name):
+                    body, _ = bases.recipe(name)
+                    self.assertIn("UV_LINK_MODE=copy", body)
+                    self.assertIn("zsh openjdk-21-jre-headless", body)
+                    self.assertEqual(body.count('FDB_VERSION="${OFFBOX_FDB_VERSION:-7.3.63}"'),
+                                     int(name in ("crpko-go", "crpko-harness")))
+                    result = subprocess.run(["/bin/bash", "-n"], input=body, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

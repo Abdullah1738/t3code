@@ -4,22 +4,36 @@
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NVM_DIR="$HOME/.nvm"
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  mkdir -p "$NVM_DIR"
+  nvm_install=$(mktemp)
+  curl -fsSL --retry 5 https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh -o "$nvm_install"
+  PROFILE=/dev/null bash "$nvm_install"
+  rm -f "$nvm_install"
+fi
 # shellcheck disable=SC1091
 . "$NVM_DIR/nvm.sh"
 
 NODE_MAJOR="${OFFBOX_NODE_MAJOR:-24}"
 nvm install "$NODE_MAJOR" >/dev/null
 nvm install 22 >/dev/null  # crpko_mobile_app and backoffice-frontend pin 22.13 via .nvmrc/engines; offbox picks per repo
+nvm install 20 >/dev/null
 nvm alias default "$NODE_MAJOR" >/dev/null
 nvm use default >/dev/null
 node --version
 npm --version
 
-corepack enable >/dev/null 2>&1 || true
+for major in 20 22 "$NODE_MAJOR"; do
+  nvm use "$major" >/dev/null
+  corepack enable
+  corepack prepare pnpm@10 --activate
+done
+nvm use default >/dev/null
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync watchman >/dev/null || \
-  sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync >/dev/null
+sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync zsh openjdk-21-jre-headless >/dev/null
+sudo apt-get install -y -qq --no-install-recommends watchman >/dev/null || true
+sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
 sudo apt-get clean
 
 sudo tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null <<'EOF'
