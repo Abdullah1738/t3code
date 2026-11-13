@@ -4,10 +4,17 @@ Live-captured 2026-10-10 on paid order **NNGAANNWEFJMZW8A** (Spinneys Dubai Mari
 1x Grenade Protein Shake White Chocolate 330ml, subtotal 20.50 + delivery 6.45 +
 service 4.50 = **AED 31.45 paid**). **No CVV, no 3DS** — payment rides the saved-card
 token bound into the checkout session by `edit-payment`; `place-order` is the single
-financial send. (Minutes needs paymentintent/complete + 3DS; NowNow does NOT.)
+financial send on that historical card path. The current 9546 path can require
+a pre-order CVV verification and 3DS; it remains unproven until one real order
+completes with exact capture and tracker evidence.
 
 CLI: `commerce order nownow --product-code P4372707388695472A --store-code SPNNYSAKBB \
---quantity 1 --label "…"` (+ `--resume-flow FLOW_UUID`, 24h window).
+--quantity 1 --prepare-only`. Quote `flow_age_seconds` and `reviewed_total_minor`
+when asking for purchase approval. After approval, repeat the basket with
+`--resume-flow FLOW_UUID --cvv-from-keychain --label "…"` and without
+`--prepare-only`. Financial sends require the same reviewed basket prepared
+within 60 minutes and a flow no older than 12 hours. A refusal says to
+re-run `--prepare-only`; an old flow needs a new preparation after cart cleanup.
 
 Module map: `commerce_nownow_order.py` (journalled lane) over
 `noon_nownow_checkout.py` (native transport). Fixture:
@@ -73,9 +80,14 @@ tests: `test/test_commerce_nownow_order.py`.
   means paid, exactly confirmed and tracked, not necessarily delivered.
 - Fee/address/manifest anomalies: STOP before place (`NOWNOW_*` codes); at most ONE
   place per flow (journal-enforced); financial retry never happens.
-- Review freshness ≤ 60s at place; flow resume ≤ 24h (`NOWNOW_FLOW_EXPIRED_24H`);
+- Review freshness ≤ 60s at place; financial flow age ≤ 12h and explicit prepare
+  age ≤ 60min (journal-enforced before reservation). Nonfinancial resume ≤ 24h (`NOWNOW_FLOW_EXPIRED_24H`);
   resume re-reads the live store session and refuses a foreign manifest — nothing
   is re-sent.
+- Resume, review retention and cleanup also require the session binding recorded
+  from the original create response. An adopted review cannot establish ownership.
+  Older preparations without that binding stop with
+  `NOWNOW_SESSION_OWNERSHIP_UNPROVEN`; no automatic backfill or cart deletion occurs.
 - 401/403 → `NOWNOW_AUTH_EXPIRED_NEEDS_APP_REBIND`; no re-login attempt exists.
 - No local order/campaign spending cap; durable reservations and no-retry
   financial ownership remain. The caller accounts for all uncertain liability.

@@ -100,6 +100,50 @@ class LogCatchupTests(Isolated):
         self.assertFalse(list(self.path.parent.glob('*.catchup.*')))
         self.assertEqual(self.invoke(wait=True)[0], 0)
 
+    def test_incomplete_step_warnings_never_repeat_a_recorded_zero(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        self.prefix(b'offbox step 1 rc=0: first\n')
+        for result in ('complete', 'caught_up', 'n/a', 'incomplete:history unavailable', 'incomplete:timeout'):
+            for reader in ('logs', 'logs-follow', 'wait'):
+                with self.subTest(result=result, reader=reader):
+                    self.state('done', 0)
+                    with patch.object(api, 'BACKEND', 'server'), \
+                            patch.object(misc, '_catch_up_log', return_value=result):
+                        for _ in range(2):
+                            code, out, err = self.invoke(wait=reader == 'wait', follow=reader == 'logs-follow')
+                            self.assertEqual(code, 90)
+                            self.assertIn('steps incomplete: got 1 of 2 step results', err)
+                            self.assertNotIn('done exit=0', out + err)
+                            self.assertNotIn('remote exit 0', out + err)
+
+    def test_step_history_timeout_never_describes_a_recorded_zero_as_validated(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        for complete_prefix in (False, True):
+            with self.subTest(complete_prefix=complete_prefix):
+                self.state('done', 0)
+                data = b'offbox step 1 rc=0: first\n'
+                if complete_prefix:
+                    data += b'offbox step 2 rc=0: second\n'
+                self.prefix(data)
+                clock = [1000]
+                def timeout(*args, **kwargs):
+                    clock[0] = 1002
+                    return 'incomplete:timeout'
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(api, 'BACKEND', 'server'), \
+                        patch.object(misc, 'now', side_effect=lambda: clock[0]), \
+                        patch.object(misc, '_catch_up_log', side_effect=timeout), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with self.assertRaises(OffboxError) as raised:
+                        misc.wait('run-x', 1)
+                self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                self.assertIn('steps incomplete:', err.getvalue())
+                report = out.getvalue() + err.getvalue() + str(raised.exception)
+                self.assertNotIn('done exit=0', report)
+                self.assertNotIn('remote exit 0', report)
+
     def test_no_checkpoint_does_not_guess_stream_offsets(self):
         common.offsets_path(self.path).unlink()
         code, out, err = self.invoke()

@@ -195,7 +195,7 @@ class StaleContainersTests(Isolated):
         self.state.write_text(json.dumps([item('a'),item('b','leaked')]))
         def ssh(box,command,timeout):
             return subprocess.run(['bash','-c',command],env=self.env,capture_output=True,timeout=timeout)
-        with patch.object(containers.ssh_sync,'ssh',side_effect=ssh), patch.object(runs,'db',return_value=self.con), patch.object(
+        with patch.object(containers.ssh_sync,'ssh',side_effect=ssh), patch.object(
                 runs.lease,'touch'), patch.object(runs.lease,'idle_ttl'):
             runs.finish('r',143,'killed',catch_up=False)
         self.assertTrue(self.con.execute("SELECT 1 FROM events WHERE kind='stale_containers_left'").fetchone())

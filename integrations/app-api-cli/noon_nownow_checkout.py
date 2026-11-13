@@ -342,7 +342,9 @@ class NowNowCheckout:
             except Exception as exc:
                 if str(exc) == 'OWNER_GO_REQUIRED':
                     raise NowNowError('OWNER_GO_REQUIRED') from None
-                raise NowNowError('SEND_RESERVATION_FAILED') from None
+                # The caller can recover its own typed denial without exposing
+                # arbitrary callback text or weakening the transport's error.
+                raise NowNowError('SEND_RESERVATION_FAILED') from exc
             require(reserved is True, 'SEND_RESERVATION_DENIED')
             sent = self._mutation_fenced = True
         observations = []

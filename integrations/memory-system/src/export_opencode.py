@@ -136,9 +136,13 @@ class Exporter:
                 CREATE TABLE IF NOT EXISTS session_inbox(id TEXT PRIMARY KEY,session_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS session_pending(id TEXT PRIMARY KEY,session_id TEXT NOT NULL);
             ''')
-            identity = f'{self.source_path}:{self.source_path.stat().st_dev}:{self.source_path.stat().st_ino}'
-            if self.meta('source') not in (None, identity):
-                raise RuntimeError('native source replaced; rebuild disposable export')
+            identity = self.source_identity()
+            stored = self.meta('source')
+            if stored not in (None, identity):
+                legacy = stored.rsplit(':', 2)
+                if (len(legacy) != 3 or not legacy[1].isdecimal()
+                        or json.dumps([legacy[0], legacy[2]]) != identity):
+                    raise RuntimeError('native source replaced; rebuild disposable export')
             self.setmeta('source', identity)
             self.identity = identity
             self.schema_version = self.src.execute('PRAGMA schema_version').fetchone()[0]
@@ -188,6 +192,11 @@ class Exporter:
     def meta(self, key):
         row = self.out.execute('SELECT value FROM ardud_readonly_meta WHERE key=?', (key,)).fetchone()
         return row[0] if row else None
+
+    def source_identity(self):
+        # macOS device numbers depend on mount order, unlike the file's inode.
+        # JSON keeps paths ending in :<digits> distinct from legacy device stamps.
+        return json.dumps([str(self.source_path), str(self.source_path.stat().st_ino)])
 
     @staticmethod
     def file_identity(path):
@@ -246,7 +255,7 @@ class Exporter:
 
     def begin_cycle(self):
         self.check_destination()
-        identity = f'{self.source_path}:{self.source_path.stat().st_dev}:{self.source_path.stat().st_ino}'
+        identity = self.source_identity()
         if identity != self.identity:
             raise RuntimeError('native source replaced; reopen exporter')
         if self.read('PRAGMA schema_version')[0][0] != self.schema_version:
@@ -557,7 +566,9 @@ def main():
         try:
             run(args, watchdog)
         except Exception as exc:
-            print(f'native export unavailable: {type(exc).__name__}', file=sys.stderr, flush=True)
+            # Our RuntimeErrors are fixed reasons; SQLite/decoding errors can contain row data.
+            detail = f': {exc}' if type(exc) is RuntimeError else ''
+            print(f'native export unavailable: {type(exc).__name__}{detail}', file=sys.stderr, flush=True)
             sys.exit(1)
 
 

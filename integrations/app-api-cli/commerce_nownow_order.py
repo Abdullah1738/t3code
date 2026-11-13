@@ -235,6 +235,7 @@ class NowNowOrderFlow:
         self.expected = None
         self.operation_name = None
         self.session_code = None
+        self.owned_session_code = None
         self.current = None
         self.review = None
         self.order = None
@@ -268,7 +269,7 @@ class NowNowOrderFlow:
             _fail('NOWNOW_REQUEST_NOT_BOUND')
         journal.require_account_available('noon', self.account_hash,
                                           flow_id=self.flow_id if self.opened else None)
-        kinds = {'cart_get': 'quote', 'cart_create': 'cart', 'product_edit': 'cart',
+        kinds = {'cart_get': 'quote', 'cart_create': 'cart', 'cart_delete': 'cart', 'product_edit': 'cart',
                   'cart_validate': 'quote', 'payment': 'selection',
                   'delivery_preference': 'instructions', 'instructions': 'instructions',
                   'payment_subscription': 'preauthorize', 'payment_complete': 'prepay',
@@ -373,6 +374,8 @@ class NowNowOrderFlow:
                                          modifiers=first['modifiers'],
                                          before_send=self._before, timeout=timeout)
         self.session_code = result.projection['session_code']
+        journal.bind_nownow_session(self.flow_id, journal.digest({'session': self.session_code}))
+        self.owned_session_code = self.session_code
         self.current = result
         return result.projection
 
@@ -613,7 +616,7 @@ class NowNowOrderFlow:
         retain(self)
 
     def prepare_payment(self, cvv_loader=None):
-        from commerce_preorder import IntentVault, payment_outcome
+        from commerce_preorder import IntentVault, payment_outcome, observe_zero_amounts
         from noon_cvv import encrypt
         from noon_checkout import fingerprint
         row = self.current.wire['data']
@@ -648,6 +651,7 @@ class NowNowOrderFlow:
         record_approval(self.flow_id,result.wire)
         outcome = payment_outcome(result.projection)
         journal.observe(self.flow_id, 'payment_complete', outcome=outcome, evidence_hash=journal.digest(result.projection))
+        observe_zero_amounts(self.flow_id, 'payment_complete', result.wire)
         if outcome != 'PREORDER_PAYMENT_CONFIRMED':
             raise journal.PaymentError('NOWNOW_BANK_APPROVAL_OR_PAYMENT_PENDING', {
                 'flow_id': self.flow_id, 'financial_retry': False, 'amount_minor': self.review['payable_minor'],
@@ -707,6 +711,8 @@ class NowNowOrderFlow:
         state = journal.inspect(flow_id)
         if binding['app'] != 'noon' or binding['vertical'] != 'nownow':
             _fail('NOWNOW_FLOW_REQUIRED')
+        if any(x['name'] == 'cart_delete' for x in state['operations']):
+            _fail('NOWNOW_STOP_CLEANUP_REQUIRED')
         if state['state'] != 'ACTIVE' or state['order_id'] \
                 or any(x['kind'] == 'place' for x in state['operations']) \
                 or any(x['state'] != 'OBSERVED' for x in state['operations']):
@@ -742,6 +748,7 @@ class NowNowOrderFlow:
         self.card = None
         self.receipt_store = receipts.load(**binding)
         self.pending_cookies = []
+        self.owned_session_code = None
         self.client = native.NowNowCheckout(
             AccountHome('nownow', self.account_hash, self.address_hash, time.time()),
             header_provider=self._headers, request=request,
@@ -751,11 +758,13 @@ class NowNowOrderFlow:
         self._expect('cart_get', body)
         readback = self.client.get_cart(self.store_code, before_send=self._before, timeout=25)
         row = readback.wire.get('data') or {}
+        journal.require_nownow_session(flow_id, journal.digest({'session': readback.projection.get('session_code')}))
         expected = sorted((item['product_code'], item['quantity']) for item in self.items)
         if readback.projection.get('empty') \
                 or _wire_manifest(row.get('products')) != expected:
             _fail('NOWNOW_RESUME_MANIFEST_MISMATCH')
         self.session_code = readback.projection['session_code']
+        self.owned_session_code = self.session_code
         self.current = native.Snapshot({'data': row}, readback.projection, time.time())
         self.card = saved_card(self.client, timeout=25)
         corroborate_token(self.client, self.card, timeout=25)
@@ -763,7 +772,7 @@ class NowNowOrderFlow:
         register(self.flow_id, 'nownow', self.account_hash, self.items)
         return self
 
-    def prepare_only(self, *, timeout=25):
+    def prepare_only(self, *, timeout=25, record=True):
         """Build and review the exact basket, then STOP before any financial send.
 
         Fresh flow: full guard (attributed distinct orders, no foreign store cart) ->
@@ -785,6 +794,7 @@ class NowNowOrderFlow:
                                             timeout=timeout)
             if readback.projection.get('empty'):
                 _fail('NOWNOW_SESSION_LOST_BEFORE_PLACE')
+            journal.require_nownow_session(self.flow_id, journal.digest({'session': readback.projection['session_code']}))
             self.session_code = readback.projection['session_code']
             self.current = readback
             expected = sorted((item['product_code'], item['quantity']) for item in self.items)
@@ -810,8 +820,59 @@ class NowNowOrderFlow:
         self.guard_validated(timeout=timeout)
         review = self.review_final(timeout=timeout)
         self.retain_review()
+        gate = journal.record_nownow_prepared(self.flow_id, self.review['digest']) if record else {}
         return {'flow_id': self.flow_id, 'prepared_only': True, 'review': review,
+                **gate, 'reviewed_total_minor': self.review['payable_minor'],
                 'readback': dict(self.current.projection)}
 
     def consumed(self):
         return {x['name'] for x in journal.inspect(self.flow_id)['operations']}
+
+    def stop_unsent(self):
+        """Clear only this run's observed, unplaced cart; ambiguity keeps its fence."""
+        if not self.opened:
+            return {'cart_checked': False, 'reason': 'NOWNOW_NO_OWNED_CART'}
+        state = journal.inspect(self.flow_id)
+        if (state['state'] != 'ACTIVE' or state['reserved_minor'] or state['order_id']
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('place', 'payment', 'preauthorize', 'prepay')
+                       for o in state['operations'])):
+            return {'cart_checked': False, 'reason': 'NOWNOW_STOP_RECONCILIATION_REQUIRED'}
+        if not getattr(self, 'owned_session_code', None) or self.session_code != self.owned_session_code:
+            return {'cart_checked': False, 'reason': 'NOWNOW_STOP_OWNERSHIP_UNPROVEN'}
+        journal.require_nownow_session(self.flow_id, journal.digest({'session': self.session_code}))
+        journal.require_nownow_cleanup_available(self.account_hash, flow_id=self.flow_id)
+        deleted = 'cart_delete' in self.consumed()
+        body = {'storeCode': self.store_code}
+        self._expect('cart_get', body)
+        read = self.client.get_cart(self.store_code, before_send=self._before)
+        if read.projection.get('empty') is not True:
+            native.require(not deleted, 'NOWNOW_STOP_CLEAR_UNVERIFIED')
+            row = read.wire['data']
+            from noon_checkout import fingerprint
+            native.require(row.get('checkoutSessionCode') == self.session_code
+                and (row.get('storeInfo') or {}).get('storeCode') == self.store_code
+                and row.get('addressCode') == self.snapshot.read_headers()['x-addresscode']
+                and fingerprint(row.get('customerCode')) == self.account_hash
+                and _wire_manifest(row.get('products')) == sorted((i['product_code'], i['quantity']) for i in self.items)
+                and all(row.get(k) is None for k in ('order', 'orderNr', 'order_nr', 'orderId'))
+                and all(not i.get('modifiers') and not i.get('notes') for i in row['products']),
+                'NOWNOW_STOP_CART_CHANGED')
+            self.guard_active_orders()
+            from commerce_nownow_cleanup import retain_stopped_preparation
+            retain_stopped_preparation(self)
+            self._expect('cart_delete', {'sessionCode': self.session_code})
+            self.client.delete_cart(self.session_code, before_send=self._before)
+            deleted = True
+            self._expect('cart_get', body)
+            read = self.client.get_cart(self.store_code, before_send=self._before)
+        native.require(read.wire.get('data', 'missing') is None and read.projection.get('empty') is True,
+                       'NOWNOW_STOP_CLEAR_UNVERIFIED')
+        recent = self.client.recent_carts().projection['carts']
+        native.require(not any(c.get('store_code') == self.store_code
+                               or c.get('session_code') == self.owned_session_code for c in recent),
+                       'NOWNOW_STOP_CLEAR_UNVERIFIED')
+        if deleted:
+            journal.observe(self.flow_id, 'cart_delete', outcome='CART_READBACK',
+                            evidence_hash=journal.digest({'empty': True, 'recent': recent}))
+        journal.abandon(self.flow_id)
+        return {'cart_checked': True, 'cart_empty': True, 'state': 'RELEASED', 'financial_send': False}

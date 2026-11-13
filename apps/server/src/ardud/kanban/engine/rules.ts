@@ -11,7 +11,6 @@ import {
   kanbanHeldUpBy,
   kanbanBoardClock,
   kanbanPickOrder,
-  kanbanRetryNotBefore,
   kanbanSchedule,
   kanbanScriptStep,
   kanbanDeciding,
@@ -26,6 +25,7 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { heldForRetry } from "./retries.ts";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -562,10 +562,6 @@ export function planDispatch(
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const clock = nowMs ?? kanbanBoardClock(cards);
-  const retryHeld = (card: KanbanCard) => {
-    const notBefore = kanbanRetryNotBefore(card);
-    return notBefore !== null && notBefore > clock;
-  };
   const waiting = cards.filter(
     (card) =>
       !attempted.has(card.id) &&
@@ -574,7 +570,7 @@ export function planDispatch(
       card.activeThreadId === null &&
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
-      !retryHeld(card) &&
+      !heldForRetry(card, clock) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
       !kanbanWaitsOnEvaluator(card) &&

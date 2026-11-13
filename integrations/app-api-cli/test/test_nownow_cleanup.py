@@ -46,6 +46,11 @@ class CleanupTests(unittest.TestCase):
     def clear(self, request=None):
         return cleanup.clear_cart(self.flow.flow_id, auth=f.FakeAuth(), request=request or self.request)
 
+    def assert_cleanup_blocked_but_new_orders_allowed(self):
+        self.assertTrue(j.require_account_available('noon', self.flow.account_hash))
+        with self.assertRaisesRegex(j.JournalError, 'NOWNOW_CLEAR_OPEN_FLOW'):
+            j.require_nownow_cleanup_available(self.flow.account_hash)
+
     def test_clear_exact_session_and_independent_readback(self):
         result = self.clear()
         self.assertTrue(result['cart_empty']); self.assertFalse(result['financial_send'])
@@ -74,7 +79,7 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(j.JournalError, 'CLEAR_EMPTY_READBACK_REQUIRED'): j.abandon(cleanup_id)
         with self.assertRaises(Exception): self.clear(lost)
         self.assertEqual(self.deletes, ['cart_delete'])
-        with self.assertRaises(j.JournalError): j.require_account_available('noon', self.flow.account_hash)
+        self.assert_cleanup_blocked_but_new_orders_allowed()
 
     def test_ack_without_empty_readback_stays_blocked(self):
         def unchanged(*a, **kw):
@@ -83,7 +88,7 @@ class CleanupTests(unittest.TestCase):
             return result
         with self.assertRaises(cleanup.CleanupUnverified): self.clear(unchanged)
         with self.assertRaises(Exception): self.clear()
-        with self.assertRaises(j.JournalError): j.require_account_available('noon', self.flow.account_hash)
+        self.assert_cleanup_blocked_but_new_orders_allowed()
         with j._db() as db:
             cleanup_id = db.execute("SELECT flow_id FROM operations WHERE name='cart_delete'").fetchone()[0]
         with self.assertRaisesRegex(j.JournalError, 'CLEAR_EMPTY_READBACK_REQUIRED'): j.abandon(cleanup_id)
@@ -112,7 +117,21 @@ class CleanupTests(unittest.TestCase):
             self.wire.responses['home'] = {'data': {}}
             return result
         with self.assertRaises(cleanup.CleanupUnverified): self.clear(changed)
-        with self.assertRaises(j.JournalError): j.require_account_available('noon', self.flow.account_hash)
+        self.assert_cleanup_blocked_but_new_orders_allowed()
+
+    def test_new_flow_at_delete_boundary_prevents_delete(self):
+        original = j.consume
+        other = '10000000-0000-4000-8000-000000000099'
+        def consume(flow_id, operation, **kw):
+            if operation == 'cart_delete':
+                j.open_flow(flow_id=other, app='noon', vertical='food',
+                            account_hash=self.flow.account_hash, scope_hash='a'*64)
+            return original(flow_id, operation, **kw)
+        with patch.object(j, 'consume', side_effect=consume), self.assertRaises(Exception):
+            self.clear()
+        self.assertEqual(self.deletes, [])
+        self.assertEqual(j.inspect(other)['state'], 'ACTIVE')
+        self.assertTrue(j.require_account_available('noon', self.flow.account_hash))
 
     def test_final_reader_receives_retained_home(self):
         self.clear()

@@ -6,6 +6,7 @@ import codecs
 import contextlib
 import json
 import os
+import sqlite3
 import re
 import signal
 import shlex
@@ -19,7 +20,7 @@ from time import monotonic, sleep
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
-                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, log, month_key, now,
                      offsets_path, out, read_json, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
@@ -87,7 +88,7 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
 
 def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     con = db()
-    capacity.schema(con)
+    capacity.schema(con, import_legacy=False)
     if show_all:
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') ORDER BY last_used_at DESC").fetchall()
     else:
@@ -383,10 +384,20 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
             + f". The box may still be stopping it: re-run `offbox kill {rid}` (safe to repeat), "
               f"or check `offbox logs {rid}`.")
         return 1
-    con = db()
-    con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
-    con.commit()
     finish(rid, 143, "killed", catch_up=False)
+    con = None
+    try:
+        con = db()
+        con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
+        con.commit()
+    except sqlite3.Error as error:
+        message = (f"{rid}: remote termination confirmed; local start-marker cleanup failed ({error}). "
+                   f"Read/repair its result with: offbox wait {rid}; do not rerun the command")
+        say("warning: " + message)
+        log(message)
+    finally:
+        if con:
+            con.close()
     print(f"killed run {rid} (process {pid} on box {box}). `offbox release [--delete]` works now."
           + (f" (kill request failed but boat reports the process gone: {kill_err})" if kill_err else ""))
     return 0
@@ -522,7 +533,16 @@ def _run_row(run_id: str):
     r = con.execute("SELECT * FROM runs WHERE run_id=? OR run_id LIKE ?", (run_id, f"%{run_id}")).fetchone()
     if not r:
         raise OffboxError(f"no run {run_id}", code=2)
-    return r
+    _require_my_run(r)
+    from .runs import finish, restore_run_state, terminal_result
+    from . import start_check
+    recovered = restore_run_state(r)
+    _require_my_run(recovered)
+    if terminal_result(recovered) and (r['status'] in ('starting','running') or
+                                     (r['exit_code'] is None and (r['status'] == 'lost' or
+                                      (r['status'] == 'infra' and start_check.recovery_marked(con, r))))):
+        finish(r['run_id'], recovered['exit_code'], recovered['status'], catch_up=False)
+    return recovered
 
 
 def _require_my_run(r) -> None:
@@ -723,8 +743,12 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
 
 def _catch_up_finished(con, run_id, budget: float = 10) -> None:
     """Best effort under the maintenance caller's box lock; history errors cannot undo settlement."""
+    from .runs import planned_steps
     try:
         r = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        # Step settlement fetched and validated its output before commit. Replacing it here could invalidate the exit.
+        if planned_steps(r):
+            return
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
@@ -766,11 +790,23 @@ def _refresh_running_ttl(r, until=None) -> None:
         pass
 
 
+def _validated_step_row(r, code):
+    from .runs import planned_steps
+    if not planned_steps(r):
+        return r
+    status = r['status']
+    if code is None:
+        status = 'infra'
+    elif status in ('done', 'failed', 'infra', 'lost'):
+        status = 'done' if code == 0 else 'failed'
+    return dict(r, status=status, exit_code=code)
+
+
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
     p = LOGS_DIR / f"{r['run_id']}.log"
-    if r['status'] == 'lost' and r['box_id']:
+    if r['status'] == 'lost' and r['exit_code'] is None and r['box_id']:
         if do_follow:
             return _wait_locked(r, echo=True)
         from .runs import reconcile_lost
@@ -800,7 +836,11 @@ def logs(run_id: str, do_follow: bool) -> int:
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     _tail(p, 0, True)
-    _incomplete_log(r, result)
+    from .runs import settled_steps_code, planned_steps
+    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    _incomplete_log(_validated_step_row(r, code), result)
+    if planned_steps(r) and code is None:
+        return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
         if result in ('complete', 'caught_up'):
             say(f"no output recorded for {r['run_id']} (server history checked)")
@@ -813,35 +853,47 @@ def wait(run_id: str, timeout: float | None) -> int:
     _require_my_run(r)
     from . import start_check
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
-    if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and not r['box_id']):
+    if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
         return _settled(r, until=None if timeout is None else now() + timeout)
     return _wait_locked(r, echo=False, timeout=timeout)
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
-    from .runs import repo_setup_failed
+    from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
+    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    checked = _validated_step_row(r, code)
     if until is not None and now() >= until:
-        _incomplete_log(r, result)
-        raise _wait_timeout(r)
+        _incomplete_log(checked, result)
+        raise _wait_timeout(checked)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
     if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
         say(f"{r['run_id']} settled with no output on record")
     else:
-        _incomplete_log(r, result)
+        _incomplete_log(checked, result)
     if repo_setup_failed(r['exit_code'], LOGS_DIR / f"{r['run_id']}.log"):
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
-    _report_deps_hint(r, r['exit_code'], LOGS_DIR / f"{r['run_id']}.log")
-    out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
-    if r['exit_code'] is None and r['box_id']:
+    _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log")
+    status = checked['status']
+    if planned_steps(r) and code is not None and status in ('done', 'failed', 'infra', 'lost'):
+        if (status, code) != (r['status'], r['exit_code']):
+            con = db()
+            try:
+                con.execute("UPDATE runs SET status=?,exit_code=? WHERE run_id=? "
+                            "AND status IN ('done','failed','infra','lost')", (status, code, r['run_id']))
+                con.commit()
+            finally:
+                con.close()
+    out(f"{r['run_id']}: {status} exit={code}")
+    if code is None and r['box_id']:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
-    return r["exit_code"] if r["exit_code"] is not None else 90
+    return code if code is not None else 90
 
 
 def _tail(path, pos: int, echo: bool, limit: int | None = None) -> int:
@@ -899,6 +951,8 @@ def _wait_locked(r, echo, timeout=None):
     from .runs import _ended, reconcile_lost
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
+    if r['status'] == 'lost' and r['exit_code'] is not None:
+        return _settled(r, echo=echo, until=deadline)
     from . import start_check
     if start_check.recovery_marked(db(), r) and not start_check.api_pid(db(), r):
         r = _wait_start_receipt(r, deadline)
@@ -952,8 +1006,9 @@ def _wait_locked(r, echo, timeout=None):
         if ck:
             pos = _tail(log_path, pos, echo, ck["logBytes"])
         cur = _run_row(r['run_id'])
-        if cur['status'] not in ('starting', 'running', 'lost') or (cur['status'] == 'lost' and db().execute(
-                'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone()):
+        if cur['status'] not in ('starting', 'running', 'lost') or (cur['status'] == 'lost' and (
+                cur['exit_code'] is not None or db().execute(
+                    'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone())):
             # Settled: nothing will be replayed, so drain the whole rest of the log.
             return _settled(cur, echo=echo, pos=pos, until=deadline)
         if deadline is not None and now() >= deadline:
@@ -1000,10 +1055,11 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
-    from .runs import _status_code
+    from .runs import _status_code, settled_steps_code
     code, how = _status_code(st), "boat's process status"
     if code is None:
         code, how = _recover_by(r, log_path, deadline)
+    code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     _tail(log_path, pos, echo)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
@@ -1017,12 +1073,12 @@ def _recover_by(r, log_path, deadline):
     """recover_lost_exit for a wait: the box read gets only what is left of the caller's deadline (20 s without one),
     and an answer that arrives at or past the deadline is not accepted, so nothing is published or settled from it
     (--timeout is 124 and the run is left alone)."""
-    from .runs import recover_lost_exit
+    from .runs import recover_lost_exit, planned_steps
     budget = 20.0 if deadline is None else deadline - now()
     if budget <= 0:
         raise _wait_timeout(r)
     try:
-        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, planned_steps(r), timeout=min(20.0, budget))
     except OffboxError:
         if deadline is not None and now() >= deadline:
             raise _wait_timeout(r) from None
@@ -1227,7 +1283,10 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
                       mirror_keep=mirror_keep, receipt_locked=True)
     except Interrupted as e:
         # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
-        finish(r["run_id"], e.code, "interrupted")
+        code = finish(r["run_id"], e.code, "interrupted")
+        if code is None:
+            raise OffboxError(f"{r['run_id']}: steps incomplete after the server restart; remote exit unknown",
+                              code=EXIT_INFRA, started=True) from None
         raise
     if code is None:
         code, how = _recover_by(r, log_path, until)
@@ -1248,7 +1307,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
-                       settle_box_wedged, wedged_message)
+                       settle_box_wedged, wedged_message, settled_steps_code)
     try:
         delivered = os.path.getsize(log_path)
     except OSError:
@@ -1259,36 +1318,45 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
             _tail(log_path, delivered, True)
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
-    con = db()
-    with contextlib.nullcontext() if until is None else api.budget(max(0, until-now())):
-        wedged = settle_box_wedged(con, r, code)
-    if wedged:
-        say(wedged_message(r['box_id'], *wedged))
-        return EXIT_INFRA
-    pulls = json.loads(r["pulls"] or "[]")
-    if pulls:
+    from .runs import state_warning
+    quarantine_pending = code == 97
+    try:
         con = db()
-        row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
-                               (r["run_id"],)).fetchone())
-        do_pulls(r["box_id"], row, pulls, until=until)
-    if until is not None and now() >= until:
-        raise _wait_timeout(r)
-    finish(r['run_id'], code, until=until)
-    if dict(r).get('mode') == 'bg' and not _has_data(log_path):
-        settled = _run_row(r['run_id'])
-        result = _catch_up_log(settled, budget=None if until is None else max(0, until-now()),
-                               lock_wait=LOG_READ_WAIT_S)
-        if result in ('complete', 'caught_up') and not _has_data(log_path):
-            say(f"{r['run_id']} settled with no output on record")
-        else:
-            _incomplete_log(settled, result)
-    if until is not None and now() >= until:
-        raise _wait_timeout(_run_row(r['run_id']))
-    # finish can fill a detached run's log after its stream ended. Only these new bytes remain undelivered.
-    if echo:
-        _tail(log_path, delivered, True)
-    go_std_glitch(r["box_id"], r["run_id"], log_path, code)
-    _report_deps_hint(r, code, log_path)
+        with contextlib.nullcontext() if until is None else api.budget(max(0, until-now())):
+            wedged = settle_box_wedged(con, r, code)
+        quarantine_pending = False
+        if wedged:
+            say(wedged_message(r['box_id'], *wedged))
+            return EXIT_INFRA
+        pulls = json.loads(r["pulls"] or "[]")
+        if pulls:
+            con = db()
+            row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
+                                   (r["run_id"],)).fetchone())
+            do_pulls(r["box_id"], row, pulls, until=until)
+        if until is not None and now() >= until:
+            raise _wait_timeout(r)
+        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
+        code = finish(r['run_id'], code, until=until, report=True, run=r)
+        if dict(r).get('mode') == 'bg' and not _has_data(log_path):
+            settled = _run_row(r['run_id'])
+            result = _catch_up_log(settled, budget=None if until is None else max(0, until-now()),
+                                   lock_wait=LOG_READ_WAIT_S)
+            if result in ('complete', 'caught_up') and not _has_data(log_path):
+                say(f"{r['run_id']} settled with no output on record")
+            else:
+                _incomplete_log(settled, result)
+        if until is not None and now() >= until:
+            raise _wait_timeout(_run_row(r['run_id']))
+        # finish can fill a detached run's log after its stream ended. Only these new bytes remain undelivered.
+        if echo:
+            _tail(log_path, delivered, True)
+        go_std_glitch(r["box_id"], r["run_id"], log_path, code)
+        _report_deps_hint(r, code, log_path)
+    except sqlite3.Error as error:
+        if not quarantine_pending:
+            code = finish(r['run_id'], code, until=until, run=r)
+        state_warning(r['run_id'], code, error)
     out(f"{r['run_id']}: exit={code}")
     if code is None:
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
@@ -1299,7 +1367,7 @@ def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
     from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
-        return r['exit_code'] if r['exit_code'] is not None else 90
+        return _settled(r, echo=echo, locked=True, until=until)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
     return _finalize(r, code, log_path, until=until, echo=echo)

@@ -2217,11 +2217,14 @@ describe("OrchestratorMcpService provider resolution", () => {
     { mode: "wait", legacy: false, stillRunning: true },
     { mode: "async", legacy: true },
     { mode: "wait", legacy: true },
+    { mode: "async", legacy: false, recoveryTimeout: true },
+    { mode: "async", legacy: true, recoveryTimeout: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning)",
+    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
+      const recoveryTimeout = "recoveryTimeout" in testCase;
       return Effect.scoped(
         Effect.gen(function* () {
           const driver = ProviderDriverKind.make("codex");
@@ -2257,12 +2260,26 @@ describe("OrchestratorMcpService provider resolution", () => {
           const firstWatch = yield* Deferred.make<void>();
           const secondWatch = yield* Deferred.make<void>();
           const watchCount = yield* Ref.make(0);
+          const recoveryEntered = yield* Deferred.make<void>();
+          const recoveryRelease = yield* Deferred.make<void>();
+          const recoveryStopped = yield* Deferred.make<void>();
+          let blockRecovery = false;
           const threadsWithWatchSignal = Layer.effect(
             ThreadManagementService.ThreadManagementService,
             Effect.gen(function* () {
               const real = yield* ThreadManagementService.ThreadManagementService;
               return {
                 ...real,
+                getThreadRecords: (threadId, fields, filter, options) =>
+                  Effect.gen(function* () {
+                    if (blockRecovery && filter?.messageRoles?.includes("user")) {
+                      yield* Deferred.succeed(recoveryEntered, undefined);
+                      yield* Deferred.await(recoveryRelease).pipe(
+                        Effect.ensuring(Deferred.succeed(recoveryStopped, undefined)),
+                      );
+                    }
+                    return yield* real.getThreadRecords(threadId, fields, filter, options);
+                  }),
                 getThreadEventSequence: (threadId) =>
                   real
                     .getThreadEventSequence(threadId)
@@ -2434,9 +2451,35 @@ describe("OrchestratorMcpService provider resolution", () => {
                 creationSource: "mcp",
               });
             }
-            const sent = yield* service.sendToThread(scope, send);
+            if (recoveryTimeout) {
+              blockRecovery = true;
+              const waiting = yield* service
+                .sendToThread(scope, send)
+                .pipe(Effect.result, Effect.forkScoped);
+              yield* Deferred.await(recoveryEntered);
+              yield* TestClock.adjust("15 seconds");
+              const timedOut = yield* Fiber.join(waiting);
+              assert.equal(timedOut._tag, "Failure");
+              if (timedOut._tag === "Failure") {
+                assert.equal(timedOut.failure.code, "send_timeout");
+                assert.include(timedOut.failure.message, send.clientRequestId);
+              }
+              yield* Deferred.await(recoveryStopped);
+              blockRecovery = false;
+              yield* Deferred.succeed(recoveryRelease, undefined);
+              const afterTimeout = yield* orchestrator.getThreadProjection(first.childThreadId);
+              assert.equal(
+                afterTimeout.messages.filter((message) => message.text === send.message).length,
+                legacy ? 1 : 0,
+              );
+              assert.equal(
+                afterTimeout.runs.length,
+                childBeforeSend.runs.length + (legacy ? 1 : 0),
+              );
+            }
+            const sent = yield* service.sendToThread(recoveryTimeout ? renewedScope : scope, send);
             const afterSend = yield* orchestrator.getThreadProjection(first.childThreadId);
-            const resent = yield* service.sendToThread(renewedScope, send);
+            const resent = yield* service.sendToThread(recoveryTimeout ? scope : renewedScope, send);
             assert.equal(resent.messageId, sent.messageId);
             if (legacy)
               assert.equal(
@@ -2447,6 +2490,10 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.equal(child.runs.length, afterSend.runs.length);
             assert.equal(
               child.messages.filter((message) => message.id === sent.messageId).length,
+              1,
+            );
+            assert.equal(
+              child.messages.filter((message) => message.text === send.message).length,
               1,
             );
           }).pipe(Effect.provide(layerTest));

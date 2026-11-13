@@ -304,6 +304,7 @@ class ProcessNamespace(Isolated):
         self.seed(pid=4242, wrapper=None)
         self.con.execute("INSERT INTO runs(run_id,process_id,command_id) VALUES ('run-api',1001,'cmd-api')")
         self.con.execute('ALTER TABLE runs DROP COLUMN wrapper_pid')
+        self.con.execute('PRAGMA user_version=2')
         self.con.commit()
         with contextlib.closing(common.db()) as upgraded:
             self.assertIn('wrapper_pid', {r[1] for r in upgraded.execute('PRAGMA table_info(runs)')})

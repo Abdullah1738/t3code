@@ -81,6 +81,20 @@ class StepScriptTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn('offbox step 2 rc=0', err)
 
+    def test_step_killing_its_shell_cannot_pass(self):
+        for sig in ('TERM', 'KILL'):
+            with self.subTest(sig=sig):
+                p = subprocess.run(['bash', '-c', runs.steps_block([
+                    f"bash -c 'kill -{sig} \"$PPID\"'", 'echo should-not-run'])],
+                    capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertNotIn('offbox step 2 rc=', p.stderr)
+
+    def test_failed_result_write_cannot_pass(self):
+        p = subprocess.run(['bash', '-c', 'exec 2>&-; ' + runs.steps_block(['true'])],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        self.assertNotEqual(p.returncode, 0)
+
 
 class MissingDepsTests(unittest.TestCase):
 
@@ -831,8 +845,23 @@ class SummaryAndHintTests(unittest.TestCase):
         s = runs.steps_summary([(1, 0), (2, 1), (3, 0), (4, 2)], 4)
         self.assertEqual(s, 'offbox steps: 2 ok, 2 failed (step 2 rc=1, step 4 rc=2)')
 
+    def test_completeness_requires_each_planned_number(self):
+        cases = [([], 2), ([(1, 0), (1, 0)], 1), ([(0, 0), (3, 0)], 2),
+                 ([(1, 0), (3, 0)], 1), ([(2, 0), (1, 0)], 0)]
+        for results, missing in cases:
+            with self.subTest(results=results):
+                self.assertEqual(runs.missing_step_count(results, 2), missing)
+
     def test_summary_mentions_steps_not_run(self):
         self.assertEqual(runs.steps_summary([(1, 0)], 3), 'offbox steps: 1 ok, 0 failed, 2 not run')
+
+    def test_command_restart_marker_discards_prior_step_results(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'run.log'
+            log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
+                           + runs.COMMAND_STARTED_MARKER + ' run-retry\noffbox step 1 rc=0: a\n')
+            self.assertEqual(runs.step_results(log), [(1, 0)])
+            self.assertIsNone(runs.steps_exit(log, 2))
 
     def test_grep_hint_only_for_exit_1_from_trailing_grep(self):
         self.assertTrue(runs.last_stage_is_grep('go test ./... 2>&1 | tee /tmp/l | tail -40; grep -c FAIL /tmp/l'))
@@ -900,6 +929,17 @@ class CliStepTests(Isolated):
         self.assertEqual(lines[-2], 'offbox: offbox steps: 1 ok, 1 failed (step 2 rc=1)')
         self.assertEqual(lines[-1], 'offbox: remote exit 1')
 
+    def test_foreground_zero_without_step_result_is_incomplete(self):
+        rc, lines = self.run_cli(['--step', 'terraform test'], 0)
+        self.assertEqual(rc, 90)
+        self.assertIn('offbox: steps incomplete: got 0 of 1 step results; remote exit unknown', lines)
+        self.assertNotIn('offbox: remote exit 0', lines)
+
+    def test_foreground_complete_steps_keep_zero(self):
+        rc, lines = self.run_cli(['--step', 'true'], 0, 'offbox step 1 rc=0: true\n')
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines[-1], 'offbox: remote exit 0')
+
     def test_missing_deps_hint_from_probes_log(self):
         # Crpko #3816: probes.log, cf1569-a3 on bx_yy9mjenc after an install on another box.
         log = ('offbox: reusing repository pool box bx_yy9mjenc (xlarge)\n'
@@ -936,7 +976,7 @@ class CliStepTests(Isolated):
                     with self.subTest(code=code, steps=steps, marked=marked, settled=settled):
                         err, out = io.StringIO(), io.StringIO()
                         with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
-                                patch.object(runs, 'finish'), patch.object(runs, 'go_std_glitch'), \
+                                patch.object(runs, 'finish', side_effect=lambda rid, code, **kw: code), patch.object(runs, 'go_std_glitch'), \
                                 patch.object(runs, 'settle_box_wedged', return_value=None), \
                                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
                             rc = misc._settled(row) if settled else misc._finalize(row, code, log)
@@ -948,7 +988,7 @@ class CliStepTests(Isolated):
         row = dict(run_id='legacy', mode='bg', box_id='B', repo_root=None, pulls='[]', exit_code=127,
                    status='failed', error=None)
         err, out = io.StringIO(), io.StringIO()
-        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+        with patch.object(misc, '_catch_up_log', return_value='complete'), patch.object(misc, '_incomplete_log'), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             self.assertEqual(misc._settled(row), 127)
         self.assertEqual(err.getvalue(), 'offbox: legacy settled with no output on record\n')

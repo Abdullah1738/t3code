@@ -39,6 +39,8 @@ class FenceApprovalTests(unittest.TestCase):
         flow = str(uuid.uuid4())
         j.open_flow(flow_id=flow, app='noon', vertical=lane,
                     account_hash='a'*64, scope_hash=j.digest([lane, item, flow]))
+        if lane == 'nownow':
+            j.record_nownow_prepared(flow, 'c'*64)
         pending.register(flow, lane, 'a'*64, [{ITEM_KEYS[lane]: item, 'quantity': 1}],
                          card_last4='2342')
         return flow

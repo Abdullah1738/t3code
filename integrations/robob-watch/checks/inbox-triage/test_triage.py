@@ -1086,7 +1086,7 @@ class LiveWorkTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][1:], ['open-flows', '--minutes', '60'])
         # sent_at errs late by the second commerce rounds away.
         self.assertEqual(work, {'open_payments': [{'ref': 'p1', 'app': 'noon', 'vertical': 'supermall', 'state': 'PLACED',
-                                                   'amount_aed': 123.45, 'minutes_ago': 19, 'sent_at': 3861.0}],
+                                                   'amount_aed': 123.45, 'minutes_ago': 19, 'sent_at': 3861.0, 'flow_id': 'f1', 'order_id': None}],
                                 'phone_task': {'running': True, 'minutes': 10}})
         self.assertEqual(t.work_line(work), 'In flight: noon supermall payment AED 123.45 (19 min ago); a phone task has run for 10 min.')
 
@@ -1127,7 +1127,7 @@ class LiveWorkTests(unittest.TestCase):
         self.assertIn('In flight: talabat mart payment (3 min ago).', event)
         state = t.read_json(wd / 'cursor.json')
         self.assertEqual(t.read_json(Path(state['outbox']['batch']))['live_work'], work)
-        with patch.object(t, 'handled', return_value=({}, {})):
+        with patch.object(t, 'handled', return_value=({}, {})), patch.object(t, 'live_work', return_value=work):
             self.assertEqual(t.replay_outbox(state, wd, 'second'), event)
 
 
@@ -1644,6 +1644,131 @@ class PaymentNotices(unittest.TestCase):
                     self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
                     scheduled = f'Your {alias} of AED 100.00 is scheduled today at 21:00. ' + text
                     self.assertEqual(self.mc.payments.parse(scheduled, 'Wio', self.when)['kind'], 'autopay_expected')
+
+
+
+class PaymentSettlementTests(unittest.TestCase):
+    def payment(self, **changes):
+        return {'flow_id': 'flow1', 'order_id': 'NNTEST1', 'card_last4': '9546',
+                'sent_at': 1000, 'amount_aed': 26.75, **changes}
+
+    def test_terminal_and_zero_flows_never_reach_in_flight(self):
+        cases = [dict(state='ACTIVE', financial_send=False, sent_seconds_ago=None),
+                 dict(state='FENCED', amount_minor=0), dict(in_flight=False),
+                 *[dict(state=s) for s in ('COMPLETE', 'RELEASED', 'OWNER_ATTESTED_UNCHARGED', 'REJECTED_DUPLICATE')]]
+        for change in cases:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
+                flow = {'app':'noon', 'vertical':'nownow', 'state':'ACTIVE', 'amount_minor':2675,
+                        'financial_send':True, 'sent_seconds_ago':30, **change}
+                answer = types.SimpleNamespace(stdout=json.dumps({'ok':True,'open':[flow]}), returncode=0, stderr='')
+                with patch.object(t.subprocess, 'run', return_value=answer), patch.object(t, 'PHONE_LOCK', Path(temp)):
+                    work = t.live_work(2000)
+                self.assertEqual(work['open_payments'], [])
+                self.assertIsNone(t.work_line(work))
+
+    def test_evidence_class_matches_and_persists_only_exact_settlements(self):
+        cases = [
+            ('purchase', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon', 1100, True),
+            ('receipt', 'email', 'orders@noon.com', 'Order NNTEST1 receipt', 1100, True),
+            ('other_card', 'imessage', 'Mashreq', 'Purchase AED 26.75 at noon using card 2342', 1100, False),
+            ('other_amount', 'imessage', 'Mashreq', 'Purchase AED 267.50 at noon using card 9546', 1100, False),
+            ('other_merchant', 'imessage', 'Mashreq', 'Purchase AED 26.75 at cafe using card 9546', 1100, False),
+            ('older', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon', 999, False),
+            ('approval', 'imessage', 'Mashreq', 'Approve purchase AED 26.75 at noon card 9546', 1100, False),
+            ('failed', 'imessage', 'Mashreq', 'Purchase declined AED 26.75 at noon card 9546', 1100, False),
+            ('otp', 'imessage', 'Mashreq', 'OTP for purchase AED 26.75 at noon card 9546', 1100, False),
+            ('foreign_receipt', 'email', 'orders@other.com', 'Order NNTEST1 receipt', 1100, False),
+            ('substring_order', 'email', 'orders@noon.com', 'Order NNTEST12 receipt', 1100, False),
+            ('noon_card_other_shop', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at ACME', 1100, False),
+            ('noon_card_noon_shop', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, True),
+            ('enbd_noon_shop', 'imessage', 'EmiratesNBD', 'Purchase of AED 26.75 with Credit Card ending 9546 at noon, Dubai.', 1100, True),
+            ('similar_merchant', 'imessage', 'Mashreq', 'Your Card ending with 9546 was used for a purchase of AED26.75 at noon cafe', 1100, False),
+            ('failed_email', 'email', 'orders@noon.com', 'Payment failed for order NNTEST1', 1100, False),
+            ('failed_receipt', 'email', 'orders@noon.com', 'Receipt: payment failed for order NNTEST1', 1100, False),
+            ('pending_receipt', 'email', 'orders@noon.com', 'Receipt: payment pending for order NNTEST1', 1100, False),
+            ('cancelled_receipt', 'email', 'orders@noon.com', 'Receipt: cancelled order NNTEST1', 1100, False),
+            ('unpaid_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 not paid', 1100, False),
+            ('plain_order_mail', 'email', 'orders@noon.com', 'Order NNTEST1 update', 1100, False),
+            ('positive_receipt', 'email', 'orders@noon.com', 'Payment received for order NNTEST1', 1100, True),
+            ('mashreq_email', 'email', 'MashreqAlerts@mashreq.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, True),
+            ('mashreq_native_merchant', 'email', 'MashreqAlerts@mashreq.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at Noon 80038888 AE on 09-NOV-2026 05:48 PM.', 1100, True),
+            ('foreign_bank_email', 'email', 'MashreqAlerts@other.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, False),
+            ('declined_receipt', 'email', 'orders@noon.com', 'Receipt: payment declined for NNTEST1', 1100, False),
+            ('refund_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 refunded', 1100, False),
+            ('reversed_receipt', 'email', 'orders@noon.com', 'Receipt: payment reversed for NNTEST1', 1100, False),
+            ('unpaid_literal_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 unpaid', 1100, False),
+        ]
+        for name, source, sender, text, at, expected in cases:
+            with self.subTest(name=name):
+                work = {'open_payments':[self.payment()]}; state = {}
+                item = {'id':'evidence', 'source':source, 'sender':sender, 'subject':text, 'preview':'', 'ts':at}
+                t.settle_work(work, [item], state)
+                self.assertEqual(not work['open_payments'], expected)
+                work = {'open_payments':[self.payment()]}
+                t.settle_work(work, [], state)
+                self.assertEqual(not work['open_payments'], expected)
+                self.assertNotIn(text, json.dumps(state))
+
+    def test_same_amount_is_ambiguous(self):
+        work = {'open_payments':[self.payment(), self.payment(flow_id='flow2')]}
+        t.settle_work(work, [{'id':'sms','source':'imessage','sender':'Mashreq',
+             'preview':'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon','ts':1100}], {})
+        self.assertEqual(len(work['open_payments']), 2)
+
+    def test_reopened_payment_invalidates_old_settlement_and_old_evidence(self):
+        state = {}
+        item = {'id':'sms', 'source':'imessage', 'sender':'Mashreq', 'ts':1100,
+                'preview':'Your Card ending with 9546 was used for a purchase of AED26.75 at noon.com'}
+        t.settle_work({'open_payments':[self.payment()]}, [item], state)
+        self.assertIn('flow1', state['settled_payments'])
+        reopened = self.payment(sent_at=1200, settlement_epoch=1200)
+        work = {'open_payments':[reopened]}
+        t.settle_work(work, [item], state)
+        self.assertEqual(work['open_payments'], [reopened])
+        self.assertNotIn('flow1', state['settled_payments'])
+        t.settle_work(work, [{**item, 'id':'new', 'ts':1300}], state)
+        self.assertEqual(work['open_payments'], [])
+        self.assertEqual(state['settled_payments']['flow1']['epoch'], 1200)
+
+    def test_held_and_previously_queued_evidence_settles_without_classifier_readiness(self):
+        for initially_queued in (False, True):
+            with self.subTest(initially_queued=initially_queued), tempfile.TemporaryDirectory() as temp:
+                wd = Path(temp)
+                item = {'id':'imsg:1','source':'imessage','sender':'Mashreq','ts':1100,'subject':'',
+                        'preview':'Your Card ending with 9546 was used for a purchase of AED26.75 at noon.com'}
+                t.atomic(wd/'cursor.json', {'version':1,'initialized_at':1000,'cursors':{},
+                    'queue':[item] if initially_queued else []})
+                first = {'imessage':{'cursor':1,'items':[] if initially_queued else [item],'drops':{},'scanned':1}}
+                args = types.SimpleNamespace(dry_run_hours=None, report=None)
+                with patch.dict(t.os.environ, {'WATCH_DIR':str(wd), 'WATCH_RUN':'test'}), \
+                        patch.object(t,'active_watchers',return_value=[]), patch.object(t,'noise_rules',return_value=[]), \
+                        patch.object(t,'collect',side_effect=[(first,{}), ({},{})]), \
+                        patch.object(t,'handled',return_value=({},{})), \
+                        patch.object(t,'payment_checks',return_value=({},None)), \
+                        patch.object(t,'renewal_checks',return_value=({},None)), \
+                        patch.object(t,'charge_checks',return_value=({}, {'imsg:1'},None)), \
+                        patch.object(t,'build_context',side_effect=lambda *_: {'live_work':{'open_payments':[self.payment()]}}), \
+                        patch.object(t,'classify_batch') as classify, patch('builtins.print'):
+                    self.assertEqual(t.run(args),0)
+                    state = t.read_json(wd/'cursor.json')
+                    self.assertIn('flow1', state['settled_payments'])
+                    self.assertEqual(t.run(args),0)
+                    self.assertIn('flow1', t.read_json(wd/'cursor.json')['settled_payments'])
+                    classify.assert_not_called()
+
+    def test_replayed_outbox_uses_current_terminal_payment_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wd = Path(temp); batch = wd/'batch.json'
+            hit = {'id':'email:1','source':'email','sender':'orders@noon.com', 'subject':'Receipt',
+                   'preview':'Order NNTEST1','ts':1100,'reason':'receipt','urgency':'info'}
+            t.atomic(batch, {'hits':[hit], 'live_work':{'open_payments':[self.payment()]}})
+            state = {'outbox':{'run':'first','batch':str(batch),'event':'In flight: stale payment'},'queue':[]}
+            with patch.object(t,'handled',return_value=({},{})), \
+                    patch.object(t,'live_work',return_value={'open_payments':[]}), \
+                    patch.object(t,'withdrawal_statuses'), patch.object(t,'urgent_alerts',return_value={}):
+                event = t.replay_outbox(state,wd,'second')
+            self.assertNotIn('In flight:',event)
+            self.assertEqual(t.read_json(batch)['live_work']['open_payments'],[])
 
 
 if __name__ == '__main__':

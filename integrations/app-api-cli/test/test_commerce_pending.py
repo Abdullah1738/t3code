@@ -31,6 +31,8 @@ class PendingTests(unittest.TestCase):
         flow = str(uuid.uuid4())
         j.open_flow(flow_id=flow, app='noon', vertical=vertical,
                     account_hash=self.account, scope_hash=scope or '2'*64)
+        if vertical == 'nownow':
+            j.record_nownow_prepared(flow, '4'*64)
         if items:
             p.register(flow, vertical, self.account, items, card_last4='9546')
         return flow
