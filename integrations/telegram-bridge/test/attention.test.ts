@@ -6,6 +6,9 @@ import { join } from "node:path";
 import { Attention, type AttentionOptions } from "../src/attention.ts";
 import { callbackToken, sessionNoticeId, Store, type SessionNotice } from "../src/store.ts";
 import { OpenChamber, type BoardSnapshot, type JsonValue, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "../src/openchamber.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
 
 const now = Date.parse("2026-09-10T12:00:00Z");
 const stores: Store[] = [];
@@ -283,6 +286,10 @@ test("tapping Reject answers reject; transport failures keep the prompt actionab
   expect(h.backend.permissionReplies).toEqual([]);
   expect(h.answers).toEqual([["cb", "The reply failed; try again."]]);
   expect(h.store.sessionNotice(id)?.state).toBe("sent");
+  expect(logs.entries().find(row => row.error?.tag === "tg.attention.approvalReply")).toMatchObject({
+    tool: "watchers", kind: "error", ok: false, error: { tag: "tg.attention.approvalReply", message: "tg.attention.approvalReply" },
+  });
+  expect(logs.text()).not.toContain("PRIVATE_FAILURE");
   h.backend.failReplies = false;
   await h.attention.handleUpdate(h.callback(901, `a:${token}:reject`));
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats", "reject"]]);

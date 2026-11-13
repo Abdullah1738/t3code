@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import { toolError, toolLog } from "./toollog.ts";
 
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
 export type KeyboardSpec = { rows: Array<Array<{ text: string; data: string }>> } | { remove: true };
@@ -107,6 +108,7 @@ export class Store {
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
     } catch (error) {
+      toolError("telegram", "tg.store.open");
       this.db.close();
       throw error;
     }
@@ -147,8 +149,10 @@ export class Store {
   enqueueSessionNotice(notice: SessionNotice, text: string, keyboard?: KeyboardSpec): void {
     const payload = json({ id: notice.id, kind: notice.kind === "review" ? "notification" : "control", text, ...(keyboard ? { keyboard } : {}) });
     this.db.transaction(() => {
-      this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
+      const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(notice.id, payload);
+      if (!result.changes) toolLog({ component: "telegram", kind: "event", name: "tg.dedupe", ok: true,
+        ids: { operation: notice.id, key: notice.id, thread: notice.sessionId }, props: { deduped: true, action: "check" } });
       this.saveSessionNotice({ ...notice, state: "queued" });
     }).immediate();
   }
@@ -168,7 +172,13 @@ export class Store {
       const existing = this.db.query<{ payload: string }, [string]>(
         "SELECT payload FROM outbox WHERE id = ?",
       ).get(op.id)!;
-      if (existing.payload !== payload) throw new Error(`Outbox content mismatch: ${op.id}`);
+      if (existing.payload !== payload) {
+        toolLog({ component: "telegram", kind: "error", name: "tg.dedupe", ok: false,
+          ids: { operation: op.id, key: op.id }, props: { action: "conflict" }, error: { tag: "tg.dedupe.contentConflict" } });
+        throw new Error(`Outbox content mismatch: ${op.id}`);
+      }
+      toolLog({ component: "telegram", kind: "event", name: "tg.dedupe", ok: true,
+        ids: { operation: op.id, key: op.id }, props: { deduped: true, action: "check" } });
       return false;
     }).immediate();
   }
@@ -203,6 +213,13 @@ export class Store {
         this.db.query("UPDATE reminders SET status = 'sent' WHERE operationId = ?").run(id);
       }
     }).immediate();
+    try {
+      const reminder = this.db.query<{ reminderId: string | null }, [string]>("SELECT reminderId FROM outbox WHERE id = ?").get(id);
+      if (reminder?.reminderId) toolLog({ component: "telegram", kind: state === "failed" || state === "uncertain" ? "error" : "event",
+        name: "tg.reminder", ok: state !== "failed" && state !== "uncertain", ids: { reminder: reminder.reminderId, operation: id },
+        props: { action: state === "sent" ? "sent" : state === "pending" ? "retry" : state === "cancelled" ? "cancel" : "send", state },
+        ...(state === "failed" || state === "uncertain" ? { error: { tag: "tg.reminder.deliveryFailed" } } : {}) });
+    } catch { toolError("telegram", "tg.reminder.deliveryLog", { operation: id }); }
   }
 
   byProviderId(id: number): OutboxRecord | undefined {
@@ -226,12 +243,21 @@ export class Store {
   }
 
   createReminder(input: { id?: string; text: string; dueAt: number; timezone: string }): ReminderRecord {
-    new Date(input.dueAt).toISOString();
-    new Intl.DateTimeFormat("en-US", { timeZone: input.timezone });
-    const id = input.id ?? `R${randomUUID()}`;
-    this.db.query(`INSERT INTO reminders (id, text, dueAt, timezone, status, revision)
-      VALUES (?, ?, ?, ?, 'scheduled', 1)`).run(id, input.text, input.dueAt, input.timezone);
-    return this.getReminder(id);
+    try {
+      new Date(input.dueAt).toISOString();
+      new Intl.DateTimeFormat("en-US", { timeZone: input.timezone });
+      const id = input.id ?? `R${randomUUID()}`;
+      this.db.query(`INSERT INTO reminders (id, text, dueAt, timezone, status, revision)
+        VALUES (?, ?, ?, ?, 'scheduled', 1)`).run(id, input.text, input.dueAt, input.timezone);
+      const reminder = this.getReminder(id);
+      toolLog({ component: "telegram", kind: "event", name: "tg.reminder", ok: true,
+        ids: { reminder: id }, props: { action: "create", state: reminder.status } });
+      return reminder;
+    } catch (error) {
+      toolLog({ component: "telegram", kind: "error", name: "tg.reminder", ok: false,
+        ids: { reminder: input.id }, props: { action: "create" }, error: { tag: "tg.reminder.createFailed" } });
+      throw error;
+    }
   }
 
   listReminders(): ReminderRecord[] {
@@ -241,12 +267,30 @@ export class Store {
   }
 
   cancelReminder(id: string): ReminderRecord {
-    return this.changeReminder(id);
+    try {
+      const reminder = this.changeReminder(id);
+      toolLog({ component: "telegram", kind: "event", name: "tg.reminder", ok: true,
+        ids: { reminder: id }, props: { action: "cancel", state: reminder.status } });
+      return reminder;
+    } catch (error) {
+      toolLog({ component: "telegram", kind: "error", name: "tg.reminder", ok: false,
+        ids: { reminder: id }, props: { action: "cancel" }, error: { tag: "tg.reminder.cancelFailed" } });
+      throw error;
+    }
   }
 
   snoozeReminder(id: string, dueAt: number): ReminderRecord {
-    new Date(dueAt).toISOString();
-    return this.changeReminder(id, dueAt);
+    try {
+      new Date(dueAt).toISOString();
+      const reminder = this.changeReminder(id, dueAt);
+      toolLog({ component: "telegram", kind: "event", name: "tg.reminder", ok: true,
+        ids: { reminder: id }, props: { action: "snooze", state: reminder.status } });
+      return reminder;
+    } catch (error) {
+      toolLog({ component: "telegram", kind: "error", name: "tg.reminder", ok: false,
+        ids: { reminder: id }, props: { action: "snooze" }, error: { tag: "tg.reminder.snoozeFailed" } });
+      throw error;
+    }
   }
 
   private getReminder(id: string): ReminderRecord {
@@ -273,24 +317,33 @@ export class Store {
   }
 
   enqueueDueReminders(now: number): number {
-    if (!Number.isFinite(now)) throw new Error("Invalid reminder clock");
-    return this.db.transaction(() => {
-      const due = this.db.query<ReminderRow, [number]>(`SELECT * FROM reminders
-        WHERE status = 'scheduled' AND dueAt <= ? ORDER BY dueAt, id`).all(now);
-      for (const reminder of due) {
-        const operationId = `reminder:${reminder.id}:${reminder.revision}`;
-        const localDue = new Intl.DateTimeFormat("en-US", {
-          timeZone: reminder.timezone, dateStyle: "medium", timeStyle: "long",
-        }).format(reminder.dueAt);
-        const text = `[Reminder ${reminder.id}] ${reminder.text}\nDue: ${localDue} (${reminder.timezone}; ${new Date(reminder.dueAt).toISOString()})${now - reminder.dueAt > 60_000 ? " [late]" : ""}`;
-        if (!this.enqueue({ id: operationId, kind: "notification", text })) {
-          throw new Error(`Reminder operation already exists: ${operationId}`);
+    try {
+      if (!Number.isFinite(now)) throw new Error("Invalid reminder clock");
+      const queued = this.db.transaction(() => {
+        const due = this.db.query<ReminderRow, [number]>(`SELECT * FROM reminders
+          WHERE status = 'scheduled' AND dueAt <= ? ORDER BY dueAt, id`).all(now);
+        for (const reminder of due) {
+          const operationId = `reminder:${reminder.id}:${reminder.revision}`;
+          const localDue = new Intl.DateTimeFormat("en-US", {
+            timeZone: reminder.timezone, dateStyle: "medium", timeStyle: "long",
+          }).format(reminder.dueAt);
+          const text = `[Reminder ${reminder.id}] ${reminder.text}\nDue: ${localDue} (${reminder.timezone}; ${new Date(reminder.dueAt).toISOString()})${now - reminder.dueAt > 60_000 ? " [late]" : ""}`;
+          if (!this.enqueue({ id: operationId, kind: "notification", text })) {
+            throw new Error(`Reminder operation already exists: ${operationId}`);
+          }
+          this.db.query("UPDATE outbox SET reminderId = ? WHERE id = ?").run(reminder.id, operationId);
+          this.db.query(`UPDATE reminders SET status = 'queued', operationId = ? WHERE id = ?`
+          ).run(operationId, reminder.id);
         }
-        this.db.query("UPDATE outbox SET reminderId = ? WHERE id = ?").run(reminder.id, operationId);
-        this.db.query(`UPDATE reminders SET status = 'queued', operationId = ? WHERE id = ?`
-        ).run(operationId, reminder.id);
-      }
-      return due.length;
-    }).immediate();
+        return due;
+      }).immediate();
+      for (const reminder of queued) toolLog({ component: "telegram", kind: "event", name: "tg.reminder", ok: true,
+        ids: { reminder: reminder.id, operation: `reminder:${reminder.id}:${reminder.revision}` }, props: { action: "queue", state: "queued" } });
+      return queued.length;
+    } catch (error) {
+      toolLog({ component: "telegram", kind: "error", name: "tg.reminder", ok: false,
+        props: { action: "queue" }, error: { tag: "tg.reminder.queueFailed" } });
+      throw error;
+    }
   }
 }

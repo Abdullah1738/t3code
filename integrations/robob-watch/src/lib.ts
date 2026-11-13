@@ -1,3 +1,4 @@
+import { toolLog, toolError } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -159,7 +160,7 @@ function validQuiet(value: unknown): value is Quiet {
   const { start, end, time_zone } = value as Record<string, unknown>;
   const hour = (h: unknown) => Number.isInteger(h) && (h as number) >= 0 && (h as number) <= 23;
   if (!hour(start) || !hour(end) || start === end || typeof time_zone !== "string" || !time_zone) return false;
-  try { new Intl.DateTimeFormat("en-GB", { timeZone: time_zone }); return true; } catch { return false; }
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: time_zone }); return true; } catch { toolError("runner", "watch.timezone_invalid"); return false; }
 }
 
 const oneLine = (value: unknown, max: number) => typeof value === "string" && !!value.trim() && value.length <= max && !/[\x00-\x1f]/.test(value);
@@ -174,7 +175,7 @@ function lidPhone(lid: string): string | undefined {
       const row = db.query("select pn from whatsmeow_lid_map where lid = ?").get(lid) as { pn?: unknown } | null;
       return typeof row?.pn === "string" && row.pn ? row.pn : undefined;
     } finally { db.close(); }
-  } catch { return undefined; }
+  } catch { toolError("runner", "watch.contact_lookup_failed"); return undefined; }
 }
 
 /** One key per person: a phone jid, its mapped @lid, a +phone and a bare number match. Groups match by jid. */
@@ -206,12 +207,13 @@ export const watcherDir = (id: string) => join(WATCHERS, id);
 export function triggerSig(watcher: Watcher): string | undefined {
   if (!watcher.triggers?.length) return undefined;
   return watcher.triggers.map(path => {
-    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch { return "missing"; }
+    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch { toolError("runner", "watch.trigger_stat_failed"); return "missing"; }
   }).join("|");
 }
 
 export function readJson<T>(path: string): T | undefined {
-  try { return JSON.parse(readFileSync(path, "utf8")) as T; } catch { return undefined; }
+  if (!existsSync(path)) return undefined;
+  try { return JSON.parse(readFileSync(path, "utf8")) as T; } catch { toolError("runner", "watch.json_read_failed"); return undefined; }
 }
 
 export function writeJson(path: string, value: unknown): void {
@@ -315,7 +317,7 @@ export function log(id: string | null, message: string): void {
       writeFileSync(path, text.slice(text.length / 2));
     }
     appendFileSync(path, line);
-  } catch { /* A missing dir (removed mid-run) is fine. */ }
+  } catch { toolError("runner", "watch.legacy_log_failed", { watcher: id }); }
 }
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
@@ -341,19 +343,21 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       done = true;
       clearTimeout(timer);
       clearTimeout(grace);
-      resolve({ code, stdout, stderr: stderr + extra, timedOut, ms: now() - started });
+      const ms = now() - started;
+      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
+      resolve({ code, stdout, stderr: stderr + extra, timedOut, ms });
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
-      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { toolError("runner", "watch.kill_failed", { watcher: watcher.id }); }
       grace = setTimeout(() => {
-        try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { /* ignore */ }
+        try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { toolError("runner", "watch.pipe_cleanup_failed", { watcher: watcher.id }); }
         finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
@@ -363,9 +367,16 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
 }
 
 async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; out: string }> {
-  const child = Bun.spawn(args, { env: { HOME, PATH }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
-  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
+  const started = now();
+  try {
+    const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
+    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
+  } catch (error) {
+    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, error: { tag: "helper.spawn_failed" } });
+    throw error;
+  }
 }
 
 /** Async on purpose: a blocking spawnSync here would freeze every watcher's timers for up to 10s. */
@@ -445,7 +456,7 @@ export function telegram(source: string, text: string, key: string, severity = "
 const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
   "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
   "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
-  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;

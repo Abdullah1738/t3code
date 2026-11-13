@@ -1,3 +1,4 @@
+import { toolLog, toolError, rollup } from "./toollog.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
                                          watcher sharing ID's trip
   robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (info only)
+  robob-watch log-rollup [--day YYYY-MM-DD]   roll up a UTC day (default yesterday)
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -98,7 +100,7 @@ async function main(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: rest, allowPositionals: true, strict: true,
     options: {
-      id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
+      day: { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" },
@@ -108,6 +110,13 @@ async function main(argv: string[]): Promise<void> {
   });
   ensureDirs();
   switch (command) {
+    case "log-rollup": {
+      const day = values.day ?? new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+      const result = await rollup(day);
+      if (!result) throw new CliError("Could not roll up UTC day");
+      console.log(JSON.stringify(result));
+      return;
+    }
     case "add": {
       let input: Record<string, unknown>;
       if (values.json !== undefined) {
@@ -142,7 +151,7 @@ async function main(argv: string[]): Promise<void> {
       if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
       if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
       let watcher: Watcher;
-      try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { throw new CliError((error as Error).message); }
+      try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition"); throw new CliError((error as Error).message); }
       const dir = watcherDir(watcher.id);
       const replacingExisting = existsSync(join(dir, "watcher.json"));
       if (replacingExisting) {
@@ -254,6 +263,7 @@ async function main(argv: string[]): Promise<void> {
     case "resume": {
       const w = need(positionals[0]);
       w.paused = command === "pause";
+      toolLog({ component: "cli", kind: "event", name: command === "pause" ? "watch.disabled" : "watch.recovered", ids: { watcher: w.id }, props: { action: command } });
       if (command === "resume" && values.expires !== undefined) w.expires_at = duration(values.expires);
       writeJson(join(watcherDir(w.id), "watcher.json"), w);
       const s: State = loadState(w.id);
@@ -310,6 +320,7 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     case "remove": {
+      toolLog({ component: "cli", kind: "event", name: "watch.disabled", ids: { watcher: positionals[0] }, props: { action: "remove" } });
       const w = need(positionals[0]);
       log(w.id, "removed");
       const target = join(ARCHIVE, `${w.id}-${Date.now()}`);
@@ -344,6 +355,7 @@ async function main(argv: string[]): Promise<void> {
 try {
   await main(process.argv.slice(2));
 } catch (error) {
+  toolError("cli", "watch.command_failed");
   console.error(`robob-watch: ${error instanceof CliError ? error.message : String((error as Error)?.message ?? error)}`);
   process.exitCode = 1;
 }

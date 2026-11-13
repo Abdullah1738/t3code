@@ -2,6 +2,7 @@ import { redact } from "./redact.ts";
 import { allowQueuedAsk, flushBursts, runCloudUp } from "./notification-policy.ts";
 import { classifySendFailure, type SendFailure, type Telegram } from "./telegram.ts";
 import type { OutboxRecord, Store } from "./store.ts";
+import { toolError, toolLog } from "./toollog.ts";
 
 export { classifySendFailure } from "./telegram.ts";
 
@@ -35,6 +36,8 @@ export class Delivery {
   }
 
   tick(): Promise<void> {
+    if (this.ticking) toolLog({ component: "telegram", kind: "event", name: "tg.dedupe", ok: true,
+      props: { action: "coalesce", deduped: true } });
     return this.ticking ??= Promise.resolve().then(() => this.run()).finally(() => { this.ticking = undefined; });
   }
 
@@ -186,6 +189,13 @@ export class Delivery {
         if (state === "pending") dispatched++;
         state = "sending";
         let result: { providerId?: number };
+        const ids = { operation: item.id, key: item.id, chat: chatId };
+        let severity = item.kind === "control" ? "attention" : "info";
+        try {
+          severity = this.store.get<{ severity: string }>(`api:notification:${item.id}`)?.severity
+            ?? this.store.get<string>(`log:severity:${item.id}`) ?? severity;
+        } catch { toolError("telegram", "tg.send.severityRead", ids); }
+        const started = performance.now();
         try {
           if (item.attachment && index === chunks.length) {
             const previous = index > 0 ? this.store.get<Checkpoint>(`chunk:${item.id}:${index - 1}`) : undefined;
@@ -207,9 +217,17 @@ export class Delivery {
             });
           }
         } catch (error) {
-          this.failed(item, state, wasAmbiguous, classifySendFailure(error));
+          const failure = classifySendFailure(error);
+          // TransportError codes may come from a caller; the log tag depends only on the classified outcome.
+          const tag = failure.code === "floodWait" ? "tg.send.floodWait"
+            : failure.uncertain ? "tg.send.uncertain" : failure.retryable ? "tg.send.retryable" : "tg.send.rejected";
+          toolLog({ component: "telegram", kind: "error", name: "tg.send", durationMs: performance.now() - started,
+            ok: false, ids, props: { severity, attempt: item.attempts + 1, accepted: false }, error: { tag } });
+          this.failed(item, state, wasAmbiguous, failure);
           continue operations;
         }
+        toolLog({ component: "telegram", kind: "perf", name: "tg.send", durationMs: performance.now() - started,
+          ok: true, ids, props: { severity, attempt: item.attempts + 1, accepted: true } });
         // Provider acceptance is durable even if cancellation raced with this call.
         // Keep every message alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {

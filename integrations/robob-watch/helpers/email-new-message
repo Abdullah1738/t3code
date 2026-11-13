@@ -1,4 +1,5 @@
 #!/bin/zsh -f
+source "${0:A:h}/toollog.zsh" email-new-message 2>/dev/null || true
 # email-new-message ACCOUNT 'himalaya query' [MAILBOX]
 # e.g. email-new-message icloud 'from apple.com' Inbox   (query uses himalaya's DSL: from/to/subject/body X, and/or/not)
 # Looks at the last 3 days only.

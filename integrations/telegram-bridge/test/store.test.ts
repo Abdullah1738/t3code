@@ -3,6 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, callbackToken, sessionNoticeId, type OutboxOperation, type SessionNotice } from "../src/store.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
 
 const stores: Store[] = [];
 const directories: string[] = [];
@@ -173,4 +176,48 @@ test("blobs are content-addressed, size-bounded, and verified on read", () => {
   expect(Buffer.from(store.getBlob(sha256))).toEqual(data);
   expect(() => store.putBlob(Buffer.alloc(20 * 1024 * 1024 + 1))).toThrow("exceeds 20 MiB");
   expect(() => store.getBlob("f".repeat(64))).toThrow("unavailable");
+});
+
+test("tg.dedupe logs normalized replays and conflicts without operation content", () => {
+  const store = open();
+  const op: OutboxOperation = { id: "PRIVATE_KEY", kind: "notification", text: "PRIVATE_MESSAGE" };
+  expect(store.enqueue(op)).toBe(true);
+  expect(store.enqueue(op)).toBe(false);
+  expect(() => store.enqueue({ ...op, text: "PRIVATE_CHANGED_BODY" })).toThrow("content mismatch");
+  expect(logs.entries()).toMatchObject([
+    { tool: "watchers", name: "tg.dedupe", kind: "event", ok: true, props: { action: "check", deduped: true } },
+    { tool: "watchers", name: "tg.dedupe", kind: "error", ok: false, props: { action: "conflict" },
+      error: { tag: "tg.dedupe.contentConflict", message: "tg.dedupe.contentConflict" } },
+  ]);
+  for (const row of logs.entries()) {
+    expect(row.ids?.key).toMatch(/^[a-f0-9]{24}$/);
+    expect(row.ids?.operation).toBe(row.ids?.key);
+  }
+  expect(logs.text()).not.toContain("PRIVATE_");
+});
+
+test("tg.reminder records lifecycle transitions and failed mutations without reminder text or due dates", () => {
+  const store = open();
+  const id = "PRIVATE_REMINDER";
+  store.createReminder({ id, text: "PRIVATE_HEALTH_VALUE", dueAt: now, timezone: "Asia/Dubai" });
+  store.enqueueDueReminders(now);
+  store.snoozeReminder(id, now + 120_000);
+  store.enqueueDueReminders(now + 120_000);
+  store.outboxState(`reminder:${id}:2`, "sending");
+  expect(() => store.cancelReminder(id)).toThrow("ambiguous send");
+  store.outboxState(`reminder:${id}:2`, "sent", 900);
+  store.cancelReminder(id);
+  expect(() => store.snoozeReminder("PRIVATE_MISSING", now)).toThrow("Unknown reminder");
+  expect(() => store.createReminder({ id: "PRIVATE_INVALID", text: "PRIVATE_HEALTH_VALUE", dueAt: NaN, timezone: "UTC" })).toThrow();
+  expect(() => store.enqueueDueReminders(NaN)).toThrow("Invalid reminder clock");
+  const entries = logs.entries().filter(row => row.name === "tg.reminder");
+  expect(entries.filter(row => row.ok).map(row => [row.props?.action, row.props?.state])).toEqual([
+    ["create", "scheduled"], ["queue", "queued"], ["snooze", "scheduled"], ["queue", "queued"],
+    ["send", "sending"], ["sent", "sent"], ["cancel", "cancelled"],
+  ]);
+  expect(entries.filter(row => row.ok === false).map(row => row.error?.tag)).toEqual([
+    "tg.reminder.cancelFailed", "tg.reminder.snoozeFailed", "tg.reminder.createFailed", "tg.reminder.queueFailed",
+  ]);
+  for (const row of entries.filter(row => row.ids?.reminder)) expect(row.ids?.reminder).toMatch(/^[a-f0-9]{24}$/);
+  for (const forbidden of ["PRIVATE_", "Asia/Dubai", new Date(now).toISOString()]) expect(logs.text()).not.toContain(forbidden);
 });

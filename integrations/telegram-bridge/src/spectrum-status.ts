@@ -1,5 +1,6 @@
 import { request } from "node:http";
 import { isAbsolute } from "node:path";
+import { toolError } from "./toollog.ts";
 
 export type RouterStatus = {
   route: { id: string; directory: string; generation: number } | null;
@@ -88,6 +89,7 @@ export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Pro
           try {
             finish(decodeStatus(JSON.parse(Buffer.concat(chunks, size).toString("utf8"))));
           } catch {
+            toolError("telegram", "tg.router.decode");
             finish(undefined);
           }
         });
@@ -95,6 +97,7 @@ export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Pro
       req.on("error", () => finish(undefined));
       req.end();
     } catch {
+      toolError("telegram", "tg.router.request");
       finish(undefined);
     }
   });

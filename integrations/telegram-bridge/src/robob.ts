@@ -1,4 +1,5 @@
 import type { NotificationEvent } from "./notification-events.ts";
+import { toolError } from "./toollog.ts";
 import {
   IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
   type QuestionRequest, type RequestReader, type SessionRecord, type SessionStatus,
@@ -152,7 +153,9 @@ export class RobobAlertBackend implements AlertBackend {
       directories: async () => {
         const found = new Set<string>();
         for (const request of requests) {
-          const directory = await this.directoryOf(request.threadId).catch(() => undefined);
+          const directory = await this.directoryOf(request.threadId).catch(() => {
+            toolError("telegram", "tg.robob.requestDirectory", { thread: request.threadId }); return undefined;
+          });
           if (directory !== undefined) found.add(directory);
         }
         return [...found];
@@ -184,7 +187,8 @@ export class RobobAlertBackend implements AlertBackend {
 
   /** Full-access threads never ask; subagents inherit their parent's mode. Undefined when unknown. */
   async isSessionAutoAccepting(sessionId: string): Promise<boolean | undefined> {
-    try { return (await this.client.thread(await this.resolve(sessionId))).thread.runtimeMode === "full-access"; } catch { return undefined; }
+    try { return (await this.client.thread(await this.resolve(sessionId))).thread.runtimeMode === "full-access"; }
+    catch { toolError("telegram", "tg.robob.runtimeMode", { thread: sessionId }); return undefined; }
   }
 
   /**
@@ -200,7 +204,9 @@ export class RobobAlertBackend implements AlertBackend {
     if (type === "thread.created") return { type: "wake" };
     if (type !== "request.opened" && type !== "request.resolved" && type !== "thread.status" && type !== "message.completed") return;
     if (type === "message.completed" && data.role !== "user") return;
-    const directory = await this.directoryOf(threadId).catch(() => undefined);
+    const directory = await this.directoryOf(threadId).catch(() => {
+      toolError("telegram", "tg.robob.eventDirectory", { thread: threadId }); return undefined;
+    });
     if (!directory) return { type: "wake" };
     if (type === "request.opened" || type === "request.resolved") {
       const requestId = typeof data.requestId === "string" && data.requestId ? data.requestId : undefined;
@@ -232,6 +238,7 @@ export class RobobAlertBackend implements AlertBackend {
           if (event) yield event;
         }
       } catch (error) {
+        toolError("telegram", "tg.robob.notifications");
         if (signal.aborted) return;
         if (error instanceof ControlError && (error.status === 401 || error.status === 403)) throw error;
       }

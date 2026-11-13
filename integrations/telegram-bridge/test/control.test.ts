@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { useToolLogFixture } from "./toollog-fixture.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,3 +50,5 @@ test("control config takes env credentials before any file", () => {
   expect(discoverControlConfig({ env: { T3_CONTROL_URL: "http://localhost:1/", T3_CONTROL_TOKEN: "env", T3_CONTROL_TOKEN_FILE: file } }))
     .toEqual({ url: "http://localhost:1", token: "env" });
 });
+
+useToolLogFixture();

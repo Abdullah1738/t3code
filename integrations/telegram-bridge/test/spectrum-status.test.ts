@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { useToolLogFixture } from "./toollog-fixture.ts";
 import { createServer, type Server } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -99,3 +100,5 @@ test("timeouts bound the ownership check", async () => {
   const path = await serve(() => { /* never respond */ });
   expect(await spectrumRouterStatus(path, 50)).toBeUndefined();
 });
+
+useToolLogFixture();

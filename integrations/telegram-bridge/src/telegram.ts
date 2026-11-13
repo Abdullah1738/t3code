@@ -2,6 +2,7 @@ import { redact } from "./redact.ts";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Chat } from "grammy/types";
 import type { KeyboardSpec } from "./store.ts";
+import { toolError } from "./toollog.ts";
 
 export const MAX_TEXT = 4_096;
 
@@ -95,6 +96,7 @@ export class Telegram {
       const me = await this.#client().api.getMe();
       return me?.is_bot === true && typeof me.id === "number";
     } catch {
+      toolError("telegram", "tg.transport.ping");
       return false;
     }
   }
@@ -158,7 +160,7 @@ export class Telegram {
   async start(options: StartOptions): Promise<void> {
     const bot = this.#client();
     const log = options.log;
-    bot.catch(error => log?.("polling-error", classifySendFailure(error.error).code));
+    bot.catch(error => { toolError("telegram", "tg.transport.polling"); log?.("polling-error", classifySendFailure(error.error).code); });
     const accepted = (from: { id?: number } | undefined): number | undefined => {
       const id = from?.id;
       if (!Number.isSafeInteger(id)) return undefined;
@@ -206,11 +208,12 @@ export class Telegram {
         await bot.start({ allowed_updates: ["message", "callback_query"] });
         backoff = 2_000;
       } catch {
+        toolError("telegram", "tg.transport.start");
         // grammY resolves or rejects; both mean polling ended without stop().
         if (!this.#stopping) backoff = Math.min(60_000, backoff * 2);
       }
       if (this.#stopping) break;
-      try { await bot.stop(); } catch { /* Best effort cleanup before reconnecting. */ }
+      try { await bot.stop(); } catch { toolError("telegram", "tg.transport.reconnectStop"); }
       await sleep(backoff);
     }
   }
@@ -218,6 +221,6 @@ export class Telegram {
   stop(): Promise<void> {
     this.#stopping = true;
     const bot = this.#bot;
-    return (bot ? bot.stop() : Promise.resolve()).catch(() => undefined) as Promise<void>;
+    return (bot ? bot.stop() : Promise.resolve()).catch(() => { toolError("telegram", "tg.transport.stop"); }) as Promise<void>;
   }
 }
