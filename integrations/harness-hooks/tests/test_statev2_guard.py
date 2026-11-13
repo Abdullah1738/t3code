@@ -800,11 +800,23 @@ class GuardTests(unittest.TestCase):
             variants.append(('heredoc-unquoted-body:' + target, original.replace(
                 '"$REAL_RSYNC" "\\$@" || exit \\$?\n', '"$REAL_RSYNC" "\\$@" || exit \\$?\n' + body.replace('$T', '\\$T'), 1)))
             variants.append(('heredoc-tab-body:' + target, original + "\ncat > \"$R/bin/extra\" <<-'SH'\n\t#!/bin/bash\n\t" + body + "\tSH\n"))
+        # Discounting one root's main-shell words must not shift where the
+        # heredoc bodies are when another root's words are checked.
+        opener = 'cat > "$R/bin/sqlite3_rsync" <<\'SH\'\n#!/bin/bash\necho "$$" > "$HOME/sync-pid"\n'
+        for padding in ('echo "$TOP/fixture/statev2.sqlite" "$T/fixture/statev2.sqlite"\n',
+                        'echo "$T/fixture/statev2.sqlite" "$TOP/fixture/statev2.sqlite"\n',
+                        'echo "$TOP/fixture/statev2.sqlite"\n', 'echo "$T/fixture/statev2.sqlite"\n'):
+            for count in (1, 10, 100):
+                for reader in ('T', 'TOP'):
+                    body = '/bin/cat "$' + reader + '/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite" > "$HOME/leak"\n'
+                    variants.append(('heredoc-after-discounts:%s:%d:%s' % (padding.strip(), count, reader),
+                                     original.replace(opener, padding * count + opener + body, 1)))
         variants.append(('before-setup', original.replace('# 1. sync', 'cat "$T/fixture-live/userdata/statev2.sqlite"\n# 1. sync')))
         variants.append(('quote-concatenated-tail', original.replace(
             '"$T/fixture-live/userdata/statev2.sqlite"', '"$T/fixture-live/userdata/statev2.sqlite"/../../real')))
         variants.append(('string-built-home', original + "\n/opt/homebrew/bin/python3 - <<'PY'\nimport os\nroot = os.path.join(os.environ['HOME'], '.ro' + 'bob', 'userdata', 'statev2.sqlite')\nopen(root).read()\nPY\n"))
         for label, source in variants:
+            self.assertNotEqual(source, original, label)
             self.write(path, source)
             for command in ('bash ' + path, '/bin/bash ' + str(self.root / path),
                             'offbox run --bg -- bash ' + path):

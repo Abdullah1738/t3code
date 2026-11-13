@@ -943,31 +943,35 @@ def _shell_fixture_source(source, directory):
     def in_body(position):
         return any(start <= position < end for start, end in body_lines)
 
-    for name in proven:
+    roots = []
+    for name in sorted(proven):
         root = r"\$(?:" + re.escape(name) + r"\b|\{" + re.escape(name) + r"\})/"
-        fixture = root + SHELL_FIXTURE_DATABASE
-        body_fixture = root + SHELL_HIDDEN_FIXTURE_DATABASE
         assignment = re.search(r'(?m)^[ \t]*' + re.escape(name) + r'="?\$\(mktemp ', source)
-        if not reset_fixture and assignment and any(match.start() < assignment.start() for match in re.finditer(fixture, source)):
+        if not reset_fixture and assignment and any(match.start() < assignment.start() for match in re.finditer(root + SHELL_FIXTURE_DATABASE, source)):
             continue
+        roots.append(root)
+    if not roots:
+        return source
+    root = '(?:' + '|'.join(roots) + ')'
+    fixture, body_fixture = root + SHELL_FIXTURE_DATABASE, root + SHELL_HIDDEN_FIXTURE_DATABASE
 
-        def discount_word(match):
-            word = match[0]
-            binding = re.match(r'[A-Za-z_]\w*=', word)
-            prefix = binding[0] if binding else ''
-            value = word[len(prefix):]
-            # Single quotes preserve a literal dollar sign, not a mktemp root.
-            quote = '"' if value.startswith('"') and value.endswith('"') else ''
-            if quote:
-                value = value[1:-1]
-            if not re.fullmatch(body_fixture if in_body(match.start()) else fixture, value):
-                return word
-            return prefix + quote + 'guard_isolated_fixture' + quote
+    def discount_word(match):
+        word = match[0]
+        binding = re.match(r'[A-Za-z_]\w*=', word)
+        prefix = binding[0] if binding else ''
+        value = word[len(prefix):]
+        # Single quotes preserve a literal dollar sign, not a mktemp root.
+        quote = '"' if value.startswith('"') and value.endswith('"') else ''
+        if quote:
+            value = value[1:-1]
+        if not re.fullmatch(body_fixture if in_body(match.start()) else fixture, value):
+            return word
+        return prefix + quote + 'guard_isolated_fixture' + quote
 
-        # Match complete raw shell words, retaining adjacent quoted pieces.
-        # Punctuation or whitespace inside quotes cannot terminate a path.
-        source = SHELL_FIXTURE_WORD.sub(discount_word, source)
-    return source
+    # One pass over the original text, so heredoc offsets stay valid. Match
+    # complete raw shell words, retaining adjacent quoted pieces; punctuation
+    # or whitespace inside quotes cannot terminate a path.
+    return SHELL_FIXTURE_WORD.sub(discount_word, source)
 
 
 def _fixture_shell_live(text, depth=0):
