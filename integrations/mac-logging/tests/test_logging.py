@@ -320,5 +320,318 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn('private',str(self.rows()))
 
 
-if __name__=='__main__':
+class FakeDiskutil:
+    def __init__(self, outcome='ok', reap_timeout=False):
+        self.pid = 4321
+        self.outcome = outcome
+        self.returncode = None
+        self.killed = False
+        self.reaped = False
+        self.reap_timeout = reap_timeout
+        self.stdout = io.BytesIO()
+        self.stderr = None
+
+    def communicate(self, timeout):
+        if self.killed:
+            if self.reap_timeout:
+                raise subprocess.TimeoutExpired('diskutil', timeout)
+            self.reaped = True
+            self.returncode = -9
+            return b'', None
+        if self.outcome == 'timeout':
+            assert timeout == 20
+            raise subprocess.TimeoutExpired('diskutil', timeout)
+        if self.outcome == 'error':
+            raise OSError('private failure')
+        import plistlib
+        self.returncode = 0
+        return (plistlib.dumps({'WholeDisks': ['disk0', 'disk3']})
+                if self.outcome == 'ok' else b'invalid plist'), None
+
+    def kill(self):
+        self.killed = True
+
+
+class DiskProbeTests(unittest.TestCase):
+    setUp = LoggingTests.setUp
+    rows = LoggingTests.rows
+
+    def runner(self, absent=False, sample_fail=False, notify_fail=False):
+        from types import SimpleNamespace
+        def run(cmd, **kwargs):
+            if cmd[0] == '/bin/ps':
+                self.assertEqual(kwargs['timeout'], 5)
+                return SimpleNamespace(returncode=0, stdout='' if absent else
+                    ' PID ELAPSED STAT COMM\n 80846 1-02:03:04 Ss /usr/libexec/storagekitd\n'
+                    ' 137 03:04 S /usr/libexec/diskarbitrationd\n')
+            if cmd[0] == '/usr/bin/hdiutil':
+                self.assertEqual(kwargs['timeout'], 10)
+                return SimpleNamespace(returncode=0)
+            if cmd[0] == '/usr/bin/sample':
+                self.assertEqual(kwargs['timeout'], 15)
+                self.assertFalse(self.child.killed)
+                if sample_fail:
+                    raise subprocess.TimeoutExpired(cmd, 15)
+                Path(cmd[-1]).write_text('    + 10 -[SKHelperClient syncAllDisks]\nprivate stack\n')
+                return SimpleNamespace(returncode=0)
+            self.assertEqual(cmd[0], '/Users/ardud/.bun/bin/bun')
+            self.assertNotIn('BUN_INSPECT', kwargs['env'])
+            self.notifications.append(cmd)
+            if notify_fail:
+                raise OSError('private notify failure')
+            return SimpleNamespace(returncode=0)
+        return run
+
+    def probe(self, outcome='ok', **kwargs):
+        self.child = FakeDiskutil(outcome)
+        self.notifications = getattr(self, 'notifications', [])
+        return collector.disk_tooling_probe(self.runner(**kwargs),
+                    lambda *a, **kw: self.child, lambda pid: False)
+
+    def test_probe_ok_and_absent_daemons_survive_schema(self):
+        for absent in (False, True):
+            with self.subTest(absent=absent):
+                self.probe(absent=absent)
+                row = self.rows()[-1]
+                self.assertEqual(row['name'], 'disk.tooling_probe')
+                self.assertTrue(row['ok'])
+                self.assertEqual(row['props']['diskCount'], 2)
+                self.assertFalse(row['props']['timedOut'])
+                self.assertEqual(row['props']['exitCode'], 0)
+                self.assertEqual(row['props']['storagekitdPid'], None if absent else 80846)
+                self.assertEqual(row['props']['storagekitdUptimeS'], None if absent else 93784)
+                self.assertEqual(row['props']['storagekitdStat'], None if absent else 'Ss')
+                self.assertEqual(row['props']['diskarbitrationdUptimeS'], None if absent else 184)
+                self.assertTrue(row['props']['hdiutilOk'])
+                self.assertGreaterEqual(row['props']['hdiutilMs'], 0)
+                self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
+        self.assertEqual(self.notifications, [])
+
+    def test_probe_timeout_samples_then_kills_and_reaps(self):
+        self.probe('timeout')
+        row = self.rows()[-1]
+        self.assertFalse(row['ok'])
+        self.assertTrue(row['props']['timedOut'])
+        self.assertEqual(row['props']['exitCode'], -9)
+        self.assertIsNone(row['props']['diskCount'])
+        self.assertEqual(row['props']['blockedIn'], 'SKHelperClient')
+        sample = Path(row['props']['samplePath'])
+        self.assertTrue(sample.is_file())
+        self.assertEqual(sample.parent, self.logs/'state/diskutil-samples')
+        self.assertEqual(stat.S_IMODE(sample.stat().st_mode), 0o600)
+        self.assertTrue(self.child.killed)
+        self.assertTrue(self.child.reaped)
+        self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
+        self.assertNotIn('private stack', str(self.rows()))
+
+    def test_probe_previous_child_and_overlapping_collector_skip(self):
+        import fcntl
+        jobs.save_state('disk-tooling-pid', {'pid': 4321})
+        with patch.object(collector.subprocess, 'Popen') as popen:
+            collector.disk_tooling_probe(self.runner(), popen, lambda pid: pid == 4321)
+            self.assertEqual(self.rows()[-1]['props']['skipped'], 'previous-probe-still-running')
+            self.assertNotIn('ok', self.rows()[-1])
+            popen.assert_not_called()
+            with (jobs.state_path('disk-tooling-pid').parent/'disk-tooling.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                collector.disk_tooling_probe(self.runner(), popen)
+                self.assertEqual(self.rows()[-1]['props']['skipped'], 'previous-probe-still-running')
+                popen.assert_not_called()
+
+    def test_two_timeouts_alert_once_and_restart_has_new_incident(self):
+        with patch.dict(os.environ, {'BUN_INSPECT': 'do-not-inherit'}):
+            self.probe('timeout')
+            self.assertEqual(self.notifications, [])
+            self.probe('timeout')
+            self.probe('timeout')
+            self.assertEqual(len(self.notifications), 1)
+            cmd = self.notifications[0]
+            self.assertEqual(cmd[cmd.index('--key')+1], 'mac-upkeep:diskutil-hang:80846')
+            self.probe('ok')
+            self.probe('timeout')
+            self.probe('timeout')
+            self.assertEqual(len(self.notifications), 1)
+            # A changed daemon must accumulate two fresh timeouts.
+            props = dict(storagekitdPid=88888, storagekitdUptimeS=10, timedOut=True)
+            collector.alert(props, self.runner())
+            self.assertEqual(len(self.notifications), 1)
+            collector.alert(props, self.runner())
+            self.assertEqual(len(self.notifications), 2)
+            self.assertEqual(self.notifications[-1][-1], 'mac-upkeep:diskutil-hang:88888')
+
+    def test_success_breaks_consecutive_timeouts(self):
+        for outcome in ('timeout', 'invalid', 'timeout', 'ok', 'timeout'):
+            self.probe(outcome)
+        self.assertEqual(self.notifications, [])
+
+    def test_notify_failure_is_logged_and_retried(self):
+        self.probe('timeout')
+        self.probe('timeout', notify_fail=True)
+        self.assertEqual(self.rows()[-1]['name'], 'disk.tooling_probe')
+        alerts = [r for r in self.rows() if r['name'] == 'disk.tooling_alert']
+        self.assertFalse(alerts[-1]['ok'])
+        self.probe('timeout')
+        self.probe('timeout')
+        self.assertEqual(len(self.notifications), 2)
+        self.assertNotIn('private notify failure', str(self.rows()))
+
+    def test_notify_retry_freezes_text_as_uptime_changes(self):
+        self.notifications = []
+        props = dict(storagekitdPid=80846, storagekitdUptimeS=3600, timedOut=True)
+        collector.alert(props, self.runner())
+        collector.alert(props, self.runner(notify_fail=True))
+        props['storagekitdUptimeS'] = 7200
+        collector.alert(props, self.runner())
+        self.assertEqual(self.notifications[0], self.notifications[1])
+
+    def test_sample_failure_still_kills_child_and_old_samples_expire(self):
+        root = jobs.state_path('disk-tooling-pid').parent/'diskutil-samples'
+        root.mkdir()
+        old, fresh = root/'diskutil-old.sample', root/'diskutil-fresh.sample'
+        old.touch(); fresh.touch()
+        os.utime(old, (time.time()-8*86400,)*2)
+        self.probe('timeout', sample_fail=True)
+        self.assertTrue(self.child.killed)
+        self.assertTrue(self.child.reaped)
+        self.assertEqual(self.rows()[-1]['props']['blockedIn'], 'unknown')
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_failed_reap_retains_pid_and_next_probe_skips(self):
+        self.child = FakeDiskutil('timeout', reap_timeout=True)
+        collector.disk_tooling_probe(self.runner(), lambda *a, **kw: self.child, lambda pid: False)
+        self.assertEqual(jobs.read_state('disk-tooling-pid')['pid'], 4321)
+        with patch.object(collector.subprocess, 'Popen') as popen:
+            collector.disk_tooling_probe(self.runner(), popen, lambda pid: True)
+            popen.assert_not_called()
+        self.assertTrue(self.child.stdout.closed)
+
+    def test_surviving_child_retries_failed_alert_without_spawning(self):
+        self.probe('timeout')
+        self.child = FakeDiskutil('timeout', reap_timeout=True)
+        collector.disk_tooling_probe(self.runner(notify_fail=True),
+                                    lambda *a, **kw: self.child, lambda pid: False)
+        self.assertEqual(len(self.notifications), 1)
+        samples = self.logs/'state/diskutil-samples'
+        old = samples/'diskutil-old.sample'
+        old.touch(); os.utime(old, (time.time()-8*86400,)*2)
+        with patch.object(collector.subprocess, 'Popen') as popen:
+            collector.disk_tooling_probe(self.runner(), popen, lambda pid: True)
+            collector.disk_tooling_probe(self.runner(), popen, lambda pid: True)
+            popen.assert_not_called()
+        self.assertEqual(len(self.notifications), 2)
+        self.assertEqual(self.notifications[0], self.notifications[1])
+        self.assertFalse(old.exists())
+        self.assertEqual(jobs.read_state('disk-tooling-alert')['consecutiveTimeouts'], 2)
+        self.assertEqual(self.rows()[-1]['props']['skipped'], 'previous-probe-still-running')
+
+    def test_surviving_child_alert_state_matrix(self):
+        self.notifications = []
+        key = 'mac-upkeep:diskutil-hang:80846'
+        for count, alerted in [(0, False), (1, False), (2, True)]:
+            with self.subTest(count=count, alerted=alerted):
+                jobs.save_state('disk-tooling-alert', dict(pid=80846, consecutiveTimeouts=count,
+                                alertedKey=key if alerted else None))
+                jobs.save_state('disk-tooling-pid', {'pid': 4321})
+                with patch.object(collector.subprocess, 'Popen') as popen:
+                    collector.disk_tooling_probe(self.runner(), popen, lambda pid: True)
+                    popen.assert_not_called()
+                self.assertEqual(jobs.read_state('disk-tooling-alert')['consecutiveTimeouts'], count)
+        self.assertEqual(self.notifications, [])
+
+    def test_pending_alert_survives_skip_daemon_lookup_forms(self):
+        from types import SimpleNamespace
+        key = 'mac-upkeep:diskutil-hang:80846'
+        # All missing-data forms preserve the incident; a known changed PID
+        # starts a new one. No skipped lookup advances the timeout streak.
+        for form in ('present', 'absent', 'nonzero', 'timeout', 'restarted'):
+            with self.subTest(form=form):
+                self.notifications = []
+                jobs.save_state('disk-tooling-alert', dict(pid=80846, consecutiveTimeouts=2,
+                                pendingKey=key, pendingText='fixed incident message'))
+                jobs.save_state('disk-tooling-pid', {'pid': 4321})
+                base = self.runner(absent=form == 'absent')
+                def run(cmd, **kwargs):
+                    if cmd[0] == '/bin/ps':
+                        if form == 'nonzero':
+                            return SimpleNamespace(returncode=1, stdout='')
+                        if form == 'timeout':
+                            raise subprocess.TimeoutExpired(cmd, 5)
+                        if form == 'restarted':
+                            return SimpleNamespace(returncode=0, stdout='88888 00:02 Ss /usr/libexec/storagekitd')
+                    return base(cmd, **kwargs)
+                with patch.object(collector.subprocess, 'Popen') as popen:
+                    collector.disk_tooling_probe(run, popen, lambda pid: True)
+                    collector.disk_tooling_probe(run, popen, lambda pid: True)
+                    popen.assert_not_called()
+                state = jobs.read_state('disk-tooling-alert')
+                self.assertEqual(state['pid'], 88888 if form == 'restarted' else 80846)
+                self.assertEqual(state['consecutiveTimeouts'], 0 if form == 'restarted' else 2)
+                self.assertEqual(len(self.notifications), 0 if form == 'restarted' else 1)
+                if self.notifications:
+                    self.assertEqual(self.notifications[0][-1], key)
+                    self.assertIn('fixed incident message', self.notifications[0])
+
+    def test_exception_paths_reap_and_do_not_break_collector(self):
+        for outcome in ('error', 'invalid'):
+            self.probe(outcome)
+            self.assertFalse(self.rows()[-1]['ok'])
+            self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
+            if outcome == 'error':
+                self.assertTrue(self.child.reaped)
+        with patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
+             patch.object(collector, 'state_path', side_effect=OSError('private state failure')):
+            collector.main()
+            collect.assert_called_once()
+        self.assertNotIn('private state failure', str(self.rows()))
+
+    def test_blocking_frame_forms(self):
+        from types import SimpleNamespace
+        root = jobs.state_path('disk-tooling-pid').parent
+        cases = [('    + 10 -[SKHelperClient syncAllDisks]', 'SKHelperClient'),
+                 ('    ! 10 +[SKManager initializedManager]', 'SKManager'),
+                 ('       10 DiskArbitration`waitForReply', 'DiskArbitration'),
+                 ('    | 10 DASessionCopyDiskDescription', 'DASession'),
+                 ('       10 mach_msg2_trap', 'unknown'),
+                 ('Binary Images: DiskArbitration', 'unknown')]
+        for frame, expected in cases:
+            with self.subTest(frame=frame):
+                def run(cmd, **kwargs):
+                    Path(cmd[-1]).write_text(frame+'\n')
+                    return SimpleNamespace(returncode=0)
+                self.assertEqual(collector.sample_child(4321, root, run)['blockedIn'], expected)
+
+    def test_stale_marker_does_not_skip_reused_unrelated_pid(self):
+        from types import SimpleNamespace
+        with patch.object(collector.os, 'kill'):
+            for command, expected in [('/usr/sbin/diskutil', True), ('/usr/bin/python3', False)]:
+                self.assertEqual(collector.alive(4321, lambda *a, **kw:
+                    SimpleNamespace(returncode=0, stdout=command)), expected)
+        with patch.object(collector.os, 'kill', side_effect=ProcessLookupError):
+            self.assertFalse(collector.alive(4321))
+
+    def test_etime_forms(self):
+        cases = [('00:01', 1), ('59:59', 3599), ('01:02:03', 3723),
+                 ('3-01:02:03', 262923), ('12-00:00:00', 1036800)]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(collector.elapsed_seconds(value), expected)
+
+    def test_disk_rollup_counts_skips_and_latest_by_timestamp(self):
+        now = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
+        for minute, timeout, skipped, blocked in [(1, False, False, None), (3, True, False, 'SKHelperClient'),
+                                                  (2, True, False, 'DASession'), (4, False, True, None)]:
+            props = dict(timedOut=timeout)
+            if skipped:
+                props['skipped'] = 'previous-probe-still-running'
+            if blocked:
+                props['blockedIn'] = blocked
+            toollog.emit('disk', 'event', 'disk.tooling_probe', now=now.replace(minute=minute),
+                         duration_ms=None if skipped else (20000 if timeout else 10), props=props)
+        result = rollup('2026-11-13')
+        self.assertEqual(result['diskTooling'], dict(probes=3, timeouts=2, maxDurationMs=20000,
+                                                    latestBlockedIn='SKHelperClient'))
+
+
+if __name__ == "__main__":
     unittest.main()
