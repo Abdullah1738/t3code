@@ -25,6 +25,59 @@ export const isNegativeOption = (label: string): boolean =>
     label.trim(),
   );
 
+const approvalAction = (text: string): string =>
+  text
+    .toLowerCase()
+    .replace(/\b(?:the|a|an)\b/g, "")
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim()
+    .replace(/^deployment\b/, "deploy")
+    .replace(/^installation\b/, "install")
+    .replace(/^payment\b/, "pay")
+    .replace(/^buy\b/, "purchase")
+    .replace(/^sharing\b/, "share")
+    .replace(/\s+/g, " ");
+
+const approvesGate = (
+  label: string,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  task: string,
+): boolean => {
+  const words = label
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  if (
+    isNegativeOption(words) ||
+    /\b(?:if|unless|after|before|once|when|pending|first|then)\b/i.test(words)
+  )
+    return false;
+  const command = words.replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "");
+  if (/^(?:yes|approve|approved|go|ok|okay|do it|proceed)$/i.test(command)) return true;
+  const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
+  const normalized = approvalAction(action);
+  if (normalized.replace(/\s+now$/, "") === approvalAction(task).replace(/\s+now$/, ""))
+    return true;
+  let verb: RegExp;
+  switch (gate) {
+    case "deploy":
+      verb = /^(?:deploy|install|restart|release)\b/i;
+      break;
+    case "money":
+      verb = /^(?:pay|purchase|buy|charge|refund|transfer)\b/i;
+      break;
+    case "secret":
+      verb = /^(?:share|provide|use|enter|set|rotate|reveal|send|show)\b/i;
+      break;
+  }
+  const operation = action !== command ? normalized : action;
+  const matched = verb.exec(operation)?.[0];
+  if (!matched) return false;
+  // Prefixes such as "Release notes" or "Show token permissions" are information, not consent.
+  return /^(?:\s+now)?$/i.test(operation.slice(matched.length));
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt">,
@@ -54,7 +107,7 @@ export const approvalProblem = (
       Boolean(answer.optionIds?.length) &&
       answer.optionIds!.every((id) => {
         const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && !isNegativeOption(option.label);
+        return option !== undefined && approvesGate(option.label, gate, subtask.text);
       }));
   return approved
     ? null

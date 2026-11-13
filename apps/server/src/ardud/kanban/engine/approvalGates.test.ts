@@ -6,6 +6,117 @@ import { inferGate, isNegativeOption } from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
+
+it.effect.each([
+  { task: "Purchase the license", neutral: "Show the price", approve: "Purchase now" },
+  { task: "Purchase the license", neutral: "Compare purchase options", approve: "Buy the license" },
+  { task: "Pay the invoice", neutral: "Check the invoice", approve: "Pay now" },
+  { task: "Refund the charge", neutral: "Review the refund", approve: "Refund now" },
+  { task: "Make a money transfer", neutral: "Show the balance", approve: "Transfer now" },
+  { task: "Deploy the release", neutral: "Show the deployment plan", approve: "Deploy now" },
+  { task: "Install the release", neutral: "Staging", approve: "Install the release" },
+  { task: "Restart LaunchAgent", neutral: "Check status first", approve: "Restart now" },
+  { task: "Share the token", neutral: "Explain the token permissions", approve: "Share the token" },
+  { task: "Use the API key", neutral: "Check the key", approve: "Use the API key" },
+  { task: "Purchase the license", neutral: "Purchase after review", approve: "Approve" },
+  { task: "Deploy the release", neutral: "Deploy if tests pass", approve: "Yes" },
+  { task: "Deploy the release", neutral: "Deploy later", approve: "Go" },
+  { task: "Deploy the release", neutral: "Release notes", approve: "Approve deployment" },
+  { task: "Deploy the release", neutral: "Deployment plan", approve: "Approve the deployment" },
+  { task: "Deploy the release", neutral: "Deploy details", approve: "Approve the release" },
+  {
+    task: "Share the token",
+    neutral: "Show token permissions",
+    approve: "Approve sharing the token",
+  },
+  { task: "Purchase the license", neutral: "Purchase details", approve: "Yes, purchase now" },
+  {
+    task: "Purchase the license",
+    neutral: "Approve purchase price",
+    approve: "Approve the purchase",
+  },
+  ...[",", ":", ";", ".", "-", "–", "—", ""].map((separator) => ({
+    task: "Deploy the release",
+    neutral: `Yes${separator} show the deployment plan`,
+    approve: `Yes${separator} deploy now`,
+  })),
+  ...[
+    { task: "Make a money transfer", neutral: "Show the balance" },
+    { task: "Deploy the release", neutral: "Release notes" },
+    { task: "Purchase the license", neutral: "Purchase details" },
+    { task: "Share the token", neutral: "Show token permissions" },
+  ].flatMap(({ task, neutral }) =>
+    ["", " now", " now.", " now!"].map((suffix) => ({
+      task,
+      neutral,
+      approve: `${task}${suffix}`,
+    })),
+  ),
+])("$neutral does not approve $task after a drop", ({ task, neutral, approve }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Action approval",
+          prompt: "Work",
+          subtasks: [{ text: task, owner: "evaluator" }],
+        },
+        owner,
+      );
+      yield* kanban.askOwner(
+        card.id,
+        { question: `${task}?`, blocking: false },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
+      for (const [id, optionId] of [
+        ["q2", "o1"],
+        ["q3", "o2"],
+      ] as const) {
+        yield* kanban.askOwner(
+          card.id,
+          { question: `${task}?`, blocking: false, options: [neutral, approve] },
+          evaluator,
+          "evaluator",
+        );
+        yield* kanban.answerAsk(
+          card.id,
+          id,
+          { verdict: "picked", optionIds: [optionId], revision: 0 },
+          owner,
+        );
+        if (optionId === "o1") {
+          for (const state of ["done", "skipped"] as const) {
+            const refused = yield* kanban
+              .markSubtask(card.id, "s1", state, "Owner chose information", evaluator, "evaluator")
+              .pipe(Effect.flip);
+            assert.include(refused.detail, "approval");
+          }
+          const verify = yield* kanban
+            .moveCard(card.id, "verified", "evaluator", evaluator)
+            .pipe(Effect.flip);
+          assert.include(verify.detail, "approval");
+          assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]?.state, "open");
+        } else {
+          const done = yield* kanban.markSubtask(
+            card.id,
+            "s1",
+            "done",
+            null,
+            evaluator,
+            "evaluator",
+          );
+          assert.strictEqual(done.subtasks[0]?.state, "done");
+        }
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect.each([owner, evaluator])(
   "$_tag drop cannot complete, skip, remove or verify a deploy gate",
   (dropper) =>

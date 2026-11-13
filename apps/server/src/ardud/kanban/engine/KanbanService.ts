@@ -9906,9 +9906,28 @@ const make = Effect.gen(function* () {
           answer = { ...checked, values: values as NonNullable<KanbanAskAnswer["values"]> };
         }
         const discussion = yield* cardDiscussionUnlocked(card.id);
-        // The ask's pick block shows the answer to clients that only read the discussion.
-        const asked = ask.seq === null ? null : yield* store.message(discussion.id, ask.seq);
-        if (asked?.blocks.some((block) => block._tag === "choice" && block.id === ask.id)) {
+        // Both the ask and its current confirmation show the same recorded decision.
+        const answerSeqs = new Set([
+          ask.seq,
+          ask.confirmation?.revision === kanbanAskRevision(ask) ? ask.confirmation.seq : null,
+        ]);
+        for (const seq of answerSeqs) {
+          if (seq === null || seq === undefined) continue;
+          const asked = yield* store.message(discussion.id, seq);
+          const block = asked?.blocks.find(
+            (entry): entry is Extract<KanbanBlock, { _tag: "choice" }> =>
+              entry._tag === "choice" && entry.id === ask.id,
+          );
+          if (!asked || !block) continue;
+          let display = Asks.blockAnswer(ask, answer);
+          if (display.choice.some((id) => !block.options.some((option) => option.id === id))) {
+            // The form can choose outside the confirmation's candidates; keep that decision visible.
+            const labels = Asks.pickOptions(ask)
+              .filter((option) => display.choice.includes(option.id))
+              .map((option) => option.label)
+              .join(", ");
+            display = { ...display, text: [labels, display.text].filter(Boolean).join("\n\n") };
+          }
           const key = actorKey(actor);
           const shown: KanbanMessage = {
             ...asked,
@@ -9916,7 +9935,7 @@ const make = Effect.gen(function* () {
               ...asked.answers.filter(
                 (entry) => !(entry.blockId === ask.id && actorKey(entry.by) === key),
               ),
-              { blockId: ask.id, by: actor, ...Asks.blockAnswer(ask, answer), at: answer.at },
+              { blockId: ask.id, by: actor, ...display, at: answer.at },
             ],
           };
           yield* store.putMessage(shown);
@@ -11471,7 +11490,14 @@ const make = Effect.gen(function* () {
                 revision: kanbanAskRevision(pick.ask),
               });
             }
-            // A closed ask's late pick, and an ask that takes words alone, go the way a reply does.
+            if (pick.ask.closedAt !== null && pick.ask.confirmation !== undefined) {
+              return failAnswer({
+                code: "conflict",
+                detail: `${ref} is closed. Its recorded answer cannot be changed by another pick.`,
+                revision: kanbanAskRevision(pick.ask),
+              });
+            }
+            // Older asks without confirmations retain their late discussion-reply route.
             if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {
               return answerChoice(discussionId, seq, blockId, choice, by, text);
             }
