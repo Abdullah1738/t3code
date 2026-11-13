@@ -467,12 +467,11 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     questions = load_questions(data)['questions'] if questions is None else questions
     current = next((q for q in questions if q['id'] == qid), None)
     current = current or (dict(charge, at=stamp(at)) if at is not None else None)
-    transaction = unmatched_id(current) if current and current.get('kind') == 'charge' else None
     # Descriptor variants of one alert may have different question IDs. Only
     # different transactions, including settled ones, compete for a receipt.
     rivals = [q for q in questions if q['id'] != qid and q.get('kind') == 'charge'
               and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])
-              and (not transaction or not moment(q.get('at')) or unmatched_id(q) != transaction)]
+              and (not current or not moment(q.get('at')) or not alert_alias(current, q))]
 
     def accepts(row, text):
         received = dt.datetime.fromtimestamp(row['ts'], TZ)
@@ -495,8 +494,11 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
 
 
 def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None):
-    return purchase_match(data, charge, at, qid) or charges.explain(
-        charge, at, now, deadline, find, said, receipt_ok=receipt_for_question(data, charge, qid, at=at))
+    questions = load_questions(data)['questions']
+    shared = alert_explanation(alert_explanations(questions), dict(charge, at=stamp(at), id=qid)) \
+        if charge['kind'] == 'charge' else None
+    return shared or purchase_match(data, charge, at, qid) or charges.explain(
+        charge, at, now, deadline, find, said, receipt_ok=receipt_for_question(data, charge, qid, questions, at))
 
 
 def norm_ref(text):
@@ -2094,6 +2096,29 @@ def unmatched_id(q):
     return 'unmatched-' + hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+def alert_explanations(questions):
+    evidence = {}
+    for q in questions:
+        if q.get('kind') == 'charge' and (q.get('explanation') or {}).get('verdict') in ('receipt', 'owner', 'subscription'):
+            evidence.setdefault(unmatched_id(q), []).append((q, q['explanation']))
+    return evidence
+
+
+def alert_alias(q, other):
+    # Separate questions with identical descriptors represent distinct bank
+    # alerts, even if their timestamps have the same precision.
+    return unmatched_id(q) == unmatched_id(other) and (q.get('id') == other.get('id') or
+            merchant_key(q['merchant']) != merchant_key(other['merchant']))
+
+
+def alert_explanation(evidence, q):
+    for source, result in evidence.get(unmatched_id(q), []):
+        if alert_alias(q, source):
+            # The source already owns its purchase-note claim; aliases reuse
+            # the evidence without trying to claim that note a second time.
+            return {k: v for k, v in result.items() if k != 'purchase'}
+
+
 def case_owner(case):
     if case.get('owner'):
         return case['owner']
@@ -2466,6 +2491,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     errors, hits, verdicts, looked, failed = [], {}, {}, set(), set()
     todo = []
     questions = load_questions(data)['questions']
+    explanations = alert_explanations(questions)
     cases, repaired = load(data)['cases'], set()
     for q in questions:
         before = dict(q)
@@ -2527,7 +2553,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 with within(each, LookupTimeout('out of time')):
                     matched = subscription_match(data, charge_of(q), at, record=True, end=each) if q.get('subscription_dated', False) else None
                     charge = charge_of(q)
-                    hit = matched or purchase_match(data, charge, at, q['id'])
+                    hit = alert_explanation(explanations, q) or matched or purchase_match(data, charge, at, q['id'])
                     receipt_ok = receipt_for_question(data, charge, q['id'], questions, at)
                     if not hit and active(q) and not q.get('case') and now - at >= UNMATCHED_AFTER \
                             and charges.card_owner(charge) == 'abdullah':
@@ -2553,8 +2579,23 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         return errors
     with Locked(data, 'questions', wait=lock_wait(end)) as book:
         cases = load(data)['cases']
+        explanations = alert_explanations(book['questions'])
+        # Finish evidence assignment for every alias before any question can
+        # open a case, regardless of lookup or question insertion order.
         for q in book['questions']:
-            if q['id'] not in looked and q['id'] not in repaired:
+            hit = hits.get(q['id'])
+            if not hit:
+                continue
+            key = unmatched_id(q)
+            purchase = hit.get('purchase')
+            if purchase and not bind_purchase(data, hit, parse_time(q['at']), q['id']):
+                failed.add(q['id'])
+                errors.append(f"{q['id']}: purchase note matched a different charge; recheck next run")
+                continue
+            explanations.setdefault(key, []).append((q, hit))
+        for q in book['questions']:
+            hit = alert_explanation(explanations, q) if q.get('kind') == 'charge' else None
+            if q['id'] not in looked and q['id'] not in repaired and not hit:
                 continue
             q['owner'] = charges.card_owner(charge_of(q))
             if q.get('status') in ('open', 'case', 'awaiting_answer') and q.get('asks'):
@@ -2563,20 +2604,15 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 q['checked'] = stamp(now)
                 q['unverified'] = q['id'] in failed
             recover_case(data, q, cases)
-            hit = hits.get(q['id'])
-            if hit and hit.get('purchase') and not bind_purchase(data, hit, parse_time(q['at']), q['id']):
-                q['unverified'] = True
-                errors.append(f"{q['id']}: purchase note matched a different charge; recheck next run")
-                continue
-            if q['id'] in hits and (active(q) or q.get('status') == 'case'):
+            if hit and (active(q) or q.get('status') == 'case'):
                 try:
-                    explain_question(data, q, hits[q['id']], 'check', now, end)
+                    explain_question(data, q, hit, 'check', now, end)
                 except CheckTimeout:
                     raise
                 except CaseError as e:
                     errors.append(f"{q['id']}: {e}")
             result = verdicts.get(q['id'])
-            if result and active(q) and not q.get('case') and not q.get('case_opened'):
+            if result and not hit and active(q) and not q.get('case') and not q.get('case_opened'):
                 note_why(q, result['why'], now)
                 if result['verdict'] == 'wait':
                     q['wait_until'] = result['until']

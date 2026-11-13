@@ -1253,6 +1253,102 @@ class UnmatchedCharges(Base):
         self.assertEqual([self.question(qid)['status'] for qid in (first, second)], ['closed', 'closed'])
         self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'closed')
 
+    def test_receipt_for_only_one_variant_explains_the_transaction_before_promotion(self):
+        # receipt arrival    insertion order       no unmatched case for either descriptor
+        for recorded in (False, True):
+            for explained_first in (False, True):
+                with self.subTest(recorded=recorded, explained_first=explained_first):
+                    label = f'{recorded}-{explained_first}'
+                    self.data, self.wd = self.tmp / label, self.tmp / ('wd-' + label)
+                    self.wd.mkdir()
+                    variant = ALERT.replace('ACME * EATS PENDING', 'SECONDVENDOR GROCERY')
+                    receipt = dict(RECEIPT, sender='Secondvendor <orders@secondvendor.example>',
+                                   subject='Your Secondvendor order', ts=at('2026-10-24T08:30').timestamp())
+                    def seed_variant():
+                        return mc.screen(variant, 'alerts@emiratesnbd.com', at('2026-10-24T08:00'),
+                                         at('2026-10-24T09:00'), data=self.data, said=nobody, item='mail:variant',
+                                         find=finder(receipt) if recorded else finder())['id']
+                    if explained_first:
+                        second, first = seed_variant(), self.seed_charge()
+                    else:
+                        first, second = self.seed_charge(), seed_variant()
+                    self.assertNotEqual(first, second)
+                    self.follow('2026-10-24T10:00', finder(receipt))
+                    self.assertEqual([self.question(qid)['status'] for qid in (first, second)], ['closed', 'closed'])
+                    self.assertEqual(mc.load(self.data)['cases'], [])
+                    self.follow('2026-10-24T10:15', finder())
+                    self.assertEqual(mc.load(self.data)['cases'], [])
+                    self.assertEqual(mc.unasked_candidates(self.data, at('2026-10-25T09:00')), [])
+
+    def test_stored_sibling_evidence_repairs_a_false_case_but_preserves_manual_work(self):
+        for worked in (False, True):
+            with self.subTest(worked=worked):
+                self.data, self.wd = self.tmp / str(worked), self.tmp / ('wd-' + str(worked))
+                self.wd.mkdir()
+                first = self.seed_charge()
+                second = self.seed_charge(ALERT.replace('ACME * EATS PENDING', 'SECONDVENDOR GROCERY'), item='sms:variant')
+                result = {'verdict': 'receipt', 'why': 'verified sibling receipt', 'msgs': 2, 'errors': []}
+                with mc.Locked(self.data, 'questions') as book:
+                    # The old check saved one explanation but promoted its alias independently.
+                    mc.explain_question(self.data, mc.find_question(book, second), result, 'triage', at('2026-10-24T09:00'))
+                    cid = mc.unmatched_from(self.data, mc.find_question(book, first), at('2026-10-24T10:00'))
+                if worked:
+                    mc.update(self.data, cid, {}, note='investigating', at=at('2026-10-24T10:05'))
+                self.follow('2026-10-24T11:00', finder())
+                self.assertEqual(self.question(first)['status'], 'closed')
+                self.assertEqual(self.question(first)['explanation']['msgs'], 2)
+                self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open' if worked else 'closed')
+
+    def test_stored_transaction_evidence_is_used_by_each_ask_entry_point(self):
+        # evidence kind            consumer       persisted source can be a closed alias
+        for verdict in ('receipt', 'owner', 'subscription'):
+            for entry in ('screen', 'ask', 'charge', 'daily'):
+                with self.subTest(verdict=verdict, entry=entry):
+                    label = verdict + entry
+                    self.data, self.wd = self.tmp / label, self.tmp / ('wd-' + label)
+                    self.wd.mkdir()
+                    first = self.seed_charge()
+                    second = self.seed_charge(ALERT.replace('ACME * EATS PENDING', 'SECONDVENDOR'), item='sms:alias')
+                    evidence = {'verdict': verdict, 'why': 'verified sibling evidence', 'errors': []}
+                    with mc.Locked(self.data, 'questions') as book:
+                        mc.explain_question(self.data, mc.find_question(book, second), evidence, 'triage', at('2026-10-24T09:00'))
+                    if entry == 'screen':
+                        result = mc.screen(ALERT, BANK, at('2026-10-24T08:00'), at('2026-10-24T10:00'),
+                                           data=self.data, find=finder(), said=nobody, item='imsg:auto')
+                        self.assertEqual(result['verdict'], 'explained')
+                    elif entry == 'ask':
+                        self.assertEqual(mc.ask(self.data, 'Yours?', qid=first, now=at('2026-10-24T10:00'),
+                                                find=finder(), said=nobody)[0], mc.DONT_ASK)
+                    elif entry == 'daily':
+                        mc.unasked(self.data, at('2026-10-25T09:00'), finder(), nobody)
+                    else:
+                        result = mc.explain_charge(self.data, mc.charge_of(self.question(first)),
+                                                   at('2026-10-24T08:00'), at('2026-10-24T10:00'),
+                                                   find=finder(), said=nobody, qid=first)
+                        self.assertEqual(result['verdict'], verdict)
+                    self.follow('2026-10-25T09:15', finder())
+                    self.assertEqual(self.question(first)['status'], 'closed')
+                    self.assertEqual(self.question(first)['asks'], [])
+                    self.assertEqual(mc.load(self.data)['cases'], [])
+
+    def test_shared_purchase_evidence_binds_once_and_never_explains_a_later_charge(self):
+        for claimed in (False, True):
+            with self.subTest(claimed=claimed):
+                self.data, self.wd = self.tmp / str(claimed), self.tmp / ('wd-' + str(claimed))
+                self.wd.mkdir()
+                first = self.seed_charge()
+                alias = self.seed_charge(ALERT.replace('ACME * EATS PENDING', 'ACME GROCERY'), item='sms:alias')
+                later = self.seed_charge(when='2026-10-24T08:01', item='sms:later')
+                mc.note_purchase(self.data, 'ACME EATS', '12.34', 'EUR', '1111', 'owner', 'thread:purchase',
+                                 now=at('2026-10-24T08:00'))
+                if claimed:
+                    mc.ask(self.data, 'Yours?', qid=first, now=at('2026-10-24T09:00'), find=finder(), said=nobody)
+                self.follow('2026-10-24T11:00', finder())
+                self.assertEqual([self.question(qid)['status'] for qid in (first, alias)], ['closed', 'closed'])
+                self.assertEqual(self.question(later)['status'], 'open')
+                self.assertEqual(mc.load(self.data)['purchases'][0]['question'], first)
+                self.assertEqual(len(mc.load(self.data)['cases']), 0 if not claimed else 1)
+
     def test_receipt_competitors_use_alert_identity_across_known_and_new_questions(self):
         charge = mc.charges.parse(ALERT, BANK)
         observed = at('2026-10-24T08:00')
@@ -1261,7 +1357,8 @@ class UnmatchedCharges(Base):
         forms = (
             ('descriptor', {'merchant': 'ACME GROCERY'}, False),
             ('utc', {'merchant': 'ACME GROCERY', 'at': '2026-10-24T04:00:00Z'}, False),
-            ('amount-shape', {'amount': '12.3400'}, False),
+            ('amount-shape', {'merchant': 'ACME GROCERY', 'amount': '12.3400'}, False),
+            ('same-descriptor', {}, True),
             ('other-card', {'card': '2222'}, True),
             ('next-second', {'at': '2026-10-24T08:00:01+04:00'}, True),
             ('next-charge', {'at': '2026-10-24T10:00:00+04:00'}, True),
