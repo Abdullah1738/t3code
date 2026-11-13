@@ -23,19 +23,67 @@ const hasReleaseGate = (text: string): boolean => {
   return false;
 };
 
+const deployKeyword = /\b(?:deploy\w*|install\w*|restart\w*|launchagents?|release(?:s|d)?)\b/i;
+const moneyKeyword =
+  /\b(?:pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i;
+const negatableMoneyKeyword = new RegExp(`${moneyKeyword.source}|\\b(?:paying|purchasing)\\b`, "i");
+const secretAction =
+  /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b/i;
+const secretKeyword =
+  /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
+const negatableSecretKeyword = /\b(?:secrets?|passwords?|credentials?|tokens?|keys?)\b/i;
+const secretMention = new RegExp(
+  `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
+  "i",
+);
+const withoutNegated = (
+  text: string,
+  keyword: RegExp,
+  options: { readonly boundary?: boolean; readonly object?: RegExp } = {},
+): string => {
+  const gap = String.raw`(?:[ \t]+|-(?!-))`;
+  // Unknown words stay gated: arbitrary fillers can turn "don't delay deployment" into permission.
+  const filler = String.raw`(?:a|an|the|any|new|old|existing|further|additional|more|actual|real|live|prod|production|dev|test|local|remote|planned|scheduled|required|manual|automatic|immediate|full|api|private|signing|ssh)${gap}`;
+  const qualifiers = String.raw`(?:(?:just|quite)${gap}yet${gap}|yet${gap}(?:${filler})?|(?:${filler}){0,2}?)`;
+  const negation = String.raw`(?:no|not|without|never|don[’']?t|do[ \t]+not|doesn[’']?t|won[’']?t|nothing[ \t]+to)`;
+  const object = options.object ? String.raw`(?:${gap}${qualifiers}${options.object.source})?` : "";
+  const precedingNegation = new RegExp(String.raw`\b${negation}${gap}$`, "i");
+  const sharedObject = new RegExp(
+    String.raw`${secretAction.source}[ \t]*(?:${filler}){0,2}?(?:(?:[,:([{"'“‘–—-]+|(?:and|but|or|then|also)\b)[ \t]*)*$`,
+    "i",
+  );
+  return text.replace(
+    new RegExp(
+      String.raw`\b(?:${negation}${gap}${qualifiers}|non${gap})(${keyword.source})(${object})`,
+      "gi",
+    ),
+    (match, action: string, directObject: string, offset: number) => {
+      const prefix = text.slice(0, offset);
+      if (precedingNegation.test(prefix)) return match;
+      const modifier = /^(?:(?:no|not)-|non\b)/i.test(match);
+      const replacement = options.boundary && !modifier && !sharedObject.test(prefix) ? ";" : " ";
+      // "No-restart deployment" negates the modifier, unlike "don't restart the deployment".
+      const nounModifier = /^no[ \t]/i.test(match) && !/ing$/i.test(action);
+      return modifier || nounModifier ? replacement + directObject : replacement;
+    },
+  );
+};
+
 export const inferGate = (text: string): KanbanSubtask["gate"] => {
-  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(text) || hasReleaseGate(text))
+  const deployText = withoutNegated(text, deployKeyword, { object: deployKeyword });
+  if (
+    /\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(deployText) ||
+    hasReleaseGate(deployText)
+  )
     return "deploy";
-  if (
-    /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
-  )
+  if (moneyKeyword.test(withoutNegated(text, negatableMoneyKeyword, { object: moneyKeyword })))
     return "money";
-  if (
-    /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b[^.;\r\n]{0,40}\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i.test(
-      text,
-    )
-  )
-    return "secret";
+  // Removing a negated action must not attach its object to an earlier unrelated action.
+  const secretText = withoutNegated(
+    withoutNegated(text, secretAction, { boundary: true }),
+    negatableSecretKeyword,
+  );
+  if (secretMention.test(secretText)) return "secret";
   return undefined;
 };
 
