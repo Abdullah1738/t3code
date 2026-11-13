@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
+                     file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -25,6 +25,43 @@ DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w
 # Template sizes for new boxes and resumes. The harness template is large too (2026-11-01): xlarge is picked per run
 # by auto_size for container stacks; 0 of ~2,300 harness-template runs in 13-31 Oct hit an OOM.
 DEFAULT_SIZE = {"crpko-harness": "large", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
+
+
+class PinnedLeaseError(OffboxError):
+    """A pin requires retaining the disk and its lease even when the backend cannot find it."""
+
+
+def pinned_until(con, box_id: str) -> float:
+    row = con.execute("SELECT pinned_until FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    return (row[0] or 0) if row else 0
+
+
+def check_deletion(con, box_id: str) -> None:
+    if kv_get(con, 'delete_pending:' + box_id) is not None:
+        raise OffboxError(f"{box_id} deletion is unresolved; keep and reuse are blocked. "
+                          f"Retry `offbox release {box_id} --delete` to confirm deletion of this same box", code=2)
+
+
+@contextlib.contextmanager
+def unpinned(con, box_id: str):
+    # Separate from the run's box lock: keep must work during a run, and its acknowledgement must serialize
+    # with deletion, including the network request. A stale pool/reaper selection cannot overrule a new pin.
+    with file_lock('pin-' + box_id, timeout=120):
+        until = pinned_until(con, box_id)
+        if until > now():
+            by = kv_get(con, 'pin_owner:' + box_id) or 'an unknown thread (legacy pin)'
+            raise PinnedLeaseError(f"{box_id} is pinned by {by} until {iso(until)}; "
+                                   "refusing to delete or forget it", code=2)
+        yield
+
+
+def forget_box(con, box_id: str, kind: str, detail: str) -> None:
+    with unpinned(con, box_id):
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        from . import allocation
+        allocation.clear_resume(con, box_id)
+        con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
+        event(con, box_id, kind, detail)
 
 
 def _rank(size: str | None) -> int:
@@ -753,9 +790,7 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
         if is_recipe:
             _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
         else:
-            con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-            con.commit()
-            event(con, box_id, "lease_gone", "supply out")
+            forget_box(con, box_id, "lease_gone", "supply out")
         raise
     except OffboxError as e:
         # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
@@ -797,11 +832,8 @@ class _ResumeExpired(Exception):
 
 def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    forget_box(con, box_id, "lease_expired", why)
     say(f"lease {box_id} expired ({why}); starting a new box")
-    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    from . import allocation
-    allocation.clear_resume(con, box_id)
-    event(con, box_id, "lease_expired", why)
 
 
 class DiskTooBig(OffboxError):
@@ -1146,6 +1178,7 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
+    check_deletion(con, row['box_id'])
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \
@@ -1209,9 +1242,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                                 code=EXIT_BUSY) from None
         raise
     if s is None or s.get("state") in ("error", "cancelled"):
-        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        allocation.clear_resume(con, box_id)
-        event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
+        forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
@@ -1489,13 +1520,13 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
-            from . import allocation
-            allocation.clear_resume(con, box_id)
             # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
-                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-                con.commit()
+                try:
+                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}")
+                except PinnedLeaseError as pin:
+                    say(str(pin))
             return False
         raise
     ssh_sync.close_master(box_id)
@@ -1508,17 +1539,24 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
     return True
 
 
-def delete_box(con, box_id: str, reason: str) -> bool:
+def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
     from .spend import record_final_usage
-    record_final_usage(con, box_id)
-    ssh_sync.close_master(box_id)
-    d = api.delete(box_id)
-    op = (d.get("operation") or {}).get("id")
-    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    from . import allocation
-    allocation.clear_resume(con, box_id)
-    clear_prune_hold(con, box_id)  # deleted: no remote process survives
-    event(con, box_id, "delete", f"{reason} op={op}")
+    with unpinned(con, box_id):
+        if usage:
+            record_final_usage(con, box_id)
+        ssh_sync.close_master(box_id)
+        # The lock cannot survive a killed client or a lost response. Fence keep/reuse durably before sending;
+        # an explicit retry may delete this same box again, but cannot pin new work onto the doomed disk.
+        kv_set(con, 'delete_pending:' + box_id, reason)
+        event(con, box_id, 'delete_pending', reason)
+        d = api.delete(box_id)
+        op = (d.get("operation") or {}).get("id")
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        from . import allocation
+        allocation.clear_resume(con, box_id)
+        con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
+        clear_prune_hold(con, box_id)  # deleted: no remote process survives
+        event(con, box_id, "delete", f"{reason} op={op}")
     return True
 
 
