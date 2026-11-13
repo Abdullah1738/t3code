@@ -7070,7 +7070,7 @@ const make = Effect.gen(function* () {
                             )
                           )
                             return false;
-                          const cards = yield* rawStore.cards(board.id);
+                          const cards = yield* rawStore.openCards(board.id);
                           const pools = Rules.maskDownPools(
                             yield* rawStore.pools(board.id),
                             new Set((yield* Ref.get(down)).keys()),
