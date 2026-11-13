@@ -7,7 +7,7 @@ set -eu
 name="${1:-}"
 shift || true
 case "$name" in
-  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive) ;;
+  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive) ;;
   ovnfs-recovery) exec "${0:A:h}/ovnfs-recovery/install.zsh" "$@" ;;
   offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
   local-helpers) exec "${0:A:h}/local-helpers/install.zsh" "$@" ;;  # files under ~/.local, see local-helpers/README.md
@@ -16,7 +16,7 @@ case "$name" in
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
   robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|ovnfs-recovery> [--dry-run]"; exit 2 ;;
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|ovnfs-recovery> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
@@ -60,6 +60,17 @@ if [[ "$name" == memory-system ]]; then
     install -m 755 "$recall_src" "$recall_dst"
   fi
   /bin/bash "${src}scripts/install_launchagent.sh" "$@"
+fi
+
+if [[ "$name" == robob-guard ]]; then
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "robob-guard: would copy bin/robob-install-hold, symlink ~/.local/bin/robob-install-hold and install LaunchAgent (not load it)"
+  else
+    mkdir -p "$dst/bin" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.local/state/robob-guard"
+    install -m 755 "${src}bin/robob-install-hold" "${dst}bin/robob-install-hold"
+    ln -sfn "${dst}bin/robob-install-hold" "$HOME/.local/bin/robob-install-hold"
+    install -m 644 "${src}scripts/com.ardud.robob-guard.plist" "$HOME/Library/LaunchAgents/com.ardud.robob-guard.plist"
+  fi
 fi
 
 if [[ "${1:-}" == "--dry-run" ]]; then
