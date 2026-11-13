@@ -354,10 +354,14 @@ class ClaudeSync:
     def _write(self, path, rep, pos, st, events, raw, lines_total, session_key):
         def txn():
             if raw:
+                # A native tombstone identifies the source line, independently
+                # of masking or the marker bytes eventually stored in raw.
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
-                     for line, ln in raw for safe_line in [mask_json_bytes(self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line))))]],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [mask_json_bytes(self.redactor.raw(
+                         line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)),
+                         capture_alias=tc.raw_sha1(mask_json_bytes(line))))]],
                 )
             if events:
                 self.mem.executemany(

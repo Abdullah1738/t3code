@@ -1,5 +1,6 @@
 """Card masking at recall persistence boundaries, using isolated synthetic data."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -381,6 +382,74 @@ class CardMaskCaptureTests(unittest.TestCase):
                              [('removed fixture', json.dumps({'redacted': True}))])
             raw = db.execute('SELECT raw FROM native_capture_raw').fetchone()[0]
             self.assertEqual(json.loads(raw), {'redacted': 'removed fixture'})
+
+    def test_native_tombstones_survive_card_masking_and_stale_replay(self):
+        import redact
+        import test_sync_claude as claude
+        import test_sync_codex as codex
+
+        token = 'fabricated-other-credential-quartz'
+        text = '753' + PAN + '1227' + '123 ' + token
+        # Both native providers can archive ID-free records. Codex also projects
+        # them, so an inserted earlier record must not bypass the native rule.
+        for provider in ['codex', 'claude']:
+            for identity in ['masked', 'original']:
+                for has_id in [False, True]:
+                    with self.subTest(provider=provider, identity=identity, has_id=has_id):
+                        f = codex.CodexSyncTest() if provider == 'codex' else claude.ClaudeSyncTest()
+                        f.setUp()
+                        try:
+                            if provider == 'codex':
+                                record = codex.msg('user', text)
+                                if has_id:
+                                    record['uuid'] = 'stable-fixture-record'
+                                prefix = [codex.meta(codex.CHILD_ID, codex.ROOT_ID)]
+                                source = Path(f.rollout)
+                                earlier = codex.msg('user', 'earlier clean row')
+                                session = codex.CHILD_ID
+                            else:
+                                record = claude.rec('stable-fixture-record', 'user', text)
+                                if not has_id:
+                                    record.pop('uuid')
+                                prefix = []
+                                source = Path(f.top)
+                                earlier = claude.rec('earlier-fixture', 'user', 'earlier clean row')
+                                session = claude.SESSION
+                            line = (json.dumps(record) + '\n').encode()
+                            source.parent.mkdir(parents=True, exist_ok=True)
+                            source.write_text(''.join(json.dumps(r) + '\n' for r in [*prefix, record]))
+                            f.sync()
+                            with sqlite3.connect(f.db) as db:
+                                archive = db.execute('SELECT sha1,raw FROM native_capture_raw WHERE instr(raw,?)>0',
+                                                     (token.encode(),)).fetchone()
+                                self.assertIsNotNone(archive)
+                                self.assertNotIn(PAN.encode(), archive[1])
+                                self.assertEqual(archive[0], hashlib.sha1(line).hexdigest())
+                                digest = hashlib.sha1(line if identity == 'original' else archive[1]).hexdigest()
+                                # Simulate both the old source-hash archive and
+                                # the card-masked archive, then create real rules.
+                                db.execute('UPDATE native_capture_raw SET sha1=? WHERE instr(raw,?)>0',
+                                           (digest, token.encode()))
+                            redact.redact_db(f.db, token.encode(), '[redacted fixture]')
+                            with sqlite3.connect(f.db) as db:
+                                rule = db.execute('SELECT marker FROM recall_redacted_ids WHERE kind=? AND value=?',
+                                                  ('native', json.dumps([provider, session, digest]))).fetchone()
+                                self.assertEqual(rule, ('[redacted fixture]',))
+                            for shifted in [False, True]:
+                                records = [*prefix, *([earlier] if shifted else []), record]
+                                source.write_text(''.join(json.dumps(r) + '\n' for r in records))
+                                f.sync()
+                                with sqlite3.connect(f.db) as db:
+                                    raw = b'\n'.join(row[0] for row in db.execute('SELECT raw FROM native_capture_raw'))
+                                    events = '\n'.join(row[0] for row in db.execute('SELECT content FROM episodic_events'))
+                                    self.assertNotIn(token.encode(), raw)
+                                    self.assertNotIn(PAN.encode(), raw)
+                                    self.assertNotIn(token, events)
+                                    self.assertNotIn(PAN, events)
+                                    if shifted:
+                                        self.assertIn('earlier clean row', events)
+                        finally:
+                            f.tearDown()
 
     def test_codex_ingest_masks_projection_and_raw_tool_input(self):
         import test_sync_codex as fixture

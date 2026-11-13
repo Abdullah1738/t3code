@@ -396,8 +396,10 @@ class CodexSync:
                     proj.feed(rec, line_no)  # seeded: identity/ordinal state only
                     self.stats["skipped_seeded"] += 1
                 else:
-                    for row in proj.feed(rec, line_no, line_sha=tc.raw_sha1(line)):
-                        batch_rows.append((proj.session_id, tc.raw_sha1(line), *row))
+                    source_sha = tc.raw_sha1(line)
+                    masked_sha = tc.raw_sha1(mask_json_bytes(line))
+                    for row in proj.feed(rec, line_no, line_sha=source_sha):
+                        batch_rows.append((proj.session_id, source_sha, masked_sha, *row))
                 session_key = tc.merge_session_key(session_key, proj.session_id)
             if batch_bytes >= tc.BATCH_BYTES:
                 self._write(path, key, rep, batch_end, st, proj, batch_rows, batch_raw, line_no,
@@ -424,10 +426,14 @@ class CodexSync:
 
         def txn():
             if raw:
+                # A native tombstone identifies the source line, independently
+                # of masking or the marker bytes eventually stored in raw.
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
-                     for line, ln in raw for safe_line in [mask_json_bytes(self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line))))]],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [mask_json_bytes(self.redactor.raw(
+                         line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)),
+                         capture_alias=tc.raw_sha1(mask_json_bytes(line))))]],
                 )
             if events:
                 self.mem.executemany(
@@ -435,9 +441,10 @@ class CodexSync:
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
                      [(SOURCE, event_session, tid, ts or int(time.time()), spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
-                      for event_session, capture_id, tid, spk, ctype, text, model, m, ts in events
+                      for event_session, capture_id, capture_alias, tid, spk, ctype, text, model, m, ts in events
                       for safe_content, safe_meta in [self.redactor.event(
-                          SOURCE, event_session, tid, text, json.dumps(m, ensure_ascii=False), capture_id=(SOURCE,capture_id))]],
+                          SOURCE, event_session, tid, text, json.dumps(m, ensure_ascii=False),
+                          capture_id=(SOURCE,capture_id), capture_alias=capture_alias)]],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tail,
