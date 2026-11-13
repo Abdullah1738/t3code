@@ -15,6 +15,19 @@ spec.loader.exec_module(installer)
 
 
 class InstallTests(unittest.TestCase):
+    def setUp(self):
+        producer_patch = patch.object(installer, 'AUTH_PRODUCERS', installer.SOURCE.parents[2] / 'app-api-cli')
+        producer_patch.start()
+        self.addCleanup(producer_patch.stop)
+
+    def test_missing_auth_producers_prevent_install_before_any_live_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live = Path(tmp) / 'live'
+            with patch.object(installer, 'AUTH_PRODUCERS', Path(tmp) / 'absent'), \
+                 self.assertRaisesRegex(RuntimeError, 'auth producers'):
+                installer.install(live=live, data=Path(tmp) / 'data')
+            self.assertFalse(live.exists())
+
     def test_upgrade_preserves_state_preferences_and_lock_inode(self):
         with tempfile.TemporaryDirectory() as tmp:
             live, data = Path(tmp) / 'live', Path(tmp) / 'data'

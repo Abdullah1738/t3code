@@ -15,7 +15,7 @@ MAGIC = re.compile(r'\b(?:(?:secure|magic|sign[- ]in|login) link|link to (?:sign
 SIGNIN_BUTTON = re.compile(r'(?:sign[- ]in|log[- ]?in)(?:\s+(?:to|with)\s+[\w .-]{1,50})?', re.I)
 NEW_LOGIN = re.compile(r'\b(?:new[- ](?:login|sign[- ]in)|(?:sign[- ]in|log(?:ged)?[- ]in|login) (?:to .{0,40}? )?(?:on|from|with) (?:a |an )?(?:new|unrecogni[sz]ed)|unrecogni[sz]ed (?:login|sign[- ]in))\b', re.I)
 DEVICE_NOTICE = re.compile(r'\b(?:new|unrecogni[sz]ed)[- ]device\b.{0,50}\b(?:registered|registration|added|linked|detected|connected|signed|logged|accessed)\b'
-                           r'|\b(?:registered|added|linked|detected|connected)\b.{0,50}\b(?:new|unrecogni[sz]ed)[- ]device\b', re.I)
+                           r'|\b(?:registered|added|linked|detected|connected|accessed|signed|logged)\b.{0,50}\b(?:new|unrecogni[sz]ed)[- ]device\b', re.I)
 SIM = re.compile(r'\b(?:e?sim(?: card)?[ -](?:(?:has been|was|is being|will be) )?(?:successfully )?(?:swap(?:ped|ping)?|replacement|replaced|change|changed|transfer(?:red)?|converted)|(?:swap|replace|convert|transfer|switch)(?:ped|d|ed|ment|ing)? .{0,40}\be?sim|sim\s*(?:to|→|->)\s*esim|port[- ]?out|number.{0,25}\bport(?:ed|ing))\b', re.I)
 MONEY = r'(?P<currency>AED|USD|SAR|QAR|BHD|OMR|KWD|EUR|GBP|INR|JPY|CHF|CAD|AUD|SGD)\s*(?P<amount>\d+(?:,\d{3})*(?:\.\d{1,3})?)(?!\d|[.,]\d)'
 DEBITS = [re.compile(p, re.I) for p in (
@@ -40,7 +40,7 @@ def expected(item, actions):
 
 def issued_auth(text):
     # A boilerplate "never share your OTP" footer does not mean a code was issued.
-    code = r'(?:\[code\]|(?=[A-Z0-9-]{4,12}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+)'
+    code = r'(?:\[code\]|\d{2,4}(?:\s+\d{2,4}){1,2}\b|(?=[A-Z0-9-]{4,12}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+)'
     connector = (r'(?:\s+(?:for|to)\s+(?:(?![.!?](?:\s|$)).){1,220}?(?:\bis\s*[:=-]?\s*|[:=]\s*)'
                  r'|\s*(?:is\s*)?[:=-]?\s*)')
     return bool(re.search(AUTH.pattern + connector + code, text, re.I)

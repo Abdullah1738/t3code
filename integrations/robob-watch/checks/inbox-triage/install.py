@@ -13,7 +13,9 @@ import tempfile
 SOURCE = Path(__file__).resolve().parent
 LIVE = Path.home() / '.local/share/robob-watch/watchers/inbox-triage'
 DATA = Path.home() / 'Documents/assistant/inbox-triage'
-SOURCE_FILES = ('triage.py', 'fastpath.py', 'check.sh', 'install.py', 'test_triage.py', 'test_urgent.py', 'test_fastpath.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
+AUTH_PRODUCERS = Path.home() / '.local/share/app-api-cli'
+PRODUCER_FILES = ('inbox_auth.py', 'careem_account_auth.py', 'commerce_journal.py')
+SOURCE_FILES = ('triage.py', 'fastpath.py', 'expected_auth.py', 'check.sh', 'install.py', 'test_triage.py', 'test_urgent.py', 'test_fastpath.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
 
 
 def atomic_copy(source, destination, executable=False):
@@ -31,6 +33,11 @@ def atomic_copy(source, destination, executable=False):
 
 
 def install(source=SOURCE, live=LIVE, data=DATA, cli='robob-watch'):
+    producers = source.parents[2] / 'app-api-cli'
+    if any(not (AUTH_PRODUCERS / name).is_file()
+           or (AUTH_PRODUCERS / name).read_bytes() != (producers / name).read_bytes()
+           for name in PRODUCER_FILES):
+        raise RuntimeError('Install the matching app-api-cli auth producers before enabling inbox-triage-fastpath')
     os.umask(0o077)
     live.mkdir(parents=True, exist_ok=True)
     data.mkdir(parents=True, exist_ok=True)

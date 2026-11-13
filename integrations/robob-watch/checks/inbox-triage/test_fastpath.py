@@ -31,12 +31,14 @@ CORPUS = [
     ('Apple <appleid@id.apple.com>', 'Your Apple Account was used to sign in to iCloud via a web browser.', 'login'),
     ('Google <no-reply@accounts.google.com>', 'New sign-in on Windows', 'login'),
     ('Mashreq', 'New device registered for mobile banking', 'login'),
+    ('Mashreq', 'Your account was accessed from a new device.', 'login'),
     ('WHOOP <support@whoop.com>', 'Your sign-in code is 123456', 'auth'),
     ('Claude <support@anthropic.com>', 'Here is your secure link to Claude: https://example.test/secret', 'auth'),
     ('Bank', 'Your OTP is 654321. Do not share.', 'auth'),
     ('Bank', 'A1B2C3 is your verification code.', 'auth'),
     ('Bank', 'Your verification code [code]', 'auth'),
     ('Bank', 'Your verification code is: 123456.', 'auth'),
+    ('Bank', 'Your verification code is 123 456. Do not share it.', 'auth'),
     ('Bank', 'Your OTP for login is 123456.', 'auth'),
     ('Bank', 'Your OTP for authentication: A1B2C3.', 'auth'),
     ('Bank', 'Your OTP for online log in is: 123456.', 'auth'),
@@ -84,6 +86,27 @@ CORPUS = [
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_numeric_otp_grouping_and_expected_actions(self):
+        for code in ('123456', '123 456', '123\u00a0456', '123\u202f456', '12 34 56', '1234 5678'):
+            for body in (f'Your verification code is {code}. Do not share it.',
+                         f'{code} is your OTP.', f'Use {code} to sign in.'):
+                with self.subTest(code=code, body=body):
+                    msg = item('Bank', body)
+                    self.assertEqual(t.fastpath.classify(msg)['kind'], 'auth')
+                    self.assertIsNone(t.fastpath.classify(msg, [{'sender': 'bank', 'at': 990}]))
+                    for clean in (t.clean, lambda value: t.clean_lines(value, 500)):
+                        self.assertNotIn(code, clean(body))
+                    self.assertNotIn(code, t.redact_item(dict(msg))['preview'])
+
+    def test_device_notice_verb_order_and_sender_family(self):
+        for sender in ('Mashreq', 'WioPersonal', 'EmiratesNBD', 'Apple', 'Google'):
+            for text in ('Your account was accessed from a new device.',
+                         'A new device accessed your account.',
+                         'Your account was accessed from an unrecognized device.',
+                         'You signed in from a new device.', 'You logged in from a new device.'):
+                with self.subTest(sender=sender, text=text):
+                    self.assertEqual(t.fastpath.classify(item(sender, text))['kind'], 'login')
+
     def test_corpus(self):
         for sender, text, kind in CORPUS:
             with self.subTest(sender=sender, text=text):
@@ -327,6 +350,31 @@ if sys.argv[1] == 'send':
 
     def notifications(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def test_spaced_otp_unexpected_alerts_once_and_expected_stays_batch(self):
+        for n, code in enumerate(('123 456', '123\u00a0456', '12 34 56', '1234 5678')):
+            with self.subTest(code=code):
+                msg = item('Bank', f'Your verification code is {code}. Do not share it.', id=f'imsg:spaced{n}')
+                before = len(self.notifications())
+                self.run_items([msg])
+                self.run_items([msg])
+                self.assertEqual(len(self.notifications()) - before, 2)
+                for call in self.notifications()[before:]:
+                    self.assertNotIn(code, call[call.index('--text') + 1])
+        with patch.object(t.time, 'time', return_value=990):
+            t.expect_auth('Bank')
+        before = len(self.notifications())
+        self.run_items([item('Bank', 'Your verification code is 123 456.', id='imsg:expected-spaced')])
+        self.assertEqual(len(self.notifications()), before)
+
+    def test_access_before_device_alerts_both_once(self):
+        for n, text in enumerate(('Your account was accessed from a new device.',
+                                  'You signed in from a new device.', 'You logged in from a new device.')):
+            msg = item('Mashreq', text, id=f'imsg:access{n}')
+            before = len(self.notifications())
+            self.run_items([msg])
+            self.run_items([msg])
+            self.assertEqual(len(self.notifications()) - before, 2)
 
     def test_button_mail_collects_and_alerts_once_without_persisting_target(self):
         helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))

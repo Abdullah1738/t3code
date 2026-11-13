@@ -5,6 +5,7 @@ An unknown send retains account ownership; a different flow ID cannot escape it.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
 import order_card
+import inbox_auth
 from contextlib import contextmanager
 import hashlib
 import json
@@ -394,6 +395,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                 fail('JOURNAL_PAYMENT_ALREADY_REPORTED')
         db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                    (flow_id, operation, kind, request_hash, 'MAY_HAVE_SENT', time.time()))
+        if financial and flow['app'] == 'noon':
+            inbox_auth.expect_payment(order_card.LAST4)
     return True
 
 
