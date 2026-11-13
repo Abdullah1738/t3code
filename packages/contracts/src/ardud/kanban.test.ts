@@ -92,6 +92,14 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
 const decodeCard = Schema.decodeUnknownSync(KanbanCard);
 const encodeCard = Schema.encodeSync(KanbanCard);
 
+it.each([undefined, "2026-11-13T10:00:00.000Z"])(
+  "preserves a detached steer signal through storage (%s)",
+  (detachedSteerAt) => {
+    const stored = JSON.parse(JSON.stringify({ ...card("a"), detachedSteerAt }));
+    expect(encodeCard(decodeCard(stored))).toEqual(stored);
+  },
+);
+
 describe("KanbanCard retries", () => {
   const stored = JSON.parse(JSON.stringify(card("a")));
 
