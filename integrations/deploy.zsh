@@ -8,7 +8,6 @@ name="${1:-}"
 shift || true
 case "$name" in
   router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive) ;;
-  ovnfs-recovery) exec "${0:A:h}/ovnfs-recovery/install.zsh" "$@" ;;
   9router-reauth) exec /usr/bin/python3 "${0:A:h}/robob-watch/checks/9router-claude-reauth/install.py" "$@" ;;
   offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
   local-helpers) exec "${0:A:h}/local-helpers/install.zsh" "$@" ;;  # files under ~/.local, see local-helpers/README.md
@@ -17,7 +16,7 @@ case "$name" in
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
   robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|ovnfs-recovery> [--dry-run]"; exit 2 ;;
+  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
