@@ -1220,7 +1220,13 @@ def save_run_state(run_id, **values):
 def restore_run_state(row):
     """A remote handle/result survives a failed SQLite write; wait and reap can repair the row."""
     saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
-    return {**dict(row), **saved}
+    restored = {**dict(row), **saved}
+    # A competing finisher can commit before a blocked writer saves its result to the file.
+    # Keep recoverable handles, but a known terminal result already committed to SQLite wins.
+    if terminal_result(row):
+        for key in ('status', 'exit_code', 'end_at'):
+            restored[key] = row[key]
+    return restored
 
 
 def terminal_result(row):

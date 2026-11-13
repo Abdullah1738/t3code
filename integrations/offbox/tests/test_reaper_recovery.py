@@ -89,6 +89,55 @@ class ReaperRecovery(Isolated):
                 runs.finish(rid, 0 if code is not None else None)
                 self.assertEqual(self.result(rid), (status, code))
 
+    def test_settled_database_result_wins_over_conflicting_recovery(self):
+        for status, code in RESULTS + [('lost', 17)]:
+            for saved_status, saved_code in RESULTS:
+                with self.subTest(status=status, saved_status=saved_status):
+                    rid = f'conflict-{status}-{saved_status}'
+                    self.con.execute('INSERT INTO runs(run_id,status,exit_code,end_at) VALUES (?,?,?,10)',
+                                     (rid, status, code))
+                    runs.save_run_state(rid, status=saved_status, exit_code=saved_code, end_at=20,
+                                        box_id='saved-box', process_id=7, command_id='saved-command')
+                    row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                    restored = runs.restore_run_state(row)
+                    self.assertEqual((restored['status'], restored['exit_code'], restored['end_at']), (status, code, 10))
+                    self.assertEqual((restored['box_id'], restored['process_id'], restored['command_id']),
+                                     ('saved-box', 7, 'saved-command'))
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(misc.wait(rid, None), code)
+                    self.assertEqual(self.result(rid), (status, code))
+
+    def test_kill_finish_contention_keeps_concurrent_committed_exit(self):
+        self.box('kill-race', used=common.now())
+        for code in (0, 17):
+            with self.subTest(code=code):
+                rid = f'kill-race-{code}'
+                self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,process_id,docker) "
+                                 "VALUES (?,'kill-race','running','fg',7,0)", (rid,))
+                def finish_during_kill(box, pid):
+                    # kill_run already read the running row, but the foreground finisher wins before its reply.
+                    runs.finish(rid, code)
+                    self.assertEqual(self.result(rid), ('done' if code == 0 else 'failed', code))
+                    self.con.execute('BEGIN IMMEDIATE')
+                    return {}
+                try:
+                    with patch.object(api, 'cmd_kill', side_effect=finish_during_kill) as kill, \
+                            patch.object(api, 'cmd_status', return_value={'running':False, 'exitCode':143}), \
+                            patch.object(common, 'DB_TIMEOUT', .001), patch.object(common.time, 'sleep'), \
+                            patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(misc.kill_run(rid), 0)
+                        kill.assert_called_once_with('kill-race', 7)
+                        saved = common.read_json(runs.LOGS_DIR / f'{rid}.state.json', {})
+                        self.assertEqual((saved['status'], saved['exit_code']), ('killed', 143))
+                finally:
+                    self.con.rollback()
+                for _ in range(2):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(misc.wait(rid, None), code)
+                self.assertEqual(self.result(rid), ('done' if code == 0 else 'failed', code))
+                self.assertEqual(lease.active_runs(self.con, 'kill-race'), 0)
+
     def test_top_level_recovery_dry_run_does_not_write(self):
         self.pending_result('dry-result', 'local_error', 93, age=3 * 3600)
         with patch.object(api, 'list_boxes', return_value=[]):
