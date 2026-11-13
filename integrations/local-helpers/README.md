@@ -129,11 +129,10 @@ Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet pee
 `QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
 Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
 
-Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
-nvm before `~/.local/bin`. Until approved PATH changes and installation, call
-the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
-`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
-archive from this change; shipping both and fixing PATH is a separate task.
+Agent PATHs put `~/.local/share/quint-guard/bin` immediately after the blocker dirs, before nvm; its only tool is a symlink to `~/.local/bin/quint`.
+The shared shell fence refuses direct npm/Node/package-runner `quint verify`; use `/Users/ardud/.local/bin/quint` or explicitly set `QUINT_ALLOW_VULNERABLE_APALACHE=1`.
+Bare `quint` relies on the managed PATH when the hook cannot see the executing shell's PATH. Other subcommands pass through; the shared `~/.quint` cache is untouched.
+Offbox has no installed wrapper or pinned archive from this change; shipping both remains a separate task.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads

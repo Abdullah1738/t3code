@@ -76,6 +76,35 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(rc, 0, out.getvalue())
             return out.getvalue()
 
+    def test_quint_guard_path_in_all_generated_homes(self) -> None:
+        self.run_gen()
+        paths = [json.loads((self.claude / "settings.json").read_text())["env"]["PATH"]]
+        for harness in ["codex", "codex-cu"]:
+            paths.append(tomllib.loads((self.root / harness / "config.toml").read_text())["shell_environment_policy"]["set"]["PATH"])
+        expected = ":".join(self.manifest()["shellPathPrefix"] + self.manifest()["shellPath"])
+        fixture = self.tmp / "path-fixture"
+        raw = fixture / ".nvm/versions/node/v26.2.0/bin/quint"
+        wrapper = fixture / ".local/bin/quint"
+        link = fixture / ".local/share/quint-guard/bin/quint"
+        for executable in [raw, wrapper]:
+            write(executable, "#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+        link.parent.mkdir(parents=True)
+        link.symlink_to(wrapper)
+        for path in paths:
+            self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
+            self.assertEqual(path, expected)
+            entries = path.split(":")
+            self.assertEqual(entries[:3], [
+                "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
+                "/Users/ardud/.local/share/harness-hooks/coord-blockers",
+                "/Users/ardud/.local/share/quint-guard/bin",
+            ])
+            for i, entry in enumerate(entries):
+                if "/.nvm/" in entry:
+                    self.assertGreater(i, 2)
+                    self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
+
     def run_check(self, manifest: dict | None = None) -> tuple[int, str]:
         with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
             out = io.StringIO()
@@ -974,7 +1003,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall", "toollog"})
+                             {"hook-adapters", "live-database", "rootwide-search", "quint-verify", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())
