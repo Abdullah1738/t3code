@@ -9500,36 +9500,7 @@ const make = Effect.gen(function* () {
         if (editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)) return card;
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
-        for (const requested of [
-          ...(patch.model ? [patch.model] : []),
-          ...(patch.models ?? []).map((entry) => entry.model),
-        ]) {
-          const routed = yield* canonicalModel(requested);
-          if (routed.instanceId !== requested.instanceId) {
-            return yield* failWith(
-              "invalid",
-              `Asked for ${Rules.poolKey(requested)}; selection routing rewrites it to ${Rules.poolKey(routed)}. Card keeps ${Rules.poolKey(card.model)}; request the routed model explicitly.`,
-            );
-          }
-        }
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
-        for (const requested of [
-          ...(patch.model ? [patch.model] : []),
-          ...(patch.models ?? []).map((entry) => entry.model),
-        ]) {
-          const resolved = yield* poolModel(card.boardId, requested);
-          // A split prefix (opus + cx/model) is an accepted model-name alias.
-          if (
-            resolved.instanceId !== requested.instanceId &&
-            resolved.model !== `${requested.instanceId}/${requested.model}`
-          ) {
-            return yield* failWith(
-              "invalid",
-              `Asked for ${Rules.poolKey(requested)}; pool alias resolution selects ${Rules.poolKey(resolved)}. Card keeps ${Rules.poolKey(card.model)}; request the pool's harness explicitly.`,
-            );
-          }
-        }
-
         const model = models
           ? // A card with a work thread stays on its pool while the list still has it; the list's
             // entry carries the pool's variant, so a variant change sticks.
