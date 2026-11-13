@@ -243,6 +243,10 @@ it("nightly review puts information gaps before improvements and limits proposal
   for (const text of [
     "last 24 hours",
     "analytics_read",
+    "board_activity first",
+    "board_get with since",
+    "compact: true",
+    "limit: 40",
     "todo at P3",
     "settled cards",
     "at most 5",
