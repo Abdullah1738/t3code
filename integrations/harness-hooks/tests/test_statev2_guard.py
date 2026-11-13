@@ -869,7 +869,7 @@ class GuardTests(unittest.TestCase):
         (home / '.nvm/versions/node/v26.0.0/bin/node').write_text('')
         environment = {'HOME': str(home), 'BASH_ENV': str(helper / 'bash-env.sh'),
                        'ROBOB_REPO_PREVIOUS_BASH_ENV': '', 'ROBOB_REPO_NODE_HELPER': '',
-                       'ROBOB_REPO_NODE_PYTHON': '', 'NVM_DIR': '', '_repo_node_added_node': '', 'ZDOTDIR': ''}
+                       'ROBOB_REPO_NODE_PYTHON': '', 'NVM_DIR': str(home / '.nvm'), '_repo_node_added_node': '', 'ZDOTDIR': ''}
         return home, helper, environment
 
     def write_plain_subpath_fixture(self):
@@ -1052,26 +1052,86 @@ class GuardTests(unittest.TestCase):
                     if path.is_symlink() or path.exists():
                         path.unlink()
                 made.clear()
-        # The selector walks from the cwd up to the repo root.
+        # The selector walks from each cwd (here deep/a/b and its HERE, deep/a)
+        # up to the repo root.
+        deep = self.root / 'deep/a/b'
+        self.write('deep/a/b/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
         with patch.dict(os.environ, environment):
-            self.assertIsNone(guard.classify('bash fixture.sh', str(self.root / 'tmp')))
-            link(self.root / 'package.json', marker)
+            self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
+            link(self.root / 'deep/package.json', marker)
             try:
-                self.assertEqual(guard.classify('bash fixture.sh', str(self.root / 'tmp')), SCRIPT)
-                (self.root / '.git').mkdir()
-                (self.root / 'tmp/.git').mkdir()
-                # A repo root below the link stops the walk before it.
-                self.assertIsNone(guard.classify('bash fixture.sh', str(self.root / 'tmp')))
+                self.assertEqual(guard.classify('bash fixture.sh', str(deep)), SCRIPT)
+                (deep / '.git').mkdir()
+                (deep.parent / '.git').mkdir()
+                # Repo roots below the link stop both walks before it.
+                self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
             finally:
                 made.pop().unlink()
-                (self.root / '.git').rmdir()
-                (self.root / 'tmp/.git').rmdir()
+                (deep / '.git').rmdir()
+                (deep.parent / '.git').rmdir()
         # The command must not create selector inputs on the way in.
         with patch.dict(os.environ, environment):
             for command in ('ln -s x package.json; bash tmp/fixture.sh', 'cp a .nvmrc && bash tmp/fixture.sh',
                             'COREPACK_HOME=/tmp/c bash tmp/fixture.sh'):
                 with self.subTest(command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs_round_two(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        # The pinned cd wrapper refreshes in "$(dirname "$0")/..", the fixture's HERE.
+        nested = self.write('nested/tests/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
+        nested_commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(nested),
+                           'offbox run --bg -- bash nested/tests/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for command in nested_commands:
+                with self.subTest(case='nested-clean', command=command):
+                    self.assertIsNone(self.classify(command))
+            (self.root / 'nested/.nvmrc').symlink_to(marker)
+            try:
+                for command in nested_commands:
+                    with self.subTest(case='nested-here-nvmrc-live', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+                # Run from inside the script dir too: HERE is then the cwd's parent.
+                with self.subTest(case='nested-here-from-tests'):
+                    self.assertEqual(guard.classify('bash fixture.sh', str(self.root / 'nested/tests')), SCRIPT)
+            finally:
+                (self.root / 'nested/.nvmrc').unlink()
+        # select.py uses get(name, default), so empty or relative roots follow the cwd.
+        (self.root / 'alias').mkdir()
+        (self.root / 'alias/default').symlink_to(marker)
+        (self.root / 'rel/alias').mkdir(parents=True)
+        (self.root / 'rel/alias/default').symlink_to(marker)
+        (self.root / 'v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        (self.root / 'rel/v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'rel/v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        for name in ('NVM_DIR', 'COREPACK_HOME'):
+            for value in ('', 'rel', './rel'):
+                with patch.dict(os.environ, {**environment, name: value}):
+                    for command in commands:
+                        with self.subTest(name=name, value=value, command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+        # Lookups by name still work in a directory that cannot be listed.
+        if os.geteuid() != 0:
+            alias = home / '.nvm/alias'
+            alias.mkdir(parents=True)
+            (alias / 'default').symlink_to(marker)
+            alias.chmod(0o111)
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case='unlistable-alias', command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+            finally:
+                alias.chmod(0o755)
+            (alias / 'default').unlink()
+            (alias / 'default').write_text('v26\n')
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case='listable-alias-clean', command=command):
+                        self.assertIsNone(self.classify(command))
 
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off
