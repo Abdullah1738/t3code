@@ -898,9 +898,13 @@ const handlers = {
           return yield* invalid("Pass slug or slugs, not both.");
         }
         const board = yield* boardFor(service, caller, input.boardId, true);
-        const pages = yield* service.wiki(board.id);
+        const pages = yield* service.wiki(board.id, {
+          slug: input.slug,
+          section: input.section,
+          outline: input.outline,
+        });
         if (input.slug !== undefined) {
-          return { pages: pages.filter((page) => page.slug === input.slug) };
+          return { pages };
         }
         if (input.slugs !== undefined) {
           const bySlug = new Map(pages.map((page) => [page.slug, page]));
@@ -1192,10 +1196,12 @@ const handlers = {
         const board = yield* boardFor(service, caller, input.boardId);
         const page = yield* service.writeWiki(
           board.id,
-          { slug: input.slug, title: input.title, body: input.body },
+          { slug: input.slug, title: input.title, body: input.body, edits: input.edits },
           caller.actor,
         );
-        return { page };
+        if (input.edits === undefined) return { page };
+        const { body, ...metadata } = page;
+        return { page: { ...metadata, bodyLength: body.length, edits: input.edits.length } };
       }),
     ),
   ),

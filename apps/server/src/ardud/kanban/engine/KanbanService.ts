@@ -115,6 +115,7 @@ import * as Waits from "./waits.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
 import * as Pages from "./messagePages.ts";
+import { wikiOutline, wikiSection } from "./wikiSections.ts";
 import * as BoardReplies from "./boardReplies.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import { KanbanThreads, KanbanThreadError, type KanbanThreadView } from "./threads.ts";
@@ -769,10 +770,26 @@ export interface KanbanServiceShape {
 
   readonly wiki: (
     boardId: KanbanBoard["id"],
-  ) => Effect.Effect<ReadonlyArray<KanbanWikiPage>, KanbanError>;
+    options?: {
+      readonly slug?: string | undefined;
+      readonly section?: string | undefined;
+      readonly outline?: boolean | undefined;
+    },
+  ) => Effect.Effect<ReadonlyArray<KanbanWikiPage & { readonly note?: string }>, KanbanError>;
   readonly writeWiki: (
     boardId: KanbanBoard["id"],
-    page: { readonly slug: string; readonly title: string; readonly body: string },
+    page: {
+      readonly slug: string;
+      readonly title?: string | undefined;
+      readonly body?: string | undefined;
+      readonly edits?:
+        | ReadonlyArray<{
+            readonly oldString: string;
+            readonly newString: string;
+            readonly count?: number | undefined;
+          }>
+        | undefined;
+    },
     actor: KanbanActor,
   ) => Effect.Effect<KanbanWikiPage, KanbanError>;
 
@@ -14193,14 +14210,44 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
+  const wiki: KanbanServiceShape["wiki"] = Effect.fn("KanbanService.wiki")(
+    function* (boardId, options) {
+      if (
+        (options?.section !== undefined || options?.outline === true) &&
+        options?.slug === undefined
+      )
+        return yield* failWith("invalid", "section and outline require slug");
+      if (options?.section !== undefined && options?.outline === true)
+        return yield* failWith("invalid", "Pass section or outline, not both.");
+      const pages = yield* readDb(store.wiki(boardId));
+      if (options?.slug === undefined) return pages;
+      const page = pages.find((page) => page.slug === options.slug);
+      if (page === undefined) return [];
+      if (options.outline) return [{ ...page, body: wikiOutline(page.body) }];
+      if (options.section === undefined) return [page];
+      const section = wikiSection(page.body, options.section);
+      if (!section.found)
+        return yield* failWith(
+          "invalid",
+          `no wiki section ${options.section}; headings: ${section.headings.join(", ")}`,
+        );
+      return [
+        {
+          ...page,
+          body: section.body,
+          ...(section.note === undefined ? {} : { note: section.note }),
+        },
+      ];
+    },
+  );
+
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
     guard(
       "wiki.write",
       Effect.gen(function* () {
-        yield* checkText([
-          ["title", page.title],
-          ["wiki body", page.body],
-        ]);
+        if ((page.body === undefined) === (page.edits === undefined))
+          return yield* failWith("invalid", "Pass exactly one of body or edits.");
+        if (page.title !== undefined) yield* checkText([["title", page.title]]);
         yield* boardOf(boardId);
         const slug = page.slug
           .trim()
@@ -14208,11 +14255,41 @@ const make = Effect.gen(function* () {
           .replace(/[^a-z0-9]+/g, "-")
           .replace(/^-|-$/g, "");
         if (!slug) return yield* failWith("invalid", "a wiki page needs a slug");
+        // boardOf acquires the board's exclusive guard until this operation returns;
+        // both full replacements and edits read and write under that same guard.
+        const current =
+          page.edits !== undefined || page.title === undefined
+            ? (yield* store.wiki(boardId)).find((page) => page.slug === slug)
+            : undefined;
+        let body = page.body ?? current?.body ?? "";
+        if (page.edits !== undefined) {
+          if (current === undefined)
+            return yield* failWith("invalid", `no wiki page ${slug}; create it with body`);
+          if (page.edits.length < 1 || page.edits.length > 50)
+            return yield* failWith("invalid", "edits must contain 1–50 entries");
+          for (const [index, edit] of page.edits.entries()) {
+            const expected = edit.count ?? 1;
+            if (edit.oldString.length === 0 || !Number.isSafeInteger(expected) || expected < 1)
+              return yield* failWith(
+                "invalid",
+                `edit ${index + 1} needs a non-empty oldString and a positive integer count`,
+              );
+            const parts = body.split(edit.oldString);
+            const found = parts.length - 1;
+            if (found !== expected)
+              return yield* failWith(
+                "invalid",
+                `edit ${index + 1}: expected ${expected}, found ${found} occurrences of "${edit.oldString.slice(0, 80)}"`,
+              );
+            body = parts.join(edit.newString);
+          }
+        }
+        yield* checkText([["wiki body", body]]);
         const next: KanbanWikiPage = {
           boardId,
           slug,
-          title: page.title.trim() || slug,
-          body: page.body,
+          title: page.title === undefined ? (current?.title ?? slug) : page.title.trim() || slug,
+          body,
           updatedAt: yield* nowIso,
           updatedBy: actor,
         };
@@ -14841,7 +14918,7 @@ const make = Effect.gen(function* () {
     answer,
     markRead,
     markReadSoon,
-    wiki: (boardId) => readDb(store.wiki(boardId)),
+    wiki,
     writeWiki,
     endSetup: (boardId, actor) => guard("board.endSetup", endSetupUnlocked(boardId, actor)),
     pauseBoard: (boardId, pause, actor, callerAncestors = []) =>

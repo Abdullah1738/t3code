@@ -692,12 +692,14 @@ const DiscussionRead = tool(
 const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
-  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them.",
+  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them. With slug, section reads the first matching ATX heading (case-insensitive) and its content through the next same-or-higher heading. outline: true returns heading lines with character offsets. Headings in code fences are ignored. section and outline require slug and cannot be combined.",
   {
     slug: Schema.optional(TrimmedNonEmptyString),
     slugs: Schema.optional(
       Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
     ),
+    section: Schema.optional(TrimmedNonEmptyString),
+    outline: Schema.optional(Schema.Boolean),
     boardId: BoardRef,
   },
   {
@@ -919,12 +921,21 @@ const DiscussionCreate = tool(
 const WikiWrite = tool(
   "wiki_write",
   "Write a wiki page",
-  "Evaluators: create or replace a wiki page of lessons future threads should know.",
+  "Evaluators: create or replace a page with body, or change an existing page with edits (1–50). Pass exactly one of body or edits. Each oldString must appear exactly count times (default 1) in the page as left by the edits before it; all edits apply or none do. title is kept when left out (new pages default to slug). Edits return page metadata, bodyLength and edits count without the body; body writes return the full page.",
   {
     boardId: BoardRef,
     slug: TrimmedNonEmptyString,
-    title: RawBoardText,
-    body: Schema.String,
+    title: Schema.optional(RawBoardText),
+    body: Schema.optional(Schema.String),
+    edits: Schema.optional(
+      Schema.Array(
+        Schema.Struct({
+          oldString: Schema.String.check(Schema.isMinLength(1)),
+          newString: Schema.String,
+          count: Schema.optional(PositiveInt),
+        }),
+      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+    ),
   },
   { page: Record },
   { readonly: false },
