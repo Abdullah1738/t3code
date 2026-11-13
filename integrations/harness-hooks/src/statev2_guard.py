@@ -1401,6 +1401,29 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
     populated_variables = set()
     noclobber = False
 
+    def affected_sources(path, descendants=False):
+        if path is None:
+            return set(written)
+        affected = {remembered for remembered in written
+                    if remembered == path or descendants and remembered.is_relative_to(path)}
+        # Different realpaths can still name the same hard-linked file.
+        # Unavailable identity cannot prove that a write leaves sources alone.
+        try:
+            destination_info = path.stat()
+        except FileNotFoundError:
+            return affected
+        except OSError:
+            return set(written)
+        for remembered in written:
+            try:
+                if os.path.samestat(destination_info, remembered.stat()):
+                    affected.add(remembered)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                affected.add(remembered)
+        return affected
+
     def python_preserves_sources(source, directory):
         try:
             tree = ast.parse(source)
@@ -1443,25 +1466,8 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     else:
                         return False
                     path = _literal_path(destination, directory) if destination is not None else None
-                    if path is None or path in written:
+                    if path is None or affected_sources(path):
                         return False
-                    # Different realpaths can still name the same hard-linked
-                    # file. Unavailable identity cannot prove independence.
-                    try:
-                        destination_info = path.stat()
-                    except FileNotFoundError:
-                        destination_info = None
-                    except OSError:
-                        return False
-                    if destination_info is not None:
-                        for remembered in written:
-                            try:
-                                if os.path.samestat(destination_info, remembered.stat()):
-                                    return False
-                            except FileNotFoundError:
-                                continue
-                            except OSError:
-                                return False
                     statement.value = ast.Tuple(elts=[*values, *call.args, *(k.value for k in call.keywords)], ctx=ast.Load())
             literal = None
             is_string = False
@@ -1938,7 +1944,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 for candidate in script_variants(arg):
                     target = _literal_path(candidate, directory)
                     if target is not None:
-                        invalidated_written.update(path for path in written if path == target or path.is_relative_to(target))
+                        invalidated_written.update(affected_sources(target, descendants=True))
         if binary == "vp" and args[:2] == ["run", "migrate-dev-db"]:
             if any(_direct_read(['cat', *values], directory)
                    for values in variants([v for op, v in redirects if op == '<'])):
@@ -1990,10 +1996,10 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             opaque_written.clear()
             for candidate in script_variants(target):
                 path = _literal_path(candidate, directory)
-                if path is None:
-                    invalidated_written.update(written)
-                if path in written and not (documents and binary in {'cat', 'tee'}):
-                    invalidated_written.add(path)
+                affected = affected_sources(path)
+                if documents and binary in {'cat', 'tee'}:
+                    affected.discard(path)
+                invalidated_written.update(affected)
         if binary == 'tee':
             opaque_written.clear()
         tee_options = binary == 'tee' and all(arg and (not arg.startswith('-') or arg in {'-a', '--append', '--'}) for arg in args)
@@ -2286,10 +2292,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                         for target in targets:
                             for candidate in script_variants(target):
                                 path = _literal_path(candidate, current)
-                                if path is None:
-                                    invalidated_written.update(written)
-                                if path is not None:
-                                    invalidated_written.update(p for p in written if p == path or p.is_relative_to(path))
+                                invalidated_written.update(affected_sources(path, descendants=True))
                         if targets:
                             opaque_written.clear()
                         group = []

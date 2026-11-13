@@ -298,6 +298,15 @@ class GuardTests(unittest.TestCase):
             with self.subTest(unavailable=name), patch.object(Path, 'stat', new=unavailable_stat):
                 self.assertEqual(self.classify(command), UNRESOLVED)
 
+    def test_shell_writes_invalidate_hard_linked_script_proofs(self):
+        target = self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        os.link(target, self.root / 'tmp/report.txt')
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        for writer in ['cat tmp/read.py > tmp/report.txt', 'tee tmp/report.txt < tmp/read.py']:
+            with self.subTest(writer=writer):
+                self.assertEqual(self.classify(prefix + writer + '\npython3 "$D/a.py"'), UNRESOLVED)
+
     def test_exact_variable_script_reporters(self):
         fixtures = Path(__file__).with_name('fixtures') / 'variable-scripts'
         for name in ['card3409', 'card3650', 'card937', 'torssh31']:
