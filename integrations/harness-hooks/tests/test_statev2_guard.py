@@ -60,6 +60,321 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
 
+    def test_stdin_programs_keep_positional_arguments_out_of_script_resolution(self):
+        rows = [
+            ('python3 - "$X"', 'print(1)'),
+            ('python3 -I - "$X"', 'print(1)'),
+            ('python3 -X dev - "$X"', 'print(1)'),
+            ('bash -s "$X"', 'echo hi'),
+            ('sh -s -- "$X"', 'echo hi'),
+            ('zsh -xs "$X"', 'echo hi'),
+            ('dash -s "$X"', 'echo hi'),
+            ('ksh -s "$X"', 'echo hi'),
+            ('node - "$X"', 'console.log(1)'),
+            ('node --input-type=module - "$X"', 'console.log(1)'),
+            ('bun - "$X"', 'console.log(1)'),
+            ('deno run - "$X"', 'console.log(1)'),
+        ]
+        for invocation, source in rows:
+            with self.subTest(invocation=invocation):
+                self.assertIsNone(self.classify(invocation + " <<'EOF'\n" + source + '\nEOF'))
+                self.assertIsNone(self.classify(invocation + ' < tmp/t.py'))
+        for invocation, source in [
+            ('python3 - "$X"', f'open({LIVE!r}).read()'),
+            ('python3 -I - "$X"', 'open("~/.local/share/opencode/opencode.db").read()'),
+            ('bash -s "$X"', 'cat ~/.robob/userdata/statev2.sqlite'),
+            ('sh -xs -- "$X"', 'cat ~/.local/share/opencode/opencode.db'),
+            ('node - "$X"', f'require("fs").readFileSync({LIVE!r})'),
+            ('bun - "$X"', f'require("fs").readFileSync({LIVE!r})'),
+            ('deno run - "$X"', f'Deno.readFileSync({LIVE!r})'),
+        ]:
+            with self.subTest(invocation=invocation):
+                self.assertEqual(self.classify(invocation + " <<'EOF'\n" + source + '\nEOF'), READ)
+        self.table([
+            ('python3 -I "$X" -', UNRESOLVED),
+            ('bash -c "$X"', None),
+            ("bash -sc 'python3 \"$X\"'", UNRESOLVED),
+            ('python3 - "$X" < ' + LIVE, READ),
+            ('cat ' + LIVE + ' | python3 - "$X"', READ),
+            ('python3 - "$X" <<< \'print(1)\'', None),
+            ('bash -s "$X" <<< \'echo hi\'', None),
+            ('node - "$X" <<< \'console.log(1)\'', None),
+            ('python3 - "$X" <<< ' + shlex.quote('open(' + repr(LIVE) + ').read()'), READ),
+            ('bash -s "$X" <<< ' + shlex.quote('cat ' + LIVE), READ),
+            ('python3 - "$X" <<< "$(cat tmp/live.py)"', UNRESOLVED),
+            ('python3 - "$X" <<< "$CODE"', UNRESOLVED),
+        ])
+
+    def test_literal_variable_scripts_are_resolved_and_inspected(self):
+        self.write('tmp/a.sh', 'echo hi')
+        self.write('tmp/live.sh', 'cat ' + LIVE)
+        self.table([
+            ('S=tmp/t.py; python3 "$S"', None),
+            ('D=tmp; python3 -I "${D}/t.py"', None),
+            ('D=tmp; S="$D/t.py"; python3 "$S"', None),
+            ('S=tmp/live.py; python3 "$S"', SCRIPT),
+            ('D=tmp; bash "$D/live.sh"', SCRIPT),
+            ('python3 "$X/a.py"', UNRESOLVED),
+            ('S=tmp/t.py; read S; python3 "$S"', UNRESOLVED),
+            ('S=tmp/t.py; unset S; python3 "$S"', UNRESOLVED),
+            ('if true; then S=tmp/t.py; fi; python3 "$S"', UNRESOLVED),
+            ('S=tmp/live.py; if true; then S=tmp/t.py; fi; python3 "$S"', SCRIPT),
+            ('S=tmp/live.py; S=tmp/t.py true; python3 "$S"', SCRIPT),
+            ('S=tmp/live.py; env S=tmp/t.py true; python3 "$S"', SCRIPT),
+            ('S=tmp/live.py; (S=tmp/t.py); python3 "$S"', SCRIPT),
+            ('S=tmp/t.py; S+=x; python3 "$S"', UNRESOLVED),
+            ('S=tmp/t.py; declare -n S=OTHER; python3 "$S"', UNRESOLVED),
+            ('S=tmp/t.py; printf -v S x; python3 "$S"', UNRESOLVED),
+            ('S=-I; python3 "$S" tmp/live.py', UNRESOLVED),
+            ('S=-c; bash "$S" "echo hi"', UNRESOLVED),
+            ('S="~/tmp/a.py"; python3 "$S"', UNRESOLVED),
+            ('S="tmp/t.py extra"; python3 $S', UNRESOLVED),
+            ('S="tmp/t.py extra"; python3 $S "$S"', UNRESOLVED),
+            ('D="tmp/t.py extra"; F=x; python3 $D/"$F"', UNRESOLVED),
+            ('S=tmp/t.py; while true; do python3 "$S"; S=tmp/live.py; done', UNRESOLVED),
+        ])
+
+    def test_literal_dollars_do_not_become_script_expansions(self):
+        self.write('tmp/with space.py', 'print(1)')
+        self.table([
+            ('S="tmp/with space.py"; python3 "$S"', None),
+            ('S=tmp/t.py; python3 \'$S\'', UNRESOLVED),
+            ('S=tmp/t.py; python3 \\$S', UNRESOLVED),
+            ('S=tmp/t.py; python3 "\\$S"', UNRESOLVED),
+            ('D=tmp; S=\'$D/t.py\'; python3 "$S"', UNRESOLVED),
+            ('D=tmp; S="\\$D/t.py"; python3 "$S"', UNRESOLVED),
+            ('D=tmp; S=\'$D\'; python3 "$S/$D/t.py"', UNRESOLVED),
+            ('D=tmp; python3 "$D/t.py"', None),
+            ('D=tmp; bash -c \'python3 "$D/t.py"\'', UNRESOLVED),
+        ])
+
+    def test_literal_loop_script_candidates_all_require_inspection(self):
+        paths = ['native/scripts/bootstrap-tools.sh', 'native/ssh/build.sh',
+                 'native/tests/build-ssh-host.sh', 'native/tests/build-rekey-server.sh',
+                 'tmp/vault-native/build-final.sh']
+        for path in paths:
+            self.write(path, 'echo hi')
+        prefix = 'for file in ' + ' '.join(paths) + '; do '
+        self.assertIsNone(self.classify(prefix + 'bash -n "$file"; done'))
+        self.assertIsNone(self.classify(prefix + 'bash "$file"; done'))
+        self.write(paths[2], 'cat ' + LIVE)
+        self.assertEqual(self.classify(prefix + 'bash "$file"; done'), SCRIPT)
+        self.table([
+            ('for f in *.sh; do bash "$f"; done', UNRESOLVED),
+            ('for f in $(ls); do bash "$f"; done', UNRESOLVED),
+            ('for f in tmp/t.py "$X"; do python3 "$f"; done', UNRESOLVED),
+            ('for f; do python3 "$f"; done', UNRESOLVED),
+            ('for f in tmp/t.py; do :; done; python3 "$f"', UNRESOLVED),
+        ])
+
+    def test_heredoc_variable_scripts_and_invalidated_proofs(self):
+        for assignment in ['D=$(mktemp -d)', 'D=tmp']:
+            for interpreter, suffix, body in [('python3 -I', 'py', 'print(1)'), ('bash', 'sh', 'echo hi')]:
+                prefix = assignment + '; cat > "$D/a.' + suffix + '" <<\'EOF\'\n'
+                invoke = '\nEOF\n' + interpreter + ' "$D/a.' + suffix + '"'
+                with self.subTest(assignment=assignment, interpreter=interpreter):
+                    self.assertIsNone(self.classify(prefix + body + invoke))
+                    bad = f'open({LIVE!r}).read()' if suffix == 'py' else 'cat ' + LIVE
+                    self.assertEqual(self.classify(prefix + bad + invoke), SCRIPT)
+                    bad = 'open("~/.local/share/opencode/opencode.db").read()' if suffix == 'py' else 'cat ~/.local/share/opencode/opencode.db'
+                    self.assertEqual(self.classify(prefix + bad + invoke), SCRIPT)
+        prefix = 'D=$(mktemp -d); cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        literal_prefix = prefix.replace('$(mktemp -d)', 'tmp')
+        self.assertEqual(self.classify(literal_prefix + 'cp /elsewhere/x.py "$D/a.py"; python3 "$D/a.py"'), UNRESOLVED)
+        self.assertEqual(self.classify(literal_prefix + 'printf x > "$D/a.py"; python3 "$D/a.py"'), UNRESOLVED)
+        self.table([
+            (prefix + 'python3 "$D/b.py"', UNRESOLVED),
+            (prefix + 'D=$(other); python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'D=/elsewhere; python3 "$D/a.py"', None),
+            (prefix + 'cp /elsewhere/x.py "$D/a.py"; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'mv /elsewhere/x.py "$D/a.py"; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'printf x > "$D/a.py"; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'cat /elsewhere/x.py > "$D/a.py"; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'tee "$D/a.py" < /elsewhere/x.py; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'E="$D"; cat > "$E/a.py" <<\'EOF\'\nprint(2)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'cat > "${D}/a.py" <<\'EOF\'\nprint(2)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
+            (prefix + "python3 '$D/a.py'", UNRESOLVED),
+            ('cat > "$X/a.py" <<\'EOF\'\nprint(1)\nEOF\npython3 "$X/a.py"', UNRESOLVED),
+            ('D=$(mktemp -d); if true; then cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\nfi; python3 "$D/a.py"', UNRESOLVED),
+            (prefix + 'cat >> "$D/a.py" <<\'EOF\'\nprint(2)\nEOF\npython3 "$D/a.py"', None),
+            (prefix + 'cat >> "$D/a.py" <<\'EOF\'\nopen(' + repr(LIVE) + ').read()\nEOF\npython3 "$D/a.py"', SCRIPT),
+            ('D=$(mktemp -d); cat >> "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
+        ])
+
+    def test_interpreter_execution_invalidates_prior_source_proofs(self):
+        python = "from pathlib import Path\nPath('tmp/a.py').write_text(Path('tmp/read.py').read_text())\n"
+        javascript = "require('fs').copyFileSync('tmp/read.py', 'tmp/a.py')\n"
+        shell = 'cp tmp/read.py tmp/a.py\n'
+        self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        self.write('tmp/writer.py', python)
+        self.write('tmp/writer.js', javascript)
+        self.write('tmp/writer.sh', shell)
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        invoke = '\npython3 "$D/a.py"'
+        rows = [
+            ('python file', 'python3 tmp/writer.py'),
+            ('python file argv', 'python3 tmp/writer.py -c "print(1)"'),
+            ('python module', 'python3 -m tmp.writer'),
+            ('python stdin', "python3 - <<'PY'\n" + python + 'PY'),
+            ('python stdin argv', "python3 -I - \"$X\" <<'PY'\n" + python + 'PY'),
+            ('python implicit stdin', "python3 <<'PY'\n" + python + 'PY'),
+            ('python redirected stdin', 'python3 - < tmp/writer.py'),
+            ('python piped stdin', 'cat tmp/writer.py | python3 -'),
+            ('python here-string', 'python3 - <<< ' + shlex.quote(python)),
+            ('python inline', 'python3 -c ' + shlex.quote(python)),
+            ('python bound destination', "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/a.py')\np.write_text(Path('tmp/read.py').read_text())\nPY"),
+            ('python unknown destination', "python3 - <<'PY'\nimport sys\nopen(sys.argv[1], 'w').write('print(1)')\nPY"),
+            ('python global destination', "python3 - <<'PY'\ndef change():\n global p\n p='tmp/a.py'\np='tmp/report.txt'\nchange()\nopen(p, 'w').write(open('tmp/read.py').read())\nPY"),
+            ('shell file', 'bash tmp/writer.sh'),
+            ('shell stdin', "bash -s \"$X\" <<'SH'\n" + shell + 'SH'),
+            ('node file', 'node tmp/writer.js'),
+            ('node stdin', "node - <<'JS'\n" + javascript + 'JS'),
+            ('bun file', 'bun run tmp/writer.js'),
+            ('bun stdin', "bun - <<'JS'\n" + javascript + 'JS'),
+            ('deno file', 'deno run tmp/writer.js'),
+            ('deno stdin', "deno run - <<'JS'\nDeno.copyFileSync('tmp/read.py', 'tmp/a.py')\nJS"),
+            ('direct script', './tmp/writer.sh'),
+            ('command wrapper', 'command python3 tmp/writer.py'),
+            ('env wrapper', 'env python3 tmp/writer.py'),
+            ('uv wrapper', 'uv run python3 tmp/writer.py'),
+            ('offbox wrapper', 'offbox run -- python3 tmp/writer.py'),
+            ('loop next iteration', 'for i in one two; do python3 "$D/a.py"; python3 tmp/writer.py; done'),
+        ]
+        for label, writer in rows:
+            with self.subTest(form=label):
+                self.assertEqual(self.classify(prefix + writer + invoke), UNRESOLVED)
+        self.assertIsNone(self.classify(prefix + invoke))
+        self.assertIsNone(self.classify(prefix + 'python3 -I -c "print(1)"' + invoke))
+        self.assertIsNone(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke))
+        self.assertEqual(self.classify(prefix + 'bash -nc "echo hi"' + invoke), UNRESOLVED)
+        with patch.dict(os.environ, {'BASH_ENV': '/tmp/guard841-shell-env.sh'}):
+            self.assertEqual(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke), UNRESOLVED)
+        other_edit = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/report.txt')\np.write_text('report')\nPY"
+        self.assertIsNone(self.classify(prefix + other_edit + invoke))
+        other_edit_live_read = other_edit.replace("'report'", 'open(' + repr(LIVE) + ').read()')
+        self.assertEqual(self.classify(prefix + other_edit_live_read + invoke), READ)
+        (self.root / 'tmp/report.txt').symlink_to('a.py')
+        self.assertEqual(self.classify(prefix + other_edit + invoke), UNRESOLVED)
+
+    def test_script_write_destinations_require_distinct_files(self):
+        target = self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        self.write('tmp/unrelated.txt', 'print(1)\n')
+        (self.root / 'tmp/symlink.txt').symlink_to('a.py')
+        os.link(target, self.root / 'tmp/report.txt')
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        invoke = '\npython3 "$D/a.py"'
+        destinations = [
+            ('same path', 'tmp/a.py', UNRESOLVED),
+            ('symlink', 'tmp/symlink.txt', UNRESOLVED),
+            ('hard link', 'tmp/report.txt', UNRESOLVED),
+            ('distinct file', 'tmp/unrelated.txt', None),
+            ('new file', 'tmp/new.txt', None),
+        ]
+        writes = [
+            "Path({dest!r}).write_text(Path('tmp/read.py').read_text())",
+            "Path({dest!r}).write_bytes(Path('tmp/read.py').read_bytes())",
+            "open({dest!r}, 'w').write(open('tmp/read.py').read())",
+            "open({dest!r}, 'a').write(open('tmp/read.py').read())",
+            "open({dest!r}, 'wb').write(open('tmp/read.py', 'rb').read())",
+            "open({dest!r}, 'ab').write(open('tmp/read.py', 'rb').read())",
+        ]
+        for label, destination, expected in destinations:
+            for write in writes:
+                with self.subTest(alias=label, write=write):
+                    source = 'from pathlib import Path\n' + write.format(dest=destination)
+                    command = prefix + "python3 - <<'PY'\n" + source + '\nPY' + invoke
+                    self.assertEqual(self.classify(command), expected)
+        source = 'from pathlib import Path\n' + writes[0].format(dest='tmp/unrelated.txt')
+        command = prefix + "python3 - <<'PY'\n" + source + '\nPY' + invoke
+        path_stat = Path.stat
+        for name in ['tmp/unrelated.txt', 'tmp/a.py']:
+            blocked_path = Path(os.path.realpath(self.root / name))
+            def unavailable_stat(path, *args, **kwargs):
+                if path == blocked_path:
+                    raise PermissionError('fixture identity unavailable')
+                return path_stat(path, *args, **kwargs)
+            with self.subTest(unavailable=name), patch.object(Path, 'stat', new=unavailable_stat):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+
+    def test_shell_writes_invalidate_hard_linked_script_proofs(self):
+        target = self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        os.link(target, self.root / 'tmp/report.txt')
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        for writer in ['cat tmp/read.py > tmp/report.txt', 'tee tmp/report.txt < tmp/read.py']:
+            with self.subTest(writer=writer):
+                self.assertEqual(self.classify(prefix + writer + '\npython3 "$D/a.py"'), UNRESOLVED)
+
+    def test_exact_variable_script_reporters(self):
+        fixtures = Path(__file__).with_name('fixtures') / 'variable-scripts'
+        for name in ['card3409', 'card3650', 'card937', 'torssh31']:
+            command = (fixtures / (name + '.sh')).read_text()
+            with self.subTest(reporter=name):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        command = (fixtures / 'card3409.sh').read_text().replace('$(mktemp -d /tmp/card-3409-writer.XXXXXX)', str(self.root / 'writer'))
+        self.assertIsNone(self.classify(command))
+        command = (fixtures / 'card4079.sh').read_text()
+        historical_root = '/Volumes/ExternalSSD/crpko-devops/tmp/readbacks/risk-liquidation-docs128-dev.1-card4079'
+        command = command.replace(historical_root, str(self.root / 'readback'))
+        self.write('readback/probe-manifest.sh', 'echo hi')
+        self.assertIsNone(self.classify(command))
+        self.write('readback/probe-manifest.sh', 'cat ' + LIVE)
+        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_variable_path_expansion_bounds_and_candidate_products(self):
+        self.write('one/safe.py', 'print(1)')
+        self.write('two/live.py', 'open(' + repr(LIVE) + ').read()')
+        self.table([
+            ('for D in one two; do for F in safe.py live.py; do python3 "$D/$F"; done; done', SCRIPT),
+            ('for D in one two; do for F in safe.py; do python3 "$D/$F"; done; done', None),
+            ('for D in one two; do cd "$D"; python3 safe.py; done', UNRESOLVED),
+            ('D=tmp; if true; then D=$(unknown); fi; python3 "$D/t.py"', UNRESOLVED),
+        ])
+        words = ' '.join('dir' + str(i) for i in range(guard.MAX_SCRIPTS + 1))
+        self.assertEqual(self.classify('for D in ' + words + '; do python3 "$D/a.py"; done'), UNRESOLVED)
+
+    def test_variable_script_review_corpus(self):
+        corpus = json.loads((Path(__file__).with_name('fixtures') / 'variable-scripts/review-corpus.json').read_text())
+        for name, source in corpus['files'].items():
+            self.write(name, source)
+        for label, command in corpus['cases']:
+            with self.subTest(case=label):
+                self.assertIn(self.classify(command), {READ, SCRIPT, UNRESOLVED})
+        for label, command in corpus['allow_cases']:
+            with self.subTest(case=label):
+                self.assertIsNone(self.classify(command))
+        fallback = '$D' + str(self.root / 'tmp/read.py')
+        command = 'D=$(mktemp -d invalid) && cat > "' + fallback + '" <<\'EOF\'\nprint(1)\nEOF\npython3 "' + fallback + '"'
+        self.assertEqual(self.classify(command), SCRIPT)
+        self.table([
+            ('D=$(printf tmp); cat > "$D/new.py" <<\'EOF\'\nprint(1)\nEOF\npython3 "$D/new.py"', UNRESOLVED),
+            ('D=$(mktemp -d); cp tmp/read.py "$D/a.py"; chmod a-w "$D/a.py"; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
+            ('D=$(mktemp -d); cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n./writer.sh; cat > "$D/a.py" <<\'EOF\'\nprint(2)\nEOF\npython3 "$D/a.py"', UNRESOLVED),
+        ])
+        bad = 'from pathlib import Path\nq=".robob"\np=Path.home()/q/"userdata"/"statev2.sqlite"\np.read_bytes()\n'
+        for assignment in ['D=tmp', 'D=$(mktemp -d)']:
+            command = assignment + '; cat > "$D/new.py" <<\'EOF\'\n' + bad + 'EOF\ncat >> "$D/new.py" <<\'EOF\'\nq=".robob"\nprint(1)\nEOF\npython3 "$D/new.py"'
+            self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_opaque_sources_must_stay_inside_the_fresh_root(self):
+        self.write('tmp/safe.py', 'print(1)')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()')
+        template = str(self.root / 'fresh.XXXXXX')
+        for target, expected in [
+            ('$D/a.py', None),
+            ('${D}/sub/a.py', None),
+            ('$D/../tmp/read.py', UNRESOLVED),
+            ('${D}/./../tmp/read.py', UNRESOLVED),
+            ('$D/sub/../../tmp/read.py', UNRESOLVED),
+            ('prefix/$D/a.py', UNRESOLVED),
+            ('$D/$D/a.py', UNRESOLVED),
+        ]:
+            with self.subTest(target=target):
+                command = 'D=$(mktemp -d ' + template + '); mkdir tmp/safe.py && cat > "' + target + '" <<\'EOF\'\nprint(1)\nEOF\npython3 "' + target + '"'
+                self.assertEqual(self.classify(command), expected)
+
     def test_isolated_migrate_source_and_note_case_matrix(self):
         source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
         self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
