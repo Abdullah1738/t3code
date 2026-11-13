@@ -40,6 +40,7 @@ import {
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  runSilentDue,
   reviewerQuietDue,
   waitingOnBackground,
   BACKGROUND_GRACE_MS,
@@ -1978,5 +1979,51 @@ describe("claude effort pools", () => {
       model: "opus/cc/claude-haiku-5-5",
     };
     expect(poolFor(all, bare)?.key).toBe(poolKey(opencodeHigh));
+  });
+});
+
+describe("runSilentDue", () => {
+  const start = "2026-10-25T00:00:00.000Z";
+  const running = { state: "running", lastActivityAt: start, backgroundWork: 0 };
+  const working = card({
+    stage: "working",
+    activeRole: "work",
+    activeThreadId: ThreadId.make("t1"),
+  });
+  const at = (minutes: number) => Date.parse(start) + minutes * 60000;
+  it("waits thirty minutes and respects recent nudges, activity and background work", () => {
+    expect(runSilentDue(working, running, at(30))).toBe(true);
+    expect(runSilentDue(working, running, at(29))).toBe(false);
+    expect(runSilentDue(working, { ...running, backgroundWork: 1 }, at(31))).toBe(false);
+    expect(runSilentDue(working, { ...running, lastActivityAt: null }, at(31))).toBe(false);
+    expect(runSilentDue(working, { ...running, state: "idle" }, at(31))).toBe(false);
+    expect(
+      runSilentDue(
+        { ...working, stalled: { reason: "hold", by: { _tag: "owner" }, at: start } },
+        running,
+        at(31),
+      ),
+    ).toBe(false);
+    expect(
+      runSilentDue({ ...working, nudgedAt: "2026-10-25T00:20:00.000Z" }, running, at(31)),
+    ).toBe(false);
+    expect(
+      runSilentDue({ ...working, nudgedAt: "2026-10-25T00:20:00.000Z" }, running, at(50)),
+    ).toBe(true);
+  });
+  it.each(["todo", "needs_review", "working", "in_review"] as const)("covers %s", (stage) => {
+    const active = stage === "working" || stage === "in_review";
+    expect(
+      runSilentDue(
+        {
+          ...working,
+          stage,
+          activeThreadId: active ? working.activeThreadId : null,
+          activeRole: stage === "in_review" ? "review" : active ? "work" : null,
+        },
+        running,
+        at(31),
+      ),
+    ).toBe(true);
   });
 });

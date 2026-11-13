@@ -1,5 +1,6 @@
 import { carryActionValue } from "../actionTelemetry.ts";
 import { Atom } from "effect/reactivity";
+import type { PermissionStatus } from "../../state/commandPermissions.ts";
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
@@ -85,6 +86,7 @@ export interface KanbanClient {
   scriptRuns(boardId: string, scriptId: string): SnapshotStore<ReadonlyArray<KanbanScriptRun>>;
   /** Whether the connection's grants allow a kanban write, read as an atom to gate its control. */
   permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
+  permissionStatus(tag: KanbanRequestTag): Atom.Atom<PermissionStatus>;
 
   patchCard(input: KanbanCardPatchInput): Promise<void>;
   settleCard(cardId: string): Promise<void>;
@@ -902,6 +904,7 @@ export function createKanbanClient(
     scripts,
     scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
     permission: (tag) => transport.permission(tag),
+    permissionStatus: (tag) => transport.permissionStatus(tag),
 
     async patchCard(input) {
       await transport.request(M.cardPatch, input);

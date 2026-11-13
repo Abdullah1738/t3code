@@ -202,9 +202,12 @@ it("lets only watched pull requests stop their watch", () => {
       failedChecks: [],
       passed: false,
       passedChecks: [],
+      passedPending: [],
       remarksThrough: "2026-01-01T00:00:30.000Z",
       remarkIds: [],
       conflicting: false,
+      conflictHead: null,
+      conflictWokeFor: null,
       wakes: 0,
     },
   };

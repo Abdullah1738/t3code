@@ -77,6 +77,7 @@ pyc() { local f rc=0; for f in "${PY[@]}"; do python3 -c 'import ast,sys; ast.pa
 check "python syntax" pyc
 unit() { python3 vmtest/test_plan.py 2>&1 | tail -3 | tr '\n' ' '; return "${PIPESTATUS[0]}"; }
 check "plan.py unit tests (disk decision, wipe scope, storage layout)" unit
+check "box userns persistence and acceptance regression" python3 ../../tests/test_userns.py
 
 # ---- yaml / cloud-init / netplan / grub
 if need yamllint; then

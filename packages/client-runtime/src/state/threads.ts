@@ -1,3 +1,4 @@
+import { threadCacheRedactions } from "./threadCacheRedactions.ts";
 import {
   ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
@@ -200,10 +201,12 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   );
   const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
+  const redactions = threadCacheRedactions(cache, environmentId, threadId);
+  if (resumeCache) redactions.retain(resumeCache);
   const retained = resumeCache?.snapshot;
   const owner = {};
   if (resumeCache) resumeCache.owner = owner;
-  const cached =
+  const loadedCache =
     retained === undefined
       ? yield* cache.loadThread(environmentId, threadId).pipe(
           Effect.catch((error) =>
@@ -218,6 +221,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ),
         )
       : Option.none<OrchestrationV2ThreadDetailSnapshot>();
+  const cached = Option.filter(
+    loadedCache,
+    (snapshot) => snapshot.snapshotSequence >= redactions.sequence,
+  );
   const cachedThread = Option.map(cached, (snapshot) => snapshot.projection);
   const initialState: EnvironmentThreadState = retained
     ? cachedThreadState(retained.state)
@@ -245,7 +252,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     persisted: retained?.persisted ?? Option.isSome(cached),
     acceptsBoundedSnapshots: canLoadHistory,
   };
-  if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
+  if (resumeCache?.owner === owner)
+    resumeCache.snapshot = committed.sequence < redactions.sequence ? undefined : committed;
   const awaitingCompletion = yield* Ref.make(false);
   const applyLock = yield* Semaphore.make(1);
   // Save only completed data/cursor updates. A canceled scope must not cache
@@ -261,15 +269,39 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         committed.persisted &&
         matchesThreadSnapshot(committed, Option.getOrNull(current.data), sequence, current.history),
     };
-    if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
+    if (resumeCache?.owner === owner)
+      resumeCache.snapshot = committed.sequence < redactions.sequence ? undefined : committed;
   });
   const persistence = yield* Queue.sliding<OrchestrationV2ThreadDetailSnapshot>(1);
+  const persistenceLock = yield* Semaphore.make(1);
+  let redactionSequence = 0;
+  const redactionResubscriptions = yield* Queue.sliding<void>(1);
+  const minimumSequence = () => Math.max(redactionSequence, redactions.sequence);
+  const invalidateFromShell = () =>
+    applyLock.withPermit(
+      Effect.gen(function* () {
+        redactionSequence = minimumSequence();
+        if ((yield* SubscriptionRef.get(lastSequence)) >= redactionSequence) return;
+        yield* Queue.poll(persistence);
+        yield* SubscriptionRef.update(state, (current) => ({
+          ...current,
+          data: Option.none(),
+          status: "synchronizing" as const,
+          history: EMPTY_THREAD_HISTORY_META,
+        }));
+        yield* remember;
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      }),
+    );
+  yield* redactions.listen(invalidateFromShell);
+  yield* invalidateFromShell();
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationV2ThreadDetailSnapshot,
   ) {
     if (resumeCache !== undefined && resumeCache.owner !== owner) return;
-    if (committed.state.status === "deleted") return;
+    if (committed.state.status === "deleted" || snapshot.snapshotSequence < minimumSequence())
+      return;
     if (
       committed.persisted &&
       matchesThreadSnapshot(
@@ -280,32 +312,44 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       )
     )
       return;
-    yield* cache.saveThread(environmentId, snapshot).pipe(
-      Effect.tap(() =>
-        Effect.sync(() => {
-          if (
-            !matchesThreadSnapshot(
-              committed,
-              snapshot.projection,
-              snapshot.snapshotSequence,
-              historyMetaFromCachedSnapshot(snapshot),
+    yield* persistenceLock
+      .withPermits(1)(
+        redactions.withPermit(
+          Effect.suspend(() =>
+            snapshot.snapshotSequence < minimumSequence()
+              ? Effect.void
+              : cache.saveThread(environmentId, snapshot),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (
+              !matchesThreadSnapshot(
+                committed,
+                snapshot.projection,
+                snapshot.snapshotSequence,
+                historyMetaFromCachedSnapshot(snapshot),
+              )
             )
-          )
-            return;
-          committed = { ...committed, persisted: true };
-          if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
-        }),
-      ),
-      Effect.catch((error) =>
-        Effect.logWarning("Could not persist the thread cache.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            threadId,
-            error: error.message,
+              return;
+            committed = { ...committed, persisted: true };
+            if (resumeCache?.owner === owner)
+              resumeCache.snapshot =
+                committed.sequence < redactions.sequence ? undefined : committed;
           }),
         ),
-      ),
-    );
+        Effect.catch((error) =>
+          Effect.logWarning("Could not persist the thread cache.").pipe(
+            Effect.annotateLogs({
+              environmentId,
+              threadId,
+              error: error.message,
+            }),
+          ),
+        ),
+      );
   });
 
   yield* Effect.addFinalizer(() =>
@@ -381,6 +425,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       readonly history?: ThreadHistoryMeta;
     },
   ) {
+    if ((yield* SubscriptionRef.get(lastSequence)) < minimumSequence()) return;
     const waiting = yield* Ref.get(awaitingCompletion);
     // Atomic with concurrent history meta updates: never get-then-set the whole
     // state when only the projection changes. Bounded installs pass history so
@@ -561,6 +606,52 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (sequence === appliedSequence) return;
     yield* SubscriptionRef.set(lastSequence, sequence);
     if (fresh.length === 0) return;
+    const redaction = fresh.findLast((item) => item.event.type === "thread.item-redacted");
+    if (redaction !== undefined) {
+      // A needle sweep can affect any field. Drop the whole snapshot, including
+      // queued saves, before refetching so no client-specific disk cache retains it.
+      redactionSequence = redaction.sequence;
+      yield* Queue.poll(persistence);
+      yield* SubscriptionRef.update(state, (current) => ({
+        ...current,
+        data: Option.none(),
+        status: "synchronizing" as const,
+      }));
+      yield* remember;
+      yield* persistenceLock.withPermits(1)(cache.removeThread(environmentId, threadId));
+      const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+      if (Option.isNone(prepared)) {
+        yield* Queue.offer(redactionResubscriptions, undefined);
+        return;
+      }
+      const refreshed = yield* snapshotLoader.load(prepared.value, threadId);
+      if (refreshed._tag === "present") {
+        yield* clearMiss;
+        if (canLoadHistory && refreshed.history !== undefined)
+          yield* Ref.set(acceptsBoundedSocketSnapshots, true);
+        yield* SubscriptionRef.set(lastSequence, refreshed.snapshot.snapshotSequence);
+        const history = historyMetaFromCachedSnapshot({
+          ...refreshed.snapshot,
+          ...refreshed.history,
+        });
+        yield* setThread(refreshed.snapshot.projection, { history });
+        yield* remember;
+      } else if (refreshed._tag === "denied") {
+        yield* SubscriptionRef.set(state, {
+          data: Option.none(),
+          status: "no-access",
+          error: Option.none(),
+          history: EMPTY_THREAD_HISTORY_META,
+        });
+        yield* remember;
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      } else {
+        // Reopen without a resume cursor so the normal HTTP/WS snapshot path
+        // recovers even if this socket itself stayed healthy.
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      }
+      return;
+    }
 
     const waiting = yield* Ref.get(awaitingCompletion);
     // Apply against the latest projection/history in one update so a concurrent
@@ -671,6 +762,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
 
     if (item.kind === "snapshot") {
+      if (item.snapshotSequence < minimumSequence()) return;
       yield* SubscriptionRef.set(lastSequence, item.snapshotSequence);
       const hasProgressiveHistory =
         item.historyCursor !== undefined ||
@@ -946,6 +1038,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               // snapshots still go through applyItem (resetHistory).
               yield* applyLock.withPermits(1)(
                 Effect.gen(function* () {
+                  if (httpResult.snapshot.snapshotSequence < minimumSequence()) return;
                   yield* SubscriptionRef.set(lastSequence, httpResult.snapshot.snapshotSequence);
                   const history: ThreadHistoryMeta =
                     httpResult.history !== undefined
@@ -1019,7 +1112,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         },
         retryExpectedFailureAfter: "250 millis",
         retryDefects: true,
-        resubscribe: foregroundResubscriptions,
+        resubscribe: Stream.merge(
+          foregroundResubscriptions,
+          Stream.fromQueue(redactionResubscriptions),
+        ),
       },
     ).pipe(Stream.runForEachArray(applyItems)),
   );
@@ -1083,9 +1179,12 @@ export function createEnvironmentThreadStateAtoms<R, E>(
           // `stream` subscribes without making the shell a dependency, so shell
           // updates never restart this thread's stream.
           const presenceAtom = atomsOptions?.threadPresenceAtom?.({ environmentId, threadId });
-          const live = threadStateChanges(environmentId, threadId, resume, {
-            ...(presenceAtom === undefined ? {} : { presence: get.stream(presenceAtom) }),
-          });
+          const live = threadStateChanges(
+            environmentId,
+            threadId,
+            resume,
+            presenceAtom === undefined ? undefined : { presence: get.stream(presenceAtom) },
+          );
           return resume.snapshot === undefined
             ? live
             : Stream.concat(Stream.succeed(cachedThreadState(resume.snapshot.state)), live);

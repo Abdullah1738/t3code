@@ -40,8 +40,7 @@ def allowed(argv: list[str], error, cwd: str) -> bool:
         exe = os.path.basename(words[0])
         if exe in ('echo','true','false','pwd','ls','cat','head','tail','wc','printf','date','uname','git'):
             return True
-        # Go checks run on the Mac only through local-first's sandbox (localfirst.py), never through this
-        # unsandboxed fallback: a check local-first refused (OS-specific code, .env reads) must stay remote.
+        # Go checks never run through this unsandboxed fallback (OS-specific code, .env reads): they stay remote.
         if exe in ('pytest','py.test','jest','vitest','mocha'):
             return True
         if exe.startswith('python') and words[1:3] == ['-m','pytest']:

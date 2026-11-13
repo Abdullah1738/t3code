@@ -1,0 +1,34 @@
+{
+  "case_number": 13,
+  "reporter_id": "torssh35",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:054f2ecc-27d6-4bf2-b389-a1b389c7b377",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T01-30-37-01a1cc85-1951-7d60-96c4-d80aa7efc7a3.jsonl",
+    "source_call_line_0": 2794,
+    "timestamp": "2026-11-12T00:39:19.570Z",
+    "call_id": "call_8f3ff5e68d8e40729cc3be150896b34f",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 206,
+    "intentionally_absent_from_setup_files": [
+      "tmp/card35/run-final-gate.sh",
+      "scripts/check-formal-reuse.sh"
+    ]
+  },
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "commands": [
+    {
+      "cmd": "cat > tmp/card35/run-final-gate.sh <<'SH'\n#!/usr/bin/env bash\nset -euo pipefail\nexpected_head=$1\n[[ ${OFFBOX_RUN_ID-} =~ ^run-[0-9a-z-]+$ ]]\n# The parent supplies the box selected by offbox for this unique run.\nassignment=\"/tmp/torssh35-${OFFBOX_RUN_ID}.box\"\nfor ((n=0;n<60;n++)); do\n    [[ ! -s \"$assignment\" ]] || break\n    sleep 1\ndone\n[[ -s \"$assignment\" ]] || { echo 'Missing allocation assignment' >&2; exit 1; }\nread -r allocated_box < \"$assignment\"\n[[ $allocated_box =~ ^bx_[a-z0-9]+$ ]]\nrm \"$assignment\"\nexec bash scripts/check-formal-reuse.sh --head \"$expected_head\" \\\n    --coverage docs/evidence/reconnect-core/formal-coverage.json --box-id \"$allocated_box\"\nSH\nbash -n tmp/card35/run-final-gate.sh",
+      "workdir": "/Users/ardud/checkouts/torssh-reconnect-core",
+      "sha256": "4bfb002bd4b1524f8652435dd651b304f9f49247cc7984607e8d194aa19f7140"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

@@ -59,13 +59,14 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
    * messages no other row has claimed. Until SETTLE_MS have passed since the latest attempt a miss
    * only fails again as `sendUnconfirmed`; after that the send goes out again.
    */
-  const once = async (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean,
-    send: () => Promise<{ handle: string }>): Promise<{ providerId?: string; duplicate?: boolean; original?: boolean }> => {
+  type Receipt = { providerId?: string; duplicate?: boolean; original?: boolean };
+  const recover = (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean): Receipt | Promise<Receipt | undefined> | undefined => {
     const saved = store.get<{ handle: string; original?: boolean }>(sentKey(id));
     if (saved) return { providerId: saved.handle, duplicate: true, ...(saved.original ? { original: true } : {}) };
     const own = attempts(id);
     const earlier = [own, retryOf === undefined ? undefined : attempts(retryOf)].filter(value => value !== undefined);
-    if (earlier.length) {
+    if (!earlier.length) return undefined;
+    return (async () => {
       const first = Math.min(...earlier.map(value => value.first));
       const last = Math.max(...earlier.map(value => value.last));
       const sent = await wrap(() => line.outbound(chat, first - RESEND_LOOKBACK_MS));
@@ -74,13 +75,15 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       const match = sent.find(message => message.handle && message.sentAt >= first && !UNSENT.test(message.status)
         && store.byProviderId(message.handle) === undefined && landed(message));
       if (match) {
-        // Only retryOf's copies can predate this id's own first attempt; a later one is this variant's.
         const original = retryOf !== undefined && (own === undefined || match.sentAt < own.first);
         store.set(sentKey(id), { handle: match.handle, ...(original ? { original } : {}) });
         return { providerId: match.handle, duplicate: true, ...(original ? { original } : {}) };
       }
       if (now() < last + SETTLE_MS) throw new TransportError("sendUnconfirmed", true, true);
-    }
+    })();
+  };
+  const dispatch = async (id: string, send: () => Promise<{ handle: string }>): Promise<Receipt> => {
+    const own = attempts(id);
     const start = now();
     store.set(attemptKey(id), { first: own?.first ?? start, last: start } satisfies Attempts);
     let sent: { handle: string };
@@ -97,6 +100,14 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     store.set(sentKey(id), { handle: sent.handle });
     rearm();
     return { providerId: sent.handle };
+  };
+  const once = async (id: string, retryOf: string | undefined, landed: (message: LineOutbound) => boolean,
+    send: () => Promise<{ handle: string }>): Promise<Receipt> => {
+    const recovery = recover(id, retryOf, landed);
+    const receipt = recovery instanceof Promise ? await recovery : recovery;
+    if (receipt) return receipt;
+    // A fresh text/file send must reserve its id and dispatch without yielding after Delivery's guards.
+    return dispatch(id, send);
   };
   // One queue keeps a re-arm after a send from landing after the turn's stop.
   let typingOn = false;
@@ -149,20 +160,29 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       return once(input.id, undefined, message => message.mediaUrl === input.attachmentGuid,
         () => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) }));
     },
-    async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<{ providerId?: string; duplicate?: boolean }> {
+    /** All reads/uploads finish before Delivery's final guards; the returned function only sends. */
+    async prepareApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<() => Promise<Receipt>> {
       const { id, chatGuid: _chat, ...given } = input;
-      // Live cards reuse one page URL with new captions, so the text has to match too.
       const layout = cardLayout(given);
       const sameLayout = (stored: CardText) => layout !== undefined
         && CARD_TEXT_FIELDS.every(key => sameText(stored[key] ?? "") === sameText(layout[key] ?? ""));
-      return once(id, undefined, message => message.card?.url === given.url && sameLayout(message.card.layout), async () => {
-        let card: LineAppCard = given;
-        if (cards.static) {
-          const imageUrl = card.imageUrl ?? await cards.previewImage?.(card.url).catch(() => undefined);
+      const receipt = await recover(id, undefined, message => message.card?.url === given.url && sameLayout(message.card.layout));
+      if (receipt) return async () => receipt;
+      let card = given;
+      if (cards.static) {
+        const key = `prepared-app:${id}`;
+        const saved = store.get<LineAppCard>(key);
+        if (saved) card = saved;
+        else {
+          const imageUrl = card.imageUrl ?? await wrap(() => cards.previewImage?.(card.url) ?? Promise.resolve(undefined));
           card = { ...card, interactive: false, ...(imageUrl ? { imageUrl } : {}) };
+          store.set(key, card);
         }
-        return line.sendApp(chat, card);
-      });
+      }
+      return () => dispatch(id, () => line.sendApp(chat, card));
+    },
+    async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<Receipt> {
+      return (await this.prepareApp(input))();
     },
     /** Polls are unsupported on Sendblue; the title and numbered options go out as plain text. */
     async sendPoll(input: { id: string; chatGuid: string; title: string; options: readonly string[] }): Promise<{ providerId?: string; duplicate?: boolean }> {

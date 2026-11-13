@@ -246,12 +246,16 @@ Producer source configuration: `OPENCODE_EXPORT_SOURCE_DB` (default
 producer-only; `OPENCODE_DB` remains a guarded legacy reader override. Python 3.11+
 is required for incremental blob I/O; the plist uses Homebrew Python.
 
-For first deployment, sync this integration, create its log directory, install
-`scripts/com.abdullah.opencode-readonly.plist` in `~/Library/LaunchAgents/`, and
-bootstrap that agent. Wait for `ready=1` and fresh `updated_at` in the **export**
+`zsh -f integrations/deploy.zsh memory-system` installs the exporter plist in
+`~/Library/LaunchAgents/` and creates its log directory. Bootstrap the exporter
+separately with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.abdullah.opencode-readonly.plist`.
+Wait for `ready=1` and fresh `updated_at` in the **export**
 before restarting the recall/capture readers. After an OpenCode schema change or
 source-file replacement, rebuild this disposable export (never alter live state).
-The producer refuses overlapping instances and source/target aliases.
+The producer refuses overlapping instances and source/target aliases. It exits
+after five minutes without progress so launchd can recover from a lost volume.
+Memory health flags publications older than 30 minutes; a first bootstrap may
+take longer while its progress heartbeat stays within five minutes.
 
 Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and
 `bash tests/test_stages.sh`.

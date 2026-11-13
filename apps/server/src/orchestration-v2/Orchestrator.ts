@@ -10230,6 +10230,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : {},
     );
     let run = projection.runs.find((candidate) => candidate.id === command.runId);
+    // Native steering preserves the attempt; compare its accepted input while owning the command lock.
+    if (command.expectedLastInputMessageId !== undefined && run !== undefined) {
+      const inputs = yield* loadProjectionForCommand(command, ["turnItems"], {
+        turnItemTypes: ["user_message"],
+        turnItemRunId: run.id,
+      });
+      const latest = inputs.turnItems.findLast((item) => item.type === "user_message");
+      if (latest?.messageId !== command.expectedLastInputMessageId) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${run.id} accepted another input before interruption.`,
+        });
+      }
+    }
     if (command.fenced === true && run !== undefined) {
       const cause =
         run.status === "completed" ||
@@ -10317,7 +10332,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             (candidate) => candidate.providerThreadId === run?.providerThreadId,
           )
         : undefined);
-    if (run === undefined || rootNode === undefined || providerThread === undefined) {
+    if (run === undefined) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -10350,7 +10365,98 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               });
             }
           });
-
+    const ownedNodes = new Set(
+      projection.nodes.filter((node) => node.runId === run.id).map((node) => node.id),
+    );
+    const ownedAttempts = new Set(
+      projection.attempts
+        .filter((attempt) => attempt.runId === run.id)
+        .map((attempt) => attempt.id),
+    );
+    // Notification-only runs can be active without a root/provider binding. There
+    // is no provider to interrupt; settle only that run and keep normal queue policy.
+    if (
+      (rootNode === undefined ||
+        providerThread === undefined ||
+        !projection.attempts.some((attempt) => attempt.id === run.activeAttemptId)) &&
+      ["preparing", "starting", "running"].includes(run.status) &&
+      projection.runs
+        .filter((candidate) => ["preparing", "starting", "running"].includes(candidate.status))
+        .at(-1)?.id === run.id &&
+      !projection.providerTurns.some(
+        (turn) =>
+          (turn.status === "running" || turn.status === "pending") &&
+          ((run.activeAttemptId !== null && turn.runAttemptId === run.activeAttemptId) ||
+            (run.rootNodeId !== null && turn.nodeId === run.rootNodeId) ||
+            ownedNodes.has(turn.nodeId) ||
+            (turn.runAttemptId !== null && ownedAttempts.has(turn.runAttemptId))),
+      )
+    ) {
+      const emitEvent = emit(events, command);
+      const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
+      if (attempt)
+        yield* emitEvent({
+          type: "run-attempt.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...attempt, status: "interrupted", completedAt: now },
+        });
+      if (rootNode)
+        yield* emitEvent({
+          type: "node.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...rootNode, status: "interrupted", completedAt: now },
+        });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          id: idAllocator.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-result" }),
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: rootNode?.id ?? null,
+          providerThreadId: providerThread?.id ?? null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+          status: "interrupted",
+          title: "Interrupted",
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "run_interrupt_result",
+          message: "Run had no provider turn; cleared",
+        },
+      });
+      yield* emitEvent({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: "interrupted", completedAt: now },
+      });
+      yield* stopRemainingWork();
+      return {
+        effectTypes: ["provider-turn.start", "provider-turn.restart"],
+        reason: `Run ${run.id} had no provider turn; cleared.`,
+      } satisfies {
+        readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+        readonly reason: string;
+      };
+    }
+    if (rootNode === undefined || providerThread === undefined) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Run ${command.runId} is not interruptible.`,
+      });
+    }
     const emitEvent = emit(events, command);
     const interruptRequestItem: OrchestrationV2TurnItem = {
       id: idAllocator.derive.runSignalTurnItem({

@@ -1,0 +1,30 @@
+{
+  "case_number": 12,
+  "reporter_id": "crpko3917",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:7f5808e3-56ac-42c6-8bf9-a473a67504d1",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T03-26-36-01a1ccef-48a1-7d53-875b-e1de78f8344c.jsonl",
+    "source_call_line_0": 357,
+    "timestamp": "2026-11-11T23:40:11.195Z",
+    "call_id": "call_74b39d5af037490a966be4d42568196b",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 304
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\nimport shutil,json,xml.etree.ElementTree as E\nroot=Path('/Volumes/ExternalSSD/crpko-devops/tmp/card-bc-546')\nsrc=Path('/Users/ardud/checkouts/bc-pr546/tmp/pr546-surgical-results')\nshutil.copytree(src,root/'surgical-results',dirs_exist_ok=True)\nrows=[]\nfor label in ('wrong-bucket','base64-of-hex-text','unsigned-checksum','missing-required-checksum','permission-after-body','unchecked-digest','restored'):\n cases=list(E.parse(src/(label+'.xml')).getroot().iter('testcase'))\n fails=sum(c.find('failure') is not None or c.find('error') is not None for c in cases)\n rows.append((label,len(cases),fails,len(cases)-fails))\nprint(rows)\np=root/'review.md'\ns=p.read_text().replace('Surgical mutation results are recorded below after completion.','''Surgical offbox run **run-1112-033501-a577**, `uv run --frozen python tmp/pr546-mutation/surgical.py`, completed overall exit0. Each mutation is isolated and restored before the next; each targeted pytest command returned exit1 with assertion failures, no collection failure:\n\n| Production mutation | Failed / selected |\n| --- | --- |\n'''+''.join(f'| {label} | {fails} / {total} |\\n' for label,total,fails,passes in rows[:-1])+'''\nThe final restored subset passed **10/10**, exit0. Wrong-bucket and missing-header rows both fail the existing route test and the duplicate F2 test, confirming their overlap. Invalid-base64 and omitted-checksum signing fail the real boto3 test; removing route permission precedence fails both denied-body cases. The unchecked-digest mutation fails all four digest cases. All source mutations occurred only on the remote scratch copy and were restored in finally blocks; the local checkout's tracked files stayed unchanged.''')\np.write_text(s)\nwith (root/'checks.log').open('a') as log:\n log.write('\\nCOMMAND offbox wait run-1112-032843-29b1 --timeout 45\\nEXIT 124 (attachment timed out; remote continued)\\n')\n log.write('COMMAND offbox wait run-1112-032843-29b1 --timeout 45\\nEXIT 0 (completed; artifacts pulled)\\n')\n log.write('COMMAND offbox run --include tmp/pr546-mutation --pull tmp/pr546-surgical-results -- uv run --frozen python tmp/pr546-mutation/surgical.py\\nEXIT 0\\n')\n log.write('Surgical summary: '+repr(rows)+'\\n')\nprint('Report finalized')\nPY\ngit --no-optional-locks status --porcelain; git diff --check; git rev-parse HEAD",
+      "workdir": "/Users/ardud/checkouts/bc-pr546",
+      "sha256": "c41b1eb1019468754593b7c5d49d730de996155a38acb94eeae6feaeec6b64d8"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

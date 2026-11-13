@@ -43,6 +43,9 @@ class GitSyncTests(unittest.TestCase):
         self.remote = self.base / "remote checkout"
         self.real_run = subprocess.run
         self.stack.enter_context(patch.object(ssh_sync, "log"))
+        self.stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        self.stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         # Keep actual rsync/Git behavior; replace only the network transport.
         self.stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
         self.stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=self.ssh_local))
@@ -53,6 +56,10 @@ class GitSyncTests(unittest.TestCase):
         if p.returncode:
             raise AssertionError(f"git {args}: {p.stderr}")
         return p.stdout.strip()
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:

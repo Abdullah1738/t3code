@@ -1087,6 +1087,8 @@ export function toPullRequestWatchFingerprint(
 }
 
 export interface GitHubPullRequestCore extends GitHubPullRequestDetail {
+  readonly headBranchSha: string | null;
+  readonly checksHeadSha: string | null;
   readonly reviewRequestTeams: ReadonlyArray<PullRequestActor>;
   readonly viewerAccess: GitHubViewerAccess & GitHubRepositoryAccess;
   readonly comparison: GitHubBaseComparison | null;
@@ -1134,6 +1136,8 @@ export function toPullRequestCore(result: PullRequestCore.Result): GitHubPullReq
       labels: nodesOf(pr.labels),
       statusCheckRollup: toCheckContexts(nodesOf(contexts)),
     }),
+    headBranchSha: trimmed(pr.headRef?.target?.oid),
+    checksHeadSha: trimmed(nodesOf(pr.commits)[0]?.commit.oid),
     headRepositoryNameWithOwner: trimmed(pr.headRepository?.nameWithOwner),
     viewerAccess: {
       canWrite: toCanWrite(repository.viewerPermission),
@@ -1253,6 +1257,7 @@ function toCheckContexts(nodes: ReadonlyArray<CheckContext>): ReadonlyArray<GitH
 /** One page of the head commit's check contexts; null for a pull request GitHub did not find. */
 export function toPullRequestCheckContextsPage(result: PullRequestCheckContexts.Result): {
   readonly headSha: string;
+  readonly checksHeadSha: string | null;
   readonly contexts: ReadonlyArray<GitHubCheckContext>;
   readonly nextCursor: string | null;
 } | null {
@@ -1261,6 +1266,7 @@ export function toPullRequestCheckContextsPage(result: PullRequestCheckContexts.
   const contexts = nodesOf(pr.commits)[0]?.commit.statusCheckRollup?.contexts;
   return {
     headSha: pr.headRefOid,
+    checksHeadSha: trimmed(nodesOf(pr.commits)[0]?.commit.oid),
     contexts: toCheckContexts(nodesOf(contexts)),
     nextCursor: nextCursorOf(contexts?.pageInfo),
   };

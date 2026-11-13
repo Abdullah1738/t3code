@@ -1,3 +1,4 @@
+import * as RedactionTools from "../ardud/redaction/tools.ts";
 import * as SavedBoardReply from "../ardud/kanban/tools/savedReply.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -1229,3 +1230,8 @@ export const layer = Layer.mergeAll(
   layerDeviceToolkit,
   layerHtmlToolkit,
 ).pipe(Layer.provideMerge(layerMcpTransport));
+
+export const layerRedactionToolkit = toolkitRegistration(
+  RedactionTools.ThreadRedactionToolkit,
+  RedactionTools.layer,
+);

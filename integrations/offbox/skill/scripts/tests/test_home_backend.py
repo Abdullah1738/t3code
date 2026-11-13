@@ -112,7 +112,6 @@ class Unconfigured(HomeFiles):
         me = {"owner": "t", "repo_root": "/r", "repo_key": "r"}
         boom = AssertionError("home code reached on a Boat-only install")
         with patch.object(home, "probe", side_effect=boom), patch.object(home, "fail_over", side_effect=boom), \
-                patch("offbox_lib.localfirst.decide", return_value="not a light command"), \
                 patch.object(runs, "run_remote", return_value=7) as rr, patch.object(cli, "log"), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(cli.cmd_run(a, me), 7)
@@ -229,7 +228,6 @@ class Failover(HomeFiles):
             self.execs.append((argv, env))
             raise self.Exec()
         self.stack.enter_context(patch.object(os, "execve", execve))
-        self.stack.enter_context(patch("offbox_lib.localfirst.decide", return_value="not a light command"))
         self.stack.enter_context(patch.object(cli, "log"))
         self.me = {"owner": "t", "repo_root": "/r", "repo_key": "r"}
 
@@ -368,7 +366,7 @@ class PersonNeverOnBoat(HomeFiles):
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         a = cli.build_parser().parse_args(["run", "--no-fallback", "--remote", "--", "true"])
         gone = api.NetworkError("offbox server API unreachable")
-        with patch("offbox_lib.localfirst.decide", return_value="remote"), patch.object(cli, "log"), \
+        with patch.object(cli, "log"), \
                 patch.object(runs, "run_remote", side_effect=gone), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.cmd_run(a, {"owner": "person:moni", "repo_root": "/p", "repo_key": "moni"}), 93)
 
@@ -527,6 +525,85 @@ class Reconnect(unittest.TestCase):
         self.assertNotIn("offbox server", err)
 
 
+class MissingTemplates(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.root = Path(self.tmp.name) / "repo"
+        self.root.mkdir()
+        (self.root / "go.mod").write_text("module example\n\ngo 1.24\n")
+        self.me.update(repo_root=str(self.root), repo_key="example")
+        self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
+        self.stack.enter_context(patch.object(api, "BACKEND", "server"))
+        self.stack.enter_context(patch.object(home, "only_on_home", return_value=False))
+        self.stack.enter_context(patch.object(lease, "_fit_new", side_effect=lambda sz, size: sz))
+        self.stack.enter_context(patch.object(lease, "new_id", return_value="lease-test"))
+        self.create = self.stack.enter_context(patch.object(api, "create", return_value={"id": "bx_recipe"}))
+        self.fork = self.stack.enter_context(patch.object(api, "fork", return_value={"id": "bx_template"}))
+        self.err = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+
+    def template(self, name):
+        self.con.execute("INSERT INTO templates (name, box_id, size, token_owner) VALUES (?,?,?,?)",
+                         (name, "bx_" + name, lease.DEFAULT_SIZE[name], common.token_owner()))
+        self.con.commit()
+
+    def new_box(self, **kw):
+        return lease._new_box(self.con, self.me, kw.get("size"), kw.get("template"), None, kw.get("fresh", False))
+
+    def test_missing_template_uses_its_recipe_and_says_so_once_on_each_backend(self):
+        for backend, label in (("server", "home server"), ("boat", "boat.dev")):
+            with self.subTest(backend=backend), patch.object(api, "BACKEND", backend):
+                self.err.seek(0)
+                self.err.truncate()
+                self.assertEqual(self.new_box(), ({"id": "bx_recipe"}, "recipe:crpko-go", None, "large"))
+                self.create.assert_called_with("large", common.RUN_TTL_S, lease.box_name(self.me, "example"),
+                                               "lease-test-recipe")
+                self.assertEqual(self.err.getvalue(), f"offbox: template crpko-go not built on the {label}; "
+                                 "building this box from its recipe (a few minutes). "
+                                 "offbox template build crpko-go makes the next one fast.\n")
+        self.fork.assert_not_called()
+
+    def test_generic_template_does_not_replace_a_missing_go_template(self):
+        self.template("generic")
+        self.assertEqual(self.new_box()[1], "recipe:crpko-go")
+        self.fork.assert_not_called()
+
+    def test_generic_repository_keeps_using_its_generic_template(self):
+        (self.root / "go.mod").unlink()
+        self.template("generic")
+        self.assertEqual(self.new_box()[1:], ("template:generic", None, "default"))
+        self.create.assert_not_called()
+        self.assertEqual(self.fork.call_args.args[0], "bx_generic")
+
+    def test_fresh_is_bare_even_when_a_template_is_explicit(self):
+        self.template("crpko-go")
+        self.assertEqual(self.new_box(fresh=True, template="crpko-go")[1], "fresh")
+        self.fork.assert_not_called()
+        self.assertEqual(self.create.call_args.args[-1], "lease-test")
+
+    def test_matching_template_is_used(self):
+        self.template("crpko-go")
+        self.assertEqual(self.new_box()[1:], ("template:crpko-go", None, "large"))
+        self.create.assert_not_called()
+        self.assertEqual(self.fork.call_args.args[0], "bx_crpko-go")
+
+    def test_missing_generic_and_explicit_templates_use_the_recipe_with_requested_size(self):
+        for template in common.TEMPLATES:
+            with self.subTest(template=template):
+                self.assertEqual(self.new_box(template=template, size="xlarge")[1:],
+                                 ("recipe:" + template, None, "xlarge"))
+        self.fork.assert_not_called()
+
+    def test_missing_template_uses_the_existing_locked_bring_up_and_owner_stamp(self):
+        with patch.object(lease, "_bring_up") as up, patch.object(api, "rename"):
+            row = lease.acquire_private(dict(self.me, owner="pool:example"))
+        self.addCleanup(row["_guard"].__exit__, None, None, None)
+        self.assertEqual((row["source"], row["state"], row["token_owner"]),
+                         ("recipe:crpko-go", "running", common.token_owner()))
+        self.assertEqual(up.call_args.kwargs["recipe"], "crpko-go")
+        self.assertTrue(up.call_args.kwargs["box_held"])
+        self.assertFalse(up.call_args.kwargs["fresh"])
+
+
 class BoatPlan(Isolated):
     """Boat as the standby on its $20 plan: 12/60/200 starts, no xlarge (numbers from Boat's /limits)."""
 
@@ -615,6 +692,25 @@ class ReapBothBackends(HomeFiles):
                 patch.object(common, "_BACKEND", "boat"):
             cli._reap_other_backend(False)
 
+
+
+class HomePoolIsAQueue(unittest.TestCase):
+    """Owner, 13 Nov 2026: no caps at home; a full pool is a queue and callers wait for a slot."""
+
+    def test_home_waits_a_day_for_a_slot_and_boat_keeps_its_numbers(self):
+        import importlib.util
+        from offbox_lib import pool
+        clean = {k: v for k, v in os.environ.items() if k not in ("OFFBOX_POOL_WAIT_SECONDS", "OFFBOX_POOL_SIZE")}
+        with patch.dict(os.environ, clean, clear=True):
+            with patch.object(pool, "backend", return_value="server"):
+                self.assertEqual((pool.wait_seconds(), pool.wait_max(), pool.pool_size()), (86400, 86400, 8))
+            with patch.object(pool, "backend", return_value="boat"):
+                self.assertEqual((pool.wait_seconds(), pool.wait_max(), pool.pool_size()), (600, 1200, 4))
+        with patch.dict(os.environ, {"OFFBOX_POOL_SIZE": "500", "OFFBOX_POOL_WAIT_SECONDS": "30"}), \
+                patch.object(pool, "backend", return_value="server"):
+            self.assertEqual((pool.wait_seconds(), pool.pool_size()), (30, 64))
+        self.assertEqual((pool._span(59), pool._span(5400), pool._span(86400)), ("59s", "1h30m", "24h00m"))
+        self.assertIsNone(importlib.util.find_spec("offbox_lib.localfirst"), "the local-first lane is retired")
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,13 +12,14 @@ import noon_nownow_checkout as native
 import commerce_receipts as receipts
 
 
-def reader(*, auth=None, expected_account=None):
+def reader(*, auth=None, expected_account=None, expected_address=None):
     auth=auth or NoonAuthLifecycle()
     def snapshot():
         return auth.reconcile('nownow') if auth.status('nownow')['maintenance_state']!='none' else auth.revalidate('nownow')
     current=snapshot()
     account,address=current.account_ref,current.address_ref
     if expected_account is not None and expected_account!=account:journal.fail('RECOVERY_ACCOUNT_CHANGED')
+    if expected_address is not None and expected_address!=address:journal.fail('NOWNOW_ACCOUNT_HOME_CHANGED')
     retained=[]
     def headers(operation,deadline):
         nonlocal current

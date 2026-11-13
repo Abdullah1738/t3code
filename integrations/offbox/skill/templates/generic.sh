@@ -15,7 +15,8 @@ fi
 
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync zip unzip ca-certificates \
-  python3-venv python3-pip libssl-dev >/dev/null
+  python3-venv python3-pip libssl-dev zsh openjdk-21-jre-headless >/dev/null
+sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
 sudo apt-get clean
 
 # corepack shims for yarn/pnpm (cache dirs come from the offbox env block)

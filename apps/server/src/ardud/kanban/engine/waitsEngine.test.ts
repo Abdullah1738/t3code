@@ -159,6 +159,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         updatedAt: iso(nowMs),
         quietSince: iso(T0),
         runStartedAt: null,
+        lastActivityAt: null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
@@ -174,6 +175,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {
@@ -199,6 +201,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       send: (input) =>
         Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
@@ -212,7 +215,9 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         Effect.sync(() => {
           host.asked.push(requests.map((request) => request.url));
           const wanted = new Set(requests.map((request) => Waits.prKey(request.url)));
-          const read = host.readings.filter((reading) => wanted.has(Waits.prKey(reading.url)));
+          const read = host.readings
+            .filter((reading) => wanted.has(Waits.prKey(reading.url)))
+            .map((reading) => ({ ...reading, failedChecks: reading.failedChecks ?? [] }));
           return {
             readings: Waits.mergePrReadings(
               requests.flatMap((request) => (request.live === null ? [] : [request.live])),

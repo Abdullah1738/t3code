@@ -18,6 +18,7 @@ import { sessionMarker } from "./session.ts";
 import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, mentionsRobob, observedPreamble } from "./group-gate.ts";
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
+import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -134,6 +135,7 @@ type Options = {
   swipes?: { find: Swipes; line: string; waitMs?: number };
   /** "final" (default) forwards each turn's final text; "tool" forwards nothing and the agent sends with imessage_send. */
   replyMode?: ReplyMode;
+  notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
 type Swipe =
@@ -602,6 +604,13 @@ export class Router {
     return this.ticking ??= this.run().finally(() => { this.ticking = undefined; });
   }
 
+  private checkingFailed?: Promise<void>;
+
+  /** The health timer also runs this while a normal tick waits on the backend. */
+  checkFailedInbound(): Promise<void> {
+    return this.checkingFailed ??= this.recoverFailedInbound().finally(() => { this.checkingFailed = undefined; });
+  }
+
   /** Tool mode: the agent texts the chat itself, and no assistant text is ever forwarded. */
   private get toolMode(): boolean {
     return this.options.replyMode === "tool";
@@ -637,6 +646,200 @@ export class Router {
     };
   }
 
+  private recordFailure(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    const failure = { stage, message: failureMessage(error), threadId: route?.id ?? null, at: Date.now() };
+    this.store.recordInboundFailure(id, failure);
+    this.options.log?.("inbound-failed", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", ...failure }));
+  }
+
+  private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    // Keep the transport exception rather than replacing it with a generic timeout notice.
+    const prior = this.store.inboundFailure(id);
+    if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
+    const failure = this.store.inboundFailure(id)!;
+    this.store.updateInbound(id, "failed", undefined, { ...failure, at: Date.now() });
+  }
+
+  private failedScanAt = -Infinity;
+
+  private expireFailedReplay(id: string | undefined): boolean {
+    if (!id) return false;
+    const until = this.store.get<number>(`failed-replay-until:${id}`);
+    if (until === undefined || Date.now() <= until) return false;
+    if (this.store.get(`batch-phase:${id}`) === "accepted") return true;
+    const active = this.store.get<Turn | null>("activeTurn");
+    // A POST already in flight can still land; expiry forbids another POST, not its receipt.
+    if (active?.inboundId === id && this.inflight.has(active.messageId)) return true;
+    this.store.db.transaction(() => {
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      const attempted = active?.inboundId === id ? active : this.store.get<Turn | null>(`failed-delivery:${id}`);
+      // Expiry revokes POST permission; an earlier ambiguous POST may still be admitted later.
+      if (attempted && !this.store.get(`failed-replay-receipt:${id}`)) this.store.set(`failed-replay-receipt:${id}`, attempted);
+      const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
+      for (const member of ids) this.store.db.query("UPDATE inbound SET state = 'failed' WHERE id = ? AND state IN ('processing', 'batched')").run(member);
+      this.store.set(`batch-phase:${id}`, "expired");
+      if (preparing?.id === id) this.store.set("preparingDelivery", null);
+      if (active?.inboundId === id) this.store.set("activeTurn", { ...active, phase: "failed" });
+      if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
+      if (preparing?.id === id || active?.inboundId === id) this.store.set("deliveryOutage", null);
+    }).immediate();
+    return true;
+  }
+
+  private async reconcileExpiredFailedReplays(): Promise<void> {
+    const rows = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null'",
+    ).all();
+    for (const row of rows) {
+      const turn = JSON.parse(row.value) as Turn;
+      if (this.store.get(`batch-phase:${turn.inboundId}`) === "accepted") { this.store.set(row.key, null); continue; }
+      if (!this.current(turn)) continue;
+      let found: string | undefined;
+      for (const id of [turn.messageId, ...turn.earlier ?? []]) {
+        try { if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; } }
+        catch { /* Unknown admission retains the receipt watch, never POST permission. */ }
+      }
+      if (!found) continue;
+      this.store.db.transaction(() => {
+        const active = this.store.get<Turn | null>("activeTurn");
+        // A newer turn keeps the chat; adopt the late receipt after it settles.
+        if (!this.current(turn) || active && active.phase !== "failed" || this.store.get("preparingDelivery")) return;
+        const admitted: Turn = { ...turn, messageId: found!, phase: "running" };
+        this.store.set("activeTurn", admitted);
+        this.landed(admitted);
+        this.store.set(row.key, null);
+      }).immediate();
+    }
+  }
+
+  private skipStaleFailedInbound(id: string, input: NormalizedInbound): boolean {
+    if (this.store.get<boolean>(`failed-stale:${id}`)) return true;
+    const receivedAt = input.receivedAt ?? input.sentAt;
+    if (receivedAt === undefined || Date.now() - receivedAt <= FAILED_INBOUND_ALERT_MAX_AGE_MS) return false;
+    this.store.db.transaction(() => {
+      this.store.set(`failed-stale:${id}`, true);
+      this.store.set(`failed-alert-pending:${id}`, null);
+    }).immediate();
+    this.options.log?.("failed-inbound-skipped-stale", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", age: Date.now() - receivedAt }));
+    return true;
+  }
+
+  private async sendFailedAlert(id: string, text: string): Promise<void> {
+    // Pending notifications outlive failed rows, including successful recovery and restart.
+    const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+    if (row && this.skipStaleFailedInbound(id, JSON.parse(row.payload) as NormalizedInbound)) return;
+    if (this.store.get<boolean>(`failed-alert:${id}`)) return;
+    try {
+      if (await this.options.notifyFailure!(text, `bridge-failed:${id}`)) this.store.db.transaction(() => {
+        this.store.set(`failed-alert:${id}`, true);
+        this.store.set(`failed-alert-pending:${id}`, null);
+      }).immediate();
+    } catch { this.options.log?.("failed-alert-unavailable", id); }
+  }
+
+  private async recoverFailedInbound(): Promise<void> {
+    const chat = this.options.context?.chat;
+    if (!this.options.notifyFailure || (chat && chat.kind !== "owner" && chat.slug !== "moni")) return;
+    const now = Date.now();
+    if (now - this.failedScanAt < 30_000) return;
+    this.failedScanAt = now;
+    await this.reconcileExpiredFailedReplays();
+    // A failed notification stays due even if recovery has since delivered the message.
+    const pending = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null'",
+    ).all();
+    const attempted = new Set<string>();
+    for (const row of pending) {
+      const id = row.key.slice("failed-alert-pending:".length);
+      attempted.add(id);
+      await this.sendFailedAlert(id, JSON.parse(row.value) as string);
+    }
+    for (const row of this.store.failedInbound()) {
+      const input = row.payload as NormalizedInbound;
+      const critical = criticalWake(row.id, input.text);
+      if (!critical && (synthetic(row.id) || input.source !== "typed")) continue;
+      if (this.skipStaleFailedInbound(row.id, input)) continue;
+      // Failure logging (including legacy backfill) must never refresh the received age.
+      const receivedAt = input.receivedAt ?? input.sentAt;
+      const failure = this.store.inboundFailure(row.id);
+      const at = failure?.at ?? input.receivedAt ?? input.sentAt;
+      if (at === undefined || now - at < 120_000) continue;
+      const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
+      const parent = this.store.db.query<{ id: string }, [string]>(
+        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? LIMIT 1",
+      ).get(row.id)?.id ?? row.id;
+      const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
+      // landed() writes this receipt. A later failed run must never erase its proof of admission.
+      const receipted = () => this.store.get(`batch-phase:${parent}`) === "accepted";
+      if (!critical && receipted()) continue;
+      const destination = this.store.get<Route | null>("route");
+      let original = this.store.get<Turn | null>(`failed-delivery:${parent}`);
+      const live = this.store.get<Turn | null>("activeTurn");
+      if (!original && live?.inboundId === parent) original = live;
+      if (!original) {
+        const notice = this.store.db.query<{ payload: string }, [string]>(
+          "SELECT payload FROM outbox WHERE json_extract(payload, '$.replyTo') = ? AND id LIKE 'turn:%:failed' ORDER BY rowid DESC LIMIT 1",
+        ).get(parent);
+        const op = notice ? JSON.parse(notice.payload) as OutboxRecord : undefined;
+        const route = this.store.get<Route | null>("route");
+        // Robob ignores the directory argument; other backends need their original directory as proof.
+        if (op?.sessionId?.startsWith("ardud-control:thread:") && route) original = { ...route, id: op.sessionId, generation: op.generation ?? route.generation,
+          inboundId: parent, messageId: `msg_${hash(parent)}`, phase: "failed", startedAt: input.receivedAt ?? at };
+      }
+      const admitted = async (): Promise<boolean | undefined> => {
+        if (receipted()) return true;
+        const route = this.store.get<Route | null>("route");
+        const destinations = original ? [original] : [];
+        if (route && !destinations.some(item => item.id === route.id && item.directory === route.directory)) destinations.push({ ...route,
+          inboundId: parent, messageId: original?.messageId ?? `msg_${hash(parent)}`, phase: "failed", startedAt: at });
+        let conclusive = original !== undefined;
+        for (const target of destinations) for (const id of [target.messageId, ...(target.earlier ?? [])]) {
+          try { if (await bounded(this.backend.promptAccepted(target.id, target.directory, id))) return true; }
+          catch { conclusive = false; }
+          if (receipted()) return true;
+        }
+        if (route && !this.current(route)) return undefined;
+        return conclusive ? false : undefined;
+      };
+      const accepted = critical ? undefined : await admitted();
+      // The new destination was outside this readback's snapshot; let the next scan check it.
+      if (!critical && (destination ? !this.current(destination) : this.store.get("route") != null)) continue;
+      if (!stillFailed() || (!critical && (accepted || receipted()))) continue;
+      if (!this.store.get<boolean>(`failed-alert:${row.id}`)) {
+        const who = chat?.slug === "moni" ? "Moni" : "Abdullah";
+        const time = new Date(input.sentAt ?? input.receivedAt ?? at).toLocaleString("en-GB", { timeZone: this.options.timezone });
+        const text = critical ? `Missed money/security update at ${time}:\n${wakeEventPreview(input.text)}`
+          : `Missed message from ${who} at ${time}: '${input.text.slice(0, 80)}'`;
+        // No await separates the final receipt check from the durable alert decision.
+        if (!critical && receipted()) continue;
+        const saved = this.store.get<string | null>(`failed-alert-pending:${row.id}`);
+        if (!saved) this.store.set(`failed-alert-pending:${row.id}`, text);
+        if (!attempted.has(row.id)) await this.sendFailedAlert(row.id, saved ?? text);
+      }
+      if (!stillFailed() || (!critical && receipted())) continue;
+      if (!failure) this.recordFailure(row.id, "legacy", "Failure predates reason logging", original);
+      if (critical || accepted !== false || parent !== row.id || !original || receivedAt === undefined
+        || Date.now() - receivedAt > FAILED_INBOUND_REPLAY_MAX_AGE_MS) continue;
+      // Alert delivery was an await too: reconcile again before scheduling a replay.
+      if (await admitted() !== false) continue;
+      const route = this.store.get<Route | null>("route");
+      if (!route) continue;
+      this.store.db.transaction(() => {
+        const active = this.store.get<Turn | null>("activeTurn");
+        if (!stillFailed() || receipted() || !this.current(route) || this.store.get<PreparingDelivery | null>("preparingDelivery")
+          || (active && active.phase !== "failed") || this.controlArrived(new Set())
+          || Date.now() - receivedAt > FAILED_INBOUND_REPLAY_MAX_AGE_MS) return;
+        this.store.updateInbound(row.id, "processing");
+        this.store.set(`batch:${row.id}`, batch ?? { ...input, batchIds: [row.id] });
+        this.store.set(`batch-phase:${row.id}`, "preparing");
+        this.store.set(`failed-replay-until:${row.id}`, receivedAt + FAILED_INBOUND_REPLAY_MAX_AGE_MS);
+        this.store.set("activeTurn", null);
+        this.store.set("preparingDelivery", { id: row.id, startedAt: input.receivedAt ?? at, attemptAt: now - ACCEPT_WAIT_MS,
+          attempt: 2, held: true, posted: true } satisfies PreparingDelivery);
+      }).immediate();
+    }
+  }
+
   private current(route: Route): boolean {
     const current = this.store.get<Route | null>("route");
     return current?.id === route.id && current.directory === route.directory && current.generation === route.generation;
@@ -666,7 +869,8 @@ export class Router {
       }
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
-      this.store.updateInbound(id, state);
+      if (state === "failed") this.failInbound(id, "prepare", text);
+      else this.store.updateInbound(id, state);
     }).immediate();
   }
 
@@ -751,13 +955,13 @@ export class Router {
         // A late reset would wipe whatever the owner said in the meantime, so it
         // isn't retried and the owner never hears about it. The next due check
         // (or /new) asks again.
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         this.options.log?.("context-reset-dropped", reason);
         continue;
       }
       if (replyNudgeRow(id)) {
         // A late "you texted nothing" reminder is stale, and the owner never typed it.
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         this.options.log?.("reply-nudge-dropped", reason);
         continue;
       }
@@ -767,7 +971,7 @@ export class Router {
         // effects, and the event is already in the session's history.
         this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
         this.queueDropped(id, text, reason);
-        this.store.updateInbound(id, "failed");
+        this.failInbound(id, "synthetic", reason);
         continue;
       }
       // "errored": the model call failed before any tool ran, so a retry is safe.
@@ -782,7 +986,7 @@ export class Router {
       this.queueDropped(id, text, reason);
       const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
       this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
-      this.store.updateInbound(id, "failed");
+      this.failInbound(id, "synthetic", reason);
     }
   }
 
@@ -919,7 +1123,7 @@ export class Router {
     }
   }
 
-  private sealBatch(handled: Set<string>): InboundRecord | undefined {
+  private sealBatch(handled: Set<string>): (InboundRecord & { resumed?: boolean }) | undefined {
     return this.store.db.transaction(() => {
       this.cancelQueuedNew();
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")) return;
@@ -961,15 +1165,16 @@ export class Router {
         this.store.updateInbound(row.id, "failed");
         this.options.log?.("reply-nudge-dropped", "overtaken");
       }
-      // A prompt ID already used for a steer can only carry its original sealed members.
-      if (this.store.get(`batch-phase:${leader.id}`) === "queued-steer") {
+      // A deferred wake or previously attempted steer keeps its original sealed members.
+      if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${leader.id}`) ?? "")) {
+        const resumed = this.store.get(`batch-phase:${leader.id}`) === "deferred-wake";
         const batch = this.store.get<NormalizedInbound | null>(`batch:${leader.id}`);
         const ids = batch?.batchIds ?? [leader.id];
         const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
         if (ids.some(id => state.get(id)?.state !== (id === leader.id ? "pending" : "batched"))) return;
         this.store.updateInbound(leader.id, "processing");
         this.store.set(`batch-phase:${leader.id}`, steer ? "steering" : "preparing");
-        return { ...leader, state: "processing" };
+        return { ...leader, state: "processing", resumed };
       }
       const input = leader.payload as NormalizedInbound;
       const ordinary = !input.text.trimStart().startsWith("/");
@@ -987,7 +1192,7 @@ export class Router {
           if (row.id.startsWith("wake:") && !leader.id.startsWith("wake:")) continue;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           // Sendblue's reply_to is not the swiped message, so two swipes never share a batch.
-          if (this.store.get(`batch-phase:${row.id}`) === "queued-steer"
+          if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
             || row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo || (this.options.swipes && next.replyTo)
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
@@ -1174,6 +1379,7 @@ export class Router {
     const guidance = attempt?.guidance ?? `[Bridge note, not typed by anyone.] This message came in while you were working. Take it into account in what you are doing now; ${this.toolMode ? `${TOOL_MODE_MARKER} Answer it with imessage_send if it needs an answer.` : "your final reply still goes to the chat."} Current incoming message ID: ${JSON.stringify(input.id)}. Source incoming message IDs (in order, available as reaction targets): ${JSON.stringify(input.batchIds ?? [row.id])}.${eyes ? " The 👀 reaction to it is already sent." : ""}`;
     const sent: SteerAttempt = { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance, startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
     this.store.set(`steer-attempt:${row.id}`, sent);
+    this.store.set(`failed-delivery:${row.id}`, { ...turn, inboundId: row.id, messageId });
     let delivery: SteerDelivery;
     try {
       delivery = await this.sending(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance), handled);
@@ -1214,12 +1420,28 @@ export class Router {
         if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
         return true;
       }
-      for (const member of ids) this.store.updateInbound(member, "pending");
-      // Original payloads were never replaced by the aggregate.
-      this.store.set(`batch:${id}`, null);
-      this.store.set(`batch-phase:${id}`, null);
+      // A busy wake stays sealed even if a later arrival interrupts its next readiness check.
+      const deferred = this.wakeBatch(id) && this.store.get<boolean>(`wake-deferred:${id}`);
+      for (const member of ids) this.store.updateInbound(member, deferred && member !== id ? "batched" : "pending");
+      if (!deferred) this.store.set(`batch:${id}`, null);
+      this.store.set(`batch-phase:${id}`, deferred ? "deferred-wake" : null);
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       return true;
+    }).immediate();
+  }
+
+  private deferBusyBatch(row: InboundRecord): void {
+    if (!this.wakeBatch(row.id)) { this.unsealBatch(row.id); return; }
+    this.store.db.transaction(() => {
+      if (this.store.get(`batch-phase:${row.id}`) !== "preparing"
+        || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing") return;
+      this.store.updateInbound(row.id, "pending");
+      this.store.set(`batch-phase:${row.id}`, "deferred-wake");
+      this.store.set("preparingDelivery", null);
+      if (!this.store.get<boolean>(`wake-deferred:${row.id}`)) {
+        this.store.set(`wake-deferred:${row.id}`, true);
+        this.stage("wake-deferred", row.id);
+      }
     }).immediate();
   }
 
@@ -1242,7 +1464,7 @@ export class Router {
   private async dispatch(handled: Set<string>): Promise<void> {
     const next = this.sealBatch(handled);
     if (!next) return;
-    this.stage("batch-sealed", next.id);
+    if (!next.resumed) this.stage("batch-sealed", next.id);
     if (this.steering(next.id)) await this.steer(next, handled);
     else {
       this.store.set("preparingDelivery", { id: next.id, startedAt: Date.now(), attemptAt: Date.now(), attempt: 1 } satisfies PreparingDelivery);
@@ -2324,6 +2546,7 @@ export class Router {
       return;
     }
     const interrupted = () => {
+      if (this.expireFailedReplay(row.id)) return true;
       const held = steerAttempt !== undefined && steerAttempt !== null
         || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
       const arrived = held ? this.controlArrived(handled)
@@ -2410,7 +2633,7 @@ export class Router {
       let busy = false;
       try { busy = (await this.statusesFor(route))[id] !== undefined; } catch { /* Checked again after downloads. */ }
       if (interrupted()) return;
-      if (busy) { this.unsealBatch(row.id); return; }
+      if (busy) { this.deferBusyBatch(row); return; }
     }
     const downloaded: (Parameters<typeof prepareIncoming>[0] & { guid: string })[] = [];
     const undelivered: string[] = [];
@@ -2528,7 +2751,7 @@ export class Router {
       } catch { /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
-        this.unsealBatch(row.id);
+        this.deferBusyBatch(row);
         return;
       }
       if (interrupted() || !activeRoute) return;
@@ -2548,7 +2771,8 @@ export class Router {
           this.store.set(`batch-phase:${row.id}`, "preparing");
         }).immediate();
         this.retireOthers();
-      } catch {
+      } catch (error) {
+        this.recordFailure(row.id, "create-chat", error);
         if (replyNudgeRow(row.id)) this.store.db.transaction(() => {
           this.retrySynthetic(row.id, "undelivered");
           this.store.set("preparingDelivery", null);
@@ -2718,6 +2942,7 @@ export class Router {
       // Anything the agent sends for this turn lands after this mark.
       turn.outbox = steerAttempt?.outbox ?? this.outboxMark();
       this.store.set("activeTurn", turn);
+      this.store.set(`failed-delivery:${row.id}`, turn);
       // Keep the exact sealed body until acceptance; retries share its prompt id.
       this.store.set("resendBody", {
         inboundId: row.id, text: body, system, parts, model: preferences.model, ...(owner ? { owner } : {}),
@@ -2745,7 +2970,8 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch {
+    } catch (error) {
+      if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
   }
@@ -3010,6 +3236,7 @@ export class Router {
     if (!preparing) return;
     const row = this.store.pendingInbound().find(row => row.id === preparing.id);
     if (!row || row.state !== "processing") { this.store.set("preparingDelivery", null); return; }
+    if (this.expireFailedReplay(preparing.id)) return;
     const turn = { inboundId: preparing.id, messageId: `msg_${hash(preparing.id)}` };
     if (this.wakeBatch(preparing.id)) {
       // Same rule as a POSTed wake: it never holds the chat or earns the outage
@@ -3054,6 +3281,7 @@ export class Router {
   }
 
   private async sendDelivery(turn: Turn, body: ResendBody, handled: Set<string>, replay = false): Promise<void> {
+    if (this.expireFailedReplay(body.inboundId)) return;
     if (this.controlArrived(handled)) return;
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
@@ -3064,7 +3292,8 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch {
+    } catch (error) {
+      if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
   }
@@ -3079,6 +3308,7 @@ export class Router {
     const absent = await this.reconcile(turn);
     turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "running" || this.controlArrived(handled)) return;
+    if (this.expireFailedReplay(turn.inboundId)) return;
     const stored = this.store.get<ResendBody | null>("resendBody");
     const body = stored && stored.inboundId === turn.inboundId ? stored : undefined;
     const elapsed = Date.now() - (turn.attemptAt ?? turn.startedAt);
@@ -3126,6 +3356,35 @@ export class Router {
     this.store.set("deliveryOutage", { ...outage, probeAt: Date.now(), replayAt: Date.now() });
     this.watchdogLog("replay", turn);
     await this.sendDelivery(turn, body, handled, true);
+  }
+
+  private requestScan?: {
+    key: string;
+    result: Promise<{ request: PermissionRequest | QuestionRequest; directory?: string }[]>;
+  };
+
+  /** Child discovery can outlive a tick; root completion must still be read on the next one. */
+  private async scanRequests(turn: Turn, statuses: Record<string, SessionStatus>) {
+    const key = JSON.stringify([turn.id, turn.directory, turn.generation]);
+    if (this.requestScan?.key !== key) {
+      this.requestScan = { key, result: this.requests(turn, statuses) };
+      // A scan may fail between ticks, before its next reader attaches.
+      void this.requestScan.result.catch(() => {});
+    }
+    const scan = this.requestScan;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        scan.result,
+        // Give local request reads a short budget; retain a slow scan for the next tick.
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 100); }),
+      ]);
+      if (result !== undefined && this.requestScan === scan) this.requestScan = undefined;
+      return result;
+    } catch (error) {
+      if (this.requestScan === scan) this.requestScan = undefined;
+      throw error;
+    } finally { clearTimeout(timer); }
   }
 
   /**
@@ -3194,12 +3453,19 @@ export class Router {
       const live = new Set<string>();
       let statuses: Record<string, SessionStatus> = {};
       let refreshed = false;
+      let discoveryPending = false;
       const refreshRequestsOnce = async () => {
         if (refreshed) return;
         refreshed = true;
         const currentTurn = turn!;
         statuses = await this.statusesFor(currentTurn);
-        const requests = await this.requests(currentTurn, statuses);
+        const requests = await this.scanRequests(currentTurn, statuses);
+        if (!requests) {
+          discoveryPending = true;
+          // An incomplete scan says nothing about whether an already-asked request closed.
+          for (const entry of entries) if (["pending", "submitting", "unknown"].includes(entry.state)) live.add(entry.operationId);
+          return;
+        }
         if (!this.current(currentTurn)) return;
         for (const { request, directory } of requests) {
           const kind = "questions" in request ? "question" : "permission";
@@ -3396,6 +3662,11 @@ export class Router {
           }).immediate();
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
+        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
+        if (turn.inboundId && providerError) {
+          const detail = typeof providerError === "object" && "message" in providerError ? providerError.message : providerError;
+          this.recordFailure(turn.inboundId, "execution", detail, turn);
+        }
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
           failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
           return;
@@ -3420,6 +3691,8 @@ export class Router {
           this.store.set("activeTurn", turn);
           return;
         }
+        // Absence is only known after discovery finishes, even if the handover grace elapsed.
+        if (discoveryPending) return;
         // Only a request that is still open keeps the turn: an answer whose
         // outcome is unknown for a request that has since gone away (answered
         // elsewhere, child aborted) must not hold the conversation forever.
@@ -3441,7 +3714,7 @@ export class Router {
       }
       // Busy activity may belong to an older run whose records precede this watermark.
       // Once it stops, there is no later idle marker for this empty background turn.
-      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size) {
+      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size && !discoveryPending) {
         this.store.db.transaction(() => {
           this.store.set("activeTurn", null);
           this.store.set("pendingApprovals", null);
@@ -3577,7 +3850,9 @@ export class Router {
       const followUp = statuses[route.id] !== undefined || after.some(m => m.type === "assistant");
       if (!followUp && !after.some(m => m.type === "user") && Object.keys(statuses).some(id => id !== route.id)) {
         const probe: Turn = { ...route, messageId: mark.id, startedAt: now, phase: "running", background: true };
-        const asking = (await this.requests(probe, statuses)).length > 0;
+        const requests = await this.scanRequests(probe, statuses);
+        if (!requests) return;
+        const asking = requests.length > 0;
         const latest = this.store.get<Turn | null>("activeTurn");
         if (!this.current(route) || (latest && latest.phase !== "failed" && this.current(latest))) return;
         if (asking) {
@@ -3612,7 +3887,7 @@ export class Router {
     this.store.db.transaction(() => {
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.store.updateInbound(id, "failed");
+        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.failInbound(id, "execution", text, turn);
         this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
@@ -3629,7 +3904,7 @@ export class Router {
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);
-        if (turn.inboundId) this.store.updateInbound(turn.inboundId, "failed");
+        if (turn.inboundId) this.failInbound(turn.inboundId, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.store.set("activeTurn", turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

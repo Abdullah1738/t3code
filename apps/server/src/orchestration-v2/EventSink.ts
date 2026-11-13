@@ -69,6 +69,10 @@ export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStre
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
+  /** Publish an already-committed maintenance rewrite to application and live thread subscribers. */
+  readonly publishCommitted: (
+    events: ReadonlyArray<OrchestrationV2StoredEvent>,
+  ) => Effect.Effect<void>;
   readonly write: (input: {
     /** Restate still-bound canonical session rows inside the write transaction. */
     readonly refreshBoundProviderSessions?: true;
@@ -1163,6 +1167,9 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      publishCommitted: Effect.fn("orchestrationV2.EventSink.publishCommitted")((events) =>
+        publishLane.withPermit(publishStoredEvents(events)).pipe(Effect.uninterruptible),
+      ),
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(

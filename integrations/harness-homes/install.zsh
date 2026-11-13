@@ -40,7 +40,9 @@ fi
 
 backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-homes-install.XXXXXX")
 agents=(com.ardud.shared-mcp-flighty com.ardud.shared-mcp-inbody)
-(( with_agent )) && agents+=("$label")
+if (( with_agent )); then
+  agents+=("$label")
+fi
 if [[ -d "$dst" ]]; then
   rsync -a --exclude logs "$dst/" "$backup_dir/package/"
 fi

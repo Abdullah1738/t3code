@@ -167,8 +167,7 @@ class CmdRunOutageTests(OutageBase):
     def run_cli(self, argv, side_effect, wait=None, fallback_rc=0):
         a = cli.build_parser().parse_args(["run", "--"] + argv)
         err = io.StringIO()
-        with patch("offbox_lib.localfirst.decide", return_value="test"), \
-                patch.object(runs, "run_remote", side_effect=side_effect) as rr, \
+        with patch.object(runs, "run_remote", side_effect=side_effect) as rr, \
                 patch.object(outage, "wait_until_up", return_value=wait) as w, \
                 patch.object(fallback, "run_local", return_value=fallback_rc) as loc, \
                 patch.object(fallback, "note_infra_failure"), \

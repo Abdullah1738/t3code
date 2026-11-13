@@ -3,6 +3,24 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type OutboxOperation } from "../src/store.ts";
+import { Database } from "bun:sqlite";
+
+test("inbound failure migration preserves legacy rows and reasons survive acceptance and reopen", () => {
+  const path = databasePath();
+  const legacy = new Database(path);
+  legacy.exec("CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)");
+  legacy.query("INSERT INTO inbound VALUES (?, ?, ?)").run("old", '{"text":"Pause"}', "failed"); legacy.close();
+  let store = open(path);
+  expect(store.failedInbound()).toEqual([{ id: "old", payload: { text: "Pause" }, state: "failed" }]);
+  store.updateInbound("old", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "thread-1", at: 123 });
+  store.close(); store = open(path);
+  expect(store.inboundFailure("old")).toEqual({ stage: "dispatch", message: "offline", threadId: "thread-1", at: 123 });
+  store.updateInbound("old", "done");
+  expect(store.failedInbound()).toEqual([]);
+  expect(store.inboundFailure("old")?.message).toBe("offline");
+  store.acceptInbound("new", {}); store.updateInbound("new", "failed");
+  expect(store.inboundFailure("new")).toMatchObject({ stage: "state-transition", threadId: null });
+});
 
 const stores: Store[] = [];
 const directories: string[] = [];

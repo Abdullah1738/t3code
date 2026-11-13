@@ -123,6 +123,7 @@ const fakeThreads = (
             updatedAt: "2026-10-26T08:00:00.000Z",
             quietSince: "2026-10-26T08:00:00.000Z",
             runStartedAt: null,
+            lastActivityAt: null,
             backgroundWork: 0,
             prWatches: 0,
             prs: [],
@@ -139,6 +140,7 @@ const fakeThreads = (
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) => {
         const launch = Effect.sync(() => {
@@ -160,6 +162,7 @@ const fakeThreads = (
             : Effect.void),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -460,7 +463,7 @@ it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("#566 review replies distinguish a recorded verdict from an exact replay", () => {
+it.effect("#769 review replies name exact replays and refuse expired verdicts", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -491,12 +494,29 @@ it.effect("#566 review replies distinguish a recorded verdict from an exact repl
     });
     assert.isFalse(replay.isError, replay.text);
     assert.strictEqual(replay.structured.recorded, false);
-    assert.include(String(replay.structured.note), "nothing new written");
+    const review = (yield* kanban.card(card.id)).events.findLast(
+      (event) => event.kind === "review",
+    )!;
+    assert.strictEqual(
+      replay.structured.note,
+      `Already recorded as review event ${review.id} at ${review.at}; not saved again.`,
+    );
     assert.deepStrictEqual(replay.structured.card, first.structured.card);
     assert.lengthOf(
       (yield* kanban.card(card.id)).events.filter((event) => event.kind === "review"),
       1,
     );
+    const before = yield* kanban.card(card.id);
+    yield* TestClock.adjust("11 minutes");
+    const expired = yield* call(reviewer, "card_review_result", {
+      verdict: "clear",
+      head: "abc1234",
+    });
+    assert.isTrue(expired.isError, expired.text);
+    assert.include(expired.text, "stage completed");
+    assert.include(expired.text, "review step 1 of 1");
+    assert.include(expired.text, "Your verdict was not recorded.");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
   }).pipe(Effect.provide(layer));
 });
 
@@ -2681,7 +2701,34 @@ it.effect(
         note: "later",
       });
       assert.isTrue(own.isError);
-      assert.include(own.text, "has a running thread");
+      assert.include(
+        own.text,
+        "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
+      );
+      yield* store.putCard({ ...running, links: card.links });
+      const ci = yield* call(running.activeThreadId!, "card_wait", {
+        on: "ci",
+        pr: card.links[0]!.url,
+        note: "checks finish",
+      });
+      assert.isTrue(ci.isError);
+      assert.include(
+        ci.text,
+        "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
+      );
+      const evaluator = yield* call(evaluatorThread, "card_wait", {
+        card: `#${running.number}`,
+        on: "ci",
+        note: "checks finish",
+      });
+      assert.isTrue(evaluator.isError);
+      assert.include(
+        evaluator.text,
+        `card #${running.number} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+      );
+      const after = (yield* kanban.card(running.id)).card;
+      assert.isUndefined(after.wait);
+      assert.strictEqual(after.activeThreadId, running.activeThreadId);
       // And it can't touch another thread's card.
       const foreign = yield* call(running.activeThreadId!, "card_wait", {
         card: `#${card.number}`,
