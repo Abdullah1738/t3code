@@ -128,6 +128,7 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
     if (!sessionMatches(route, sessionId)) throw new ApiError(409);
+    if (prefix === "send" && store.get<boolean>(`cancelledSend:${id}`)) throw new ApiError(409);
     // Delivery and the origin backfill match on the bare id.
     const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation };
     const key = `api:${prefix}:${id}`;
@@ -231,7 +232,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         }
         throw new ApiError(404);
       }
-      if (request.method !== "POST" || !["/files", "/react", "/send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
+      if (request.method !== "POST" || !["/files", "/react", "/send", "/cancel-send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
         "/secret-forget", ...SHARE_ROUTES].includes(path)) throw new ApiError(404);
       const body = await readBody(request, path === "/files" ? MAX_FILE_BODY : path === "/send" || path === "/wake" ? MAX_SEND_BODY : MAX_BODY);
 
@@ -258,6 +259,32 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           if (error instanceof SecretError) throw new ApiError(error.status);
           throw error;
         }
+      }
+
+      if (path === "/cancel-send") {
+        fields(body, ["dedupeKey", "sessionId"]);
+        const { dedupeKey, sessionId } = body;
+        if (!string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
+        liveSendRoute(store, sessionId);
+        const id = `send:${hash(dedupeKey)}`;
+        const cancelled = store.db.transaction(() => {
+          const item = store.getOperation(id);
+          if (item && item.state !== "cancelled") {
+            const marks = store.db.query<{ key: string }, [string]>("SELECT key FROM kv WHERE key GLOB ?")
+              .all(`chunk:${id}:*`);
+            const ambiguity = store.get<boolean>(`sendAmbiguous:${id}`);
+            const unattempted = item.attempts === 0 && store.get(`firstAttempt:${id}`) === undefined
+              && ambiguity === undefined;
+            if (item.state !== "pending" || marks.length || (!unattempted && ambiguity !== false)) return false;
+            store.outboxState(id, "cancelled");
+          }
+          // A timed-out enqueue can still be reaching this process. Fence its
+          // key even if the operation is not here yet; never create a new send.
+          store.set(`cancelledSend:${id}`, true);
+          return true;
+        }).immediate();
+        const state = store.getOperation(id)?.state;
+        return json({ id, cancelled, settled: state === "sent" || state === "failed" || state === "cancelled" });
       }
 
       const chat = pairedChat();
