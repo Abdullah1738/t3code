@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 from pathlib import Path
 import time
@@ -854,6 +855,11 @@ def _refresh_background(con, key, pull_artifacts=True):
                         result = start_check.check(row['box_id'], row['run_id'],
                                                    claim=start_check.claims_enabled(con, row['run_id']),
                                                    timeout=min(10, api.left() or 10))
+                        if result.code is not None and not pull_artifacts and json.loads(row['pulls'] or '[]'):
+                            # Affinity waits leave artifact-bearing runs reserved for a later full refresh.
+                            start_check.remember_wrapper(con, row, result.pid)
+                            con.commit()
+                            continue
                         if result.code is not None or result.verdict == 'fenced':
                             start_check.settle(con, row, result, 'pool checked an unattached start',
                                                until=None if api.left() is None else time.time() + api.left())
@@ -881,7 +887,6 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if wedged:
                         say(runs.wedged_message(row['box_id'], *wedged))
                         continue
-                    import json
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:
                         if not pull_artifacts:

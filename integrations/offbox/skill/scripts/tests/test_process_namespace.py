@@ -1,6 +1,7 @@
 """API IDs are opaque: a wrapper PID may be absent from the API or belong to another command."""
 import contextlib
 import io
+import json
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -153,12 +154,74 @@ class ProcessNamespace(Isolated):
                     self.assertTrue(all(pid == 1001 for _, pid in self.calls), self.calls)
                     self.assertTrue(self.other['running'])
 
+    def test_pool_artifact_mode_matrix_preserves_the_reservation_until_pulled(self):
+        sources = (('api', 1001, 'cmd-own', None, None, 'running'),
+                   ('receipt', None, None, 'start_unattached', 4242, 'running'),
+                   ('legacy', 4242, None, 'start_unattached', 4242, 'running'),
+                   ('collision', 1002, None, 'start_unattached', 1002, 'running'),
+                   ('prior-unknown', None, None, 'start_unknown', 4242, 'infra'))
+        for source, pid, command, marker, wrapper, status in sources:
+            for pulls in ([], ['build/out.zip']):
+                for pull_artifacts in (False, True):
+                    for code in (0, 7):
+                        with self.subTest(source=source, pulls=pulls, pull_artifacts=pull_artifacts, code=code):
+                            self.seed(pid=pid, command=command, marker=marker, wrapper=wrapper)
+                            self.con.execute('UPDATE runs SET pulls=?, status=? WHERE run_id=?',
+                                             (json.dumps(pulls), status, 'run-own'))
+                            self.con.commit()
+                            self.commands[1001]['exitCode'] = code
+                            receipt = start_check.Result('started', code, wrapper)
+                            def pull(box, row, paths, **kwargs):
+                                self.assertEqual((box, paths), ('bx', ['build/out.zip']))
+                                self.assertEqual(self.row()['status'], status)
+                                self.assertGreater(lease.active_runs(self.con, 'bx'), 0)
+                            with patch.object(start_check, 'check', return_value=receipt), \
+                                    patch.object(runs, 'do_pulls', side_effect=pull) as pulled, \
+                                    patch.object(runs, 'settle_docker'):
+                                pool._refresh_background(self.con, 'repo', pull_artifacts=pull_artifacts)
+                                deferred = bool(pulls and not pull_artifacts)
+                                self.assertEqual(pulled.call_count, int(bool(pulls) and pull_artifacts))
+                                if deferred:
+                                    self.assertEqual((self.row()['status'], self.row()['exit_code']), (status, None))
+                                    self.assertGreater(lease.active_runs(self.con, 'bx'), 0)
+                                    if marker:
+                                        self.assertTrue(start_check.recovery_marked(self.con, self.row()))
+                                    pool._refresh_background(self.con, 'repo')
+                                    self.assertEqual(pulled.call_count, 1)
+                            self.assertEqual((self.row()['status'], self.row()['exit_code']),
+                                             ('done' if code == 0 else 'failed', code))
+                            self.assertEqual(lease.active_runs(self.con, 'bx'), 0)
+                            if source == 'api':
+                                self.assertTrue(self.calls)
+                                self.assertTrue(all(pid == 1001 for _, pid in self.calls))
+                            else:
+                                self.assertEqual(self.calls, [])
+                                self.assertIsNone(self.row()['process_id'])
+                                self.assertEqual(self.row()['wrapper_pid'], wrapper)
+                            self.assertTrue(self.other['running'])
+
+    def test_pool_without_artifact_pulls_still_handles_nonexit_receipt_verdicts(self):
+        for verdict in ('fenced', 'unknown', 'started'):
+            with self.subTest(verdict=verdict):
+                self.seed(pid=1002)
+                self.con.execute("UPDATE runs SET pulls='[\"build/out.zip\"]'")
+                self.con.commit()
+                with patch.object(start_check, 'check', return_value=start_check.Result(verdict, pid=4242)), \
+                        patch.object(runs, 'do_pulls') as pulled:
+                    pool._refresh_background(self.con, 'repo', pull_artifacts=False)
+                self.assertEqual(self.row()['status'], 'lost' if verdict == 'fenced' else 'running')
+                self.assertEqual(lease.active_runs(self.con, 'bx'), 0 if verdict == 'fenced' else 1)
+                self.assertEqual(self.calls, [])
+                self.assertIsNone(self.row()['process_id'])
+                self.assertEqual(self.row()['wrapper_pid'], 4242)
+                pulled.assert_not_called()
+
     def test_kill_rechecks_every_terminal_transition_while_acquiring_the_box_lock(self):
         for status, code, reservation in (('done', 0, 0), ('failed', 7, 0), ('killed', 143, 0),
                                            ('lost', None, 1), ('infra', None, 0), ('interrupted', 94, 0)):
             for marker in ('start_unattached', 'start_unknown'):
                 with self.subTest(status=status, marker=marker):
-                    self.seed(marker=marker)
+                    self.seed(pid=4242, marker=marker)
                     @contextlib.contextmanager
                     def complete(*args, **kwargs):
                         self.con.execute('UPDATE runs SET status=?, exit_code=? WHERE run_id=?',
@@ -174,6 +237,25 @@ class ProcessNamespace(Isolated):
                     self.assertEqual((self.row()['status'], self.row()['exit_code']), (status, code))
                     self.assertIsNone(self.con.execute("SELECT 1 FROM kv WHERE k='start_unknown:run-own'").fetchone())
                     self.assertEqual(lease.active_runs(self.con, 'bx'), reservation)
+                    check.assert_not_called()
+                    self.assertFalse(self.calls)
+
+    def test_no_api_id_kill_preserves_the_current_precommand_cancellation_flow(self):
+        for client in (None, 424242):
+            for marker in ('start_unattached', 'start_unknown'):
+                with self.subTest(client=client, marker=marker):
+                    self.seed(marker=marker)
+                    self.con.execute('UPDATE runs SET client_pid=? WHERE run_id=?', (client, 'run-own'))
+                    self.con.commit()
+                    with patch.object(start_check, 'check') as check, contextlib.redirect_stderr(io.StringIO()):
+                        if client is None:
+                            with self.assertRaises(common.OffboxError) as error:
+                                misc.kill_run('run-own')
+                            self.assertEqual(error.exception.code, 2)
+                        else:
+                            self.assertEqual(misc.kill_run('run-own'), 1)
+                    self.assertEqual(self.row()['status'], 'running')
+                    self.assertGreater(lease.active_runs(self.con, 'bx'), 0)
                     check.assert_not_called()
                     self.assertFalse(self.calls)
 
