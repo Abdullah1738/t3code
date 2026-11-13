@@ -2626,7 +2626,10 @@ const make = Effect.gen(function* () {
         "caller",
         loadThreadCaller(callerScope, "delegate_task"),
       );
-      const parentRecords = yield* bounded("caller", loadProjection(parent.thread.id, ["runs", "subagents"]));
+      const parentRecords = yield* bounded(
+        "caller",
+        loadProjection(parent.thread.id, ["runs", "subagents"]),
+      );
       const parentRun = parentRecords.runs
         .filter(ThreadManagementService.isActiveRun)
         .toSorted((left, right) => right.ordinal - left.ordinal)[0];
@@ -3395,10 +3398,19 @@ const make = Effect.gen(function* () {
       const mode = input.mode ?? "auto";
       const key = yield* requestKey(input.clientRequestId);
       // Recover sends accepted by older builds before the caller's credential was rebound.
+      const messages =
+        scope.thread === undefined
+          ? []
+          : (yield* threadManagement
+              .getThreadRecords(input.threadId, ["messages"], {
+                messageRoles: ["user"],
+                turnItemTypes: [],
+              })
+              .pipe(Effect.mapError(threadManagementFailure))).messages;
       const prior =
         scope.thread === undefined
           ? undefined
-          : target.messages.find((message) => {
+          : messages.find((message) => {
               const parts = message.id.split(":");
               return (
                 message.senderThreadId === scope.thread?.threadId &&
@@ -3457,10 +3469,11 @@ const make = Effect.gen(function* () {
       let snapshot: OrchestratorMcpThreadWaitResult | undefined;
       const waiting = Effect.gen(function* () {
         const { target } = yield* loadScopedThread(scope, input.threadId);
+        const records = yield* loadProjection(input.threadId, ["runs"]);
         const selected =
           input.runId === undefined
-            ? target.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
-            : target.runs.find((run) => run.id === input.runId);
+            ? records.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
+            : records.runs.find((run) => run.id === input.runId);
         snapshot = {
           threadId: input.threadId,
           runId: selected?.id ?? null,
