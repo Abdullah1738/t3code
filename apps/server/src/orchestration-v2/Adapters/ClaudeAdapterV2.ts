@@ -4026,19 +4026,45 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         // Foreground Bash calls whose output file is being tailed, by tool_use_id.
         const taskOutputTails = new Map<
           string,
-          { readonly fiber: Fiber.Fiber<void>; readonly stop: Deferred.Deferred<void> }
+          {
+            readonly fiber: Fiber.Fiber<void>;
+            readonly stop: Deferred.Deferred<void>;
+            readonly stopOutput: () => void;
+          }
         >();
         const taskOutputRoot = claudeTaskOutputRoot(adapterOptions.environment, path);
-        // Waits for the tail's last read so its output lands before the call settles.
-        const stopTaskOutputTail = (toolUseId: string) =>
+        // Prefer the final output read, but a stuck file must not retain tool
+        // or child settlement. A timed-out tail cannot publish late output.
+        const stopTaskOutputTail = (toolUseId: string, drainOutput = true) =>
           Effect.suspend(() => {
             const tail = taskOutputTails.get(toolUseId);
             if (tail === undefined) return Effect.void;
             taskOutputTails.delete(toolUseId);
-            return Deferred.succeed(tail.stop, undefined).pipe(
-              Effect.andThen(Fiber.await(tail.fiber)),
+            const drain = Deferred.succeed(tail.stop, undefined).pipe(
+              Effect.andThen(
+                Fiber.await(tail.fiber).pipe(
+                  Effect.interruptible,
+                  Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+                  Effect.catchCause((cause) =>
+                    Effect.gen(function* () {
+                      tail.stopOutput();
+                      yield* Effect.logWarning("orchestration-v2.claude-task-output-drain-failed", {
+                        providerSessionId: input.providerSessionId,
+                        toolUseId,
+                        cause,
+                      });
+                      yield* Fiber.interrupt(tail.fiber).pipe(Effect.forkIn(sessionScope));
+                    }),
+                  ),
+                ),
+              ),
               Effect.asVoid,
             );
+            if (drainOutput) return drain;
+            // Disposal publishes terminal tool/child events without waiting
+            // for file I/O; drain independently and suppress all late chunks.
+            tail.stopOutput();
+            return drain.pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           });
         const sdkMessageLock = yield* Semaphore.make(1);
         const turnControlLock = yield* Semaphore.make(1);
@@ -6599,7 +6625,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly completedAt: DateTime.Utc;
         }) {
           for (const toolCall of input.toolCalls) {
-            yield* stopTaskOutputTail(toolCall.nativeItemId);
+            yield* stopTaskOutputTail(toolCall.nativeItemId, false);
             yield* emitToolCallArtifacts(
               buildToolCallArtifacts({
                 context: input.context,
@@ -7053,25 +7079,31 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               input.status === "failed" &&
               [...input.context.pendingSteers.values()].some((steer) => steer.offeredAt !== null)
             ) {
-              // The CLI can drain an offered message after an error result. Fence
-              // its callbacks and close it before publishing the failed T3 turn.
+              // Fence before disposal so late SDK output cannot reopen this
+              // failed turn, even when closing the native process times out.
               const live = turnQueries.get(input.context);
               if (live !== undefined) {
+                const alreadyStopping = live.stopping;
                 live.stopping = true;
                 input.context.acceptingSteers = false;
                 yield* Ref.update(queryContext, (current) => (current === live ? null : current));
                 yield* Ref.update(activeTurn, (current) =>
                   current === input.context ? null : current,
                 );
-                yield* live.query.close.pipe(
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("orchestration-v2.claude-steer-failed-query-close", {
-                      threadId: input.context.input.threadId,
-                      providerTurnId: input.context.providerTurnId,
-                      cause,
-                    }),
-                  ),
-                );
+                // The watchdog and Stop already own their close. Repeating it
+                // here would make finalization wait on that same stuck process.
+                if (!alreadyStopping)
+                  yield* live.query.close.pipe(
+                    Effect.interruptible,
+                    Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("orchestration-v2.claude-steer-failed-query-close", {
+                        threadId: input.context.input.threadId,
+                        providerTurnId: input.context.providerTurnId,
+                        cause,
+                      }),
+                    ),
+                  );
                 // Fencing transfers stream-exit cleanup here too, including
                 // background work inherited from earlier turns in this process.
                 yield* finalizeActiveTurnAfterQueryExit(
@@ -7081,7 +7113,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 );
                 yield* endSubagentCallsOfClosedQuery(live, "failed");
               }
-              finalization = { ...input, threadDisposition: "broken" };
+              finalization = {
+                ...input,
+                threadDisposition: "broken",
+                deferWorkflowTranscripts: true,
+              };
             }
             yield* performActiveTurnFinalization(finalization);
           }).pipe(Effect.ensuring(Deferred.succeed(done, undefined)), Effect.uninterruptible);
@@ -8474,25 +8510,36 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   nativeItemId: tailedCall.nativeItemId,
                 });
                 const stop = yield* Deferred.make<void>();
+                let publishOutput = true;
                 const fiber = yield* tailClaudeTaskOutput({
                   root: taskOutputRoot,
                   sessionId: message.session_id,
                   taskId: message.task_id,
                   stop,
                   onChunk: (chunk) =>
-                    emitProviderEvent({
-                      type: "command_output.delta",
-                      driver: CLAUDE_PROVIDER,
-                      threadId: tailedCall.threadId,
-                      itemId,
-                      chunk,
-                    }),
+                    Effect.suspend(() =>
+                      publishOutput
+                        ? emitProviderEvent({
+                            type: "command_output.delta",
+                            driver: CLAUDE_PROVIDER,
+                            threadId: tailedCall.threadId,
+                            itemId,
+                            chunk,
+                          })
+                        : Effect.void,
+                    ),
                 }).pipe(
                   Effect.provideService(FileSystem.FileSystem, fileSystem),
                   Effect.provideService(Path.Path, path),
                   Effect.forkIn(sessionScope),
                 );
-                taskOutputTails.set(tailedCall.nativeItemId, { fiber, stop });
+                taskOutputTails.set(tailedCall.nativeItemId, {
+                  fiber,
+                  stop,
+                  stopOutput: () => {
+                    publishOutput = false;
+                  },
+                });
               }
               context.ignoredTaskIds.add(message.task_id);
               yield* applyBackgroundTaskRosterMessage({

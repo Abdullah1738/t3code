@@ -55,6 +55,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -2981,7 +2982,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
-    readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
+    readonly close?: (
+      sdkMessages: Queue.Queue<SDKMessage>,
+    ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly interrupt?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly offer?: (
       message: SDKUserMessage,
@@ -3007,9 +3010,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly nativeSessionId?: string;
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
+    readonly fileSystem?: FileSystem.FileSystem;
   }) =>
     Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
+      const fileSystem = options?.fileSystem ?? (yield* FileSystem.FileSystem);
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3-claude-v2-wake-",
@@ -4749,16 +4753,34 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
-  it.effect.each([false, true])(
-    "closes a failed query with an unconfirmed steer and settles background work, between turns=%s",
-    (betweenTurns) =>
+  it.effect.each(
+    [false, true].flatMap((betweenTurns) =>
+      (["responsive", "failed", "unresponsive", "watchdog"] as const).map((closeMode) => ({
+        betweenTurns,
+        closeMode,
+      })),
+    ),
+  )(
+    "bounds failed-query disposal and settles children, between turns=$betweenTurns close=$closeMode",
+    ({ betweenTurns, closeMode }) =>
       Effect.gen(function* () {
-        let closed = false;
+        let closeCalls = 0;
+        const closeEntered = yield* Deferred.make<void>();
+        const releaseClose = yield* Deferred.make<void>();
         const h = yield* makeWakeHarnessWithOptions({
           close: (messages) =>
-            Effect.sync(() => {
-              closed = true;
-            }).pipe(Effect.andThen(Queue.shutdown(messages))),
+            Effect.gen(function* () {
+              closeCalls++;
+              yield* Deferred.succeed(closeEntered, undefined);
+              if (closeMode === "failed")
+                return yield* new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                  method: "close",
+                  cause: "Close failed",
+                });
+              if (closeMode === "unresponsive" || closeMode === "watchdog")
+                yield* Deferred.await(releaseClose);
+              yield* Queue.shutdown(messages);
+            }),
         });
         const ids = yield* IdAllocator.IdAllocatorV2;
         let input = makeClaudeTestTurnInput({
@@ -4823,19 +4845,48 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           },
         });
         assert.lengthOf(h.offeredMessages, offersBeforeSteer + 1);
-        yield* h.offerAndWait(
-          makeResultFrame({
-            uuid: "failed-before-echo",
-            result: "",
-            subtype: "error_during_execution",
-            isError: true,
-            errors: ["Provider failed"],
-          }),
+        const failed =
+          closeMode === "watchdog"
+            ? null
+            : yield* h
+                .offerAndWait(
+                  makeResultFrame({
+                    uuid: "failed-before-echo",
+                    result: "",
+                    subtype: "error_during_execution",
+                    isError: true,
+                    errors: ["Provider failed"],
+                  }),
+                )
+                .pipe(Effect.forkScoped);
+        if (closeMode === "watchdog") {
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: "compacting",
+              uuid: "failure-compacting",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* TestClock.adjust("5 minutes");
+        }
+        yield* Deferred.await(closeEntered);
+        yield* TestClock.adjust("30 seconds");
+        const terminalsBeforeCloseSettled = h.terminalEvents().length;
+        yield* Deferred.succeed(releaseClose, undefined);
+        if (failed !== null) yield* Fiber.join(failed);
+        assert.equal(
+          terminalsBeforeCloseSettled,
+          betweenTurns ? 2 : 1,
+          "failure does not await an unresponsive close",
         );
         const terminal = yield* Queue.take(h.terminalReceipts);
         assert.equal(terminal.status, "failed");
         assert.equal(terminal.threadDisposition, "broken");
-        assert.isTrue(closed, "the native queue is closed before failure is published");
+        assert.equal(closeCalls, 1, "the watchdog and finalization share one close attempt");
+        if (closeMode === "watchdog")
+          assert.equal(terminal.failure?.code, "compaction_no_progress");
         assert.isEmpty(h.continuationRequests);
         assert.isFalse(yield* h.hasPendingBackgroundWork);
         const child = h.events.findLast(
@@ -4856,6 +4907,191 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           bash?.type === "turn_item.updated" ? bash.turnItem.status : undefined,
           "failed",
         );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    (["result", "watchdog"] as const).flatMap((trigger) =>
+      [false, true].map((betweenTurns) => ({ trigger, betweenTurns })),
+    ),
+  )(
+    "settles an earlier child's visible state when its output tail stalls, prior turn=$betweenTurns trigger=$trigger",
+    ({ trigger, betweenTurns }) =>
+      Effect.gen(function* () {
+        const uid = process.getuid?.();
+        if (uid === undefined) return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempRoot = yield* fs.makeTempDirectoryScoped({
+          prefix: "claude-steer-disposal-tail-",
+        });
+        const tasks = path.join(tempRoot, `claude-${uid}`, "project", WAKE_NATIVE_SESSION, "tasks");
+        const taskId = "blocked-child-output";
+        const outputPath = path.join(tasks, `${taskId}.output`);
+        yield* fs.makeDirectory(tasks, { recursive: true });
+        yield* fs.writeFileString(outputPath, "Late child output");
+        const readEntered = yield* Deferred.make<void>();
+        const closeEntered = yield* Deferred.make<void>();
+        const releaseRead = yield* Deferred.make<void>();
+        const fileSystem = FileSystem.FileSystem.of({
+          ...fs,
+          open: (file, options) =>
+            file === outputPath
+              ? Deferred.succeed(readEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRead)),
+                  Effect.andThen(fs.open(file, options)),
+                  Effect.uninterruptible,
+                )
+              : fs.open(file, options),
+        });
+        yield* Effect.gen(function* () {
+          const h = yield* makeWakeHarnessWithOptions({
+            fileSystem,
+            environment: { CLAUDE_CODE_TMPDIR: tempRoot },
+            close: () => Deferred.succeed(closeEntered, undefined),
+          });
+          const ids = yield* IdAllocator.IdAllocatorV2;
+          const original = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("blocked-tail-first"),
+            text: "Run background work",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(original);
+          const childTaskId = "blocked-tail-child";
+          const childToolId = "blocked-tail-agent";
+          const childBashId = "blocked-tail-bash";
+          yield* h.offerAndWait(
+            makeSubagentTaskStartedFrame({
+              taskId: childTaskId,
+              toolUseId: childToolId,
+              uuid: "blocked-child-start",
+            }),
+          );
+          for (const frame of makeSubagentAssistantFrames({
+            parentToolUseId: childToolId,
+            uuid: "blocked-child-bash",
+            bashToolUseId: childBashId,
+          }))
+            yield* h.offerAndWait(frame);
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "task_started",
+              task_type: "local_bash",
+              is_backgrounded: false,
+              task_id: taskId,
+              tool_use_id: childBashId,
+              description: "Child command",
+              uuid: "blocked-bash-start",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* Deferred.await(readEntered);
+          let current = original;
+          if (betweenTurns) {
+            yield* h.offerAndWait(
+              makeResultFrame({
+                uuid: "blocked-tail-original-complete",
+                result: "Working in background",
+              }),
+            );
+            assert.equal((yield* Queue.take(h.terminalReceipts)).status, "completed");
+            current = {
+              ...original,
+              runId: RunId.make("blocked-tail-next"),
+              attemptId: RunAttemptId.make("blocked-tail-next"),
+              runOrdinal: 2,
+              providerTurnOrdinal: 2,
+            };
+            yield* h.runtime.startTurn(current);
+          }
+          yield* h.runtime.steerTurn({
+            threadId: h.threadId,
+            runId: current.runId,
+            providerThread: h.providerThread,
+            providerTurnId: ids.derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${current.attemptId}`,
+            }),
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: MessageId.make("blocked-tail-steer"),
+              text: "Correction",
+              attachments: [],
+            },
+          });
+          const failure =
+            trigger === "result"
+              ? yield* h
+                  .offerAndWait(
+                    makeResultFrame({
+                      uuid: "blocked-tail-failure",
+                      result: "",
+                      subtype: "error_during_execution",
+                      isError: true,
+                      errors: ["Provider failed"],
+                    }),
+                  )
+                  .pipe(Effect.forkScoped)
+              : null;
+          if (trigger === "watchdog") {
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "status",
+                status: "compacting",
+                uuid: "blocked-tail-compacting",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* TestClock.adjust("5 minutes");
+          }
+          yield* Deferred.await(closeEntered);
+          yield* TestClock.adjust("30 seconds");
+          const beforeRelease = h.events.slice();
+          yield* Deferred.succeed(releaseRead, undefined);
+          if (failure !== null) yield* Fiber.join(failure);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          assert.lengthOf(
+            beforeRelease.filter((event) => event.type === "turn.terminal"),
+            betweenTurns ? 2 : 1,
+          );
+          const child = beforeRelease.findLast(
+            (event) =>
+              event.type === "subagent.updated" &&
+              event.subagent.nativeTaskRef?.nativeId === childTaskId,
+          );
+          assert.equal(
+            child?.type === "subagent.updated" ? child.subagent.status : undefined,
+            "failed",
+          );
+          const bash = beforeRelease.findLast(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.nativeItemRef?.nativeId === childBashId,
+          );
+          assert.equal(
+            bash?.type === "turn_item.updated" ? bash.turnItem.status : undefined,
+            "failed",
+          );
+          assert.isFalse(yield* h.hasPendingBackgroundWork);
+          assert.isFalse(
+            h.events.some(
+              (event) =>
+                event.type === "command_output.delta" && event.chunk.includes("Late child output"),
+            ),
+          );
+        }).pipe(Effect.ensuring(Deferred.succeed(releaseRead, undefined)));
       }).pipe(
         Effect.scoped,
         Effect.provide(
@@ -8806,6 +9042,57 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* TestClock.adjust("5 minutes");
         assert.lengthOf(h.terminalEvents(), 1);
       }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect.each(["none", "offered", "confirmed", "buffered"] as const)(
+      "publishes a compaction timeout before unresponsive close settles, steer=%s",
+      (delivery) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const h = yield* start({
+            close: () =>
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          });
+          if (delivery === "buffered") yield* h.offerAndWait(compacting);
+          if (delivery !== "none") {
+            const ids = yield* IdAllocator.IdAllocatorV2;
+            yield* h.runtime.steerTurn({
+              threadId: h.threadId,
+              runId: h.input.runId,
+              providerThread: h.providerThread,
+              providerTurnId: ids.derive.providerTurn({
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeTurnId: `turn:${h.input.attemptId}`,
+              }),
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: MessageId.make("compaction-timeout-pending-steer"),
+                text: "Correction before compaction",
+                attachments: [],
+              },
+            });
+            assert.lengthOf(h.offeredMessages, delivery === "buffered" ? 1 : 2);
+            if (delivery === "confirmed")
+              yield* h.offerAndWait(
+                claudeSdkFrame({ ...h.offeredMessages[1], session_id: WAKE_NATIVE_SESSION }),
+              );
+          }
+          if (delivery !== "buffered") yield* h.offerAndWait(compacting);
+          yield* TestClock.adjust("5 minutes");
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust("30 seconds");
+          const terminalsBeforeCloseSettled = h.terminalEvents().length;
+          yield* Deferred.succeed(release, undefined);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.failure?.code, "compaction_no_progress");
+          assert.equal(
+            terminalsBeforeCloseSettled,
+            1,
+            "watchdog must publish failure without waiting for native close",
+          );
+        }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
     it.effect("fails stalled compaction after five minutes without SDK progress", () =>
@@ -20848,6 +21135,22 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           const NESTED_TOOL_USE_ID = "toolu-steer-nested";
           const FINISHED_TOOL_USE_ID = "toolu-steer-finished";
           const calls: Array<string> = [];
+          const backgroundWaits = yield* Queue.unbounded<void>();
+          const clock = yield* Clock.Clock;
+          // Skill discovery does file I/O before each steer. Advance time only
+          // after its backgrounding timeout has actually registered.
+          const steeringClock: Clock.Clock = {
+            ...clock,
+            sleep: (duration) =>
+              Effect.gen(function* () {
+                const sleeping = yield* clock
+                  .sleep(duration)
+                  .pipe(Effect.forkChild({ startImmediately: true }));
+                if (Duration.toMillis(duration) === 5_000)
+                  yield* Queue.offer(backgroundWaits, undefined);
+                yield* Fiber.join(sleeping);
+              }),
+          };
           let beforeAnswer: Effect.Effect<void> = Effect.void;
           const harness = yield* makeWakeHarnessWithOptions({
             backgroundTasks: (toolUseId) =>
@@ -20980,22 +21283,24 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           );
 
           const offered = harness.offeredMessages.length;
-          const steer = harness.runtime.steerTurn({
-            threadId: harness.threadId,
-            runId: input.runId,
-            providerThread: harness.providerThread,
-            providerTurnId: idAllocator.derive.providerTurn({
-              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
-              nativeTurnId: `turn:${attemptId}`,
-            }),
-            message: {
-              createdBy: "user",
-              creationSource: "web",
-              messageId: MessageId.make("message-steer-foreground-subagent"),
-              text: "Also check the docs.",
-              attachments: [],
-            },
-          });
+          const steer = harness.runtime
+            .steerTurn({
+              threadId: harness.threadId,
+              runId: input.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: idAllocator.derive.providerTurn({
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeTurnId: `turn:${attemptId}`,
+              }),
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: MessageId.make("message-steer-foreground-subagent"),
+                text: "Also check the docs.",
+                attachments: [],
+              },
+            })
+            .pipe(Effect.provideService(Clock.Clock, steeringClock));
           const RERUN_TOOL_USE_ID = "toolu-steer-rerun";
           if (backgrounding === "answers after the subagent ran again") {
             beforeAnswer = harness
@@ -21024,7 +21329,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             backgrounding === "never answers" ||
             backgrounding === "answers after the steer went out"
           ) {
-            yield* awaitUntil(() => calls.length === 1, "background request");
+            yield* Queue.take(backgroundWaits);
             assert.equal(harness.offeredMessages.length, offered);
             yield* TestClock.adjust("5 seconds");
           }
@@ -21045,10 +21350,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           if (backgrounding === "never answers") {
             for (let repeat = 1; repeat <= 2; repeat++) {
               const again = yield* Effect.forkScoped(steer);
-              for (let tick = 0; tick < 100 && again.pollUnsafe() === undefined; tick++) {
-                yield* TestClock.adjust("1 second");
-                yield* Effect.yieldNow;
-              }
+              yield* Queue.take(backgroundWaits);
+              yield* TestClock.adjust("5 seconds");
               assert.isTrue(Exit.isSuccess(yield* Fiber.await(again)));
               yield* harness.offerAndWait(
                 claudeSdkFrame({
