@@ -432,3 +432,85 @@ test.each(["owner", "moni"])("an in-flight latency sweep must not re-adopt an ad
   expect(h.backend.prompts).toHaveLength(2);
   expect(h.store.get(`synthetic-retry:${id}`)).toMatchObject({ attempts: 1 });
 });
+
+function recoveredBatch(slug: string) {
+  const h = setup(slug, { quietMs: undefined });
+  h.input("recovered-a"); h.input("recovered-b");
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  const batch: NormalizedInbound = { id: "recovered-b", text: "recovered-a\nrecovered-b", source: "typed", attachments: [], isAudioMessage: false, receivedAt: now - 120_000, batchIds: ["recovered-a", "recovered-b"] };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:recovered-a", { ...route, inboundId: "recovered-a", messageId: hash("recovered-a"), startedAt: now - 120_000, phase: "unknown" });
+  h.store.set("batch:recovered-a", batch);
+  h.store.updateInbound("recovered-a", "processing"); h.store.updateInbound("recovered-b", "batched");
+  return { ...h, route, batch };
+}
+
+test.each(["owner", "moni"].flatMap(slug => [false, true].flatMap(busy => [0, 1_000].map(elapsed => ({ slug, busy, elapsed })))))
+("latency recovery keeps its original members across a preparation arrival %j", async ({ slug, busy, elapsed }) => {
+  const h = recoveredBatch(slug);
+  let arrived = false;
+  h.backend.statuses = async () => {
+    if (!arrived && h.store.get("batch-phase:recovered-a") === "preparing") {
+      arrived = true;
+      h.input("newer-c", 0);
+      return busy ? { [h.route.id]: { type: "busy" as const } } : {};
+    }
+    return {};
+  };
+  const accept = h.backend.prompt.bind(h.backend);
+  h.backend.prompt = async (id, directory, messageId, text) => {
+    // The original ambiguous A+B commits before this replay is handled.
+    // Idempotency returns that original body even if the retry incorrectly appended C.
+    await accept(id, directory, messageId, messageId === hash("recovered-a") ? h.batch.text : text);
+  };
+  const timer = () => Promise.all([h.router.checkInboundLatency(), h.router.tick(), h.router.checkFailedInbound()]);
+  await timer();
+  const sealedAfterArrival = h.store.get("batch:recovered-a");
+  setSystemTime(now + elapsed);
+  await timer();
+  expect(arrived).toBe(true);
+  expect(h.states()).toEqual(["done", "done", "pending"]);
+  expect(h.backend.records.filter(r => r.type === "user")).toEqual([
+    expect.objectContaining({ id: hash("recovered-a"), text: h.batch.text }),
+  ]);
+  expect(sealedAfterArrival).toEqual(h.batch);
+  expect(h.store.get<NormalizedInbound>("batch:recovered-a")?.batchIds).toEqual(h.batch.batchIds);
+  h.backend.records.push({ id: "original-finished", type: "idle", outcome: "succeeded", time: { created: now + 2_000 } });
+  setSystemTime(now + 2_000);
+  await timer();
+  expect(h.states()).toEqual(["done", "done", "done"]);
+  expect(h.backend.records.filter(r => r.type === "user")).toEqual([
+    expect.objectContaining({ id: hash("recovered-a"), text: h.batch.text }),
+    expect.objectContaining({ id: hash("newer-c"), text: "newer-c" }),
+  ]);
+});
+
+test.each(["owner", "moni"].flatMap(slug => ["/status", "/new"].map(command => ({ slug, command }))))
+("a control still interrupts recovery without unsealing its members %j", async ({ slug, command }) => {
+  const h = recoveredBatch(slug);
+  let arrived = false;
+  h.backend.statuses = async () => {
+    if (!arrived && h.store.get("batch-phase:recovered-a") === "preparing") {
+      arrived = true;
+      h.input(command, 0);
+    }
+    return {};
+  };
+  const timer = () => Promise.all([h.router.checkInboundLatency(), h.router.tick(), h.router.checkFailedInbound()]);
+  await timer();
+  expect(arrived).toBe(true);
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.states()).toEqual(["pending", "batched", "pending"]);
+  expect(h.store.get<NormalizedInbound>("batch:recovered-a")).toEqual(h.batch);
+  setSystemTime(now + 1_000);
+  await timer();
+  if (command === "/new") {
+    expect(h.states()).toEqual(["cancelled", "cancelled", "done"]);
+    expect(h.backend.prompts).toEqual([]);
+    return;
+  }
+  expect(h.states()).toEqual(["done", "done", "done"]);
+  expect(h.backend.records.filter(r => r.type === "user")).toEqual([
+    expect.objectContaining({ id: hash("recovered-a"), text: h.batch.text }),
+  ]);
+});

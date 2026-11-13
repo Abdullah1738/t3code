@@ -1625,6 +1625,12 @@ export class Router {
         if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
         return true;
       }
+      if (this.store.get(`latency-route:${id}`)) {
+        this.store.updateInbound(id, "pending");
+        this.store.set(`batch-phase:${id}`, "queued-steer");
+        if (preparing?.id === id) this.store.set("preparingDelivery", null);
+        return true;
+      }
       // A busy wake stays sealed even if a later arrival interrupts its next readiness check.
       const deferred = this.wakeBatch(id) && this.store.get<boolean>(`wake-deferred:${id}`);
       for (const member of ids) this.store.updateInbound(member, deferred && member !== id ? "batched" : "pending");
@@ -2032,7 +2038,7 @@ export class Router {
       for (const row of this.store.pendingInbound()) {
         // A watcher event still needs handling; it carries over into the fresh chat.
         if (resetRow(row.id) || (preceding.has(row.id) && !(row.id.startsWith("wake:") && row.state === "pending"))) {
-          this.store.updateInbound(row.id, "cancelled");
+          for (const id of this.store.get<NormalizedInbound | null>(`batch:${row.id}`)?.batchIds ?? [row.id]) this.store.updateInbound(id, "cancelled");
         }
       }
       // A synthetic row whose turn failed is queued for a retry and carries over like any pending wake.
@@ -2754,7 +2760,8 @@ export class Router {
     }
     const interrupted = () => {
       if (this.expireFailedReplay(row.id)) return true;
-      const held = steerAttempt !== undefined && steerAttempt !== null
+      const held = latencyRoute !== undefined && latencyRoute !== null
+        || steerAttempt !== undefined && steerAttempt !== null
         || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
       const arrived = held ? this.controlArrived(handled)
         : this.store.pendingInbound().some(next => next.state === "pending" && !handled.has(next.id));
