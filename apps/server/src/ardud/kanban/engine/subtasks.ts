@@ -10,6 +10,57 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
+export const inferGate = (text: string): KanbanSubtask["gate"] => {
+  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?|releases?)\b/i.test(text)) return "deploy";
+  if (
+    /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
+  )
+    return "money";
+  if (/\b(secrets?|tokens?|keys?)\b/i.test(text)) return "secret";
+  return undefined;
+};
+
+export const isNegativeOption = (label: string): boolean =>
+  /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
+    label.trim(),
+  );
+
+/** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
+export const approvalProblem = (
+  card: Pick<KanbanCard, "number" | "asks" | "createdAt">,
+  subtask: KanbanSubtask,
+): string | null => {
+  const gate = subtask.gate ?? inferGate(subtask.text);
+  if (gate === undefined) return null;
+  const since = subtask.createdAt ?? card.createdAt;
+  const decisions = card.asks
+    .filter((ask) => {
+      const answer = ask.answer;
+      if (!ask.closedAt || !answer || answer.at < since) return false;
+      if (answer.verdict === "dropped") return true;
+      if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
+      if (ask.draft) return false;
+      return (
+        inferGate(`${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`) === gate ||
+        (ask.text.match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id)
+      );
+    })
+    .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
+  const latest = decisions.at(-1);
+  const answer = latest?.answer;
+  const approved =
+    answer?.verdict === "approved" ||
+    (answer?.verdict === "picked" &&
+      Boolean(answer.optionIds?.length) &&
+      answer.optionIds!.every((id) => {
+        const option = latest?.options?.find((entry) => entry.id === id);
+        return option !== undefined && !isNegativeOption(option.label);
+      }));
+  return approved
+    ? null
+    : `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval after it was created; a dropped ask is not approval`;
+};
+
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
@@ -20,6 +71,7 @@ export interface SubtaskInput {
   readonly step?: number | undefined;
   readonly text: string;
   readonly owner: KanbanSubtask["owner"];
+  readonly gate?: KanbanSubtask["gate"];
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -70,6 +122,7 @@ export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
   inputs: ReadonlyArray<SubtaskInput>,
   seq = 0,
+  at?: string,
 ): SubtaskPlan {
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
@@ -105,14 +158,32 @@ export function planSubtasks(
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
       const { script: _old, ...rest } = known;
-      planned.push({ ...rest, step, text, owner: input.owner, ...(script ? { script } : {}) });
+      const gate = known.gate ?? inferGate(known.text) ?? input.gate ?? inferGate(text);
+      planned.push({
+        ...rest,
+        step,
+        text,
+        owner: input.owner,
+        ...(gate === undefined ? {} : { gate }),
+        ...((text !== known.text ||
+          script !== known.script ||
+          !(known.gate ?? inferGate(known.text))) &&
+        (input.gate ?? inferGate(text) ?? known.gate ?? inferGate(known.text)) &&
+        at
+          ? { createdAt: at }
+          : {}),
+        ...(script ? { script } : {}),
+      });
     } else {
       nextId += 1;
+      const gate = input.gate ?? inferGate(text);
       planned.push({
         id: `s${nextId}`,
         step,
         text,
         owner: input.owner,
+        ...(gate === undefined ? {} : { gate }),
+        ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
         state: "open",
         note: null,

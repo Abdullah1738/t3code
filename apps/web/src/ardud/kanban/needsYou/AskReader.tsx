@@ -5,7 +5,6 @@ import {
   askFormFor,
   askDiscussion,
   askRepliedOnCard,
-  askWordsForReply,
   askFormWithSecrets,
   nextChangeView,
   askKindLabel,
@@ -233,17 +232,8 @@ export function AskReader(props: {
     if (failure.stale) noteAskStale(entry);
     focusAt(`field:${failure.field ?? askSecretFieldIds(ask)[0] ?? ""}`);
   };
-  // Words alone never close a pick he has to make: they go to its agent as a reply and the ask stays open.
-  const sendWordsAsReply = (words: string) => {
-    void replyOnAsk(entry, [{ _tag: "md", text: words }]).then(
-      () => patchAskForm(entry, { ownWords: "" }),
-      (error: unknown) => showAskToast({ text: `Reply not sent. ${askFailureText(error)}` }, 9_000),
-    );
-  };
   const send = (intent: "primary" | "refuse") => {
     if (locked || secretBusy) return;
-    const words = intent === "primary" ? askWordsForReply(ask, form) : null;
-    if (words !== null) return sendWordsAsReply(words);
     const now = buildAskAnswer(
       ask,
       askFormWithSecrets(ask, form, secrets),

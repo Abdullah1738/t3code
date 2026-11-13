@@ -14,8 +14,7 @@ import { askAsker, replyOnAsk } from "./askStore";
 const NO_CARDS: KanbanBoardState["cards"] = new Map();
 
 /**
- * The talk under one ask, in the board's own message and composer parts. A
- * reply does not answer the ask: it hands the turn to its agent.
+ * The talk under one ask, using the board's message and composer parts.
  */
 export function AskDiscussion(props: {
   entry: KanbanAskFeedItem;
@@ -95,9 +94,7 @@ export function AskDiscussion(props: {
         <p role="alert" className="-mt-2.5 text-sm text-(--m-negative)">
           {problem}
         </p>
-      ) : (
-        <p className="-mt-2.5 text-xs text-(--m-muted)">Replying doesn't answer the ask.</p>
-      )}
+      ) : null}
     </div>
   );
   if (props.sheet) {

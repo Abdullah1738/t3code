@@ -203,7 +203,7 @@ describe("answering", () => {
     expect(h.named("answer")[0]!.args[4]).toBe(true);
   });
 
-  it("words alone never go out as the answer to a required pick", async () => {
+  it("words alone go out for classification on a required pick", async () => {
     const h = harness();
     const ask = entry(1, {
       kind: "decision",
@@ -217,10 +217,13 @@ describe("answering", () => {
     await h.store.refreshAsks();
     h.store.patchAskForm(ask, { ownWords: "neither, do it differently" });
 
-    expect(h.store.answerAsk(ask, "primary")).toEqual({ ok: false, first: "choose" });
+    expect(h.store.answerAsk(ask, "primary")).toEqual({ ok: true });
     await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
-    expect(h.named("answer")).toHaveLength(0);
-    expect(h.cell.getState().tried[askKey(ask)]).toBe(true);
+    expect(h.named("answer")).toHaveLength(1);
+    expect(h.named("answer")[0]!.args[2]).toMatchObject({
+      verdict: "answered",
+      text: "neither, do it differently",
+    });
   });
 
   it("a stale revision is never resent: the ask is marked updated and his form is kept", async () => {

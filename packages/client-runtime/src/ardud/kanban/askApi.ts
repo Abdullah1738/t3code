@@ -279,6 +279,7 @@ export interface AskApi {
     cardRef: string,
     askId: string,
     blocks: ReadonlyArray<KanbanBlock>,
+    revision?: number,
   ) => Promise<KanbanMessage>;
   readonly hand: (
     cardRef: string,
@@ -547,8 +548,10 @@ export function createAskApi(host: AskApiHost): AskApi {
     },
     answerBatch: (body, items, keepalive = false) =>
       call<AskBatchResult>("POST", "/asks/answer", { body: { ...body, items }, keepalive }),
-    reply: (cardRef, askId, blocks) =>
-      call<KanbanMessage>("POST", `${cardPath(cardRef, askId)}/reply`, { body: { blocks } }),
+    reply: (cardRef, askId, blocks, revision) =>
+      call<KanbanMessage>("POST", `${cardPath(cardRef, askId)}/reply`, {
+        body: { blocks, revision },
+      }),
     hand: (cardRef, askId, input, keepalive = false) =>
       call<AskHanded>("POST", `${cardPath(cardRef, askId)}/hand`, { body: input, keepalive }),
     handBatch: (items, input, keepalive = false) =>

@@ -735,29 +735,6 @@ describe("turns and closing", () => {
     assert.isUndefined(Asks.closeAsks(card([ask()]), LATER).asks[0]!.answer);
   });
 
-  it("a clarifying reply tells the asker to reply and fix the ask, not to treat it as the answer", () => {
-    const text = Asks.clarifyText(
-      card([ask({ title: "Go live" })]),
-      ask({ title: "Go live" }),
-      "Which env?",
-      false,
-    );
-    assert.include(text, 'The owner replied on q1 on card #12 ("Go live") without answering it.');
-    assert.include(text, "still holds the card");
-    assert.include(text, "His message:\nWhich env?");
-    assert.include(text, 'discussion_post (card #12, ask "q1")');
-    assert.include(text, "card_ask_change");
-    assert.include(text, "Don't treat his message as the answer.");
-    const passed = Asks.clarifyText(
-      card([ask()]),
-      ask({ options: ["A", "B"] }),
-      "Which env?",
-      true,
-    );
-    assert.include(passed, "can't hear this");
-    assert.include(passed, "Options: o1 = A; o2 = B");
-  });
-
   it("a tool reply is a summary, never the card", () => {
     const shown = {
       ...ask({ draft: { text: "Hi" } }),
@@ -769,4 +746,26 @@ describe("turns and closing", () => {
       ask: { id: "q1", kind: "draft", revision: 0, blocking: true, open: true, blocks: 1 },
     });
   });
+});
+
+it.each([
+  ["leading spaces", "  Edited draft"],
+  ["trailing newline", "Edited draft\n"],
+  ["CRLF", "Edited\r\ndraft\r\n"],
+  ["tabs", "\tEdited draft\t"],
+  ["Unicode spaces", "\u00a0Edited draft\u00a0"],
+])("a text answer preserves draft %s without approving a post", (_shape, finalDraft) => {
+  const asked = ask({ draft: { text: "Original draft" }, options: ["Send", "Revise"] });
+  const answered = Asks.answerFor(
+    card([asked]),
+    asked,
+    { verdict: "text", text: "Neither, revise it", finalDraft, revision: 0 },
+    owner,
+    LATER,
+  );
+  if (Asks.isAskProblem(answered)) throw new Error(answered.detail);
+  assert.strictEqual(answered.finalDraft, finalDraft);
+  const wake = Asks.answerText(card([asked]), asked, answered, () => null);
+  assert.notInclude(wake, "draft is approved");
+  assert.notInclude(wake, "Post exactly");
 });

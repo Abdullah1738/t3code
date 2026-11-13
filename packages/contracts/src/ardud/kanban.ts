@@ -136,6 +136,8 @@ export const KanbanSubtask = Schema.Struct({
   step: PositiveInt,
   text: Schema.String,
   owner: KanbanSubtaskOwner,
+  gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
   state: Schema.Literals(["open", "done", "skipped"]),
@@ -552,6 +554,17 @@ export const KanbanOwnerAsk = Schema.Struct({
   revisionNote: Schema.optional(Schema.String),
   /** The message that first asked it, kept once an edit moves `seq` to the new version. */
   firstSeq: Schema.optional(PositiveInt),
+  confirmation: Schema.optional(
+    Schema.Struct({
+      seq: PositiveInt,
+      revision: NonNegativeInt,
+      sourceSeq: PositiveInt,
+      text: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      values: KanbanAskAnswer.fields.values,
+      finalDraft: KanbanAskAnswer.fields.finalDraft,
+    }),
+  ),
   /** Set when it closes through the answer path, a hand-over or a drop. */
   answer: Schema.optional(KanbanAskAnswer),
   /** The owner asked a clarifying question: the ask waits for the agent, not for him. */
@@ -744,7 +757,8 @@ export const KANBAN_ASK_WORDS_REFUSED = "can't be answered in words alone";
  * verdict): there is no verdict to give and no pick he has to make, and there
  * is something words fill in (a field, or a pick he may leave empty). An
  * approval, a required pick, a task with nothing to fill in and a notice
- * never close on words: he says them in a reply on the ask, which stays open.
+ * use the owner reply classifier when he types words instead. A text answer
+ * closes the ask without granting an approval or completing a task.
  */
 export const kanbanResponseTakesWords = (response: KanbanAskResponse): boolean =>
   !response.ack &&

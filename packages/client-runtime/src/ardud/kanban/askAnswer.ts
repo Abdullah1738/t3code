@@ -344,9 +344,8 @@ export function askRefusal(response: KanbanAskResponse): {
 
 /**
  * His own words, when they are all the form holds for a pick he has to make.
- * Words alone never close such an ask (the server refuses them), so they go
- * out as a reply on it and the ask stays open. Null when the form answers the
- * ask, holds no words, or the ask takes words as its answer.
+ * The reply route records them as an answer, or confirms an ambiguous choice.
+ * Null when the form holds a structured answer or no words.
  */
 export function askWordsForReply(ask: KanbanOwnerAsk, form: AskForm): string | null {
   if (form.refusing) return null;
@@ -368,7 +367,7 @@ export function askWordsForReply(ask: KanbanOwnerAsk, form: AskForm): string | n
 export function askPrimaryLabel(ask: KanbanOwnerAsk, form: AskForm): string {
   const response = kanbanAskResponse(ask);
   if (response.ack) return "Seen";
-  if (askWordsForReply(ask, form) !== null) return "Send as a reply";
+  if (askWordsForReply(ask, form) !== null) return "Send answer";
   if (form.refusing) {
     const refusal = askRefusal(response);
     return refusal ? `Send: ${refusal.label.toLowerCase()}` : "Send";
@@ -456,6 +455,8 @@ export function buildAskAnswer(
     };
   }
 
+  const reply = askWordsForReply(ask, form);
+
   let optionIds = [...form.optionIds];
   const words = form.ownWords.trim();
   if (response.choose) {
@@ -468,9 +469,8 @@ export function buildAskAnswer(
       problem("choose", max === 1 ? "Pick one" : `Pick at most ${max}`);
     } else if (optionIds.length < min && words === "") {
       problem("choose", min === 1 ? "Pick one first" : `Pick at least ${min}`);
-    } else if (optionIds.length < min) {
-      // Words are not a pick: the page sends them as a reply (`askWordsForReply`), never as the answer.
-      problem("choose", "Pick one to answer. Your words alone go as a reply.");
+    } else if (optionIds.length < min && reply === null) {
+      problem("choose", "Pick one, or type your answer");
     }
   }
 
@@ -479,7 +479,11 @@ export function buildAskAnswer(
   for (const field of response.fields) {
     const value = form.values[field.id];
     const proof = response.task?.proof === field.id;
-    const wrong = askFieldProblem(field, value, field.required === true || proof);
+    const wrong = askFieldProblem(
+      field,
+      value,
+      (field.required === true || proof) && reply === null,
+    );
     if (wrong !== null) {
       problem(`field:${field.id}`, wrong);
       continue;
@@ -505,13 +509,16 @@ export function buildAskAnswer(
     }
   }
 
-  const verdict = response.task
-    ? "done"
-    : response.verdict
-      ? "approved"
-      : response.choose && optionIds.length > 0
-        ? "picked"
-        : "answered";
+  const verdict =
+    reply !== null
+      ? "answered"
+      : response.task
+        ? "done"
+        : response.verdict
+          ? "approved"
+          : response.choose && optionIds.length > 0
+            ? "picked"
+            : "answered";
   if (
     verdict === "answered" &&
     text === undefined &&

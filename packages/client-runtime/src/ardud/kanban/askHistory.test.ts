@@ -311,3 +311,12 @@ describe("askHistoryFacts", () => {
     });
   });
 });
+
+it("shows the current confirmation and hides superseded confirmation choices", () => {
+  const talk = entry({ seq: 1, revision: 2, confirmation: { seq: 3, sourceSeq: 2, revision: 2 } }, [
+    message(2, "evaluator", "2026-11-10T10:01:00.000Z", [{ _tag: "choice", id: "q1" }]),
+    message(3, "evaluator", "2026-11-10T10:02:00.000Z", [{ _tag: "choice", id: "q1" }]),
+  ]);
+  expect(askThread(talk).map((item) => item.message.seq)).toEqual([3]);
+  expect(askDiscussion(talk).map((item) => item.seq)).toEqual([3]);
+});
