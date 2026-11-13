@@ -29,6 +29,11 @@ const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.
 const readCalls = () => (existsSync(calls) ? readFileSync(calls, "utf8") : "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { cli: string; args: string[] });
 const optIn = (id: string) => { const f = join(sandbox, "root/watchers", id, "watcher.json"); writeFileSync(f, JSON.stringify({ ...JSON.parse(readFileSync(f, "utf8")), headsup: true })); };
 const state = (id: string) => JSON.parse(readFileSync(join(sandbox, "root/watchers", id, "state.json"), "utf8"));
+const rollupFor = (id: string) => {
+  const result = cli("log-rollup", "--day", new Date().toISOString().slice(0, 10));
+  expect(result.exitCode).toBe(0);
+  return JSON.parse(result.stdout.toString()).byWatcher[id];
+};
 const events = (name: string, watcher?: string) => readFileSync(join(sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.name === name && (!watcher || row.ids?.watcher === watcher));
 
 async function runnerFor(ms: number) {
@@ -39,7 +44,7 @@ async function runnerFor(ms: number) {
 }
 
 afterAll(() => {
-  if (process.env.TOOLLOG_SAMPLES) for (const name of ["watch.run", "watch.retry", "watch.fire_cap", "watch.recovered", "watch.disabled", "wake.sent", "helper.run"]) {
+  if (process.env.TOOLLOG_SAMPLES) for (const name of ["watch.run", "watch.retry", "watch.fire", "watch.fire_cap", "watch.recovered", "watch.disabled", "wake.sent", "helper.run"]) {
     console.log("LOG_SAMPLE " + JSON.stringify(events(name)[0]));
   }
   rmSync(sandbox, { recursive: true, force: true });
@@ -73,6 +78,8 @@ test("a wake watcher fires once with its context, falling back to send when wake
   const inboundId = "wake:" + new Bun.CryptoHasher("sha256").update(sentKey).digest("hex");
   const correlationKey = new Bun.CryptoHasher("sha256").update(inboundId).digest("hex").slice(0, 24);
   expect(events("wake.sent", "demo")[0].ids.key).toBe(correlationKey);
+  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: { count: 1 } })]);
+  expect(rollupFor("demo")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
   expect(events("watch.fire_cap", "demo")).toHaveLength(1);
   expect(events("watch.disabled", "demo")).toHaveLength(1);
   expect(events("helper.run", "demo").length).toBeGreaterThan(0);
@@ -117,6 +124,8 @@ test("an undelivered event is kept and retried under the same key before the che
   const pending = state("retry").pending;
   expect(pending.event).toBe("event-1");
   expect(state("retry").fires).toBe(0);
+  expect(events("watch.fire", "retry")).toHaveLength(0);
+  expect(rollupFor("retry")).toMatchObject({ runs: 1, fires: 0, outcomes: { fire: 1 } });
   expect(events("wake.sent", "retry")).toContainEqual(expect.objectContaining({ ok: false, error: { tag: "wake.delivery_failed", message: "wake.delivery_failed" } }));
   rmSync(join(sandbox, "fail-notify"));
   const s = state("retry");
@@ -126,6 +135,8 @@ test("an undelivered event is kept and retried under the same key before the che
   const tg = readCalls().filter(call => call.cli === "telegram");
   expect(tg.at(-1)!.args[tg.at(-1)!.args.indexOf("--key") + 1]).toBe(pending.key);
   expect(state("retry")).toMatchObject({ status: "done", fires: 1, last_delivery: "telegram" });
+  expect(events("watch.fire", "retry")).toHaveLength(1);
+  expect(rollupFor("retry")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
   expect(events("watch.retry", "retry").length).toBeGreaterThan(0);
 }, 20_000);
 
@@ -143,6 +154,8 @@ test("quiet hours hold an event, new or retried, under its key and deliver it on
   const held = state("hush");
   expect(held.pending.event).toBe("quiet-event");
   expect(held.fires).toBe(0);
+  expect(events("watch.fire", "hush")).toHaveLength(0);
+  expect(rollupFor("hush")).toMatchObject({ runs: 1, fires: 0, outcomes: { fire: 1 } });
   expect(readCalls().some(call => call.args.join(" ").includes("quiet-event"))).toBe(false);
   const file = join(sandbox, "root/watchers/hush/watcher.json");
   writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), quiet: window(3) }));
@@ -152,6 +165,8 @@ test("quiet hours hold an event, new or retried, under its key and deliver it on
   expect(sent).toHaveLength(1);
   expect(sent[0]!.args[sent[0]!.args.indexOf("--key") + 1]).toBe(held.pending.key);
   expect(state("hush")).toMatchObject({ status: "done", fires: 1 });
+  expect(events("watch.fire", "hush")).toHaveLength(1);
+  expect(rollupFor("hush")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
 }, 20_000);
 
 test("failing checks back off and alert once; expired watchers switch off with a notice", async () => {
@@ -200,6 +215,9 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   expect(text).toContain("wacli sync daemon is not running");
   expect(text).toContain("robob-watch resume esc");
   expect(state("esc").failure_escalated).toBe(true);
+  expect(events("wake.sent", "esc")).toContainEqual(expect.objectContaining({ ok: true }));
+  expect(events("watch.fire", "esc")).toHaveLength(0);
+  expect(rollupFor("esc")).toMatchObject({ fires: 0 });
   // Still failing: not woken again.
   writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0 }));
   await runnerFor(2_000);

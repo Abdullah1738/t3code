@@ -54,6 +54,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   if (!delivery.ok) return false;
   state.fires += 1;
+  toolLog({ component: "runner", kind: "event", name: "watch.fire", ok: true, ids: { watcher: watcher.id, key: wakeInboundId(pending.key) }, props: { count: state.fires } });
   state.last_fire_at = iso();
   state.last_delivery = delivery.via;
   if (delivery.via === "wake") {
