@@ -23,12 +23,12 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
   if (
     row.archivedAt === null &&
     row.providerInstanceId === providerInstanceId &&
-    row.forkedFrom === null &&
+    (row.forkedFrom === null || row.forkedFrom.type === "node") &&
     row.activeRunId !== null
   ) {
     return { ...row, pendingBackgroundTasks: [] } satisfies CallerIdentity;
   }
-  // Background subagents and all uncertain cases retain the full shell's exact liveness policy.
+  // Without an active run, native background subagents need the full shell's liveness facts.
   return yield* McpDeadline.waitingOn(
     threads.getThreadShell(threadId).pipe(NodeSqliteClient.backgroundReads),
     "statev2 background caller shell",
