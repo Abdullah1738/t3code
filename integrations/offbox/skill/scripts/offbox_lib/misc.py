@@ -770,6 +770,18 @@ def _refresh_running_ttl(r, until=None) -> None:
         pass
 
 
+def _validated_step_row(r, code):
+    from .runs import planned_steps
+    if not planned_steps(r):
+        return r
+    status = r['status']
+    if code is None:
+        status = 'infra'
+    elif status in ('done', 'failed', 'infra', 'lost'):
+        status = 'done' if code == 0 else 'failed'
+    return dict(r, status=status, exit_code=code)
+
+
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
@@ -804,9 +816,9 @@ def logs(run_id: str, do_follow: bool) -> int:
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
     _tail(p, 0, True)
-    _incomplete_log(r, result)
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    _incomplete_log(_validated_step_row(r, code), result)
     if planned_steps(r) and code is None:
         return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
@@ -830,25 +842,25 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None) -> int:
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
+    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    checked = _validated_step_row(r, code)
     if until is not None and now() >= until:
-        _incomplete_log(r, result)
-        raise _wait_timeout(r)
+        _incomplete_log(checked, result)
+        raise _wait_timeout(checked)
     if echo:
         _tail(LOGS_DIR / f"{r['run_id']}.log", pos, True)
     if result in ('complete', 'caught_up') and r['mode'] == 'bg' and not _has_data(LOGS_DIR / f"{r['run_id']}.log"):
         say(f"{r['run_id']} settled with no output on record")
     else:
-        _incomplete_log(r, result)
+        _incomplete_log(checked, result)
     if repo_setup_failed(r['exit_code'], LOGS_DIR / f"{r['run_id']}.log"):
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
-    code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     _report_deps_hint(r, code, LOGS_DIR / f"{r['run_id']}.log")
-    status = r['status']
+    status = checked['status']
     if planned_steps(r) and code is not None and status in ('done', 'failed', 'infra', 'lost'):
-        status = 'done' if code == 0 else 'failed'
         if (status, code) != (r['status'], r['exit_code']):
             con = db()
             try:

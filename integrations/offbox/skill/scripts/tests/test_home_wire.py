@@ -247,7 +247,7 @@ class Wire(Isolated):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 self.assertEqual(misc.logs('run-silent', False), 1)
             self.assertEqual(out.getvalue(), '')
-            self.assertIn('offbox server history empty', err.getvalue())
+            self.assertIn('server history checked', err.getvalue())
             self.assertEqual(len(err.getvalue().splitlines()), 1)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(misc.wait('run-silent', None), 0)

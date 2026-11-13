@@ -988,7 +988,7 @@ class CliStepTests(Isolated):
         row = dict(run_id='legacy', mode='bg', box_id='B', repo_root=None, pulls='[]', exit_code=127,
                    status='failed', error=None)
         err, out = io.StringIO(), io.StringIO()
-        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+        with patch.object(misc, '_catch_up_log', return_value='complete'), patch.object(misc, '_incomplete_log'), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             self.assertEqual(misc._settled(row), 127)
         self.assertEqual(err.getvalue(), 'offbox: legacy settled with no output on record\n')
