@@ -2115,6 +2115,15 @@ export const KanbanScript = Schema.Struct({
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
   held: Schema.optional(Schema.Array(KanbanScriptHeldCommand)),
+  /** A write started but has no confirmed outcome. These records must never replay automatically. */
+  unresolved: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        ...KanbanScriptHeldCommand.fields,
+        reported: Schema.optional(Schema.Boolean),
+      }),
+    ),
+  ),
   lastRun: Schema.NullOr(
     Schema.Struct({
       startedAt: IsoDateTime,

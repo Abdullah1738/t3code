@@ -65,6 +65,7 @@ const RUN_TIMEOUT_MS = 10 * 60_000;
 const STDOUT_LIMIT = 4 * 1024 * 1024;
 /** The shortest schedule a script can have. */
 const MIN_EVERY_MS = 60_000;
+const sameCommand = Schema.toEquivalence(Scripts.ScriptCommand);
 
 export interface NewScript {
   readonly boardId: KanbanBoard["id"];
@@ -469,22 +470,53 @@ const make = Effect.gen(function* () {
     type Held = NonNullable<KanbanScript["held"]>[number];
     const notes: Array<string> = [];
     const notices: Array<string> = [];
-    let held = [...((yield* scriptOf(script.id)).held ?? [])];
-    const saveHeld = () => update(script.id, (latest) => ({ ...latest, held: [...held] }));
+    type Unresolved = NonNullable<KanbanScript["unresolved"]>[number];
+    const latest = yield* scriptOf(script.id);
+    let held = [...(latest.held ?? [])];
+    let unresolved = [...(latest.unresolved ?? [])];
+    const saveDelivery = () =>
+      update(script.id, (record) => ({
+        ...record,
+        held: [...held],
+        unresolved: [...unresolved],
+      }));
+    const limitHeld = () => {
+      held.sort((a, b) => a.firstFailedAt.localeCompare(b.firstFailedAt));
+      while (held.length > 100) {
+        const dropped = held.shift()!;
+        const note = `Dropped ${commandLabel(dropped.command)}: ${dropped.lastError} (100 command limit; will not retry).`;
+        notes.push(note);
+        notices.push(note);
+      }
+    };
+    for (const entry of unresolved) {
+      if (!entry.reported) {
+        notices.push(
+          `Unresolved ${commandLabel(entry.command)}: ${entry.lastError} Will not retry; check the board.`,
+        );
+      }
+    }
     const pending = [
       ...held.map((entry) => ({ command: entry.command, previous: entry as Held | null })),
       ...commands.map((command) => ({ command, previous: null as Held | null })),
     ];
     for (const { command, previous } of pending) {
       const label = commandLabel(command);
+      if (unresolved.some((entry) => sameCommand(entry.command, command))) {
+        if (previous !== null) {
+          held = held.filter((entry) => entry !== previous);
+          yield* saveDelivery();
+        }
+        notes.push(`Skipped unresolved ${label}: check the board before retrying.`);
+        continue;
+      }
       if (previous !== null) {
-        // Consume before sending: a crash or MAY_HAVE_APPLIED must never leave it queued for replay.
         if (!held.includes(previous)) continue;
-        held = held.filter((entry) => entry !== previous);
-        yield* saveHeld();
         const age =
           DateTime.toEpochMillis(yield* DateTime.now) - Date.parse(previous.firstFailedAt);
         if (age >= 24 * 60 * 60_000 || previous.attempts >= 10) {
+          held = held.filter((entry) => entry !== previous);
+          yield* saveDelivery();
           const note = `Dropped ${label}: ${previous.lastError} (${age >= 24 * 60 * 60_000 ? "24 hours old" : "10 attempts"}; will not retry).`;
           notes.push(note);
           notices.push(note);
@@ -496,10 +528,59 @@ const make = Effect.gen(function* () {
         continue;
       }
       const firstFailedAt = previous?.firstFailedAt ?? (yield* nowIso);
-      const { result, attempts } = yield* retryWrite(
-        writeCommand(script, command),
-        10 - (previous?.attempts ?? 0),
-      );
+      if ((command.kanban === "card" || command.kanban === "post") && unresolved.length >= 100) {
+        const error = "100 unresolved deliveries need reconciliation before sending more commands.";
+        if (previous === null) held.push({ command, firstFailedAt, lastError: error, attempts: 0 });
+        limitHeld();
+        yield* saveDelivery();
+        notes.push(`Held ${label}: ${error}`);
+        notices.push(`Held ${label}: ${error} Will retry next run.`);
+        continue;
+      }
+      let current = previous;
+      let attempted = 0;
+      const write = writeCommand(script, command);
+      const trackedWrite =
+        command.kanban === "card" || command.kanban === "post"
+          ? Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                attempted += 1;
+                held = held.filter((entry) => entry !== current);
+                const active: Unresolved = {
+                  command,
+                  firstFailedAt,
+                  lastError: "Delivery started; its outcome is unknown.",
+                  attempts: (previous?.attempts ?? 0) + attempted,
+                };
+                unresolved.push(active);
+                // Persist before sending; an interrupted call stays visible but cannot be replayed.
+                yield* saveDelivery();
+                const result = yield* Effect.result(restore(write));
+                if (
+                  Result.isFailure(result) &&
+                  result.failure._tag === "KanbanError" &&
+                  result.failure.writeOutcome === "may-have-applied"
+                ) {
+                  const error = result.failure;
+                  unresolved = unresolved.map((entry) =>
+                    entry === active ? { ...active, lastError: error.detail } : entry,
+                  );
+                } else {
+                  unresolved = unresolved.filter((entry) => entry !== active);
+                  if (Result.isFailure(result) && result.failure._tag !== "InvalidScriptCommand") {
+                    current = { ...active, lastError: result.failure.detail };
+                    held.push(current);
+                    limitHeld();
+                  } else current = null;
+                }
+                // Mask settlement only: a known not-written result is durable before any sleep/interrupt.
+                yield* saveDelivery();
+                if (Result.isFailure(result)) return yield* Effect.fail(result.failure);
+                return result.success;
+              }),
+            )
+          : write;
+      const { result, attempts } = yield* retryWrite(trackedWrite, 10 - (previous?.attempts ?? 0));
       if (Result.isSuccess(result)) {
         notes.push(
           attempts > 1
@@ -528,25 +609,13 @@ const make = Effect.gen(function* () {
       }
       const total = (previous?.attempts ?? 0) + attempts;
       if (error._tag === "InvalidScriptCommand" || total >= 10) {
+        held = held.filter((entry) => entry !== current);
+        yield* saveDelivery();
         const note = `Dropped ${label}: ${error.detail} (${total >= 10 ? "10 attempts" : "invalid command"}; will not retry).`;
         notes.push(note);
         notices.push(note);
         continue;
       }
-      held.push({
-        command,
-        firstFailedAt,
-        lastError: error.detail,
-        attempts: total,
-      });
-      held.sort((a, b) => a.firstFailedAt.localeCompare(b.firstFailedAt));
-      while (held.length > 100) {
-        const dropped = held.shift()!;
-        const note = `Dropped ${commandLabel(dropped.command)}: ${dropped.lastError} (100 command limit; will not retry).`;
-        notes.push(note);
-        notices.push(note);
-      }
-      yield* saveHeld();
       notices.push(`Held ${label}: ${error.detail} Will retry next run.`);
     }
     if (notices.length > 0) {
@@ -561,6 +630,9 @@ const make = Effect.gen(function* () {
       );
       if (Result.isFailure(notice.result)) {
         notes.push(`Couldn't post delivery notice: ${notice.result.failure.detail}`);
+      } else if (unresolved.length > 0) {
+        unresolved = unresolved.map((entry) => ({ ...entry, reported: true }));
+        yield* saveDelivery();
       }
     }
     return { notes, heldCount: held.length };
@@ -1205,7 +1277,17 @@ const make = Effect.gen(function* () {
         yield* saveRun(script.boardId, {
           ...open,
           endedAt: at,
-          output: [open.output, "Robob stopped during this run."].filter(Boolean).join("\n\n"),
+          output: [
+            script.held?.length ? `Held ${script.held.length} command(s) for retry` : null,
+            open.output,
+            "Robob stopped during this run.",
+            ...(script.unresolved ?? []).map(
+              (entry) =>
+                `Unresolved ${commandLabel(entry.command)}: ${entry.lastError} Will not retry; check the board.`,
+            ),
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
         });
       }
       if (script.lastRun !== null && leftOpen(script.lastRun.startedAt, script.lastRun.endedAt)) {
