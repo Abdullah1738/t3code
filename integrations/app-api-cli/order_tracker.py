@@ -390,6 +390,28 @@ def careem_live_stage(text, merchant):
     return classified, None
 
 
+def careem_order_lifetimes(cfg):
+    lifetimes = []
+    for path in (ROOT / 'orders').glob('*.json'):
+        other = read(path)
+        if other.get('app') != 'careem' or other.get('order') == cfg['order']:
+            continue
+        try:
+            start = epoch(other.get('placed_at'))
+        except (AttributeError, TypeError, ValueError):
+            start = float('-inf')
+        end = float('inf')
+        if other.get('active') is False:
+            try:
+                # Legacy retirement wrote active=false without an end stamp;
+                # the config's last write is a conservative upper bound.
+                end = epoch(other['retired_at']) if other.get('retired_at') else path.stat().st_mtime
+            except (AttributeError, TypeError, ValueError, OSError):
+                pass
+        lifetimes.append((start, end if end >= start else float('inf')))
+    return lifetimes
+
+
 def careem_live_evidence(cfg, now):
     placed = epoch(cfg['placed_at'])
     until = min(now + 120, (epoch(cfg['eta']) if cfg.get('eta') else placed + 7200) + 3600)
@@ -397,10 +419,12 @@ def careem_live_evidence(cfg, now):
     merchant = cfg.get('label', '').split(':', 1)[0].strip()
     if cfg.get('vertical') == 'quik':
         merchant = 'Careem Quik'
+    lifetimes = careem_order_lifetimes(cfg)
     evidence, eta = [], None
     for row in rows:
         stage, hint = careem_live_stage(row['text'], merchant)
-        if stage == 'unknown' or row['posted'] < placed:
+        if (stage == 'unknown' or row['posted'] < placed
+                or any(start <= row['posted'] <= end for start, end in lifetimes)):
             continue
         evidence.append({'stage': stage, 'source': 'android_notification_journal',
                          'confidence': 'careem_single_active', 'observed_at': stamp(row['posted']),
@@ -1059,6 +1083,8 @@ def retire(cfg, path, watcher=None):
         run(['robob-watch', 'remove', watcher])
     if cfg:
         cfg['active'] = False
+        if cfg.get('app') == 'careem':
+            cfg.setdefault('retired_at', stamp())
         write(path, cfg)
 
 

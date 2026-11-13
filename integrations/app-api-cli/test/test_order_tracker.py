@@ -4,6 +4,7 @@ import time
 import unittest
 import json
 import io
+import os
 import tempfile
 from contextlib import redirect_stdout
 from unittest import mock
@@ -934,6 +935,94 @@ class CareemLiveTests(unittest.TestCase):
             self.assertEqual(result['status'], 'unknown')
             self.assertEqual(result['candidate']['confidence'], 'app_unassigned_unconfirmed')
             self.assertNotIn('live_source_ok', result)
+
+    def test_overlapping_push_stays_ambiguous_after_other_tracker_retires(self):
+        posted = t.epoch('2026-11-11T14:59:00+04:00')
+        retired = t.epoch('2026-11-11T15:30:00+04:00')
+        for vertical in ('food', 'quik', 'box'):
+            for text in ("Thank you for your order, can't wait to deliver your next order!",
+                         'Your order is confirmed', 'Your captain has picked up your order',
+                         "Your order's nearby", 'Your order is cancelled', 'Your order is delayed',
+                         'Starbucks - JLT Drive Thru Arrives 15:05-15:15',
+                         'Starbucks - JLT Drive Thru 5 minutes',
+                         'Starbucks - JLT Drive Thru Delivered in 10 minutes'):
+                with self.subTest(vertical=vertical, text=text):
+                    other = dict(self.cfg, order='other', watcher='order-careem-other', vertical=vertical,
+                                 placed_at='2026-11-11T14:50:00+04:00')
+                    self.register(other)
+                    self.load([{'posted': posted, 'detected': posted + 1, 'text': text}])
+                    self.assertFalse(t.single_allowed(self.cfg))
+                    self.assertEqual(t.fetch(self.cfg, {}, posted + 60)['status'], 'unknown')
+                    with mock.patch.object(t, 'run', return_value=''), \
+                            mock.patch.object(t.time, 'time', return_value=retired):
+                        t.retire(other, t.ROOT / 'orders' / (other['watcher'] + '.json'))
+                    saved = t.read(t.ROOT / 'orders' / (other['watcher'] + '.json'))
+                    self.assertEqual(saved['retired_at'], t.stamp(retired))
+                    (t.WATCHERS / other['watcher'] / 'watcher.json').unlink()
+                    self.assertTrue(t.single_allowed(self.cfg))
+                    result = t.fetch(self.cfg, {}, retired + 1)
+                    state = {'primed': True, 'status': 'unknown'}
+                    events = t.transition(result, state, self.cfg, retired + 1)
+                    self.assertEqual(result['status'], 'unknown')
+                    self.assertEqual(result['evidence'], [])
+                    self.assertNotIn('live_source_ok', result)
+                    self.assertNotIn('terminal_at', state)
+                    self.assertFalse(any(e['kind'] == 'stage_change' for e in events))
+
+    def test_lifetime_boundaries_and_legacy_retired_trackers(self):
+        posted = t.epoch('2026-11-11T14:59:00+04:00')
+        at = t.epoch('2026-11-11T15:40:00+04:00')
+        cases = [
+            ('overlap', {}, False),
+            ('placed boundary', {'placed_at': t.stamp(posted)}, False),
+            ('retired boundary', {'retired_at': t.stamp(posted)}, False),
+            ('retired before push', {'retired_at': t.stamp(posted - 1)}, True),
+            ('placed after push', {'placed_at': t.stamp(posted + 1)}, True),
+            ('legacy overlap', {'retired_at': None}, False),
+            ('legacy retired before push', {'retired_at': None, 'mtime': posted - 1}, True),
+            ('orphaned active tracker past ETA', {'active': True, 'retired_at': None,
+                                                 'eta': t.stamp(posted - 60)}, False),
+            ('unknown placement', {'placed_at': None}, False),
+            ('invalid placement', {'placed_at': 'invalid'}, False),
+            ('invalid retirement', {'retired_at': 'invalid'}, False),
+            ('retirement before placement', {'retired_at': '2026-11-11T14:49:00+04:00'}, False),
+            ('other app', {'app': 'noon'}, True),
+            ('same order', {'order': self.cfg['order']}, True),
+        ]
+        for name, overrides, allowed in cases:
+            with self.subTest(name=name):
+                other = dict(self.cfg, order='other', watcher='order-careem-other', active=False,
+                             placed_at='2026-11-11T14:50:00+04:00', retired_at=t.stamp(at))
+                other.update(overrides)
+                mtime = other.pop('mtime', at)
+                self.register(other)
+                (t.WATCHERS / other['watcher'] / 'watcher.json').unlink()
+                path = t.ROOT / 'orders' / (other['watcher'] + '.json')
+                os.utime(path, (mtime, mtime))
+                self.load([{'posted': posted, 'detected': posted + 1,
+                            'text': "Thank you for your order, can't wait to deliver your next order!"}])
+                self.assertTrue(t.single_allowed(self.cfg))
+                result = t.fetch(self.cfg, {}, at)
+                self.assertEqual(result['status'], 'delivered' if allowed else 'unknown')
+                self.assertEqual(bool(result.get('live_source_ok')), allowed)
+
+    def test_new_push_after_retirement_can_advance_without_reusing_old_push(self):
+        retired = t.epoch('2026-11-11T15:30:00+04:00')
+        other = dict(self.cfg, order='other', watcher='order-careem-other', active=False,
+                     placed_at='2026-11-11T14:50:00+04:00', retired_at=t.stamp(retired))
+        self.register(other)
+        old = {'posted': t.epoch('2026-11-11T14:59:00+04:00'), 'detected': retired,
+               'text': "Thank you for your order, can't wait to deliver your next order!"}
+        new = {'posted': retired + 60, 'detected': retired + 61,
+               'text': 'Starbucks - JLT Drive Thru 1 minute'}
+        self.load([old, new])
+        result = t.fetch(self.cfg, {}, retired + 62)
+        state = {'primed': True, 'status': 'unknown', 'delay_sent': True}
+        events = t.transition(result, state, self.cfg, retired + 62)
+        self.assertEqual(result['status'], 'nearby')
+        self.assertEqual(t.epoch(result['eta']), new['posted'] + 60)
+        self.assertEqual(events, [{'kind': 'stage_change', 'status': 'nearby'}])
+        self.assertNotIn('terminal_at', state)
 
     def test_non_single_and_box_keep_existing_evidence_path(self):
         at = t.epoch('2026-11-11T15:05:00+04:00')
