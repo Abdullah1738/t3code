@@ -28,13 +28,13 @@ _NAMES = {
 }
 _ENUMS = {
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'careem', 'uber'},
-    'merchant': {'noon', 'careem', 'amazon', 'uber', 'other'},
+    'merchant': {'noon', 'careem', 'amazon', 'web', 'uber', 'other'},
     'source': {'cli', 'phone', 'email'},
     'outcome': {'success', 'failure', 'refused', 'ask_now', 'dont_ask', 'unverified', 'failed'},
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
-    'state': {'unknown', 'placed', 'preparing', 'picked up', 'out for delivery',
+    'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
