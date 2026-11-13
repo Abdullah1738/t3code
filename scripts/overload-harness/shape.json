@@ -1,0 +1,1362 @@
+{
+  "boardRanks": [
+    {
+      "activeThread": 13,
+      "askTextBytes": {
+        "max": 42522,
+        "min": 5,
+        "n": 1360,
+        "p25": 718,
+        "p50": 1252,
+        "p75": 2988,
+        "p90": 5306,
+        "p95": 8111,
+        "p99": 14205,
+        "sum": 3263650
+      },
+      "asksPerCard": {
+        "max": 13,
+        "min": 0,
+        "n": 2590,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 2,
+        "p95": 3,
+        "p99": 6,
+        "sum": 1360
+      },
+      "blockedByPerCard": {
+        "max": 150,
+        "min": 0,
+        "n": 2590,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 6,
+        "p95": 11,
+        "p99": 15,
+        "sum": 4520
+      },
+      "count": 2590,
+      "descriptionBytes": {
+        "max": 72264,
+        "min": 0,
+        "n": 2590,
+        "p25": 199,
+        "p50": 305,
+        "p75": 402,
+        "p90": 704,
+        "p95": 1146,
+        "p99": 17286,
+        "sum": 2106244
+      },
+      "discussionLinked": 1525,
+      "discussions": 1559,
+      "goals": 7,
+      "jsonBytes": {
+        "max": 216410,
+        "min": 1335,
+        "n": 2590,
+        "p25": 11529,
+        "p50": 16942,
+        "p75": 28293,
+        "p90": 38124,
+        "p95": 43444,
+        "p99": 63806,
+        "sum": 53569049
+      },
+      "linksPerCard": {
+        "max": 16,
+        "min": 0,
+        "n": 2590,
+        "p25": 1,
+        "p50": 2,
+        "p75": 3,
+        "p90": 4,
+        "p95": 6,
+        "p99": 9,
+        "sum": 5651
+      },
+      "modelsPerCard": {
+        "max": 2,
+        "min": 0,
+        "n": 2590,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 2,
+        "sum": 168
+      },
+      "open": 2200,
+      "openAsksPerCard": {
+        "max": 2,
+        "min": 0,
+        "n": 2590,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 11
+      },
+      "pools": 6,
+      "projectsPerCard": {
+        "max": 1,
+        "min": 0,
+        "n": 2590,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 1
+      },
+      "promptBytes": {
+        "max": 89635,
+        "min": 4,
+        "n": 2590,
+        "p25": 5860,
+        "p50": 10292,
+        "p75": 20632,
+        "p90": 29895,
+        "p95": 34882,
+        "p99": 45578,
+        "sum": 36059342
+      },
+      "rank": 1,
+      "reviewThread": 1319,
+      "settled": 390,
+      "stages": {
+        "completed": 363,
+        "deployed": 69,
+        "in_review": 65,
+        "needs_owner": 7,
+        "needs_review": 58,
+        "todo": 1095,
+        "verified": 920,
+        "working": 13
+      },
+      "subtasksPerCard": {
+        "max": 19,
+        "min": 0,
+        "n": 2590,
+        "p25": 4,
+        "p50": 5,
+        "p75": 6,
+        "p90": 7,
+        "p95": 8,
+        "p99": 10,
+        "sum": 12783
+      },
+      "threads": 4477,
+      "titleBytes": {
+        "max": 200,
+        "min": 24,
+        "n": 2590,
+        "p25": 49,
+        "p50": 60,
+        "p75": 88,
+        "p90": 107,
+        "p95": 120,
+        "p99": 161,
+        "sum": 181220
+      },
+      "waitKinds": {
+        "none": 2590
+      },
+      "workThread": 1509
+    },
+    {
+      "activeThread": 0,
+      "askTextBytes": {
+        "max": 2529,
+        "min": 76,
+        "n": 336,
+        "p25": 278,
+        "p50": 460,
+        "p75": 728,
+        "p90": 1164,
+        "p95": 1486,
+        "p99": 2297,
+        "sum": 193548
+      },
+      "asksPerCard": {
+        "max": 20,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 2,
+        "p95": 2,
+        "p99": 4,
+        "sum": 336
+      },
+      "blockedByPerCard": {
+        "max": 47,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 1,
+        "p95": 1,
+        "p99": 3,
+        "sum": 207
+      },
+      "count": 560,
+      "descriptionBytes": {
+        "max": 2209,
+        "min": 0,
+        "n": 560,
+        "p25": 232,
+        "p50": 326,
+        "p75": 425,
+        "p90": 605,
+        "p95": 777,
+        "p99": 1252,
+        "sum": 201796
+      },
+      "discussionLinked": 430,
+      "discussions": 529,
+      "goals": 10,
+      "jsonBytes": {
+        "max": 41907,
+        "min": 2453,
+        "n": 560,
+        "p25": 7668,
+        "p50": 10628,
+        "p75": 14140,
+        "p90": 18754,
+        "p95": 22095,
+        "p99": 33598,
+        "sum": 6468445
+      },
+      "linksPerCard": {
+        "max": 97,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 1,
+        "p75": 2,
+        "p90": 4,
+        "p95": 6,
+        "p99": 13,
+        "sum": 1035
+      },
+      "modelsPerCard": {
+        "max": 2,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 2,
+        "p95": 2,
+        "p99": 2,
+        "sum": 272
+      },
+      "open": 560,
+      "openAsksPerCard": {
+        "max": 1,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 1,
+        "sum": 11
+      },
+      "pools": 6,
+      "projectsPerCard": {
+        "max": 4,
+        "min": 0,
+        "n": 560,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 2,
+        "p95": 2,
+        "p99": 3,
+        "sum": 370
+      },
+      "promptBytes": {
+        "max": 34844,
+        "min": 96,
+        "n": 560,
+        "p25": 3595,
+        "p50": 5574,
+        "p75": 8180,
+        "p90": 10939,
+        "p95": 13886,
+        "p99": 22292,
+        "sum": 3572750
+      },
+      "rank": 2,
+      "reviewThread": 349,
+      "settled": 0,
+      "stages": {
+        "completed": 93,
+        "deployed": 56,
+        "needs_owner": 5,
+        "needs_review": 13,
+        "todo": 207,
+        "verified": 186
+      },
+      "subtasksPerCard": {
+        "max": 16,
+        "min": 2,
+        "n": 560,
+        "p25": 4,
+        "p50": 5,
+        "p75": 6,
+        "p90": 6,
+        "p95": 7,
+        "p99": 10,
+        "sum": 2802
+      },
+      "threads": 1759,
+      "titleBytes": {
+        "max": 173,
+        "min": 22,
+        "n": 560,
+        "p25": 60,
+        "p50": 82,
+        "p75": 107,
+        "p90": 124,
+        "p95": 135,
+        "p99": 157,
+        "sum": 47616
+      },
+      "waitKinds": {
+        "none": 560
+      },
+      "workThread": 399
+    },
+    {
+      "activeThread": 5,
+      "askTextBytes": {
+        "max": 1874,
+        "min": 176,
+        "n": 89,
+        "p25": 323,
+        "p50": 450,
+        "p75": 686,
+        "p90": 1066,
+        "p95": 1263,
+        "p99": 1874,
+        "sum": 49308
+      },
+      "asksPerCard": {
+        "max": 6,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 2,
+        "p95": 4,
+        "p99": 5,
+        "sum": 89
+      },
+      "blockedByPerCard": {
+        "max": 56,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 0,
+        "p75": 1,
+        "p90": 2,
+        "p95": 3,
+        "p99": 4,
+        "sum": 107
+      },
+      "count": 114,
+      "descriptionBytes": {
+        "max": 1051,
+        "min": 38,
+        "n": 114,
+        "p25": 251,
+        "p50": 303,
+        "p75": 341,
+        "p90": 389,
+        "p95": 412,
+        "p99": 543,
+        "sum": 33789
+      },
+      "discussionLinked": 108,
+      "discussions": 118,
+      "goals": 3,
+      "jsonBytes": {
+        "max": 141080,
+        "min": 1628,
+        "n": 114,
+        "p25": 9903,
+        "p50": 14074,
+        "p75": 19845,
+        "p90": 31367,
+        "p95": 36938,
+        "p99": 45988,
+        "sum": 1984185
+      },
+      "linksPerCard": {
+        "max": 9,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 1,
+        "p75": 3,
+        "p90": 3,
+        "p95": 5,
+        "p99": 8,
+        "sum": 186
+      },
+      "modelsPerCard": {
+        "max": 2,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 2
+      },
+      "open": 114,
+      "openAsksPerCard": {
+        "max": 0,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "pools": 6,
+      "projectsPerCard": {
+        "max": 0,
+        "min": 0,
+        "n": 114,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "promptBytes": {
+        "max": 119046,
+        "min": 5,
+        "n": 114,
+        "p25": 4724,
+        "p50": 8655,
+        "p75": 13399,
+        "p90": 21911,
+        "p95": 26823,
+        "p99": 31991,
+        "sum": 1256693
+      },
+      "rank": 3,
+      "reviewThread": 105,
+      "settled": 0,
+      "stages": {
+        "completed": 63,
+        "in_review": 2,
+        "todo": 3,
+        "verified": 43,
+        "working": 3
+      },
+      "subtasksPerCard": {
+        "max": 21,
+        "min": 0,
+        "n": 114,
+        "p25": 5,
+        "p50": 6,
+        "p75": 7,
+        "p90": 9,
+        "p95": 13,
+        "p99": 20,
+        "sum": 713
+      },
+      "threads": 350,
+      "titleBytes": {
+        "max": 101,
+        "min": 37,
+        "n": 114,
+        "p25": 50,
+        "p50": 55,
+        "p75": 64,
+        "p90": 75,
+        "p95": 81,
+        "p99": 94,
+        "sum": 6612
+      },
+      "waitKinds": {
+        "none": 114
+      },
+      "workThread": 110
+    },
+    {
+      "activeThread": 0,
+      "askTextBytes": {
+        "max": 1168,
+        "min": 318,
+        "n": 19,
+        "p25": 471,
+        "p50": 542,
+        "p75": 619,
+        "p90": 783,
+        "p95": 1168,
+        "p99": 1168,
+        "sum": 10844
+      },
+      "asksPerCard": {
+        "max": 3,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 1,
+        "p75": 1,
+        "p90": 1,
+        "p95": 2,
+        "p99": 3,
+        "sum": 19
+      },
+      "blockedByPerCard": {
+        "max": 1,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 1,
+        "p99": 1,
+        "sum": 2
+      },
+      "count": 22,
+      "descriptionBytes": {
+        "max": 419,
+        "min": 93,
+        "n": 22,
+        "p25": 214,
+        "p50": 292,
+        "p75": 331,
+        "p90": 348,
+        "p95": 417,
+        "p99": 419,
+        "sum": 6032
+      },
+      "discussionLinked": 22,
+      "discussions": 25,
+      "goals": 2,
+      "jsonBytes": {
+        "max": 18686,
+        "min": 6013,
+        "n": 22,
+        "p25": 8996,
+        "p50": 12237,
+        "p75": 14664,
+        "p90": 16698,
+        "p95": 16941,
+        "p99": 18686,
+        "sum": 264415
+      },
+      "linksPerCard": {
+        "max": 2,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 1,
+        "p95": 2,
+        "p99": 2,
+        "sum": 6
+      },
+      "modelsPerCard": {
+        "max": 0,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "open": 22,
+      "openAsksPerCard": {
+        "max": 0,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "pools": 6,
+      "projectsPerCard": {
+        "max": 0,
+        "min": 0,
+        "n": 22,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "promptBytes": {
+        "max": 11252,
+        "min": 1314,
+        "n": 22,
+        "p25": 3223,
+        "p50": 6520,
+        "p75": 8462,
+        "p90": 9230,
+        "p95": 9599,
+        "p99": 11252,
+        "sum": 136810
+      },
+      "rank": 4,
+      "reviewThread": 22,
+      "settled": 0,
+      "stages": {
+        "completed": 1,
+        "verified": 21
+      },
+      "subtasksPerCard": {
+        "max": 8,
+        "min": 4,
+        "n": 22,
+        "p25": 4,
+        "p50": 5,
+        "p75": 6,
+        "p90": 8,
+        "p95": 8,
+        "p99": 8,
+        "sum": 121
+      },
+      "threads": 73,
+      "titleBytes": {
+        "max": 111,
+        "min": 33,
+        "n": 22,
+        "p25": 43,
+        "p50": 45,
+        "p75": 54,
+        "p90": 69,
+        "p95": 89,
+        "p99": 111,
+        "sum": 1151
+      },
+      "waitKinds": {
+        "none": 22
+      },
+      "workThread": 22
+    }
+  ],
+  "cards": {
+    "activeThread": 18,
+    "askTextBytes": {
+      "max": 42522,
+      "min": 5,
+      "n": 1804,
+      "p25": 525,
+      "p50": 970,
+      "p75": 2114,
+      "p90": 4743,
+      "p95": 6919,
+      "p99": 13392,
+      "sum": 3517350
+    },
+    "asksPerCard": {
+      "max": 20,
+      "min": 0,
+      "n": 3286,
+      "p25": 0,
+      "p50": 0,
+      "p75": 1,
+      "p90": 2,
+      "p95": 3,
+      "p99": 6,
+      "sum": 1804
+    },
+    "blockedByPerCard": {
+      "max": 150,
+      "min": 0,
+      "n": 3286,
+      "p25": 0,
+      "p50": 0,
+      "p75": 1,
+      "p90": 4,
+      "p95": 10,
+      "p99": 14,
+      "sum": 4836
+    },
+    "count": 3286,
+    "descriptionBytes": {
+      "max": 72264,
+      "min": 0,
+      "n": 3286,
+      "p25": 204,
+      "p50": 309,
+      "p75": 404,
+      "p90": 674,
+      "p95": 970,
+      "p99": 15734,
+      "sum": 2347861
+    },
+    "discussionLinked": 2085,
+    "linksPerCard": {
+      "max": 97,
+      "min": 0,
+      "n": 3286,
+      "p25": 1,
+      "p50": 2,
+      "p75": 3,
+      "p90": 4,
+      "p95": 5,
+      "p99": 10,
+      "sum": 6878
+    },
+    "modelsPerCard": {
+      "max": 2,
+      "min": 0,
+      "n": 3286,
+      "p25": 0,
+      "p50": 0,
+      "p75": 0,
+      "p90": 0,
+      "p95": 2,
+      "p99": 2,
+      "sum": 442
+    },
+    "open": 2896,
+    "openAsksPerCard": {
+      "max": 2,
+      "min": 0,
+      "n": 3286,
+      "p25": 0,
+      "p50": 0,
+      "p75": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "sum": 22
+    },
+    "projectsPerCard": {
+      "max": 4,
+      "min": 0,
+      "n": 3286,
+      "p25": 0,
+      "p50": 0,
+      "p75": 0,
+      "p90": 0,
+      "p95": 1,
+      "p99": 2,
+      "sum": 371
+    },
+    "promptBytes": {
+      "max": 119046,
+      "min": 4,
+      "n": 3286,
+      "p25": 5229,
+      "p50": 8842,
+      "p75": 16880,
+      "p90": 28001,
+      "p95": 33655,
+      "p99": 43694,
+      "sum": 41025595
+    },
+    "reviewThread": 1795,
+    "settled": 390,
+    "stages": {
+      "completed": 520,
+      "deployed": 125,
+      "in_review": 67,
+      "needs_owner": 12,
+      "needs_review": 71,
+      "todo": 1305,
+      "verified": 1170,
+      "working": 16
+    },
+    "subtasksPerCard": {
+      "max": 21,
+      "min": 0,
+      "n": 3286,
+      "p25": 4,
+      "p50": 5,
+      "p75": 6,
+      "p90": 7,
+      "p95": 8,
+      "p99": 11,
+      "sum": 16419
+    },
+    "titleBytes": {
+      "max": 200,
+      "min": 22,
+      "n": 3286,
+      "p25": 50,
+      "p50": 64,
+      "p75": 91,
+      "p90": 111,
+      "p95": 123,
+      "p99": 159,
+      "sum": 236599
+    },
+    "waitKinds": {
+      "none": 3286
+    },
+    "workThread": 2040
+  },
+  "discussions": {
+    "messageCount": {
+      "max": 293,
+      "min": 0,
+      "n": 2231,
+      "p25": 2,
+      "p50": 4,
+      "p75": 7,
+      "p90": 13,
+      "p95": 20,
+      "p99": 49,
+      "sum": 14702
+    },
+    "open": 1206
+  },
+  "schemaVersion": 1,
+  "source": {
+    "backup": "restart-backup-20261113-103633/statev2.sqlite (scratch clone, mode=ro)",
+    "limitations": [
+      "Legacy board tables in backup predate the live boards.sqlite split and later board growth.",
+      "Live load cardinalities are packet overrides; not inferred from the older backup.",
+      "Projection samples describe JSON byte sizes, not a full replay of state/event history."
+    ],
+    "openPredicate": "json_extract(json, '$.settledAt') IS NULL (not stage)",
+    "percentiles": "Nearest rank; all legacy kanban JSON rows. Projection JSON uses deterministic rowid strata, at most 1024 samples per table.",
+    "privacy": "Aggregate numeric statistics only; no row identifiers, payloads or card text."
+  },
+  "syntheticLoad": {
+    "boards": 260,
+    "largeBoards": [
+      {
+        "cards": 4290,
+        "discussions": 3224,
+        "openCards": 3900,
+        "settledCards": 390
+      },
+      {
+        "cards": 1320,
+        "discussions": null,
+        "openCards": null,
+        "settledCards": null
+      }
+    ],
+    "seed": 20261113,
+    "smallBoards": 258,
+    "source": "Card #1352 live-shape requirements, 2026-11-13; kept separate from measured backup statistics.",
+    "unspecifiedCounts": "Scale the measured rank-specific structure and open/settled ratios; do not present these as measured live counts."
+  },
+  "tables": {
+    "ardud_kanban_automations": {
+      "jsonBytes": {
+        "max": 0,
+        "min": 0,
+        "n": 0,
+        "p25": 0,
+        "p50": 0,
+        "p75": 0,
+        "p90": 0,
+        "p95": 0,
+        "p99": 0,
+        "sum": 0
+      },
+      "rows": 0,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_boards": {
+      "jsonBytes": {
+        "max": 12178,
+        "min": 5681,
+        "n": 4,
+        "p25": 5681,
+        "p50": 8538,
+        "p75": 8783,
+        "p90": 12178,
+        "p95": 12178,
+        "p99": 12178,
+        "sum": 35180
+      },
+      "rows": 4,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_card_events": {
+      "jsonBytes": {
+        "max": 84488,
+        "min": 175,
+        "n": 73638,
+        "p25": 320,
+        "p50": 350,
+        "p75": 700,
+        "p90": 1088,
+        "p95": 1575,
+        "p99": 3959,
+        "sum": 46184073
+      },
+      "rows": 73638,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_cards": {
+      "jsonBytes": {
+        "max": 216410,
+        "min": 1335,
+        "n": 3286,
+        "p25": 10412,
+        "p50": 15126,
+        "p75": 25549,
+        "p90": 36026,
+        "p95": 41513,
+        "p99": 60665,
+        "sum": 62286094
+      },
+      "rows": 3286,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_discussions": {
+      "jsonBytes": {
+        "max": 18634,
+        "min": 543,
+        "n": 2231,
+        "p25": 1064,
+        "p50": 1249,
+        "p75": 1565,
+        "p90": 1924,
+        "p95": 2244,
+        "p99": 3363,
+        "sum": 3119570
+      },
+      "rows": 2231,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_goals": {
+      "jsonBytes": {
+        "max": 27078,
+        "min": 779,
+        "n": 22,
+        "p25": 1765,
+        "p50": 3137,
+        "p75": 8819,
+        "p90": 15533,
+        "p95": 15639,
+        "p99": 27078,
+        "sum": 140575
+      },
+      "rows": 22,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_groups": {
+      "jsonBytes": {
+        "max": 23130,
+        "min": 2,
+        "n": 4,
+        "p25": 2,
+        "p50": 902,
+        "p75": 16047,
+        "p90": 23130,
+        "p95": 23130,
+        "p99": 23130,
+        "sum": 40081
+      },
+      "rows": 4,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_messages": {
+      "jsonBytes": {
+        "max": 1042757,
+        "min": 201,
+        "n": 14702,
+        "p25": 633,
+        "p50": 948,
+        "p75": 1564,
+        "p90": 2776,
+        "p95": 4447,
+        "p99": 10441,
+        "sum": 28056108
+      },
+      "rows": 14702,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_pools": {
+      "jsonBytes": {
+        "max": 173,
+        "min": 157,
+        "n": 24,
+        "p25": 163,
+        "p50": 163,
+        "p75": 169,
+        "p90": 173,
+        "p95": 173,
+        "p99": 173,
+        "sum": 3954
+      },
+      "rows": 24,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_script_runs": {
+      "jsonBytes": {
+        "max": 7162,
+        "min": 178,
+        "n": 11315,
+        "p25": 180,
+        "p50": 180,
+        "p75": 239,
+        "p90": 987,
+        "p95": 2512,
+        "p99": 4020,
+        "sum": 5309001
+      },
+      "rows": 11315,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_scripts": {
+      "jsonBytes": {
+        "max": 424,
+        "min": 402,
+        "n": 11,
+        "p25": 404,
+        "p50": 407,
+        "p75": 412,
+        "p90": 417,
+        "p95": 424,
+        "p99": 424,
+        "sum": 4496
+      },
+      "rows": 11,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_thread_cards": {
+      "rows": 2064
+    },
+    "ardud_kanban_threads": {
+      "jsonBytes": {
+        "max": 538,
+        "min": 395,
+        "n": 6659,
+        "p25": 436,
+        "p50": 444,
+        "p75": 524,
+        "p90": 537,
+        "p95": 538,
+        "p99": 538,
+        "sum": 3104356
+      },
+      "rows": 6659,
+      "sampling": "all rows"
+    },
+    "ardud_kanban_wiki": {
+      "jsonBytes": {
+        "max": 213786,
+        "min": 362,
+        "n": 234,
+        "p25": 1535,
+        "p50": 2569,
+        "p75": 6881,
+        "p90": 18630,
+        "p95": 38009,
+        "p99": 150971,
+        "sum": 2139677
+      },
+      "rows": 234,
+      "sampling": "all rows"
+    },
+    "orchestration_v2_projection_checkpoint_scopes": {
+      "jsonBytes": {
+        "max": 1239,
+        "min": 605,
+        "n": 1024,
+        "p25": 1086,
+        "p50": 1139,
+        "p75": 1145,
+        "p90": 1148,
+        "p95": 1168,
+        "p99": 1206,
+        "sum": 1127361
+      },
+      "rows": 37316,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_checkpoints": {
+      "jsonBytes": {
+        "max": 26316,
+        "min": 585,
+        "n": 1024,
+        "p25": 904,
+        "p50": 1021,
+        "p75": 1399,
+        "p90": 1407,
+        "p95": 1791,
+        "p99": 5671,
+        "sum": 1349821
+      },
+      "rows": 162185,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_context_handoffs": {
+      "jsonBytes": {
+        "max": 791101,
+        "min": 1342,
+        "n": 1024,
+        "p25": 2770,
+        "p50": 4207,
+        "p75": 7749,
+        "p90": 33063,
+        "p95": 41305,
+        "p99": 103544,
+        "sum": 12070049
+      },
+      "rows": 7831,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_context_transfers": {
+      "jsonBytes": {
+        "max": 2638,
+        "min": 986,
+        "n": 1024,
+        "p25": 1851,
+        "p50": 2022,
+        "p75": 2090,
+        "p90": 2481,
+        "p95": 2511,
+        "p99": 2579,
+        "sum": 2078714
+      },
+      "rows": 40690,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_messages": {
+      "jsonBytes": {
+        "max": 53718,
+        "min": 428,
+        "n": 1024,
+        "p25": 801,
+        "p50": 945,
+        "p75": 1555,
+        "p90": 3073,
+        "p95": 6861,
+        "p99": 17443,
+        "sum": 2004690
+      },
+      "rows": 780249,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_metadata": {
+      "rows": 1
+    },
+    "orchestration_v2_projection_nodes": {
+      "jsonBytes": {
+        "max": 1851,
+        "min": 809,
+        "n": 1024,
+        "p25": 999,
+        "p50": 1463,
+        "p75": 1681,
+        "p90": 1743,
+        "p95": 1755,
+        "p99": 1763,
+        "sum": 1398216
+      },
+      "rows": 5518254,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_plans": {
+      "jsonBytes": {
+        "max": 1877,
+        "min": 779,
+        "n": 1024,
+        "p25": 1259,
+        "p50": 1392,
+        "p75": 1503,
+        "p90": 1598,
+        "p95": 1649,
+        "p99": 1745,
+        "sum": 1424371
+      },
+      "rows": 2134,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_provider_session_bindings": {
+      "rows": 35650
+    },
+    "orchestration_v2_projection_provider_sessions": {
+      "jsonBytes": {
+        "max": 2815,
+        "min": 2558,
+        "n": 1024,
+        "p25": 2747,
+        "p50": 2749,
+        "p75": 2751,
+        "p90": 2751,
+        "p95": 2757,
+        "p99": 2797,
+        "sum": 2812482
+      },
+      "rows": 10289,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_provider_threads": {
+      "jsonBytes": {
+        "max": 1433,
+        "min": 611,
+        "n": 1024,
+        "p25": 916,
+        "p50": 962,
+        "p75": 1040,
+        "p90": 1122,
+        "p95": 1131,
+        "p99": 1175,
+        "sum": 995109
+      },
+      "rows": 58497,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_provider_turns": {
+      "jsonBytes": {
+        "max": 1927,
+        "min": 532,
+        "n": 1024,
+        "p25": 1297,
+        "p50": 1435,
+        "p75": 1729,
+        "p90": 1878,
+        "p95": 1886,
+        "p99": 1898,
+        "sum": 1514672
+      },
+      "rows": 144280,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_run_attempts": {
+      "jsonBytes": {
+        "max": 1199,
+        "min": 609,
+        "n": 1024,
+        "p25": 766,
+        "p50": 1075,
+        "p75": 1119,
+        "p90": 1127,
+        "p95": 1131,
+        "p99": 1138,
+        "sum": 987317
+      },
+      "rows": 130637,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_runs": {
+      "jsonBytes": {
+        "max": 2148,
+        "min": 980,
+        "n": 1024,
+        "p25": 1270,
+        "p50": 1665,
+        "p75": 1767,
+        "p90": 1877,
+        "p95": 1902,
+        "p99": 2065,
+        "sum": 1577016
+      },
+      "rows": 130622,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_runtime_requests": {
+      "jsonBytes": {
+        "max": 4124,
+        "min": 666,
+        "n": 297,
+        "p25": 1411,
+        "p50": 1753,
+        "p75": 2097,
+        "p90": 2426,
+        "p95": 2790,
+        "p99": 3315,
+        "sum": 515804
+      },
+      "rows": 297,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_subagents": {
+      "jsonBytes": {
+        "max": 46121,
+        "min": 1068,
+        "n": 1024,
+        "p25": 3240,
+        "p50": 4591,
+        "p75": 6486,
+        "p90": 9501,
+        "p95": 11501,
+        "p99": 18769,
+        "sum": 5564440
+      },
+      "rows": 41779,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_threads": {
+      "jsonBytes": {
+        "max": 10709,
+        "min": 1007,
+        "n": 1024,
+        "p25": 1247,
+        "p50": 1304,
+        "p75": 1582,
+        "p90": 2175,
+        "p95": 2371,
+        "p99": 4406,
+        "sum": 1577214
+      },
+      "rows": 56543,
+      "sampling": "rowid strata, deduplicated"
+    },
+    "orchestration_v2_projection_turn_items": {
+      "jsonBytes": {
+        "max": 164290,
+        "min": 844,
+        "n": 738,
+        "p25": 1590,
+        "p50": 2720,
+        "p75": 6561,
+        "p90": 18345,
+        "p95": 28996,
+        "p99": 66033,
+        "sum": 5406338
+      },
+      "rows": 3038618,
+      "sampling": "rowid strata, deduplicated"
+    }
+  },
+  "threads": {
+    "open": 5884,
+    "roles": {
+      "evaluator": 2801,
+      "review": 1798,
+      "work": 2060
+    }
+  }
+}
