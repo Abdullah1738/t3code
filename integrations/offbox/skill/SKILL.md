@@ -84,7 +84,7 @@ Record the Node version, manager/version, install command and the files that cho
 1. Read `package.json` `packageManager` first. `pnpm@x` → `corepack pnpm@x install --frozen-lockfile`;
    `yarn@x` → `corepack yarn@x install --immutable` (v2+) or `--frozen-lockfile` (v1);
    `npm@x` → `npm ci` using that npm version. `bun@x` → `bun install --frozen-lockfile` using that Bun version.
-2. Without that field, use the lockfile: `pnpm-lock.yaml` → `corepack pnpm install --frozen-lockfile`;
+2. Without that field, use the lockfile: `pnpm-lock.yaml` → the shared CI pin, or pnpm 10 for lockfile 9.0 (`corepack pnpm@10 install --frozen-lockfile`);
    `yarn.lock` → Corepack Yarn (v2+ `--immutable`, v1 `--frozen-lockfile`);
    `bun.lock` / `bun.lockb` → `bun install --frozen-lockfile`;
    `package-lock.json` / `npm-shrinkwrap.json` → `npm ci`; none → `npm install`.
@@ -96,8 +96,7 @@ Record the Node version, manager/version, install command and the files that cho
 4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
    then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
    Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
-   on PATH); offbox selects from its installed Nodes using file/engine pins. CI fallback on boxes is #694.
-   If offbox warns no Node matches, fix the run's Node before testing. Log `node --version`.
+   on PATH); offbox provisions a matching Node or stops before the command. CI-only Node fallback on boxes is #694. Log `node --version`.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.

@@ -1,81 +1,13 @@
 """Repo pnpm pin selection, shared with callers that need CI-compatible toolchains."""
-import json
-import re
 import shlex
 from pathlib import Path
 
-from . import node_version, toolchain
-
-PIN = re.compile(r"^v?\d+(?:\.(?:\d+|x|\*)){0,2}(?:\+sha(?:224|256|384|512)\.[a-zA-Z0-9+/=]+)?$")
-SCALAR = r'''["']?([^\s"'#{},]+)["']?'''
-
-
-def _ci(root):
-    env, action = set(), set()
-    for p in sorted((root / '.github/workflows').glob('*')):
-        if p.suffix not in ('.yaml', '.yml'):
-            continue
-        text = node_version._read(p) or ''
-        env.update(re.findall(r'''^\s*["']?PNPM_VERSION["']?:\s*''' + SCALAR, text, re.M))
-        env.update(re.findall(r'''^\s*(?:-\s+)?env:\s*\{[^}\n]*?\bPNPM_VERSION:\s*''' + SCALAR, text, re.M))
-        # YAML step keys can appear in either order, and the step itself may have a name/id.
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if not re.search(r'\buses:\s*["\']?pnpm/action-setup@', line):
-                continue
-            depth = len(line) - len(line.lstrip())
-            start = next((j for j in range(i, -1, -1)
-                          if re.match(r'\s*-\s+', lines[j]) and
-                          len(lines[j]) - len(lines[j].lstrip()) <= depth), i)
-            step_depth = len(lines[start]) - len(lines[start].lstrip())
-            end = next((j for j in range(start + 1, len(lines)) if lines[j].strip() and
-                        (len(lines[j]) - len(lines[j].lstrip()) < step_depth or
-                         (len(lines[j]) - len(lines[j].lstrip()) == step_depth and
-                          lines[j].lstrip().startswith('- ')))), len(lines))
-            for j in range(start, end):
-                header = re.match(r'\s*(?:-\s+)?with:\s*(.*)', lines[j])
-                if not header:
-                    continue
-                if header.group(1).startswith('{'):
-                    m = re.search(r'\bversion:\s*' + SCALAR, header.group(1))
-                    if m:
-                        action.add(m.group(1))
-                    continue
-                with_depth = len(lines[j]) - len(lines[j].lstrip())
-                for option in lines[j + 1:end]:
-                    if option.strip() and len(option) - len(option.lstrip()) <= with_depth:
-                        break
-                    m = re.match(r'\s*version:\s*' + SCALAR, option)
-                    if m:
-                        action.add(m.group(1))
-
-    for values, source in ((env, 'ci PNPM_VERSION'), (action, 'ci pnpm/action-setup')):
-        if values:
-            return (next(iter(values)) if len(values) == 1 else '', source)
-    return None
-
+from . import node_version, package_manager, toolchain
 
 def want(root: Path, cwd: Path):
-    for d in node_version._dirs(Path(root), Path(cwd)):
-        lock = node_version._read(d / 'pnpm-lock.yaml')
-        if lock is None:
-            continue
-        try:
-            pkg = json.loads(node_version._read(d / 'package.json') or '{}')
-        except ValueError:
-            return '', 'invalid package.json'
-        manager = pkg.get('packageManager', '') if isinstance(pkg, dict) else ''
-        if isinstance(manager, str) and manager.startswith('pnpm@'):
-            return manager[5:], 'packageManager'
-        ci = _ci(Path(root))
-        if ci:
-            return ci
-        m = re.search(r'^lockfileVersion:\s*' + SCALAR, lock, re.M)
-        version = m.group(1) if m else '?'
-        major = version.split('.')[0]
-        # Lockfile 9 is shared by pnpm 9/10/11; the compatibility fallback must retain package.json overrides.
-        pin = {'9': '10', '6': '8', '5': '7'}.get(major, '')
-        return pin, f'lockfile {version}'
+    for directory in node_version._dirs(Path(root), Path(cwd)):
+        if (directory / 'pnpm-lock.yaml').is_file():
+            return package_manager.pnpm_selection(directory, ci_root=root)
     return None
 
 
@@ -169,6 +101,6 @@ unset __offbox_pnpm_pin __offbox_pnpm_base __offbox_pnpm_source __offbox_pnpm_cu
 
 def block(w):
     pin, source = w
-    if not PIN.fullmatch(pin):
+    if not package_manager.supported_pnpm_descriptor(pin):
         return toolchain.SHELL + '__offbox_stop ' + shlex.quote(f'pnpm pin {pin!r} ({source}) is unsupported or conflicting')
     return toolchain.SHELL + BLOCK.replace('@PIN@', shlex.quote(pin)).replace('@SOURCE@', shlex.quote(source))

@@ -1,15 +1,22 @@
 """Shared, bounded download prelude for repo toolchains (exit 99 never runs user code)."""
 
-EXIT_TOOLCHAIN = 99
+from pathlib import Path
 
-SHELL = r'''
+EXIT_TOOLCHAIN = 99
+FETCH = (Path(__file__).resolve().parents[2] / "templates/tools/fetch.sh").read_text()
+
+SHELL = FETCH + r'''
 __offbox_curl() {
-  local attempt rc=1
-  # Same per-attempt bounds as templates/tools/fetch.sh; explicitly retry *all* errors, including curl 18/35/56.
-  for attempt in 1 2 3; do
-    command curl -q --connect-timeout 20 --speed-limit 30720 --speed-time 60 --max-time 600 "$@" && return 0
+  local attempt rc=1 retries=0 option previous=
+  for option in "${OFFBOX_FETCH_BOUNDS[@]}"; do
+    [ "$previous" != --retry ] || { retries=$option; break; }
+    previous=$option
+  done
+  # Keep the shared bounds, but retry all errors explicitly (including curl 18/35/56).
+  for ((attempt=1; attempt<=retries+1; attempt++)); do
+    command curl -q "${OFFBOX_FETCH_BOUNDS[@]}" --retry 0 "$@" && return 0
     rc=$?
-    echo "offbox: toolchain download attempt $attempt/3 failed (curl exit $rc)" >&2
+    echo "offbox: toolchain download attempt $attempt/$((retries+1)) failed (curl exit $rc)" >&2
   done
   return "$rc"
 }
