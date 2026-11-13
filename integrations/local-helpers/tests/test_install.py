@@ -140,6 +140,7 @@ exit 0
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
+                    "Library/LaunchAgents/com.ardud.9router-log-poll.plist",
                     ".local/bin/robob-read-watchdog",
                     "Library/LaunchAgents/com.ardud.robob-read-watchdog.plist",
                     ".local/bin/mirage-beacon-keepalive", ".local/libexec/mirage/clients.py",
@@ -149,7 +150,7 @@ exit 0
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 13, self.calls_log())
+        self.assertEqual(len(loads), 14, self.calls_log())
         self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
         self.assertFalse(os.path.exists(self.live(".local/state/mirage-beacon-keepalive")))
         self.assertTrue(os.access(self.live(".local/bin/robob-read-watchdog"), os.X_OK))
@@ -389,7 +390,8 @@ exit 0
         for d in logs:
             self.assertTrue(os.path.isdir(d), d)
         self.assertEqual(sorted(os.listdir(self.loaded)),
-                         ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.cards-health",
+                         ["com.abdullah.juno-proxy", "com.ardud.9router-log-poll",
+                          "com.ardud.battery-low-telegram", "com.ardud.cards-health",
                           "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
                           "com.ardud.lydia-ticks-tunnel", "com.ardud.mirage-beacon-keepalive", "com.ardud.opencode-web",
                           "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog",
