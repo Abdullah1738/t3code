@@ -340,6 +340,7 @@ const AskFieldsInput = {
             label: Schema.String,
             detail: Schema.optional(Schema.String),
             recommended: Schema.optional(Schema.Boolean),
+            approves: Schema.optional(Schema.Array(Schema.String)),
             consequence: Schema.optional(Schema.String),
             block: Schema.optional(Schema.Finite),
           }),
@@ -431,7 +432,7 @@ const CardAsk = tool(
     blocking: Schema.optional(Schema.Boolean),
     ...AskFieldsInput,
   },
-  { card: Record },
+  { card: Record, warning: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
@@ -462,7 +463,7 @@ const CardAskChange = tool(
       ),
     ),
   },
-  { card: Record },
+  { card: Record, warning: Schema.optional(Schema.String) },
   { readonly: false },
 );
 

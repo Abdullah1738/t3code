@@ -11766,7 +11766,7 @@ const make = Effect.gen(function* () {
         }
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
-        const written = Asks.askFields(input, { blocking: input.blocking });
+        const written = Asks.askFields(input, { blocking: input.blocking, card });
         if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
         if (written.to === "evaluator" && actor._tag !== "thread") {
           return yield* failWith(
@@ -11891,7 +11891,7 @@ const make = Effect.gen(function* () {
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = yield* openAskOf(card, askId);
         const at = yield* nowIso;
-        const written = Asks.reviseAsk(ask, edit, at);
+        const written = Asks.reviseAsk(ask, edit, at, card);
         if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
         const { blocks: _blocks, ...revised } = written;
         // New blocks replace the old ones; otherwise the last version's come along whole.

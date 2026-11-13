@@ -19,6 +19,7 @@ const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("thread-1"
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") };
 const AT = "2026-11-10T10:00:00.000Z";
 const LATER = "2026-11-10T11:00:00.000Z";
+const decodeStoredAsk = Schema.decodeSync(KanbanOwnerAsk);
 
 /** The ask as it is stored: what addAsk gives, plus the typed fields. */
 const ask = (fields: Asks.AskFieldsInput = {}, text = "Ship it?"): KanbanOwnerAsk => {
@@ -768,4 +769,107 @@ it.each([
   const wake = Asks.answerText(card([asked]), asked, answered, () => null);
   assert.notInclude(wake, "draft is approved");
   assert.notInclude(wake, "Post exactly");
+});
+
+describe("subtask approval options", () => {
+  const s4 = {
+    id: "s4",
+    step: 4,
+    owner: "evaluator" as const,
+    state: "open" as const,
+    text: "After his yes, move main; install any new dependency in live node_modules first.",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const target = { number: 18, subtasks: [s4] };
+  const fields: Asks.AskFieldsInput = {
+    kind: "change",
+    title: "#18 go-live: Dia bridge stops before acting on a tab someone else navigated",
+    change: { label: "Tool wording", before: "Old", after: "New" },
+    options: [{ label: "Approve", recommended: true }, "Change", "Drop"],
+  };
+  const question =
+    "Put the outside-navigation guard live in the Dia bridge (move main to the reviewed branch), with the tool wording below?";
+  const diaAsk = () => ask(fields, question);
+
+  it("normalizes and stores approves through creation, revision and schema round-trip", () => {
+    const input = { options: [{ label: "Approve", approves: [" s4 "] }, "Change", "Drop"] };
+    const created = Asks.askFields(input, { blocking: false, card: target });
+    if (Asks.isAskProblem(created)) throw new Error(created.detail);
+    assert.deepStrictEqual(created.options?.[0]?.approves, ["s4"]);
+    const revised = Asks.reviseAsk(diaAsk(), input, LATER, target);
+    if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+    assert.deepStrictEqual(decodeStoredAsk(revised).options?.[0]?.approves, ["s4"]);
+    const kept = Asks.reviseAsk(revised, { context: "More detail" }, LATER, target);
+    if (Asks.isAskProblem(kept)) throw new Error(kept.detail);
+    assert.deepStrictEqual(kept.options?.[0]?.approves, ["s4"]);
+  });
+
+  it.each([
+    {
+      label: "Approve",
+      approves: ["s99"],
+      reason: "option o1 approves s99, which isn't a subtask on card #18",
+    },
+    { label: "Drop it", approves: ["s4"], reason: "hold or no option" },
+    { label: "Wait for #73, then run install.zsh", approves: ["s4"], reason: "hold or no option" },
+    { label: "Approve", approves: [" "], reason: "non-empty subtask ids" },
+  ])("refuses $label / $approves on create and revise", ({ label, approves, reason }) => {
+    const input = { options: [{ label, approves }, "Change"] };
+    assert.include(
+      problem(Asks.askFields(input, { blocking: false, card: target })).detail,
+      reason,
+    );
+    assert.include(problem(Asks.reviseAsk(diaAsk(), input, LATER, target)).detail, reason);
+  });
+
+  it("warns on the Dia #18 shape, including after revision", () => {
+    const expected =
+      "This ask won't approve s4 (deploy steps) when he picks a go option: name the id in the question or set approves: [s4] on the go option.";
+    assert.strictEqual(Asks.approvalWarning(target, diaAsk()), expected);
+    const revised = Asks.reviseAsk(diaAsk(), { context: "More detail" }, LATER, target);
+    if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+    assert.strictEqual(Asks.approvalWarning(target, revised), expected);
+  });
+
+  it("doesn't warn when explicit scope, ids or gate wording give a match", () => {
+    const base = diaAsk();
+    for (const candidate of [
+      { ...base, options: [{ id: "o1", label: "Approve", approves: ["s4"] }] },
+      { ...base, options: [{ id: "o1", label: "Approve s4" }] },
+      { ...base, options: [{ id: "o1", label: "Yes, tick s4" }] },
+      { ...base, text: `${base.text} s4` },
+      { ...base, title: "s4 go-live" },
+      { ...base, action: { summary: "s4 go-live" } },
+      { ...base, text: `${base.text} deploy` },
+      { ...base, title: "Deploy guard" },
+      { ...base, action: { summary: "Install guard" } },
+      { ...base, to: "evaluator" as const },
+      { ...base, draft: { text: "Please post this", format: "markdown" as const } },
+      { ...base, respond: { ack: true } },
+      { ...base, options: [{ id: "o1", label: "Wait for a release" }] },
+    ])
+      assert.isUndefined(Asks.approvalWarning(target, candidate));
+  });
+
+  it("only warns for open gated evaluator or script steps", () => {
+    const base = diaAsk();
+    assert.isUndefined(Asks.approvalWarning({ subtasks: [] }, base));
+    for (const state of ["done", "skipped"] as const) {
+      assert.isUndefined(Asks.approvalWarning({ subtasks: [{ ...s4, state }] }, base));
+    }
+    for (const owner of ["work", "review"] as const) {
+      assert.isUndefined(
+        Asks.approvalWarning({ subtasks: [{ ...s4, owner, gate: "deploy" }] }, base),
+      );
+    }
+    assert.include(
+      Asks.approvalWarning(
+        { subtasks: [{ ...s4, owner: "script", text: "Put it live", gate: "money" }] },
+        base,
+      )!,
+      "s4 (money steps)",
+    );
+  });
 });

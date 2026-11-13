@@ -536,7 +536,12 @@ const handlers = {
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
         // The newest ask is the one just added.
-        return { card: Asks.askSummary(asked, asked.asks.at(-1)?.id ?? "") };
+        const ask = asked.asks.at(-1);
+        const warning = ask ? Asks.approvalWarning(asked, ask) : undefined;
+        return {
+          card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(warning === undefined ? {} : { warning }),
+        };
       }),
     ),
   ),
@@ -596,7 +601,12 @@ const handlers = {
           }
           changed = yield* service.changeAsk(card.id, askId, "block", caller.actor, role);
         }
-        return { card: Asks.askSummary(changed, askId) };
+        const revised = changed.asks.find((entry) => entry.id === askId);
+        const warning = edits && revised ? Asks.approvalWarning(changed, revised) : undefined;
+        return {
+          card: Asks.askSummary(changed, askId),
+          ...(warning === undefined ? {} : { warning }),
+        };
       }),
     ),
   ),

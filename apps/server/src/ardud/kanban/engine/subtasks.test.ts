@@ -362,10 +362,17 @@ describe("approvalProblem", () => {
   });
 
   it("still denies a deploy action after a dropped ask", () => {
+    const action = {
+      ...subtask,
+      owner: "evaluator" as const,
+      text: "Restart agent-bridges",
+      gate: "deploy" as const,
+    };
     expect(
       approvalProblem(
         {
           ...card,
+          subtasks: [action],
           asks: [
             {
               id: "q1",
@@ -379,7 +386,7 @@ describe("approvalProblem", () => {
             },
           ],
         },
-        { ...subtask, owner: "evaluator", text: "Restart agent-bridges", gate: "deploy" },
+        action,
       ),
     ).toContain("a dropped ask is not approval");
   });

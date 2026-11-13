@@ -6,6 +6,7 @@ import {
   kanbanOpenStep,
   kanbanStepSubtasks,
   type KanbanActor,
+  type KanbanAskOption,
   type KanbanCard,
   type KanbanSubtask,
 } from "@t3tools/contracts";
@@ -132,6 +133,21 @@ const approvesGate = (
   );
 };
 
+export const optionApprovalIds = (
+  card: Pick<KanbanCard, "subtasks">,
+  option: Pick<KanbanAskOption, "label" | "approves">,
+): ReadonlyArray<string> | undefined => {
+  if (option.approves !== undefined) return option.approves;
+  if (
+    isNegativeOption(option.label) ||
+    !/^(?:yes|ok|approve|approved|go\s+ahead)\b/i.test(option.label.trim())
+  )
+    return undefined;
+  const ids = option.label.match(/\bs\d+\b/g);
+  if (!ids) return undefined;
+  return ids.filter((id) => card.subtasks.some((subtask) => subtask.id === id));
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
@@ -144,9 +160,18 @@ export const approvalProblem = (
     .filter((ask) => {
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
-      if (answer.verdict === "dropped") return true;
-      if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
-      if (ask.draft) return false;
+      if (answer.verdict !== "dropped") {
+        if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
+        if (ask.draft) return false;
+      }
+      // Explicit scopes replace wording matching for the entire ask, including other options.
+      if (ask.options?.some((option) => optionApprovalIds(card, option) !== undefined)) {
+        const options =
+          answer.verdict === "picked"
+            ? ask.options.filter((option) => answer.optionIds?.includes(option.id))
+            : ask.options;
+        return options.some((option) => optionApprovalIds(card, option)?.includes(subtask.id));
+      }
       const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
       const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
       if (ids.size > 0) return ids.has(subtask.id);
@@ -163,18 +188,28 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
-  const approved =
-    answer?.verdict === "approved" ||
-    (answer?.verdict === "picked" &&
-      Boolean(answer.optionIds?.length) &&
-      answer.optionIds!.every((id) => {
-        const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && approvesGate(option.label, gate, subtask.text);
-      }));
+  const scoped = latest?.options?.some((option) => optionApprovalIds(card, option) !== undefined);
+  const explicitlyApproved =
+    answer?.verdict === "picked" &&
+    answer.optionIds?.length === 1 &&
+    latest?.options?.some(
+      (option) =>
+        option.id === answer.optionIds?.[0] &&
+        optionApprovalIds(card, option)?.includes(subtask.id),
+    );
+  const approved = scoped
+    ? explicitlyApproved
+    : answer?.verdict === "approved" ||
+      (answer?.verdict === "picked" &&
+        Boolean(answer.optionIds?.length) &&
+        answer.optionIds!.every((id) => {
+          const option = latest?.options?.find((entry) => entry.id === id);
+          return option !== undefined && approvesGate(option.label, gate, subtask.text);
+        }));
   if (approved) return null;
   let reason: string;
   if (!latest || !answer) {
-    reason = `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+    reason = `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask or set approves: [${subtask.id}] on the go option`;
   } else if (answer.verdict === "dropped") {
     reason = `the latest decision, ${latest.id}, was dropped (a dropped ask is not approval)`;
   } else if (answer.verdict === "picked") {
