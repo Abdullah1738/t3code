@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDateInEffect:off preferSchemaOverJson:off - The restart marker crosses the process boundary before application services are available.
 import * as Effect from "effect/Effect";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";

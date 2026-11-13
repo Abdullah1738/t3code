@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDateInEffect:off - Verify the real file and epoch timestamp read by the external restart watcher.
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -44,7 +45,7 @@ it.effect("clears the old restart marker on boot and publishes it before provide
       checkpoint: Effect.void,
     });
     assert.isTrue(closed);
-    yield* restartMarker(dir);
+    yield* restartMarker(dir).pipe(Effect.asVoid);
     assert.isFalse(
       yield* Effect.promise(() =>
         NodeFSP.access(marker).then(
