@@ -1,5 +1,10 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId, type KanbanActor, type KanbanCard } from "@t3tools/contracts";
+import {
+  ThreadId,
+  type KanbanActor,
+  type KanbanCard,
+  type KanbanSubtask,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as KanbanStore from "../store/KanbanStore.ts";
@@ -7,6 +12,144 @@ import { approvalProblem, inferGate, isNegativeOption } from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
+
+const goChoiceSubtask: KanbanSubtask = {
+  id: "s1",
+  step: 1,
+  text: "Tag the edge-api main-dev tip and dev-deploy it",
+  owner: "evaluator",
+  gate: "deploy",
+  createdAt: "2026-11-13T14:00:00.000Z",
+  state: "open",
+  note: null,
+  doneBy: null,
+  doneAt: null,
+};
+
+const goChoiceCard = (
+  labels: readonly string[],
+  optionIds: readonly string[] = ["o1"],
+  subtask = goChoiceSubtask,
+): Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks"> => ({
+  number: 3329,
+  createdAt: "2026-11-13T13:00:00.000Z",
+  subtasks: [subtask],
+  asks: [
+    {
+      id: "q1",
+      kind: "decision",
+      text: `For ${subtask.id}, should I tag and deploy the edge-api bundle now, or wait for #4280?`,
+      blocking: false,
+      by: evaluator,
+      at: "2026-11-13T14:01:00.000Z",
+      seq: null,
+      options: labels.map((label, index) => ({
+        id: `o${index + 1}`,
+        label,
+        recommended: index === 0,
+      })),
+      closedAt: "2026-11-13T14:08:11.000Z",
+      answer: {
+        verdict: "picked",
+        optionIds: [...optionIds],
+        by: owner,
+        at: "2026-11-13T14:08:11.000Z",
+      },
+    },
+  ],
+});
+
+it.each([
+  ...[
+    "Tag and deploy now",
+    "Merge and deploy",
+    "Deploy edge-api now",
+    "Yes, tag and release it",
+    "Cut the tag and release",
+    "Please install edge-api",
+    "Go ahead and restart edge-api",
+    "Ship edge-api",
+    "Approve deployment of edge-api",
+  ].map((label) => ({ label, approved: true })),
+  ...[
+    "Tag and deploy after CI",
+    "Deploy only the docs change",
+    "Tag and deploy without the read-backs",
+    "Prepare the deploy",
+    "Wait for #4280",
+    "Tag it",
+    "Redeploy edge-api",
+    ...["if", "unless", "before", "once", "when", "pending", "first", "then"].map(
+      (word) => `Tag and deploy ${word} CI passes`,
+    ),
+    ...[
+      "not",
+      "no",
+      "except",
+      "instead",
+      "partial",
+      "dry-run",
+      "dry run",
+      "draft",
+      "plan",
+      "preview",
+    ].map((word) => `Tag and deploy ${word} changes`),
+  ].map((label) => ({ label, approved: false })),
+])("go/hold deploy pick: $label approves=$approved", ({ label, approved }) => {
+  const problem = approvalProblem(goChoiceCard([label, "Wait for #4280"]), goChoiceSubtask);
+  assert.strictEqual(problem === null, approved);
+});
+
+it.each([
+  { others: ["Deploy tonight"] },
+  { others: ["Tag and deploy production", "Release edge-api"] },
+  { others: [] },
+])("a new approval path needs a hold option: $others", ({ others }) => {
+  // This label also fails the existing paths: it starts with "Tag" and isn't the task text.
+  const card = goChoiceCard(["Tag and deploy now", ...others]);
+  assert.include(approvalProblem(card, goChoiceSubtask)!, "approval");
+});
+
+it.each(["Don't deploy", "Show status"])("a hold can be %s", (hold) => {
+  assert.isNull(approvalProblem(goChoiceCard(["Tag and deploy now", hold]), goChoiceSubtask));
+});
+
+it.each([
+  { label: "Buy it on the 9546 card", approved: true },
+  { label: "Buy only one", approved: false },
+  { label: "Pay the vendor", approved: true },
+  { label: "Purchase the license now", approved: true },
+  { label: "Charge the saved card", approved: true },
+  { label: "Refund the invoice", approved: true },
+  { label: "Transfer the balance", approved: true },
+])("go/hold money pick: $label approves=$approved", ({ label, approved }) => {
+  const subtask = { ...goChoiceSubtask, text: "Purchase the license", gate: "money" as const };
+  assert.strictEqual(
+    approvalProblem(goChoiceCard([label, "Leave it"], ["o1"], subtask), subtask) === null,
+    approved,
+  );
+});
+
+it("secret picks keep the strict approval path even with a hold", () => {
+  const subtask = { ...goChoiceSubtask, text: "Share the token", gate: "secret" as const };
+  const card = goChoiceCard(["Share the key with the worker", "Don't"], ["o1"], subtask);
+  assert.include(approvalProblem(card, subtask)!, "approval");
+});
+
+it("#3329: the owner's q1 go pick approves the evaluator's dev-deploy step", () => {
+  const subtask = { ...goChoiceSubtask, text: "Tag the main-dev tip and dev-deploy it" };
+  const card = goChoiceCard(["Tag and deploy now", "Wait for #4280"], ["o1"], subtask);
+  assert.isNull(approvalProblem(card, subtask));
+});
+
+it.each([
+  { labels: ["Tag and deploy now", "Merge and deploy", "Wait for #4280"], approved: false },
+  { labels: ["Tag and deploy now", "Approve", "Wait for #4280"], approved: false },
+  { labels: ["Deploy now", "Approve", "Wait for #4280"], approved: true },
+])("multi-picks keep existing approval paths: $labels", ({ labels, approved }) => {
+  const card = goChoiceCard(labels, ["o1", "o2"]);
+  assert.strictEqual(approvalProblem(card, goChoiceSubtask) === null, approved);
+});
 
 const consentReplies = [
   { task: "Purchase the license", label: "Yes, buy it", reply: "yes", approved: true },
@@ -240,7 +383,8 @@ it.effect.each(
         yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
         yield* kanban.askOwner(
           card.id,
-          { question: `${task} (s1)?`, blocking: false, options: [label, "No"] },
+          // The alternate action supplies no hold without also matching a bare "go" reply.
+          { question: `${task} (s1)?`, blocking: false, options: [label, `Alternate ${task}`] },
           evaluator,
           "evaluator",
         );
