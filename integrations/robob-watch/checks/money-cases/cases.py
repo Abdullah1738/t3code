@@ -111,24 +111,39 @@ REFUND_DONE = re.compile(
     r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
     r'|\b(?:(?P<credit_past>was|has been)\s+)?(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
 REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
-_REFUND_REQUEST = (r'(?:(?:re)?confirm|verify|check|advise|tell|inform|ensure|let)\b'
-                   r'|(?:provide|send|share)\s+(?:(?:a|the|your)\s+)?confirmation\b')
+_REFUND_REQUEST = r'(?:(?:re)?confirm|verify|check|advise|tell|inform|ensure|let|provide|send|share|give)\b'
 _REFUND_MODIFIERS = r'(?:(?:please|kindly|just|simply|also|again|now|do|[a-z]+ly)\s+)*'
+_REFUND_ASK = (r'(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?|need(?:s|ed|ing)?|want(?:s|ed|ing)?'
+               r'|requir(?:e[sd]?|ing)|seek(?:s|ing)?|sought)')
+REFUND_REQUEST_WORD = re.compile(rf'\b{_REFUND_ASK}\b', re.I)
+REFUND_PROOF_NOUN = re.compile(r'\b(?:confirmations?|verification|proof|evidence|assurance)\b', re.I)
+_REFUND_CREDIT_FOLLOW = (r'\s+(?:to\s+)?(?:(?:already|[a-z]+ly)\s+)*'
+                         r'(?:(?:be|have\s+been)\s+)?(?:(?:already|[a-z]+ly)\s+)*credited\b')
+REFUND_PROOF_DEMAND = re.compile(
+    r'\b(?:required|needed|requested|wanted|sought|awaited|necessary|mandatory|essential)\b'
+    rf'|\bexpected\b(?!{_REFUND_CREDIT_FOLLOW})', re.I)
 REFUND_QUERY = re.compile(
     rf'(?:^|[\n.!?;:,])\s*{_REFUND_MODIFIERS}(?:(?:am|is|are|was|were|do|does|did|has|have|had|can|could|may|might|will|would|shall|should|who|what|when|where|why|how|which)\b|{_REFUND_REQUEST})'
     rf'|\b(?:please|kindly)\s+{_REFUND_MODIFIERS}(?:{_REFUND_REQUEST})'
     r'|\bwhether\b|\b(?:confirm|check|know|advise|ask(?:s|ing)?|wonder(?:s|ing)?)\s+if\b'
-    r'|\b(?:ask(?:s|ed|ing)?|request(?:s|ed|ing)?|need(?:s|ed)?|want(?:s|ed)?)\s+(?:that\s+)?you\b'
+    rf'|\b{_REFUND_ASK}\s+(?:to\b|(?:(?:that|for)\s+)?(?:i|we|you|he|she|they|me|us|him|her|them)\b'
+    r'|(?:for\s+)?(?:(?:a|the|your|written)\s+)*confirmations?\b)'
     r'|\b(?:asked|requested|required)\s+to\s+(?:confirm|verify|check)\b', re.I)
 REFUND_UNCERTAIN = re.compile(
     r'\b(?:if|unless|until|pending|provided|providing|assuming|tomorrow|later|soon)\b'
     r'|\b(?:in\s+case|as\s+long\s+as|so\s+long\s+as|subject\s+to|next\s+(?:day|week|month|year))\b', re.I)
 REFUND_TIMING = re.compile(r'\b(?:once|when|before|after|upon)\b', re.I)
+REFUND_PAST_PREFIX = re.compile(
+    r'^\s*(?:(?:after|before|upon)\s+(?:the\s+)?(?:approval|cutoff)'
+    r'|(?:after|before|once|when)\s+(?:the\s+)?approval\s+(?:was|has been|had been)\s+(?:received|granted))\s*,\s*', re.I)
 REFUND_FUTURE = re.compile(
     r'\b(?:will|would|shall|should|may|might|could|can(?!\s+confirm\b)|expect(?:s|ed|ing)?|hop(?:e[sd]?|ing)|plan(?:s|ned|ning)?|'
     r'anticipat(?:e|es|ed|ing)|intend(?:s|ed|ing)?|aim(?:s|ed|ing)?|scheduled|await(?:s|ing)?|'
     r'(?:going|about|trying|attempting)\s+to|working\s+(?:to|on))\b'
     r"|['’](?:ll|d)\b", re.I)
+REFUND_PROOF_PENDING = re.compile(
+    rf'(?:{REFUND_FUTURE.pattern}|\b(?:must|can|(?:has|have|had|ought)\s+to)\b)'
+    rf'(?!{_REFUND_CREDIT_FOLLOW})', re.I)
 REFUND_FOLLOWUP = re.compile(
     r'(?<=[.!])\s+(?:have you received (?:it|the refund|the credit)|is there anything else we can help with)\?\s*$', re.I)
 QUOTED_REPLY = re.compile(r'^\s*>|^.*Original Message.*$|^.*\bOn\b.+\bwrote:.*$', re.I | re.M)
@@ -2858,6 +2873,20 @@ def refund_text(shown):
     return QUOTED_REPLY.split(text, maxsplit=1)[0].replace('’', "'")
 
 
+def direct_refund_statement(evidence, done, merchant):
+    lead = ' '.join(evidence[:done.start()].casefold().split())
+    lead = re.sub(r'^(?:confirmation|verification|proof|evidence|assurance)\s*:\s*', '', lead)
+    lead = re.sub(r'^(?:(?:we|i) (?:can )?confirm|(?:kindly|please) note)(?: that)?(?: |$)', '', lead)
+    if done['before']:
+        return (lead in ('', ' '.join(merchant.casefold().split()), 'the bank', 'our team', 'the team')
+                or re.fullmatch(r'(?:we|i|they|he|she)(?: (?:have|had|has))?(?: (?:manually|already))?'
+                                r'(?: processed (?:the|your) request and)?', lead) is not None)
+    money = re.fullmatch(r'(?:(?:your|the|our) )?[a-z]{3} ?\d[\d.,]*', lead) is not None
+    if done['credit']:
+        return lead in ('', 'the amount', 'the payment', 'your card', 'your account') or money
+    return lead in ('', 'your', 'the', 'our', 'this', 'that') or money
+
+
 def refund_mails(data, now, deadline, find=None, read=None):
     find, read = find or charges.search, read or charges.show
     errors = []
@@ -2888,15 +2917,35 @@ def refund_mails(data, now, deadline, find=None, read=None):
                     # Abbreviations can look like sentence endings inside a question. Only
                     # a neutral trailing follow-up may be ignored; other questions block a hold.
                     confirmation = REFUND_FOLLOWUP.sub('', text)
+                    prefix = REFUND_PAST_PREFIX.match(confirmation)
+                    if prefix:
+                        confirmation = confirmation[prefix.end():]
                     if '?' in confirmation or REFUND_QUERY.search(confirmation):
                         continue
                     # A completed initiation may precede an estimate for the card credit.
                     future = REFUND_FUTURE.search(confirmation)
                     evidence = confirmation[:future.start()] if future else confirmation
                     done = REFUND_DONE.search(evidence)
+                    # A recipient can be any name or noun phrase, including wrapped text.
                     if not done:
                         continue
+                    before = evidence[:done.start()]
+                    proof = REFUND_PROOF_NOUN.search(before)
+                    demand = REFUND_PROOF_DEMAND.search(confirmation)
+                    # Requests and nominal proof claims need a recognizable direct assertion,
+                    # rather than a completed verb embedded in an unresolved statement.
+                    if ((prefix or proof or demand or REFUND_REQUEST_WORD.search(before))
+                            and not direct_refund_statement(evidence, done, merchant)):
+                        continue
+                    if proof and (REFUND_PROOF_DEMAND.search(confirmation[done.end():])
+                                  or REFUND_REQUEST_WORD.search(confirmation[done.end():])
+                                  or REFUND_PROOF_PENDING.search(confirmation[done.end():])):
+                        continue
                     completed = done['past'] or done['before'] or done['credit_past']
+                    # A resolved timing prefix dates a past assertion; it cannot make
+                    # present or future processing into completed-refund evidence.
+                    if prefix and not completed:
+                        continue
                     # Present/bare wording may depend on a condition after the future marker.
                     context = evidence if completed else confirmation
                     if REFUND_UNCERTAIN.search(context):
