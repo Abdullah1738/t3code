@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -24,6 +25,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as TestClock from "effect/testing/TestClock";
 import { McpSchema, McpServer } from "effect/ai";
 
@@ -111,6 +113,7 @@ const fakeThreads = (
   const launches: Array<string> = [];
   const views: Array<string> = [];
   const viewControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
+  const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
   const view: KanbanThreads["Service"]["view"] = (threadId) =>
     Effect.suspend(() => viewControl.beforeRead(threadId)).pipe(
       Effect.andThen(
@@ -264,33 +267,43 @@ const fakeThreads = (
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
-        getCallerRow: (threadId) => {
-          if (unreadable.has(threadId))
-            return Effect.fail(new OrchestratorProjectionError({ threadId }));
-          if (missing.has(threadId)) return Effect.succeed(null);
-          const shell = liveThreadShell(threadId);
-          return Effect.succeed({
-            ...shell,
-            deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
-          });
-        },
-        getThreadShell: (threadId) => {
-          if (unreadable.has(threadId)) {
-            return Effect.fail(new OrchestratorProjectionError({ threadId }));
-          }
-          if (missing.has(threadId)) return Effect.succeed(null);
-          const parentThreadId = parents.get(threadId) ?? null;
-          const shell = liveThreadShell(threadId);
-          return Effect.succeed({
-            ...shell,
-            deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
-            lineage: {
-              ...shell.lineage,
-              parentThreadId,
-              relationshipToParent: parentThreadId === null ? null : "subagent",
-            },
-          });
-        },
+        getCallerRow: (threadId) =>
+          Effect.suspend(() => callerControl.beforeRead()).pipe(
+            Effect.andThen(
+              Effect.suspend(() => {
+                if (unreadable.has(threadId))
+                  return Effect.fail(new OrchestratorProjectionError({ threadId }));
+                if (missing.has(threadId)) return Effect.succeed(null);
+                const shell = liveThreadShell(threadId);
+                return Effect.succeed({
+                  ...shell,
+                  deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
+                });
+              }),
+            ),
+          ),
+        getThreadShell: (threadId) =>
+          Effect.suspend(() => callerControl.beforeRead()).pipe(
+            Effect.andThen(
+              Effect.suspend(() => {
+                if (unreadable.has(threadId)) {
+                  return Effect.fail(new OrchestratorProjectionError({ threadId }));
+                }
+                if (missing.has(threadId)) return Effect.succeed(null);
+                const parentThreadId = parents.get(threadId) ?? null;
+                const shell = liveThreadShell(threadId);
+                return Effect.succeed({
+                  ...shell,
+                  deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
+                  lineage: {
+                    ...shell.lineage,
+                    parentThreadId,
+                    relationshipToParent: parentThreadId === null ? null : ("subagent" as const),
+                  },
+                });
+              }),
+            ),
+          ),
       }),
     ),
     Layer.provideMerge(serviceLayer),
@@ -312,12 +325,114 @@ const fakeThreads = (
     unreadable,
     views,
     viewControl,
+    callerControl,
     rejectSends,
     layer,
   };
 };
 
 const owner: KanbanActor = { _tag: "owner" };
+
+it.effect.each(["subtask_done", "report_bug"] as const)(
+  "%s saves an attached active worker's result while the state background reader is held",
+  (tool) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "board-caller-reader-" });
+      yield* Effect.gen(function* () {
+        const state = Context.get(
+          yield* Layer.build(
+            NodeSqliteClient.layer({
+              filename: path.join(directory, "caller.sqlite"),
+              readerWorker: true,
+              foregroundReaderSlots: 1,
+              backgroundReaderSlots: 1,
+            }),
+          ),
+          SqlClient.SqlClient,
+        );
+        yield* state`PRAGMA journal_mode = WAL`;
+        yield* state`CREATE TABLE caller_probe (value INTEGER)`;
+        yield* state`INSERT INTO caller_probe VALUES (1)`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const fake = fakeThreads();
+        yield* Effect.gen(function* () {
+          const kanban = yield* KanbanService.KanbanService;
+          const board = yield* kanban.ensureBoard({
+            slug: "busy-caller",
+            name: "Busy caller",
+            defaultProjectId: ProjectId.make("project-1"),
+          });
+          yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+          const work = yield* kanban.createCard(
+            board.id,
+            {
+              title: "Work",
+              prompt: "Work",
+              subtasks: [{ step: 1, owner: "work", text: "Implement" }],
+            },
+            owner,
+          );
+          const bug = yield* kanban.createCard(
+            board.id,
+            { title: "Known bug", prompt: "Fix" },
+            owner,
+          );
+          yield* kanban.dispatchNow;
+          const active = (yield* kanban.card(work.id)).card;
+          const worker = active.activeThreadId!;
+          assert.equal(active.activeRole, "work");
+          const holder = yield* state
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* state`SELECT * FROM caller_probe`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }),
+            )
+            .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+          yield* Deferred.await(held);
+          fake.callerControl.beforeRead = () =>
+            state
+              .withTransaction(state`SELECT * FROM caller_probe`)
+              .pipe(NodeSqliteClient.readOnly, Effect.orDie, Effect.asVoid);
+          yield* Effect.gen(function* () {
+            const result = yield* call(
+              worker,
+              tool,
+              tool === "subtask_done"
+                ? {
+                    card: work.id,
+                    subtask: "s1",
+                    state: "done",
+                    note: "Saved while busy",
+                  }
+                : {
+                    boardId: board.id,
+                    cardHint: `#${bug.number}`,
+                    title: "Known bug",
+                    evidence: "Reader held",
+                  },
+            );
+            assert.isFalse(result.isError, result.text);
+            assert.isFalse(yield* Deferred.isDone(release));
+            if (tool === "subtask_done") {
+              assert.equal((yield* kanban.card(work.id)).card.subtasks[0]?.state, "done");
+            } else {
+              assert.isTrue(
+                (yield* kanban.card(bug.id)).events.some(
+                  (event) => event.kind === "comment" && event.body?.includes("Reader held"),
+                ),
+              );
+            }
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+          yield* Fiber.join(holder);
+        }).pipe(Effect.provide(fake.layer));
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect("card_edit reports control characters to an evaluator", () => {
   const { layer } = fakeThreads();
