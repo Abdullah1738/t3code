@@ -266,9 +266,11 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 - `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
   `offbox whoami`, `offbox status`.
-- `offbox kill <run>` stops a hung starting/running box run and marks it `killed` once boat confirms the process
+- `offbox kill <run>` stops your starting/running box run and marks it `killed` once the backend confirms the process
   stopped. Release refuses while a run is active and names the run ids. Use kill, not pkill on the box.
-  Local runs are refused; `offbox kill <run>` also cancels a run that is still syncing.
+  Local runs are refused. It also cancels your own run before its command starts, whether queued for a box or
+  still syncing/starting on one, by sending SIGTERM to its proven client and letting it release the pool guard.
+  If the client has not settled the row after 15 seconds, check `offbox list`; kill does not force it to stop.
 - A run that never got a box and whose client is gone is marked lost by the reaper within 5 minutes.
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.

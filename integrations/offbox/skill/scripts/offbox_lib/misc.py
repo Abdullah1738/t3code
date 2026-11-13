@@ -197,54 +197,86 @@ def _release_one(con, r, delete):
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 
-def _stop_run_client(pid: int, start_at: float | None) -> bool:
-    def send(sig, group=False):
-        # Recheck before every signal, including escalation: the PID may have been reused while we waited.
-        if not _client_alive(pid, start_at):
-            return
-        try:
-            if group:
-                pgid = os.getpgid(pid)
-                if pgid == pid and pgid != os.getpgrp():
-                    os.killpg(pgid, sig)
-                    return
-                if sig == signal.SIGTERM:
-                    return
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            pass
+CANCEL_WAIT_S = 15
+CANCEL_POLL_S = 0.5
 
-    def wait_until(deadline):
-        while _client_alive(pid, start_at):
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return False
-            time.sleep(min(0.1, left))
-        return True
 
-    deadline = time.monotonic() + 10
-    send(signal.SIGTERM)
-    if wait_until(time.monotonic() + 1):
-        return True
-    # A client leading its own group can leave rsync/ssh behind while unwinding a blocked push.
-    send(signal.SIGTERM, group=True)
-    if wait_until(deadline):
-        return True
-    send(signal.SIGKILL, group=True)
-    return wait_until(time.monotonic() + 2)
+def _cancel_before_start(r):
+    rid, client, start_at = r["run_id"], r["client_pid"], r["start_at"]
+    if not client:
+        raise OffboxError(f"run {rid}: no client pid is recorded, so kill cannot tell which process to stop. "
+                          "Stop it with Ctrl-C or its tool, or run `offbox reap` once it is gone", code=2)
+    if client <= 1 or client == os.getpid():
+        raise OffboxError(f"run {rid}: refusing to signal invalid client pid {client}", code=2)
+    alive = _client_alive(client, start_at)
+    if alive:
+        began = _pid_started_at(client)
+        if began is None or start_at is None:
+            raise OffboxError(f"run {rid}: cannot prove client pid {client}'s start time; nothing was stopped. "
+                              "Stop it with Ctrl-C or its tool, or run `offbox reap` once it is gone", code=2)
+        alive = began <= start_at + 2
+    deadline = time.monotonic() + CANCEL_WAIT_S
+    sent = False
+    while True:
+        r = _run_row(rid)
+        if r["status"] not in ("starting", "running"):
+            if r["status"] == "killed":
+                where = f"box {r['box_id']} returned to the pool" if r["box_id"] else "queued, no box used"
+                print(f"cancelled run {rid} before its command started (client pid {client} stopped; {where})")
+            else:
+                print(f"run {rid} settled as {r['status']}; nothing else was stopped")
+            return r, 0
+        if r["process_id"]:
+            return r, None
+        if alive and not sent:
+            # Only the proven client may unwind its preparation and release the pool guard.
+            try:
+                os.kill(client, signal.SIGTERM)
+                sent = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError as e:
+                raise OffboxError(f"run {rid}: cannot signal client pid {client}: {e}", code=2) from e
+        if not alive or time.monotonic() >= deadline:
+            if alive and _client_alive(client, start_at):
+                cur = _run_row(rid)
+                if cur["status"] not in ("starting", "running") or cur["process_id"]:
+                    continue
+                say(f"run {rid}: sent SIGTERM to client {client}; it has not settled the row yet, "
+                    "check `offbox list`")
+                return r, 1
+            con = db()
+            start_keys = tuple(f"{kind}:{rid}" for kind in
+                               ("start_unknown", "start_unattached", "containers_expected"))
+            pending = con.execute("SELECT 1 FROM kv WHERE k IN (?,?,?)", start_keys).fetchone()
+            if r["box_id"] and (r["error"] or r["command_id"] or pending):
+                say(f"run {rid}: remote start unconfirmed on {r['box_id']}; row left as {r['status']}, "
+                    "box remains reserved. `offbox reap` fences or reconciles the start")
+                return r, 1
+            error = "client ended before its command started" if r["box_id"] else "client ended before it got a box"
+            # A pending cmd_start has no process_id either. Preserve its evidence for the reaper's start fence,
+            # including evidence the client records between our read and this write.
+            changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? "
+                                  "AND process_id IS NULL AND status IN ('starting','running') "
+                                  "AND (box_id IS NULL OR (COALESCE(error,'')='' AND command_id IS NULL "
+                                  "AND NOT EXISTS (SELECT 1 FROM kv WHERE k IN (?,?,?))))"
+                                  + (" AND box_id IS NULL" if not r["box_id"] else ""),
+                                  (now(), error, rid, *start_keys)).rowcount
+            con.commit()
+            if not changed:
+                alive = False
+                continue
+            where = f"; box {r['box_id']} returns to the pool via the reaper" if r["box_id"] else ""
+            print(f"run {rid}: settled as lost ({error}); nothing was stopped{where}")
+            return _run_row(rid), 0
+        time.sleep(min(CANCEL_POLL_S, max(0, deadline - time.monotonic())))
 
 
 def kill_run(run_id: str, me: dict | None = None) -> int:
-    """Stop a hung starting/running box run after confirming its local client or remote process is gone.
-    Signal without the box lock; reconcile an unrecorded start under it after the client stops.
+    """Cancel the caller's pre-command run, or confirm a started remote process stopped.
 
     With a caller (`me`), the run must be the caller's own: an unproven caller is refused, and a proven one may only
     stop a run its owner string names. Killing another execution's run is an authority transfer, like a release."""
-    with contextlib.ExitStack() as locks:
-        return _kill_run(run_id, me, locks)
-
-
-def _kill_run(run_id: str, me: dict | None, locks: contextlib.ExitStack) -> int:
     from .runs import confirmed_lost, finish
     r = _run_row(run_id)
     rid = r["run_id"]
@@ -257,101 +289,12 @@ def _kill_run(run_id: str, me: dict | None, locks: contextlib.ExitStack) -> int:
     if r["mode"] == "local":
         raise OffboxError(f"run {rid} is a local run (no box); kill its process on this Mac instead", code=2)
     _require_my_run(r)
-    cancel_hold_added = False
     needs_id_proof = not r["process_id"] or db().execute(
         "SELECT 1 FROM kv WHERE k=?", (f"start_unknown:{rid}",)).fetchone() is not None
     if not r["process_id"]:
-        client = r["client_pid"]
-        if not client or not _client_alive(client, r["start_at"]):
-            raise OffboxError(f"run {rid}: {_not_started(r)}; its client is gone; `offbox reap` settles it.", code=2)
-        if client <= 1 or client == os.getpid():
-            raise OffboxError(f"run {rid}: refusing to signal invalid client pid {client}", code=2)
-        stopped = _stop_run_client(client, r["start_at"])
-        r = _run_row(rid)
-        if (stopped and r["box_id"] and (not r["process_id"] or r["status"] not in ("starting", "running"))
-                and not (r["status"] == "killed" and r["exit_code"] == 130 and not r["process_id"])):
-            from . import start_check
-            _require_my_run(r)
-            con = db()
-            con.execute("UPDATE runs SET status='starting' WHERE run_id=? AND process_id IS NULL "
-                        "AND status IN ('starting','running')", (rid,))
-            cancel_hold_added = bool(con.execute("INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)",
-                                                 (f"start_unknown:{rid}", r["box_id"])).rowcount)
-            con.commit()
-            # A live client can be inside cmd_start with no recorded PID (#680). Fence late starts before freeing
-            # its slot. killed/130 is already proof: the client's handler writes it only when rn.started is false.
-            try:
-                # Keep the lock through settlement so wait/reap cannot insert a terminal result in the gap.
-                locks.enter_context(file_lock('box-' + r["box_id"], timeout=1))
-                r = _run_row(rid)
-                fenced = r["status"] == "lost" and not r["process_id"] and con.execute(
-                    "SELECT 1 FROM kv WHERE k=? AND v='fenced'", (f"lost_confirmed:{rid}",)).fetchone()
-                completed = r["status"] in ("done", "failed") and r["exit_code"] is not None
-                cancelled = (r["status"] == "killed" and r["exit_code"] == 143 and not r["process_id"]
-                             and r["client_pid"] == client
-                             and r["error"] == "cancelled before the command started (client stopped by offbox kill)")
-                if fenced or completed or cancelled:
-                    con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
-                    con.commit()
-                    outcome = ("was cancelled before start; nothing ran" if cancelled else
-                               "was fenced before start; nothing ran" if fenced else f"already ended with exit {r['exit_code']}")
-                    print(f"run {rid} {outcome}; stopped local client pid {client}. "
-                          "`offbox release [--delete]` works now.")
-                    return 0
-                if not r["process_id"] and r["status"] in ("starting", "running"):
-                    con = db()
-                    result = start_check.check(r["box_id"], rid, claim=start_check.claims_enabled(con, rid))
-                    if result.code is not None:
-                        start_check.settle(con, r, start_check.Result(result.verdict, result.code),
-                                           'client stopped by offbox kill')
-                        con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
-                        con.commit()
-                        print(f"run {rid} already ended with exit {result.code}; stopped local client pid {client}. "
-                              "`offbox release [--delete]` works now.")
-                        return 0
-                    if result.verdict != 'fenced':
-                        # The wrapper's OS PID is not necessarily the backend's command ID (boatd uses synthetic
-                        # IDs). Without a receipt or fence, keep the quarantine even if reap settles this row.
-                        say(f"run {rid}: stopped local client pid {client}, but its remote termination is unconfirmed; "
-                            "reservation kept until the box stops. " + start_check.hint(r['box_id'], rid, result.pid))
-                        return 1
-                r = _run_row(rid)
-            except OffboxError as e:
-                say(f"run {rid}: could not reconcile its remote start after stopping local client pid {client} "
-                    f"({e}); reservation kept until the box stops")
-                return 1
-        if not r["process_id"]:
-            if not stopped:
-                say(f"run {rid}: local client pid {client} did not stop; row left as {r['status']}")
-                return 1
-            con = db()
-            error = "cancelled before the command started (client stopped by offbox kill)"
-            changed = con.execute("UPDATE runs SET status='killed', exit_code=143, end_at=?, error=? "
-                                  "WHERE run_id=? AND process_id IS NULL AND status IN ('starting','running')",
-                                  (now(), error, rid)).rowcount
-            if not changed:
-                # run_remote's SIGTERM handler may have recorded killed/130 before the client exited.
-                changed = con.execute("UPDATE runs SET exit_code=143, error=? WHERE run_id=? "
-                                      "AND process_id IS NULL AND status='killed' AND exit_code=130 AND client_pid=?",
-                                      (error, rid, client)).rowcount
-            con.commit()
-            r = _run_row(rid)
-            if not r["process_id"]:
-                if not changed:
-                    say(f"run {rid}: local client stopped; row is {r['status']}, left unchanged")
-                    return 1
-                con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
-                con.commit()
-                event(con, r["box_id"], "run_end", f"{rid} status=killed exit=143 (client stopped before start)")
-                remote_dir = r["remote_dir"]
-                if not remote_dir and r["box_id"]:
-                    row = con.execute("SELECT remote_dir FROM leases WHERE box_id=?", (r["box_id"],)).fetchone()
-                    remote_dir = row["remote_dir"] if row else None
-                where = f"nothing ran on {r['box_id']}" if r["box_id"] else "no box was assigned"
-                print(f"killed run {rid} before its command started (stopped local client pid {client}; {where}). "
-                      "`offbox release [--delete]` works now. A partial upload may remain in the remote checkout dir"
-                      + (f" {remote_dir}" if remote_dir else "") + ".")
-                return 0
+        r, result = _cancel_before_start(r)
+        if result is not None:
+            return result
     if needs_id_proof:
         _require_my_run(r)
         # Concurrent recovery can overwrite process_id with an OS PID. Check the API's command identity before
@@ -371,11 +314,6 @@ def _kill_run(run_id: str, me: dict | None, locks: contextlib.ExitStack) -> int:
             return 1
     if not r["box_id"]:
         raise OffboxError(f"run {rid} has process {r['process_id']} but no box; cannot stop it", code=2)
-    if cancel_hold_added:
-        # A recorded API command ID restores the normal reaper path; it does not need our temporary quarantine.
-        con = db()
-        con.execute("DELETE FROM kv WHERE k=?", (f"start_unknown:{rid}",))
-        con.commit()
     box, pid = r["box_id"], r["process_id"]
     # DELETE may fail (timeout) while the process is already gone, so the GET is the authority. Only a 404 (None)
     # or an explicit running:false counts as stopped; a DELETE error alone, an error on the GET, or an empty/unknown
