@@ -3291,7 +3291,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     { name: "parent instance", parentEnabled: true, model: "gpt-5.4" },
     { name: "alternate instance", parentEnabled: false, model: "gpt-5.5" },
     ...[true, false].flatMap((parentEnabled) =>
-      ["same binding", "rebound binding"].flatMap((legacy) =>
+      ["same binding", "rebound binding", "unlinked rebound binding"].flatMap((legacy) =>
         [false, true].map((promptAccepted) => ({
           name: `legacy ${legacy} / parent=${parentEnabled} / prompt=${promptAccepted}`,
           parentEnabled,
@@ -3438,23 +3438,48 @@ describe("OrchestratorMcpService provider resolution", () => {
                   createdBy: "agent",
                   creationSource: "mcp",
                 });
-              if (testCase.legacy === "rebound binding") {
-                const parent = yield* orchestrator.getThreadProjection(parentThreadId);
-                yield* orchestrator.dispatch({
-                  type: "thread.created.record",
-                  commandId: commandId("record-created-thread"),
-                  parentThreadId,
-                  parentRunId: parent.runs[0]!.id,
-                  parentNodeId: parent.runs[0]!.rootNodeId!,
-                  targetThreadId: legacyId,
-                  targetRunId: null,
-                });
+              if (testCase.legacy !== "same binding") {
+                if (testCase.legacy === "rebound binding") {
+                  const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+                  yield* orchestrator.dispatch({
+                    type: "thread.created.record",
+                    commandId: commandId("record-created-thread"),
+                    parentThreadId,
+                    parentRunId: parent.runs[0]!.id,
+                    parentNodeId: parent.runs[0]!.rootNodeId!,
+                    targetThreadId: legacyId,
+                    targetRunId: null,
+                  });
+                }
                 retryScope = {
                   ...scope,
                   requestNamespace: "new-catalog-binding",
                   thread: { ...scope.thread!, providerSessionId: "new-catalog-binding" },
                 };
               }
+            }
+            if (
+              "legacy" in testCase &&
+              testCase.legacy === "unlinked rebound binding" &&
+              !testCase.promptAccepted
+            ) {
+              const error = yield* service.createThreads(retryScope, request).pipe(Effect.flip);
+              assert.equal(error.code, "ambiguous_replay");
+              assert.include(error.message, "t3_thread_list");
+              const threads = yield* ThreadManagementService.ThreadManagementService;
+              assert.equal(
+                (yield* threads.listProjectThreads({ projectId, includeSubagents: true })).length,
+                2,
+              );
+              const legacy = yield* orchestrator.getThreadProjection(legacyId);
+              assert.equal(legacy.messages.length, 0);
+              assert.equal(legacy.runs.length, 0);
+              const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+              assert.equal(
+                parent.turnItems.filter((item) => item.type === "thread_created").length,
+                0,
+              );
+              return;
             }
             const first = yield* service.createThreads(retryScope, request);
             if ("legacy" in testCase) assert.equal(first.threads[0]?.threadId, legacyId);
@@ -3744,6 +3769,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                   ...parentProjection([], parentModelSelection).thread,
                 }),
               hasReceipt: () => Effect.succeed(false),
+              findMcpThreadCreations: () => Effect.succeed([]),
               assertProviderInstanceEnabled: () => Effect.void,
               isProviderInstanceEnabledForProject: () => Effect.succeed(true),
               getThreadRecords: (threadId) =>

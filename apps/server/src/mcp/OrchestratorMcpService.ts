@@ -1178,6 +1178,62 @@ const make = Effect.gen(function* () {
     return [...namespaces];
   });
 
+  const unrecordedCreation = Effect.fn("OrchestratorMcpService.unrecordedCreation")(function* (
+    scope: McpThreadInvocationScope,
+    projectId: ProjectId,
+    key: string,
+    index: number,
+  ) {
+    const traces = yield* threadManagement
+      .findMcpThreadCreations({ projectId, requestKey: key, index })
+      .pipe(
+        Effect.mapError(() =>
+          failure("orchestration_error", "Unable to check earlier create_threads receipts."),
+        ),
+      );
+    const owned: Array<ReturnType<typeof threadCreationIds>> = [];
+    let unresolved = false;
+    for (const trace of traces) {
+      const namespace = yield* Effect.try(() =>
+        decodeURIComponent(trace.threadId.split(":")[2]!),
+      ).pipe(Effect.option);
+      if (Option.isNone(namespace)) {
+        unresolved = true;
+        continue;
+      }
+      // New identities already include their caller; this lookup is only for legacy namespaces.
+      if (namespace.value.startsWith("thread:")) continue;
+      const ids = threadCreationIds(namespace.value, key, index);
+      if (ids.threadId !== trace.threadId || ids.commandId("create-thread") !== trace.commandId) {
+        unresolved = true;
+        continue;
+      }
+      const records = yield* threadManagement
+        .getThreadRecords(
+          trace.threadId,
+          ["messages"],
+          {
+            messageIds: [ids.messageId],
+            messageRoles: ["user"],
+            turnItemTypes: [],
+          },
+          { projectionOnly: true },
+        )
+        .pipe(Effect.mapError(threadManagementFailure));
+      const sender = records.messages.find(
+        (message) => message.id === ids.messageId,
+      )?.senderThreadId;
+      if (sender === scope.thread.threadId) owned.push(ids);
+      else if (sender === undefined) unresolved = true;
+    }
+    if (unresolved || owned.length > 1)
+      return yield* failure(
+        "ambiguous_replay",
+        "An earlier create_threads with this clientRequestId may have created a thread; check t3_thread_list. No new work was created.",
+      );
+    return owned[0];
+  });
+
   const loadProjectThread = (
     projectId: OrchestrationV2ThreadProjection["thread"]["projectId"],
     threadId: ThreadId,
@@ -3109,6 +3165,10 @@ const make = Effect.gen(function* () {
                   ids = legacy;
                   break;
                 }
+              }
+              if (!(yield* threadManagement.hasReceipt(ids.commandId("create-thread")))) {
+                ids =
+                  (yield* unrecordedCreation(scope, parent.thread.projectId, key, index)) ?? ids;
               }
               const commandId = ids.commandId("create-thread");
               const threadId = ids.threadId;
