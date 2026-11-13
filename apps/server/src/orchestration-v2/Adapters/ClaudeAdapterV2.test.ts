@@ -7113,6 +7113,85 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
+    it.effect.each(["query exit", "watchdog", "watchdog with unresponsive close"] as const)(
+      "%s settles an earlier run's native subagent and open call",
+      (mode) =>
+        Effect.gen(function* () {
+          const closed = yield* Deferred.make<void>();
+          const h = yield* start({
+            close: (q) =>
+              Deferred.succeed(closed, undefined).pipe(
+                Effect.andThen(
+                  mode === "watchdog with unresponsive close" ? Effect.never : Queue.shutdown(q),
+                ),
+              ),
+          });
+          const taskId = "old-run-task";
+          const toolUseId = "toolu-old-run-agent";
+          const bashToolUseId = "toolu-old-run-bash";
+          const bashStatuses = () =>
+            h.events.flatMap((event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.nativeItemRef?.nativeId === bashToolUseId
+                ? [event.turnItem.status]
+                : [],
+            );
+          yield* h.offerAndWait(
+            makeSubagentTaskStartedFrame({
+              taskId,
+              toolUseId,
+              uuid: "old-run-task-start",
+            }),
+          );
+          const started = yield* Queue.take(h.subagentReceipts);
+          assert.equal(started.subagent.status, "running");
+          for (const frame of makeSubagentAssistantFrames({
+            parentToolUseId: toolUseId,
+            uuid: "old-run-assistant",
+            bashToolUseId,
+          }))
+            yield* h.offerAndWait(frame);
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "old-run-complete", result: "Working in background." }),
+          );
+          const firstTerminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(firstTerminal.status, "completed");
+          assert.isTrue(yield* h.hasPendingBackgroundWork);
+          assert.deepEqual(bashStatuses(), ["running"]);
+
+          const next = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("next-run"),
+            providerTurnOrdinal: 2,
+            text: "Continue.",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(next);
+          yield* h.offerAndWait(compacting);
+          if (mode === "query exit") yield* Queue.shutdown(h.sdkMessages);
+          else yield* TestClock.adjust("5 minutes");
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (mode !== "query exit") yield* Deferred.await(closed);
+          else {
+            let ended = yield* Queue.take(h.subagentReceipts);
+            while (ended.subagent.status === "running")
+              ended = yield* Queue.take(h.subagentReceipts);
+          }
+          const latest = h.events.findLast((event) => event.type === "subagent.updated");
+          assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "failed");
+          assert.equal(
+            latest?.type === "subagent.updated" && latest.subagent.runId,
+            started.subagent.runId,
+          );
+          assert.deepEqual(bashStatuses(), ["running", "failed"]);
+          assert.isFalse(yield* h.hasPendingBackgroundWork);
+          assert.lengthOf(h.terminalEvents(), 2);
+        }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
     it.effect("fails stalled compaction after five minutes without SDK progress", () =>
       Effect.gen(function* () {
         const closed = yield* Deferred.make<void>();

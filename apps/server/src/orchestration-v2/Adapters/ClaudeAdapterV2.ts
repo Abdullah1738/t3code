@@ -7037,13 +7037,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const finalizeActiveTurnAfterQueryExit = Effect.fnUntraced(function* (
           closedQuery: ClaudeLiveQueryContext,
           cause?: Cause.Cause<ClaudeAgentSdkQueryRunnerError>,
+          failure?: OrchestrationV2ProviderFailure,
         ) {
           const current = yield* Ref.get(activeTurn);
           // A replacement query can reuse the native thread id; only this query's turn is ours.
           const context = closedQuery.lastTurn;
           if (context === null) return;
           const interrupted =
-            closedQuery.stopping || (yield* Ref.get(interruptedTurns)).has(context.providerTurnId);
+            failure === undefined &&
+            (closedQuery.stopping ||
+              (yield* Ref.get(interruptedTurns)).has(context.providerTurnId));
           // Finalization can yield to a replacement process; capture ownership and outcomes first.
           const subagents = yield* Ref.get(sessionSubagentsByTaskId);
           const buffered = (yield* Ref.get(wakeBuffers)).get(closedQuery.nativeThreadId)?.messages;
@@ -7055,10 +7058,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ...(interrupted
                 ? {}
                 : {
-                    failure: makeProviderFailure({
-                      cause: cause === undefined ? undefined : Cause.squash(cause),
-                      class: "transport_error",
-                    }),
+                    failure:
+                      failure ??
+                      makeProviderFailure({
+                        cause: cause === undefined ? undefined : Cause.squash(cause),
+                        class: "transport_error",
+                      }),
                   }),
             });
           } else if (
@@ -7542,17 +7547,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context.compactionWatchdogStop = null;
                     liveQuery.stopping = true;
                     yield* Ref.set(queryContext, null);
-                    yield* finalizeActiveTurn({
-                      context,
-                      status: "failed",
-                      completedAt: yield* DateTime.now,
-                      failure: makeProviderFailure({
+                    // This path owns disposal after fencing. Stream exit can no
+                    // longer settle native tasks left running by earlier turns.
+                    yield* finalizeActiveTurnAfterQueryExit(
+                      liveQuery,
+                      undefined,
+                      makeProviderFailure({
                         class: "provider_error",
                         category: "transient",
                         code: "compaction_no_progress",
                         message: "Claude compaction made no progress for 5 min.",
                       }),
-                    });
+                    );
+                    yield* endSubagentCallsOfClosedQuery(liveQuery.nativeThreadId, "failed");
                     yield* liveQuery.query.close.pipe(
                       Effect.timeout("10 seconds"),
                       Effect.ignore,
