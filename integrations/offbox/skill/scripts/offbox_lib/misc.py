@@ -723,8 +723,12 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
 
 def _catch_up_finished(con, run_id, budget: float = 10) -> None:
     """Best effort under the maintenance caller's box lock; history errors cannot undo settlement."""
+    from .runs import planned_steps
     try:
         r = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        # Step settlement fetched and validated its output before commit. Replacing it here could invalidate the exit.
+        if planned_steps(r):
+            return
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'

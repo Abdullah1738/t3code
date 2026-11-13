@@ -622,6 +622,59 @@ class WaitLockTests(Isolated):
                         self.assertNotIn('remote exit 0', err.getvalue())
                         self.assertNotIn('exit=0', out.getvalue())
 
+    def test_settlement_keeps_the_step_evidence_it_validated(self):
+        complete = 'offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
+        retry = ('\noffbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                 'it is queued again as attempt 2\noffbox step 1 rc=0: a\n')
+        cases = [(complete, 'done', 0), (complete.replace('step 2 rc=0', 'step 2 rc=7'), 'failed', 7),
+                 ('offbox step 1 rc=0: a\n', 'infra', None)]
+        log = common.LOGS_DIR / 'run-x.log'
+        self.box('bx_a', member=True)
+        for path in ('finish', 'reap', 'start-receipt', 'lost-reconcile', 'pool-reconcile'):
+            for initial, status, code in cases:
+                with self.subTest(path=path, status=status):
+                    self.con.execute("UPDATE runs SET status=?,exit_code=NULL,known_exit_code=NULL,step_count=2,"
+                                     "command_id='cmd-x',mode='bg' WHERE run_id='run-x'",
+                                     ('lost' if path in ('lost-reconcile', 'pool-reconcile') else 'running',))
+                    self.con.execute('DELETE FROM events')
+                    self.con.commit()
+                    log.write_text(initial)
+                    reads = []
+                    def catch_up(*args, **kw):
+                        # A later read would replace the evidence after its exit was already saved.
+                        log.write_text(initial if not reads else complete + retry)
+                        reads.append(None)
+                        return 'caught_up'
+                    err = io.StringIO()
+                    with patch.object(api, 'BACKEND', 'server'), \
+                            patch.object(misc, '_catch_up_log', side_effect=catch_up), \
+                            patch.object(api, 'cmd_status', return_value=dict(status='exited', running=False, exitCode=0)), \
+                            patch.object(runs, 'confirmed_lost', return_value=dict(status='exited', exitCode=0)), \
+                            patch.object(api, 'get', return_value=dict(state='running')), \
+                            contextlib.redirect_stderr(err):
+                        row = misc._run_row('run-x')
+                        if path == 'finish':
+                            runs.finish('run-x', 0, report=True)
+                        elif path == 'reap':
+                            reap._check_unlocked(self.con, 'bx_a', 'running', False, [])
+                        elif path == 'start-receipt':
+                            start_check.settle(self.con, row, start_check.Result('started', 0, 7), 'receipt')
+                        elif path == 'pool-reconcile':
+                            pool._refresh_background(self.con, 'repo')
+                        else:
+                            runs.reconcile_lost(self.con, 'bx_a')
+                    row = misc._run_row('run-x')
+                    self.assertEqual((row['status'], row['exit_code']), (status, code))
+                    self.assertEqual(log.read_text(), initial)
+                    self.assertEqual(runs.steps_exit(log, 2), code)
+                    event_kind = {'finish':'run_end', 'reap':'run_reaped', 'start-receipt':'start_settled',
+                                  'lost-reconcile':'run_reattached', 'pool-reconcile':'run_reattached'}[path]
+                    details = [r[0] for r in self.con.execute('SELECT detail FROM events WHERE kind=?', (event_kind,))]
+                    self.assertTrue(details)
+                    self.assertTrue(all(f'{status} exit={code}' in detail for detail in details))
+                    if code is None:
+                        self.assertIn('steps incomplete:', err.getvalue())
+
     def test_logs_follow_tails_the_holders_log(self):
         self.hold_box()
         log = common.LOGS_DIR / 'run-x.log'
