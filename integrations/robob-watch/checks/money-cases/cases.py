@@ -29,7 +29,8 @@ words already explain, wait for the receipt from a merchant he already pays, nev
                        run before asking him about a charge: exit 0 = ask now (counted), 3 = don't
   money-cases answered QID --note TEXT
   money-cases questions [--all] [--json]
-  money-cases unasked [--json | --ask]   daily first asks, screened before listing
+  money-cases migrate-legacy-asks [--dry-run]   mark pre-13 Nov 04:25Z cases already raised
+  money-cases unasked [--all] [--json | --ask]   daily first asks, screened before listing
 
 A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has one.
 An optional due date uses the same format; deadline remains the follow-up ping date.
@@ -1968,6 +1969,7 @@ def recover_case(data, q, cases=None):
             q['was_case'] = previous['id']
             settle(q, 'owner answered linked case ' + previous['id'], 'case_reply', answered_at(previous))
         elif active(previous) and q.get('status') in ('open', 'case', 'awaiting_answer') and question_in_cycle(q, previous) \
+                and any(not a.get('legacy') for a in previous.get('asks', [])) \
                 and len(previous.get('asks', [])) > len(q.get('asks', [])):
             q.update(status='awaiting_answer', asks=list(previous['asks']), closed=None)
         elif active(previous) and q.get('status') == 'open':
@@ -2176,8 +2178,10 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
             attach(q, chan, at)
         if q['status'] == 'closed':
             return DONT_ASK, f"{q['id']} is settled ({q['outcome']}). Don't ask."
-        if daily and (q.get('asks') or q.get('unverified') or
-                      (q.get('case') and not initial_question_needed(next(c for c in load(data)['cases'] if c['id'] == q['case'])))):
+        parent = next((c for c in load(data)['cases'] if c['id'] == q.get('case')), None) if daily else None
+        linked = [other for other in book['questions'] if parent and linked_case(other) == parent['id']
+                  and question_in_cycle(other, parent)]
+        if daily and (q.get('asks') or q.get('unverified') or (parent and daily_case_handled(parent, linked))):
             return DONT_ASK, f"{q['id']}: already handled; not in the daily list."
         if q['status'] == 'case' and not daily:
             return DONT_ASK, f"{q['id']} is money case {q['case']}; follow the case, don't ask about the charge."
@@ -2215,7 +2219,9 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
         if q.get('case'):
             with Locked(data, wait=lock_wait(deadline)) as cases:
                 parent = next(c for c in cases['cases'] if c['id'] == q['case'])
-                if not active(parent) or (daily and not initial_question_needed(parent)):
+                if not active(parent) or (daily and daily_case_handled(parent, [
+                        other for other in book['questions'] if linked_case(other) == parent['id']
+                        and question_in_cycle(other, parent)])):
                     return DONT_ASK, f"{q['id']}: linked case already handled."
                 parent.update(status='awaiting_answer', asks=asks + [entry])
                 parent['history'].append({'at': stamp(now), 'text': 'asked; awaiting_answer', 'automatic': True})
@@ -2362,38 +2368,170 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     return errors
 
 
-def unasked_candidates(data, now):
+LEGACY_ASK_CUTOFF = dt.datetime(2026, 11, 13, 4, 25, tzinfo=dt.timezone.utc)
+# These four were verified as already raised before the structured ask flow.
+LEGACY_RAISED_CASES = {'yalla-tph-mandate', 'logic-utilities-nov', 'charge-26dc3e4c',
+                       'refund-noon-fgb9nne277t50va'}
+
+
+def cycle_started(case):
+    starts = [moment(h.get('at')) for h in case.get('history', [])
+              if h.get('text', '').startswith(('reopened:', 'repeat bill:'))]
+    return max((t for t in starts if t), default=moment(case.get('opened')))
+
+
+def owner_answered(case):
+    started = cycle_started(case)
+    return any(h.get('owner') and moment(h.get('at')) and (not started or moment(h['at']) >= started)
+               and not h.get('text', '').startswith(('reopened:', 'repeat bill:'))
+               for h in case.get('history', []))
+
+
+def daily_case_handled(case, linked):
+    if not initial_question_needed(case):
+        return 'already asked or answered'
+    if owner_answered(case):
+        return 'owner answered'
+    if any(q.get('asks') or q.get('status') in ('closed', 'answered') for q in linked):
+        return 'linked question already asked or settled'
+    return ''
+
+
+def legacy_migration_reason(case, linked):
+    now = LEGACY_ASK_CUTOFF.astimezone(TZ)
+    if case['id'] in LEGACY_RAISED_CASES:
+        return 'verified pre-daily case already raised'
+    # Match the original daily list eligibility, before linked-answer and decline
+    # filtering. Unrelated disputes, holds and young charges were never in that list.
+    opened, wait = moment(case.get('opened')), moment(case.get('wait_until'))
+    if (case.get('kind') != 'charge' or case_owner(case) != 'abdullah' or not initial_question_needed(case)
+            or not opened or now - opened <= SOON or (wait and now < wait) or case.get('unverified')
+            or any(q.get('asks') or q.get('unverified') or q.get('explanation') or
+                   (moment(q.get('wait_until')) or now) > now for q in linked)):
+        return ''
+    return 'eligible for original daily list; pre-install cycle'
+
+
+def migrate_legacy_asks(data, dry_run=False):
+    """Seed asks without turning historical notifications into pending questions."""
+    def migrate(book):
+        changed = []
+        questions = load_questions(data)['questions']
+        for case in book['cases']:
+            started = cycle_started(case)
+            if (not active(case) or is_bill(case) or case.get('asks') or not started
+                    or started >= LEGACY_ASK_CUTOFF):
+                continue
+            linked = [q for q in questions if linked_case(q) == case['id'] and question_in_cycle(q, case)]
+            reason = legacy_migration_reason(case, linked)
+            if not reason:
+                continue
+            entry = {'at': case.get('updated') or case['opened'], 'question': 'legacy (pre-daily list)', 'legacy': True}
+            case['asks'] = [entry]
+            if (owner_answered(case) or any(q.get('status') in ('closed', 'answered') for q in linked)):
+                case['answered_cycle'] = case.get('cycle', 0)
+            changed.append(f"{case['id']} -> {case['status']} ({reason}; legacy ask at {entry['at']})")
+        return changed
+    if dry_run:
+        return migrate(load(data))
+    with Locked(data) as book:
+        return migrate(book)
+
+
+def daily_version(row):
+    # Screening timestamps must not re-arm a declined charge. Manual edits and new
+    # charge evidence do, even when an older writer did not bump rev or cycle.
+    return [row.get(k) for k in ('rev', 'cycle', 'charged', 'opened', 'at', 'amount',
+                                 'currency', 'merchant', 'card', 'reference', 'state')]
+
+
+def daily_skip_reason(row, now):
+    if row.get('daily_skip') and row.get('daily_skip_version') == daily_version(row):
+        until = moment(row.get('daily_skip_until'))
+        if not until or now < until:
+            return row['daily_skip']
+    return ''
+
+
+def daily_decline(row, linked):
+    if row['type'] == 'case' and not any(q.get('status') != 'closed' for q in linked):
+        if not re.fullmatch(r'\d{4}', row['card']):
+            return 'no unambiguous card last four'
+        if row.get('charged') != row['at'][:10]:
+            return 'charge date differs from case opening date'
+    return ''
+
+
+def mark_daily_skip(data, row, reason, now, end, wait_until=None):
+    kind = 'questions' if row['type'] == 'question' else 'cases'
+    try:
+        with within(end, CheckTimeout('skip recording out of time')):
+            with Locked(data, kind, wait=lock_wait(end)) as book:
+                current = (find_question if kind == 'questions' else find)(book, row['id'])
+                if daily_version(current) != row.get('_daily_version', daily_version(row)):
+                    return
+                current.update(daily_checked=stamp(now), daily_skip=clip(redact(reason), 200),
+                               daily_skip_version=daily_version(current))
+                current.pop('daily_skip_until', None)
+                if wait_until or current.get('wait_until'):
+                    current['daily_skip_until'] = wait_until or current['wait_until']
+    except CheckTimeout:
+        # An exhausted budget leaves the item available for another attempt.
+        pass
+
+
+def unasked_candidates(data, now, excluded=None, declined=None):
     """Read-only snapshots; linked cases and their questions count as one charge."""
     now = now.astimezone(TZ)
     cases = load(data)['cases']
     questions = load_questions(data)['questions']
     rows = []
+    def omit(row, reason):
+        if excluded is not None:
+            excluded.append(dict(row, skip=reason))
     for q in questions:
         recover_case(data, q, cases)
-        if (q.get('status') != 'open' or q.get('asks')
-                or q.get('unverified') or charges.card_owner(charge_of(q)) != 'abdullah'):
-            continue
+        reason = ('already asked or settled' if q.get('status') != 'open' or q.get('asks') else
+                  'source unreadable' if q.get('unverified') else
+                  'held for another owner' if charges.card_owner(charge_of(q)) != 'abdullah' else
+                  daily_skip_reason(q, now))
         observed, wait = moment(q.get('at')), moment(q.get('wait_until'))
-        if observed and now - observed > SOON and (not wait or now >= wait):
+        reason = reason or ('less than 24 h old or missing charge time' if not observed or now - observed <= SOON else
+                            'waiting for receipt' if wait and now < wait else '')
+        if reason:
+            omit(q, reason)
+        else:
             rows.append(dict(q, type='question'))
     represented = {linked_case(q) for q in rows}
     for c in cases:
-        if (not active(c) or c.get('kind') != 'charge' or not initial_question_needed(c)
-                or is_bill(c) or case_owner(c) != 'abdullah' or c['id'] in represented):
-            continue
-        opened, wait = moment(c.get('opened')), moment(c.get('wait_until'))
         linked = [q for q in questions if linked_case(q) == c['id'] and question_in_cycle(q, c)]
-        if c.get('unverified') or any(q.get('asks') or q.get('unverified') or q.get('explanation') or
-                                    (moment(q.get('wait_until')) or now) > now for q in linked):
+        reason = ('closed' if not active(c) else 'not a charge' if c.get('kind') != 'charge' else
+                  'bill uses deadline reminders' if is_bill(c) else daily_case_handled(c, linked) or
+                  ('held for another owner' if case_owner(c) != 'abdullah' else
+                   'represented by charge question' if c['id'] in represented else daily_skip_reason(c, now)))
+        opened, wait = moment(c.get('opened')), moment(c.get('wait_until'))
+        reason = reason or ('source unreadable' if c.get('unverified') or any(q.get('unverified') for q in linked) else
+                            'charge explained' if any(q.get('explanation') for q in linked) else
+                            'waiting for receipt' if (wait and now < wait) or any(
+                                (moment(q.get('wait_until')) or now) > now for q in linked) else
+                            'less than 24 h old or missing opening time' if not opened or now - opened <= SOON else '')
+        if reason:
+            omit(c, reason)
             continue
-        if opened and now - opened > SOON and (not wait or now >= wait):
-            cards = {m[1] or m[2] for m in re.finditer(
-                r'\bending(?: in)?\s+(\d{4})(?!\d)|[•*]{2,4}\s*(\d{4})(?!\d)',
-                c.get('reference', '') + ' ' + c.get('state', ''), re.I)}
-            card = c.get('card') or (next(iter(cards)) if len(cards) == 1 else '')
-            if charges.card_owner({'card': card}) == 'abdullah':
-                rows.append(dict(c, type='case', at=c['opened'], card=card,
-                                 daily_checked=max((q.get('daily_checked') or '' for q in linked), default='')))
+        cards = {m[1] or m[2] for m in re.finditer(
+            r'\bending(?: in)?\s+(\d{4})(?!\d)|[•*]{2,4}\s*(\d{4})(?!\d)',
+            c.get('reference', '') + ' ' + c.get('state', ''), re.I)}
+        card = c.get('card') or (next(iter(cards)) if len(cards) == 1 else '')
+        row = dict(c, type='case', at=c['opened'], card=card, _daily_version=daily_version(c),
+                   daily_checked=max([c.get('daily_checked') or ''] + [q.get('daily_checked') or '' for q in linked]))
+        reason = ('held for another owner' if charges.card_owner({'card': card}) != 'abdullah' else
+                  daily_decline(row, linked))
+        if reason:
+            omit(row, reason)
+            if declined is not None:
+                declined.append((row, reason))
+        else:
+            rows.append(row)
     return sorted(rows, key=lambda row: (parse_time(row['at']), row['id']))
 
 
@@ -2404,7 +2542,8 @@ def daily_question(data, row, now, end):
             q = find_question(book, row['id'])
         else:
             case = find(load(data), row['id'])
-            if not active(case) or not initial_question_needed(case):
+            linked = [q for q in book['questions'] if linked_case(q) == case['id'] and question_in_cycle(q, case)]
+            if not active(case) or daily_case_handled(case, linked):
                 return None
             for linked in book['questions']:
                 if linked_case(linked) == case['id']:
@@ -2435,7 +2574,12 @@ def unasked(data, now=None, find=None, said=None, budget=40):
     end = time.time() + budget
     run_id = '.'.join(os.urandom(4).hex() for _ in range(3))
     listed, explained, open_parents = [], [], []
-    candidates = unasked_candidates(data, now)
+    declined = []
+    candidates = unasked_candidates(data, now, declined=declined)
+    for row, reason in declined:
+        if end - time.time() < 2:
+            break
+        mark_daily_skip(data, row, reason, now, end)
     for row in sorted(candidates, key=lambda r: (r.get('daily_checked') or '', parse_time(r['at']), r['id'])):
         if end - time.time() < 2:
             break
@@ -2445,8 +2589,9 @@ def unasked(data, now=None, find=None, said=None, budget=40):
             with within(each, LookupTimeout('out of time')):
                 qid = daily_question(data, row, now, each)
                 if not qid:
+                    mark_daily_skip(data, row, 'daily question declined', now, each)
                     continue
-                rc, _ = ask(data, f'daily list {now.date()}', qid=qid, now=now,
+                rc, refusal = ask(data, f'daily list {now.date()}', qid=qid, now=now,
                             deadline=each, find=find, said=said, daily=True, daily_run=run_id)
             q = find_question(load_questions(data), qid)
         except (LookupTimeout, CheckTimeout, charges.Lookup):
@@ -2461,7 +2606,9 @@ def unasked(data, now=None, find=None, said=None, budget=40):
             rc = 0
         if rc == 0:
             listed.append((parse_time(row['at']), row['id'], unasked_line(dict(q, id=row['id']))))
-        elif q['status'] == 'closed' and q.get('explanation'):
+        elif rc != 4:
+            mark_daily_skip(data, row, refusal, now, each, q.get('wait_until'))
+        if rc != 0 and q['status'] == 'closed' and q.get('explanation'):
             line = f"{row['id']} {clip(row['merchant'], 80)} ({q['why']})"
             if q.get('case') and not q.get('case_closed'):
                 open_parents.append(line)
@@ -2898,7 +3045,10 @@ def main(argv=None):
     p = sub.add_parser('questions')
     p.add_argument('--all', action='store_true')
     p.add_argument('--json', action='store_true')
+    p = sub.add_parser('migrate-legacy-asks')
+    p.add_argument('--dry-run', action='store_true')
     p = sub.add_parser('unasked')
+    p.add_argument('--all', action='store_true', help='include excluded items and their reasons (read-only)')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--json', action='store_true')
     mode.add_argument('--ask', action='store_true')
@@ -2907,13 +3057,26 @@ def main(argv=None):
         if args.command == 'note-purchase':
             entry = note_purchase(DATA, args.merchant, args.amount, args.currency, args.card, args.asked_by, args.thread, args.invoice)
             print(json.dumps(entry, ensure_ascii=False))
+        elif args.command == 'migrate-legacy-asks':
+            rows = migrate_legacy_asks(DATA, args.dry_run)
+            print(('Would migrate' if args.dry_run else 'Migrated') + f' {len(rows)} legacy asks.')
+            for row in rows:
+                print(row)
         elif args.command == 'unasked':
+            if args.ask and args.all:
+                raise CaseError('--all is read-only; use it without --ask')
             if args.ask:
                 print(unasked(DATA))
             else:
-                rows = unasked_candidates(DATA, now_dubai())
+                excluded = [] if args.all else None
+                rows = unasked_candidates(DATA, now_dubai(), excluded=excluded)
+                if args.all and args.json:
+                    rows += excluded
                 print(json.dumps(redact_all(rows), ensure_ascii=False, indent=1) if args.json else
                       '\n'.join(unasked_line(row) for row in rows) or 'No unasked charges.')
+                if args.all and not args.json:
+                    for row in excluded:
+                        print(redact(f"{row['id']}: skipped ({row['skip']})"))
         elif args.command == 'charge':
             charge = charges.parse(args.alert, args.sender)
             if not charge:

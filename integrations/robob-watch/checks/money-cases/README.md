@@ -148,6 +148,10 @@ Use `--asked-by moni` for her purchases. This records the request, not a payment
 
 ## Daily unasked list
 
-The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
+The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; add `--all` to see excluded items and their reasons; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
 
 The command screens receipts, orders, purchase notes and subscriptions before listing each charge, oldest first, then summarizes explanations it settled. Listed charges become `awaiting_answer`; reruns cannot list them again. Moni's charges stay held. Failed screens rotate behind untouched items so later charges get checked. Unreadable or unscreened items stay for a later run: the command has a 40-second total budget and a 6-second limit per item. Cases without a known card or charge time stay held for inspection. Quiet hours, overdue bills and payment deadlines keep their existing behavior.
+
+After installing this fix, run `money-cases migrate-legacy-asks --dry-run`, review the list, then run `money-cases migrate-legacy-asks` once. It seeds the existing ask marker on open non-bill cases from the original daily list whose current cycle started before 13 Nov 2026 04:25Z, plus four verified legacy cases. Age and receipt-wait eligibility are frozen at that cutoff. It preserves their status; historical notifications do not become pending questions. Repeating it makes no further changes. Existing asks and answered state prevent another daily first ask, including linked questions and structured owner answers.
+
+Declined daily items retain a reason until their revision, cycle or charge evidence changes. Receipt waits resume at their expiry; timeouts and unreadable lookups can be retried. Cases without usable card evidence or a matching charge date are excluded from the daily count.

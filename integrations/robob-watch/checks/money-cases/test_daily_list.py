@@ -1,6 +1,7 @@
 """Daily first asks share the receipt gate and retain durable answer state."""
 import io
 import json
+from pathlib import Path
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -228,7 +229,7 @@ class DailyList(Base):
                 self.data = self.tmp / reference.replace('/', '-')
                 self.case('charge', reference=reference, when=at('2026-11-10T09:00'), deadline='2026-12-01')
                 rows = mc.unasked_candidates(self.data, at('2026-11-11T10:00'))
-                self.assertEqual(rows[0]['card'], card)
+                self.assertEqual([r['card'] for r in rows], [card] if card else [])
                 text = self.ask_list()
                 self.assertEqual('charge:' in text, bool(card))
 
@@ -350,3 +351,194 @@ class DailyList(Base):
         self.assertIn(qid+':', text)
         self.assertNotIn(qid+':', self.ask_list())
         self.assertEqual(len(mc.find_question(mc.load_questions(self.data), qid)['asks']), 1)
+
+    def legacy_fixture(self):
+        fixture = json.loads(Path(__file__).with_name('daily_legacy.fixture.json').read_text())
+        for kind in ('cases', 'questions'):
+            mc.write_json(self.data / (kind + '.json'), {'version': 1, kind: fixture[kind]})
+        return fixture
+
+    def test_live_legacy_migration_dry_run_idempotence_and_new_charge(self):
+        fixture = self.legacy_fixture()
+        paths = [self.data / (kind + '.json') for kind in ('cases', 'questions')]
+        before = [p.read_bytes() for p in paths]
+        dry = self.cli('migrate-legacy-asks', '--dry-run')
+        self.assertIn('Would migrate 4 legacy asks.', dry)
+        for case in fixture['cases']:
+            self.assertIn(case['id'], dry)
+        self.assertEqual(before, [p.read_bytes() for p in paths])
+        self.assertIn('Migrated 4 legacy asks.', self.cli('migrate-legacy-asks'))
+        migrated = [p.read_bytes() for p in paths]
+        self.assertEqual(mc.unasked_candidates(self.data, at('2026-11-14T10:00')), [])
+        self.assertIn('Migrated 0 legacy asks.', self.cli('migrate-legacy-asks'))
+        self.assertEqual(migrated, [p.read_bytes() for p in paths])
+        for case in mc.load(self.data)['cases']:
+            self.assertEqual(len(case['asks']), 1)
+            self.assertEqual(case['asks'][0]['question'], 'legacy (pre-daily list)')
+        # Justlife's linked answer remains answered rather than becoming pending.
+        justlife = mc.find(mc.load(self.data), 'charge-26dc3e4c')
+        self.assertEqual(justlife['answered_cycle'], justlife['cycle'])
+        self.assertEqual(justlife['status'], 'open')
+        mc.update(self.data, 'yalla-tph-mandate', {}, reply='owner:keep', at=at('2026-11-14T11:00'))
+        self.assertEqual(mc.find(mc.load(self.data), 'yalla-tph-mandate')['status'], 'open')
+        self.assertEqual(self.fire('2026-11-14T10:00'), '')
+        new = self.seed('19.32', '2026-11-13T10:00')
+        self.assertEqual([r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-14T10:01'))], [new])
+        self.assertIn(new + ':', self.ask_list('2026-11-14T10:01'))
+
+    def test_migration_scope_cutoff_bills_existing_asks_and_new_cycles(self):
+        for name, when, extra in [('old', '2026-11-11T08:24', {}),
+                                 ('cutoff', '2026-11-13T08:25', {}),
+                                 ('new', '2026-11-13T09:00', {}),
+                                 ('bill', '2026-11-10T10:00', {'merchant': 'Card bill'}),
+                                 ('closed', '2026-11-10T10:00', {}),
+                                 ('asked', '2026-11-10T10:00', {}),
+                                 ('reopened', '2026-11-10T10:00', {})]:
+            self.case(name, when=at(when), distinct=True, **extra)
+        mc.close(self.data, 'closed', 'settled', at=at('2026-11-11T10:00'))
+        mc.close(self.data, 'reopened', 'settled', at=at('2026-11-11T10:00'))
+        mc.reopen(self.data, 'reopened', '2026-12-01', 'new charge', at=at('2026-11-13T10:00'))
+        with mc.Locked(self.data) as book:
+            mc.find(book, 'asked')['asks'] = [{'at': '2026-11-11T10:00+04:00', 'question': 'already asked'}]
+        self.assertEqual([line.split(' ->')[0] for line in mc.migrate_legacy_asks(self.data)], ['old'])
+
+    def test_linked_answer_or_structured_history_excludes_case_without_migration(self):
+        for shape in ('linked-closed', 'linked-asked', 'linked-answered', 'owner-history'):
+            with self.subTest(shape=shape):
+                self.data = self.tmp / shape
+                self.case('charge', reference='card ending 1111', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+                if shape == 'owner-history':
+                    with mc.Locked(self.data) as book:
+                        book['cases'][0]['history'].append(dict(at='2026-11-10T10:00+04:00', text='his answer', owner=True))
+                else:
+                    qid = self.seed()
+                    with mc.Locked(self.data, 'questions') as book:
+                        q = mc.find_question(book, qid)
+                        q.update(case='charge', status=shape.split('-')[1])
+                        if shape == 'linked-asked':
+                            q.update(status='case', asks=[dict(at='2026-11-10T10:00+04:00')])
+                self.assertEqual(mc.unasked_candidates(self.data, at('2026-11-11T10:00')), [])
+                self.assertNotIn('charge:', self.ask_list())
+
+    def test_static_declines_are_not_counted_and_are_recorded_by_ask(self):
+        for shape, ref, charged, reason in [('card', 'invoice 2026', '2026-11-10', 'card last four'),
+                                           ('date', 'card ending 1111', '2026-11-09', 'charge date')]:
+            with self.subTest(shape=shape):
+                self.data = self.tmp / shape
+                self.case('declined', reference=ref, charged=charged, when=at('2026-11-10T09:00'), deadline='2026-12-01')
+                self.assertEqual(mc.unasked_candidates(self.data, at('2026-11-11T10:00')), [])
+                self.assertNotIn('unasked charges', self.fire())
+                self.assertNotIn('declined:', self.ask_list())
+                c = mc.find(mc.load(self.data), 'declined')
+                self.assertIn(reason, c['daily_skip'])
+                self.assertTrue(c['daily_checked'])
+                self.assertNotIn('unasked charges', self.fire('2026-11-12T10:00'))
+                with patch.object(mc, 'now_dubai', return_value=at('2026-11-12T10:00')):
+                    self.assertNotIn('declined:', self.cli('unasked'))
+                    self.assertIn(reason, self.cli('unasked', '--all'))
+
+    def test_runtime_decline_rearms_on_each_new_charge_or_revision_shape(self):
+        # Version field | new value: every supported way to re-arm a declined row.
+        for field, value in [('rev', 1), ('cycle', 1), ('amount', '121'), ('charged', '2026-11-11')]:
+            with self.subTest(field=field):
+                self.data = self.tmp / field
+                self.case('declined', reference='card ending 1111', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+                with patch.object(mc, 'daily_question', return_value=None):
+                    self.assertNotIn('declined:', self.ask_list())
+                self.assertEqual(mc.unasked_candidates(self.data, at('2026-11-12T10:00')), [])
+                self.assertNotIn('unasked charges', self.fire('2026-11-12T10:00'))
+                with mc.Locked(self.data) as book:
+                    book['cases'][0][field] = value
+                # A new charge day also needs a matching opening timestamp to be screenable.
+                if field == 'charged':
+                    with mc.Locked(self.data) as book:
+                        book['cases'][0]['opened'] = '2026-11-11T09:00+04:00'
+                self.assertEqual([r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-12T10:00'))], ['declined'])
+
+    def test_ask_refusal_stops_counting_questions_and_cases_but_unreadable_retries(self):
+        for shape in ('question', 'case'):
+            for rc in (mc.DONT_ASK, 4):
+                with self.subTest(shape=shape, rc=rc):
+                    self.data = self.tmp / (shape + str(rc))
+                    if shape == 'question':
+                        ident = self.seed()
+                    else:
+                        ident = 'declined'
+                        self.case(ident, reference='card ending 1111', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+                    with patch.object(mc, 'ask', return_value=(rc, 'cannot ask this charge')):
+                        self.assertNotIn(ident + ':', self.ask_list())
+                    ids = [r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-12T10:00'))]
+                    self.assertEqual(ids, [ident] if rc == 4 else [])
+
+    def test_declined_receipt_wait_becomes_candidate_when_wait_expires(self):
+        for shape in ('question', 'case'):
+            with self.subTest(shape=shape):
+                self.data = self.tmp / shape
+                if shape == 'question':
+                    ident = self.seed()
+                else:
+                    ident = 'waiting'
+                    self.case(ident, reference='card ending 1111', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+                with patch.object(mc, 'explain_charge', return_value=dict(verdict='wait', why='wait for receipt', errors=[],
+                                                                        until='2026-11-11T11:00+04:00')):
+                    self.ask_list()
+                self.assertEqual(mc.unasked_candidates(self.data, at('2026-11-11T10:30')), [])
+                self.assertEqual([r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-11T11:01'))], [ident])
+
+    def test_skip_recording_timeout_keeps_previously_committed_lines(self):
+        first, last = self.seed('11'), self.seed('22')
+        clock = [1000.0]
+        ask = mc.ask
+        def delayed_refusal(data, question, **kw):
+            if kw['qid'] == last:
+                clock[0] += 41
+                return mc.DONT_ASK, 'declined after lookup'
+            return ask(data, question, **kw)
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc, 'ask', delayed_refusal):
+            text = self.ask_list()
+        self.assertIn(first + ':', text)
+        self.assertNotIn(last + ':', text)
+        self.assertIn(last, [r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-12T10:00'))])
+
+    def test_legacy_seed_keeps_pending_false_and_new_question_can_be_asked(self):
+        self.legacy_fixture()
+        mc.migrate_legacy_asks(self.data)
+        event = self.fire('2026-11-14T10:00')
+        self.assertNotIn('awaiting answer', event)
+        cases = mc.load(self.data)['cases']
+        self.assertTrue(all(c['status'] == 'open' for c in cases))
+        self.assertFalse(any(mc.active(c) and c['status'] == 'awaiting_answer' for c in cases))
+        self.assertFalse(any(q.get('asks') and mc.active(q) for q in mc.load_questions(self.data)['questions']))
+        self.assertNotIn('awaiting answer', mc.brief(mc.visible_cases(self.data), at('2026-11-14T10:00')))
+        fresh = self.seed('19.32', '2026-11-13T10:00')
+        self.assertIn('1 unasked charges', self.fire('2026-11-14T10:01'))
+        self.assertIn(fresh + ':', self.ask_list('2026-11-14T10:01'))
+
+    def test_migration_leaves_non_candidates_untouched(self):
+        self.case('dispute', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+        self.case('hold', kind='hold', when=at('2026-11-10T09:00'), deadline='2026-12-01', distinct=True)
+        self.case('young', when=at('2026-11-13T05:11'), deadline='2026-12-01', distinct=True)
+        with mc.Locked(self.data) as book:
+            mc.find(book, 'dispute').pop('kind')
+        before = (self.data / 'cases.json').read_bytes()
+        self.assertEqual(mc.migrate_legacy_asks(self.data), [])
+        self.assertEqual(before, (self.data / 'cases.json').read_bytes())
+
+    def test_migration_eligibility_never_ages_into_legacy_on_later_runs(self):
+        # Cutoff exclusion | source of time eligibility that must remain frozen.
+        for shape in ('young', 'case-wait', 'linked-wait'):
+            with self.subTest(shape=shape):
+                self.data = self.tmp / shape
+                opened = '2026-11-13T05:11' if shape == 'young' else '2026-11-11T09:00'
+                self.case('never-asked', reference='card ending 1111', when=at(opened), deadline='2026-12-01')
+                if shape == 'case-wait':
+                    with mc.Locked(self.data) as book:
+                        book['cases'][0]['wait_until'] = '2026-11-13T09:00+04:00'
+                if shape == 'linked-wait':
+                    qid = self.seed(when='2026-11-11T09:00')
+                    with mc.Locked(self.data, 'questions') as book:
+                        mc.find_question(book, qid).update(case='never-asked', wait_until='2026-11-13T09:00+04:00')
+                for day in ('2026-11-13T16:00', '2026-11-14T10:00', '2026-12-14T10:00'):
+                    with patch.object(mc, 'now_dubai', return_value=at(day)):
+                        self.assertEqual(mc.migrate_legacy_asks(self.data), [])
+                self.assertEqual([r['id'] for r in mc.unasked_candidates(self.data, at('2026-11-14T10:00'))], ['never-asked'])

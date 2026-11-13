@@ -169,7 +169,7 @@ class Unanswered(Base):
         self.assertEqual(len(mc.find_question(mc.load_questions(self.data), second)['asks']), 1)
 
     def test_explicit_never_asked_charge_case_joins_daily_list(self):
-        self.case('charge', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+        self.case('charge', when=at('2026-11-10T09:00'), deadline='2026-12-01', reference='card ending 1111')
         self.assertIn('unasked charges', self.fire())
         self.assertEqual(self.fire(n=1), '')
 
