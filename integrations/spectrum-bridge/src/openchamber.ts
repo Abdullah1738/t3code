@@ -34,17 +34,25 @@ const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEG
 const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
 export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
 
-/** Native OpenCode reports also reach Robob as provider-created user messages. */
-export function subagentNoticeState(text: string): string | undefined {
-  const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>[\s\S]*<\/subagent>$/.exec(text.trim())?.[1];
-  if (!header) return;
-  const states = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
-  return states.length === 1 ? states[0]![2] : undefined;
+/** The provider joins delivered native reports with blank lines in one continuation. */
+export function subagentNoticeStates(text: string): string[] {
+  const source = text.trim();
+  const reports = /<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>[\s\S]*?<\/subagent>/g;
+  const states: string[] = [];
+  let end = 0;
+  for (const report of source.matchAll(reports)) {
+    if (source.slice(end, report.index).trim()) return [];
+    const attributes = [...report[1]!.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
+    if (attributes.length !== 1) return [];
+    states.push(attributes[0]![2]!);
+    end = report.index + report[0].length;
+  }
+  return source.slice(end).trim() ? [] : states;
 }
 
 export const isCompletionNoticeText = (text: string): boolean => isDelegatedCompletionText(text)
   // OpenCode calls a failed native report "error" (reportOutcome in its provider adapter).
-  || ["completed", "failed", "error", "cancelled"].includes(subagentNoticeState(text) ?? "");
+  || subagentNoticeStates(text).some(state => ["completed", "failed", "error", "cancelled"].includes(state));
 
 export type MessageRecord =
   | { id: string; type: "user"; text: string; time: { created: number }; createdBy?: string; [key: string]: unknown }

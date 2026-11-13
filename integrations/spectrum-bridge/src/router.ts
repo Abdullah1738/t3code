@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, subagentNoticeStates, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -480,16 +480,25 @@ export function quietMessages(records: readonly MessageRecord[]): Set<string> {
 /** Native reports can be synthetic in OpenCode or provider-created user messages in Robob. */
 function backgroundNotice(record: MessageRecord): boolean {
   return (record.type === "user" || record.type === "synthetic") && record.createdBy !== "user"
-    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeState(record.text) !== undefined);
+    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeStates(record.text).length > 0);
 }
 
 function backgroundCompletion(record: MessageRecord): boolean {
   return backgroundNotice(record) && typeof record.text === "string" && isCompletionNoticeText(record.text);
 }
 
-function suppressesBackgroundReply(record: MessageRecord): boolean {
-  return !backgroundCompletion(record) && (record.type === "user"
-    || record.type === "synthetic" && typeof record.text === "string" && subagentNoticeState(record.text) !== undefined);
+function ownerPrompt(record: MessageRecord): boolean {
+  return record.type === "user" && !backgroundNotice(record);
+}
+
+/** A progress prompt only silences its own steps, until the next prompt or idle. */
+function withoutProgressReplies(records: MessageRecord[]): MessageRecord[] {
+  let progress = false;
+  return records.filter(record => {
+    if (backgroundNotice(record)) progress = !backgroundCompletion(record);
+    else if (record.type === "user" || record.type === "idle") progress = false;
+    return record.type !== "assistant" || !progress;
+  });
 }
 
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
@@ -3716,8 +3725,8 @@ export class Router {
     let settled: string | undefined;
     for (const record of records) {
       if (record.type !== "idle") { scope.push(record); continue; }
-      if (!scope.some(backgroundCompletion) || scope.some(suppressesBackgroundReply)) { scope = []; continue; }
-      const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+      if (!scope.some(backgroundCompletion) || scope.some(ownerPrompt)) { scope = []; continue; }
+      const steps = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = steps.at(-1);
       if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
         if (final && (final.time.completed === undefined || final.finish === "tool-calls")) break;
@@ -3729,9 +3738,9 @@ export class Router {
     }
     // mode:auto can steer the wake into the notice's run. Its completed answer
     // still belongs to the notice, even though the shared idle will follow the wake.
-    if (scope.some(backgroundCompletion) && !scope.some(suppressesBackgroundReply)) {
+    if (scope.some(backgroundCompletion) && !scope.some(ownerPrompt)) {
       const quiet = quietMessages(scope);
-      const answered = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
+      const answered = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
         && m.answer === true && m.time.completed !== undefined && !m.error && !m.continued && m.finish !== "tool-calls" && !quiet.has(m.id));
       replies.push(...answered);
       settled = answered.at(-1)?.id ?? settled;
@@ -3868,7 +3877,7 @@ export class Router {
       // but reply ownership starts at the earliest accepted prompt this turn tracks.
       const start = messages.findIndex(m => m.type === "user" && ownedPrompts.has(m.id)
         || turn!.background && m.id === turn!.messageId);
-      const after = start < 0 ? [] : messages.slice(start + 1);
+      const after = start < 0 ? [] : withoutProgressReplies(messages.slice(start + 1));
       if (!turn.background && mark?.sessionId === turn.id) {
         const markIndex = messages.findIndex(m => m.id === mark.id);
         if (markIndex >= 0 && start > markIndex) this.settlePrecedingCompletions(turn, messages.slice(markIndex + 1, start));
@@ -3896,8 +3905,8 @@ export class Router {
       const scope = end < 0 ? after : after.slice(0, end);
       const quiet = quietMessages(scope);
       // watch() can begin following a busy run before its prompt is visible.
-      // Apply the same ownership/progress boundary once that prompt arrives.
-      if (turn.background && idle && scope.some(suppressesBackgroundReply)) {
+      // Apply the same owner boundary once that prompt arrives.
+      if (turn.background && idle && scope.some(ownerPrompt)) {
         this.enqueueReply(turn, idle, replies, [], undefined, "", scope, entries);
         return;
       }
@@ -4237,12 +4246,7 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
-      if (after.some(suppressesBackgroundReply)) {
-        // Progress and completion runs can arrive between the same two polls.
-        // Keep the completed results without forwarding the progress replies.
-        if (after.some(backgroundNotice) && !after.some(record => record.type === "user" && !backgroundNotice(record))) {
-          this.settlePrecedingCompletions({ ...route, messageId: mark.id, startedAt: now, phase: "running", background: true }, after);
-        }
+      if (after.some(ownerPrompt)) {
         // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");
         if (idle && statuses[route.id] === undefined) this.store.set("watermark", { sessionId: route.id, id: idle.id } satisfies Watermark);

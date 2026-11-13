@@ -1,5 +1,5 @@
 import { toolError } from "./toollog.ts";
-import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeStates, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -80,7 +80,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
-        const notice = isCompletionNoticeText(message.text) || subagentNoticeState(message.text) !== undefined;
+        const notice = isCompletionNoticeText(message.text) || subagentNoticeStates(message.text).length > 0;
         if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !notice) continue;
         records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created },
           ...(notice && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });

@@ -4830,6 +4830,52 @@ test.each(nativeBackends.flatMap(backend => ["before", "after", "both"].map(prog
   expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
 });
 
+const nativeReportBatches = nativeBackends.flatMap(backend => ["idle", "observed", "sealed"].map(timing => ({ backend, timing })));
+test.each(nativeReportBatches.flatMap(row => [false, true].map(reverse => ({ ...row, reverse }))))("native same-execution reports preserve terminal replies ($backend $timing reverse=$reverse)", async ({ backend, timing, reverse }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    for (const state of reverse ? ["completed", "running"] : ["running", "completed"]) {
+      nativeNoticeReply(h, backend, state, state === "running" ? "Still checking" : "Nothing to cancel");
+      h.backend.records.pop();
+    }
+    h.backend.settle();
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Nothing to cancel"]);
+});
+
+test.each(nativeReportBatches.flatMap(row => ["running-completed", "completed-running", "running-running", "error-cancelled"].map(states => ({ ...row, states }))))("joined native reports inspect every wrapper ($backend $timing $states)", async ({ backend, timing, states }) => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "native-first", "Check a cancellation", "On it");
+  if (timing === "observed") { h.backend.states.ses_1 = { type: "busy" }; await h.router.tick(); }
+  const insert = () => {
+    const before = h.backend.records.length;
+    nativeNoticeReply(h, backend);
+    const notice = h.backend.records[before]!;
+    notice.text = states.split("-").map(state => robobSubagentNotice.text.replace('state="completed"', `state="${state}"`)).join("\n\n");
+  };
+  if (timing === "sealed") {
+    h.backend.promptBehavior = async call => { insert(); h.backend.accept(call); };
+    h.input("wake:native-batch", "Another update");
+    await h.router.tick();
+    h.backend.final("NO_REPLY");
+  } else insert();
+  delete h.backend.states.ses_1;
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(states === "running-running" ? [] : ["Nothing to cancel"]);
+});
+
 test.each(nativeBackends.flatMap(backend => ["idle", "steer", "rejected"].map(boundary => ({ backend, boundary }))))("native subagent completion racing a sealed wake forwards once ($backend $boundary)", async ({ backend, boundary }) => {
   const start = 10_000;
   setSystemTime(start);
