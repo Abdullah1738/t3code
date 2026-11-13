@@ -133,19 +133,31 @@ const approvesGate = (
   );
 };
 
+const optionScopeIds = (
+  card: Pick<KanbanCard, "subtasks">,
+  option: Pick<KanbanAskOption, "label" | "approves">,
+): ReadonlyArray<string> | undefined => {
+  if (option.approves !== undefined) return option.approves;
+  if (!/^(?:yes|ok|approve|approved|go\s+ahead)\b/i.test(option.label.trim())) return undefined;
+  const ids = option.label.match(/\bs\d+\b/g);
+  if (!ids) return undefined;
+  return ids.filter((id) => card.subtasks.some((subtask) => subtask.id === id));
+};
+
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
   if (option.approves !== undefined) return option.approves;
+  // Label shorthand accepts a direct id list, never additional clauses or qualifications.
   if (
     isNegativeOption(option.label) ||
-    !/^(?:yes|ok|approve|approved|go\s+ahead)\b/i.test(option.label.trim())
+    !/^(?:yes|ok|approve|approved|go\s+ahead)\b[\s,.:;–—-]+(?:(?:tick|clear|do|approve)\s+)?s\d+(?:(?:\s*[,;/&+]\s*(?:and\s+)?|\s+(?:and\s+)?)s\d+)*(?:\s+now)?[.!]*$/i.test(
+      option.label.trim(),
+    )
   )
     return undefined;
-  const ids = option.label.match(/\bs\d+\b/g);
-  if (!ids) return undefined;
-  return ids.filter((id) => card.subtasks.some((subtask) => subtask.id === id));
+  return optionScopeIds(card, option);
 };
 
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
@@ -165,12 +177,17 @@ export const approvalProblem = (
         if (ask.draft) return false;
       }
       // Explicit scopes replace wording matching for the entire ask, including other options.
-      if (ask.options?.some((option) => optionApprovalIds(card, option) !== undefined)) {
-        const options =
-          answer.verdict === "picked"
-            ? ask.options.filter((option) => answer.optionIds?.includes(option.id))
-            : ask.options;
-        return options.some((option) => optionApprovalIds(card, option)?.includes(subtask.id));
+      if (ask.options?.some((option) => optionScopeIds(card, option) !== undefined)) {
+        const selected =
+          (answer.verdict === "picked" || answer.verdict === "approved") &&
+          answer.optionIds?.length === 1
+            ? ask.options.find((option) => option.id === answer.optionIds?.[0])
+            : undefined;
+        const selectedIds = selected ? optionScopeIds(card, selected) : undefined;
+        // A refusal concerns the whole ask; a scoped go choice concerns only its own ids.
+        return selectedIds !== undefined
+          ? selectedIds.includes(subtask.id)
+          : ask.options.some((option) => optionScopeIds(card, option)?.includes(subtask.id));
       }
       const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
       const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
@@ -188,9 +205,9 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
-  const scoped = latest?.options?.some((option) => optionApprovalIds(card, option) !== undefined);
+  const scoped = latest?.options?.some((option) => optionScopeIds(card, option) !== undefined);
   const explicitlyApproved =
-    answer?.verdict === "picked" &&
+    (answer?.verdict === "picked" || answer?.verdict === "approved") &&
     answer.optionIds?.length === 1 &&
     latest?.options?.some(
       (option) =>
@@ -199,8 +216,8 @@ export const approvalProblem = (
     );
   const approved = scoped
     ? explicitlyApproved
-    : answer?.verdict === "approved" ||
-      (answer?.verdict === "picked" &&
+    : (answer?.verdict === "approved" && !answer.optionIds?.length) ||
+      ((answer?.verdict === "picked" || answer?.verdict === "approved") &&
         Boolean(answer.optionIds?.length) &&
         answer.optionIds!.every((id) => {
           const option = latest?.options?.find((entry) => entry.id === id);
@@ -217,6 +234,8 @@ export const approvalProblem = (
       .map((id) => latest.options?.find((option) => option.id === id)?.label ?? id)
       .join(", ");
     reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
+  } else if (scoped && answer.verdict === "approved") {
+    reason = `the latest decision, ${latest.id}, approved without one scoped go option; pick exactly one option naming ${subtask.id} or carrying approves: [${subtask.id}]`;
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
   }

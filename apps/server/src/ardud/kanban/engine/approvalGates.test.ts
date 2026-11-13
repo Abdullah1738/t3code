@@ -1178,3 +1178,288 @@ it("an approves field stays authoritative when a consent label names different i
   assert.isNotNull(approvalProblem(card, s4));
   assert.isNull(approvalProblem(card, s5));
 });
+
+it.each(["Drop", "Wait"])(
+  "review regression: a newer %s pick supersedes an earlier approval",
+  (label) => {
+    const s4 = gatedStep("s4");
+    const earlier = {
+      ...pickedAsk("Install s4?"),
+      id: "q1",
+      options: [
+        { id: "o1", label: "Approve" },
+        { id: "o2", label: "Drop" },
+      ],
+    };
+    const later = {
+      ...pickedAsk("Install s4?", ["s4"]),
+      id: "q2",
+      options: [
+        { id: "o1", label: "Approve", approves: ["s4"] },
+        { id: "o2", label },
+      ],
+      closedAt: laterDecisionAt,
+      answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+    };
+    assert.isNotNull(approvalProblem(approvalCard([s4], [earlier, later]), s4));
+  },
+);
+
+it.each(["Approve s4 after the review", "Yes, do not approve s4", "Approve s1, not s4"])(
+  "review regression: qualified consent never grants s4: %s",
+  (label) => {
+    const s1 = gatedStep("s1");
+    const s4 = gatedStep("s4");
+    const ask = {
+      ...pickedAsk("Install s4?"),
+      options: [
+        { id: "o1", label },
+        { id: "o2", label: "Drop" },
+      ],
+    };
+    assert.isNotNull(approvalProblem(approvalCard([s1, s4], [ask]), s4));
+  },
+);
+
+it.each([
+  { scopedBy: "field", go: { id: "o1", label: "Approve", approves: ["s4", "s5"] } },
+  { scopedBy: "label", go: { id: "o1", label: "Approve s4 and s5" } },
+])("refusals supersede all $scopedBy scopes, go choices retain their own scope", ({ go }) => {
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  const s7 = gatedStep("s7");
+  const earlier = pickedAsk("Put these live?", ["s4", "s5", "s7"]);
+  for (const label of ["Drop", "Wait", "Change", "Don't approve", "Wait for the review"]) {
+    const later = {
+      ...pickedAsk("Put these live?"),
+      id: "q6",
+      options: [go, { id: "o2", label }],
+      answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+    };
+    const card = approvalCard([s4, s5, s7], [earlier, later]);
+    for (const target of [s4, s5]) {
+      const result = approvalProblem(card, target);
+      assert.include(result!, "the latest decision, q6");
+      assert.include(result!, label);
+    }
+    assert.isNull(approvalProblem(card, s7));
+  }
+  const scopedGo = {
+    ...pickedAsk("Install s5 and s7?"),
+    id: "q6",
+    options: [go, { id: "o2", label: "Approve s7" }],
+    answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+  };
+  const rejected = {
+    ...pickedAsk("Install s4?", ["s4"]),
+    id: "q5",
+    answer: { verdict: "rejected" as const, by: owner, at: decisionAt },
+  };
+  const card = approvalCard([s4, s5, s7], [rejected, scopedGo]);
+  assert.include(approvalProblem(card, s4)!, "q5");
+  assert.isNull(approvalProblem(card, s7));
+});
+
+it.each([
+  "Yes, do not approve s4",
+  "Yes, don't approve s4",
+  "Yes, don’t approve s4",
+  "Approve s1, not s4",
+  "Approve s1 but not s4",
+  "Approve s1 except s4",
+  "Approve s1 without s4",
+  "Yes, no approval for s4",
+  "Yes, never approve s4",
+  "Yes, we won't approve s4",
+  "Yes, we can’t approve s4",
+  "Yes, we cannot approve s4",
+  "Approve s4 after the review",
+  "Approve s4 before the review",
+  "Approve s4 if reviewed",
+  "Approve s4 unless review fails",
+  "Approve s4 once reviewed",
+  "Approve s4 when reviewed",
+  "Approve s4 pending review",
+  "Approve s4, first review",
+  "Approve s4, then review",
+  "Approve s4 later",
+  "Approve s4 tomorrow",
+  "Approve s4 next week",
+  "Approve s4 next month",
+  "Approve s1; reject s4",
+  "Approve s1; hold s4",
+  "Approve s1; wait for s4",
+  "Approve s1, cancel s4",
+  "Approve s1, skip s4",
+  "Approve s1; decline s4",
+  "Yes, approve s4 only if needed",
+])("a qualified label cannot grant any explicit scope: %s", (label) => {
+  const s1 = gatedStep("s1");
+  const s4 = gatedStep("s4");
+  const ask = {
+    ...pickedAsk("Install s1 and s4?"),
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Drop" },
+    ],
+  };
+  const card = approvalCard([s1, s4], [ask]);
+  for (const target of [s1, s4]) assert.isNotNull(approvalProblem(card, target));
+  const earlier = pickedAsk("Put it live?", ["s4"]);
+  const later = {
+    ...ask,
+    id: "q6",
+    options: [...ask.options, { id: "o3", label: "Approve", approves: ["s1", "s4"] }],
+    answer: { ...ask.answer!, at: laterDecisionAt },
+  };
+  assert.include(approvalProblem(approvalCard([s1, s4], [earlier, later]), s4)!, "q6");
+  for (const verdict of ["picked", "approved"] as const) {
+    const signoff = {
+      ...ask,
+      id: "q7",
+      kind: "signoff",
+      answer: { verdict, optionIds: ["o1"], by: owner, at: laterDecisionAt },
+    };
+    const result = approvalProblem(approvalCard([s1, s4], [earlier, signoff]), s4);
+    assert.include(result!, "the latest decision, q7");
+  }
+});
+
+it.each(["field", "label"])("Crpko #3868 signoff approved with one %s-scoped option", (scope) => {
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  const go =
+    scope === "field"
+      ? { id: "o1", label: "Approve", approves: ["s4"] }
+      : { id: "o1", label: "Approve s4" };
+  const ask: KanbanCard["asks"][number] = {
+    ...pickedAsk("Sign off so the card can close this step?"),
+    id: "q1",
+    kind: "signoff",
+    title: "Sign off: quick-setup frontend is on dev",
+    options: [go, { id: "o2", label: "Change" }, { id: "o3", label: "Drop" }],
+    answer: { verdict: "approved", optionIds: ["o1"], by: owner, at: decisionAt },
+  };
+  const card = approvalCard([s4, s5], [ask]);
+  assert.isNull(approvalProblem(card, s4));
+  assert.isNotNull(approvalProblem(card, s5));
+  for (const optionIds of [undefined, [], ["o1", "o2"], ["o2"], ["unknown"]]) {
+    const candidate = {
+      ...ask,
+      answer: {
+        verdict: "approved" as const,
+        ...(optionIds === undefined ? {} : { optionIds }),
+        by: owner,
+        at: laterDecisionAt,
+      },
+    };
+    const earlier = pickedAsk("Install s4?", ["s4"]);
+    const result = approvalProblem({ ...card, asks: [earlier, candidate] }, s4);
+    assert.include(result!, "the latest decision, q1");
+    assert.include(result!, "pick exactly one option naming s4");
+  }
+  for (const candidate of [
+    { ...ask, answer: { ...ask.answer!, by: evaluator } },
+    { ...ask, draft: { text: "Text to send", format: "markdown" as const } },
+    { ...ask, answer: { ...ask.answer!, at: "2026-11-12T00:00:00.000Z" } },
+  ])
+    assert.isNotNull(approvalProblem({ ...card, asks: [candidate] }, s4));
+});
+
+it.effect("signoff persists approved plus optionIds and clears only the selected scope", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Signoff approval",
+          prompt: "Work",
+          subtasks: [{ text: "Install the skill", owner: "evaluator" }],
+        },
+        owner,
+      );
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Sign off so the card can close this step?",
+          kind: "signoff",
+          blocking: false,
+          options: [{ label: "Approve", approves: ["s1"] }, "Change", "Drop"],
+        },
+        evaluator,
+        "evaluator",
+      );
+      const answered = yield* kanban.answerAsk(
+        card.id,
+        "q1",
+        { verdict: "approved", optionIds: ["o1"], revision: 0 },
+        owner,
+      );
+      assert.strictEqual(answered.card.asks[0]?.answer?.verdict, "approved");
+      assert.deepStrictEqual(answered.card.asks[0]?.answer?.optionIds, ["o1"]);
+      const done = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Scoped signoff",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(done.subtasks[0]?.state, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.each([
+  "Approve s1,s4",
+  "Approve s1 and s4",
+  "Approve s1, and s4",
+  "Approve s1; s4",
+  "Approve s1 / s4",
+  "Approve s1 & s4",
+  "Approve s1 + s4",
+  "Approve s1 s4",
+  "Yes, tick s1 and s4",
+  "Ok: clear s1 and s4",
+  "Approved s1 and s4 now!",
+  "Go ahead, do s1 and s4.",
+])("direct id-list consent works for picked and approved: %s", (label) => {
+  const s1 = gatedStep("s1");
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  for (const verdict of ["picked", "approved"] as const) {
+    const ask = {
+      ...pickedAsk("Put it live?"),
+      options: [
+        { id: "o1", label },
+        { id: "o2", label: "Drop" },
+      ],
+      answer: { verdict, optionIds: ["o1"], by: owner, at: decisionAt },
+    };
+    const card = approvalCard([s1, s4, s5], [ask]);
+    assert.isNull(approvalProblem(card, s1));
+    assert.isNull(approvalProblem(card, s4));
+    assert.isNotNull(approvalProblem(card, s5));
+  }
+});
+
+it.each([
+  "Don't approve s4",
+  "Wait, s4 later",
+  "Yes, do not approve s4",
+  "Approve s4 after the review",
+])("an approved answer cannot bypass a qualified selected label: %s", (label) => {
+  const s4 = gatedStep("s4");
+  const ask = {
+    ...pickedAsk("Install s4?"),
+    kind: "signoff",
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Change" },
+    ],
+    answer: { verdict: "approved" as const, optionIds: ["o1"], by: owner, at: decisionAt },
+  };
+  assert.isNotNull(approvalProblem(approvalCard([s4], [ask]), s4));
+});
