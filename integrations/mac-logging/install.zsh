@@ -20,11 +20,12 @@ copy_file() {
     install -m "$perm" "$src" "$dst"
   fi
 }
-for file in toollog.py toollog.sh jobs.py collector.py rollup.py; do
+for file in toollog.py toollog.sh jobs.py collector.py rollup.py status.py; do
   copy_file "$here/$file" "$HOME/.local/lib/mac-logging/$file" 600
 done
 # A plain executable wrapper keeps imports local to the installed helper directory.
 copy_file "$here/mac-log-rollup" "$HOME/.local/bin/mac-log-rollup" 755
+copy_file "$here/mac-log-status" "$HOME/.local/bin/mac-log-status" 755
 if [[ $mode == install ]]; then
   /usr/bin/python3 - "$here/launchd/com.abdullah.mac-log-collector.plist" "$HOME/Library/LaunchAgents/com.abdullah.mac-log-collector.plist" <<'PY'
 from pathlib import Path

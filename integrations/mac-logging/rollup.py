@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 from toollog import directory, private_dir, safe_fields
+from status import report
 
 
 def rollup(day, root=None):
@@ -63,6 +64,11 @@ def rollup(day, root=None):
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,
                   topErrors=[dict(tag=t, count=c, sampleIds=samples[t]) for t, c in tags.most_common(20)])
+    # Freeze the cadence view at this day's end, regardless of when it is rebuilt.
+    date = dt.date.fromisoformat(day)
+    end = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
+    cadence = report(end, root, day=date)
+    result.update(jobs=cadence['jobs'], missingJobs=cadence['missingJobs'])
     private_dir(root)
     fd, temp = tempfile.mkstemp(prefix='.rollup-', dir=root)
     try:

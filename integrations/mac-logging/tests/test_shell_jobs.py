@@ -116,6 +116,17 @@ class ShellJobsTests(unittest.TestCase):
   def check():
    return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
   self.assertEqual(check(),0)
+  wrapper=home/'.local/bin/mac-log-status'
+  self.assertEqual(wrapper.stat().st_mode & 0o777,0o755)
+  status=subprocess.run([str(wrapper),'--now','2026-11-15T12:00:00Z','--json'],env=env,capture_output=True,text=True,timeout=10)
+  self.assertEqual(status.returncode,0,status.stderr)
+  self.assertEqual(len(json.loads(status.stdout)['jobs']),7)
+  wrapper.chmod(0o644);self.assertNotEqual(check(),0);wrapper.chmod(0o755)
+  original_wrapper=wrapper.read_text()
+  wrapper.write_text('stale');self.assertNotEqual(check(),0);wrapper.write_text(original_wrapper)
+  self.assertEqual(check(),0)
+  wrapper.rename(wrapper.with_suffix('.saved'));self.assertNotEqual(check(),0)
+  wrapper.with_suffix('.saved').rename(wrapper)
   plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
   plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)
   plist.rename(plist.with_suffix('.saved'));self.assertNotEqual(check(),0)

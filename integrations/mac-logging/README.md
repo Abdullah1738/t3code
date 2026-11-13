@@ -6,11 +6,47 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
+or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
+clock (include `Z` or an explicit UTC offset). The command always exits 0,
+including invalid arguments or unreadable input; inspect the report for errors.
+It only reads today's and yesterday's UTC day files. Missing and unreadable
+files are listed separately; malformed rows (including invalid timestamps) are
+skipped and counted. Future timestamps are ignored. It makes no network calls
+and creates no files or locks.
+
+The single cadence table is `CADENCES` in `status.py`, with schedule sources
+beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
+hours for disk sampling (guard every 30 minutes), inventory and crash collection
+(hourly collector), and janitor (hourly watcher); seven hours for health backup
+(every six), five hours for memory backup (every four), and 26 hours for the
+daily CVE sweep (09:00 Dubai / 05:00 UTC).
+
+`LATE` means the last line is older than the maximum gap. `SILENT` means that
+gap has elapsed and there is no matching line in the available 36-hour window.
+Before logging applies a row is `PENDING`; after that it gets one maximum gap
+of startup grace. A failed or skipped run still proves the job ran: `lastOk`
+reports the last line's boolean outcome (null if omitted), independently of
+cadence. Backups match `props.target` exactly (`health` or `memory`).
+
+Daily rollups add `jobs` and `missingJobs`, leaving all existing keys intact.
+The jobs view is frozen at the end of the requested UTC day and reads that day
+and its predecessor, capped to 36 hours. Each job has `lastSeen` (normalized
+UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
+`since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
+backup keys are `backup.run:health` and `backup.run:memory`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour; subsequent runs cover since the last successful read.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
+Before any job can create today's log, it checks today's and yesterday's files
+(from the logging start date). If either is absent it emits one `log.missing_day`
+error per UTC reporting day, with `ids.runId`, the missing dates in `props.source`
+and their count. This uses collector state to suppress repeats; status and rollup
+readers never append log lines. A stopped collector is visible through status's
+missing-file report and silent jobs.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.

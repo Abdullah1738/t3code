@@ -14,10 +14,30 @@ import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied)
 from rollup import rollup
-from toollog import emit, private_dir
+from status import CADENCES
+from toollog import directory, emit, private_dir
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
+
+
+def missing_day(now=None):
+    try:
+        utc = dt.datetime.now(dt.timezone.utc) if now is None else now.astimezone(dt.timezone.utc)
+        day = utc.date()
+        state = read_state('missing-day')
+        if state.get('reportedDay') == day.isoformat():
+            return
+        since = min(dt.date.fromisoformat(row['since']) for row in CADENCES.values())
+        missing = [date.isoformat() for date in (day - dt.timedelta(days=1), day)
+                   if date >= since and not (directory() / (date.isoformat() + '.ndjson')).exists()]
+        if missing:
+            emit('collector', 'error', 'log.missing_day', now=utc, ok=False,
+                 props={'source': ' and '.join(missing), 'count': len(missing)}, error_tag='log.missing_day')
+            state['reportedDay'] = day.isoformat()
+            save_state('missing-day', state)
+    except Exception:
+        pass
 
 
 def reports(root, since, until):
@@ -347,6 +367,8 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 
 
 def main():
+    # Check before any job can create today's file and hide its absence.
+    missing_day()
     disk_tooling_probe()
     try:
         directory_inventory()
