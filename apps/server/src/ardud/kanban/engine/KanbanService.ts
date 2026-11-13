@@ -4865,7 +4865,12 @@ const make = Effect.gen(function* () {
         (subtask) =>
           Subtasks.gateOf(subtask, board.guessedGates) !== undefined &&
           (subtask.state === "open" ||
-            Subtasks.approvalProblem(next, subtask, board.guessedGates) !== null),
+            Subtasks.approvalProblem(
+              next,
+              subtask,
+              board.guessedGates,
+              subtask.state === "skipped" ? "skip" : "do",
+            ) !== null),
       );
       const stage =
         back === "verified" && gated
@@ -11629,7 +11634,7 @@ const make = Effect.gen(function* () {
             const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
             if (replacement && Subtasks.gateOf(replacement, board.guessedGates) !== undefined)
               continue;
-            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
+            const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates, "skip");
             if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
           }
           yield* checkScriptNames(card.boardId, plan.subtasks);
@@ -11860,7 +11865,14 @@ const make = Effect.gen(function* () {
           const board = yield* boardOf(card.boardId);
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           const missing = card.subtasks
-            .map((subtask) => Subtasks.approvalProblem(card, subtask, board.guessedGates))
+            .map((subtask) =>
+              Subtasks.approvalProblem(
+                card,
+                subtask,
+                board.guessedGates,
+                subtask.state === "skipped" ? "skip" : "do",
+              ),
+            )
             .find((problem) => problem !== null);
           if (open.length > 0) {
             const reason = `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`;
@@ -13046,7 +13058,12 @@ const make = Effect.gen(function* () {
         const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
         const missing =
           gated && state !== "open"
-            ? Subtasks.approvalProblem(card, gated, board.guessedGates)
+            ? Subtasks.approvalProblem(
+                card,
+                gated,
+                board.guessedGates,
+                state === "skipped" ? "skip" : "do",
+              )
             : null;
         if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
         const at = yield* nowIso;
