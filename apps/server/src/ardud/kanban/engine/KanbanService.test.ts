@@ -18665,6 +18665,116 @@ it.effect.each(
     }),
 );
 
+it.effect.each([
+  { phase: "needs_review", run: "finishing" },
+  { phase: "needs_review", run: "steered" },
+  { phase: "in_review", run: "finishing" },
+  { phase: "in_review", run: "steered" },
+] as const)(
+  "#813 a $run old worker leaves $phase ownership alone while other cards start",
+  ({ phase, run }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Handed off", prompt: "Review this", priority: 1 },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+        yield* setRunning(fake, worker, true);
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: worker,
+        });
+        if (run === "steered") {
+          yield* setRunning(fake, worker, false);
+          yield* kanban.turnEnded(worker);
+          yield* setRunning(fake, worker, true);
+          const threads = yield* KanbanThreads;
+          yield* threads.send({ threadId: worker, text: "Unrelated report; no card work" });
+        }
+        let reviewer: ThreadId | null = null;
+        if (phase === "in_review") {
+          yield* kanban.dispatchNow;
+          reviewer = (yield* kanban.card(card.id)).card.reviewThreadId!;
+          yield* setRunning(fake, reviewer, true);
+        }
+        const before = [...(yield* Ref.get(fake.threads)).get(worker)!.messages];
+        const lower = yield* kanban.createCard(
+          board.id,
+          { title: "Other work", prompt: "Other work", priority: 3 },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const current = (yield* kanban.card(card.id)).card;
+        reviewer ??= current.reviewThreadId;
+        assert.isNotNull(reviewer);
+        assert.strictEqual(current.stage, "in_review");
+        assert.strictEqual(current.activeRole, "review");
+        assert.strictEqual(current.activeThreadId, reviewer);
+        assert.notStrictEqual(reviewer, worker);
+        assert.strictEqual(current.workThreadId, worker);
+        assert.isNull(current.stalled);
+        assert.strictEqual((yield* kanban.card(lower.id)).card.stage, "working");
+        assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(worker)!.messages, before);
+        assert.notInclude(fake.interrupted, worker);
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, reviewer);
+        assert.deepStrictEqual((yield* Ref.get(fake.threads)).get(worker)!.messages, before);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("#813 review start in flight never asks the finishing worker to claim", () =>
+  Effect.gen(function* () {
+    const gate = yield* assignmentGate;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Review starting", prompt: "Review starting", priority: 1 },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+      yield* setRunning(gate.fake, worker, true);
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: worker,
+      });
+      const before = [...(yield* Ref.get(gate.fake.threads)).get(worker)!.messages];
+      const lower = yield* kanban.createCard(
+        board.id,
+        { title: "After review start", prompt: "Other work", priority: 3 },
+        owner,
+      );
+      gate.control.enabled = true;
+      const dispatch = yield* kanban.dispatchNow.pipe(Effect.forkChild);
+      yield* Deferred.await(gate.entered);
+      const pending = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(pending.stage, "needs_review");
+      assert.isNull(pending.activeThreadId);
+      const claim = yield* kanban.claimCard(worker, card.id).pipe(Effect.flip);
+      assert.include(claim.detail, "is starting; wait for its assignment");
+      assert.deepStrictEqual((yield* Ref.get(gate.fake.threads)).get(worker)!.messages, before);
+      yield* Deferred.succeed(gate.release, undefined);
+      yield* Fiber.join(dispatch);
+      const reviewing = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(reviewing.stage, "in_review");
+      assert.isNotNull(reviewing.reviewThreadId);
+      assert.strictEqual(reviewing.activeThreadId, reviewing.reviewThreadId);
+      assert.notStrictEqual(reviewing.activeThreadId, worker);
+      assert.strictEqual((yield* kanban.card(lower.id)).card.stage, "working");
+      assert.deepStrictEqual((yield* Ref.get(gate.fake.threads)).get(worker)!.messages, before);
+    }).pipe(Effect.provide(testLayer(gate.layer)));
+  }),
+);
+
 it.effect.each(["work", "review"] as const)(
   "a running %s orphan is adopted without another prompt while both lower pools start",
   (role) =>
