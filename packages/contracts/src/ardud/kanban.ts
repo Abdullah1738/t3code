@@ -2208,8 +2208,8 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
    * (`invalid`) or an older one (`conflict`). The detail says it in words too.
    */
   revision: Schema.optionalKey(NonNegativeInt),
-  /** Only not-written failures may be retried automatically. */
-  writeOutcome: Schema.optional(Schema.Literals(["not-written", "may-have-applied"])),
+  /** The savedReply signal: false means definitely not written, null means possibly saved. */
+  saved: Schema.optional(Schema.NullOr(Schema.Boolean)),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

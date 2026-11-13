@@ -47,6 +47,7 @@ import * as KanbanStore from "../store/KanbanStore.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
 import * as Rules from "./rules.ts";
+import * as SavedWrite from "./savedWrite.ts";
 import * as ScriptService from "./ScriptService.ts";
 import * as Scripts from "./scripts.ts";
 import { modelSelectionOf, modelSelectionResult } from "./defaults.ts";
@@ -1629,7 +1630,7 @@ const busyError = () =>
   new KanbanError({
     code: "conflict",
     detail: "Board busy: not written. Safe to retry once.",
-    writeOutcome: "not-written",
+    saved: false,
   });
 
 const retryFixture = Effect.gen(function* () {
@@ -1783,7 +1784,7 @@ it.effect(
           new KanbanError({
             code: "conflict",
             detail: "May have been applied",
-            writeOutcome: "may-have-applied",
+            saved: null,
           }),
       );
       yield* Effect.gen(function* () {
@@ -2330,7 +2331,7 @@ it.effect.each(["service", "http", "ws"] as const)(
           new KanbanError({
             code: "conflict",
             detail: "Unknown outcome",
-            writeOutcome: "may-have-applied",
+            saved: null,
           }),
       );
       yield* Effect.gen(function* () {
@@ -2360,7 +2361,11 @@ it.effect.each(["service", "http", "ws"] as const)(
           assert.strictEqual((yield* request(script.id, deliveries)).status, 200);
         } else if (entry === "ws") {
           const input = yield* decodeAcknowledgement({ scriptId: script.id, deliveries });
-          yield* makeKanbanWsHandlers(kanban, scripts)[KANBAN_WS_METHODS.scriptAcknowledge](input);
+          yield* makeKanbanWsHandlers(kanban, scripts, {
+            sessionId: "scripts-owner",
+            subject: "operator",
+            origin: { _tag: "owner", source: "paired-client" },
+          })[KANBAN_WS_METHODS.scriptAcknowledge](input);
         } else yield* scripts.acknowledge({ scriptId: script.id, deliveries });
         assert.lengthOf((yield* store.script(script.id))!.unresolved!, 99);
         assert.strictEqual(fixture.calls(), 100);
@@ -2523,4 +2528,63 @@ it.effect("#577 events queued during acknowledgement still run after it commits"
       assert.lengthOf((yield* store.script(script.id))!.unresolved!, 0);
     }).pipe(Effect.scoped, Effect.provide(layer));
   }),
+);
+
+it.effect.each(
+  (["card", "post"] as const).flatMap((kind) =>
+    (["committing", "saved"] as const).map((evidence) => ({ kind, evidence })),
+  ),
+)(
+  "#577 main $evidence evidence prevents a $kind retry even when a later error says not saved",
+  ({ kind, evidence }) =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const layer = makeTestLayer(threads, false, (service) => ({
+        ...service,
+        createCard: (boardId, input, actor) =>
+          actor._tag !== "script" || kind !== "card"
+            ? service.createCard(boardId, input, actor)
+            : Effect.gen(function* () {
+                calls += 1;
+                if (evidence === "saved") yield* service.createCard(boardId, input, actor);
+                else yield* SavedWrite.committing;
+                return yield* Effect.fail(busyError());
+              }),
+        post: (id, actor, blocks) =>
+          kind !== "post" ||
+          !blocks.some((block) => block._tag === "md" && block.text === "Main saved signal")
+            ? service.post(id, actor, blocks)
+            : Effect.gen(function* () {
+                calls += 1;
+                if (evidence === "saved") yield* service.post(id, actor, blocks);
+                else yield* SavedWrite.committing;
+                return yield* Effect.fail(busyError());
+              }),
+      }));
+      yield* Effect.gen(function* () {
+        const scripts = yield* ScriptService.KanbanScripts;
+        const store = yield* KanbanStore.KanbanStore;
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* toyBoard;
+        const command =
+          kind === "card"
+            ? { kanban: "card", prompt: "Main saved signal", title: "Main saved signal" }
+            : { kanban: "post", text: "Main saved signal" };
+        const path = scriptFile(`echo '${JSON.stringify(command)}'`);
+        const script = yield* register(board, path);
+        yield* scripts.run(script.id, "manual");
+        yield* TestClock.adjust(43_000);
+        yield* scripts.idle;
+        assert.strictEqual(calls, 1);
+        const current = (yield* store.script(script.id))!;
+        assert.lengthOf(current.held!, 0);
+        assert.lengthOf(current.unresolved!, evidence === "saved" ? 0 : 1);
+        if (evidence === "saved" && kind === "card")
+          assert.lengthOf((yield* kanban.snapshot(board.id)).cards, 1);
+        NodeFS.writeFileSync(path, "");
+        yield* scripts.run(script.id, "manual");
+        yield* scripts.idle;
+        assert.strictEqual(calls, 1);
+      }).pipe(Effect.provide(layer));
+    }),
 );

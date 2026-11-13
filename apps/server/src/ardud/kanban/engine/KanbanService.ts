@@ -8833,7 +8833,7 @@ const make = Effect.gen(function* () {
           ? Effect.fail(
               new KanbanError({
                 code: "conflict",
-                writeOutcome: defect.committed ? "may-have-applied" : "not-written",
+                saved: defect.committed ? null : false,
                 detail: defect.committed
                   ? BoardLocks.MAY_HAVE_APPLIED
                   : "Board changed during this operation. Re-read its state before retrying.",

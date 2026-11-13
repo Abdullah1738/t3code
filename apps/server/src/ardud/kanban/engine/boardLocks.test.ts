@@ -45,7 +45,7 @@ it.effect("#566 a committed re-acquire timeout never advertises a safe retry", (
     if (Exit.isFailure(result)) {
       const error = Cause.squash(result.cause);
       assert.instanceOf(error, KanbanError);
-      assert.strictEqual((error as KanbanError).writeOutcome, "may-have-applied");
+      assert.strictEqual((error as KanbanError).saved, null);
       const message = String(error);
       assert.include(message, "may have been applied");
       assert.notInclude(message, "Safe to retry");
