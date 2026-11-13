@@ -1,9 +1,8 @@
 /**
  * Every open ask across boards (or on one), for the Needs-you page, in bounded
  * reader statements. It never decodes a board's cards: SQLite picks the cards that
- * hold a matching ask with a substring test on the stored JSON (no JSON parse
- * for the rest), trimmed to the few card fields the
- * page shows plus their matching asks.
+ * hold a matching ask through partial indexes on the stored JSON, trimmed to
+ * the few card fields the page shows plus their matching asks.
  */
 import {
   KANBAN_DONE_STAGES,
@@ -34,10 +33,6 @@ export const CLOSED_ASKS_MAX = 200;
 /** At most this many of an ask's newest messages, plus the one that asked it. */
 export const ASK_MESSAGES_MAX = 50;
 
-// Stored JSON is compact (JSON.stringify, SQLite's json_set), and only asks have
-// `closedAt`, so these find a card with an open (or a closed) ask without parsing it.
-const OPEN_MARK = '"closedAt":null';
-const CLOSED_MARK = '"closedAt":"';
 const ASK_MESSAGE_MARK = '"askId":"';
 
 const FeedCard = Schema.Struct({
@@ -75,22 +70,26 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
   let boardAfter = input.boardId ?? "";
   let numberAfter = 0;
   while (true) {
-    // Limit the input before filtering JSON: LIMIT after the ask predicate can
-    // still scan the entire board when its last cards have no matching asks.
-    const cardRows = yield* sql<{ boardId: string; number: number; json: string | null }>`
+    const after =
+      input.boardId === undefined
+        ? sql`(board_id, number) > (${boardAfter}, ${numberAfter})`
+        : sql`board_id = ${input.boardId} AND number > ${numberAfter}`;
+    // Literal predicates match the partial indexes in kanbanDDL. UNION merges
+    // their ordered ranges and deduplicates cards that have both kinds of ask.
+    const cardRows = yield* sql<{ boardId: string; number: number; json: string }>`
       WITH page AS MATERIALIZED (
         SELECT id, board_id, number FROM ardud_kanban_cards
-        WHERE ${
-          input.boardId === undefined
-            ? sql`(board_id, number) > (${boardAfter}, ${numberAfter})`
-            : sql`board_id = ${input.boardId} AND number > ${numberAfter}`
+        WHERE instr(json, '"closedAt":null') > 0 AND ${after}
+        ${
+          since === null
+            ? sql``
+            : sql`UNION
+                SELECT id, board_id, number FROM ardud_kanban_cards
+                WHERE instr(json, '"closedAt":"') > 0 AND ${after}`
         }
         ORDER BY board_id, number LIMIT 64
       )
-      SELECT c.board_id AS boardId, c.number, CASE WHEN
-        instr(c.json, ${OPEN_MARK}) > 0
-        OR (${since} IS NOT NULL AND instr(c.json, ${CLOSED_MARK}) > 0)
-      THEN json_object(
+      SELECT c.board_id AS boardId, c.number, json_object(
         'id', c.id,
         'boardId', c.board_id,
         'number', c.number,
@@ -105,12 +104,11 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
           WHERE json_extract(ask.value, '$.closedAt') IS NULL
             OR (${since} IS NOT NULL AND json_extract(ask.value, '$.closedAt') >= ${since})
         ), '[]'))
-      ) END AS json
+      ) AS json
       FROM page p JOIN ardud_kanban_cards c ON c.id = p.id
       ORDER BY c.board_id, c.number
     `;
     for (const row of cardRows) {
-      if (row.json === null) continue;
       const card = yield* decodeCard(row.json);
       if (card.asks.length > 0) cards.push(card);
     }
