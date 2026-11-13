@@ -447,8 +447,76 @@ class BackupSkipTests(unittest.TestCase):
         rows=self.rows(logs)
         for row in rows[:-1]:
             self.assertIn(row['props']['skipReason'],toollog.SKIP_REASONS)
-            self.assertFalse(row['ok'])
+            self.assertEqual(row['ok'], row['props']['skipReason'] in ('load_deferred', 'boot_grace'))
         self.assertNotIn('private-',json.dumps(rows))
+
+    def test_deliberate_deferrals_have_numeric_metadata_and_no_error(self):
+        root,home,fake,logs,env=self.fixture()
+        with patch.dict(os.environ,env,clear=True), patch.object(jobs,'backup_snapshot_age',return_value=(None,'unavailable')):
+            for reason in ('load_deferred','boot_grace'):
+                jobs.backup_run('memory',time.time(),'',0,0,'',reason,'', '3.126','18000','3')
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),2)
+        for row,reason in zip(rows,('load_deferred','boot_grace')):
+            self.assertTrue(row['ok'])
+            self.assertEqual(row['kind'],'perf')
+            self.assertNotIn('error',row)
+            props=row['props']
+            self.assertEqual(props['skipReason'],reason)
+            self.assertEqual(props['skipped'],1)
+            self.assertEqual(props['loadPerCore'],3.13)
+            self.assertEqual(props['lastSuccessAgeS'],18000)
+            self.assertEqual(props['deferredCount'],3)
+            self.assertIs(type(props['loadPerCore']),float)
+            self.assertIs(type(props['lastSuccessAgeS']),int)
+            self.assertIs(type(props['deferredCount']),int)
+            self.assertTrue(all('/' not in value and '\\' not in value for value in props.values() if isinstance(value,str)))
+            self.assertNotIn(str(root),json.dumps(props))
+
+    def test_optional_deferral_numbers_reject_invalid_input_independently(self):
+        root,home,fake,logs,env=self.fixture()
+        cases=[('', '', ''), ('/private/file','host.example','python backup.py'),
+               ('nan','1.5','1e2'), ('inf','-1','-1'), ('-1','True','False'),
+               (True,True,True), (None,None,None), ('1e9999','nan','inf')]
+        with patch.dict(os.environ,env,clear=True), patch.object(jobs,'backup_snapshot_age',return_value=(None,'unavailable')):
+            for values in cases:
+                jobs.backup_run('memory',time.time(),'',0,0,'','load_deferred','',*values)
+            jobs.backup_run('memory',time.time(),'',0,0,'','boot_grace','', 'bad','0','0')
+            jobs.backup_run('memory',time.time(),'',0,0,'','unknown-deferral','', '0','0','0')
+            jobs.backup_run('memory',time.time(),'',1,0,'','load_deferred','', '0','0','0')
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),len(cases)+3)
+        for row in rows[:len(cases)]:
+            self.assertTrue(row['ok'])
+            for key in ('loadPerCore','lastSuccessAgeS','deferredCount'):
+                self.assertNotIn(key,row['props'])
+        self.assertNotIn('loadPerCore',rows[-3]['props'])
+        self.assertEqual(rows[-3]['props']['lastSuccessAgeS'],0)
+        self.assertEqual(rows[-3]['props']['deferredCount'],0)
+        self.assertEqual(rows[-2]['props']['skipReason'],'other')
+        self.assertFalse(rows[-2]['ok'])
+        self.assertEqual(rows[-2]['error']['tag'],'backup.skipped_other')
+        self.assertFalse(rows[-1]['ok'])
+        self.assertEqual(rows[-1]['error']['tag'],'backup.skipped_load_deferred')
+
+    def test_deferral_cli_keeps_restic_summary_on_stdin(self):
+        root,home,fake,logs,env=self.fixture()
+        for reason in ('load_deferred','boot_grace'):
+            result=subprocess.run([sys.executable,str(HERE/'jobs.py'),'backup','memory',str(time.time()),
+                                   '', '0','0',reason,'','3.126','18000','2'],env=env,
+                                  input=json.dumps({'total_files_processed':7,'path':'/private/file'}),
+                                  capture_output=True,text=True,timeout=8)
+            self.assertEqual(result.returncode,0,result.stderr)
+        rows=self.rows(logs)
+        self.assertEqual(len(rows),2)
+        for row in rows:
+            self.assertTrue(row['ok'])
+            self.assertNotIn('error',row)
+            self.assertEqual(row['props']['loadPerCore'],3.13)
+            self.assertEqual(row['props']['lastSuccessAgeS'],18000)
+            self.assertEqual(row['props']['deferredCount'],2)
+            self.assertEqual(row['props']['files'],7)
+            self.assertNotIn('/private/file',json.dumps(row))
 
     def test_missing_logger_preserves_success_and_failure(self):
         for target in ('health','memory'):

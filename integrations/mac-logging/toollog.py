@@ -25,7 +25,8 @@ NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
     NUMBERS.add(prefix+'DeltaWindowS')
-SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
+SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
+NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
 BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'redact_lock.py',
