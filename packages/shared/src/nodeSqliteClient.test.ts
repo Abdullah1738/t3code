@@ -3,6 +3,7 @@ import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -616,6 +617,62 @@ it.effect("labels only the span of the statement or transaction that took the lo
     }),
   );
 });
+
+it.effect.each(["statement", "transaction", "reservation"] as const)(
+  "a second client's %s labels its own acquisition inside another client's transaction",
+  (mode) =>
+    Effect.gen(function* () {
+      const a = Context.get(
+        yield* Layer.build(
+          SqliteClient.layer({ filename: ":memory:", spanAttributes: { "db.name": "a" } }),
+        ),
+        SqlClient.SqlClient,
+      );
+      const b = Context.get(
+        yield* Layer.build(
+          SqliteClient.layer({ filename: ":memory:", spanAttributes: { "db.name": "b" } }),
+        ),
+        SqlClient.SqlClient,
+      );
+      const spans: Tracer.NativeSpan[] = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const read =
+        mode === "statement"
+          ? b`SELECT 1`
+          : mode === "transaction"
+            ? b.withTransaction(b`SELECT 1`)
+            : Effect.scoped(
+                Effect.flatMap(b.reserve, (connection) =>
+                  connection.execute("SELECT 1", [], undefined),
+                ),
+              );
+      yield* a
+        .withTransaction(read.pipe(SqliteClient.readOnly))
+        .pipe(
+          Effect.withTracer(tracer),
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+        );
+      const parent = spans.find(
+        (span) => span.name === "sql.transaction" && span.attributes.get("db.name") === "a",
+      );
+      assert.equal(parent?.attributes.get("db.connection"), "writer");
+      assert.isUndefined(parent?.attributes.get("db.reader.requested_lane"));
+      if (mode !== "reservation") {
+        const own = spans.find(
+          (span) => span.attributes.get("db.name") === "b" && span.attributes.has("db.connection"),
+        );
+        assert.equal(own?.attributes.get("db.connection"), "writer");
+        assert.isNumber(own?.attributes.get("db.lock_wait_ms"));
+        assert.equal(own?.attributes.get("db.reader.requested_lane"), "background");
+      }
+    }).pipe(Effect.scoped),
+);
 
 it.effect("keeps identity reads read-only and preserves an enclosing writer transaction", () =>
   withReaderClient((sql) =>

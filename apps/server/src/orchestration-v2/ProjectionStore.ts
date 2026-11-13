@@ -552,6 +552,10 @@ export interface ProjectionStoreV2Shape {
     ReadonlyArray<{ readonly threadId: ThreadId; readonly worktreePath: string }>,
     ProjectionStoreV2Error
   >;
+  readonly getThreadIdsForWorktree: (input: {
+    readonly worktreePath: string;
+    readonly branch: string;
+  }) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
   readonly getTurnStartContext: (
     threadId: ThreadId,
     runId: RunId,
@@ -6575,6 +6579,23 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    const getThreadIdsForWorktree: ProjectionStoreV2Shape["getThreadIdsForWorktree"] = Effect.fn(
+      "ProjectionStore.getThreadIdsForWorktree",
+    )(
+      function* (input) {
+        const rows = yield* sql<{ readonly thread_id: string }>`
+          SELECT thread_id
+          FROM orchestration_v2_projection_threads
+          WHERE deleted_at IS NULL
+            AND json_extract(payload_json, '$.worktreePath') = ${input.worktreePath}
+            AND json_extract(payload_json, '$.branch') = ${input.branch}
+          ORDER BY thread_id ASC
+        `.pipe(offWriter);
+        return rows.map((row) => ThreadId.make(row.thread_id));
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const shellThreadStateFromRow =
       /* Runs once per shell row; the enclosing snapshot or thread read owns the span. */
       Effect.fnUntraced(function* (input: {
@@ -6981,6 +7002,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSettlementCandidates,
       getThreadsWithPullRequests,
       getThreadWorktreePaths,
+      getThreadIdsForWorktree,
       getThreadProjection,
       getTurnStartContext,
       getTurnStartHistory,
@@ -7193,6 +7215,20 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             ),
           ),
         ),
+      getThreadIdsForWorktree: Effect.fn("ProjectionStore.getThreadIdsForWorktree")(
+        function* (input) {
+          const { projections } = yield* Ref.get(replayState);
+          return [...projections.values()]
+            .filter(
+              ({ thread }) =>
+                thread.deletedAt === null &&
+                thread.worktreePath === input.worktreePath &&
+                thread.branch === input.branch,
+            )
+            .map(({ thread }) => thread.id)
+            .toSorted();
+        },
+      ),
       getThreadsWithPullRequests: (threadId) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>

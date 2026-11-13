@@ -239,6 +239,7 @@ export class OrchestratorMcpService extends Context.Service<
 type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
   return new OrchestratorMcpFailure({ code, message });
@@ -268,6 +269,7 @@ export const isLiveCallerShell = (
       false));
 
 function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
+  if (isOrchestratorMcpFailure(error)) return error;
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
     case "ThreadManagementThreadNotFoundError":

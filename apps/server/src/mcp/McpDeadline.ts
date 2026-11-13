@@ -3,6 +3,8 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Schema from "effect/Schema";
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",
@@ -86,6 +88,16 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
           }),
         );
       }),
+    }),
+    Effect.mapError((error) => {
+      // Admission can fail before the timer; keyed callers still need the same retry identity.
+      const retry = `Retry only with the same clientRequestId: ${input.requestKey}.`;
+      return isOrchestratorMcpFailure(error) &&
+        error.code === "caller_unresolved" &&
+        input.requestKey !== undefined &&
+        !error.message.includes(retry)
+        ? new OrchestratorMcpFailure({ code: error.code, message: `${error.message} ${retry}` })
+        : error;
     }),
   );
 });
