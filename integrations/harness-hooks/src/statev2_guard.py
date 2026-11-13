@@ -1445,6 +1445,23 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     path = _literal_path(destination, directory) if destination is not None else None
                     if path is None or path in written:
                         return False
+                    # Different realpaths can still name the same hard-linked
+                    # file. Unavailable identity cannot prove independence.
+                    try:
+                        destination_info = path.stat()
+                    except FileNotFoundError:
+                        destination_info = None
+                    except OSError:
+                        return False
+                    if destination_info is not None:
+                        for remembered in written:
+                            try:
+                                if os.path.samestat(destination_info, remembered.stat()):
+                                    return False
+                            except FileNotFoundError:
+                                continue
+                            except OSError:
+                                return False
                     statement.value = ast.Tuple(elts=[*values, *call.args, *(k.value for k in call.keywords)], ctx=ast.Load())
             literal = None
             is_string = False

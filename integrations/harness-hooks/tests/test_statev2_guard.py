@@ -257,6 +257,47 @@ class GuardTests(unittest.TestCase):
         (self.root / 'tmp/report.txt').symlink_to('a.py')
         self.assertEqual(self.classify(prefix + other_edit + invoke), UNRESOLVED)
 
+    def test_script_write_destinations_require_distinct_files(self):
+        target = self.write('tmp/a.py', 'print(1)\n')
+        self.write('tmp/read.py', 'open(' + repr(LIVE) + ').read()\n')
+        self.write('tmp/unrelated.txt', 'print(1)\n')
+        (self.root / 'tmp/symlink.txt').symlink_to('a.py')
+        os.link(target, self.root / 'tmp/report.txt')
+        prefix = 'D=tmp; cat > "$D/a.py" <<\'EOF\'\nprint(1)\nEOF\n'
+        invoke = '\npython3 "$D/a.py"'
+        destinations = [
+            ('same path', 'tmp/a.py', UNRESOLVED),
+            ('symlink', 'tmp/symlink.txt', UNRESOLVED),
+            ('hard link', 'tmp/report.txt', UNRESOLVED),
+            ('distinct file', 'tmp/unrelated.txt', None),
+            ('new file', 'tmp/new.txt', None),
+        ]
+        writes = [
+            "Path({dest!r}).write_text(Path('tmp/read.py').read_text())",
+            "Path({dest!r}).write_bytes(Path('tmp/read.py').read_bytes())",
+            "open({dest!r}, 'w').write(open('tmp/read.py').read())",
+            "open({dest!r}, 'a').write(open('tmp/read.py').read())",
+            "open({dest!r}, 'wb').write(open('tmp/read.py', 'rb').read())",
+            "open({dest!r}, 'ab').write(open('tmp/read.py', 'rb').read())",
+        ]
+        for label, destination, expected in destinations:
+            for write in writes:
+                with self.subTest(alias=label, write=write):
+                    source = 'from pathlib import Path\n' + write.format(dest=destination)
+                    command = prefix + "python3 - <<'PY'\n" + source + '\nPY' + invoke
+                    self.assertEqual(self.classify(command), expected)
+        source = 'from pathlib import Path\n' + writes[0].format(dest='tmp/unrelated.txt')
+        command = prefix + "python3 - <<'PY'\n" + source + '\nPY' + invoke
+        path_stat = Path.stat
+        for name in ['tmp/unrelated.txt', 'tmp/a.py']:
+            blocked_path = Path(os.path.realpath(self.root / name))
+            def unavailable_stat(path, *args, **kwargs):
+                if path == blocked_path:
+                    raise PermissionError('fixture identity unavailable')
+                return path_stat(path, *args, **kwargs)
+            with self.subTest(unavailable=name), patch.object(Path, 'stat', new=unavailable_stat):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+
     def test_exact_variable_script_reporters(self):
         fixtures = Path(__file__).with_name('fixtures') / 'variable-scripts'
         for name in ['card3409', 'card3650', 'card937', 'torssh31']:
