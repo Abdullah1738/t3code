@@ -74,6 +74,7 @@ import * as Scribe from "./scribe.ts";
 import * as KanbanService from "./KanbanService.ts";
 import type { KanbanScriptsShape } from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
+import { mapCodexModelCapabilities } from "../../../provider/CodexProvider.ts";
 import {
   KanbanThreadError,
   KanbanThreads,
@@ -15611,6 +15612,108 @@ it.effect(
         }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
         assert.strictEqual(rekeyFailures.remaining, 0);
       }).pipe(Effect.provide(probeDeps(fake.layer)));
+    }),
+);
+
+it.effect.each([
+  ["gpt-6.1-sol", "opus/cx/gpt-6.1-sol", "codex"],
+  ["gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+  ["gpt-6.1-terra", "opus/cx/gpt-6.1-terra", "codex-cu"],
+  ["gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+  ["gpt-6-astra", "opus/gpt-6-astra", "codex"],
+  ["gpt-6-astra", "layso/gpt-6-astra", "codex"],
+  ["gpt-6-astra", "gpt-6-astra", "codex"],
+] as const)(
+  "card %s selections keep serviceTier through pool matching (%s)",
+  ([model, source, destination]) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const instanceId = ProviderInstanceId.make(destination);
+      const legacy = source !== model;
+      const pool = {
+        instanceId,
+        model,
+        options: [{ id: "reasoningEffort", value: "xhigh" }],
+      };
+      const requested = {
+        instanceId: legacy ? ProviderInstanceId.make("opencode") : instanceId,
+        model: source,
+        options: [
+          { id: legacy ? "variant" : "reasoningEffort", value: "xhigh" },
+          { id: "serviceTier", value: "default" },
+        ],
+      };
+      const expected = {
+        ...pool,
+        options: [...pool.options, { id: "serviceTier", value: "default" }],
+      };
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+          ardudHarnessMigration: { selections: "apply" },
+        });
+        yield* kanban.setPool(board.id, pool, 1);
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Tier", prompt: "Tier", model: requested },
+          owner,
+        );
+        assert.deepStrictEqual(created.model, expected);
+        const weighted = yield* kanban.createCard(
+          board.id,
+          { title: "Weighted tier", prompt: "Tier", models: [{ model: requested, weight: 1 }] },
+          owner,
+        );
+        assert.deepStrictEqual(weighted.model, expected);
+        const editable = yield* kanban.createCard(
+          board.id,
+          { title: "Edit tier", prompt: "Tier", model: pool },
+          owner,
+        );
+        assert.deepStrictEqual(editable.model, pool);
+        yield* kanban.editCard(editable.id, { model: requested }, owner);
+        assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
+        yield* kanban.editCard(editable.id, { model: pool }, owner);
+        assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, pool);
+        yield* kanban.editCard(editable.id, { models: [{ model: requested, weight: 1 }] }, owner);
+        assert.deepStrictEqual((yield* kanban.card(editable.id)).card.model, expected);
+        yield* kanban.dispatchNow;
+        assert.deepStrictEqual(
+          (yield* Ref.get(fake.threads)).get((yield* kanban.card(created.id)).card.workThreadId!)
+            ?.model,
+          expected,
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer, KanbanModels.layerTest(null), [
+            opencodeTestProvider(),
+            {
+              ...opencodeTestProvider(),
+              instanceId,
+              driver: ProviderDriverKind.make("codex"),
+              models: [
+                {
+                  slug: model,
+                  name: model,
+                  isCustom: false,
+                  capabilities: mapCodexModelCapabilities({
+                    id: model,
+                    model,
+                    displayName: model,
+                    description: "",
+                    hidden: false,
+                    isDefault: true,
+                    defaultReasoningEffort: "xhigh",
+                    additionalSpeedTiers: [],
+                    supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "" }],
+                    serviceTiers: [{ id: "priority", name: "Fast", description: "" }],
+                  }),
+                },
+              ],
+            },
+          ]),
+        ),
+      );
     }),
 );
 
