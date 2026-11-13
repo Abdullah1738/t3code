@@ -5325,3 +5325,104 @@ it.effect(
     });
   },
 );
+
+const defaultDiscussionCases = (["discussion_read", "discussion_post"] as const).flatMap((tool) =>
+  (["fresh", "existing", "owned", "multiple", "none"] as const).map((selection) => ({
+    tool,
+    selection,
+  })),
+);
+it.effect.each(defaultDiscussionCases)(
+  "default worker discussion attribution: $tool with $selection selection",
+  ({ tool, selection }) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const ledger = yield* Deferred.make<AnalyticsEvent>();
+      const generic = yield* Deferred.make<AnalyticsEvent>();
+      const sink = Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          event.kind === "mcp.call" && event.tool === tool
+            ? Deferred.succeed(ledger, event).pipe(Effect.asVoid)
+            : (event.kind === "server.mcp" || event.kind === "server.mcp.error") &&
+                event.props?.method === tool
+              ? Deferred.succeed(generic, event).pipe(Effect.asVoid)
+              : Effect.void,
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "default-discussion",
+          name: "Default",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const first = yield* kanban.createCard(
+          board.id,
+          { title: "First", prompt: "private-prompt" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(first.id)).card.activeThreadId!;
+        fake.running.add(worker);
+        let selected = first;
+        if (selection === "owned" || selection === "multiple")
+          selected = (yield* kanban.createForThread(worker, {
+            title: "Second",
+            prompt: "private-prompt",
+          })).card;
+        if (selection !== "fresh") {
+          const discussion = yield* kanban.cardDiscussion(selected.id);
+          yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "private-message" }]);
+        }
+        if (selection === "owned" || selection === "none") {
+          yield* kanban.moveCard(first.id, "todo", "owner", owner);
+          yield* kanban.dispatchNow;
+          assert.notEqual((yield* kanban.card(first.id)).card.workThreadId, worker);
+          if (selection === "owned")
+            yield* kanban.moveCard(
+              selected.id,
+              "needs_owner",
+              "cardThread",
+              { _tag: "thread", threadId: worker },
+              { question: "private-question" },
+            );
+          assert.lengthOf(yield* kanban.carried(worker), 0);
+          assert.deepEqual(
+            (yield* kanban.ownCards(worker)).map((card) => card.id),
+            selection === "owned" ? [selected.id] : [],
+          );
+        }
+        const refused = selection === "multiple" || selection === "none";
+        const result = yield* call(
+          worker,
+          tool,
+          tool === "discussion_post" ? { text: "private-post" } : {},
+        );
+        assert.equal(result.isError, refused, result.text);
+        const rows = [yield* Deferred.await(ledger), yield* Deferred.await(generic)];
+        for (const row of rows) {
+          assert.equal(row.boardId, board.id);
+          assert.equal(row.props?.boardId, board.id);
+          assert.equal(row.cardId, refused ? undefined : selected.id);
+          assert.equal(row.props?.cardNumber, refused ? undefined : selected.number);
+          assert.notInclude(JSON.stringify(row), "private");
+        }
+        if (!refused) {
+          const discussion = yield* kanban.cardDiscussion(selected.id);
+          if (tool === "discussion_read")
+            assert.equal((result.structured.discussion as { id: string }).id, discussion.id);
+          else {
+            assert.equal(
+              (result.structured.message as { discussionId: string }).discussionId,
+              discussion.id,
+            );
+            assert.deepInclude(
+              (yield* kanban.messages(discussion.id)).map((message) => message.blocks).flat(),
+              { _tag: "md", text: "private-post" },
+            );
+          }
+        }
+      }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+    });
+  },
+);

@@ -355,7 +355,10 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
     const [only] = cards;
-    if (cards.length === 1 && only) return yield* service.cardDiscussion(only.id);
+    if (cards.length === 1 && only) {
+      yield* resolvedContext(only);
+      return yield* service.cardDiscussion(only.id);
+    }
     return yield* invalid(
       cards.length > 1
         ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
@@ -389,7 +392,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
     const [only] = cards;
-    if (cards.length === 1 && only) return { kind: "card" as const, id: only.id };
+    if (cards.length === 1 && only) {
+      yield* resolvedContext(only);
+      return { kind: "card" as const, id: only.id };
+    }
     return yield* invalid(
       cards.length > 1
         ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
