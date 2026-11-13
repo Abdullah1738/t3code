@@ -22,6 +22,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import { sampleMix } from "./samples.ts";
 import {
   accumulate,
   boundedLines,
@@ -180,9 +181,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter?.outcome !== undefined
         ? makeAccumulator()
         : full;
-    const samples: AnalyticsEvent[] = [];
-    const limit = filter?.limit ?? 100;
-    let cursor = 0;
+    const samples = sampleMix(filter?.limit ?? 100, filter?.kind);
     const selected = files
       .flatMap((file) => {
         const match = LOG_FILE.exec(file);
@@ -204,6 +203,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       }
       accumulate(full, event);
       if (
+        (filter?.boardId !== undefined && event.kind === "performance.long-task") ||
         (filter?.kind !== undefined && filter.kind !== event.kind) ||
         (filter?.boardId !== undefined && filter.boardId !== event.boardId) ||
         (filter?.tool !== undefined && filter.tool !== event.tool) ||
@@ -211,11 +211,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       )
         return;
       if (filtered !== full) accumulate(filtered, event);
-      if (samples.length < limit) samples.push(event);
-      else {
-        samples[cursor] = event;
-        cursor = (cursor + 1) % limit;
-      }
+      samples.add(event);
     });
 
     for (const { file } of selected) {
@@ -231,7 +227,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       full: finishRollup(full, day, generatedAt),
       result: {
         rollup: finishRollup(filtered, day, generatedAt),
-        samples: [...samples.slice(cursor), ...samples.slice(0, cursor)].toReversed(),
+        samples: samples.finish(),
       },
       hasFiles: selected.length > 0,
     };

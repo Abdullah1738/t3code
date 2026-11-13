@@ -51,6 +51,32 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const boardId = "board-crpko";
+      for (const row of [
+        event({
+          boardId,
+          kind: "kanban.card_move",
+          props: { from: "todo", to: "working", msInPrevStage: 10 },
+        }),
+        ...Array.from({ length: 150 }, () => event({ boardId, kind: "performance.long-task" })),
+        event({ boardId, kind: "toast.show" }),
+        event({ boardId: "other", kind: "kanban.dispatch" }),
+      ])
+        yield* analytics.record(row);
+      const result = yield* analytics.read({ day, boardId, limit: 2 });
+      assert.deepEqual(
+        result.samples.map((row) => row.kind),
+        ["kanban.card_move", "toast.show"],
+      );
+      assert.equal(result.rollup.total, 2);
+      assert.isUndefined(result.rollup.kindCounts["performance.long-task"]);
+      assert.equal(result.rollup.boards[0]?.moves[0]?.count, 1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>

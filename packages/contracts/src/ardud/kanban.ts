@@ -1014,6 +1014,8 @@ export const KanbanCard = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   movedAt: IsoDateTime,
+  /** Lifecycle clock for local analytics; movedAt may deliberately retain queue age on retry. */
+  analyticsStageEnteredAt: Schema.optional(IsoDateTime),
 });
 export type KanbanCard = typeof KanbanCard.Type;
 
