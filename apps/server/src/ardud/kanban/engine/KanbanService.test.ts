@@ -543,6 +543,7 @@ const observedInlineTestLayer = (...args: Parameters<typeof observedTestLayer>) 
   );
 
 const owner: KanbanActor = { _tag: "owner" };
+const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent, { onExcessProperty: "error" });
 /** The session of the owner's own app, for the WS handlers. */
 const OWNER_APP_SESSION = {
   sessionId: "session-owner",
@@ -664,8 +665,7 @@ it.effect("records tick queues and phases during overlaps without blocking local
       assert.equal(tick.props?.tickId, overlap.props?.activeTickId);
       assert.equal(tick.props?.overlappingTicks, 1);
       assert.isAtLeast(tick.props!.cardsScanned!, 1);
-      for (const event of [tick, overlap, ...phases])
-        yield* Schema.decodeEffect(AnalyticsEvent, { onExcessProperty: "error" })(event);
+      for (const event of [tick, overlap, ...phases]) yield* decodeAnalyticsEvent(event);
       assert.isTrue(phases.every((event) => event.props?.tickId === tick.props?.tickId));
       yield* kanban.tick;
       assert.equal(events.filter((event) => event.kind === "kanban.tick").length, 2);
