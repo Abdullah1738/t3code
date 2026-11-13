@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 
 from . import common
-from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now,
+from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, local_error, log, new_id, now,
                      say)
 
 HELP = """offbox: run heavy work (tests, installs, docker) off the Mac: on the home offbox server when one is set up
@@ -25,9 +26,10 @@ and up, else on a boat.dev VM.
 Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) run on this Mac in a sandbox;
 --remote forces the box.
 Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "offbox: local exit N"); 90 infra/start-limit
-failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally.
+failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally after 90/91/92.
 With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
 94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once).
+96 local state failure (no local fallback).
 95 Robob restarted: the remote run detached and keeps going (offbox wait <run-id>)."""
 
 
@@ -129,6 +131,8 @@ def _remote_once(a, me) -> int:
         return runs.run_remote(a, me)
     except (OffboxError, KeyboardInterrupt):
         raise
+    except sqlite3.Error as error:
+        raise local_error(error) from error
     except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
         import traceback
         log("run crashed: " + traceback.format_exc()[-2000:])
@@ -360,6 +364,9 @@ def main(argv: list[str] | None = None) -> int:
     except OffboxError as e:
         say(str(e))
         return e.code
+    except sqlite3.Error as error:
+        say(str(local_error(error)))
+        return local_error(error).code
     except KeyboardInterrupt:
         return 130
     except Exception as e:  # noqa: BLE001

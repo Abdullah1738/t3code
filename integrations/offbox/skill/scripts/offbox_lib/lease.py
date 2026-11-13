@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner)
+                     file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -871,7 +871,7 @@ def set_aside(con, box_id: str, kind: str, reason: str, run_id: str | None = Non
     """Remove a broken box from selection before trying to stop it. Never archive images or delete its disk."""
     # A terminal run is no longer reconciled by the pool/reaper. Its marker must commit in the same transaction,
     # before any event logging, TTL update, resume bookkeeping or network stop can be interrupted.
-    with con:
+    with write(con):
         con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{kind}: {reason}"[:500], box_id))
         if run_id:
             con.execute("UPDATE runs SET error='box wedged before the command', status='infra', exit_code=NULL, "
@@ -1399,14 +1399,9 @@ def keep_images(box_id: str) -> None:
         event(db(), box_id, "keep_images_failed", str(e)[:300])
 
 
-_HOLDS_DDL = ("CREATE TABLE IF NOT EXISTS prune_holds ("
-              "box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL)")
-
-
 def ensure_holds(con) -> None:
-    """Create the prune_holds table if this database predates it. common.db() builds only the old schema, and
-    capacity.schema() is not guaranteed to have run first, so every hold path makes the table itself."""
-    con.execute(_HOLDS_DDL)
+    from .common import ensure_schema
+    ensure_schema(con)
 
 
 def clear_prune_hold(con, box_id: str) -> None:

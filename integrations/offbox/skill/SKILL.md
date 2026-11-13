@@ -362,10 +362,11 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
 - **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
   had already been retried once). The command ran partly: check what it did before running it again.
+- **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = infra failure (or, on the Boat standby, an exhausted start budget); **91** = Boat's spend guard, which only
   exists on the standby (the home server has no cap). Heavy commands
-  and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
+  and opaque project scripts **stay remote-only**, returning 90/91/92/96 with a clear retry message after bounded
   capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
   semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.
 - **90 + "boat.dev is down (HTTP 525 since HH:MM, waited Ns); nothing ran"** = boat's own API was unreachable
