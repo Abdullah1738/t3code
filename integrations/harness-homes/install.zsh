@@ -3,6 +3,7 @@
 # homes under ~/.robob/harness-homes, and check them.
 #   install.zsh            copy, generate, check
 #   install.zsh --check    check only (no copy, no write)
+#   install.zsh --flighty-python   prepare only the dedicated Flighty Python
 #   install.zsh --with-agent   also (re)load com.ardud.harness-homes every 5 min
 set -eu
 
@@ -17,10 +18,16 @@ with_agent=0
 for arg in "$@"; do
   case "$arg" in
     --check) mode=check ;;
+    --flighty-python) mode=flighty-python ;;
     --with-agent) with_agent=1 ;;
-    *) print -u2 "usage: install.zsh [--check] [--with-agent]"; exit 2 ;;
+    *) print -u2 "usage: install.zsh [--check | --flighty-python] [--with-agent]"; exit 2 ;;
   esac
 done
+
+if [[ "$mode" == flighty-python ]]; then
+  "$py" "$pkg/shared/flighty_python.py"
+  exit
+fi
 
 if [[ "$mode" == check ]]; then
   failed=0
@@ -37,6 +44,8 @@ if [[ "$mode" == check ]]; then
   done
   exit "$failed"
 fi
+
+"$py" "$pkg/shared/flighty_python.py"
 
 backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-homes-install.XXXXXX")
 agents=(com.ardud.shared-mcp-flighty com.ardud.shared-mcp-inbody)
