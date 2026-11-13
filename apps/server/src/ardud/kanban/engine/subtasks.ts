@@ -10,12 +10,23 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
+const releaseResource =
+  /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?|devices?)\b/i;
+const releaseObject =
+  /^\s+(?:apps?|firmware|builds?|binar(?:y|ies)|images?|updates?|versions?|releases?|to)\b/i;
+
+const hasReleaseGate = (text: string): boolean => {
+  for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
+    const tail = text.slice(release.index + release[0].length);
+    const resource = releaseResource.exec(tail);
+    // Only freeing the resource itself is exempt from owner approval.
+    if (!resource || releaseObject.test(tail.slice(resource[0].length))) return true;
+  }
+  return false;
+};
+
 export const inferGate = (text: string): KanbanSubtask["gate"] => {
-  if (
-    /\b(deploy\w*|install\w*|restart\w*|launchagents?|release(?:s|d)?(?!\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?|devices?)\b))\b/i.test(
-      text,
-    )
-  )
+  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(text) || hasReleaseGate(text))
     return "deploy";
   if (
     /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
