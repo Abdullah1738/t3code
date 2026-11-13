@@ -2999,3 +2999,134 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
     }),
   );
 });
+
+it.layer(layerTest)("unstarted task-owned follow-ups after restart", (it) => {
+  const cases = (["cancelled", "interrupted"] as const).flatMap((status) =>
+    [2, 4].flatMap((ordinal) =>
+      (["none", "partial", "nested", "native"] as const).map((work) => ({ status, ordinal, work })),
+    ),
+  );
+  it.effect.each(cases)(
+    "handles $status follow-up $ordinal with $work work",
+    ({ status, ordinal, work }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const name = `unstarted-${status}-${ordinal}-${work}`;
+        const threadId = ThreadId.make(`thread:${name}:parent`);
+        const projectId = ProjectId.make(`project:${name}`);
+        const runId = RunId.make(`run:${name}:parent`);
+        const rootNodeId = NodeId.make(`node:${name}:parent`);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make(`node:${name}:seed`),
+          deliveryState: "delivered",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name,
+          completionWake: "always",
+          continuationPending: true,
+          runStatus: status,
+          ...(work === "partial" ? { partialResult: "Pending follow-up result" } : {}),
+          now,
+        });
+        const before = yield* orchestrator.getThreadProjection(child.childThreadId);
+        const current = before.runs[0]!;
+        const parent = yield* orchestrator.getThreadProjection(threadId);
+        const task = parent.subagents.find((row) => row.id === child.taskId)!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${name}:origin`),
+              type: "thread.metadata-updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: {
+                ...before.thread,
+                forkedFrom: { type: "node", nodeId: NodeId.make(`${name}:previous-task`) },
+              },
+            },
+            {
+              id: EventId.make(`${name}:followup`),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: { ...current, ordinal, startedAt: null, delegatedTaskId: child.taskId },
+            },
+            {
+              id: EventId.make(`${name}:previous-run`),
+              type: "run.created",
+              threadId: child.childThreadId,
+              occurredAt: now,
+              payload: {
+                ...current,
+                id: RunId.make(`${name}:previous-run`),
+                ordinal: 1,
+                status: "completed",
+                delegatedTaskId: NodeId.make(`${name}:previous-task`),
+              },
+            },
+            ...(work === "nested"
+              ? [
+                  {
+                    id: EventId.make(`${name}:nested`),
+                    type: "subagent.updated" as const,
+                    threadId: child.childThreadId,
+                    occurredAt: now,
+                    payload: {
+                      ...task,
+                      id: NodeId.make(`${name}:nested`),
+                      threadId: child.childThreadId,
+                      runId: current.id,
+                      origin: "provider_native" as const,
+                      childThreadId: null,
+                      completionDelivery: undefined,
+                      status: "running" as const,
+                    },
+                  },
+                ]
+              : []),
+            ...(work === "native"
+              ? [
+                  {
+                    id: EventId.make(`${name}:native`),
+                    type: "provider-thread.updated" as const,
+                    threadId: child.childThreadId,
+                    occurredAt: now,
+                    payload: {
+                      ...parent.providerThreads[0]!,
+                      id: ProviderThreadId.make(`${name}:native`),
+                      appThreadId: child.childThreadId,
+                      pendingBackgroundTasks: [
+                        { taskId: `${name}:native`, kind: "command" as const },
+                      ],
+                    },
+                  },
+                ]
+              : []),
+          ],
+        });
+        const pending = yield* orchestrator.delegatedTaskResultPending(
+          child.childThreadId,
+          child.taskId,
+        );
+        assert.equal(pending, work !== "none");
+        yield* orchestrator.recoverDelegatedTasks;
+        const recovered = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+          (row) => row.id === child.taskId,
+        )!;
+        assert.equal(recovered.status, work === "none" ? status : "running");
+        if (work === "none") assert.isNotNull(recovered.result);
+        else assert.isNull(recovered.result);
+      }),
+  );
+});

@@ -62,6 +62,7 @@ it.effect.each([
   "native_background",
   "external_interrupt",
   "restart_without_result",
+  "restart_unstarted_followup",
   "restart_legacy_without_result",
   "restart_legacy_continuation_with_result",
   "restart_disposed_queue",
@@ -302,6 +303,11 @@ it.effect.each([
           } else {
             const commandId = CommandId.make("command:runtime-reconcile:shutdown:test-child");
             const cutRun = { ...run };
+            const unstartedFollowup = scenario === "restart_unstarted_followup";
+            if (unstartedFollowup) {
+              cutRun.ordinal = 2;
+              cutRun.startedAt = null;
+            }
             if (
               scenario === "restart_legacy_without_result" ||
               scenario === "restart_legacy_continuation_with_result"
@@ -334,6 +340,36 @@ it.effect.each([
                     completedAt: now,
                   },
                 },
+                ...(unstartedFollowup
+                  ? [
+                      {
+                        id: EventId.make("unstarted-followup:origin"),
+                        type: "thread.metadata-updated" as const,
+                        threadId: task.childThreadId!,
+                        occurredAt: now,
+                        payload: {
+                          ...before.thread,
+                          forkedFrom: {
+                            type: "node" as const,
+                            nodeId: NodeId.make("node:previous-task"),
+                          },
+                        },
+                      },
+                      {
+                        id: EventId.make("unstarted-followup:previous-run"),
+                        type: "run.created" as const,
+                        threadId: task.childThreadId!,
+                        occurredAt: now,
+                        payload: {
+                          ...run,
+                          id: RunId.make("run:previous-task"),
+                          status: "completed" as const,
+                          delegatedTaskId: NodeId.make("node:previous-task"),
+                          completedAt: now,
+                        },
+                      },
+                    ]
+                  : []),
                 ...(scenario === "restart_legacy_continuation_with_result"
                   ? [
                       {
@@ -403,7 +439,7 @@ it.effect.each([
               );
               assert.lengthOf(
                 (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs,
-                1,
+                unstartedFollowup ? 2 : 1,
               );
             }
             if (scenario === "restart_disposed_queue") {

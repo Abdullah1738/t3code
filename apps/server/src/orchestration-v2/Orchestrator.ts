@@ -11467,7 +11467,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           turnItemTypes: ["assistant_message", "error"],
         },
       );
-      if (delegatedTaskProgress({ ...child, runs }).state !== "result_available") return true;
+      if (delegatedTaskProgress({ ...child, runs }).hasPendingWork) return true;
       // A queued recovery effect alone is not work or a result. In particular,
       // restart teardown can leave that effect pending after cancelling the turn.
       return resultChain.some((run) => {
