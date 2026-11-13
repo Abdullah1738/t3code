@@ -7535,6 +7535,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       (yield* Ref.get(activeTurn)) !== context ||
                       (yield* Ref.get(queryContext)) !== liveQuery ||
                       liveQuery.stopping ||
+                      turnFinalizations.has(context) ||
                       context.compaction?.id !== compactionId ||
                       context.compaction?.status !== "running"
                     )
@@ -7559,14 +7560,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                         message: "Claude compaction made no progress for 5 min.",
                       }),
                     );
-                    yield* endSubagentCallsOfClosedQuery(liveQuery.nativeThreadId, "failed");
+                    yield* endSubagentCallsOfClosedQuery(liveQuery, "failed");
                     yield* liveQuery.query.close.pipe(
                       Effect.timeout("10 seconds"),
                       Effect.ignore,
                       Effect.forkIn(sessionScope),
                     );
                     return 0;
-                  }),
+                  }).pipe(turnControlLock.withPermits(1)),
                 );
               }
             }).pipe(Effect.raceFirst(Deferred.await(stop)), Effect.forkIn(sessionScope));

@@ -7192,6 +7192,92 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
+    it.effect("keeps a replacement turn and native task live after watchdog disposal", () =>
+      Effect.gen(function* () {
+        const closed = yield* Deferred.make<void>();
+        const h = yield* start({
+          freshQueueOnReopen: true,
+          close: () => Deferred.succeed(closed, undefined),
+        });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("5 minutes");
+        const timedOut = yield* Queue.take(h.terminalReceipts);
+        assert.equal(timedOut.failure?.code, "compaction_no_progress");
+        yield* Deferred.await(closed);
+        const next = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("after-compaction-timeout"),
+          providerTurnOrdinal: 2,
+          text: "Recover.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(next);
+        const replacementQueue = h.processQueues[1]!;
+        yield* Queue.offer(
+          replacementQueue,
+          makeSubagentTaskStartedFrame({
+            taskId: "replacement-task",
+            toolUseId: "replacement-agent",
+            uuid: "replacement-started",
+          }),
+        );
+        const task = yield* Queue.take(h.subagentReceipts);
+        assert.equal(task.subagent.status, "running");
+        assert.equal(task.subagent.runId, next.runId);
+        // Both a late result and stream exit belong to the fenced process.
+        yield* h.offerAndWait(makeResultFrame({ uuid: "discarded-result", result: "Too late." }));
+        yield* Queue.shutdown(h.sdkMessages);
+        yield* h.awaitQueryCleanup;
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.isTrue(yield* h.hasPendingBackgroundWork);
+        const latest = h.events.findLast((event) => event.type === "subagent.updated");
+        assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "running");
+        const conflict = yield* h.runtime.startTurn(h.input).pipe(Effect.flip);
+        assert.isTrue(isProtocolError(conflict.cause));
+        if (isProtocolError(conflict.cause))
+          assert.equal(conflict.cause.activeTurn?.runId, next.runId);
+        yield* Queue.offer(
+          replacementQueue,
+          makeResultFrame({ uuid: "replacement-result", result: "Recovered." }),
+        );
+        const completed = yield* Queue.take(h.terminalReceipts);
+        assert.equal(completed.status, "completed");
+        assert.notEqual(completed.providerTurnId, timedOut.providerTurnId);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
+    it.effect("lets an admitted Stop own compaction shutdown without a watchdog terminal", () =>
+      Effect.gen(function* () {
+        const interrupted = yield* Deferred.make<void>();
+        const h = yield* start({
+          interrupt: Deferred.succeed(interrupted, undefined).pipe(Effect.andThen(Effect.never)),
+          close: Queue.shutdown,
+        });
+        yield* h.offerAndWait(compacting);
+        yield* TestClock.adjust("4 minutes");
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const stop = yield* h.runtime
+          .interruptTurn({
+            providerThread: h.providerThread,
+            providerTurnId: idAllocator.derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${h.input.attemptId}`,
+            }),
+          })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(interrupted);
+        yield* TestClock.adjust("1 minute");
+        yield* Fiber.join(stop);
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "interrupted");
+        assert.equal(compactions(h.events).at(-1)?.status, "interrupted");
+        yield* TestClock.adjust("5 minutes");
+        assert.lengthOf(h.terminalEvents(), 1);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
+    );
+
     it.effect("fails stalled compaction after five minutes without SDK progress", () =>
       Effect.gen(function* () {
         const closed = yield* Deferred.make<void>();
