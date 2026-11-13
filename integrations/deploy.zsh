@@ -34,6 +34,16 @@ rsync "${flags[@]}" \
   --exclude 'verification*' --exclude bin --exclude .gitignore --exclude README.md --exclude docs \
   "$src" "$dst"
 
+if [[ "$name" == robob-watch ]]; then
+  # Watcher directories also contain private state: sync only this source allowlist.
+  rsync "${flags[@]}" --relative \
+    "$src"./watchers/meds-nag/check.py \
+    "$src"./watchers/meds-nag/took.py \
+    "$src"./watchers/forge-workouts/check.py \
+    "$src"./watchers/gym-nudge/check.py \
+    "$dst"
+fi
+
 if [[ "$name" == memory-system ]]; then
   export_plist="com.abdullah.opencode-readonly.plist"
   export_src="${src}scripts/$export_plist"
