@@ -2544,7 +2544,7 @@ const make = Effect.gen(function* () {
   });
 
   // Logged when a card leaves a thread that got too long; a repeat inside an hour is flagged.
-  const FRESH_START = "Thread too long; the next run starts on a fresh thread";
+  const FRESH_START = Retries.FRESH_START_EVENT;
   const COMPACT_FIRST = "Thread too long; compacting it before the next run";
   const happenedRecently = (card: KanbanCard, at: string, prefix: string) =>
     store

@@ -197,7 +197,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): each ask with asked/answered times and minutes to answer (p50/p90/max), review rounds and verdicts per card, hours in each stage and the longest spans, stalls and how long they lasted, run failures by model, threads started and restarts, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Read from the cards' stored history; long lists are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
   {
     boardId: BoardRef,
     since: Schema.optional(describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until.")),

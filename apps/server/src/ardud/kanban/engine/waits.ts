@@ -572,6 +572,21 @@ export const waitingFor = (wait: KanbanWait, cards?: WaitFacts["cards"]): string
 /** A wait that ended, with why: "Wait ended: trading-core#544 merged". */
 export const waitEndedBody = (reason: string) => `Wait ended: ${reason}`;
 
+/**
+ * Whether a stored event set or ended a wait, in either form it is stored under
+ * (its own kind, or the plain edit used while `WAIT_EVENT_KINDS_LIVE` is off).
+ */
+export const waitEventOf = (
+  event: Pick<KanbanCardEvent, "kind" | "body">,
+): "set" | "end" | null => {
+  if (event.kind === "wait_set") return "set";
+  if (event.kind === "wait_cleared" || event.kind === "wait_expired") return "end";
+  if (event.kind !== "edited" || event.body === null) return null;
+  if (event.body.startsWith("Waiting ")) return "set";
+  if (event.body.startsWith("Wait ended: ") || event.body.startsWith("Wait expired: ")) return "end";
+  return null;
+};
+
 /** A wait someone cleared with card_wait clear. */
 export const waitClearedBody = (wait: KanbanWait, cards?: WaitFacts["cards"]) =>
   waitEndedBody(`cleared by hand (was waiting ${waitingFor(wait, cards)})`);

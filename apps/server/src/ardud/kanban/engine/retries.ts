@@ -46,6 +46,8 @@ export const RETRY_SETTLE_MS = 2 * 60_000;
 
 /** Card event when a failed run's card goes back to its queue for its one retry; a board shows "Retrying". */
 export const RETRYING_EVENT = "Run failed, retrying once";
+/** Card event when a run fails because its thread got too long and the card leaves that thread. */
+export const FRESH_START_EVENT = "Thread too long; the next run starts on a fresh thread";
 export const NO_VERDICT_RESTARTED_EVENT = "Reviewer stopped without a verdict, retrying once";
 export const NO_VERDICT_REASON = "Reviewer stopped without a verdict";
 

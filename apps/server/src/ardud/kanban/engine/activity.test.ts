@@ -59,6 +59,26 @@ const card = (id: string, patch: Partial<KanbanCard> = {}): KanbanCard => ({
   ...patch,
 });
 
+const waitOn: NonNullable<KanbanCard["wait"]> = {
+  on: "ci",
+  script: null,
+  args: null,
+  pr: "https://example.com/pr/1",
+  card: null,
+  ask: null,
+  until: null,
+  sinceHead: null,
+  note: "CI",
+  by: { _tag: "owner" },
+  at: "2026-11-11T00:00:00.000Z",
+  wakeRole: null,
+  expiredAt: null,
+  status: null,
+  lastCheckedAt: null,
+  failures: 0,
+  problem: null,
+};
+
 let nextId = 1;
 const event = (
   cardId: string,
@@ -230,6 +250,19 @@ describe("compact rows", () => {
     expect(huge.rows).toHaveLength(1);
     expect(huge.hasMore).toBe(false);
     expect(huge.nextAfter).toBeNull();
+    // Inside a wrapper, the whole reply stays under the limit, not just the rows.
+    const many = Array.from({ length: 400 }, (_, index) => ({
+      number: index + 1,
+      title: "z".repeat(300),
+    }));
+    const wrapped = Activity.pageRowsInReply(many, 0, 500, (cards, cursor) => ({
+      legend: "w".repeat(5_000),
+      cards,
+      page: cursor,
+    }));
+    expect(JSON.stringify(wrapped).length).toBeLessThanOrEqual(Activity.COMPACT_READ_CHARS);
+    expect(JSON.stringify(wrapped).length).toBeGreaterThan(Activity.COMPACT_READ_CHARS - 1_000);
+    expect(wrapped.page.hasMore).toBe(true);
     const limited = Activity.pageRows(rows, 0, 3);
     expect(limited.rows.map((row) => row.number)).toEqual([1, 2, 3]);
     expect(limited.nextAfter).toBe(3);
@@ -246,10 +279,13 @@ describe("rollup", () => {
       closedWithoutAnswer: 1,
       answerMinutes: { p50: 30, p90: 30, max: 30 },
     });
-    expect(result.asks.items.map((item) => [item.card, item.id, item.minutes])).toEqual([
+    expect(result.asks.answeredItems.map((item) => [item.card, item.id, item.minutes])).toEqual([
       [1, "q1", 30],
-      [1, "q2", undefined],
+    ]);
+    // The rest newest first, so a long day cuts the oldest.
+    expect(result.asks.others.items.map((item) => [item.card, item.id, item.minutes])).toEqual([
       [1, "q3", 240],
+      [1, "q2", undefined],
     ]);
   });
 
@@ -283,6 +319,7 @@ describe("rollup", () => {
   it("puts run failures on the model of the thread that failed", () => {
     expect(result.failures).toEqual({
       count: 1,
+      byKind: { stalled: 1 },
       byPool: { [Rules.poolKey(opus)]: { count: 1, reasons: ["provider boom"] } },
     });
   });
@@ -317,17 +354,24 @@ describe("rollup", () => {
     });
     expect(stuckRun.pools.used).toEqual(result.pools.used);
     // Its time still counts as time in review.
-    expect(stuckRun.stages.hours.in_review!.hours - result.stages.hours.in_review!.hours).toBeCloseTo(24, 1);
+    expect(
+      stuckRun.stages.hours.in_review!.hours - result.stages.hours.in_review!.hours,
+    ).toBeCloseTo(24, 1);
     // A thread that ended mid-span stops holding the slot then.
     const released = { ...parked, activeThreadId: null, activePool: null };
     const ended = Activity.rollup({
       ...input,
       cards: [busy, released, old],
-      threads: [...threads.filter((link) => link.threadId !== "tb"), thread("tb", "b", "work", opus, before, t("06:00"))],
+      threads: [
+        ...threads.filter((link) => link.threadId !== "tb"),
+        thread("tb", "b", "work", opus, before, t("06:00")),
+      ],
     });
     expect(ended.pools.used[Rules.poolKey(opus)]![5]).toBe(1);
     expect(ended.pools.used[Rules.poolKey(opus)]![12]).toBe(0);
-    expect(ended.stages.withoutThread.items).toEqual([{ card: 2, stage: "working", since: "2026-11-10T00:00Z" }]);
+    expect(ended.stages.withoutThread.items).toEqual([
+      { card: 2, stage: "working", since: "2026-11-10T00:00Z" },
+    ]);
     // Never marked ended and no active thread: it held nothing after its last event (none here).
     const unmarked = Activity.rollup({ ...input, cards: [busy, released, old] });
     expect(unmarked.pools.used[Rules.poolKey(opus)]![0]).toBe(0);
@@ -347,9 +391,10 @@ describe("rollup", () => {
       activeThreadId: ThreadId.make("tw2"),
       activePool: Rules.poolKey(opus),
     });
+    // Stored as waits are today: plain edits (WAIT_EVENT_KINDS_LIVE is off).
     const waitEvents = [
-      event("w", t("02:00"), "wait_set", null, null, "ci"),
-      event("w", t("05:00"), "wait_cleared", null, null, "ci passed"),
+      event("w", t("02:00"), "edited", null, null, "Waiting for CI on app#12: ci"),
+      event("w", t("05:00"), "edited", null, null, "Wait ended: CI on app#12 passed"),
     ];
     const shared = thread("tw2", "w", "work", opus, before);
     const run = Activity.rollup({
@@ -364,10 +409,36 @@ describe("rollup", () => {
     expect(row[0]).toBe(1);
     expect(row[3]).toBe(1);
     expect(row[12]).toBe(1);
-    const alone = Activity.rollup({ window, cards: [waiting], events: waitEvents, threads: [shared], pools });
+    const alone = Activity.rollup({
+      window,
+      cards: [waiting],
+      events: waitEvents,
+      threads: [shared],
+      pools,
+    });
     expect(alone.pools.used[Rules.poolKey(opus)]![1]).toBe(1);
     expect(alone.pools.used[Rules.poolKey(opus)]![3]).toBe(0);
     expect(alone.pools.used[Rules.poolKey(opus)]![5]).toBe(1);
+    // The wait kinds, once live, read the same.
+    const kinds = [
+      event("w", t("02:00"), "wait_set", null, null, "Waiting for CI on app#12: ci"),
+      event("w", t("05:00"), "wait_cleared", null, null, "Wait ended: cleared by hand"),
+    ];
+    expect(
+      Activity.rollup({ window, cards: [waiting], events: kinds, threads: [shared], pools }).pools
+        .used,
+    ).toEqual(alone.pools.used);
+    // A wait set before the window, still set, holds nothing all window; one that expired counts.
+    const parkedWait = { ...waiting, wait: { ...waitOn, at: before } };
+    expect(
+      Activity.rollup({ window, cards: [parkedWait], events: [], threads: [shared], pools }).pools
+        .used,
+    ).toEqual({});
+    const expired = { ...waiting, wait: { ...waitOn, at: before, expiredAt: before } };
+    expect(
+      Activity.rollup({ window, cards: [expired], events: [], threads: [shared], pools }).pools
+        .used[Rules.poolKey(opus)]![0],
+    ).toBe(1);
   });
 
   it("gives median, p95 and max dwell per stage from each stage's real start", () => {
@@ -392,25 +463,7 @@ describe("rollup", () => {
       number: 11,
       stage: "working",
       movedAt: "2026-11-11T00:00:00.000Z",
-      wait: {
-        on: "ci",
-        script: null,
-        args: null,
-        pr: "https://example.com/pr/1",
-        card: null,
-        ask: null,
-        until: null,
-        sinceHead: null,
-        note: "CI",
-        by: { _tag: "owner" },
-        at: "2026-11-11T00:00:00.000Z",
-        wakeRole: null,
-        expiredAt: null,
-        status: null,
-        lastCheckedAt: null,
-        failures: 0,
-        problem: null,
-      },
+      wait: waitOn,
     });
     const stalled = card("s", {
       number: 12,
@@ -442,7 +495,13 @@ describe("rollup", () => {
     const run = Activity.rollup({
       ...input,
       cards: [...input.cards, asking],
-      threads: [...threads, evaluator("e1", t("01:00")), evaluator("e2", t("09:00")), evaluator("e3", t("23:00")), evaluator("e0", before)],
+      threads: [
+        ...threads,
+        evaluator("e1", t("01:00")),
+        evaluator("e2", t("09:00")),
+        evaluator("e3", t("23:00")),
+        evaluator("e0", before),
+      ],
     });
     // #15's q2 and #1's q3 are 4 hours old: not listed.
     expect(run.asks.openOver6h).toEqual({
@@ -453,6 +512,205 @@ describe("rollup", () => {
       count: 3,
       cardsWith2OrMore: { items: [{ card: 15, wakes: 3 }] },
     });
+  });
+
+  it("counts retried, fresh-thread and no-verdict runs as failures, not a fresh start someone asked for", () => {
+    const failing = card("f", { number: 30, stage: "todo", model: opus });
+    const asked = {
+      ...event(
+        "f",
+        t("07:00"),
+        "moved",
+        "working",
+        "todo",
+        "Thread too long; the next run starts on a fresh thread: owner said so",
+      ),
+      actor: { _tag: "owner" as const },
+    };
+    const events = [
+      event("f", t("01:00"), "moved", "working", "todo", "Run failed, retrying once: rate limited"),
+      event(
+        "f",
+        t("02:00"),
+        "moved",
+        "working",
+        "todo",
+        "Thread too long; the next run starts on a fresh thread: context full",
+      ),
+      event(
+        "f",
+        t("03:00"),
+        "moved",
+        "working",
+        "todo",
+        "Thread too long; the next run starts on a fresh thread: compaction failed",
+      ),
+      event(
+        "f",
+        t("04:00"),
+        "moved",
+        "in_review",
+        "needs_review",
+        "Reviewer stopped without a verdict, retrying once",
+      ),
+      event("f", t("05:00"), "flagged", "working", "todo", "Run failed: provider boom"),
+      event("f", t("06:00"), "moved", "todo", "working"),
+      asked,
+    ];
+    const run = Activity.rollup({ window, cards: [failing], events, threads: [], pools });
+    expect(run.failures.count).toBe(5);
+    expect(run.failures.byKind).toEqual({ retried: 1, fresh_thread: 2, no_verdict: 1, stalled: 1 });
+    expect(run.failures.byPool).toEqual({
+      [Rules.poolKey(opus)]: {
+        count: 4,
+        reasons: ["rate limited", "context full", "compaction failed"],
+      },
+      "review (model unknown)": {
+        count: 1,
+        reasons: ["Reviewer stopped without a verdict, retrying once"],
+      },
+    });
+    const row = Activity.compactRow(failing, Activity.groupEvents(events).get("f") ?? [], window);
+    expect(row).toMatchObject({ failures: 5, lastFailure: "provider boom" });
+  });
+
+  it("ends a stall at whatever cleared it: a move, a verdict, a wait, a new flag", () => {
+    const at = (cardId: string, list: Array<KanbanCardEvent>, patch: Partial<KanbanCard> = {}) =>
+      Activity.rollup({
+        window,
+        cards: [card(cardId, { number: 40, ...patch })],
+        events: list,
+        threads: [],
+        pools,
+      }).stalls.items;
+    // An answered ask or a retry moves it, sometimes within the same stage.
+    expect(
+      at("m", [
+        event("m", t("01:00"), "flagged", "working", "todo", "Run failed: x"),
+        event("m", t("01:30"), "moved", "todo", "todo", "Owner replied"),
+      ]),
+    ).toEqual([
+      {
+        card: 40,
+        at: "2026-11-12T01:00Z",
+        kind: "run_failed",
+        until: "2026-11-12T01:30Z",
+        minutes: 30,
+      },
+    ]);
+    expect(
+      at("r", [
+        event(
+          "r",
+          t("01:00"),
+          "flagged",
+          "in_review",
+          "in_review",
+          "Reviewer stopped without a verdict",
+        ),
+        event("r", t("02:00"), "review", "in_review", "todo", "- [P2] x"),
+      ])[0],
+    ).toMatchObject({ kind: "flagged", until: "2026-11-12T02:00Z", minutes: 60 });
+    expect(
+      at("w", [
+        event("w", t("01:00"), "flagged", "working", "todo", "Run failed: x"),
+        event("w", t("01:10"), "edited", null, null, "Waiting for CI on app#12"),
+      ])[0],
+    ).toMatchObject({ until: "2026-11-12T01:10Z", minutes: 10 });
+    // A second flag ends the first; the second is still on the card.
+    expect(
+      at(
+        "f",
+        [
+          event("f", t("01:00"), "flagged", "working", "todo", "Run failed: x"),
+          event("f", t("03:00"), "flagged", "todo", "todo", "Run failed: y"),
+        ],
+        { stalled: { reason: "Run failed: y", by: { _tag: "owner" }, at: t("03:00") } },
+      ),
+    ).toEqual([
+      {
+        card: 40,
+        at: "2026-11-12T01:00Z",
+        kind: "run_failed",
+        until: "2026-11-12T03:00Z",
+        minutes: 120,
+      },
+      { card: 40, at: "2026-11-12T03:00Z", kind: "run_failed", ongoing: true, minutes: 1260 },
+    ]);
+    // Cleared with nothing in the history and no stall now: no made-up duration.
+    expect(
+      at("u", [event("u", t("01:00"), "flagged", "working", "todo", "Run failed: x")]),
+    ).toEqual([{ card: 40, at: "2026-11-12T01:00Z", kind: "run_failed", endUnrecorded: true }]);
+  });
+
+  it("counts a card that sat all day in needs_review or needs_owner", () => {
+    const queued = card("q", { number: 50, stage: "needs_review", movedAt: before });
+    const owner = card("o", {
+      number: 51,
+      stage: "needs_owner",
+      movedAt: "2026-11-11T12:00:00.000Z",
+    });
+    const run = Activity.rollup({ window, cards: [queued, owner], events: [], threads: [], pools });
+    expect(run.stages.hours.needs_review).toMatchObject({ hours: 24, spans: 1 });
+    expect(run.stages.hours.needs_owner).toMatchObject({ hours: 24, spans: 1 });
+    expect(run.stages.longest.map((row) => [row.card, row.stage])).toEqual([
+      [50, "needs_review"],
+      [51, "needs_owner"],
+    ]);
+    expect(run.pools.used).toEqual({});
+  });
+
+  it("an old thread never marked ended stops when the next one starts; only the active one runs on", () => {
+    const restarted = card("r", {
+      number: 60,
+      stage: "working",
+      activeThreadId: ThreadId.make("new"),
+      activePool: Rules.poolKey(opus),
+    });
+    const run = Activity.rollup({
+      window,
+      cards: [restarted],
+      events: [],
+      threads: [
+        thread("old1", "r", "work", opus, before),
+        thread("old2", "r", "work", opus, t("04:00")),
+        thread("new", "r", "work", opus, t("08:00")),
+      ],
+      pools,
+    });
+    // One slot all day, never two or three.
+    expect(run.pools.used[Rules.poolKey(opus)]!.every((value) => value === 1)).toBe(true);
+  });
+
+  it("a card left in review with a stale thread holds a slot only while that thread wrote events", () => {
+    const stale = card("s", { number: 61, stage: "in_review", movedAt: before });
+    const link = thread("rev-old", "s", "review", sonnet, before);
+    const byEvaluator = {
+      ...event("s", t("20:00"), "comment", null, null, "chasing"),
+      actor: { _tag: "evaluator" as const, threadId: ThreadId.make("ev") },
+    };
+    const quiet = Activity.rollup({
+      window,
+      cards: [stale],
+      events: [byEvaluator],
+      threads: [link],
+      pools,
+    });
+    expect(quiet.pools.used).toEqual({});
+    const byReviewer = {
+      ...event("s", t("05:00"), "comment", null, null, "still reading"),
+      actor: { _tag: "thread" as const, threadId: ThreadId.make("rev-old") },
+    };
+    const wrote = Activity.rollup({
+      window,
+      cards: [stale],
+      events: [byReviewer, byEvaluator],
+      threads: [link],
+      pools,
+    });
+    const row = wrote.pools.used[Rules.poolKey(sonnet)]!;
+    expect(row[4]).toBe(1);
+    expect(row[5]).toBe(0);
   });
 
   it("carries no card titles or text", () => {
@@ -478,7 +736,16 @@ describe("rollup", () => {
       pools,
     });
     const text = JSON.stringify(run);
-    for (const words of ["SECRET", "PROMPT", "DESCRIPTION", "STALL", "ASK WORDS", "COMMENT", "REVIEW WORDS", "FLAG"])
+    for (const words of [
+      "SECRET",
+      "PROMPT",
+      "DESCRIPTION",
+      "STALL",
+      "ASK WORDS",
+      "COMMENT",
+      "REVIEW WORDS",
+      "FLAG",
+    ])
       expect(text).not.toContain(words);
   });
 
@@ -510,7 +777,8 @@ describe("rollup", () => {
     const big = Activity.rollup({ window, cards, events, threads: [], pools });
     expect(JSON.stringify(big).length).toBeLessThan(60_000);
     expect(big.asks.answered).toBe(300);
-    expect(big.asks.items.length + (big.asks.more ?? 0)).toBe(300);
+    // Every ask answered in the window is listed, however long the day.
+    expect(big.asks.answeredItems).toHaveLength(300);
     expect(big.stalls.count).toBe(300);
     expect(big.reviews.rounds).toBe(300);
   });
@@ -524,7 +792,9 @@ describe("card_get events page", () => {
 
   it("defaults to the newest 20 and pages back to the first with no gaps or repeats", () => {
     const first = Activity.pageCardEvents(rest, events, undefined);
-    expect(first.events.map((entry) => entry.id)).toEqual(events.slice(-20).map((entry) => entry.id));
+    expect(first.events.map((entry) => entry.id)).toEqual(
+      events.slice(-20).map((entry) => entry.id),
+    );
     expect(first.eventsTotal).toBe(50);
     expect(first.olderEvents).toBe(events[30]!.id);
     const seen = [...first.events];
@@ -540,7 +810,9 @@ describe("card_get events page", () => {
   it("all returns every event; limit is capped at 200", () => {
     expect(Activity.pageCardEvents(rest, events, "all").events).toHaveLength(50);
     expect(Activity.pageCardEvents(rest, events, { limit: 5 }).events).toHaveLength(5);
-    const many = Array.from({ length: 300 }, () => event("z", t("01:00"), "moved", "todo", "working"));
+    const many = Array.from({ length: 300 }, () =>
+      event("z", t("01:00"), "moved", "todo", "working"),
+    );
     expect(Activity.pageCardEvents(rest, many, { limit: 1_000 }).events).toHaveLength(200);
   });
 

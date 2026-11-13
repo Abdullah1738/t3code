@@ -419,8 +419,7 @@ const handlers = {
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
-          const page = Activity.pageRows(rows, input.after ?? 0, limit);
-          return {
+          return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
             board: {
               id: board.id,
               name: board.name,
@@ -428,11 +427,11 @@ const handlers = {
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
               pools: read.pools.map((pool) => ({ key: pool.key, slots: pool.slots })),
-              cards: page.rows,
-              page: { limit, hasMore: page.hasMore, nextAfter: page.nextAfter },
+              cards,
+              page: { limit, ...cursor },
             },
             prompts: "omitted; card_get returns a card's prompt",
-          };
+          }));
         }
         const snapshot = yield* service.replySnapshot(board.id, {
           after: input.after ?? 0,

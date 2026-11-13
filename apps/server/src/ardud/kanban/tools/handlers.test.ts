@@ -1033,7 +1033,7 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
 
     const compact = yield* call(thread, "board_get", { since });
     assert.isFalse(compact.isError, compact.text);
-    assert.isBelow(compact.text.length, 60_000);
+    assert.isAtMost(compact.text.length, 50_000);
     const view = compact.structured.board as {
       activeCards: number;
       cards: Array<{
@@ -1113,14 +1113,14 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
     assert.isBelow(rollup.text.length, 60_000);
     const activity = rollup.structured.activity as {
       boardId: string;
-      asks: { answered: number; items: Array<{ card: number; id: string; minutes?: number }> };
+      asks: { answered: number; answeredItems: Array<{ card: number; id: string; minutes?: number }> };
       cards: { active: number };
     };
     assert.strictEqual(activity.boardId, board.id);
     assert.strictEqual(activity.cards.active, 1);
     assert.strictEqual(activity.asks.answered, 1);
-    assert.deepStrictEqual(activity.asks.items[0], {
-      ...activity.asks.items[0],
+    assert.deepStrictEqual(activity.asks.answeredItems[0], {
+      ...activity.asks.answeredItems[0],
       card: busy.number,
       id: "q1",
       minutes: 20,
