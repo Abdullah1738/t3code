@@ -15,6 +15,13 @@ export interface ReadonlyReplicaOptions {
   readonly rebuildNoticeMs?: number;
 }
 
+export interface ReadonlyExportMetrics {
+  readonly phaseMs: Record<string, number>;
+  readonly phaseSteps: Record<string, number>;
+  readonly identityRows: number;
+  readonly identityLagMaxMs: number;
+}
+
 /** Self-contained for the packaged server's eval worker. No live write handle. */
 export function createReadonlyReplica(
   sqlite: typeof NodeSqlite,
@@ -22,6 +29,21 @@ export function createReadonlyReplica(
   path: typeof NodePath,
   options: ReadonlyReplicaOptions,
 ) {
+  let metrics: ReadonlyExportMetrics = {
+    phaseMs: {},
+    phaseSteps: {},
+    identityRows: 0,
+    identityLagMaxMs: 0,
+  };
+  const measure = <A>(phase: string, body: () => A): A => {
+    const started = Date.now();
+    try {
+      return body();
+    } finally {
+      metrics.phaseMs[phase] = (metrics.phaseMs[phase] ?? 0) + Date.now() - started;
+      metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + 1;
+    }
+  };
   const batchSize = Math.max(1, Math.min(options.batchSize ?? 100, 500));
   const rebuildBackoffMs = options.rebuildBackoffMs ?? 6 * 60 * 60 * 1000;
   const rebuildNoticeMs = options.rebuildNoticeMs ?? 60 * 60 * 1000;
@@ -259,10 +281,22 @@ export function createReadonlyReplica(
             '{"cursor":0,"done":false}',
         ),
       );
-    // After bootstrap, a routine cycle runs in one replica write transaction.
+    // Auxiliary pages are staged privately before the atomic publication transaction.
     // WAL readers keep the previous completed generation (ready=1, old
     // updated_at) until it commits, so readiness is not cleared per cycle.
     let cycleTransaction = false;
+    let cycleSession: NodeSqlite.Session | undefined;
+    const beginCycle = () => {
+      out.exec("BEGIN IMMEDIATE");
+      cycleTransaction = true;
+      cycleSession = out.createSession();
+    };
+    const commitCycle = () => {
+      cycleSession?.close();
+      cycleSession = undefined;
+      out.exec("COMMIT");
+      cycleTransaction = false;
+    };
     let invalidated: string | undefined;
     const transaction = <A>(body: () => A) => {
       if (cycleTransaction) {
@@ -293,6 +327,8 @@ export function createReadonlyReplica(
     };
     const abortCycle = () => {
       if (!cycleTransaction) return false;
+      cycleSession?.close();
+      cycleSession = undefined;
       cycleTransaction = false;
       try {
         out.exec("ROLLBACK");
@@ -402,7 +438,7 @@ export function createReadonlyReplica(
         out.exec(bookkeeping);
         out
           .prepare(
-            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key IN ('archive_deletion_sequence','resetting_events')",
+            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key IN ('archive_deletion_sequence','resetting_events')",
           )
           .run();
         meta("ready", "0");
@@ -563,6 +599,44 @@ export function createReadonlyReplica(
         )
         .all(cursor, batchSize);
     };
+    // TEMP staging keeps auxiliary page pacing outside the publication lock.
+    // No partial auxiliary generation is visible to outside readers.
+    const auxiliaryStages = new Map(
+      auxiliary.map((name) => {
+        const table = tables.get(name)!;
+        const stage = `readonly_stage_${name}`;
+        out.exec(
+          sourceSchemas
+            .get(name)!
+            .replace(
+              /^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i,
+              `CREATE TEMP TABLE ${q(stage)}`,
+            ),
+        );
+        return [
+          name,
+          {
+            stage,
+            insert: out.prepare(
+              `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
+            ),
+          },
+        ];
+      }),
+    );
+    const applyAuxiliary = () => {
+      for (const name of auxiliary) {
+        const { stage } = auxiliaryStages.get(name)!;
+        const { primary, columns } = tables.get(name)!;
+        const values = columns.filter((c) => c !== primary);
+        out.exec(`INSERT INTO main.${q(name)} (${columns.map(q)}) SELECT ${columns.map(q)} FROM temp.${q(stage)} WHERE 1
+          ON CONFLICT(${q(primary)}) DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`)}
+          WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`);
+        out.exec(
+          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)})`,
+        );
+      }
+    };
     const upsertEvent = out.prepare("INSERT OR REPLACE INTO orchestration_events VALUES (?,?,?,?)");
     const routes: Record<string, string> = {
       run: "runs",
@@ -574,10 +648,9 @@ export function createReadonlyReplica(
     };
     let cycleTarget: number | undefined;
     let auxiliaryCapturedAt: number | undefined;
-    let auxiliaryGeneration = nextGeneration();
+    nextGeneration();
     let auxiliaryIndex = 0,
       auxiliaryCursor = 0,
-      pruning = false,
       reconcileIndex = 0,
       closed = false;
     const sourceSchemaVersion = Number(
@@ -614,7 +687,6 @@ export function createReadonlyReplica(
         .run(name, generation, batchSize);
       return { pruneCursor: Number(rows.at(-1)?.__rowid ?? cursor), done: rows.length < batchSize };
     };
-    let auxiliaryPruneCursor = 0;
     // While a publish drains its backlog, every source read shares one
     // pinned snapshot (main, delta archive and base, pinned in that order).
     let pinned = false;
@@ -667,7 +739,181 @@ export function createReadonlyReplica(
         unpin();
       }
     };
-    const stepOnce = (): boolean => {
+    const eventReadFirst = (cursor: number) => {
+      let first = Infinity;
+      eventRead(() => {
+        for (const { db, table } of [
+          { db: source, table: "orchestration_events" },
+          ...(archive ? [{ db: archive, table: "ardud_events" }] : []),
+          ...(baseArchive ? [{ db: baseArchive, table: "orchestration_events" }] : []),
+        ]) {
+          const row = db
+            .prepare(`SELECT sequence FROM ${q(table)} WHERE sequence>? ORDER BY sequence LIMIT 1`)
+            .get(cursor);
+          if (row) first = Math.min(first, Number(row.sequence));
+        }
+      });
+      return first;
+    };
+    const identityNames = [
+      "orchestration_v2_projection_threads",
+      "orchestration_v2_projection_provider_threads",
+      "orchestration_v2_projection_subagents",
+    ];
+    // Source rowids are insertion ordered; never use replica rowids as cursors.
+    // Restarted workers resume only committed cursors. Bootstrap covers history.
+    const identityCursors = new Map(
+      identityNames.map((name) => [
+        name,
+        Number(
+          getMeta(`identity_cursor:${name}`) ??
+            source.prepare(`SELECT max(rowid) AS n FROM ${q(name)}`).get()?.n ??
+            0,
+        ),
+      ]),
+    );
+    let identitySequence = Number(
+      getMeta("identity_sequence") ?? getMeta("sequence") ?? sequence(),
+    );
+    transaction(() => {
+      for (const [name, cursor] of identityCursors) meta(`identity_cursor:${name}`, String(cursor));
+      meta("identity_sequence", String(identitySequence));
+    });
+    let identityCheckedAt = Number.NEGATIVE_INFINITY;
+    const identityCreatedAt = (row: Record<string, NodeSqlite.SQLOutputValue>) => {
+      const timestamp = row.created_at ?? row.started_at ?? row.updated_at;
+      const created = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
+      return Number.isFinite(created) ? created : undefined;
+    };
+    const publishIdentities = (): boolean => {
+      if (!published() || Date.now() - identityCheckedAt < 1_000) return false;
+      identityCheckedAt = Date.now();
+      return measure("identity", () =>
+        sourceRead(() => {
+          assertRedactionComplete();
+          const pages = identityNames.map((name) => ({
+            name,
+            rows: page(name, identityCursors.get(name)!),
+          }));
+          // Bindings may acquire their native id after insertion. A bounded event
+          // scan also catches those updates without scanning updated_at columns.
+          const events = eventPage(source, "orchestration_events", identitySequence, sequence());
+          const changed =
+            pages.some(({ rows }) => rows.length > 0) ||
+            events.some(
+              (row) =>
+                row.event_type === "provider-thread.updated" ||
+                row.event_type === "subagent.updated" ||
+                row.event_type === "thread.created",
+            );
+          let suspended: Uint8Array | undefined;
+          if (changed && cycleTransaction) {
+            // Save the pending replica diff before releasing its write lock.
+            // Replaying it after the short identity commit preserves catch-up
+            // progress even when new children arrive throughout a long cycle.
+            suspended = measure("identitySuspend", () => cycleSession!.changeset());
+            abortCycle();
+          }
+          if (cycleTransaction) {
+            // This cursor is a source scan, independent of the full-cycle
+            // sequence. Do not rescan the same non-identity prefix forever.
+            identitySequence = Number(events.at(-1)?.sequence ?? identitySequence);
+            if (events.length === batchSize) identityCheckedAt = Number.NEGATIVE_INFINITY;
+            return events.length === batchSize;
+          }
+          if (!changed && events.length === 0) return false;
+          const nextCursors = new Map(identityCursors);
+          let oldestCreated: number | undefined;
+          transaction(() => {
+            let changes = 0;
+            const copyIdentity = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
+              // A provider/subagent page may outrun the thread page. Resolve its
+              // lineage by indexed primary key in this same source snapshot.
+              for (const key of ["thread_id", "child_thread_id"]) {
+                if (name === identityNames[0] || typeof row[key] !== "string") continue;
+                const thread = source
+                  .prepare(`SELECT * FROM ${q(identityNames[0]!)} WHERE thread_id=?`)
+                  .get(row[key]!);
+                if (thread) changes += Number(copyRow(identityNames[0]!, thread));
+              }
+              changes += Number(copyRow(name, row));
+            };
+            for (const { name, rows } of pages) {
+              for (const row of rows) {
+                copyIdentity(name, row);
+                const created = identityCreatedAt(row);
+                if (created !== undefined)
+                  oldestCreated = Math.min(oldestCreated ?? created, created);
+              }
+              nextCursors.set(name, Number(rows.at(-1)?.__rowid ?? identityCursors.get(name)!));
+              meta(`identity_cursor:${name}`, String(nextCursors.get(name)));
+            }
+            for (const event of events) {
+              const name =
+                event.event_type === "provider-thread.updated"
+                  ? identityNames[1]
+                  : event.event_type === "subagent.updated"
+                    ? identityNames[2]
+                    : event.event_type === "thread.created"
+                      ? identityNames[0]
+                      : undefined;
+              const id = event.event_type === "thread.created" ? event.stream_id : event.entity_id;
+              if (name && id) {
+                const table = tables.get(name)!;
+                const row = source
+                  .prepare(`SELECT * FROM ${q(name)} WHERE ${q(table.primary)}=?`)
+                  .get(id);
+                if (row) copyIdentity(name, row);
+              }
+            }
+            // Identity can precede its run/messages: recall only needs the thread,
+            // provider binding and subagent lineage. Do not advance the full-cycle
+            // sequence/ready/updated_at markers. Fence cached lineage overlays since
+            // these rows are visible before their corresponding exported events.
+            if (changes) {
+              meta(
+                "lineage_repair_revision",
+                String(Number(getMeta("lineage_repair_revision") ?? 0) + 1),
+              );
+              meta("lineage_repair_watermark", getMeta("updated_at")!);
+              metrics = { ...metrics, identityRows: metrics.identityRows + changes };
+            }
+            meta("identity_sequence", String(Number(events.at(-1)?.sequence ?? identitySequence)));
+          });
+          // Measure at COMMIT, and only newly inserted rows. A later status
+          // event must not report the age of a long-running subagent as lag.
+          if (oldestCreated !== undefined)
+            metrics = {
+              ...metrics,
+              identityLagMaxMs: Math.max(metrics.identityLagMaxMs, Date.now() - oldestCreated),
+            };
+          for (const [name, cursor] of nextCursors) identityCursors.set(name, cursor);
+          identitySequence = Number(events.at(-1)?.sequence ?? identitySequence);
+          if (suspended)
+            measure("identityResume", () => {
+              beginCycle();
+              // Early identity rows shadow the older pending identity values.
+              // Every other table must replay without conflicts: run/Stop state
+              // and publication markers still switch together at cycle end.
+              if (
+                !out.applyChangeset(suspended, {
+                  filter: (name) => !identityNames.includes(name),
+                }) ||
+                !out.applyChangeset(suspended, {
+                  filter: (name) => identityNames.includes(name),
+                  onConflict: () => sqlite.constants.SQLITE_CHANGESET_OMIT,
+                })
+              )
+                throw new Error("Readonly cycle could not resume after identity publication");
+            });
+          // Drain a backlog in bounded pages at the worker's 10 ms cadence.
+          if (pages.some(({ rows }) => rows.length === batchSize) || events.length === batchSize)
+            identityCheckedAt = Number.NEGATIVE_INFINITY;
+          return changed || identityCheckedAt === Number.NEGATIVE_INFINITY;
+        }),
+      );
+    };
+    const validate = () => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
       if (baseFilename() !== baseName)
@@ -707,12 +953,12 @@ export function createReadonlyReplica(
             throw invalidate("Readonly source schema changed; restart export");
         }
       }
-      // Routine refresh of a published replica: one write transaction for the
-      // whole cycle. Bootstrap and event resets commit page by page instead,
-      // so they stay resumable while ready=0.
-      if (!cycleTransaction && published()) {
-        out.exec("BEGIN IMMEDIATE");
-        cycleTransaction = true;
+    };
+    const stepOnce = (): boolean => {
+      // Only projection/event catch-up and the final staged auxiliary diff hold
+      // the publication transaction. Bootstrap/reset pages remain resumable.
+      if (!cycleTransaction && auxiliaryIndex >= auxiliary.length && published()) {
+        beginCycle();
       }
       if (resettingEvents) {
         const result = out
@@ -757,35 +1003,36 @@ export function createReadonlyReplica(
         }
         return true;
       }
-      if (cycleTarget === undefined) cycleTarget = sequence();
-      if (catchUpWork()) return true;
+      if (auxiliaryIndex === 0 && auxiliaryCursor === 0 && cycleTarget === undefined) {
+        cycleTarget = sequence();
+        const cursor = Number(getMeta("sequence"));
+        if (cursor < cycleTarget) {
+          const first = eventReadFirst(cursor);
+          if (first !== cursor + 1) return measure("eventCatchup", catchUpWork);
+        }
+      }
       if (auxiliaryIndex < auxiliary.length) {
-        auxiliaryCapturedAt ??= Date.now();
-        const name = auxiliary[auxiliaryIndex]!,
-          table = tables.get(name)!;
-        if (!pruning) {
+        return measure("auxiliary", () => {
+          auxiliaryCapturedAt ??= Date.now();
+          const name = auxiliary[auxiliaryIndex]!;
+          const stage = auxiliaryStages.get(name)!;
+          if (auxiliaryCursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
           const rows = page(name, auxiliaryCursor);
           transaction(() => {
-            for (const row of rows) {
-              copyRow(name, row);
-              markSeen(name, row[table.primary]!, auxiliaryGeneration);
-            }
+            for (const row of rows)
+              stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
           });
           auxiliaryCursor = Number(rows.at(-1)?.__rowid ?? auxiliaryCursor);
-          pruning = rows.length < batchSize;
-        } else {
-          const result = transaction(() => prune(name, auxiliaryPruneCursor, auxiliaryGeneration));
-          auxiliaryPruneCursor = result.pruneCursor;
-          if (result.done) {
+          if (rows.length < batchSize) {
             auxiliaryIndex++;
             auxiliaryCursor = 0;
-            pruning = false;
-            auxiliaryPruneCursor = 0;
           }
-        }
-        return true;
+          return true;
+        });
       }
-      return publishStep();
+      if (cycleTarget === undefined) cycleTarget = sequence();
+      if (measure("eventCatchup", catchUpWork)) return true;
+      return measure("publish", publishStep);
     };
     /**
      * Event catchup, dirty turn items and the archive deletion journal: one
@@ -834,17 +1081,14 @@ export function createReadonlyReplica(
             // Publish the reset: readers must not keep using this replica
             // while projections are rebuilt and events are cleared.
             if (cycleTransaction) {
-              cycleTransaction = false;
-              out.exec("COMMIT");
+              commitCycle();
             }
             resettingEvents = true;
             cycleTarget = undefined;
             auxiliaryIndex = 0;
             auxiliaryCursor = 0;
-            pruning = false;
-            auxiliaryPruneCursor = 0;
             auxiliaryCapturedAt = undefined;
-            auxiliaryGeneration = nextGeneration();
+            nextGeneration();
             return;
           }
           transaction(() => {
@@ -999,6 +1243,7 @@ export function createReadonlyReplica(
         }
         reconcileIndex++;
         transaction(() => {
+          measure("auxiliaryCommit", applyAuxiliary);
           let lineageRepaired = false;
           for (const row of rows) {
             const changed = refresh(name, row.id!);
@@ -1062,21 +1307,38 @@ export function createReadonlyReplica(
       drainPages = drainPagesInitial;
       // Readers switch from the previous generation to this one atomically.
       if (cycleTransaction) {
-        cycleTransaction = false;
-        out.exec("COMMIT");
+        commitCycle();
       }
       cycleTarget = undefined;
       auxiliaryIndex = 0;
       auxiliaryCursor = 0;
       auxiliaryCapturedAt = undefined;
-      auxiliaryGeneration = nextGeneration();
+      nextGeneration();
       return false;
     };
     return {
+      pollIdentities() {
+        try {
+          assertRedactionComplete();
+          validate();
+          return publishIdentities();
+        } catch (error) {
+          if (abortCycle()) invalidated ??= "Readonly refresh cycle aborted; reopen exporter";
+          recordFailure(error);
+          throw error;
+        }
+      },
+      takeMetrics() {
+        const result = metrics;
+        metrics = { phaseMs: {}, phaseSteps: {}, identityRows: 0, identityLagMaxMs: 0 };
+        return result;
+      },
       /** One bounded page; false means caught up, ready for the next interval. */
       step(): boolean {
         try {
           assertRedactionComplete();
+          validate();
+          publishIdentities();
           return stepOnce();
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of

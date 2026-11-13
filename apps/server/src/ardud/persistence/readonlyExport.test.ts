@@ -1019,7 +1019,7 @@ test("a busy source cannot hold a cycle open; updated_at tracks what was confirm
         .run(JSON.stringify({ n: ++n }));
       bump.run();
       now += 3_000;
-      if (steps === 1) auxStartedBy = now;
+      if (steps === 0) auxStartedBy = now;
       if (!f.exporter.step()) break;
       if (++steps > 100) throw new Error("a busy source held the cycle open");
     }
@@ -1192,20 +1192,407 @@ test.each([
       .run(event, id, JSON.stringify({ id }));
     for (let i = 0; i < 18; i++) f.finish();
     expect(read.get(id)?.payload_json).toBe(caughtUpPayload);
-    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision);
+    // Early binding publication fences the overlay before the full event
+    // generation is published. Ordinary thread catchup still needs no fence.
+    const earlyFence = table.endsWith("_provider_threads") ? 1 : 0;
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + earlyFence);
 
     const repairedPayload = JSON.stringify(payload);
     update.run(repairedPayload, id);
     for (let i = 0; i < 18; i++) f.finish();
     expect(read.get(id)?.payload_json).toBe(repairedPayload);
-    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + earlyFence + 1);
     expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
     for (let i = 0; i < 18; i++) f.finish();
-    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + earlyFence + 1);
 
     f.source.prepare(`DELETE FROM ${table} WHERE ${key}=?`).run(id);
     for (let i = 0; i < 18; i++) f.finish();
     expect(read.get(id)).toBeUndefined();
-    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 2);
+    expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + earlyFence + 2);
   },
 );
+
+test("identity publishes within one second during a long auxiliary sweep without publishing its generation", () => {
+  const f = fixture();
+  let now = Date.parse("2026-11-13T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const stamp = metaValue(out, "updated_at");
+  const sequence = metaValue(out, "sequence");
+  for (let i = 0; i < 200; i++)
+    f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')").run(`task${i}`);
+  f.exporter.step();
+  f.source.exec(`INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}');
+    INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}');
+    INSERT INTO orchestration_v2_projection_subagents VALUES ('delegate','{}');`);
+  now += 1_000;
+  expect(f.exporter.step()).toBe(true);
+  for (const [table, key, id] of [
+    ["threads", "thread_id", "child"],
+    ["provider_threads", "provider_thread_id", "binding"],
+    ["subagents", "subagent_id", "delegate"],
+  ])
+    expect(
+      out
+        .prepare(`SELECT 1 AS found FROM orchestration_v2_projection_${table} WHERE ${key}=?`)
+        .get(id!),
+    ).toEqual({ found: 1 });
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe(stamp);
+  expect(metaValue(out, "sequence")).toBe(sequence);
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
+  expect(f.exporter.takeMetrics().identityRows).toBe(3);
+  f.finish();
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(200);
+});
+
+test("identity arrival interrupts event catchup without exposing partial run or Stop state", () => {
+  const f = fixture(1);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const stamp = metaValue(out, "updated_at");
+  f.source.exec(`INSERT INTO orchestration_v2_projection_runs VALUES ('new-run','a','{}');
+    INSERT INTO orchestration_events VALUES (2,'run.created','a','{"id":"new-run"}');
+    INSERT INTO orchestration_events VALUES (3,'turn-item.updated','a','{}');`);
+  f.exporter.takeMetrics();
+  for (let i = 0; i < 20; i++) {
+    f.exporter.step();
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) break;
+    if (i === 19) throw new Error("catchup never started");
+  }
+  f.source.exec("INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}')");
+  now += 1_000;
+  expect(f.exporter.step()).toBe(true);
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='child'").get(),
+  ).toBeDefined();
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_runs WHERE run_id='new-run'").get(),
+  ).toBeUndefined();
+  expect(metaValue(out, "updated_at")).toBe(stamp);
+  f.finish();
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_runs WHERE run_id='new-run'").get(),
+  ).toBeDefined();
+});
+
+test("identity cursors survive a worker restart and a later native binding update", () => {
+  const f = fixture();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  f.exporter.pollIdentities();
+  f.source.exec(`INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}');
+    INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}');`);
+  f.restart();
+  const out = f.connect();
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='child'").get(),
+  ).toBeDefined();
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"fresh"}}' WHERE provider_thread_id='binding';
+    INSERT INTO orchestration_events VALUES (2,'provider-thread.updated','child','{"id":"binding"}');`);
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toContain('"fresh"');
+});
+
+test("redaction blocks both idle identity publication and an active auxiliary sweep", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  f.exporter.step();
+  f.source.exec(`CREATE TABLE ardud_thread_redaction_recovery (pending INTEGER);
+    INSERT INTO ardud_thread_redaction_recovery VALUES (1);
+    INSERT INTO orchestration_v2_projection_threads VALUES ('secret','{}');`);
+  expect(() => f.exporter.pollIdentities()).toThrow("incomplete redaction");
+  expect(() => f.exporter.step()).toThrow("incomplete redaction");
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='secret'").get(),
+  ).toBeUndefined();
+});
+
+test("identity high-water and event-page queries use indexed bounded ranges", () => {
+  const f = fixture();
+  for (const name of ["threads", "provider_threads", "subagents"]) {
+    const plan = f.source
+      .prepare(
+        `EXPLAIN QUERY PLAN SELECT rowid,* FROM orchestration_v2_projection_${name} WHERE rowid>? ORDER BY rowid LIMIT ?`,
+      )
+      .all(0, 100);
+    expect(JSON.stringify(plan)).toContain("SEARCH");
+    expect(JSON.stringify(plan)).toContain("INTEGER PRIMARY KEY");
+    expect(JSON.stringify(plan)).not.toContain("TEMP B-TREE");
+  }
+  const plan = f.source
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT sequence,event_type FROM orchestration_events WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+    )
+    .all(0, 100, 100);
+  expect(JSON.stringify(plan)).toContain("INTEGER PRIMARY KEY");
+});
+
+test("identity publication p95 is at most 1 s across a slow 50 s auxiliary cycle", () => {
+  const f = fixture();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  for (let i = 0; i < 400; i++)
+    f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')").run(`task${i}`);
+  const pending = new Map<string, number>();
+  const lags: number[] = [];
+  let inserted = 0;
+  for (let step = 0; step < 120; step++) {
+    if (step % 5 === 1 && inserted < 20) {
+      const id = `child${inserted++}`;
+      f.source.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}')").run(id);
+      pending.set(id, now);
+    }
+    now += 250;
+    expect(f.exporter.step()).toBe(true);
+    for (const [id, created] of pending) {
+      if (
+        out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id=?").get(id)
+      ) {
+        lags.push(now - created);
+        pending.delete(id);
+      }
+    }
+  }
+  expect(pending.size).toBe(0);
+  expect(lags).toHaveLength(20);
+  lags.sort((a, b) => a - b);
+  expect(lags[Math.ceil(lags.length * 0.95) - 1]).toBeLessThanOrEqual(1_000);
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
+});
+
+test("a binding page resolves child lineage by primary key ahead of a full thread page", () => {
+  const f = fixture(1);
+  let now = Date.parse("2026-11-13T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.source.exec(`ALTER TABLE orchestration_v2_projection_threads ADD COLUMN created_at TEXT;
+    ALTER TABLE orchestration_v2_projection_provider_threads ADD COLUMN thread_id TEXT;
+    ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN thread_id TEXT;
+    ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN child_thread_id TEXT;`);
+  f.restart();
+  f.finish();
+  f.exporter.pollIdentities();
+  const insert = f.source.prepare(
+    "INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}',?)",
+  );
+  for (const id of ["ahead1", "ahead2", "child"]) insert.run(id, new Date(now).toISOString());
+  f.source
+    .exec(`INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}','child');
+    INSERT INTO orchestration_v2_projection_subagents VALUES ('delegate','{}','a','child');`);
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  const out = f.connect();
+  expect(
+    out
+      .prepare("SELECT thread_id FROM orchestration_v2_projection_threads WHERE thread_id='child'")
+      .get(),
+  ).toEqual({ thread_id: "child" });
+  expect(
+    out
+      .prepare(
+        "SELECT child_thread_id FROM orchestration_v2_projection_subagents WHERE subagent_id='delegate'",
+      )
+      .get(),
+  ).toEqual({ child_thread_id: "child" });
+  expect(f.exporter.takeMetrics().identityLagMaxMs).toBe(1_000);
+});
+
+test("thread creation events cover a reused source rowid after the highest row is deleted", () => {
+  const f = fixture();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  f.exporter.pollIdentities();
+  const oldRowid = f.source
+    .prepare("SELECT rowid FROM orchestration_v2_projection_threads WHERE thread_id='c'")
+    .get()?.rowid;
+  f.source.exec(`DELETE FROM orchestration_v2_projection_threads WHERE thread_id='c';
+    INSERT INTO orchestration_v2_projection_threads VALUES ('reused','{}');
+    INSERT INTO orchestration_events VALUES (2,'thread.created','reused','{"id":"reused"}');`);
+  expect(
+    f.source
+      .prepare("SELECT rowid FROM orchestration_v2_projection_threads WHERE thread_id='reused'")
+      .get()?.rowid,
+  ).toBe(oldRowid);
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(
+    f
+      .connect()
+      .prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='reused'")
+      .get(),
+  ).toBeDefined();
+});
+
+test("binding updates behind non-identity event pages publish during a long catchup", () => {
+  const f = fixture(2);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.source.exec("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}')");
+  f.finish();
+  f.exporter.pollIdentities();
+  f.exporter.takeMetrics();
+  const add = f.source.prepare(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  for (let i = 0; i < 200; i++) add.run();
+  // Start a long projection transaction before changing the binding.
+  for (let i = 0; i < 10; i++) {
+    f.exporter.step();
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) break;
+  }
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"fresh"}}' WHERE provider_thread_id='binding';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
+  now += 1_000;
+  // Directly drive the fast-lane pages while the big cycle remains open.
+  for (let i = 0; i < 102; i++) f.exporter.pollIdentities();
+  const out = f.connect();
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toContain('"fresh"');
+  expect(metaValue(out, "sequence")).toBe("1");
+  f.finish();
+  expect(metaValue(out, "sequence")).toBe("202");
+});
+
+test("repeated identity commits preserve full-cycle catchup progress and its atomic markers", () => {
+  const f = fixture(1);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const stamp = metaValue(out, "updated_at");
+  const add = f.source.prepare(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  for (let i = 0; i < 100; i++) add.run();
+  let completed = false;
+  let inserted = 0;
+  for (let step = 0; step < 150; step++) {
+    now += 1_000;
+    if (step % 3 === 0) {
+      const id = `child${inserted++}`;
+      f.source.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}')").run(id);
+    }
+    if (!f.exporter.step()) {
+      completed = true;
+      break;
+    }
+    expect(metaValue(out, "updated_at")).toBe(stamp);
+    expect(metaValue(out, "sequence")).toBe("1");
+    expect(metaValue(out, "ready")).toBe("1");
+  }
+  expect(inserted).toBeGreaterThan(5);
+  expect(completed).toBe(true);
+  expect(metaValue(out, "sequence")).toBe("101");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBeGreaterThan(
+    Date.parse(String(stamp)),
+  );
+});
+
+test("resuming a cycle preserves the newer identity instead of replaying its older pending value", () => {
+  const f = fixture(1);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.source.exec("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}')");
+  f.finish();
+  while (f.exporter.pollIdentities()) {
+    // Drain the initial identity page before constructing the pending change.
+  }
+  const out = f.connect();
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"pending"}}' WHERE provider_thread_id='binding';
+    INSERT INTO orchestration_events VALUES (2,'provider-thread.updated','a','{"id":"binding"}');
+    INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}');`);
+  f.exporter.takeMetrics();
+  for (let i = 0; i < 10; i++) {
+    f.exporter.step();
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) break;
+  }
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toBe("{}");
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"fresh"}}' WHERE provider_thread_id='binding';
+    INSERT INTO orchestration_events VALUES (4,'provider-thread.updated','a','{"id":"binding"}');`);
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toContain('"fresh"');
+  expect(metaValue(out, "sequence")).toBe("1");
+  f.finish();
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toContain('"fresh"');
+  expect(metaValue(out, "sequence")).toBe("4");
+});
+
+test("upgrading a published replica catches identities committed before the new worker opens", () => {
+  const f = fixture();
+  f.finish();
+  const writer = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  writer.exec("DELETE FROM ardud_readonly_meta WHERE key LIKE 'identity_%'");
+  writer.close();
+  f.source.exec(`INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}');
+    INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}');
+    INSERT INTO orchestration_v2_projection_subagents VALUES ('delegate','{}');
+    INSERT INTO orchestration_events VALUES (2,'thread.created','child','{"id":"child"}');
+    INSERT INTO orchestration_events VALUES (3,'provider-thread.updated','child','{"id":"binding"}');
+    INSERT INTO orchestration_events VALUES (4,'subagent.updated','a','{"id":"delegate"}');`);
+  f.restart();
+  while (f.exporter.pollIdentities()) {
+    // Upgrade starts its bounded event scan at the last published generation.
+  }
+  const out = f.connect();
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='child'").get(),
+  ).toBeDefined();
+  expect(
+    out
+      .prepare(
+        "SELECT 1 FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get(),
+  ).toBeDefined();
+  expect(
+    out
+      .prepare("SELECT 1 FROM orchestration_v2_projection_subagents WHERE subagent_id='delegate'")
+      .get(),
+  ).toBeDefined();
+  expect(metaValue(out, "sequence")).toBe("1");
+});

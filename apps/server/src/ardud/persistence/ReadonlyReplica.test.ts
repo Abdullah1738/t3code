@@ -1,4 +1,5 @@
 import * as NodeEvents from "node:events";
+import * as NodeVM from "node:vm";
 import * as Fiber from "effect/Fiber";
 import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - fixtures drive real worker threads and native SQLite.
@@ -11,7 +12,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Logger from "effect/Logger";
-import { afterEach } from "vite-plus/test";
+import { afterEach, test } from "vite-plus/test";
 
 import {
   type ExportWorker,
@@ -401,3 +402,41 @@ it.live.each(["primary", "replica"] as const)(
     );
   },
 );
+
+test("idle polling wakes on an identity at 1 s instead of waiting the full 15 s", () => {
+  let now = 0;
+  const timers: Array<{ run: () => void; at: number }> = [];
+  const messages: Array<{ type: string; cycleMs?: number }> = [];
+  let pending = false;
+  let steps = 0;
+  NodeVM.runInNewContext(exportWorkerSource("() => workerData.replica"), {
+    require: (name: string) =>
+      name === "node:worker_threads"
+        ? {
+            parentPort: { postMessage: (message: { type: string }) => messages.push(message) },
+            workerData: {
+              replica: {
+                step: () => {
+                  steps++;
+                  return false;
+                },
+                pollIdentities: () => pending,
+              },
+            },
+          }
+        : {},
+    Date: { now: () => now },
+    setTimeout: (run: () => void, delay: number) => timers.push({ run, at: now + delay }),
+  });
+  assert.equal(steps, 1);
+  pending = true;
+  const timer = timers.shift()!;
+  assert.equal(timer.at, 1_000);
+  now = timer.at;
+  timer.run();
+  assert.equal(steps, 2);
+  assert.deepStrictEqual(
+    messages.filter((m) => m.type === "published").map((m) => m.cycleMs),
+    [0, 0],
+  );
+});
