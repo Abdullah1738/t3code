@@ -1,5 +1,6 @@
 import {
   KanbanError,
+  kanbanWorkStep,
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardId,
@@ -53,6 +54,7 @@ export const planCutoverCardRestore = (input: {
   if (card.settledAt !== null) return denied(`card #${card.number} is settled`);
 
   const role = restore.stage === "working" ? "work" : "review";
+  if (role === "work" && !kanbanWorkStep(card)) return denied("current step has no worker work");
   const same =
     card.stage === restore.stage &&
     card.activeThreadId === restore.threadId &&
