@@ -102,6 +102,7 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     body = recipe.read_bytes()
     if repo_key == "crpko-devops":
         body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
+    body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
     check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '

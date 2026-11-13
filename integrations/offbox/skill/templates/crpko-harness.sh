@@ -8,7 +8,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 GO_VERSION="${OFFBOX_GO_VERSION:-1.26.9}"
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  offbox_fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "/tmp/go.tgz"
   sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
 fi
 sudo apt-get update -qq

@@ -45,13 +45,13 @@ offbox_crpko_download_tools() (
     *) echo 'offbox: unsupported Crpko toolchain architecture' >&2; exit 98 ;;
   esac
   if [ ! -x /usr/local/bin/vector ] || ! [[ $(vector --version 2>/dev/null) == "vector $OFFBOX_VECTOR_VERSION "* ]]; then
-    curl -fsSL --retry 5 "https://github.com/vectordotdev/vector/releases/download/v$OFFBOX_VECTOR_VERSION/vector-$OFFBOX_VECTOR_VERSION-$arch-unknown-linux-gnu.tar.gz" -o "$stage/vector.tar.gz"
+    offbox_fetch "https://github.com/vectordotdev/vector/releases/download/v$OFFBOX_VECTOR_VERSION/vector-$OFFBOX_VECTOR_VERSION-$arch-unknown-linux-gnu.tar.gz" "$stage/vector.tar.gz"
     tar -xzf "$stage/vector.tar.gz" -C "$stage"
     sudo install -m 0755 "$stage/vector-$arch-unknown-linux-gnu/bin/vector" /usr/local/bin/vector
   fi
   if [ ! -x /usr/local/bin/aws ] || ! [[ $(aws --version 2>&1) == aws-cli/2.* ]]; then
     # No existing AWS pin: use the latest official v2 bundle, as hosted CI does.
-    curl -fsSL --retry 5 "https://awscli.amazonaws.com/awscli-exe-linux-$arch.zip" -o "$stage/aws.zip"
+    offbox_fetch "https://awscli.amazonaws.com/awscli-exe-linux-$arch.zip" "$stage/aws.zip"
     unzip -q "$stage/aws.zip" -d "$stage"
     (cd "$stage" && sudo ./aws/install --update --bin-dir /usr/local/bin)
     # --update skips an existing release before repairing its command symlinks.

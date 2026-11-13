@@ -1,6 +1,7 @@
 """Home template prerequisites without apt, network access or a running database service."""
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import bases, common  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "templates"
+FETCH = (TEMPLATES / "tools/fetch.sh").read_text()
 
 
 class TemplateTools(unittest.TestCase):
@@ -24,6 +26,7 @@ class TemplateTools(unittest.TestCase):
         self.log = self.root / "calls"
         self.env = dict(os.environ, HOME=str(self.root), NVM_DIR=str(self.root / ".nvm"),
                         PATH=f"{self.bin}:/usr/bin:/bin", CALLS=str(self.log))
+        self.env.pop('BASH_ENV', None)
 
     def shim(self, name, body):
         path = self.bin / name
@@ -41,7 +44,7 @@ class TemplateTools(unittest.TestCase):
         self.shim("sudo", 'echo "$*" >> "$CALLS"\n')
         env = dict(self.env, CLIENT=client, BANNER=banner if banner is not None else f"FoundationDB 7.3 (v{server})",
                    OFFBOX_FDB_VERSION=version, FAIL="yes" if fail else "no")
-        script = (TEMPLATES / "tools/foundationdb.sh").read_text() + "\noffbox_foundationdb\n"
+        script = FETCH + "\n" + (TEMPLATES / "tools/foundationdb.sh").read_text() + "\noffbox_foundationdb\n"
         return subprocess.run(["/bin/bash", "-c", script], env=env, text=True, capture_output=True, timeout=10)
 
     def test_matching_fdb_binaries_need_no_download_or_install(self):
@@ -82,12 +85,13 @@ class TemplateTools(unittest.TestCase):
     def test_fdb_version_override_updates_mismatched_client_and_server(self):
         result = self.run_fdb(version="7.3.64")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum("--retry 5" in c for c in self.calls()), 2)
+        self.assertEqual(sum("--retry 2" in c for c in self.calls()), 2)
         self.assertIn("/7.3.64/foundationdb-clients_7.3.64-1_amd64.deb", "\n".join(self.calls()))
 
     def test_fdb_download_failure_stops_setup(self):
         result = self.run_fdb(client="", server="", fail=True)
-        self.assertEqual(result.returncode, 22)
+        self.assertEqual(result.returncode, 98)
+        self.assertIn('offbox: download failed (curl exit 22)', result.stderr)
         self.assertFalse(any("apt-get" in c or "install -m" in c for c in self.calls()))
 
     def run_node(self, nvm_exists):
@@ -100,7 +104,7 @@ class TemplateTools(unittest.TestCase):
                   f"printf '%s' {shlex.quote('printf %s ' + shlex.quote(nvm) + ' > "$NVM_DIR/nvm.sh"')} > \"$1\"\n")
         for tool in ("corepack", "node", "npm"):
             self.shim(tool, f'echo "{tool} $*" >> "$CALLS"\n')
-        script = (TEMPLATES / "crpko-node.sh").read_text().split("sudo apt-get update -qq", 1)[0]
+        script = FETCH + "\n" + (TEMPLATES / "crpko-node.sh").read_text().split("sudo apt-get update -qq", 1)[0]
         return subprocess.run(["/bin/bash", "-c", script], env=self.env, text=True, capture_output=True, timeout=10)
 
     def test_node_bootstraps_missing_nvm_and_provisions_all_three_majors(self):
@@ -124,12 +128,45 @@ class TemplateTools(unittest.TestCase):
             for name in common.TEMPLATES:
                 with self.subTest(name=name):
                     body, _ = bases.recipe(name)
+                    self.assertTrue(body.startswith(FETCH + '\n'))
+                    uses = list(re.finditer(r'^\s*offbox_fetch\s+', body, re.M))
+                    self.assertTrue(uses)
+                    self.assertLess(body.index('offbox_fetch()'), uses[0].start())
                     self.assertIn("UV_LINK_MODE=copy", body)
                     self.assertIn("zsh openjdk-21-jre-headless", body)
                     self.assertEqual(body.count('FDB_VERSION="${OFFBOX_FDB_VERSION:-7.3.63}"'),
                                      int(name in ("crpko-go", "crpko-harness")))
                     result = subprocess.run(["/bin/bash", "-n"], input=body, text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_no_download_curl_bypasses_fetch(self):
+        downloads = []
+        for path in TEMPLATES.rglob('*.sh'):
+            for number, line in enumerate(path.read_text().replace('\\\n', ' ').splitlines(), 1):
+                if re.search(r'\bcurl\b', line) and re.search(r'(?:\s-o\b|\|\s*tar\b)', line):
+                    downloads.append((path.relative_to(TEMPLATES).as_posix(), number))
+        self.assertEqual([path for path, _ in downloads], ['tools/fetch.sh'], downloads)
+
+    def test_fetch_applies_bounds_and_maps_curl_failure(self):
+        self.shim('curl', 'printf "%s\\n" "$@" > "$CALLS"\nexit "$CURL_RC"\n')
+        snippet = next(line for line in (TEMPLATES / 'generic.sh').read_text().splitlines()
+                       if re.match(r'\s*(?:curl|offbox_fetch)\s+', line))
+        for rc in (28, 0):
+            with self.subTest(curl_exit=rc):
+                result = subprocess.run(['/bin/bash', '-c', FETCH + '\nset -eu\n' + snippet],
+                                        env=dict(self.env, CURL_RC=str(rc), GO_VERSION='1.26.9'),
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 98 if rc else 0, result.stderr)
+                if rc:
+                    self.assertIn('offbox: download failed (curl exit 28)', result.stderr)
+                else:
+                    self.assertEqual(result.stderr, '')
+                args = self.calls()
+                for option, value in (('--connect-timeout', '20'), ('--speed-limit', '30720'),
+                                      ('--speed-time', '60'), ('--max-time', '600'), ('--retry', '2')):
+                    self.assertIn(option, args)
+                    self.assertEqual(args[args.index(option) + 1], value)
+                self.assertEqual(args[-3:], ['https://go.dev/dl/go1.26.9.linux-amd64.tar.gz', '-o', '/tmp/go.tgz'])
 
 
 if __name__ == "__main__":

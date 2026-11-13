@@ -7,7 +7,7 @@ export DEBIAN_FRONTEND=noninteractive
 GO_VERSION="${OFFBOX_GO_VERSION:-1.26.9}"
 # A matching binary version does not prove an old overlay left a clean source tree.
 if [ -f /usr/local/go/src/runtime/traceexp.go ] || [ -f /usr/local/go/src/strconv/ctoa.go ] || [ -f /usr/local/go/src/syscall/syscall_linux_accept4.go ] || ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  offbox_fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "/tmp/go.tgz"
   sudo rm -rf /usr/local/go
   sudo tar -C /usr/local -xzf /tmp/go.tgz
   rm -f /tmp/go.tgz
