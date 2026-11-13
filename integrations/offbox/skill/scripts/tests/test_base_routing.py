@@ -1,0 +1,379 @@
+"""Saved bases resolve before allocation and remain discoverable on either backend. No network."""
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS))
+from offbox_lib import api, base_catalog, bases, cli, common, home, identity, pool
+
+
+class BaseRouting(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                                       if not k.startswith('OFFBOX_')}, clear=True))
+        for name, value in [('STATE', self.root), ('SERVER_CFG', self.root / 'server.json'),
+                            ('BACKEND_STATE', self.root / 'backend-state.json'),
+                            ('BACKEND_PATH', self.root / 'backend'), ('DB_PATH', self.root / 'offbox-home.db'), ('_BACKEND', None), ('_BACKEND_REASON', None)]:
+            self.stack.enter_context(patch.object(common, name, value))
+        common.SERVER_CFG.write_text('{"url":"http://home.invalid/api/v1"}')
+        common.BACKEND_STATE.write_text('{"state":"home_up"}')
+        self.cons = {}
+        for backend in ('server', 'boat'):
+            con = sqlite3.connect(common.db_path_for(backend))
+            common.ensure_schema(con)
+            self.cons[backend] = con
+            self.addCleanup(con.close)
+        self.me = dict(owner='thread:test', repo_root='/repo', repo_key='torssh')
+        self.stack.enter_context(patch.object(identity, 'whoami', return_value=self.me))
+        self.stack.enter_context(patch.object(identity, 'repo_root', return_value=Path('/repo')))
+        self.stack.enter_context(patch.object(identity, 'repo_key', return_value='torssh'))
+        for module, name in [(api, '_key'), (api, 'get'), (api, 'create'), (api, 'fork'), (pool, 'acquire')]:
+            self.stack.enter_context(patch.object(module, name, side_effect=AssertionError('allocation/network forbidden')))
+        self.stack.enter_context(patch.object(home, 'person_gate'))
+        self.logs = []
+        self.stack.enter_context(patch.object(cli, 'log', side_effect=self.logs.append))
+        self.events = self.stack.enter_context(patch.object(cli.toollog, 'emit'))
+
+    def add(self, backend, short, *, repo='torssh', default=False, expired=None, owner='ardud', saved='snapshot'):
+        self.cons[backend].execute('''INSERT INTO bases
+            (name,repo_key,short,box_id,size,remote_dir,is_default,created_at,saved,expired_at,token_owner)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (f'{repo}:{short}', repo, short, 'bx_' + short, 'default', 'w/repo', int(default), 100, saved, expired, owner))
+        self.cons[backend].commit()
+
+    def assert_no_allocations(self):
+        for backend, con in self.cons.items():
+            for table in ('runs', 'leases', 'pool_pending', 'pool_waiters', 'pool_callers'):
+                self.assertEqual(con.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0, (backend, table))
+
+    def invoke(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(cli, 'cmd_run', return_value=0) as run:
+            code = cli.main(argv)
+        return code, err.getvalue(), run
+
+    def test_boat_only_routes_with_reason_and_stderr_before_allocation(self):
+        self.add('boat', 'skeleton')
+        argv = ['run', '--base', 'torssh:skeleton', '--', 'true']
+        self.assertEqual(common.entry_backend(argv), 'boat')
+        self.assertEqual(common._BACKEND_REASON, 'boat-only-base')
+        common.select_backend('boat')
+        code, err, run = self.invoke(argv)
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertIn('running on Boat because base', err)
+        self.assertTrue(any('backend=boat reason=boat-only-base' in line for line in self.logs))
+        request = next(call for call in self.events.call_args_list if call.args[:2] == ('run', 'run.request'))
+        self.assertEqual(request.kwargs['props']['reason'], 'boat_only_base')
+        self.assert_no_allocations()
+
+    def test_boat_base_runs_without_claiming_a_home_outage(self):
+        self.add('boat', 'skeleton')
+        argv = ['run', '--base', 'torssh:skeleton', '--', 'true']
+        common.select_backend(common.entry_backend(argv))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(cli, '_remote_once', return_value=0) as remote:
+            self.assertEqual(cli.main(argv), 0)
+        remote.assert_called_once()
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn('running on Boat because base', err.getvalue())
+        self.assertNotIn('down', err.getvalue())
+        self.assertFalse(any(call.args[:2] == ('backend', 'backend.failover') for call in self.events.call_args_list))
+        self.assert_no_allocations()
+
+    def test_home_startup_checks_cannot_block_or_fail_over_a_boat_base_run(self):
+        self.add('boat', 'skeleton')
+        argv = ['run', '--base', 'torssh:skeleton', '--', 'true']
+        common.select_backend(common.entry_backend(argv))
+        self.assertEqual(common.backend(), 'boat')
+        self.assertEqual(common._BACKEND_REASON, 'boat-only-base')
+        self.assertFalse(home.may_fail_over())
+        err = io.StringIO()
+        # A selected Boat run must not inspect home startup state or make a home request, even if those paths fail.
+        with patch.object(home, 'recent_failure', side_effect=AssertionError('read home startup state')), \
+                patch.object(home, 'probe', side_effect=AssertionError('probed home health')), \
+                patch.object(api, 'probe_backend', side_effect=AssertionError('probed home API')), \
+                patch.object(home, 'fail_over', side_effect=AssertionError('failed over a Boat run')), \
+                patch.object(cli, '_remote_once', return_value=0) as remote, contextlib.redirect_stderr(err):
+            home.before_run(argv)
+            self.assertEqual(cli.main(argv), 0)
+        remote.assert_called_once()
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn('running on Boat because base', err.getvalue())
+        self.assertFalse(any(call.args[:2] == ('backend', 'backend.failover') for call in self.events.call_args_list))
+        self.assert_no_allocations()
+
+    def test_automatic_failover_keeps_home_base_recipe_fallback(self):
+        self.add('server', 'warm')
+        argv = ['run', '--base', 'torssh:warm', '--', 'true']
+        with patch.dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_FAILOVER='unreachable'):
+            common.select_backend(common.entry_backend(argv))
+            code, err, run = self.invoke(argv)
+            self.assertEqual((code, err), (0, ''))
+            run.assert_called_once()
+            self.assertTrue(home.only_on_home('bases', 'name=?', ('torssh:warm',)))
+        self.assert_no_allocations()
+
+    def test_legacy_owner_forms_match_backfill_without_writing(self):
+        cases = [(None, None, 'ardud'), ('', None, 'ardud'), ('thread:abc', None, 'ardud'),
+                 ('person:moni', None, 'moni'), ('person:moni-alt', None, 'moni-alt'),
+                 ('person:moni_2', None, 'moni_2'), ('person:', None, 'ardud'),
+                 ('person:../moni', None, 'ardud'), ('person:a b', None, 'ardud'),
+                 ('person:moni', 'ardud', 'ardud'), ('thread:abc', 'moni', 'moni')]
+        for i, (created_by, recorded, want) in enumerate(cases):
+            self.add('server', f'b{i}', owner=recorded)
+            self.cons['server'].execute('UPDATE bases SET created_by=? WHERE short=?', (created_by, f'b{i}'))
+        self.cons['server'].commit()
+        for owner in ('ardud', 'moni', 'moni-alt', 'moni_2'):
+            with self.subTest(owner=owner), patch.dict(os.environ, OFFBOX_THREAD='person:' + owner):
+                actual = {r['short'] for r in base_catalog.rows('server')}
+                self.assertEqual(actual, {f'b{i}' for i, (_, _, want) in enumerate(cases) if want == owner})
+        stored = self.cons['server'].execute('SELECT token_owner FROM bases ORDER BY created_at, name').fetchall()
+        self.assertEqual(sum(r[0] is None for r in stored), 9)
+
+    def test_fresh_process_binds_api_and_database_after_base_routing(self):
+        self.add('boat', 'skeleton')
+        program = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from offbox_lib import common
+common.STATE = Path(sys.argv[2])
+common.SERVER_CFG = common.STATE / 'server.json'
+common.BACKEND_PATH = common.STATE / 'backend'
+common.BACKEND_STATE = common.STATE / 'backend-state.json'
+common.select_backend(common.entry_backend(['run', '--base=torssh:skeleton', '--', 'true']))
+from offbox_lib import api, capacity
+print(json.dumps([common.backend(), api.BACKEND, common.DB_PATH.name]))
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', program, str(SCRIPTS), str(self.root)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), ['boat', 'boat', 'offbox.db'])
+        self.assert_no_allocations()
+
+    def test_home_only_and_both_keep_home_choice(self):
+        self.add('server', 'warm')
+        argv = ['run', '--base', 'torssh:warm', '--', 'true']
+        self.assertEqual(common.entry_backend(argv), 'server')
+        self.add('boat', 'warm')
+        self.assertEqual(common.entry_backend(argv), 'server')
+        self.assertIsNone(common._BACKEND_REASON)
+        common.select_backend('server')
+        self.assertEqual(self.invoke(argv)[0:2], (0, ''))
+        self.assert_no_allocations()
+
+    def test_argument_forms_match_the_run_parser(self):
+        self.add('boat', 'skeleton')
+        self.add('server', 'warm')
+        # Option values, separator, abbreviation and repeated flags belong to one input class.
+        forms = [
+            (['--base', 'torssh:skeleton', '--', 'true'], 'boat'),
+            (['--base=torssh:skeleton', '--', 'true'], 'boat'),
+            (['--bas', 'skeleton', '--', 'true'], 'boat'),
+            (['--bas=skeleton', '--', 'true'], 'boat'),
+            (['--base', 'skeleton', '--base', 'warm', '--', 'true'], 'server'),
+            (['--base', 'warm', '--base=skeleton', '--', 'true'], 'boat'),
+            (['--base', 'skeleton', '--fresh', '--', 'true'], 'server'),
+            (['--', 'echo', '--base', 'skeleton'], 'server'),
+            (['echo', '--base', 'skeleton'], 'server'),
+            (['--step', 'echo --base skeleton'], 'server'),
+            (['--env', 'X=--base=skeleton', '--', 'true'], 'server'),
+        ]
+        for args, want in forms:
+            with self.subTest(args=args):
+                self.assertEqual(common.entry_backend(['run', *args]), want)
+        self.assert_no_allocations()
+
+    def test_pins_and_person_work_do_not_route_to_boat(self):
+        self.add('boat', 'skeleton')
+        argv = ['run', '--base', 'torssh:skeleton', '--', 'true']
+        with patch.dict(os.environ, OFFBOX_BACKEND='server'):
+            common.select_backend(common.entry_backend(argv))
+            code, err, run = self.invoke(argv)
+            self.assertEqual(code, 2)
+            self.assertIn('exists only on boat standby', err)
+            self.assertIn('pinned home backend has no copy', err)
+            run.assert_not_called()
+        with patch.dict(os.environ, OFFBOX_THREAD='person:moni'):
+            self.assertEqual(common.entry_backend(argv), 'server')
+            self.assertEqual(base_catalog.rows('boat'), [])
+        self.assert_no_allocations()
+
+    def test_unknown_lists_both_backends_and_default_with_no_pending_rows(self):
+        self.add('server', 'toolchain-home', default=True)
+        self.add('boat', 'skeleton')
+        self.add('boat', 'expired', expired=1, saved=None)
+        self.add('boat', 'unrelated', repo='other')
+        self.add('server', 'private', owner='moni')
+        argv = ['run', '--base', 'torssh:missing', '--', 'true']
+        common.select_backend(common.entry_backend(argv))
+        # Validation must finish before the run/pool code can open a writable DB.
+        with patch.object(cli, 'db', side_effect=AssertionError('no writable DB on refusal')):
+            code, err, run = self.invoke(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("no saved base 'torssh:missing'", err)
+        self.assertIn('toolchain-home (home, default)', err)
+        self.assertIn('skeleton (boat standby)', err)
+        for hidden in ('expired', 'unrelated', 'private'):
+            self.assertNotIn(hidden, err)
+        run.assert_not_called()
+        self.assert_no_allocations()
+
+    def test_empty_repo_and_expired_boat_base_are_missing(self):
+        self.add('boat', 'expired', expired=0, saved=None)
+        for name in ('torssh:expired', 'empty:missing'):
+            argv = ['run', '--base', name, '--', 'true']
+            common.select_backend(common.entry_backend(argv))
+            self.assertEqual(common.backend(), 'server')
+            code, err, run = self.invoke(argv)
+            self.assertEqual(code, 2)
+            self.assertIn('Saved bases for ' + name.split(':')[0] + ': none.', err)
+            run.assert_not_called()
+        self.assert_no_allocations()
+
+    def test_expiry_forms_preserve_kept_snapshots_and_hide_expired_disks(self):
+        cases = [(None, None, True), (None, 'snapshot', True),
+                 (100, None, False), (0, None, False), (100, 'snapshot', True)]
+        for i, (expired, saved, usable) in enumerate(cases):
+            self.add('boat', f'b{i}', expired=expired, saved=saved)
+        self.assertEqual({r['short'] for r in base_catalog.rows('boat')},
+                         {f'b{i}' for i, (_, _, usable) in enumerate(cases) if usable})
+        self.assertEqual(len(base_catalog.rows('boat', include_expired=True)), len(cases))
+        argv = ['run', '--base', 'torssh:b4', '--', 'true']
+        self.assertEqual(common.entry_backend(argv), 'boat')
+        self.add('server', 'b4', expired=100, saved='home-snapshot')
+        self.assertEqual(common.entry_backend(argv), 'server')
+        self.assert_no_allocations()
+
+    def test_errors_bound_the_list_to_eight_names(self):
+        for i in range(10):
+            self.add('boat', f'b{i}')
+        message = str(base_catalog.missing('torssh:no'))
+        self.assertEqual(message.count('(boat standby)'), 8)
+        self.assertIn('2 more (offbox bases)', message)
+
+    def test_catalog_is_read_only_and_does_not_create_missing_database(self):
+        before = {name: con.total_changes for name, con in self.cons.items()}
+        self.assertEqual(base_catalog.all_rows(), [])
+        self.assertEqual(before, {name: con.total_changes for name, con in self.cons.items()})
+        with patch.object(common, 'STATE', self.root / 'missing'):
+            self.assertEqual(base_catalog.all_rows(), [])
+            self.assertFalse((self.root / 'missing').exists())
+
+    def test_unreadable_catalog_fails_closed(self):
+        with patch.object(base_catalog.sqlite3, 'connect', side_effect=sqlite3.OperationalError('locked')):
+            with self.assertRaises(common.OffboxError) as raised:
+                common.entry_backend(['run', '--base', 'torssh:skeleton', '--', 'true'])
+        self.assertEqual(raised.exception.code, common.EXIT_LOCAL)
+        self.assert_no_allocations()
+
+    def test_secondary_listing_failures_preserve_both_backends_from_metadata(self):
+        self.add('server', 'warm', default=True)
+        self.add('boat', 'skeleton')
+        self.add('boat', 'boxonly', saved=None)
+        self.add('boat', 'expired', expired=1, saved=None)
+        common.select_backend('server')
+        failures = [subprocess.TimeoutExpired(['offbox'], 15), OSError('cannot spawn'),
+                    subprocess.CompletedProcess([], 2, '', 'down'),
+                    subprocess.CompletedProcess([], 0, '{bad json', ''),
+                    subprocess.CompletedProcess([], 0, '{}', ''),
+                    subprocess.CompletedProcess([], 0, '[{}]', '')]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch.object(bases.subprocess, 'run') as child:
+                if isinstance(failure, Exception):
+                    child.side_effect = failure
+                else:
+                    child.return_value = failure
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    bases.list_bases(True)
+                rows = {r['name']: r for r in json.loads(out.getvalue())}
+                self.assertEqual(set(rows), {'torssh:warm', 'torssh:skeleton', 'torssh:boxonly'})
+                self.assertEqual(rows['torssh:boxonly']['status'], 'unknown')
+                self.assertEqual(rows['torssh:boxonly']['backend'], 'boat standby')
+                self.assertIn('showing saved metadata', err.getvalue())
+        self.assert_no_allocations()
+
+    def test_partial_child_rows_never_discard_cached_table_output(self):
+        self.add('server', 'warm', default=True)
+        self.add('boat', 'skeleton')
+        common.select_backend('server')
+        row = {**base_catalog.rows('boat')[0], 'backend': 'boat standby', 'status': 'saved', 'data_until': None}
+        for field in ('name', 'repo_key', 'box_id', 'is_default', 'size', 'size_bytes',
+                      'created_at', 'note', 'status', 'data_until', 'backend'):
+            with self.subTest(missing=field):
+                partial = {k: v for k, v in row.items() if k != field}
+                result = subprocess.CompletedProcess([], 0, json.dumps([partial]), '')
+                out = io.StringIO()
+                with patch.object(bases.subprocess, 'run', return_value=result), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    bases.list_bases(False)
+                self.assertIn('torssh:warm', out.getvalue())
+                self.assertIn('torssh:skeleton', out.getvalue())
+                self.assertIn('boat standby', out.getvalue())
+
+    def test_cached_expiry_status_survives_child_failure_with_all(self):
+        self.add('server', 'warm')
+        self.add('boat', 'expired', expired=100, saved=None)
+        self.add('boat', 'kept', expired=100, saved='snapshot')
+        self.add('boat', 'boxonly', saved=None)
+        common.select_backend('server')
+        out = io.StringIO()
+        with patch.object(bases.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['offbox'], 15)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            bases.list_bases(True, include_expired=True)
+        rows = {r['name']: r for r in json.loads(out.getvalue())}
+        self.assertEqual(rows['torssh:expired']['status'], 'expired')
+        self.assertEqual(rows['torssh:expired']['data_until'], 100)
+        self.assertEqual(rows['torssh:kept']['status'], 'saved')
+        self.assertEqual(rows['torssh:boxonly']['status'], 'unknown')
+
+    def test_bases_lists_both_backends_and_preserves_json_fields(self):
+        self.add('server', 'warm', default=True)
+        self.add('boat', 'skeleton')
+        self.add('boat', 'expired', expired=1, saved=None)
+        common.select_backend('server')
+        def child(argv, *, env, **kwargs):
+            self.assertEqual(env['OFFBOX_BACKEND'], 'boat')
+            self.assertEqual(env['OFFBOX_BASES_CHILD'], '1')
+            with patch.object(common, '_BACKEND', 'boat'):
+                rows = bases._local_base_rows('--all' in argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(rows), '')
+        for all_flag in (False, True):
+            with self.subTest(all=all_flag), patch.object(bases.subprocess, 'run', side_effect=child):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    bases.list_bases(False, include_expired=all_flag)
+                text = out.getvalue()
+                self.assertIn('torssh:warm', text)
+                self.assertIn('*default', text)
+                self.assertIn('home', text)
+                self.assertIn('boat standby', text)
+                self.assertEqual('torssh:expired' in text, all_flag)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    bases.list_bases(True, include_expired=all_flag)
+                rows = json.loads(out.getvalue())
+                self.assertEqual({r['backend'] for r in rows}, {'home', 'boat standby'})
+                self.assertEqual(len(rows), 3 if all_flag else 2)
+                for r in rows:
+                    self.assertTrue({'name', 'box_id', 'saved', 'status', 'data_until', 'is_default'} <= r.keys())
+        self.assertTrue(cli.build_parser().parse_args(['bases', '--all', '--json']).all)
+
+
+if __name__ == '__main__':
+    unittest.main()
