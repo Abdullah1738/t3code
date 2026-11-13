@@ -652,7 +652,7 @@ describe("control listings", () => {
   );
 
   // All listing forms must keep candidate reads AND summary enrichment on the request lane.
-  for (const query of [
+  it.live.each([
     "limit=1",
     "limit=1&active=true",
     "limit=1&ids=quiet",
@@ -662,9 +662,9 @@ describe("control listings", () => {
     "limit=1&origin=none",
     "limit=1&archived=true",
     "limit=1&includeSubagents=true",
-  ]) {
-    it.live(`GET threads ${query} completes during a long candidate scan and a writer`, () =>
-      Effect.gen(function* () {
+  ])(
+    "GET threads %s completes during a long candidate scan and a writer",
+    (query) => Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-list-latency-" });
@@ -713,8 +713,7 @@ describe("control listings", () => {
           yield* Fiber.join(writer);
         }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-    );
-  }
+  );
 
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
@@ -1172,9 +1171,11 @@ describe("control listings", () => {
       query: "",
     },
   ];
-  for (const row of unavailableCandidates) {
-    for (const origin of ["none", "direct", "inherited"] as const) {
-      it.effect(`refills ${origin} origin results after a candidate is ${row.name}`, () => {
+  it.effect.each(
+    unavailableCandidates.flatMap((row) =>
+      (["none", "direct", "inherited"] as const).map((origin) => ({ row, origin })),
+    ),
+  )("refills $origin origin results after a candidate is $row.name", ({ row, origin }) => {
         const candidates = ["tie-a", "tie-b", "tie-c"].map((id) => {
           const candidate = shell(id, {
             ...idle,
@@ -1229,8 +1230,6 @@ describe("control listings", () => {
           row.name === "missing" ? new Set(["tie-a"]) : new Set(),
         );
       });
-    }
-  }
 
   it.effect("refills across a whole unavailable origin-filtered candidate page", () => {
     const ids = Array.from({ length: 130 }, (_, i) => `refill-${String(i).padStart(3, "0")}`);

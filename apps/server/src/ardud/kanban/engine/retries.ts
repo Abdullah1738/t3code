@@ -17,6 +17,8 @@ import {
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardRetry,
+  type KanbanCardEvent,
+  type ThreadId,
 } from "@t3tools/contracts";
 
 import { isContextFull, isOutage } from "./rules.ts";
@@ -50,6 +52,32 @@ export const RETRYING_EVENT = "Run failed, retrying once";
 export const FRESH_START_EVENT = "Thread too long; the next run starts on a fresh thread";
 export const NO_VERDICT_RESTARTED_EVENT = "Reviewer stopped without a verdict, retrying once";
 export const NO_VERDICT_REASON = "Reviewer stopped without a verdict";
+export const REFUSED_VERDICT_PREFIX = "Review verdict refused: ";
+
+/** Only this review run's own refusal can replace its no-verdict recovery. */
+export const refusedVerdict = (
+  card: Pick<KanbanCard, "id" | "movedAt">,
+  events: ReadonlyArray<KanbanCardEvent>,
+  threadId: ThreadId,
+) => {
+  const event = events.findLast(
+    (event) =>
+      event.cardId === card.id &&
+      event.kind === "comment" &&
+      event.actor._tag === "thread" &&
+      event.actor.threadId === threadId &&
+      event.at >= card.movedAt &&
+      event.body?.startsWith(REFUSED_VERDICT_PREFIX) &&
+      /^(?:clear|findings) at [^:]+: [\s\S]+$/.test(
+        event.body.slice(REFUSED_VERDICT_PREFIX.length),
+      ),
+  );
+  return (
+    event?.body
+      ?.slice(REFUSED_VERDICT_PREFIX.length)
+      .match(/^(?:clear|findings) at [^:]+: ([\s\S]+)$/)?.[1] ?? null
+  );
+};
 
 /** The parts of a provider failure the decision reads. */
 export interface RetryFailure {

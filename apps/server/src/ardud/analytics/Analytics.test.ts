@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsError, type AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsError, LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -58,6 +58,100 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads filtered tick phase percentiles and persists the complete day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [boardId, durationMs] of [
+        ["a", 10],
+        ["a", 20],
+        ["a", 90],
+        ["b", 1_000],
+      ] as const)
+        yield* analytics.record(
+          event({
+            kind: "kanban.tick_phase",
+            surface: "server",
+            route: "kanban",
+            boardId,
+            durationMs,
+            props: { tickId: "tick-1", phase: "thread_status", count: 1 },
+          }),
+        );
+      yield* analytics.record(
+        event({
+          kind: "kanban.tick_overlap",
+          surface: "server",
+          route: "kanban",
+          boardId: "a",
+          props: { tickId: "tick-2", activeTickId: "tick-1", reason: "local_waits_only" },
+        }),
+      );
+      const result = yield* analytics.read({
+        day,
+        kind: "kanban.tick_phase",
+        boardId: "a",
+        limit: 1,
+      });
+      assert.equal(result.rollup.total, 3);
+      assert.lengthOf(result.samples, 1);
+      assert.deepEqual(result.rollup.tickPhases, [
+        {
+          boardId: "a",
+          phase: "thread_status",
+          count: 3,
+          p50Ms: 20,
+          p95Ms: 90,
+          maxMs: 90,
+          approximate: false,
+        },
+      ]);
+      const full = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(full.total, 5);
+      assert.equal(full.tickPhases?.length, 2);
+      assert.equal(full.kindCounts["kanban.tick_overlap"], 1);
+      assert.isFalse(yield* setup.fs.exists(`${setup.directory}/rollup-${day}.json.tmp`));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps a minute summary delivered after midnight in the task's UTC day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      yield* TestClock.setTime(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-14T00:00:01.000Z")),
+      );
+      yield* analytics.ingest({
+        events: [
+          event({
+            ts: "2026-11-13T23:59:00.000Z",
+            kind: "performance.long-task-summary",
+            surface: "desktop",
+            route: "board",
+            props: {
+              count: 1,
+              totalMs: 500,
+              maxMs: 500,
+              wallTimeMs: 60_000,
+              histogram: [[Math.ceil(Math.log(500) / Math.log(LONG_TASK_HISTOGRAM_RATIO)), 1]],
+            },
+          }),
+        ],
+      });
+      const previous = yield* analytics.read({ day });
+      assert.deepInclude(previous.rollup.longTasksByRoute[0], {
+        route: "board",
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        p95Ms: 500,
+        wallTimeShare: 500 / 60_000,
+      });
+      assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "reads the ask split from existing records and filters by board without recording text",
     () =>

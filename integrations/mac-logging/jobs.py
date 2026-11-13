@@ -9,12 +9,13 @@ import os
 import plistlib
 import re
 import signal
+import shlex
 from pathlib import Path
 import sys
 import subprocess
 import tempfile
 import time
-from toollog import emit, directory, private_dir, SKIP_REASONS
+from toollog import emit, directory, private_dir, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS
 
 
 def state_path(name):
@@ -56,6 +57,34 @@ class SourceFailure(Exception):
         self.failure = failure
         self.message = message
         self.exit_code = exit_code
+
+
+def deadline_call(deadline, operation, *args, **kwargs):
+    if deadline is None:
+        return operation(*args, **kwargs)
+    started = time.monotonic()
+    remaining = deadline-started
+    if remaining <= 0:
+        raise SourceFailure('timeout', 'collector budget exhausted')
+
+    def expired(signum, frame):
+        raise SourceFailure('timeout', 'collector I/O budget exhausted')
+
+    # This is a single-threaded macOS LaunchAgent. Alarm only the I/O call,
+    # never the counter/checkpoint updates that follow a completed report.
+    handler = signal.signal(signal.SIGALRM, expired)
+    previous = signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        result = operation(*args, **kwargs)
+        if time.monotonic() > deadline:
+            raise SourceFailure('timeout', 'collector I/O budget exhausted')
+        return result
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if previous[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, previous[0]-(time.monotonic()-started)), previous[1])
 
 
 def stderr_line(value):
@@ -121,56 +150,114 @@ def du_total(path, run, timeout):
     raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
 
 
-def big_root_inventory(path, run, deadline):
+def big_root_inventory(path, run, deadline, cache=None):
     total, completed, failed, denied = 0, 0, 0, 0
     children = {}
+    cache = {} if cache is None else cache
+    now = time.time()
+    for key, value in list(cache.items()):
+        if not isinstance(value, dict):
+            cache.pop(key)
+            continue
+        attempted = value.get('attemptedAt', 0)
+        value['attemptedAt'] = attempted if number(attempted) and attempted <= now else 0
+        if not number(value.get('bytes')) or not number(value.get('at')) or value['at'] > now:
+            cache[key] = dict(attemptedAt=value['attemptedAt'])
     # A slow subtree must not discard every other child's completed total.
     scan_started = time.monotonic()
+    entries, listed = [], False
     try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                child = Path(entry.path)
-                started = time.monotonic()
-                try:
-                    size, unreadable, code = du_total(child, run, min(15, deadline-started))
-                    total += size
-                    completed += 1
-                    denied += unreadable
-                    children[str(child)] = size
-                    emit('disk', 'event', 'disk.inventory.source', ok=True,
-                         props=dict(source=str(child), bytes=size, partial=bool(unreadable),
-                                    deniedCount=unreadable, exitCode=code,
-                                    elapsedMs=(time.monotonic()-started)*1000))
-                except Exception as exc:
-                    failed += 1
-                    source_error('disk', 'disk.inventory.source', child, started, exc)
-                if time.monotonic() >= deadline:
-                    # Name the root as incomplete without enumerating an unbounded
-                    # remainder. The child error identifies the subtree that stalled.
-                    failed += 1
-                    break
-    except OSError as exc:
+        with deadline_call(deadline, os.scandir, path) as listing:
+            deadline_call(deadline, entries.extend, listing)
+        listed = True
+    except (OSError, SourceFailure) as exc:
         failed += 1
         source_error('disk', 'disk.inventory.source', path, scan_started, exc)
+    if listed:
+        present = {entry.path for entry in entries}
+        for key in set(cache)-present:
+            cache.pop(key)
+    entries.sort(key=lambda entry: cache.get(entry.path, {}).get('attemptedAt', 0))
+    for turn, entry in enumerate(entries):
+        child = Path(entry.path)
+        started = time.monotonic()
+        if started >= deadline:
+            failed += 1
+            break
+        old = cache.get(str(child), {})
+        timeout = min(15, deadline-started)
+        try:
+            size, unreadable, code = du_total(child, run, timeout)
+            completed += 1
+            denied += unreadable
+            cache[str(child)] = dict(bytes=size, at=now, attemptedAt=now,
+                                     partial=bool(unreadable))
+            children[str(child)] = size
+            emit('disk', 'event', 'disk.inventory.source', ok=True,
+                 props=dict(source=str(child), bytes=size, partial=bool(unreadable),
+                            deniedCount=unreadable, exitCode=code,
+                            elapsedMs=(time.monotonic()-started)*1000))
+        except Exception as exc:
+            failed += 1
+            # A shortened timeout must not spend this child's next full turn.
+            attempted_at = now if turn == 0 or timeout >= 15 else old.get('attemptedAt', 0)
+            if old:
+                old['attemptedAt'] = attempted_at
+            else:
+                # Attempts need to rotate even before the first total.
+                cache[str(child)] = dict(attemptedAt=attempted_at)
+            source_error('disk', 'disk.inventory.source', child, started, exc)
+        if time.monotonic() >= deadline:
+            # Name the root as incomplete without enumerating an unbounded
+            # remainder. The child error identifies the subtree that stalled.
+            failed += 1
+            break
+    total = sum(value['bytes'] for value in cache.values() if 'bytes' in value)
+    cached = [value for value in cache.values() if 'bytes' in value and value['at'] < now]
     return total, dict(partial=bool(failed or denied), failedCount=failed,
-                      completedCount=completed, deniedCount=denied), children
+                      completedCount=completed, deniedCount=denied, cachedCount=len(cached),
+                      ageS=max((now-value['at'] for value in cached), default=0)), children
 
 
 def directory_inventory(paths=None, run=subprocess.run, deadline=None):
     started = time.monotonic()
     deadline = min(started + 210, deadline) if deadline is not None else started + 210
     sizes, errors, partials, children = {}, 0, {}, {}
-    for path in DIRECTORY_ROOTS if paths is None else paths:
+    previous = read_state('disk-inventory')
+    attempts = previous.get('attemptedAt', {})
+    attempts = dict(attempts) if isinstance(attempts, dict) else {}
+    child_state = previous.get('childState', {})
+    child_state = child_state if isinstance(child_state, dict) else {}
+    old_sizes = previous.get('sizes', {})
+    old_sizes = old_sizes if isinstance(old_sizes, dict) else {}
+    now = time.time()
+    roots = list(DIRECTORY_ROOTS if paths is None else paths)
+    for path in roots:
+        key = str(path)
+        # Migrate installed state, which has sizes but no attempt timestamps.
+        value = attempts.get(key, previous.get('at', 0) if key in old_sizes else 0)
+        attempts[key] = value if number(value) and value <= now else 0
+    roots.sort(key=lambda path: attempts[str(path)])
+    turn_budget = min(60, max(0, deadline-started))
+    for turn, path in enumerate(roots, 1):
         source_started = time.monotonic()
         try:
-            path.stat()
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
+            # Full failed attempts rotate; shortened timeouts keep priority.
+            if turn == 1 or remaining >= turn_budget:
+                attempts[str(path)] = time.time()
+            emit('disk', 'event', 'disk.inventory.turn',
+                 props=dict(source=str(path), turn=turn))
+            deadline_call(deadline, path.stat)
             if path in BIG_ROOTS:
-                total, flags, measured = big_root_inventory(path, run, min(deadline, source_started+60))
+                cache = child_state.setdefault(str(path), {})
+                if not isinstance(cache, dict):
+                    cache = child_state[str(path)] = {}
+                total, flags, measured = big_root_inventory(path, run, min(deadline, source_started+60), cache)
                 children[str(path)] = measured
-                if flags['completedCount'] or not flags['failedCount']:
+                if flags['completedCount'] or flags['cachedCount'] or not flags['failedCount']:
                     sizes[str(path)] = total
                 if flags['partial']:
                     partials[str(path)] = flags
@@ -180,11 +267,13 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
                     source_error('disk', 'disk.inventory.source', path, source_started,
                                  SourceFailure('partial', 'directory total is incomplete'), props)
                 else:
+                    attempts[str(path)] = time.time()
                     emit('disk', 'event', 'disk.inventory.source', ok=True,
                          props=dict(source=str(path), elapsedMs=(time.monotonic()-source_started)*1000, **props))
                 continue
-            total, denied, code = du_total(path, run, min(60, remaining))
+            total, denied, code = du_total(path, run, min(60, deadline-time.monotonic()))
             sizes[str(path)] = total
+            attempts[str(path)] = time.time()
             if code:
                 partials[str(path)] = dict(partial=True, deniedCount=denied)
                 emit('disk', 'event', 'disk.inventory.source', ok=True,
@@ -194,6 +283,7 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
         except FileNotFoundError as exc:
             if confirmed_absent(path, exc):
                 sizes[str(path)] = 0
+                attempts[str(path)] = time.time()
                 continue
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
@@ -201,7 +291,8 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
     save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials,
-                                    children=children, sourceErrors=errors))
+                                    children=children, sourceErrors=errors, attemptedAt=attempts,
+                                    childState=child_state))
     emit('disk', 'error' if errors else 'perf', 'disk.inventory', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000, props={'count': len(sizes), 'sourceErrors': errors},
          error_tag='disk.inventory_failed' if errors else None)
@@ -431,28 +522,146 @@ def backup_reason(stage, restic_rc, output):
     return 'other'
 
 
-def backup_snapshot_age(target, snapshot_at):
-    if float(snapshot_at) > 0:
-        return max(0, time.time()-float(snapshot_at))
-    # Never run a password command, read a password file or open an interactive
-    # prompt for instrumentation. A caller-supplied password allows a bounded,
-    # lock-free read; otherwise the age is unknown, not a cached success time.
-    if not os.environ.get('RESTIC_PASSWORD') or not os.environ.get('RESTIC_REPOSITORY'):
-        return None
-    env = dict(os.environ)
-    for key in ('RESTIC_PASSWORD_COMMAND', 'RESTIC_PASSWORD_FILE'):
-        env.pop(key, None)
-    tag = {'memory': 'memory-live', 'health': 'health-data'}[target]
-    result = subprocess.run([os.environ.get('MAC_LOG_RESTIC', '/opt/homebrew/bin/restic'),
-                             '--no-lock', 'snapshots', '--host', 'ardud-mac', '--tag', tag,
-                             '--latest', '1', '--json'], env=env, stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=5)
-    if result.returncode:
-        return None
-    import datetime as dt
-    snapshots = json.loads(result.stdout)
-    newest = max(dt.datetime.fromisoformat(s['time'].replace('Z', '+00:00')).timestamp() for s in snapshots)
-    return max(0, time.time()-newest)
+def backup_snapshot_time(value):
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?'
+                         r'(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)', value)
+    if not match:
+        raise ValueError('invalid snapshot time')
+    # Go's RFC3339Nano uses 1–9 fraction digits; Python 3.9 accepts only 3 or 6.
+    fraction = '.'+match[2][:6].ljust(6, '0') if match[2] else ''
+    zone = '+00:00' if match[3] == 'Z' else match[3]
+    return dt.datetime.fromisoformat(match[1]+fraction+zone).timestamp()
+
+
+def backup_snapshot_age(target):
+    try:
+        if target not in ('memory', 'health'):
+            return None, 'unavailable'
+        env = dict(os.environ)
+        # Admission skips happen before the memory shell exports RESTIC_*.
+        # Read only the two known Keychain entries, never a caller's command/file.
+        # The guard gives this entire logger six seconds, including ps and startup.
+        if not env.get('RESTIC_PASSWORD'):
+            command = ['/usr/bin/security', 'find-generic-password', '-s', 'restic-'+target+'-backup']
+            if target == 'health':
+                command += ['-a', 'ardud']
+            password = subprocess.run(command + ['-w'], capture_output=True, text=True,
+                                      stdin=subprocess.DEVNULL, timeout=1)
+            if password.returncode or not password.stdout.strip():
+                return None, 'password_unavailable'
+            env['RESTIC_PASSWORD'] = password.stdout.rstrip('\r\n')
+        for key in ('RESTIC_PASSWORD_COMMAND', 'RESTIC_PASSWORD_FILE'):
+            env.pop(key, None)
+        if not env.get('RESTIC_REPOSITORY'):
+            env['RESTIC_REPOSITORY'] = (str(Path(os.environ.get('MEMORY_BACKUP_REPO_ROOT',
+                '/Volumes/ExternalSSD/memory-system-backup/restic'))/'live') if target == 'memory'
+                else str(Path.home()/'.local/share/health-backup/restic'))
+        tag = {'memory': 'memory-live', 'health': 'health-data'}[target]
+        result = subprocess.run([os.environ.get('MAC_LOG_RESTIC', '/opt/homebrew/bin/restic'),
+                                 '--no-lock', 'snapshots', '--host', 'ardud-mac', '--tag', tag,
+                                 '--latest', '1', '--json'], env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=3)
+        if result.returncode:
+            return None, 'exit'
+        snapshots = json.loads(result.stdout)
+        if not isinstance(snapshots, list):
+            return None, 'parse'
+        if not snapshots:
+            return None, 'no_snapshots'
+        return max(0, time.time()-max(backup_snapshot_time(s['time']) for s in snapshots)), None
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return None, 'parse'
+    except Exception:
+        return None, 'unavailable'
+
+
+def backup_processes(pids):
+    processes = {}
+    deadline = time.monotonic()+0.8
+    pending = list(pids)
+    # Read only the holder and caller ancestry; never emit the raw ps output.
+    while pending and len(processes) < 16:
+        pid = pending.pop(0)
+        if pid <= 1 or pid in processes or time.monotonic() >= deadline:
+            continue
+        try:
+            result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'ppid=,etime=,tty=,command='],
+                                    capture_output=True, text=True, timeout=deadline-time.monotonic(),
+                                    env={**os.environ, 'LC_ALL': 'C'})
+            if result.returncode:
+                continue
+            parent, elapsed, tty, command = result.stdout.strip().split(None, 3)
+            parts = shlex.split(command)
+            days, _, clock = elapsed.rpartition('-')
+            seconds = 0
+            for value in clock.split(':'):
+                seconds = seconds*60+int(value)
+            seconds += int(days or 0)*86400
+            processes[pid] = dict(ppid=int(parent), age=seconds, tty=tty, args=parts)
+            pending.append(int(parent))
+        except Exception:
+            continue
+    return processes
+
+
+def backup_origin(pid, processes):
+    manual = agent = launched = False
+    for _ in range(16):
+        process = processes.get(pid)
+        if not process:
+            break
+        args = process['args']
+        names = [Path(arg).name for arg in args[:4]]
+        if any(name in ('install.zsh', 'install-jobs.zsh', 'deploy.zsh') for name in names):
+            return 'installer'
+        agent |= bool(names and names[0] in ('Robob', 'codex', 'claude', 'opencode'))
+        manual |= process['tty'] not in ('?', '??', '-')
+        launched |= process['ppid'] == 1
+        pid = process['ppid']
+    return 'agent' if agent else 'manual' if manual else 'launchd' if launched else 'unknown'
+
+
+def backup_lock(lock_path, now):
+    props = dict(lockHolderCmd=None, lockHolderPpid=None, lockHolderStartedAgoS=None,
+                 lockHolderTrigger='unknown')
+    try:
+        lock = Path(lock_path)
+        props['lockAgeS'] = max(0, int(now-lock.stat().st_mtime))
+        holder = (lock/'pid').read_text().strip()
+        holder = int(holder) if re.fullmatch(r'[0-9]{1,10}', holder) else 0
+        # Darwin/Linux pid_t is signed 32-bit; corrupt metadata must not drop the log.
+        props['lockPid'] = holder if 0 < holder <= 2**31-1 else 0
+    except (OSError, ValueError):
+        props.setdefault('lockPid', 0)
+    gone = False
+    if props['lockPid'] > 0:
+        try:
+            os.kill(props['lockPid'], 0)
+        except ProcessLookupError:
+            gone = True
+        except (OSError, OverflowError):
+            pass
+    return props, gone
+
+
+def backup_holder(props, processes):
+    holder = props.get('lockPid', 0)
+    process = processes.get(holder)
+    if process:
+        args = process['args']
+        program = Path(args[0]).name if args else 'unknown'
+        if re.fullmatch(r'python3(?:\.\d+)?', program):
+            program = 'python3'
+        if program not in BACKUP_PROGRAMS:
+            program = 'unknown'
+        command = program
+        if len(args) > 1:
+            arg = Path(args[1]).name
+            command += ' '+(arg if arg in BACKUP_ARGS else '[redacted]')
+        props.update(lockHolderCmd=command, lockHolderPpid=process['ppid'],
+                     lockHolderStartedAgoS=process['age'], lockHolderTrigger=backup_origin(holder, processes))
 
 
 def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_reason='', lock_path=''):
@@ -463,12 +672,25 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
         summary = json.loads(summary)
     except ValueError:
         summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
     ran = str(restic_rc) not in ('', '-1')
     if not ran and not skip_reason:
         skip_reason = 'other'
     if skip_reason and skip_reason not in SKIP_REASONS:
         skip_reason = 'other'
     props = dict(target=target, exitCode=int(exit_code), skipped=int(bool(skip_reason)))
+    if skip_reason == 'lock_held':
+        lock_props, gone = backup_lock(lock_path, now)
+        props.update(lock_props)
+        if gone:
+            skip_reason = 'stale_lock'
+    processes = backup_processes([props.get('lockPid', 0), os.getppid()])
+    origin = backup_origin(os.getppid(), processes)
+    if origin == 'unknown' and os.environ.get('XPC_SERVICE_NAME') == 'com.abdullah.'+target+'-backup':
+        origin = 'launchd'
+    props['trigger'] = 'unknown' if origin == 'agent' else origin
+    backup_holder(props, processes)
     if ran:
         props['resticExitCode'] = int(restic_rc)
     ok = int(exit_code) == 0
@@ -477,13 +699,6 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
         props['skipReason'] = skip_reason
         ok, tag = False, 'backup.skipped_' + skip_reason
         if skip_reason == 'lock_held':
-            try:
-                lock = Path(lock_path)
-                props['lockAgeS'] = max(0, int(now-lock.stat().st_mtime))
-                holder = (lock/'pid').read_text().strip()
-                props['lockPid'] = int(holder) if re.fullmatch(r'[0-9]{1,10}', holder) else 0
-            except (OSError, ValueError):
-                props.setdefault('lockPid', 0)
             # An unreadable age cannot prove that this is a healthy skip.
             ok = int(exit_code) == 0 and 'lockAgeS' in props and props['lockAgeS'] < 7200
             tag = (None if ok else 'backup.skip_stale_lock' if props.get('lockAgeS', -1) >= 7200
@@ -492,12 +707,14 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
     for key, source in [('bytes', 'total_bytes_processed'), ('files', 'total_files_processed')]:
         if type(summary.get(source)) is int:
             props[key] = summary[source]
-    try:
-        age = backup_snapshot_age(target, snapshot_at)
-        if age is not None:
-            props['snapshotAgeS'] = age
-    except Exception:
-        pass
+    age, snapshot_error = backup_snapshot_age(target)
+    props['lastGoodSnapshotAgeS'] = age
+    if snapshot_error:
+        props['lastGoodSnapshotError'] = snapshot_error
+    if age is not None:
+        props['snapshotAgeS'] = age
+    elif number(float(snapshot_at)) and float(snapshot_at) > 0:
+        props['snapshotAgeS'] = max(0, now-float(snapshot_at))
     emit('backup', 'perf' if ok else 'error', 'backup.run',
          duration_ms=max(0, (now-float(start))*1000), ok=ok, props=props, error_tag=tag)
 

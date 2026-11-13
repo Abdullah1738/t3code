@@ -1247,6 +1247,322 @@ it.effect("board_open gives a board its icon only while it has none", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("wiki_write edits preserve surrounding bytes and return a compact result", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const evaluator = ThreadId.make("thread-evaluator");
+    const body = `${"unchanged 𐐀\r\n".repeat(12_000)}old sentence\nend\n`;
+    const created = yield* call(evaluator, "wiki_write", {
+      slug: "Large Page",
+      title: "Kept title",
+      body,
+    });
+    assert.isFalse(created.isError, created.text);
+    assert.strictEqual((created.structured.page as { body: string }).body, body);
+    const edited = yield* call(evaluator, "wiki_write", {
+      slug: " Large Page! ",
+      edits: [{ oldString: "old sentence", newString: "$& new sentence" }],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    const [saved] = yield* kanban.wiki(board.id);
+    assert.strictEqual(
+      saved?.body,
+      body.replace("old sentence", () => "$& new sentence"),
+    );
+    assert.strictEqual(saved?.title, "Kept title");
+    assert.deepStrictEqual(edited.structured.page, {
+      boardId: board.id,
+      slug: "large-page",
+      title: "Kept title",
+      updatedAt: saved?.updatedAt,
+      updatedBy: saved?.updatedBy,
+      bodyLength: saved?.body.length,
+      edits: 1,
+    });
+    assert.isBelow(edited.text.length, 1_000);
+
+    const replaced = yield* call(evaluator, "wiki_write", {
+      slug: "large-page",
+      body: "replacement",
+    });
+    assert.isFalse(replaced.isError, replaced.text);
+    assert.strictEqual((replaced.structured.page as { title: string }).title, "Kept title");
+    const untitled = yield* call(evaluator, "wiki_write", { slug: "new-page", body: "" });
+    assert.isFalse(untitled.isError, untitled.text);
+    assert.strictEqual((untitled.structured.page as { title: string }).title, "new-page");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("wiki_write refuses invalid edits without changing the stored page", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const evaluator = ThreadId.make("thread-evaluator");
+    yield* kanban.writeWiki(
+      board.id,
+      { slug: "page", title: "Original", body: "one two two" },
+      owner,
+    );
+    const before = yield* kanban.wiki(board.id);
+    const cases = [
+      {
+        input: { edits: [{ oldString: "missing", newString: "new" }] },
+        error: "edit 1: expected 1, found 0 occurrences of",
+      },
+      {
+        input: { edits: [{ oldString: "two", newString: "new" }] },
+        error: "edit 1: expected 1, found 2 occurrences of",
+      },
+      {
+        input: {
+          title: "Not saved",
+          edits: [
+            { oldString: "one", newString: "changed" },
+            { oldString: "missing", newString: "bad" },
+          ],
+        },
+        error: "edit 2: expected 1, found 0",
+      },
+      {
+        input: { body: "replace", edits: [{ oldString: "one", newString: "new" }] },
+        error: "exactly one of body or edits",
+      },
+      { input: {}, error: "exactly one of body or edits" },
+      {
+        input: { slug: "missing", edits: [{ oldString: "one", newString: "new" }] },
+        error: "no wiki page missing; create it with body",
+      },
+      {
+        input: { edits: [{ oldString: "one", newString: "bad\u0000" }] },
+        error: "wiki body has a control character U+0000",
+      },
+      {
+        input: { title: "bad\u000b", edits: [{ oldString: "one", newString: "new" }] },
+        error: "title has a control character U+000B",
+      },
+    ];
+    for (const { input, error } of cases) {
+      const result = yield* call(evaluator, "wiki_write", { slug: "page", ...input });
+      assert.isTrue(result.isError, result.text);
+      assert.include(result.text, error);
+      assert.deepStrictEqual(yield* kanban.wiki(board.id), before);
+    }
+    // Direct callers must obey the same rules as MCP callers.
+    for (const input of [
+      {},
+      { body: "new", edits: [] },
+      { edits: [] },
+      { edits: Array.from({ length: 51 }, () => ({ oldString: "one", newString: "x" })) },
+      { edits: [{ oldString: "", newString: "x" }] },
+      ...[0, -1, 1.5, Number.NaN].map((count) => ({
+        edits: [{ oldString: "one", newString: "x", count }],
+      })),
+    ]) {
+      const result = yield* kanban
+        .writeWiki(board.id, { slug: "page", ...input }, owner)
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(result));
+      assert.deepStrictEqual(yield* kanban.wiki(board.id), before);
+    }
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const work = yield* kanban.createCard(
+      board.id,
+      {
+        prompt: "Worker",
+        title: "Worker",
+        description: "Worker",
+        subtasks: [{ step: 1, owner: "work", text: "Implement" }],
+      },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+    assert.isNotNull(worker);
+    const denied = yield* call(worker, "wiki_write", {
+      boardId: board.id,
+      slug: "page",
+      edits: [{ oldString: "one", newString: "new" }],
+    });
+    assert.isTrue(denied.isError, denied.text);
+    assert.include(denied.text, "Only evaluators");
+    assert.deepStrictEqual(yield* kanban.wiki(board.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("wiki_write schema rejects empty edits, empty oldString and invalid counts", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    for (const edits of [
+      [],
+      Array.from({ length: 51 }, () => ({ oldString: "old", newString: "new" })),
+      [{ oldString: "", newString: "new" }],
+      ...[0, -1, 1.5].map((count) => [{ oldString: "old", newString: "new", count }]),
+    ]) {
+      const error = yield* call(ThreadId.make("thread-evaluator"), "wiki_write", {
+        slug: "page",
+        edits,
+      }).pipe(Effect.flip);
+      assert.include(String(error), "Invalid parameters");
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "wiki_write applies sequential literal edits with non-overlapping counts and saves no-ops",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "wiki",
+        name: "Wiki",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const evaluator = ThreadId.make("thread-evaluator");
+      yield* kanban.writeWiki(
+        board.id,
+        { slug: "page", title: "Original", body: "aaaa token" },
+        owner,
+      );
+      const result = yield* call(evaluator, "wiki_write", {
+        slug: "page",
+        title: " Updated ",
+        edits: [
+          { oldString: "aa", newString: "$&", count: 2 },
+          { oldString: "$&$&", newString: "done" },
+          { oldString: "token", newString: "" },
+        ],
+      });
+      assert.isFalse(result.isError, result.text);
+      const [saved] = yield* kanban.wiki(board.id);
+      assert.strictEqual(saved?.body, "done ");
+      assert.strictEqual(saved?.title, "Updated");
+      yield* TestClock.adjust("1 second");
+      const noop = yield* call(evaluator, "wiki_write", {
+        slug: "page",
+        edits: [{ oldString: "done", newString: "done" }],
+      });
+      assert.isFalse(noop.isError, noop.text);
+      const [after] = yield* kanban.wiki(board.id);
+      assert.strictEqual(after?.body, saved?.body);
+      assert.notStrictEqual(after?.updatedAt, saved?.updatedAt);
+      assert.deepStrictEqual(after?.updatedBy, { _tag: "evaluator", threadId: evaluator });
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("wiki writes serialize concurrent edits and full-body replacements", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.writeWiki(board.id, { slug: "page", body: "anchor" }, owner);
+    yield* Effect.all(
+      Array.from({ length: 20 }, (_, i) =>
+        kanban.writeWiki(
+          board.id,
+          {
+            slug: "page",
+            edits: [{ oldString: "anchor", newString: `edit-${i} anchor` }],
+          },
+          owner,
+        ),
+      ),
+      { concurrency: "unbounded" },
+    );
+    const [saved] = yield* kanban.wiki(board.id);
+    for (let i = 0; i < 20; i++) assert.include(saved!.body, `edit-${i} `);
+    const [edited, replaced] = yield* Effect.all(
+      [
+        kanban.writeWiki(
+          board.id,
+          { slug: "page", edits: [{ oldString: "anchor", newString: "edited" }] },
+          owner,
+        ),
+        kanban.writeWiki(board.id, { slug: "page", body: "replacement anchor" }, owner),
+      ],
+      { concurrency: "unbounded" },
+    );
+    const [final] = yield* kanban.wiki(board.id);
+    assert.strictEqual(replaced.body, "replacement anchor");
+    assert.isTrue(
+      (edited.body === "replacement edited" && final?.body === edited.body) ||
+        (edited.body === saved!.body.replace("anchor", "edited") && final?.body === replaced.body),
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("wiki_read sections and outlines ignore fences and keep page metadata", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const thread = ThreadId.make("thread-evaluator");
+    const section = "## Deploy\ntext\n```md\n# Fake\n```\n### Nested\nchild\n";
+    const body = `# Root\n${section}## Next\nnext\n## DEPLOY\nsecond`;
+    const page = yield* kanban.writeWiki(board.id, { slug: "page", title: "Page", body }, owner);
+    const selected = yield* call(thread, "wiki_read", { slug: "page", section: "deploy" });
+    assert.isFalse(selected.isError, selected.text);
+    assert.deepStrictEqual(selected.structured.pages, [
+      { ...page, body: section, note: "2 headings match; returned the first" },
+    ]);
+    const outline = yield* call(thread, "wiki_read", { slug: "page", outline: true });
+    assert.isFalse(outline.isError, outline.text);
+    assert.deepStrictEqual(outline.structured.pages, [
+      {
+        ...page,
+        body: [
+          "0: # Root",
+          "7: ## Deploy",
+          `${body.indexOf("### Nested")}: ### Nested`,
+          `${body.indexOf("## Next")}: ## Next`,
+          `${body.indexOf("## DEPLOY")}: ## DEPLOY`,
+        ].join("\n"),
+      },
+    ]);
+    for (const section of ["missing", "Fake"]) {
+      const missing = yield* call(thread, "wiki_read", { slug: "page", section });
+      assert.isTrue(missing.isError, missing.text);
+      assert.include(missing.text, "headings: Root, Deploy, Nested, Next, DEPLOY");
+    }
+    for (const input of [
+      { section: "Deploy" },
+      { outline: true },
+      { slugs: ["page"], section: "Deploy" },
+    ]) {
+      const invalid = yield* call(thread, "wiki_read", input);
+      assert.isTrue(invalid.isError, invalid.text);
+      assert.include(invalid.text, "require slug");
+    }
+    const both = yield* call(thread, "wiki_read", {
+      slug: "page",
+      section: "Deploy",
+      outline: true,
+    });
+    assert.isTrue(both.isError, both.text);
+    assert.include(both.text, "Pass section or outline");
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("wiki_read lists metadata by default and reads requested page bodies", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -4169,7 +4485,7 @@ it.effect("a worker keeps a pre-save conflict and does not change its card", () 
   }).pipe(Effect.provide(fake.layer));
 });
 
-it.effect("card_move no-op replies name the current stage before and after dispatch", () => {
+it.effect("card_move annotates queued review and refuses to interrupt a live reviewer", () => {
   const fake = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -4191,20 +4507,25 @@ it.effect("card_move no-op replies name the current stage before and after dispa
       note: "Other note",
     });
     assert.isFalse(retry.isError);
-    assert.include(retry.text, "already in needs_review; nothing changed");
-    assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    assert.include(retry.text, "already queued for review; note added");
+    const annotated = yield* kanban.card(card.id);
+    assert.deepStrictEqual(annotated.card, before.card);
+    assert.deepStrictEqual(annotated.events.slice(0, -1), before.events);
+    assert.strictEqual(annotated.events.at(-1)?.body, "Other note");
+    const comment = yield* call(worker, "card_update", { card: card.id, comment: "New head 14a4c162" });
+    assert.isFalse(comment.isError, comment.text);
     yield* kanban.dispatchNow;
     const after = yield* kanban.card(card.id);
     assert.strictEqual(after.card.stage, "in_review");
     const dispatched = yield* call(worker, "card_move", { card: card.id, to: "needs_review" });
-    assert.isFalse(dispatched.isError);
-    assert.include(dispatched.text, "now in_review, nothing changed");
+    assert.isTrue(dispatched.isError);
+    assert.include(dispatched.text, "is being reviewed by another thread");
     assert.deepStrictEqual((yield* kanban.card(card.id)).events, after.events);
   }).pipe(Effect.provide(fake.layer));
 });
 
 it.effect(
-  "subtask advancement counts as the worker's move when dispatch wins the finish-flow race",
+  "subtask advancement does not let the worker interrupt review after dispatch",
   () => {
     const fake = fakeThreads();
     return Effect.gen(function* () {
@@ -4264,9 +4585,8 @@ it.effect(
       assert.isNotNull(reviewer);
       assert.notStrictEqual(reviewer, worker);
       const moved = yield* call(worker, "card_move", { card: card.id, to: "needs_review" });
-      assert.isFalse(moved.isError, moved.text);
-      assert.include(moved.text, "already moved to needs_review; now in_review, nothing changed");
-      assert.deepStrictEqual(moved.structured.card, reviewing.card);
+      assert.isTrue(moved.isError, moved.text);
+      assert.include(moved.text, "is being reviewed by another thread");
       const unrelated: KanbanActor = {
         _tag: "thread",
         threadId: ThreadId.make("unrelated-worker"),

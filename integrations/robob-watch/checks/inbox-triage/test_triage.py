@@ -1284,7 +1284,7 @@ class SourceHealthTests(unittest.TestCase):
                 self.tick(state, wd, bad, 10_000 + n * 300)
             self.assertEqual(run.call_count, 1)
             first = run.call_args.args[0]
-            text = first[first.index('--text') + 1]
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
             self.assertIn('outlook', text)
             self.assertIn('provider/network', text)
             self.assertIn('Other sources are still being read', text)
@@ -1293,14 +1293,14 @@ class SourceHealthTests(unittest.TestCase):
                 self.tick(state, wd, bad, 10_000 + t.HEALTH_TRANSIENT_ESCALATE + n * 300)
             self.assertEqual(run.call_count, 2)
             escalation = run.call_args.args[0]
-            self.assertIn('outlook still failing after 180 min', escalation[escalation.index('--text') + 1])
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in escalation if v.startswith('--text=')))
             self.assertIn('attention', escalation)
             self.tick(state, wd, bad, 10_000 + t.HEALTH_REALERT + 900)
             self.assertEqual(run.call_count, 2)
             self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1200)
             self.assertEqual(run.call_count, 3)
             recovery = run.call_args.args[0]
-            self.assertIn('outlook reading again after', recovery[recovery.index('--text') + 1])
+            self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in recovery if v.startswith('--text=')))
             self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1500)
             self.assertEqual(run.call_count, 3)
 
@@ -1315,7 +1315,7 @@ class SourceHealthTests(unittest.TestCase):
                         self.tick(state, t.LIVE, errors, 10_000 + n * 300)
                     # These sends succeeded; one outage and one recovery, no repeat at five/hour.
                     self.assertEqual(run.call_count, 2)
-                    texts = [c.args[0][c.args[0].index('--text') + 1] for c in run.call_args_list]
+                    texts = [next(v.split('=', 1)[1] for v in c.args[0] if v.startswith('--text=')) for c in run.call_args_list]
                     self.assertNotIn('reading again', texts[0])
                     self.assertIn('outlook reading again', texts[1])
                     self.assertEqual(state['source_health']['outlook']['last_notice_at'], 10_600)
@@ -1340,7 +1340,7 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE)
             self.assertEqual(run.call_count, 3)
             args = run.call_args.args[0]
-            self.assertIn('outlook still failing after 180 min', args[args.index('--text') + 1])
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 300)
             self.assertEqual(run.call_count, 3)
             self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 600)
@@ -1364,7 +1364,7 @@ class SourceHealthTests(unittest.TestCase):
             self.assertEqual(state['source_health']['outlook']['since'], 11_200)
             args = run.call_args.args[0]
             self.assertEqual(args[args.index('--key') + 1], pending['key'])
-            self.assertEqual(args[args.index('--text') + 1], pending['text'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), pending['text'])
             self.tick(state, t.LIVE, bad, 11_500)
             self.tick(state, t.LIVE, bad, 11_800)
             self.assertEqual(run.call_count, 2)  # recovery retries do not erase the outage cooldown
@@ -1373,7 +1373,7 @@ class SourceHealthTests(unittest.TestCase):
             for now in (later + 300, later + 600, later + 900):
                 self.tick(state, t.LIVE, bad, now)
             self.assertEqual(run.call_count, 3)
-            self.assertNotIn('reading again', run.call_args.args[0][run.call_args.args[0].index('--text') + 1])
+            self.assertNotIn('reading again', next(v.split('=', 1)[1] for v in run.call_args.args[0] if v.startswith('--text=')))
 
     def test_outage_notice_retry_after_health_window_still_has_one_recovery(self):
         state = {}
@@ -1391,11 +1391,11 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, {}, 14_800)
             args = run.call_args.args[0]
             self.assertEqual(args[args.index('--key') + 1], original['key'])
-            self.assertEqual(args[args.index('--text') + 1], original['text'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), original['text'])
             self.tick(state, t.LIVE, {}, 15_100)
             self.assertEqual(run.call_count, 2)
             args = run.call_args.args[0]
-            self.assertIn('outlook reading again after 15 min', args[args.index('--text') + 1])
+            self.assertIn('outlook reading again after 15 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, {}, 15_400)
             self.assertEqual(run.call_count, 2)
             self.assertEqual(state['source_health']['outlook']['last_notice_at'], 14_800)
@@ -1460,7 +1460,7 @@ class SourceHealthTests(unittest.TestCase):
                     self.tick(state, t.LIVE, {}, 11_500)
                     self.assertEqual(run.call_count, 2)
                     args = run.call_args.args[0]
-                    self.assertIn('outlook reading again after', args[args.index('--text') + 1])
+                    self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
                     self.tick(state, t.LIVE, {}, 11_800)
                     self.assertEqual(run.call_count, 2)
 
@@ -1480,7 +1480,7 @@ class SourceHealthTests(unittest.TestCase):
             self.tick(state, t.LIVE, {}, 22_700)
             self.assertEqual(run.call_count, 2)
             args = run.call_args.args[0]
-            self.assertIn('outlook reading again', args[args.index('--text') + 1])
+            self.assertIn('outlook reading again', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
             self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 23_000)
             self.assertEqual(run.call_count, 2)
 
@@ -1531,7 +1531,7 @@ class SourceHealthTests(unittest.TestCase):
             lost = t.subprocess.TimeoutExpired('bun', 4)
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
             with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
-                self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
+                self.assertEqual(self.tick(state, wd, bad, 10_600)['health_alert_error'], 'telegram-bridge notify failed: timeout')
                 self.assertNotIn('alerted_at', state['source_health']['gmail'])
                 # The next run counts another failure, but resends the same text under the same key.
                 self.assertEqual(self.tick(state, wd, bad, 10_900), {'health_alerts': ['gmail', 'outlook']})
@@ -1540,7 +1540,7 @@ class SourceHealthTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(first[2:4], ['notify', '--source'])
             self.assertEqual(first[first.index('--severity') + 1], 'attention')
-            text = first[first.index('--text') + 1]
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
             self.assertIn('- outlook: 3 run(s) in a row, 3 in the last hour. Last error: IMAP auth failed', text)
             self.assertIn('- gmail:', text)
             self.assertEqual(state['source_health']['outlook']['alerted_at'], 10_900)
@@ -1565,7 +1565,7 @@ class SourceHealthTests(unittest.TestCase):
             keys = [c.args[0][c.args[0].index('--key') + 1] for c in run.call_args_list]
             self.assertEqual(len(set(keys[:3])), 1)
             self.assertNotEqual(keys[2], keys[3])
-            self.assertNotIn('gmail', run.call_args_list[2].args[0][run.call_args_list[2].args[0].index('--text') + 1])
+            self.assertNotIn('gmail', next(v.split('=', 1)[1] for v in run.call_args_list[2].args[0] if v.startswith('--text=')))
 
     def test_an_alert_the_bridge_never_takes_is_dropped_after_six_hours(self):
         with tempfile.TemporaryDirectory() as tmp:

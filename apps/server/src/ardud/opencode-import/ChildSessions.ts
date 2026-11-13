@@ -140,45 +140,44 @@ const checkOne = Effect.fn("ChildSessions.checkOne")(function* (
  * server configured, a child Robob starts stops with it, so every child is
  * `stopped`. A failed read leaves that child `unknown`.
  */
-export const checkChildren = (
+export const checkChildren = Effect.fn("ChildSessions.checkChildren")(function* (
   settings: ServerSettings.ServerSettingsService["Service"],
   children: ReadonlyArray<ChildRef>,
-): Effect.Effect<ReadonlyMap<string, ChildCheck>> =>
-  Effect.gen(function* () {
-    const configured = yield* configuredConnection(settings);
-    const result = new Map<string, ChildCheck>();
-    // ardud: only a confirmed local setup means "stopped without a probe". An
-    // unreadable or half-configured setup is unknown, never a cancellation claim.
-    if (configured.kind === "local") {
-      for (const child of children) result.set(child.sessionId, { state: "stopped" });
-      return result;
-    }
-    if (configured.kind === "unknown") {
-      for (const child of children) result.set(child.sessionId, { state: "unknown" });
-      return result;
-    }
-    const connection = configured.connection;
-    const active = yield* listActiveSessionIds(connection).pipe(
-      Effect.timeoutOption(PROBE_TIMEOUT),
-      Effect.map((value) => (Option.isSome(value) ? value.value : undefined)),
-      Effect.orElseSucceed(() => undefined),
-    );
-    if (active === undefined) {
-      for (const child of children) result.set(child.sessionId, { state: "unknown" });
-      return result;
-    }
-    yield* Effect.forEach(
-      children,
-      (child) =>
-        checkOne(connection, child, active).pipe(
-          Effect.map((check) => {
-            result.set(child.sessionId, check);
-          }),
-        ),
-      { concurrency: 4, discard: true },
-    );
-    return result as ReadonlyMap<string, ChildCheck>;
-  });
+): Effect.fn.Return<ReadonlyMap<string, ChildCheck>> {
+  const configured = yield* configuredConnection(settings);
+  const result = new Map<string, ChildCheck>();
+  // ardud: only a confirmed local setup means "stopped without a probe". An
+  // unreadable or half-configured setup is unknown, never a cancellation claim.
+  if (configured.kind === "local") {
+    for (const child of children) result.set(child.sessionId, { state: "stopped" });
+    return result;
+  }
+  if (configured.kind === "unknown") {
+    for (const child of children) result.set(child.sessionId, { state: "unknown" });
+    return result;
+  }
+  const connection = configured.connection;
+  const active = yield* listActiveSessionIds(connection).pipe(
+    Effect.timeoutOption(PROBE_TIMEOUT),
+    Effect.map((value) => (Option.isSome(value) ? value.value : undefined)),
+    Effect.orElseSucceed(() => undefined),
+  );
+  if (active === undefined) {
+    for (const child of children) result.set(child.sessionId, { state: "unknown" });
+    return result;
+  }
+  yield* Effect.forEach(
+    children,
+    (child) =>
+      checkOne(connection, child, active).pipe(
+        Effect.map((check) => {
+          result.set(child.sessionId, check);
+        }),
+      ),
+    { concurrency: 4, discard: true },
+  );
+  return result as ReadonlyMap<string, ChildCheck>;
+});
 
 /**
  * ardud: the note for work a restart cut. With no OpenCode child in it there is

@@ -626,19 +626,49 @@ test('hung provider exits itself with providers and phase durations before runne
   assert.equal(r.code, 1); assert.equal(r.signal, null); assert.ok(r.ms < 2_000, r.ms);
   assert.match(r.stderr, /9router Claude detector: providers exceeded deadline/);
   assert.match(r.stderr, /phase durations: .*load=.*providers=/);
-  assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'providers');
+  const marker = readFileSync(join(dir, '.phase'), 'utf8');
+  const { phase, at, t: failedAt } = JSON.parse(marker);
+  assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers' });
+  assert.ok(Number.isFinite(failedAt));
+  const lines = [];
+  const next = phaseReporter(dir, { previous: marker, stderr: line => lines.push(line) });
+  assert.equal(next.previousStall, undefined); assert.deepEqual(lines, []);
+  assert.equal(existsSync(join(dir, 'log')), false);
 });
 
-test('previous save/sh markers survive shell handoff; done and malformed markers are quiet', async t => {
-  for (const phase of ['save', 'sh', 'done', 'malformed']) {
+test('rejected provider leaves a terminal failure marker with its subphase and no following stall', async t => {
+  const { result, dir } = syntheticProcess(t, observedBody("async phase => { phase('providers:fetch'); throw new Error('private provider payload'); }"));
+  const r = await result;
+  assert.equal(r.code, 1); assert.equal(r.signal, null);
+  assert.match(r.stderr, /9router Claude detector: providers:fetch failed/);
+  assert.match(r.stderr, /phase durations: .*providers:fetch=/);
+  assert.doesNotMatch(r.stderr, /private provider payload/);
+  const marker = readFileSync(join(dir, '.phase'), 'utf8');
+  const { phase, at, t: failedAt } = JSON.parse(marker);
+  assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers:fetch' });
+  assert.ok(Number.isFinite(failedAt));
+  writeFileSync(join(dir, 'log'), 'existing log\n');
+  const lines = [];
+  const next = phaseReporter(dir, { previous: marker, stderr: line => lines.push(line) });
+  assert.equal(next.previousStall, undefined); assert.deepEqual(lines, []);
+  assert.equal(readFileSync(join(dir, 'log'), 'utf8'), 'existing log\n');
+});
+
+test('previous save/sh markers survive shell handoff; done, failed and malformed markers are quiet', async t => {
+  for (const phase of ['save', 'sh', 'done', 'failed', 'malformed']) {
     const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-'));
     const previous = phase === 'malformed' ? '{' : JSON.stringify({ phase, t: Date.now() - 5_000 });
     // The shell has replaced .phase with sh; its env preserves the prior run.
     writeFileSync(join(dir, '.phase'), JSON.stringify({ phase: 'sh', t: Date.now() }));
     const r = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir, previous }).result;
     assert.equal(r.code, 0, r.stderr);
-    if (phase === 'save' || phase === 'sh') assert.match(r.stderr, new RegExp(`previous run stalled in ${phase} [(]`));
-    else assert.equal(r.stderr, '');
+    if (phase === 'save' || phase === 'sh') {
+      assert.match(r.stderr, new RegExp(`previous run stalled in ${phase} [(]`));
+      assert.match(readFileSync(join(dir, 'log'), 'utf8'), new RegExp(`previous run stalled in ${phase} [(]`));
+    } else {
+      assert.equal(r.stderr, '');
+      assert.equal(existsSync(join(dir, 'log')), false);
+    }
     assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
   }
   const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-direct-'));
@@ -651,7 +681,7 @@ test('previous save/sh markers survive shell handoff; done and malformed markers
   assert.equal(next.code, 0); assert.equal(next.stderr, '');
 });
 
-test('failure logs load/save timings, leaves failing marker, and never logs provider data', async t => {
+test('failure logs load/save timings despite an unwritable marker and never logs provider data', async t => {
   const h = harness(t), lines = [];
   h.ctx.enforceSafetyFence = true;
   h.ctx.save = () => { throw new Error('private payload'); };
@@ -767,19 +797,22 @@ test('runner stderr tail retains stalled phase after many phase timings', t => {
 });
 
 
-test('four failures followed by recovery remains successful and retains the stalled phase in log', async t => {
+test('four clean failures followed by recovery remain successful without a false stall', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'reauth-recovery-'));
   const codes = [];
   for (let i = 0; i < 4; i++) {
     const r = await syntheticProcess(t, observedBody('async () => { throw new Error("down"); }'), { dir }).result;
     codes.push(r.code);
     assert.match(r.stderr.slice(-500), /providers failed/);
+    assert.doesNotMatch(r.stderr, /previous run stalled/);
+    const { phase, at } = JSON.parse(readFileSync(join(dir, '.phase'), 'utf8'));
+    assert.deepEqual({ phase, at }, { phase: 'failed', at: 'providers' });
   }
   const recovered = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
   codes.push(recovered.code);
   assert.deepEqual(codes, [1, 1, 1, 1, 0]);
-  assert.match(recovered.stderr, /previous run stalled in providers/);
-  assert.match(readFileSync(join(dir, 'log'), 'utf8'), /previous run stalled in providers/);
+  assert.equal(recovered.stderr, '');
+  assert.equal(existsSync(join(dir, 'log')), false);
   assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
   const next = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
   assert.equal(next.code, 0); assert.equal(next.stderr, '');

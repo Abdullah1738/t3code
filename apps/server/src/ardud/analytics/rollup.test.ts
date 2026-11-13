@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 
 import { accumulate, boundedLines, finishRollup, makeAccumulator } from "./rollup.ts";
 
@@ -13,6 +13,151 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("rolls server tick phases up independently by board and phase, including idle phases", () => {
+    const accumulator = makeAccumulator();
+    const phase = (boardId: string, phase: string, durationMs: number) =>
+      event({
+        kind: "kanban.tick_phase",
+        boardId,
+        durationMs,
+        props: { phase, count: 2, tickId: "tick-1" },
+      });
+    for (const duration of [10, 20, 90])
+      accumulate(accumulator, phase("a", "thread_status", duration));
+    accumulate(accumulator, phase("a", "event_persistence", 0));
+    accumulate(accumulator, phase("b", "thread_status", 1_000));
+    // Older ticks and overlaps have no phase sample; incomplete and client-shaped rows don't invent one.
+    accumulate(accumulator, event({ kind: "kanban.tick", boardId: "a", durationMs: 900_000 }));
+    accumulate(accumulator, event({ kind: "kanban.tick_overlap", boardId: "a" }));
+    accumulate(accumulator, event({ kind: "kanban.tick_phase", boardId: "a", durationMs: 10 }));
+    accumulate(
+      accumulator,
+      event({ kind: "kanban.tick_phase", boardId: "a", props: { phase: "thread_status" } }),
+    );
+    accumulate(accumulator, { ...phase("a", "thread_status", 10_000), surface: "web" });
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.deepEqual(rollup.tickPhases, [
+      {
+        boardId: "a",
+        phase: "event_persistence",
+        count: 1,
+        p50Ms: 0,
+        p95Ms: 0,
+        maxMs: 0,
+        approximate: false,
+      },
+      {
+        boardId: "a",
+        phase: "thread_status",
+        count: 3,
+        p50Ms: 20,
+        p95Ms: 90,
+        maxMs: 90,
+        approximate: false,
+      },
+      {
+        boardId: "b",
+        phase: "thread_status",
+        count: 1,
+        p50Ms: 1_000,
+        p95Ms: 1_000,
+        maxMs: 1_000,
+        approximate: false,
+      },
+    ]);
+    assert.equal(rollup.kindCounts["kanban.tick_overlap"], 1);
+  });
+
+  it("separates restart interruptions by boot and tool", () => {
+    const accumulator = makeAccumulator();
+    for (const [bootId, tool] of [
+      ["boot-a", "delegate_task"],
+      ["boot-b", "delegate_task"],
+      ["boot-a", "card_update"],
+      ["boot-a", "delegate_task"],
+    ] as const) {
+      accumulate(
+        accumulator,
+        event({ kind: "mcp.call", bootId, tool, outcome: "interrupted_by_shutdown" }),
+      );
+    }
+    assert.deepEqual(
+      finishRollup(accumulator, "2026-11-13", ts).mcpCalls.map(({ bootId, tool, outcomes }) => ({
+        bootId,
+        tool,
+        outcomes,
+      })),
+      [
+        { bootId: "boot-a", tool: "card_update", outcomes: { interrupted_by_shutdown: 1 } },
+        { bootId: "boot-a", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 2 } },
+        { bootId: "boot-b", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 1 } },
+      ],
+    );
+  });
+
+  it("merges long-task histograms by route and surface without counting individual samples twice", () => {
+    const accumulator = makeAccumulator();
+    const bucket = (ms: number) => Math.ceil(Math.log(ms) / Math.log(LONG_TASK_HISTOGRAM_RATIO));
+    const summary = (
+      props: NonNullable<AnalyticsEvent["props"]>,
+      surface: AnalyticsEvent["surface"] = "desktop",
+    ) => event({ kind: "performance.long-task-summary", route: "board", surface, props });
+    accumulate(
+      accumulator,
+      summary({
+        count: 99,
+        totalMs: 9900,
+        maxMs: 100,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(100), 99]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(500), 1]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({ count: 0, totalMs: 0, maxMs: 0, wallTimeMs: 60_000, histogram: [] }),
+    );
+    accumulate(
+      accumulator,
+      event({ kind: "performance.long-task", surface: "desktop", route: "board", durationMs: 500 }),
+    );
+    accumulate(
+      accumulator,
+      summary(
+        { count: 1, totalMs: 800, maxMs: 800, wallTimeMs: 10_000, histogram: [[bucket(800), 1]] },
+        "web",
+      ),
+    );
+    // An inconsistent distribution must not create a misleading percentile.
+    accumulate(
+      accumulator,
+      summary({ count: 1000, totalMs: 10, maxMs: 10, wallTimeMs: 60_000, histogram: [[0, 1]] }),
+    );
+    const rows = finishRollup(accumulator, "2026-11-13", ts).longTasksByRoute;
+    assert.lengthOf(rows, 2);
+    assert.deepInclude(rows[0], {
+      route: "board",
+      surface: "desktop",
+      count: 100,
+      totalMs: 10_400,
+      maxMs: 500,
+      wallTimeMs: 180_000,
+      wallTimeShare: 10_400 / 180_000,
+      approximate: true,
+    });
+    assert.isAtLeast(rows[0]!.p95Ms!, 100);
+    assert.isBelow(rows[0]!.p95Ms!, 102);
+    assert.equal(rows[1]!.p95Ms, 800);
+  });
   it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
     const accumulator = makeAccumulator();
     const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>
@@ -146,10 +291,26 @@ describe("analytics rollups", () => {
         event({ kind: `kind.${index}`, props: { errorTag: `error.${index}` } }),
       );
       accumulate(accumulator, event({ durationMs: index, props: { method: `method.${index}` } }));
+      accumulate(
+        accumulator,
+        event({
+          kind: "kanban.tick_phase",
+          boardId: `board-${index}`,
+          durationMs: index,
+          props: { phase: "thread_status" },
+        }),
+      );
     }
     assert.isAtMost(accumulator.kinds.size, 129);
     assert.isAtMost(accumulator.errors.size, 129);
     assert.isAtMost(accumulator.rpcs.size, 129);
+    assert.isAtMost(accumulator.tickPhases.size, 129);
+    assert.equal(
+      finishRollup(accumulator, "2026-11-13", ts).tickPhases!.find(
+        (group) => group.phase === "__other__",
+      )!.count,
+      872,
+    );
     assert.isAtMost(finishRollup(accumulator, "2026-11-13", ts).topSlowRpcs.length, 20);
   });
 

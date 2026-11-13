@@ -103,7 +103,7 @@ describe("send, poll, and app commands", () => {
       await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
       const run = async () => {
         const child = Bun.spawn([process.execPath, "run", cli, "poll", "--title", "T", "--option", "a", "--option", "b", ...session], {
-          env: { HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+          env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
         });
         const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         return { stdout, stderr, exitCode };

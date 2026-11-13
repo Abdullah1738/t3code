@@ -1,4 +1,5 @@
 import type { AnalyticsEvent, AnalyticsRollup as ContractRollup } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 const MAX_GROUPS = 128;
@@ -27,6 +28,7 @@ interface McpGroup {
   tool: string;
   hour: string;
   build: string;
+  bootId: string;
   durations: Durations;
   failures: number;
   outcomes: Map<string, number>;
@@ -50,7 +52,20 @@ export const makeAccumulator = () => ({
   kinds: new Map<string, number>(),
   errors: new Map<string, number>(),
   rpcs: new Map<string, Durations>(),
+  longTasks: new Map<
+    string,
+    {
+      route: string;
+      surface: AnalyticsEvent["surface"];
+      count: number;
+      totalMs: number;
+      maxMs: number;
+      wallTimeMs: number;
+      histogram: Map<number, number>;
+    }
+  >(),
   answers: durations(),
+  tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -103,6 +118,62 @@ export function accumulate(
   else if ((event.props?.status ?? 0) >= 400)
     increment(target.errors, `status.${event.props!.status}`);
 
+  if (event.kind === "performance.long-task-summary") {
+    const props = event.props;
+    const count = props?.count;
+    const histogram = props?.histogram;
+    // Individual samples overlap summaries. Only merge complete distributions, never percentiles.
+    if (
+      props &&
+      count !== undefined &&
+      Number.isInteger(count) &&
+      histogram &&
+      histogram.reduce((sum, [, n]) => sum + n, 0) === count &&
+      props.totalMs !== undefined &&
+      props.maxMs !== undefined &&
+      props.wallTimeMs !== undefined
+    ) {
+      const key = boundedKey(target.longTasks, JSON.stringify([event.surface, event.route]));
+      const group = target.longTasks.get(key) ?? {
+        route: key === OTHER ? OTHER : event.route,
+        surface: event.surface,
+        count: 0,
+        totalMs: 0,
+        maxMs: 0,
+        wallTimeMs: 0,
+        histogram: new Map<number, number>(),
+      };
+      group.count += count;
+      group.totalMs += props.totalMs;
+      group.maxMs = Math.max(group.maxMs, props.maxMs);
+      group.wallTimeMs += props.wallTimeMs;
+      for (const [bucket, n] of histogram)
+        group.histogram.set(bucket, (group.histogram.get(bucket) ?? 0) + n);
+      target.longTasks.set(key, group);
+    }
+  }
+
+  if (
+    event.kind === "kanban.tick_phase" &&
+    event.surface === "server" &&
+    event.boardId &&
+    event.props?.phase &&
+    event.durationMs !== undefined
+  ) {
+    const identity = JSON.stringify([event.boardId, event.props.phase]);
+    const key = boundedKey(target.tickPhases, identity);
+    let group = target.tickPhases.get(key);
+    if (!group) {
+      group = {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        phase: key === OTHER ? OTHER : event.props.phase,
+        durations: durations(),
+      };
+      target.tickPhases.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+  }
+
   if (
     /(^|[._-])rpc([._-]|$)/i.test(event.kind) &&
     event.props?.method &&
@@ -135,7 +206,8 @@ export function accumulate(
   if (event.kind === "mcp.call" && event.tool && event.outcome) {
     const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
     const build = event.build ?? "unknown";
-    const key = JSON.stringify([event.tool, hour, build]);
+    const bootId = event.bootId ?? "unknown";
+    const key = JSON.stringify([event.tool, hour, build, bootId]);
     let group = target.mcp.get(key);
     if (!group) {
       // Bound both high-cardinality build groups and retry identities on damaged/untrusted logs.
@@ -147,6 +219,7 @@ export function accumulate(
         tool: event.tool,
         hour,
         build,
+        bootId,
         durations: durations(),
         failures: 0,
         outcomes: new Map(),
@@ -240,6 +313,35 @@ export function finishRollup(
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
     errorCounts: Object.fromEntries(target.errors),
+    longTasksByRoute: [...target.longTasks.values()]
+      .map((group) => {
+        let rank = Math.ceil(group.count * 0.95);
+        let p95Ms: number | null = null;
+        for (const [bucket, count] of [...group.histogram].sort(([a], [b]) => a - b)) {
+          rank -= count;
+          if (rank <= 0) {
+            p95Ms = Math.min(group.maxMs, LONG_TASK_HISTOGRAM_RATIO ** bucket);
+            break;
+          }
+        }
+        return {
+          route: group.route,
+          surface: group.surface,
+          count: group.count,
+          totalMs: group.totalMs,
+          maxMs: group.maxMs,
+          p95Ms,
+          wallTimeMs: group.wallTimeMs,
+          wallTimeShare: group.wallTimeMs > 0 ? group.totalMs / group.wallTimeMs : null,
+          approximate: group.count > 0,
+        };
+      })
+      .sort(
+        (a, b) =>
+          b.totalMs - a.totalMs ||
+          a.route.localeCompare(b.route) ||
+          a.surface.localeCompare(b.surface),
+      ),
     topSlowRpcs: [...target.rpcs]
       .map(([method, values]) => ({ method, ...summarize(values) }))
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
@@ -255,11 +357,19 @@ export function finishRollup(
       byBlocking: {},
       byKind: {},
     },
+    tickPhases: [...target.tickPhases.values()]
+      .map((group) => ({
+        boardId: group.boardId,
+        phase: group.phase,
+        ...summarize(group.durations),
+      }))
+      .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.phase.localeCompare(b.phase)),
     mcpCalls: [...target.mcp]
       .map(([key, group]) => ({
         tool: group.tool,
         hour: group.hour,
         build: group.build,
+        bootId: group.bootId,
         ...summarize(group.durations),
         failures: group.failures,
         failureRate: group.failures / group.durations.count,
@@ -272,7 +382,8 @@ export function finishRollup(
         (a, b) =>
           a.hour.localeCompare(b.hour) ||
           a.tool.localeCompare(b.tool) ||
-          a.build.localeCompare(b.build),
+          a.build.localeCompare(b.build) ||
+          a.bootId.localeCompare(b.bootId),
       ),
     mcpOverflow: { ...target.mcpOverflow },
   };
