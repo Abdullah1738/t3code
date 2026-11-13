@@ -27,8 +27,15 @@ export type AssistantContent =
   | { type: "reasoning"; text: string }
   | { type: "tool"; id: string; name: string; state: { status: "streaming" | "running" | "completed" | "error"; [key: string]: unknown } };
 
+const DELEGATED_ID = "node:delegated-task:[^\\s,]+";
+const DELEGATED_SINGLE = new RegExp(`^Delegated task (${DELEGATED_ID}) reached a terminal state\\. Use task_status with taskId \\1 to read the result\\.$`);
+const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEGATED_ID})+ reached terminal states\\. Use task_status with each taskId to read the results\\.$`);
+// Current wakes may inline the result after the task's title and terminal status.
+const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
+export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
+
 export type MessageRecord =
-  | { id: string; type: "user"; text: string; time: { created: number }; [key: string]: unknown }
+  | { id: string; type: "user"; text: string; time: { created: number }; createdBy?: string; [key: string]: unknown }
   | {
       id: string;
       type: "assistant";
