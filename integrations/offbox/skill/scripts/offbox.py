@@ -14,8 +14,12 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from offbox_lib import common  # noqa: E402
 
-# One backend per process, fixed before anything else is imported (api and capacity read it once).
-common.select_backend(common.entry_backend(sys.argv[1:]))
+# One backend per process, fixed before api and capacity bind their backend at import.
+try:
+    common.select_backend(common.entry_backend(sys.argv[1:]))
+except common.OffboxError as error:
+    common.say(str(error))
+    sys.exit(error.code)
 
 from offbox_lib.cli import main  # noqa: E402
 

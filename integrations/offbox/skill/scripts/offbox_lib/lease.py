@@ -503,7 +503,8 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                     "using the repo template or recipe for this run")
                 base = None
             elif not brow:
-                raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
+                from .base_catalog import missing
+                raise missing(full)
         elif not template:
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
                                f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()

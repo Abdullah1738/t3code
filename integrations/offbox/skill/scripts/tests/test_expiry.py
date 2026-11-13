@@ -201,7 +201,9 @@ class ExpiryTests(Isolated):
 
     def test_bases_json_keeps_its_shape(self):
         self.base()
-        with patch.object(api, "get", side_effect=common.OffboxError("boat API unreachable")):
+        with patch.object(common, "db_path_for", side_effect=lambda backend:
+                          common.DB_PATH if backend == "boat" else common.STATE / "offbox-home.db"), \
+                patch.object(api, "get", side_effect=common.OffboxError("boat API unreachable")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 bases.list_bases(True)
