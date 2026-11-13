@@ -97,6 +97,7 @@ it.effect(
         >;
       }> = [
         { route: "shell.runs", run: ShellQueries.selectShellRunRows(sql, ids) },
+        { route: "shell.archive", run: projection.getShellSnapshot({ location: "archive" }) },
         { route: "shell.counts", run: ShellQueries.selectShellRunItemCounts(sql, ids) },
         {
           route: "shell.providers.large",
@@ -236,6 +237,18 @@ it.effect(
               ),
               entry.route,
             );
+          }
+          if (entry.route === "shell.archive") {
+            const details = plan.map((row) => row.detail).join("\n");
+            assert.notMatch(
+              details,
+              /MATERIALIZE shell_runs|SCAN orchestration_v2_projection_runs/,
+            );
+            if (statement.includes("WITH shell_runs")) {
+              assert.match(details, /USING INDEX ardud_shell_executed_run_idx/);
+              assert.match(details, /USING INDEX ardud_shell_activity_run_idx/);
+            }
+            continue;
           }
           const findings = violations(query, plan);
           console.log(
