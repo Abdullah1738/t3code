@@ -8,14 +8,21 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
-looks back one hour; subsequent runs cover since the last successful read.
+looks back one hour. Report cursors cover since their last successful read.
+Unified-log queries cover at most the most recent hour; skipped older time is
+explicit in `skippedS`. A failed query retains the exact bounded window for retry,
+and success advances its cursor to that window end.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
 The collector gathers directory sizes with read-only du calls outside the guard,
-allowing up to 60 s per root under a shared 300 s scan budget. Samples expose
+allowing up to 60 s per root under a shared 210 s scan budget. The two big
+roots (`~/.local/share` and `~/.robob`) run first, one first-level child at a
+time with a 15 s child timeout. Each root gets at most 60 s. The collector
+also limits the scan to the time remaining in its five-minute run budget,
+reserving 65 s for crash collection after the existing disk tooling probe. Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -33,7 +40,7 @@ local package metadata; unavailable versions are `unknown`.
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
 counts. Each unavailable source also emits an error-kind `disk.inventory.source`
 or `crash.source` with `source` (root path or `unified`), `failure` (`timeout`,
-`exit`, `permission`, `parse`, or `missing-total`), `exitCode` (null when no
+`exit`, `permission`, `parse`, `missing-total`, or `partial`), `exitCode` (null when no
 exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
 timeout line without launching another command. Missing inventory paths are skipped.
 
@@ -46,15 +53,38 @@ C locale so permission diagnostics can be identified consistently.
 A completed du that exits 1 solely because of unreadable entries still supplies
 a usable root total. That source emits a successful event with `partial=true`
 and `deniedCount` plus the readable `bytes`; the cached inventory retains those flags in `partials`.
-Other exits and timeouts do not supply usable totals. A partial total measures
+Other exits and timeouts do not supply usable du totals. A partial total measures
 only readable entries; permission grants remain an owner action.
+
+Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
+`partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
+`failedCount`. Child timeouts/errors remain named source errors. An incomplete
+root emits an error with `failure=partial`, `partial=true`, and the completed
+children's `bytes` as a lower bound. `failedCount` includes one additional
+incomplete remainder when the root deadline stops enumeration; it is not a
+count of every unvisited child. Summing child du totals does not deduplicate
+hard links across children and excludes the root directory's own blocks.
+Missing totals are never replaced with an old total, even within 24 hours.
+If every child fails, the root has an error and no cached size. Inventory state
+retains completed child sizes in `children` and aggregate flags in `partials`.
+Summary `sourceErrors` counts affected roots, not their child error lines.
+Partial roots are excluded from growth comparisons on both sides, so changing
+scan coverage cannot become a reported grower.
 
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
 Missing optional database/WAL files are skipped. `crash.source` errors
 leave that source's cursor unchanged so the next run retries it. The filtered
-unified log query has a 60 s timeout; readable report sources advance independently.
+unified log query has a 60 s timeout and a one-hour maximum window. Both its
+source event/error and `crash.collect` record `windowStart` and `windowEnd`
+(Unix seconds), `windowS`, and `skippedS` (older time omitted by the cap).
+On failure, `unifiedRetry` retains the exact window until it succeeds; then
+the cursor advances to its end. Readable report sources advance independently.
+During a collector run, each report source gets its own share of a five-second
+enumeration budget before the unified query. A slow source does not expire
+the later sources' allowances. Command budgets leave ten seconds for state/log overhead
+within the five-minute run budget.
 
 ## diskutil hangs
 
