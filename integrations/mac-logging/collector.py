@@ -63,6 +63,7 @@ def reports(root, since, until):
 
 
 def unified(since, until, run=subprocess.run):
+    until = min(until, since+7200)
     def stamp(value):
         return dt.datetime.fromtimestamp(value, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
@@ -117,12 +118,19 @@ def collect(now=None, roots=None, log_reader=unified):
             errors += 1
             source_error('crashes', 'crash.source', root, source_started, exc)
     source_started = time.monotonic()
+    # Retain the initial lower bound too: repeated first-run failures must not
+    # silently move the window forward past unread crash evidence.
+    since = state.get('unified', state.get('unifiedPendingSince', now-3600))
+    until = min(now, since+7200)
+    state.setdefault('unifiedPendingSince', since)
     try:
-        counts.update(log_reader(state.get('unified', now-3600), now))
-        state['unified'] = now
+        if until > since:
+            counts.update(log_reader(since, until))
+            state['unified'] = until
+            state.pop('unifiedPendingSince', None)
     except Exception as exc:
         errors += 1
-        source_error('crashes', 'crash.source', 'unified', source_started, exc)
+        source_error('crashes', 'crash.source', 'unified', source_started, exc, windowS=max(0, until-since))
     for (kind, process), count in counts.items():
         emit('crashes', 'event', 'crash.observed', ok=True,
              props={'resourceKind': kind, 'process': process, 'count': count})

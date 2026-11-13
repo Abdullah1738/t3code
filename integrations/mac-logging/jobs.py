@@ -9,6 +9,7 @@ import os
 import plistlib
 import re
 import signal
+import stat
 from pathlib import Path
 import sys
 import subprocess
@@ -47,6 +48,7 @@ DIRECTORY_ROOTS = [Path.home() / 'Library/Caches', Path.home() / '.cache',
                    Path.home() / '.local/share', Path.home() / '.robob',
                    *[Path('/Volumes/ExternalSSD') / name for name in
                      ('wt', 't3code-wt', 'board-wt', 'coord-wt', 'caches', 'crpko-devops/tmp', 'memory-system-backup', 'memory-system-data', 'memory-system-data-v2')]]
+SPLIT_ROOTS = (Path.home() / '.local/share', Path.home() / '.robob')
 
 
 class SourceFailure(Exception):
@@ -68,7 +70,7 @@ def permission_denied(value):
     return bool(re.search(r'operation not permitted|permission denied', value, re.I))
 
 
-def source_error(component, name, source, started, exc):
+def source_error(component, name, source, started, exc, **props):
     failure, code, message = 'exit', None, 'source read failed (%s)' % type(exc).__name__
     if isinstance(exc, SourceFailure):
         failure, code, message = exc.failure, exc.exit_code, exc.message
@@ -79,60 +81,156 @@ def source_error(component, name, source, started, exc):
         message = str(exc)
     emit(component, 'error', name, ok=False,
          props=dict(source=str(source), failure=failure, exitCode=code,
-                    elapsedMs=max(0, (time.monotonic()-started)*1000)),
+                    elapsedMs=max(0, (time.monotonic()-started)*1000), **props),
          error_tag=component+'.source_unavailable', error_message=message)
+    return failure
 
 
-def directory_inventory(paths=None, run=subprocess.run):
+def du_bytes(path, deadline, cap, run):
+    remaining = deadline-time.monotonic()
+    if remaining <= 0:
+        raise SourceFailure('timeout', 'directory inventory budget exhausted')
+    result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True,
+                 timeout=min(cap, remaining), env={**os.environ, 'LC_ALL': 'C'})
+    stderr = getattr(result, 'stderr', '') or ''
+    denied = sum(permission_denied(line) for line in stderr.splitlines())
+    other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
+    message = stderr_line(stderr)
+    if result.returncode and (result.returncode != 1 or not denied or other_errors):
+        failure = 'permission' if not result.stdout.strip() and denied else 'exit'
+        raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
+    # Match the requested root, not an arbitrary number printed by du.
+    for line in result.stdout.splitlines():
+        fields = line.split('\t', 1)
+        if len(fields) == 2 and fields[1] == str(path):
+            if not fields[0].isdigit():
+                raise SourceFailure('parse', message or 'invalid du total', result.returncode)
+            return int(fields[0])*1024, denied, result.returncode
+    failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
+    raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def cache_entry(value, now):
+    value = mapping(value)
+    if (type(value.get('bytes')) is int and value['bytes'] >= 0
+            and type(value.get('at')) in (int, float) and 0 <= value['at'] <= now):
+        return {**value, 'ageS': now-value['at']}
+    return {}
+
+
+def attempt_time(value):
+    return value if type(value) in (int, float) and 0 <= value <= time.time() else 0
+
+
+def child_inventory(root, previous, deadline, run):
+    now = time.time()
+    previous = mapping(previous)
+    children, failures, denied_count = {}, [], 0
+    entries = sorted(root.iterdir(), key=lambda p: (attempt_time(mapping(previous.get(p.name)).get('attemptedAt')), p.name))
+    for path in entries:
+        started = time.monotonic()
+        old = cache_entry(previous.get(path.name), now)
+        attempted = started < deadline
+        try:
+            if not attempted:
+                raise SourceFailure('timeout', 'directory inventory budget exhausted')
+            st = path.lstat()
+            if stat.S_ISDIR(st.st_mode):
+                size, denied, code = du_bytes(path, deadline, 20, run)
+            else:
+                # Allocated bytes match du, including sparse DBs, without opening
+                # a database or following a symlink into another inventory root.
+                size, denied, code = st.st_blocks*512, 0, 0
+            children[path.name] = dict(bytes=size, at=now, ageS=0, attemptedAt=now,
+                                       partial=bool(denied), deniedCount=denied)
+            denied_count += denied
+            if denied:
+                emit('disk', 'event', 'disk.inventory.source', ok=True,
+                     props=dict(source=str(root), child=path.name, partial=True,
+                                bytes=size, deniedCount=denied, exitCode=code,
+                                elapsedMs=(time.monotonic()-started)*1000))
+        except FileNotFoundError:
+            # A child removed since listdir is absent, not a failed measurement.
+            continue
+        except Exception as exc:
+            children[path.name] = {**old, 'attemptedAt': now if attempted else attempt_time(mapping(previous.get(path.name)).get('attemptedAt'))}
+            failure = source_error('disk', 'disk.inventory.source', root, started, exc,
+                                   child=path.name, cached=bool(old), **({'ageS': old['ageS']} if old else {}))
+            failures.append(failure)
+    complete = not failures and not any(c.get('partial') for c in children.values())
+    return children, failures, denied_count, complete
+
+
+def directory_inventory(paths=None, run=subprocess.run, split_roots=None):
     started = time.monotonic()
     deadline = started + 300
     sizes, errors = {}, 0
     partials = {}
-    for path in DIRECTORY_ROOTS if paths is None else paths:
+    previous = mapping(read_state('disk-inventory'))
+    attempts = dict(mapping(previous.get('attemptedAt')))
+    children = dict(mapping(previous.get('children')))
+    split = set(SPLIT_ROOTS if split_roots is None else split_roots)
+    mix = dict(rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0)
+    roots = sorted(DIRECTORY_ROOTS if paths is None else paths, key=lambda p: attempt_time(attempts.get(str(p))))
+    for path in roots:
         source_started = time.monotonic()
+        failures = []
+        denied = 0
         try:
             path.stat()
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
-            result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True,
-                         timeout=min(60, remaining), env={**os.environ, 'LC_ALL': 'C'})
-            stderr = getattr(result, 'stderr', '') or ''
-            denied = sum(permission_denied(line) for line in stderr.splitlines())
-            other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
-            message = stderr_line(stderr)
-            if result.returncode and (result.returncode != 1 or not denied or other_errors):
-                failure = 'permission' if not result.stdout.strip() and denied else 'exit'
-                raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
-            # Match the requested root, not an arbitrary number printed by du.
-            total = None
-            for line in result.stdout.splitlines():
-                fields = line.split('\t', 1)
-                if len(fields) == 2 and fields[1] == str(path):
-                    if not fields[0].isdigit():
-                        raise SourceFailure('parse', message or 'invalid du total', result.returncode)
-                    total = int(fields[0])*1024
-            if total is None:
-                failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
-                raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
-            sizes[str(path)] = total
-            if result.returncode:
-                partials[str(path)] = dict(partial=True, deniedCount=denied)
-                emit('disk', 'event', 'disk.inventory.source', ok=True,
-                     props=dict(source=str(path), partial=True, deniedCount=denied,
-                                bytes=total, exitCode=result.returncode,
-                                elapsedMs=(time.monotonic()-source_started)*1000))
+            attempts[str(path)] = time.time()
+            if path in split:
+                measured, failures, denied, complete = child_inventory(path, children.get(str(path)), min(deadline, source_started+60), run)
+                children[str(path)] = measured
+                known = [child for child in measured.values() if 'bytes' in child]
+                if known or complete:
+                    sizes[str(path)] = sum(child['bytes'] for child in known)
+                errors += len(failures)
+                if not complete:
+                    partials[str(path)] = dict(partial=True, deniedCount=denied,
+                                               ageS=max((child['ageS'] for child in known), default=0))
+                    mix['rootsPartial'] += 1
+            else:
+                total, denied, code = du_bytes(path, deadline, 60, run)
+                sizes[str(path)] = total
+                complete = not denied
+                if denied:
+                    emit('disk', 'event', 'disk.inventory.source', ok=True,
+                         props=dict(source=str(path), partial=True, deniedCount=denied,
+                                    bytes=total, exitCode=code,
+                                    elapsedMs=(time.monotonic()-source_started)*1000))
+                    mix['rootsPartial'] += 1
+            if denied:
+                partials.setdefault(str(path), dict(partial=True))['deniedCount'] = denied
+            mix['rootsOk'] += complete
         except FileNotFoundError as exc:
             if exc.filename == str(path):
                 continue
             errors += 1
-            source_error('disk', 'disk.inventory.source', path, source_started, exc)
+            failures.append(source_error('disk', 'disk.inventory.source', path, source_started, exc))
         except Exception as exc:
             errors += 1
-            source_error('disk', 'disk.inventory.source', path, source_started, exc)
-    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials, sourceErrors=errors))
+            failures.append(source_error('disk', 'disk.inventory.source', path, source_started, exc))
+        mix['rootsTimeout'] += 'timeout' in failures
+        mix['rootsDenied'] += bool(denied or 'permission' in failures)
+    now = time.time()
+    for root, entries in children.items():
+        for name, value in mapping(entries).items():
+            fresh = cache_entry(value, now)
+            if fresh:
+                entries[name] = fresh
+    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials,
+                                    sourceErrors=errors, children=children, attemptedAt=attempts))
+    mix['scanMs'] = (time.monotonic()-started)*1000
     emit('disk', 'error' if errors else 'perf', 'disk.inventory', ok=not errors,
-         duration_ms=(time.monotonic()-started)*1000, props={'count': len(sizes), 'sourceErrors': errors},
+         duration_ms=mix['scanMs'], props=dict(count=len(sizes), sourceErrors=errors, **mix),
          error_tag='disk.inventory_failed' if errors else None)
 
 

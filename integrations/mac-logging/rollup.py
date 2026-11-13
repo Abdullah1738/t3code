@@ -16,6 +16,7 @@ def rollup(day, root=None):
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
     disk = dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None)
+    inventory = dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0)
     latest_blocked_at = ''
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
@@ -48,6 +49,13 @@ def rollup(day, root=None):
                         stamp = row.get('ts', '')
                         if blocked in ('SKHelperClient', 'SKManager', 'DiskArbitration', 'DASession', 'unknown') and stamp >= latest_blocked_at:
                             disk['latestBlockedIn'], latest_blocked_at = blocked, stamp
+                    if name == 'disk.inventory':
+                        inventory['scans'] += 1
+                        props = safe_fields(row.get('props'))
+                        for key in ('rootsOk', 'rootsPartial', 'rootsTimeout', 'rootsDenied', 'scanMs'):
+                            value = props.get(key)
+                            if type(value) in (int, float) and value >= 0:
+                                inventory[key] += value
                     tag = row.get('error', {}).get('tag')
                     if tag:
                         tags[tag] += 1
@@ -58,7 +66,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', diskTooling=disk, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', diskTooling=disk, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,
