@@ -648,3 +648,21 @@ no-charge proof; release-flow requires the existing exact failed-intent evidence
 
 `commerce open-flows` lists all unresolved flows, including ACTIVE preparations
 and older payment fences. A listed preparation is not a bank approval request.
+
+
+Noon pending payments are isolated per flow. A fenced or unresolved flow never
+claims an account-wide ordering slot; its consumed sends and cart/order bindings
+remain non-reusable. A new flow with the same vertical, item set and quantities
+as a payment pending within 48 hours reports `SAME_BASKET_PENDING`. Preparation
+prints the warning; placement requires `--ack-pending FLOW` for each match.
+An unavailable legacy manifest is labelled `unresolved_legacy_manifest` and
+requires acknowledgement as a possible match on the same vertical. Known
+different baskets and other verticals remain available.
+This acknowledges the old bank approval, without retrying its flow or proving
+that it was cancelled or uncharged.
+
+`commerce release-flow FLOW --dry-run` checks a NowNow pre-order challenge
+without closing it. Release requires an expired 24-hour continuation window,
+terminal native intent status, zero authorisation/capture, and account-bound
+order history covering the flow's start with no matching or ambiguous order.
+An old challenge that noon still reports as pending stays fenced.

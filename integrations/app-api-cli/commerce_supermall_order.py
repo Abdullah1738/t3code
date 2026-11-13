@@ -288,6 +288,8 @@ class SupermallOrderFlow(MarketplacePayment):
         if financial and (self.review is None or kind == 'place' and time.time() - self.review['observed_at'] > 60):
             _fail('SUPERMALL_FRESH_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register, legacy_scopes
+            register(self.flow_id, 'supermall', self.account_hash, self.items, legacy=legacy_scopes('supermall', self.items, self.address_hash))
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='supermall',
                               account_hash=self.account_hash, scope_hash=self.scope_hash)
             self.opened = True
@@ -755,6 +757,8 @@ class SupermallOrderFlow(MarketplacePayment):
         if cart['empty'] or manifest != expected:
             _fail('SUPERMALL_RESUME_MANIFEST_MISMATCH')
         self.last_cart = cart_read
+        from commerce_pending import register, legacy_scopes
+        register(self.flow_id, 'supermall', self.account_hash, self.items, legacy=legacy_scopes('supermall', self.items, self.address_hash))
         return self
 
     @classmethod
