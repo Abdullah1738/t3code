@@ -274,6 +274,8 @@ it.effect.each([
         },
       });
       const runAtStart = child.runs[0]!;
+      assert.isDefined(runAtStart.delegatedTaskId);
+      assert.notEqual(runAtStart.delegatedTaskId, taskId);
       const childRunStatus =
         childState === "running" || childState === "queued" || childState === "waiting"
           ? childState
@@ -302,8 +304,14 @@ it.effect.each([
       });
       assert.equal(
         (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]?.delegatedTaskId,
-        childState === "correlated" ? taskId : undefined,
+        childState === "correlated" ? taskId : runAtStart.delegatedTaskId,
       );
+      if (childState !== "correlated") {
+        assert.notEqual(
+          (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]?.delegatedTaskId,
+          taskId,
+        );
+      }
       if (childState === "provider-active" || childState === "roster") {
         yield* apply({
           type: "provider-thread.updated",
