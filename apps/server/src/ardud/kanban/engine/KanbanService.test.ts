@@ -27498,3 +27498,123 @@ it.effect("review878r3: unpause does not undo a completed sibling review", () =>
     }).pipe(Effect.provide(testLayer(delayed)));
   }),
 );
+
+it.live(
+  "measures decode and statement work over twenty 200-card ticks",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const board = yield* kanban.ensureBoard({
+          slug: "decode-counts",
+          name: "Decode counts",
+          defaultProjectId: null,
+        });
+        const created = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Measure",
+            title: "Decode fixture",
+            description: "",
+          },
+          owner,
+        );
+        yield* sql.withTransaction(
+          Effect.forEach(
+            Array.from({ length: 199 }, (_, i) => i + 2),
+            (number) =>
+              store.putCard({ ...created, id: KanbanCardId.make(`decode-${number}`), number }),
+            { discard: true },
+          ),
+        );
+        // Three boards share the unresolved set; a failed result read keeps one
+        // evaluator end pending across all twenty passes without changing cards.
+        for (const slug of ["decode-other-a", "decode-other-b"]) {
+          yield* kanban.ensureBoard({ slug, name: slug, defaultProjectId: null });
+        }
+        const threadId = ThreadId.make("decode-pending-evaluator");
+        yield* store.putThreadLink({
+          threadId,
+          boardId: board.id,
+          cardId: null,
+          role: "evaluator",
+          purpose: null,
+          discussionId: null,
+          model: board.evaluatorModel,
+          startedAt: board.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+        fake.failFailureReads.left = 1000;
+        yield* kanban.turnEnded(threadId);
+        yield* kanban.tick;
+        const counts = {
+          boards: 0,
+          maintenanceBoards: 0,
+          cards: 0,
+          threads: 0,
+          threadBatches: 0,
+          boardDecodes: 0,
+          cardDecodes: 0,
+        };
+        const statements: Statement.Transformer = (statement, _sql, _fiber, span) => {
+          const [query] = statement.compile();
+          if (/^\s*SELECT\b/i.test(query)) {
+            if (/\bFROM ardud_kanban_boards\b/.test(query)) {
+              counts.boards++;
+              let current: Tracer.AnySpan | undefined = span;
+              while (current?._tag === "Span") {
+                if (current.name === "KanbanService.tickSteps") {
+                  counts.maintenanceBoards++;
+                  break;
+                }
+                current = Option.getOrUndefined(current.parent);
+              }
+            }
+            if (/\bFROM ardud_kanban_cards\b/.test(query)) counts.cards++;
+            if (/\bFROM ardud_kanban_threads\b/.test(query)) {
+              counts.threads++;
+              if (/WHERE thread_id IN/.test(query)) counts.threadBatches++;
+            }
+          }
+          return Effect.succeed(statement);
+        };
+        const parse = JSON.parse;
+        const spy = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+          const value = parse(text, reviver);
+          if (value && typeof value === "object" && "slug" in value && "managerModel" in value)
+            counts.boardDecodes++;
+          if (value && typeof value === "object" && "number" in value && "subtaskSeq" in value)
+            counts.cardDecodes++;
+          return value;
+        });
+        try {
+          for (let i = 0; i < 20; i++) {
+            yield* kanban.tick.pipe(
+              Effect.provideService(Statement.CurrentTransformer, statements),
+              Effect.provideService(Statement.SpanPropagationEnabled, true),
+            );
+          }
+        } finally {
+          spy.mockRestore();
+        }
+        yield* Effect.logInfo(
+          "KANBAN_DECODE_COUNTS",
+          JSON.stringify({ ticks: 20, boardCount: 3, cards: 200, totals: counts }),
+        );
+        if (process.env.KANBAN_DECODE_BASELINE !== "1") {
+          assert.strictEqual(counts.boardDecodes, 0);
+          assert.strictEqual(counts.cardDecodes, 0);
+          assert.strictEqual(counts.maintenanceBoards, 60);
+          assert.strictEqual(counts.threadBatches, 20);
+          assert.isAtMost(counts.boards, 200);
+          assert.isAtMost(counts.threads, 160);
+        }
+        assert.strictEqual((yield* store.cards(board.id)).length, 200);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+  60_000,
+);

@@ -2150,8 +2150,11 @@ const make = Effect.gen(function* () {
   });
 
   const boardOf = Effect.fn("KanbanService.boardOf")(function* (boardId: string) {
-    const board = (yield* locks.access(boardId, rawStore.boards, false, "board")).find(
-      (candidate) => candidate.id === boardId,
+    const board = yield* locks.access(
+      boardId,
+      rawStore.board(KanbanBoardId.make(boardId)),
+      false,
+      "board",
     );
     if (!board) return yield* failWith("not-found", `board ${boardId}`);
     return board;
@@ -6629,7 +6632,9 @@ const make = Effect.gen(function* () {
     yield* seedDown;
     yield* locks.outside(
       Effect.forEach(
-        (yield* store.boards).filter((board) => boardId === undefined || board.id === boardId),
+        boardId === undefined
+          ? yield* store.boards
+          : [yield* store.board(KanbanBoardId.make(boardId))].filter((board) => board !== null),
         (candidate) =>
           serialEach(
             dispatching,
@@ -8165,7 +8170,32 @@ const make = Effect.gen(function* () {
   });
 
   /** One board's maintenance before its own dispatch. */
-  const tickSteps = Effect.fn("KanbanService.tickSteps")(function* (boardId: string) {
+  const tickSteps = Effect.fn("KanbanService.tickSteps")(function* (
+    boardId: string,
+    turnEndLinks: ReadonlyMap<string, KanbanThreadLink>,
+  ) {
+    // Config survives only this pass. Keep the board/epoch dependencies in every
+    // step, and reread after a board write or migration (including a step rerun).
+    let config: { board: KanbanBoard | null; version: number; epoch: number } | undefined;
+    const readTickBoard = locks.access(
+      boardId,
+      Effect.gen(function* () {
+        const version = yield* locks.resourceVersion(boardId, "board");
+        const epoch = yield* locks.resourceVersion(boardId, "epoch");
+        if (config === undefined || config.version !== version || config.epoch !== epoch) {
+          const board = yield* rawStore.board(KanbanBoardId.make(boardId));
+          config = { board, version, epoch };
+        }
+        return config.board;
+      }),
+      false,
+      "board",
+    );
+    const tickBoardOf = Effect.gen(function* () {
+      const board = yield* readTickBoard;
+      if (!board) return yield* failWith("not-found", `board ${boardId}`);
+      return board;
+    });
     const now = yield* nowMillis;
     yield* serial(evaluating, boardId, drainEvaluatorQueue(KanbanBoardId.make(boardId))).pipe(
       Effect.catchCause((cause) =>
@@ -8173,7 +8203,11 @@ const make = Effect.gen(function* () {
       ),
     );
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
-      const link = yield* store.threadLink(threadId);
+      const planned = turnEndLinks.get(threadId);
+      const link =
+        planned === undefined
+          ? null
+          : yield* locks.access(planned.boardId, Effect.succeed(planned));
       if (link?.boardId !== boardId) continue;
       const result = yield* serialEach(
         turnEnding,
@@ -8309,10 +8343,10 @@ const make = Effect.gen(function* () {
     const before = (yield* Ref.get(missing)).get(boardId) ?? new Set<ThreadId>();
     yield* locks.outside(
       Effect.forEach(
-        (yield* store.boards).filter((board) => board.id === boardId),
+        [yield* readTickBoard].filter((board) => board !== null),
         (candidate) =>
           Effect.gen(function* () {
-            let board = yield* boardOf(candidate.id);
+            let board = yield* tickBoardOf;
             if (board.archivedAt !== null) return;
             const { views, viewFences, freshFind, confirmFind, planFind, planView } = makeViews();
             const step = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>, cardId?: string) =>
@@ -8320,7 +8354,7 @@ const make = Effect.gen(function* () {
                 candidate.id,
                 name,
                 Effect.gen(function* () {
-                  board = yield* boardOf(candidate.id);
+                  board = yield* tickBoardOf;
                   return yield* effect;
                 }),
                 cardId,
@@ -9573,12 +9607,12 @@ const make = Effect.gen(function* () {
     const listed = yield* models.listed;
     const unlistedBefore = yield* Ref.get(unlistedPools);
     const unlistedNow = new Set<string>();
-    for (const candidate of (yield* store.boards).filter((board) => board.id === boardId)) {
+    for (const candidate of [yield* readTickBoard].filter((board) => board !== null)) {
       yield* tickStep(
         candidate.id,
         "unlistedPools",
         Effect.gen(function* () {
-          const board = yield* boardOf(candidate.id);
+          const board = yield* tickBoardOf;
           if (board.archivedAt !== null) return;
           let zeroed = false;
           for (const pool of yield* store.pools(board.id)) {
@@ -9608,11 +9642,14 @@ const make = Effect.gen(function* () {
   });
 
   const runningTicks = new Set<string>();
-  const tickBoard = Effect.fn("KanbanService.tickBoard")(function* (boardId: string) {
+  const tickBoard = Effect.fn("KanbanService.tickBoard")(function* (
+    boardId: string,
+    turnEndLinks: ReadonlyMap<string, KanbanThreadLink>,
+  ) {
     if (runningTicks.has(boardId)) return;
     runningTicks.add(boardId);
     const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
-    yield* serialEach(ticking, boardId, tickSteps(boardId), false).pipe(
+    yield* serialEach(ticking, boardId, tickSteps(boardId, turnEndLinks), false).pipe(
       Effect.provideService(tickKicks, kicks),
       Effect.ensuring(
         Effect.sync(() => {
@@ -9632,9 +9669,14 @@ const make = Effect.gen(function* () {
   });
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
     // A failed board must not interrupt the other boards, but callers still see its error.
+    const turnEndLinks = new Map(
+      (yield* rawStore.threadLinksByIds([...(yield* Ref.get(unresolvedTurnEnds))])).map(
+        (link) => [link.threadId, link] as const,
+      ),
+    );
     const results = yield* Effect.forEach(
       yield* store.boards,
-      (board) => Effect.exit(tickBoard(board.id)),
+      (board) => Effect.exit(tickBoard(board.id, turnEndLinks)),
       {
         concurrency: "unbounded",
         discard: false,
