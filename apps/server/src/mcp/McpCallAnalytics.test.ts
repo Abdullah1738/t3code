@@ -111,9 +111,15 @@ const probe = (name: string) =>
   );
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 
-it.effect.each([false, true, "blocked"] as const)(
-  "scope shutdown records a delegate call once with committed=%s and awaits the disk flush",
-  (committed) =>
+it.effect.each([
+  { name: "shutdown before receipt", committed: false, shutdown: true, expected: "unknown" },
+  { name: "shutdown after receipt", committed: true, shutdown: true, expected: true },
+  { name: "shutdown blocked receipt", committed: "blocked", shutdown: true, expected: "unknown" },
+  { name: "interruption before receipt", committed: false, shutdown: false, expected: false },
+  { name: "interruption after receipt", committed: true, shutdown: false, expected: true },
+] as const)(
+  "$name records a delegate call once and awaits the disk flush",
+  ({ committed, shutdown, expected }) =>
     Effect.gen(function* () {
       const rows: AnalyticsEvent[] = [];
       const entered = yield* Deferred.make<void>();
@@ -160,21 +166,26 @@ it.effect.each([false, true, "blocked"] as const)(
           Effect.forkChild,
         );
       yield* Deferred.await(entered);
-      const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
-      if (committed === "blocked") {
-        yield* Deferred.await(checkingReceipt);
-        yield* TestClock.adjust("250 millis");
+      if (shutdown) {
+        const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+        if (committed === "blocked") {
+          yield* Deferred.await(checkingReceipt);
+          yield* TestClock.adjust("250 millis");
+        }
+        yield* Fiber.join(closing);
+      } else {
+        yield* Fiber.interrupt(call);
+        yield* Scope.close(scope, Exit.void);
       }
-      yield* Fiber.join(closing);
       yield* Deferred.await(flushed);
       yield* Fiber.interrupt(call);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         kind: "mcp.call",
         tool: "delegate_task",
-        outcome: "interrupted_by_shutdown",
+        outcome: shutdown ? "interrupted_by_shutdown" : "interrupted",
         callerThreadId: "caller-ledger",
-        committed: committed === "blocked" ? "unknown" : committed,
+        committed: expected,
         ...callIdentifiers(args, "caller-ledger"),
       });
       expect(rows[0]!.bootId).toBeTruthy();
@@ -798,4 +809,82 @@ it.effect("rejects new tool calls while shutdown waits for the disk drain", () =
       expect(handled).toBe(0);
     }).pipe(Effect.provide(layer));
   }),
+);
+
+const shutdownCommitRaces = [
+  { name: "receipt lookup before dispatch", trackBeforeShutdown: true, finishAfterCommit: false },
+  { name: "handler before receipt tracking", trackBeforeShutdown: false, finishAfterCommit: false },
+  { name: "handler completes during flush", trackBeforeShutdown: true, finishAfterCommit: true },
+];
+it.effect.each(shutdownCommitRaces)(
+  "does not report false when an admitted $name can still commit during shutdown",
+  ({ trackBeforeShutdown, finishAfterCommit }) =>
+    Effect.gen(function* () {
+      let committed = false;
+      const rows: AnalyticsEvent[] = [];
+      const entered = yield* Deferred.make<void>();
+      const allowCommit = yield* Deferred.make<void>();
+      const didCommit = yield* Deferred.make<void>();
+      const flushing = yield* Deferred.make<void>();
+      const finishFlush = yield* Deferred.make<void>();
+      const toolkit = probe("delegate_task");
+      const track = McpCall.trackDelegation(
+        "created-task",
+        Effect.sync(() => committed),
+      );
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        delegate_task: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            if (trackBeforeShutdown) yield* track;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(allowCommit);
+            if (!trackBeforeShutdown) yield* track;
+            committed = true;
+            yield* Deferred.succeed(didCommit, undefined);
+            return finishAfterCommit ? { taskId: "created-task" } : yield* Effect.never;
+          }),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(McpCallLedger.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (row) =>
+              Effect.sync(() => {
+                if (row.kind === "mcp.call") rows.push(row);
+              }),
+            flush: Deferred.succeed(flushing, undefined).pipe(
+              Effect.andThen(Deferred.await(finishFlush)),
+            ),
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const ledger = yield* McpCallLedger.McpCallLedger;
+        const call = yield* server
+          .callTool({ name: "delegate_task", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+        yield* Deferred.await(entered);
+        const stopping = yield* ledger.shutdown.pipe(Effect.forkChild);
+        yield* Deferred.await(flushing);
+        yield* Deferred.succeed(allowCommit, undefined);
+        yield* Deferred.await(didCommit);
+        if (finishAfterCommit) yield* Fiber.join(call);
+        yield* Deferred.succeed(finishFlush, undefined);
+        yield* Fiber.join(stopping);
+        yield* Fiber.interrupt(call);
+        expect(committed).toBe(true);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          outcome: "interrupted_by_shutdown",
+          committed: "unknown",
+          ...callIdentifiers(args, "caller-ledger"),
+        });
+        expect(rows[0]!.taskId).toBeUndefined();
+      }).pipe(Effect.provide(registration));
+    }),
 );

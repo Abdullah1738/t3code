@@ -1059,7 +1059,7 @@ const withToolAnalytics =
                   outcome.outcome === "interrupted" ||
                   outcome.outcome === "interrupted_by_shutdown";
                 // Reserve most of the shutdown budget for recording and flushing all rows.
-                const committed =
+                const observedCommit =
                   interrupted && options.tool.name === "delegate_task"
                     ? callState.delegation === undefined
                       ? false
@@ -1069,6 +1069,11 @@ const withToolAnalytics =
                           Effect.orElseSucceed(() => "unknown" as const),
                         )
                     : undefined;
+                // HTTP teardown follows this snapshot, so admitted handlers can still commit.
+                const committed =
+                  outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
+                    ? "unknown"
+                    : observedCommit;
                 return {
                   ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                   kind: "mcp.call" as const,
