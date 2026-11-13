@@ -138,6 +138,16 @@ class Unconfigured(HomeFiles):
 
 
 class BackendChoice(HomeFiles):
+    def routing_databases(self, boat_runs=(), home_runs=()):
+        state = self.dir / "state"
+        state.mkdir()
+        self.stack.enter_context(patch.object(common, "STATE", state))
+        for name, ids in (("boat", boat_runs), ("server", home_runs)):
+            with contextlib.closing(sqlite3.connect(common.db_path_for(name))) as con:
+                con.executescript(common.SCHEMA)
+                con.executemany("INSERT INTO runs (run_id) VALUES (?)", ((run,) for run in ids))
+                con.commit()
+
     def test_configured_and_up_goes_home(self):
         self.configure()
         self.assertEqual(common.default_backend(), "server")        # no monitor file yet counts as up
@@ -216,6 +226,54 @@ class BackendChoice(HomeFiles):
         self.monitor_says("home_down")
         self.assertEqual(common.entry_backend(["run", "--", "true"]), "boat")
         self.assertEqual(common.entry_backend(["wait", "run-1112-020202-bbbb"]), "server", "a home run is still a home run")
+
+    def test_wait_routes_by_run_id_not_timeout_values_in_either_failover_direction(self):
+        self.configure()
+        boat_run, home_run = "run-1113-024127-115e", "run-1113-024128-116f"
+        decoys = ("run-1113-000000-0001", "run-1113-000000-0030")
+        self.routing_databases((boat_run, *decoys), (home_run, *decoys))
+        for state, run, want in (("home_up", boat_run, "boat"), ("home_down", home_run, "server")):
+            self.monitor_says(state)
+            for args in ([run, "--timeout", "1"], [run, "--timeout=1"],
+                         ["--timeout", "30", run], ["--timeout=30", run],
+                         ["--t", "1", run], ["--t=1", run],
+                         ["--timeout", "1", "--timeout=30", run],
+                         ["--timeout", "-1", run], ["--timeout", "1", "--", run]):
+                argv = ["wait", *args]
+                with self.subTest(state=state, argv=argv):
+                    self.assertEqual(cli.build_parser().parse_args(argv).run_id, run)
+                    self.assertEqual(common.entry_backend(argv), want)
+
+    def test_exact_run_on_other_backend_beats_suffix_on_default(self):
+        self.configure()
+        boat_run, home_run = "run-1113-024127-115e", "run-1113-024128-116f"
+        self.routing_databases((boat_run, "prefix-" + home_run), (home_run, "prefix-" + boat_run))
+        for state, ident, want in (("home_up", boat_run, "boat"), ("home_down", home_run, "server")):
+            self.monitor_says(state)
+            for sub in ("logs", "wait", "kill"):
+                with self.subTest(state=state, sub=sub):
+                    self.assertEqual(common.entry_backend([sub, ident]), want)
+
+    def test_short_run_ids_still_resolve_on_either_backend(self):
+        self.configure()
+        self.routing_databases(("run-1113-024127-115e",), ("run-1113-024128-116f",))
+        for state in ("home_up", "home_down"):
+            self.monitor_says(state)
+            for sub in ("logs", "wait", "kill"):
+                for ident, want in (("115e", "boat"), ("116f", "server")):
+                    with self.subTest(state=state, sub=sub, ident=ident):
+                        self.assertEqual(common.entry_backend([sub, ident]), want)
+
+    def test_entry_backend_pin_and_no_home_config_skip_database_lookups(self):
+        argv = ["wait", "run-1113-024127-115e", "--timeout", "1"]
+        with patch.object(common, "_known", side_effect=AssertionError("no database lookup")):
+            self.assertEqual(common.entry_backend(argv), "boat")
+            self.configure()
+            for pin in ("boat", "server"):
+                with patch.dict(os.environ, {"OFFBOX_BACKEND": pin}):
+                    self.assertEqual(common.entry_backend(argv), pin)
+                (self.dir / "backend").write_text(pin)
+                self.assertEqual(common.entry_backend(argv), pin)
 
 
 class Failover(HomeFiles):
