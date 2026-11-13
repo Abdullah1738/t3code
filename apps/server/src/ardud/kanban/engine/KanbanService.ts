@@ -784,6 +784,9 @@ interface Hold {
 const HOLD_MAX_MS = 30 * 60_000;
 /** Thread views the wait pass reads at once, in its one read outside the gate. */
 const WAIT_VIEW_READS = 8;
+const waitingToRun = (card: KanbanCard, now: number) =>
+  card.activeThreadId === null &&
+  (Retries.heldForRetry(card, now) || (Waits.WAITS_ENGINE_WIRED && kanbanWaiting(card)));
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
@@ -4928,7 +4931,24 @@ const make = Effect.gen(function* () {
     }
   });
 
-  /** A finished turn settles the agent's typing and, once, nudges an unanswered discussion. */
+  const discussionWaitHeld = Effect.fn("KanbanService.discussionWaitHeld")(function* (
+    discussion: KanbanDiscussion,
+    link: KanbanThreadLink,
+  ) {
+    if (link.role === "evaluator") return false;
+    if (discussion.cardId === null && (yield* store.cardsByThread(link.threadId)).length > 0)
+      return false;
+    const now = yield* nowMillis;
+    const id = discussion.cardId ?? link.cardId;
+    const card = id === null ? null : yield* store.card(id);
+    return (
+      card !== null &&
+      (card.workThreadId === link.threadId || card.reviewThreadId === link.threadId) &&
+      waitingToRun(card, now)
+    );
+  });
+
+  /** A deferral must leave the turn's reminder attempt available for an active sibling. */
   const settleParticipant = Effect.fn("KanbanService.settleParticipant")(function* (
     discussion: KanbanDiscussion,
     threadId: ThreadId,
@@ -4939,11 +4959,22 @@ const make = Effect.gen(function* () {
         (candidate.actor._tag === "thread" || candidate.actor._tag === "evaluator") &&
         candidate.actor.threadId === threadId,
     );
-    if (!participant) return;
-    if (discussion.settledAt !== null || discussion.archivedAt !== null) return;
+    if (!participant) return false;
+    if (discussion.settledAt !== null || discussion.archivedAt !== null) return false;
     if (participant.owes === "asked") {
       const link = yield* store.threadLink(threadId);
       const board = yield* boardOf(discussion.boardId);
+      if (link && (yield* discussionWaitHeld(discussion, link))) {
+        yield* saveDiscussion(
+          withParticipant(
+            deferParticipant(discussion, participant),
+            participant.actor,
+            participant.name,
+            { typingUntil: null },
+          ),
+        );
+        return false;
+      }
       if (board.pause && link && link.role !== "evaluator") {
         const carried = yield* store.cardsByThread(threadId);
         if (discussionHeld(board, discussion, link, carried)) {
@@ -4955,7 +4986,7 @@ const make = Effect.gen(function* () {
               { typingUntil: null },
             ),
           );
-          return;
+          return false;
         }
       }
       const sent = yield* threads
@@ -4977,7 +5008,7 @@ const make = Effect.gen(function* () {
             }),
           );
         }
-        if (retry || participant.deferred) return;
+        if (retry || participant.deferred) return true;
       }
       yield* saveDiscussion(
         withParticipant(discussion, participant.actor, participant.name, {
@@ -4985,7 +5016,7 @@ const make = Effect.gen(function* () {
           typingUntil: yield* typingUntil,
         }),
       );
-      return;
+      return true;
     }
     if (participant.typingUntil !== null || participant.owes !== null) {
       yield* saveDiscussion(
@@ -4995,6 +5026,7 @@ const make = Effect.gen(function* () {
         }),
       );
     }
+    return false;
   });
 
   const settleWhenTurnEnds = Effect.fn("KanbanService.settleWhenTurnEnds")(function* (
@@ -5036,8 +5068,7 @@ const make = Effect.gen(function* () {
         Rules.waitingOnBackground(view, yield* nowMillis)
       )
         return false;
-      yield* settleParticipant(discussion, threadId, true);
-      return true;
+      return yield* settleParticipant(discussion, threadId, true);
     }
     const attempted = participant?.actor._tag === "thread" && participant.owes === "asked";
     if (attempted) {
@@ -5048,8 +5079,8 @@ const make = Effect.gen(function* () {
         return false;
       }
     }
-    yield* settleParticipant(discussion, threadId);
-    return attempted;
+    const reminded = yield* settleParticipant(discussion, threadId);
+    return attempted && reminded;
   });
 
   const saveDispatchCard = Effect.fn("KanbanService.saveDispatchCard")(function* (
@@ -6105,6 +6136,7 @@ const make = Effect.gen(function* () {
         if (!participant?.deferred || participant.owes !== "asked") continue;
         const link = yield* store.threadLink(threadId);
         if (!link || link.boardId !== board.id || link.paused) continue;
+        if (yield* discussionWaitHeld(discussion, link)) continue;
         const carried = yield* store.cardsByThread(threadId);
         if (discussionHeld(board, discussion, link, carried)) continue;
         if (!(yield* isHome(discussion, threadId))) {
@@ -7195,6 +7227,7 @@ const make = Effect.gen(function* () {
                     : null);
               const threadId = threadFor(initial);
               if (threadId === null || initial.stalled !== null) continue;
+              if (waitingToRun(initial, now)) continue;
               yield* step(
                 "silentRunBackstop",
                 Effect.gen(function* () {
@@ -10730,8 +10763,21 @@ const make = Effect.gen(function* () {
             ),
           );
           const current = yield* cardOf(cardId);
-          yield* logEvent(current, actor, "thread", { body: `Steered: ${text}` });
-          return current;
+          // A detached steer can start a run; its old holds must not hide that run.
+          let next = current;
+          if (current.activeThreadId === null && current.workThreadId === threadId) {
+            if (card.wait !== undefined && NodeUtil.isDeepStrictEqual(current.wait, card.wait))
+              next = kanbanWithoutWait(next);
+            if (
+              card.retries !== undefined &&
+              NodeUtil.isDeepStrictEqual(current.retries, card.retries)
+            )
+              next = Retries.withoutRetries(next);
+            if (next !== current) next = { ...next, updatedAt: at };
+          }
+          yield* logEvent(next, actor, "thread", { body: `Steered: ${text}` });
+          if (next !== current) yield* saveCard(next);
+          return next;
         }
         if (action === "stop") {
           if (card.activeThreadId === null) {
