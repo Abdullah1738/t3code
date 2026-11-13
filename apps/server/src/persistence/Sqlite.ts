@@ -1,4 +1,8 @@
-import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
+import {
+  annotateSqliteError,
+  ErrorObserver,
+  sqliteErrorDetails,
+} from "@t3tools/shared/nodeSqliteErrors";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -21,6 +25,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as NodeSqlite from "node:sqlite";
 
 export const WAL_SIZE_LIMIT_BYTES = 32 * 1024 * 1024;
+const SQLITE_READONLY_ROLLBACK = 776;
 
 export const runSqliteSetupPhases = Effect.fn("runSqliteSetupPhases")(function* <E1, R1, E2, R2>(
   migrations: Effect.Effect<void, E1, R1>,
@@ -123,9 +128,12 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   const snapshotGate = yield* Semaphore.make(1);
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
-    Effect.sync(() => {
-      try {
-        const marker = new NodeSqlite.DatabaseSync(dbPath);
+    Effect.gen(function* () {
+      if (!(yield* fs.exists(dbPath))) return undefined;
+      const readMarker = (readOnly: boolean) => {
+        // A writable last connection checkpoints on close, even after SELECTs.
+        // Leave inherited WAL frames to the main client's checkpoint worker.
+        const marker = new NodeSqlite.DatabaseSync(dbPath, { readOnly });
         try {
           const exists = marker
             .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'")
@@ -139,6 +147,16 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
             : undefined;
         } finally {
           marker.close();
+        }
+      };
+      try {
+        try {
+          return readMarker(true);
+        } catch (cause) {
+          // A hot rollback journal must be recovered by a writable connection.
+          // This is rollback mode; closing it cannot checkpoint an inherited WAL.
+          if (sqliteErrorDetails(cause)?.errcode !== SQLITE_READONLY_ROLLBACK) throw cause;
+          return readMarker(false);
         }
       } catch (cause) {
         annotateSqliteError(
