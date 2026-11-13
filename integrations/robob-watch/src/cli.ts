@@ -145,6 +145,7 @@ async function main(argv: string[]): Promise<void> {
       // outside watcher.json, so no replace can lift one.
       if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
       if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
+      if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
       if (values.json === undefined && previous?.depends) input.depends = previous.depends;
       if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
       if (values.json === undefined && previous?.trip) input.trip = previous.trip;

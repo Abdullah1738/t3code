@@ -7,8 +7,11 @@ Only projected evidence is persisted; raw notification dumps/mail stay in memory
 """
 import toollog
 import argparse
+from copy import deepcopy
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,6 +37,7 @@ WATCHERS = Path.home() / '.local/share/robob-watch/watchers'
 # Moni's texts go to her Robob thread on the assistant line, never Abdullah's own iMessage.
 BUN = '/Users/ardud/.bun/bin/bun'
 BRIDGE_CLI = '/Users/ardud/.local/share/spectrum-bridge/src/cli.ts'
+PROBLEM_CLI = '/Users/ardud/.local/share/telegram-bridge/src/cli.ts'
 BRIDGE_DB = Path.home() / '.config/spectrum-bridge/state.sqlite'
 ROUTE_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]{0,199}')
 NOTICE_FAILED_EXIT = 3
@@ -116,6 +120,85 @@ def quiet_error(error):
     family = error_family(error)
     return (family in QUIET_ERROR_FAMILIES or family.startswith('notifications_')
             or 'timeout' in family or 'deadline' in family)
+
+
+def order_total_aed(cfg, result, state):
+    meta = cfg.get('card_meta') or {}
+    for source in (cfg, meta, result, state.get('last_result') or {}):
+        value = source.get('total')
+        if value is None or str(source.get('currency', 'AED')).upper() != 'AED':
+            continue
+        match = re.fullmatch(r'\s*(?:AED\s*)?((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{1,2})?)\s*(?:AED)?\s*',
+                             str(value), re.I)
+        if match:
+            try:
+                return Decimal(match[1].replace(',', ''))
+            except InvalidOperation:
+                pass
+    return Decimal(state.get('known_total_aed', '0'))
+
+
+def queue_problem_notices(cfg, result, state, events):
+    total = order_total_aed(cfg, result, state)
+    state['known_total_aed'] = str(total)
+    if total < 500:
+        return events
+    # A direct, keyed owner send cannot be dropped by an agent's NO_REPLY or
+    # held by the watcher's quiet hours. Ordinary stage updates keep their route.
+    problems = []
+    if state.get('primed'):
+        errors = (result.get('errors') or []) if state.get('status') not in TERMINAL else []
+        if (not errors and result.get('status') == 'unknown' and not result.get('status_evidence_available')
+                and not result.get('candidate') and not result.get('aftercare_evidence')
+                and state.get('status') not in TERMINAL):
+            errors = ['no_order_status_evidence']
+        problems.extend(('tracking_problem:' + family, 'Tracking unavailable (' + family + ')')
+                        for family in sorted({error_family(e) for e in errors}))
+        if result.get('problem'):
+            stage = result['problem']['stage']
+            problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
+        if result.get('status') in {'problem', 'failed', 'error'}:
+            stage = result['status']
+            problems.append(('problem:' + stage, 'Delivery problem (' + stage + ')'))
+        for event in events:
+            if event['kind'] in {'eta_elapsed', 'card_link_problem'}:
+                problems.append((event['kind'], event['message']))
+        if state.get('delay_sent') and state.get('status') not in TERMINAL:
+            problems.append(('eta_elapsed', 'Checkout ETA passed; delivery is unconfirmed'))
+        if state.get('card_link_problem_sent'):
+            problems.append(('card_link_problem', 'The delivery card link needs repair'))
+    notices = state.setdefault('problem_notices', {})
+    for problem, description in problems:
+        key = 'order-problem:' + hashlib.sha256(
+            json.dumps([cfg['app'], cfg['order'], problem], separators=(',', ':')).encode()).hexdigest()
+        notices.setdefault(key, {'status': 'pending',
+                                'text': f"{cfg['app']} order {cfg['order']} (AED {total:,.2f}): {description.rstrip('.')}."})
+    return [event for event in events if event['kind'] not in
+            {'tracking_problem', 'problem', 'eta_elapsed', 'card_link_problem'}]
+
+
+def send_problem_notices(cfg, state, path, folder):
+    # Scratch checks and registration primes must never send or consume alerts.
+    if (folder.resolve() != (WATCHERS / cfg['watcher']).resolve()
+            or os.environ.get('WATCH_RUN', '').startswith('prime-')):
+        return
+    for key, notice in state.get('problem_notices', {}).items():
+        if notice['status'] == 'sent':
+            continue
+        try:
+            # Telegram's alerts queue survives iMessage session rotation; ordinary
+            # conversation sends are bound to the chat's current generation.
+            p = subprocess.run([BUN, PROBLEM_CLI, 'notify', '--source', 'order-watch', '--severity', 'attention', '--key', key,
+                                '--text=' + notice['text']], capture_output=True, text=True,
+                               timeout=20, env=store.clean_env())
+            ack = json.loads(p.stdout) if p.returncode == 0 else None
+            if (isinstance(ack, dict) and isinstance(ack.get('id'), str)
+                    and isinstance(ack.get('created'), bool)):
+                notice.update(status='sent', bridge_id=ack['id'])
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass  # The retained text and key make an ambiguous retry safe.
+        write(path, state)
+        break  # Keep the poll's send budget bounded; the rest stay pending.
 
 
 def poll_interval(eta, now=None):
@@ -914,18 +997,45 @@ def check(cfg):
 
 
 @toollog.timed('order-watch', 'track.poll')
-def _check(cfg):
+def _check(cfg, pending_only=False):
     folder = Path(os.environ['WATCH_DIR'])
     with (folder / 'order-tracker.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = folder / 'order-tracker-state.json'
         state = read(path)
+        if pending_only and order_total_aed(cfg, {}, state) < 500:
+            return {'ok': True}
+        if pending_only and os.environ.get('WATCH_MAIN_CHECKED') == '1':
+            send_problem_notices(cfg, state, path, folder)
+            return {'ok': True}
         if terminal_order(cfg, state.get('last_result', {}), state.get('status', 'unknown')):
-            retire_terminal(cfg, folder, path, state)
+            if pending_only:
+                send_problem_notices(cfg, state, path, folder)
+            if all(n['status'] == 'sent' for n in state.get('problem_notices', {}).values()):
+                retire_terminal(cfg, folder, path, state)
             return {'ok': not bool(state.get('retire_error') or state.get('card_error')),
                     'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
         now = time.time()
-        result = fetch(cfg, state, now)
+        result = fetch(cfg, deepcopy(state) if pending_only else state, now)
+        primed = state.get('primed', False)
+        state['known_total_aed'] = str(order_total_aed(cfg, result, state))
+        if pending_only:
+            # Leave stage/delivery cursors untouched: their ordinary wake is still
+            # pending, and the normal check must see every later stage after it.
+            complete = terminal_order(cfg, result)
+            alert_state = {**state, 'status': result['status'] if complete else state.get('status')}
+            events = []
+            if not complete and eta_elapsed_due(cfg, state, now):
+                events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed; delivery is unconfirmed'})
+            if folder.resolve() == (WATCHERS / cfg['watcher']).resolve():
+                card = delivery_cards.safe_sync(cfg, result, send=False)
+                if card.get('link_health') == 'needs_repair':
+                    events.append({'kind': 'card_link_problem', 'message': 'The delivery card link needs repair'})
+            queue_problem_notices(cfg, result, alert_state, events)
+            state['problem_notices'] = alert_state.get('problem_notices', {})
+            write(path, state)
+            send_problem_notices(cfg, state, path, folder)
+            return {'ok': not bool(result.get('errors'))}
         previous = state.get('status','unknown')
         delayed = state.get('delay_sent',False)
         events = transition(result, state, cfg, now)
@@ -946,7 +1056,6 @@ def _check(cfg):
                 store.reconcile(cfg, detected=stamp(now), source=proof.get('source'),
                                 evidence_time=proof.get('email_date') or proof.get('observed_at'))
         state['last_result'] = result
-        write(path, state)
         # robob-watch test uses a scratch WATCH_DIR: no web writes or messages.
         if folder.resolve() == (WATCHERS / cfg['watcher']).resolve():
             # Poll checks never publish/send: provider reads already consume most
@@ -954,13 +1063,14 @@ def _check(cfg):
             card = delivery_cards.safe_sync(cfg, result, send=False)
             if card.get('status', '').startswith('failed'):
                 state['card_error'] = card['status']
-                write(path, state)
             if card.get('link_health') == 'needs_repair' and not state.get('card_link_problem_sent'):
                 events.append({'kind': 'card_link_problem', 'message': 'Public card link changed or expired. Repair the link; do not send progress texts.', 'card': card})
                 state['card_link_problem_sent'] = True
-                write(path, state)
-            elif card.get('link_health') == 'ok' and state.pop('card_link_problem_sent', None):
-                write(path, state)
+            elif card.get('link_health') == 'ok':
+                state.pop('card_link_problem_sent', None)
+        if primed:
+            events = queue_problem_notices(cfg, result, state, events)
+        write(path, state)
         if events:
             print(json.dumps({'app': cfg['app'], 'order': cfg['order'], 'for': cfg['for'],
                                'label': cfg.get('label'), 'events': events, 'eta': cfg.get('eta'),
@@ -1004,6 +1114,17 @@ def card_enrollment(new, cfg, args):
     return new or bool(cfg.get('delivery_card')) or args.card
 
 
+def configure_problem_check(cfg, watchpath):
+    if not watchpath.exists():
+        return
+    watcher = read(watchpath)
+    command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check-pending',
+                          '--app', cfg['app'], '--order', cfg['order']])
+    if watcher.get('pending_check') != command:
+        watcher['pending_check'] = command
+        write(watchpath, watcher)
+
+
 def retire(cfg, path, watcher=None):
     watcher = watcher or cfg['watcher']
     if (WATCHERS / watcher).exists():
@@ -1016,11 +1137,17 @@ def retire(cfg, path, watcher=None):
 @toollog.registration
 def main(argv=None, _locked=False):
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ['configure-problem-checks']:
+        for path in (ROOT / 'orders').glob('*.json'):
+            cfg = read(path)
+            if cfg.get('active', True) and cfg.get('watcher') == path.stem:
+                configure_problem_check(cfg, WATCHERS / cfg['watcher'] / 'watcher.json')
+        return 0
     if argv[:1] == ['aftercare']:
         import aftercare
         return aftercare.main(argv[1:], session=SESSION)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['status', 'add', 'check', 'remove', 'reconcile'])
+    parser.add_argument('command', choices=['status', 'add', 'check', 'check-pending', 'remove', 'reconcile'])
     parser.add_argument('--app', required=True, choices=list(PACKAGES) + list(ALIASES))
     parser.add_argument('--order', required=True)
     parser.add_argument('--for', dest='recipient', choices=['owner', 'moni'], default='owner')
@@ -1095,6 +1222,8 @@ def main(argv=None, _locked=False):
             epoch(cfg[field])
     if args.command == 'check':
         check(cfg)
+    elif args.command == 'check-pending':
+        _check(cfg, pending_only=True)
     elif args.command == 'status':
         saved = read(Path.home() / '.local/share/robob-watch/watchers' / wid / 'order-tracker-state.json')
         result = fetch(cfg, {}, time.time())
@@ -1202,6 +1331,8 @@ def main(argv=None, _locked=False):
             print(json.dumps({'watcher': wid, 'current': read(watchpath.parent / 'order-tracker-state.json')
                               .get('last_result', {})}, indent=2))
         registered = watchpath.exists()
+        if registered:
+            configure_problem_check(cfg, watchpath)
         toollog.emit('order-watch','track.add',kind='event' if registered else 'error',ok=registered,
                      ids={'orderId':args.order},props={'merchant':app,'source':args.source},
                      error=None if registered else 'TRACK_REGISTRATION_FAILED')

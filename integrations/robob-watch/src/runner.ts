@@ -44,6 +44,18 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
   log(watcher.id, `status -> ${status}`);
 }
 
+async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false): Promise<void> {
+  if (!watcher.pending_check) return;
+  await slots.run(async () => {
+    const current = loadWatcher(watcher.id);
+    if (!current || held(current) || current.paused || !current.pending_check) return;
+    const result = await runCheck({ ...current, check: current.pending_check }, watcherDir(watcher.id),
+      { WATCH_RUN: `pending-${at.toString(36)}`, ...(mainChecked ? { WATCH_MAIN_CHECKED: "1" } : {}) },
+      checkTimeout(current, sampleLoad()));
+    log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
+  });
+}
+
 /** Returns true once the event is delivered (or had been already). */
 async function deliverPending(watcher: Watcher, state: State): Promise<boolean> {
   // A held event keeps its key and is retried each minute, so it goes out once the quiet hours end.
@@ -178,6 +190,7 @@ export async function tickOne(id: string): Promise<void> {
     if (!(await deliverPending(watcher, state)) && !held(watcher)) {
       state.next_at = now() + Math.min(watcher.interval_s, 60) * 1_000;
       saveState(id, state);
+      await runPendingCheck(watcher, t);
     }
     return;
   }
@@ -295,13 +308,14 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.last_error;
   delete fresh.failing_since;
   const event = result.stdout.trim();
-  if (!event) { saveState(id, fresh); ackRun(); return; }
+  if (!event) { saveState(id, fresh); ackRun(); await runPendingCheck(watcher, t, true); return; }
   fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso() };
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
   if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
   await deliverPending(watcher, fresh);
+  await runPendingCheck(watcher, t, true);
 }
 
 let previousMaintenance: Maintenance | undefined;
