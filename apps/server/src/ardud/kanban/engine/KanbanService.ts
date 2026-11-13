@@ -1883,6 +1883,7 @@ const make = Effect.gen(function* () {
   // Notifications must neither reacquire the caller's permit nor die with its MCP request.
   const forkPostCommit = <E, R>(effect: Effect.Effect<unknown, E, R>) =>
     locks.independent(locks.run(effect)).pipe(
+      Effect.provideService(BoardLocks.operationName, "postCommit"),
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban saved write post-commit work failed", { cause }),
       ),
@@ -10162,8 +10163,14 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const guardReady = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
+  const guardReady = <A, E, R>(
+    name: string,
+    effect: Effect.Effect<A, E, R>,
+    cardId?: string,
+    boardId?: string,
+  ) =>
     locks.run(boardId === undefined ? effect : locks.access(boardId, effect), cardId).pipe(
+      Effect.provideService(BoardLocks.operationName, name),
       Effect.catchDefect((defect) =>
         defect instanceof BoardLocks.BoardStateChanged
           ? Effect.fail(
@@ -10181,8 +10188,12 @@ const make = Effect.gen(function* () {
       ),
       Effect.mapError(toKanbanError),
     );
-  const guard = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
-    Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect, cardId, boardId)));
+  const guard = <A, E, R>(
+    name: string,
+    effect: Effect.Effect<A, E, R>,
+    cardId?: string,
+    boardId?: string,
+  ) => Deferred.await(startupReady).pipe(Effect.andThen(guardReady(name, effect, cardId, boardId)));
   /**
    * A write that replies once its state is committed: thread follow-ons it
    * makes through `later` are saved as route rows as its last step, still
@@ -10192,6 +10203,7 @@ const make = Effect.gen(function* () {
    * inline path would already have run it. `inline` route mode runs them inline.
    */
   const guardDeferred = <A, E, R>(
+    name: string,
     effect: Effect.Effect<A, E, R>,
     cardId?: string,
     boardId?: string,
@@ -10218,7 +10230,7 @@ const make = Effect.gen(function* () {
             ),
             Effect.provideService(effectSink, sink),
           );
-          return guard(attempt, cardId, boardId).pipe(
+          return guard(name, attempt, cardId, boardId).pipe(
             Effect.onExit((exit) =>
               Effect.suspend(() => {
                 sink.closed = true;
@@ -10241,11 +10253,12 @@ const make = Effect.gen(function* () {
             Effect.mapError(toKanbanError),
           );
         })
-      : guard(effect, cardId, boardId);
+      : guard(name, effect, cardId, boardId);
   const agentCall: KanbanServiceShape["agentCall"] = Effect.fn("KanbanService.agentCall")(
     function* <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) {
       return yield* Effect.acquireUseRelease(
         guard(
+          "agentCall",
           Effect.gen(function* () {
             yield* store.threadLink(threadId);
             // Track the whole request: it can expose a claim through a read or a no-op mutation.
@@ -10266,13 +10279,14 @@ const make = Effect.gen(function* () {
     },
   );
   const savedCardGuard = <E, R>(
+    name: string,
     effect: Effect.Effect<KanbanCard, E, R>,
     cardId?: string,
     isSaved: (card: KanbanCard) => boolean = () => true,
   ) =>
     Effect.suspend(() => {
       let target = cardId;
-      return SavedWrite.recover(guardDeferred(effect, cardId), (saved) => {
+      return SavedWrite.recover(guardDeferred(name, effect, cardId), (saved) => {
         if (saved.kind !== "card") return undefined;
         target ??= saved.card.id;
         return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
@@ -10318,6 +10332,7 @@ const make = Effect.gen(function* () {
 
   const createBoard: KanbanServiceShape["createBoard"] = (input) =>
     guard(
+      "board.create",
       Effect.gen(function* () {
         yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
@@ -10380,6 +10395,7 @@ const make = Effect.gen(function* () {
 
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
+      "board.ensure",
       Effect.gen(function* () {
         yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
@@ -10484,10 +10500,11 @@ const make = Effect.gen(function* () {
   });
 
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
-    guard(updateBoardUnlocked(boardId, patch));
+    guard("board.update", updateBoardUnlocked(boardId, patch));
 
   const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
+      "board.open",
       Effect.gen(function* () {
         const slug = input.slug.trim().toLowerCase();
         const board =
@@ -10662,7 +10679,7 @@ const make = Effect.gen(function* () {
   });
 
   const createCard: KanbanServiceShape["createCard"] = (boardId, input, actor) =>
-    guardDeferred(createCardUnlocked(boardId, input, actor));
+    guardDeferred("card.create", createCardUnlocked(boardId, input, actor));
 
   /**
    * Where a work thread stands: its board, pool, project, the cards it carries
@@ -10880,6 +10897,7 @@ const make = Effect.gen(function* () {
 
   const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
     guard(
+      "card.claim",
       Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
@@ -10892,6 +10910,7 @@ const make = Effect.gen(function* () {
   // behind for the dispatcher to start twice.
   const createForThread: KanbanServiceShape["createForThread"] = (threadId, input) =>
     guard(
+      "card.createForThread",
       Effect.gen(function* () {
         yield* checkText(cardTextFields(input));
         const thread = yield* workThreadOf(threadId);
@@ -11004,6 +11023,7 @@ const make = Effect.gen(function* () {
     let releaseModel: Effect.Effect<void> = Effect.void;
     let confirmingModel = false;
     const editing = savedCardGuard(
+      "card.update",
       Effect.gen(function* () {
         yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
@@ -11209,6 +11229,7 @@ const make = Effect.gen(function* () {
 
   const moveCard: KanbanServiceShape["moveCard"] = (cardId, to, role, actor, options) =>
     savedCardGuard(
+      "card.move",
       Effect.gen(function* () {
         yield* checkText([
           ["note", options?.note],
@@ -11320,6 +11341,7 @@ const make = Effect.gen(function* () {
         return to === "needs_owner" && ask !== undefined && ask.seq === null
           ? SavedWrite.bestEffort(
               guardDeferred(
+                "card.move.postAsk",
                 Effect.gen(function* () {
                   const current = yield* cardOf(moved.id);
                   const pending = current.asks.find((entry) => entry.id === ask.id);
@@ -11350,6 +11372,7 @@ const make = Effect.gen(function* () {
       );
     }
     yield* guard(
+      "card.restoreCutover",
       Effect.gen(function* () {
         // Take the card's board permit before acquiring its SQLite writer.
         yield* cardOf(input.cardId);
@@ -11443,6 +11466,7 @@ const make = Effect.gen(function* () {
 
   const askOwner: KanbanServiceShape["askOwner"] = (cardId, input, actor, role) =>
     guardDeferred(
+      "card.ask",
       Effect.gen(function* () {
         yield* checkText([
           ["question", input.question],
@@ -11511,6 +11535,7 @@ const make = Effect.gen(function* () {
 
   const changeAsk: KanbanServiceShape["changeAsk"] = (cardId, askId, action, actor, role) =>
     savedCardGuard(
+      "ask.change",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
@@ -11576,6 +11601,7 @@ const make = Effect.gen(function* () {
 
   const editAsk: KanbanServiceShape["editAsk"] = (cardId, askId, edit, actor, role) =>
     guard(
+      "ask.edit",
       Effect.gen(function* () {
         yield* checkText([
           ["question", edit.question],
@@ -11664,7 +11690,7 @@ const make = Effect.gen(function* () {
   });
 
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
-    guardDeferred(answerAskUnlocked(cardId, askId, input, actor, secrets));
+    guardDeferred("ask.answer", answerAskUnlocked(cardId, askId, input, actor, secrets));
   /** The one place an ask is answered: by the answer route, a tool, or a pick on its message. */
   const answerAskUnlocked = (
     ...[cardId, askId, input, actor, secrets]: Parameters<KanbanServiceShape["answerAsk"]>
@@ -11815,7 +11841,7 @@ const make = Effect.gen(function* () {
     blocks,
     role,
     revision,
-  ) => guardDeferred(replyOnAskUnlocked(cardId, askId, actor, blocks, role, revision));
+  ) => guardDeferred("ask.reply", replyOnAskUnlocked(cardId, askId, actor, blocks, role, revision));
   /** A reply on an ask: from its route or tool, or his words typed on its pick block. */
   const replyOnAskUnlocked = (
     ...[cardId, askId, actor, blocks, role, revision]: Parameters<KanbanServiceShape["replyOnAsk"]>
@@ -11863,6 +11889,7 @@ const make = Effect.gen(function* () {
 
   const handAsk: KanbanServiceShape["handAsk"] = (cardId, askId, action, actor, always) =>
     guardDeferred(
+      "ask.hand",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = yield* openAskOf(card, askId);
@@ -11918,6 +11945,7 @@ const make = Effect.gen(function* () {
 
   const snoozeAsk: KanbanServiceShape["snoozeAsk"] = (cardId, askId, until, actor) =>
     guard(
+      "ask.snooze",
       Effect.gen(function* () {
         if (actor._tag !== "owner") {
           return yield* failWith("denied", "only the owner snoozes an ask");
@@ -11936,6 +11964,7 @@ const make = Effect.gen(function* () {
 
   const noteHandEvaluator: KanbanServiceShape["noteHandEvaluator"] = (cardId, askId, threadId) =>
     guard(
+      "ask.noteHandEvaluator",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const next = Asks.markHandEvaluator(card, askId, threadId);
@@ -11971,6 +12000,7 @@ const make = Effect.gen(function* () {
 
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
     savedCardGuard(
+      "card.flag",
       Effect.gen(function* () {
         yield* checkText([["reason", reason]]);
         const card = yield* cardOf(cardId);
@@ -12027,6 +12057,7 @@ const make = Effect.gen(function* () {
 
   const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
     guard(
+      "card.wait",
       Effect.gen(function* () {
         yield* checkText([["note", input?.note]]);
         const card = yield* cardOf(cardId);
@@ -12190,6 +12221,7 @@ const make = Effect.gen(function* () {
   ) =>
     // Deferred: the notes to evaluators are saved with the write and sent by their lanes' drains.
     guardDeferred(
+      "card.answerWaits",
       Effect.gen(function* () {
         if (!wired) {
           return yield* failWith(
@@ -12320,6 +12352,7 @@ const make = Effect.gen(function* () {
 
   const settleCard: KanbanServiceShape["settleCard"] = (cardId) =>
     guard(
+      "card.settle",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         if (card.stage !== "verified")
@@ -12351,6 +12384,7 @@ const make = Effect.gen(function* () {
     role,
   ) =>
     savedCardGuard(
+      "subtask.done",
       Effect.gen(function* () {
         yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
@@ -12437,6 +12471,7 @@ const make = Effect.gen(function* () {
 
   const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
     guard(
+      "subtask.handBack",
       Effect.gen(function* () {
         yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
@@ -12523,6 +12558,7 @@ const make = Effect.gen(function* () {
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     SavedWrite.recover(
       guardDeferred(
+        "card.reviewResult",
         Effect.gen(function* () {
           yield* checkText(findings.map((finding) => ["finding", finding] as const));
           const link = yield* store.threadLink(threadId);
@@ -12667,6 +12703,7 @@ const make = Effect.gen(function* () {
 
   const cardThread: KanbanServiceShape["cardThread"] = (cardId, action, text, actor) =>
     savedCardGuard(
+      "card.thread",
       Effect.gen(function* () {
         yield* checkText([["note", text]]);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
@@ -13069,6 +13106,7 @@ const make = Effect.gen(function* () {
 
   const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots, options) =>
     guard(
+      "pool.set",
       Effect.gen(function* () {
         model = yield* canonicalModel(model);
         const board = yield* boardOf(boardId);
@@ -13119,6 +13157,7 @@ const make = Effect.gen(function* () {
 
   const removePool: KanbanServiceShape["removePool"] = (boardId, model, options) =>
     guard(
+      "pool.remove",
       Effect.gen(function* () {
         model = yield* canonicalModel(model);
         const board = yield* boardOf(boardId);
@@ -13173,6 +13212,7 @@ const make = Effect.gen(function* () {
 
   const setGoal: KanbanServiceShape["setGoal"] = (boardId, input) =>
     guard(
+      "goal.set",
       Effect.gen(function* () {
         yield* checkText([
           ["name", input.name],
@@ -13211,6 +13251,7 @@ const make = Effect.gen(function* () {
 
   const setGroups: KanbanServiceShape["setGroups"] = (boardId, groups) =>
     guard(
+      "groups.set",
       Effect.gen(function* () {
         yield* checkText(
           groups.flatMap((group) => [
@@ -13232,6 +13273,7 @@ const make = Effect.gen(function* () {
     blocks,
   ) =>
     guard(
+      "discussion.create",
       Effect.gen(function* () {
         yield* checkText([["title", title]]);
         yield* boardOf(boardId);
@@ -13262,6 +13304,7 @@ const make = Effect.gen(function* () {
 
   const updateDiscussion: KanbanServiceShape["updateDiscussion"] = (discussionId, patch, actor) =>
     guard(
+      "discussion.update",
       Effect.gen(function* () {
         yield* checkText([["title", patch.title]]);
         if (actor._tag !== "owner") {
@@ -13385,6 +13428,7 @@ const make = Effect.gen(function* () {
             // Typed replies share the classifier used by the reply route.
             if (choice.length === 0 && words !== "") {
               return guardDeferred(
+                "discussion.answer",
                 replyOnAskUnlocked(
                   pick.card.id,
                   pick.ask.id,
@@ -13397,6 +13441,7 @@ const make = Effect.gen(function* () {
             }
             // Anything else is answered as the ask's own answer route would, checks included.
             return guardDeferred(
+              "discussion.answer",
               answerAskUnlocked(
                 pick.card.id,
                 pick.ask.id,
@@ -13425,6 +13470,7 @@ const make = Effect.gen(function* () {
     text,
   ) =>
     guard(
+      "discussion.answer",
       Effect.gen(function* () {
         yield* checkText([["answer", text]]);
         const discussion = yield* discussionOf(discussionId);
@@ -13538,6 +13584,7 @@ const make = Effect.gen(function* () {
       const seen = yield* readDb(discussionOf(discussionId));
       if (readMark(seen, actor, seq) === null) return;
       yield* guard(
+        "discussion.markRead",
         Effect.gen(function* () {
           const next = readMark(yield* discussionOf(discussionId), actor, seq);
           if (next !== null) yield* saveDiscussion(next);
@@ -13558,6 +13605,7 @@ const make = Effect.gen(function* () {
 
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
     guard(
+      "wiki.write",
       Effect.gen(function* () {
         yield* checkText([
           ["title", page.title],
@@ -13748,6 +13796,10 @@ const make = Effect.gen(function* () {
 
   const runJob = (job: Job) =>
     read(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId)).pipe(
+      Effect.provideService(
+        BoardLocks.operationName,
+        job._tag === "kick" ? "dispatchNow" : "turnEnded",
+      ),
       NodeSqliteClient.backgroundReads,
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban job failed", { job: job._tag, cause }),
@@ -13757,6 +13809,7 @@ const make = Effect.gen(function* () {
   const startEvaluator: KanbanServiceShape["startEvaluator"] = (boardId, purpose, text) =>
     SavedWrite.recover(
       guard(
+        "evaluator.start",
         Effect.gen(function* () {
           yield* checkText([
             ["text", text],
@@ -13825,6 +13878,7 @@ const make = Effect.gen(function* () {
       | undefined;
     const result = yield* SavedWrite.recover(
       guard(
+        "bug.report",
         Effect.gen(function* () {
           const open = (yield* store.cards(board.id)).filter(
             (card) => card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage),
@@ -13891,6 +13945,7 @@ const make = Effect.gen(function* () {
     // stamped text must not associate a novel report with the caller's own card.
     return yield* SavedWrite.recover(
       guard(
+        "bug.report.evaluate",
         serial(
           evaluating,
           board.id,
@@ -13913,13 +13968,20 @@ const make = Effect.gen(function* () {
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
     withSelectionMigrationLock: (effect) =>
-      Deferred.await(startupReady).pipe(Effect.andThen(locks.exclusive(effect))),
+      Deferred.await(startupReady).pipe(
+        Effect.andThen(
+          locks
+            .exclusive(effect)
+            .pipe(Effect.provideService(BoardLocks.operationName, "selectionMigration")),
+        ),
+      ),
     ensureBoard,
     openBoard,
     createBoard,
     updateBoard,
     setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {
       return yield* guard(
+        "board.setNightlyReview",
         Effect.gen(function* () {
           const board = yield* boardOf(boardId);
           const settings = yield* Schema.decodeUnknownEffect(KanbanNightlyReviewSettings)({
@@ -13944,6 +14006,7 @@ const make = Effect.gen(function* () {
       for (const candidate of yield* readDb(store.boards)) {
         if (candidate.archivedAt !== null || !candidate.nightlyReview?.enabled) continue;
         yield* guard(
+          "nightlyReview",
           serial(
             evaluating,
             candidate.id,
@@ -14067,7 +14130,7 @@ const make = Effect.gen(function* () {
           return card.discussionId === null ? null : yield* store.discussion(card.discussionId);
         }),
       );
-      return existing ?? (yield* guard(cardDiscussionUnlocked(cardId)));
+      return existing ?? (yield* guard("card.discussion", cardDiscussionUnlocked(cardId)));
     }),
     messages: (id, options = {}) =>
       readDb(
@@ -14097,6 +14160,7 @@ const make = Effect.gen(function* () {
     post: (discussionId, author, blocks) =>
       SavedWrite.recover(
         guardDeferred(
+          "discussion.post",
           postUnlocked(
             discussionId,
             author,
@@ -14111,6 +14175,7 @@ const make = Effect.gen(function* () {
     postToCard: (cardId, author, blocks) =>
       SavedWrite.recover(
         guardDeferred(
+          "card.post",
           Effect.gen(function* () {
             const discussion = yield* cardDiscussionUnlocked(cardId);
             return yield* postUnlocked(
@@ -14131,11 +14196,12 @@ const make = Effect.gen(function* () {
     markReadSoon,
     wiki: (boardId) => readDb(store.wiki(boardId)),
     writeWiki,
-    endSetup: (boardId, actor) => guard(endSetupUnlocked(boardId, actor)),
+    endSetup: (boardId, actor) => guard("board.endSetup", endSetupUnlocked(boardId, actor)),
     pauseBoard: (boardId, pause, actor, callerAncestors = []) =>
-      guard(pauseBoardUnlocked(boardId, pause, actor, callerAncestors)),
+      guard("board.pause", pauseBoardUnlocked(boardId, pause, actor, callerAncestors)),
     startSetup: (boardId, input) =>
       guard(
+        "board.startSetup",
         Effect.gen(function* () {
           yield* checkText([["text", input.text]]);
           const board = yield* boardOf(boardId);
@@ -14164,6 +14230,7 @@ const make = Effect.gen(function* () {
     submitEvaluator: (boardId, purpose, options = {}) => {
       const key = uuid();
       return guard(
+        "evaluator.submit",
         serial(
           evaluating,
           boardId,
@@ -14287,10 +14354,18 @@ const make = Effect.gen(function* () {
     claimCard,
     createForThread,
     nextCards,
-    dispatchNow: read(dispatchUnlocked()).pipe(NodeSqliteClient.backgroundReads),
-    turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
-    tick: read(tickUnlocked()).pipe(NodeSqliteClient.backgroundReads),
-    probeOutages: read(probeOutagesNow()),
+    dispatchNow: read(dispatchUnlocked()).pipe(
+      NodeSqliteClient.backgroundReads,
+      Effect.provideService(BoardLocks.operationName, "dispatchNow"),
+    ),
+    turnEnded: (threadId) => guard("turnEnded", turnEndedUnlocked(threadId)),
+    tick: read(tickUnlocked()).pipe(
+      NodeSqliteClient.backgroundReads,
+      Effect.provideService(BoardLocks.operationName, "tick"),
+    ),
+    probeOutages: read(probeOutagesNow()).pipe(
+      Effect.provideService(BoardLocks.operationName, "probeOutages"),
+    ),
     threadEvent: (threadId) => Effect.sync(() => touch(threadId)),
     notifyTurnEnded: (threadId) =>
       Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),

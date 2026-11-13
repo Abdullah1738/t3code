@@ -1665,7 +1665,7 @@ it.effect(
           assert.isTrue(result.isError, result.text);
           assert.include(
             result.text,
-            "Board busy: not written (held 2m0s by KanbanBoardLocks.run). Safe to retry once.",
+            "Board busy: not written (held 2m0s by selectionMigration). Safe to retry once.",
           );
         }
         assert.isUndefined(holder.pollUnsafe());

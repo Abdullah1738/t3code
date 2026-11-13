@@ -1,4 +1,6 @@
 import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
+import * as Metric from "effect/Metric";
 import * as References from "effect/References";
 import * as Option from "effect/Option";
 import * as Context from "effect/Context";
@@ -8,9 +10,15 @@ import * as Semaphore from "effect/Semaphore";
 import { KanbanError } from "@t3tools/contracts";
 
 import * as SavedWrite from "./savedWrite.ts";
+import * as Metrics from "../../../observability/Metrics.ts";
 
 // A board-wide writer excludes card writers; independent card writers share the gate.
 const BOARD_PERMITS = 1_000_000;
+const LONG_HOLD_MS = 5_000;
+
+export const operationName = Context.Reference<string | undefined>("KanbanBoardOperationName", {
+  defaultValue: () => undefined,
+});
 
 interface Holder {
   readonly label: string;
@@ -23,6 +31,7 @@ interface Holder {
 }
 
 interface BoardLock {
+  waiters: number;
   readonly holders: Map<symbol, Holder>;
   lastWarningAtMs: number;
   readonly gate: Semaphore.Semaphore;
@@ -111,6 +120,7 @@ export const REPLAY_MAX_MS = 30_000;
 export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const boards = new Map<string, BoardLock>();
   const migrationHolders = new Map<symbol, Holder>();
+  let migrationWaiters = 0;
   const dispatches = new Set<Operation>();
   let migrationGeneration = 0;
   // Only selection migration takes every permit; ordinary boards never exclude each other here.
@@ -119,6 +129,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     let board = boards.get(id);
     if (!board) {
       board = {
+        waiters: 0,
         holders: new Map(),
         lastWarningAtMs: -Infinity,
         gate: Semaphore.makeUnsafe(BOARD_PERMITS),
@@ -182,6 +193,25 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       cardId: holder.cardId ?? null,
       heldForMs: Math.max(0, now - holder.acquiredAtMs),
     }));
+  const recordHold = Effect.fnUntraced(function* (holder: Holder, waiters: number) {
+    const heldMs = Math.max(0, (yield* Clock.currentTimeMillis) - holder.acquiredAtMs);
+    yield* Metric.update(
+      Metric.withAttributes(
+        Metrics.kanbanBoardLockHoldDuration,
+        Metrics.metricAttributes({ name: holder.label }),
+      ),
+      Duration.millis(heldMs),
+    );
+    if (heldMs < LONG_HOLD_MS) return;
+    yield* Metrics.increment(Metrics.kanbanBoardLockLongHoldTotal, { name: holder.label });
+    yield* Effect.logWarning("kanban board lock long hold", {
+      name: holder.label,
+      boardId: holder.boardId,
+      cardId: holder.cardId ?? null,
+      heldMs,
+      waiters,
+    });
+  }, Effect.ignoreCause());
   const warning = Effect.fnUntraced(function* (
     op: Operation,
     target: WaitingOn,
@@ -207,6 +237,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       "board.waiter_fiber_id": op.fiberId,
       "board.waiting_on": target.lock,
       "board.waited_ms": Math.max(0, now - started),
+      "board.waiters": target.lock === "migration" ? migrationWaiters : board.waiters,
       "board.holders": holdersAt(now).filter(
         (holder) =>
           target.lock === "migration" ||
@@ -225,6 +256,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         ...fields,
       }),
     ).pipe(Effect.annotateLogs(fields), Effect.provideService(References.MinimumLogLevel, "Warn"));
+    if (refused)
+      yield* Metrics.increment(Metrics.kanbanBoardBusyRefusedTotal, { refused: op.label });
     return blockers;
   });
   const wait = <A>(op: Operation, target: WaitingOn, started: number, effect: Effect.Effect<A>) =>
@@ -272,35 +305,53 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     target: WaitingOn,
   ) =>
     Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const started = yield* Clock.currentTimeMillis;
-        while (!(yield* semaphore.takeIfAvailable(permits))) {
-          // withPermits owns cancellation cleanup while waiting. The actual transfer
-          // happens masked, so an interrupt cannot land between take and ownership.
-          yield* restore(
-            Effect.interruptible(
-              wait(op, target, started, semaphore.withPermits(permits)(Effect.void)),
-            ),
-          );
-        }
-        const acquiredAtMs = yield* Clock.currentTimeMillis;
-        const token = Symbol();
+      Effect.suspend(() => {
         const board = boardOf(target.boardId);
-        const holder: Holder = {
-          ...target,
-          cardId: op.diagnosticCardId,
-          label: op.label,
-          fiberId: op.fiberId,
-          acquiredAtMs,
-          mode: permits === BOARD_PERMITS || target.lock === "card" ? "exclusive" : "shared",
-        };
-        board.holders.set(token, holder);
-        if (target.lock === "migration") migrationHolders.set(token, holder);
-        yield* Effect.annotateCurrentSpan("board.admission_wait_ms", acquiredAtMs - started);
-        return Effect.sync(() => {
-          board.holders.delete(token);
-          migrationHolders.delete(token);
-        }).pipe(Effect.andThen(semaphore.release(permits)), Effect.asVoid);
+        board.waiters += 1;
+        if (target.lock === "migration") migrationWaiters += 1;
+        return Effect.gen(function* () {
+          const started = yield* Clock.currentTimeMillis;
+          while (!(yield* semaphore.takeIfAvailable(permits))) {
+            // withPermits owns cancellation cleanup while waiting. The actual transfer
+            // happens masked, so an interrupt cannot land between take and ownership.
+            yield* restore(
+              Effect.interruptible(
+                wait(op, target, started, semaphore.withPermits(permits)(Effect.void)),
+              ),
+            );
+          }
+          const acquiredAtMs = yield* Clock.currentTimeMillis;
+          const token = Symbol();
+          const holder: Holder = {
+            ...target,
+            cardId: op.diagnosticCardId,
+            label: op.label,
+            fiberId: op.fiberId,
+            acquiredAtMs,
+            mode: permits === BOARD_PERMITS || target.lock === "card" ? "exclusive" : "shared",
+          };
+          board.holders.set(token, holder);
+          if (target.lock === "migration") migrationHolders.set(token, holder);
+          yield* Effect.annotateCurrentSpan("board.admission_wait_ms", acquiredAtMs - started);
+          const release = Effect.sync(() => {
+            board.holders.delete(token);
+            migrationHolders.delete(token);
+          }).pipe(Effect.andThen(semaphore.release(permits)), Effect.asVoid);
+          // Record once for the most specific permit, before releasing it. The
+          // existing release path owns all holder cleanup and permit ordering.
+          const primary =
+            target.lock === "card" || (target.lock === "gate" && op.cardId === undefined);
+          return primary
+            ? Effect.suspend(() => recordHold(holder, board.waiters)).pipe(Effect.andThen(release))
+            : release;
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              board.waiters -= 1;
+              if (target.lock === "migration") migrationWaiters -= 1;
+            }),
+          ),
+        );
       }),
     );
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
@@ -374,7 +425,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const policy = retry ?? (yield* retryPolicy);
         const replay = replayOf ?? new Map<string, Array<ReplayEntry>>();
         const op: Operation = {
-          label: operationLabel ?? (yield* label),
+          label: operationLabel ?? (yield* operationName) ?? (yield* label),
           fiberId: yield* Effect.fiberId,
           cardId,
           diagnosticCardId: cardId,
@@ -734,7 +785,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           // Migration owns all boards, including boards first seen while it is running.
           const token = Symbol();
           const holder: Holder = {
-            label: yield* label,
+            label: (yield* operationName) ?? (yield* label),
             boardId: "*",
             cardId: undefined,
             fiberId: yield* Effect.fiberId,
@@ -750,16 +801,25 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
                 return yield* effect;
               }).pipe(
                 Effect.ensuring(
-                  Effect.sync(() => {
-                    migrationHolders.delete(token);
-                    migrationGeneration += 1;
-                    for (const board of boards.values()) {
-                      board.generation += 1;
-                      board.boardGeneration += 1;
-                      for (const [key, value] of board.resources)
-                        board.resources.set(key, value + 1);
-                    }
-                  }),
+                  Effect.suspend(() => {
+                    const holder = migrationHolders.get(token);
+                    return holder === undefined
+                      ? Effect.void
+                      : recordHold(holder, migrationWaiters);
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.sync(() => {
+                        migrationHolders.delete(token);
+                        migrationGeneration += 1;
+                        for (const board of boards.values()) {
+                          board.generation += 1;
+                          board.boardGeneration += 1;
+                          for (const [key, value] of board.resources)
+                            board.resources.set(key, value + 1);
+                        }
+                      }),
+                    ),
+                  ),
                 ),
               ),
             ),
