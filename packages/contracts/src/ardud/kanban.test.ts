@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
   kanbanAwaitsMerge,
@@ -618,6 +619,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "rocket" }))).toBe("rocket");
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
+    expect(decodeBoard(stored).nightlyReview).toBeNull();
   });
 
   it("takes only small inline pictures as a board image", () => {
@@ -1171,3 +1173,32 @@ it.each([false, true])(
     ).toBe(!reviewFindingsPending);
   },
 );
+
+describe("nightly review configuration", () => {
+  const decode = Schema.decodeUnknownSync(KanbanNightlyReview);
+  it("defaults to midnight Dubai and Sonnet medium without run state", () => {
+    const settings = decode({ enabled: true });
+    expect(settings.timeOfDay).toBe("00:00");
+    expect(settings.timeZone).toBe("Asia/Dubai");
+    expect(settings.model).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-5-5",
+      options: [{ id: "effort", value: "medium" }],
+    });
+    expect(settings.lastRunAt).toBeNull();
+    expect(settings.lastRunDay).toBeNull();
+    expect(settings.lastDiscussionId).toBeNull();
+  });
+  it.each(["00:00", "09:05", "23:59"])("accepts time %s", (timeOfDay) => {
+    expect(decode({ enabled: true, timeOfDay }).timeOfDay).toBe(timeOfDay);
+  });
+  it.each(["24:00", "12:60", "0:00", "00:0", " 00:00", "00:00:00"])(
+    "rejects time %s",
+    (timeOfDay) => {
+      expect(() => decode({ enabled: true, timeOfDay })).toThrow();
+    },
+  );
+  it("rejects a zone that cannot be scheduled", () => {
+    expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
+  });
+});

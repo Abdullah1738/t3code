@@ -18,6 +18,7 @@ import {
   TrimmedNonEmptyString,
 } from "../baseSchemas.ts";
 import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
+import { ProviderInstanceId } from "../providerInstance.ts";
 import { ModelSelection } from "../modelSelection.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
@@ -1901,6 +1902,46 @@ export const KanbanBoardPause = Schema.Struct({
 });
 export type KanbanBoardPause = typeof KanbanBoardPause.Type;
 
+export const KanbanNightlyReviewTime = Schema.String.check(
+  Schema.isPattern(/^([01]\d|2[0-3]):[0-5]\d$/),
+);
+export const KanbanNightlyReviewTimeZone = Schema.String.check(
+  Schema.makeFilter((value) => {
+    try {
+      new Intl.DateTimeFormat("en", { timeZone: value });
+      return true;
+    } catch {
+      return false;
+    }
+  }),
+);
+export const KanbanNightlyReviewSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  timeOfDay: KanbanNightlyReviewTime.pipe(Schema.withDecodingDefault(Effect.succeed("00:00"))),
+  timeZone: KanbanNightlyReviewTimeZone.pipe(
+    Schema.withDecodingDefault(Effect.succeed("Asia/Dubai")),
+  ),
+  model: ModelSelection.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-sonnet-5-5",
+        options: [{ id: "effort", value: "medium" }],
+      }),
+    ),
+  ),
+});
+export type KanbanNightlyReviewSettings = typeof KanbanNightlyReviewSettings.Type;
+export const KanbanNightlyReview = Schema.Struct({
+  ...KanbanNightlyReviewSettings.fields,
+  lastRunAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  lastRunDay: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  lastDiscussionId: Schema.NullOr(KanbanDiscussionId).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+});
+export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -1919,6 +1960,9 @@ export const KanbanBoard = Schema.Struct({
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  nightlyReview: Schema.NullOr(KanbanNightlyReview).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });

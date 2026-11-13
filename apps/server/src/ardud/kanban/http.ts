@@ -10,6 +10,7 @@ import {
   AuthOrchestrationReadScope,
   KanbanBlockInput,
   type KanbanBoard,
+  KanbanNightlyReviewSettings,
   KanbanBoardIcon,
   KanbanBoardIconImage,
   type KanbanCard,
@@ -202,6 +203,7 @@ const AskSnoozeBatchBody = Schema.Struct({
 const ASK_BATCH_MAX = 50;
 
 const BoardBody = Schema.Struct({
+  nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),
   name: Text,
   icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   iconImage: Schema.optional(Schema.NullOr(KanbanBoardIconImage)),
@@ -237,7 +239,15 @@ const RunBody = Schema.Struct({ trigger: Schema.optional(Schema.Literals(["manua
 
 const EvaluatorBody = Schema.Struct({
   forceNew: Schema.optional(Schema.Boolean),
-  kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
+  kind: Schema.Literals([
+    "setup",
+    "request",
+    "stalled",
+    "completed",
+    "deployed",
+    "check",
+    "nightly",
+  ]),
   text: Text,
 });
 
@@ -455,6 +465,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           : undefined;
         return yield* service.updateBoard(board.id, {
           ...(input.name ? { name: input.name } : {}),
+          ...(input.nightlyReview !== undefined ? { nightlyReview: input.nightlyReview } : {}),
           ...(input.icon !== undefined ? { icon: input.icon } : {}),
           ...(input.iconImage !== undefined ? { iconImage: input.iconImage } : {}),
           ...(input.projectId !== undefined

@@ -27498,3 +27498,91 @@ it.effect("review878r3: unpause does not undo a completed sibling review", () =>
     }).pipe(Effect.provide(testLayer(delayed)));
   }),
 );
+
+it.effect(
+  "nightly review catches up once per local day, preserves its marker across toggles and refuses overlap",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* TestClock.setTime(Date.parse("2026-11-12T19:59:00Z"));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const off = yield* kanban.ensureBoard({
+          slug: "off",
+          name: "Off",
+          defaultProjectId: board.defaultProjectId,
+        });
+        const channel = yield* kanban.createDiscussion(board.id, "Day's owner chat", {
+          _tag: "system",
+          component: "fixture",
+        });
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        yield* kanban.nightlyTick;
+        // It catches up the current day even when the server missed midnight.
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        const first = [...(yield* Ref.get(fake.threads)).entries()][0]!;
+        assert.include(first[1].messages[0]!, channel.id);
+        assert.strictEqual(first[1].model.instanceId, "claudeAgent");
+        assert.strictEqual(first[1].model.model, "claude-sonnet-5-5");
+        assert.deepStrictEqual(first[1].model.options, [{ id: "effort", value: "medium" }]);
+        yield* setRunning(fake, ThreadId.make(first[0]), true);
+        const refused = yield* kanban
+          .startEvaluator(board.id, { kind: "nightly" })
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "conflict");
+        yield* kanban.nightlyTick;
+        yield* kanban.setNightlyReview(board.id, { enabled: false });
+        yield* kanban.setNightlyReview(board.id, { enabled: true });
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        yield* setRunning(fake, ThreadId.make(first[0]), false);
+        yield* TestClock.setTime(Date.parse("2026-11-12T20:00:00Z"));
+        yield* kanban.nightlyTick;
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+        const saved = (yield* kanban.snapshot(board.id)).board.nightlyReview!;
+        assert.strictEqual(saved.lastRunDay, "2026-11-13");
+        assert.strictEqual(saved.lastRunAt, "2026-11-12T20:00:00.000Z");
+        assert.isNotNull(saved.lastDiscussionId);
+        assert.isNull((yield* kanban.snapshot(off.id)).board.nightlyReview);
+        yield* kanban.setNightlyReview(board.id, { enabled: false });
+        yield* TestClock.setTime(Date.parse("2026-11-13T20:00:00Z"));
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("nightly review waits for the configured time and survives a service restart", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-nightly-" });
+    const db = path.join(dir, "test.sqlite");
+    yield* TestClock.setTime(Date.parse("2026-11-12T20:29:00Z"));
+    const boardId = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setNightlyReview(board.id, { enabled: true, timeOfDay: "00:30" });
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+        yield* TestClock.adjust("1 minute");
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        return board.id;
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        yield* kanban.nightlyTick;
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+        assert.strictEqual(
+          (yield* kanban.snapshot(boardId)).board.nightlyReview?.lastRunDay,
+          "2026-11-13",
+        );
+      }).pipe(Effect.provide(fileTestLayer(fake.layer, db))),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

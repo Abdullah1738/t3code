@@ -1134,6 +1134,21 @@ const handlers = {
     ),
   ),
 
+  board_nightly_review: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        return {
+          board: yield* service.setNightlyReview(board.id, {
+            enabled: input.enabled,
+            timeOfDay: input.timeOfDay,
+            timeZone: input.timeZone,
+          }),
+        };
+      }),
+    ),
+  ),
+
   board_pause: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
