@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import sqlite3
@@ -16,6 +17,7 @@ import threading
 import traceback
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
@@ -50,6 +52,9 @@ def _log_source_change(run_id):
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
 BACKGROUND_RUN_ENV = 'OFFBOX_BACKGROUND_RUN'
+_background_context = None
+BG_ENTRY = Path(__file__).resolve().parents[1] / 'offbox.py'
+BG_READY_TIMEOUT_S = 20
 RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
 RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -2546,70 +2551,101 @@ def run_remote(a, me: dict) -> int:
 
 
 def _background(a, me: dict) -> int:
-    # Fork before pool/lease work starts any threads. Keep backend selection, identity and env in memory rather
-    # than persisting a second copy of the command or credentials for a re-exec.
     if not a.no_sync and getattr(a, "include", None):
         ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
     rn = Runner(a, me)
     rn.register_pending()
     client_log = rn.log_path.with_suffix('.client.log')
-    ready_r, ready_w = os.pipe()
-    sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
-    sys.stdout.flush()
-    sys.stderr.flush()
+    ready_r = ready_w = accept_r = accept_w = None
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
+    child = None
     try:
-        # Unknown is alive to wait/reap: a caller dying between fork and PID publication must not report safe rerun.
-        rn.record(client_pid=None)
-        child = os.fork()
-    except BaseException:
-        os.close(ready_r)
+        ready_r, ready_w = os.pipe()
+        accept_r, accept_w = os.pipe()
+        payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
+        boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
+        with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
+            # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
+            child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
+                                     start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+        # Until this publication the original caller remains the provable owner. No payload is sent before it.
+        rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        finish(rn.run_id, EXIT_LOCAL, 'local_error')
-        raise
-    if child:
-        os.close(ready_w)
-        try:
-            # Readiness means setsid, PID publication and signal handlers are in place, never a pool slot.
-            ready = os.read(ready_r, 1)
-        finally:
-            os.close(ready_r)
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        if ready != b'1':
+        ready_w = None
+        os.close(accept_r)
+        accept_r = None
+        errors = []
+        def send():
+            try:
+                with child.stdin:
+                    child.stdin.write(payload)
+            except (OSError, ValueError) as error:
+                errors.append(error)
+        # A large command/env must not fill the pipe and block the readiness deadline.
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        readable, _, _ = select.select([ready_r], [], [], BG_READY_TIMEOUT_S)
+        ready = os.read(ready_r, 1) if readable else b''
+        if ready != b'1' or errors:
             raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL)
-        print(rn.run_id, flush=True)
-        say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
-            f"client log: {client_log}")
-        return 0
-
-    os.close(ready_r)
-    code = EXIT_LOCAL
-    try:
-        os.setsid()
-        with open(os.devnull, 'rb') as src, open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
-            os.dup2(src.fileno(), 0)
-            os.dup2(dst.fileno(), 1)
-            os.dup2(dst.fileno(), 2)
-        # PID reuse checks compare birth time with this timestamp; publication can be delayed after registration.
-        rn.record(client_pid=os.getpid(), start_at=now())
-        os.environ[BACKGROUND_RUN_ENV] = rn.run_id
-        code = background_client(a, me, ready=(ready_w, mask))
-    except OffboxError as e:
-        say(str(e))
-        code = e.code
-    except KeyboardInterrupt:
-        code = 130
-    except BaseException:
-        traceback.print_exc()
+        os.write(accept_w, b'1')
+    except BaseException as error:
+        if accept_w is not None:
+            try:
+                os.write(accept_w, b'0')
+            except OSError:
+                pass
+        if child is not None and child.poll() is None:
+            # This PID came from our own spawn. Never leave an unacknowledged worker able to start later.
+            child.kill()
+            child.wait()
+        finish(rn.run_id, EXIT_LOCAL, 'local_error')
+        if isinstance(error, OffboxError):
+            raise
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL) from error
     finally:
-        os.close(ready_w)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(code)
+        if ready_r is not None:
+            os.close(ready_r)
+        if ready_w is not None:
+            os.close(ready_w)
+        if accept_r is not None:
+            os.close(accept_r)
+        if accept_w is not None:
+            os.close(accept_w)
+        # Deliver caller interruptions after handoff; they must not cancel the acknowledged detached worker.
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    print(rn.run_id, flush=True)
+    say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
+        f"client log: {client_log}")
+    return 0
 
 
-def background_client(a, me: dict, ready=None) -> int:
+def background_queue(run_id: str, payload: dict) -> int:
+    a, me = SimpleNamespace(**payload['args']), payload['me']
+    con = db()
+    try:
+        with write(con):
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            if (not row or row['mode'] != 'bg' or row['status'] != 'starting' or row['box_id'] or row['process_id']
+                    or row['client_pid'] != os.getpid() or row['owner'] != me['owner']
+                    or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
+                raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
+            con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
+        os.chdir(row['local_cwd'] or row['cwd'])
+    finally:
+        con.close()
+    os.environ[BACKGROUND_RUN_ENV] = run_id
+    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                             signal_mask=payload['signal_mask'])
+
+
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+    global _background_context
+    _background_context = (a, me)
     from . import cli
     rid = os.environ[BACKGROUND_RUN_ENV]
     def interrupted(signum, frame):
@@ -2618,12 +2654,22 @@ def background_client(a, me: dict, ready=None) -> int:
     code = EXIT_LOCAL
     try:
         if ready:
-            fd, mask = ready
+            fd = ready
+            signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
             try:
                 os.write(fd, b'1')
             except BrokenPipeError:
                 pass  # The caller can die during handoff; the detached client still owns the queued run.
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            finally:
+                os.close(fd)
+            try:
+                # EOF means the caller died after transferring the payload. An explicit rejection fences a timeout.
+                accepted = os.read(accept, 1)
+            finally:
+                os.close(accept)
+            if accepted not in (b'1', b''):
+                finish(rid, EXIT_LOCAL, 'local_error')
+                return EXIT_LOCAL
         code = cli._run_with_retries(a, me)
         return code
     except KeyboardInterrupt:
@@ -2633,12 +2679,23 @@ def background_client(a, me: dict, ready=None) -> int:
         con = db()
         try:
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
-            if row and row['status'] == 'starting' and not row['box_id'] and not row['process_id']:
+            if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
+                    and not row['box_id'] and not row['process_id']):
                 finish(rid, code, 'killed' if code == 130 else 'infra')
         finally:
             con.close()
             for s, handler in old.items():
                 signal.signal(s, handler)
+
+
+def forward_background(env: dict) -> None:
+    if _background_context is None:
+        raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
+    # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
+    common.select_backend('boat')
+    os.environ.clear()
+    os.environ.update(env)
+    raise SystemExit(_background(*_background_context))
 
 
 def retry_background(error) -> None:

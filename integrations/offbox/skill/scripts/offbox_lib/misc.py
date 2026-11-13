@@ -874,8 +874,20 @@ def _report_never_started(r) -> int:
     if r['status'] == 'killed':
         say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
         return 130
-    say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box "
-        "(caller interrupted?); nothing ran, safe to rerun")
+    client_log = LOGS_DIR / f"{r['run_id']}.client.log"
+    try:
+        with client_log.open('rb') as stream:
+            stream.seek(max(0, client_log.stat().st_size - 16384))
+            tail = stream.read().decode(errors='replace').splitlines()[-20:]
+    except OSError:
+        tail = []
+    guess = '' if client_log.exists() else ' (caller interrupted?)'
+    say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
+        f"{guess}; nothing ran, safe to rerun")
+    if tail:
+        say(f"client log: {client_log}")
+        for line in tail:
+            say(line)
     return EXIT_NOT_STARTED
 
 
