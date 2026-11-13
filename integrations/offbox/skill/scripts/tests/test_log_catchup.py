@@ -308,7 +308,8 @@ class LogCatchupTests(Isolated):
                             raise OffboxError('history deadline')
                         self.history.side_effect = history
                         self.history.reset_mock()
-                        with patch.object(misc.time, 'time', side_effect=lambda: clock[0]), \
+                        with patch.object(api, 'BACKEND', 'server'), \
+                                patch.object(misc.time, 'time', side_effect=lambda: clock[0]), \
                                 patch.object(misc, '_resolve_exit', return_value=exit_code), \
                                 patch.object(misc, '_catch_up_finished'), \
                                 patch.object(runs, 'finish', side_effect=finish), \
