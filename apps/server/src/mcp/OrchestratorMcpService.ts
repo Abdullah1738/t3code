@@ -2745,6 +2745,13 @@ const make = Effect.gen(function* () {
       retryKey = key;
       const commandId = delegationCommandId(scope, parentRecords, key);
       const expectedTaskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+      yield* McpCallAnalytics.trackDelegation(
+        expectedTaskId,
+        threadManagement.getCommandReceipt(commandId).pipe(
+          Effect.map(Option.isSome),
+          Effect.orElseSucceed(() => "unknown" as const),
+        ),
+      );
       const isRetryOfAcceptedDelegation = yield* bounded(
         "receipt",
         threadManagement.hasReceipt(commandId),

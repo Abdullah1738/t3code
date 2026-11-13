@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   AnalyticsEvent,
+  CommandId,
   EnvironmentId,
   OrchestratorMcpFailure,
   ProviderInstanceId,
@@ -21,19 +22,25 @@ import {
   DeviceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
+import * as McpCall from "../ardud/analytics/McpCall.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { callIdentifiers } from "../ardud/analytics/McpCall.ts";
 import * as McpDeadline from "./McpDeadline.ts";
@@ -103,10 +110,84 @@ const probe = (name: string) =>
     }),
   );
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
+
+it.effect.each([false, true, "blocked"] as const)(
+  "scope shutdown records a delegate call once with committed=%s and awaits the disk flush",
+  (committed) =>
+    Effect.gen(function* () {
+      const rows: AnalyticsEvent[] = [];
+      const entered = yield* Deferred.make<void>();
+      const flushed = yield* Deferred.make<void>();
+      const checkingReceipt = yield* Deferred.make<void>();
+      const scope = yield* Scope.make();
+      const toolkit = probe("delegate_task");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        delegate_task: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            yield* McpCall.trackDelegation(
+              "task-committed",
+              committed === "blocked"
+                ? Deferred.succeed(checkingReceipt, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(committed),
+            );
+            yield* Deferred.succeed(entered, undefined);
+            return yield* Effect.never;
+          }),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(McpCallLedger.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                if (event.kind === "mcp.call") rows.push(event);
+              }),
+            flush: Deferred.succeed(flushed, undefined).pipe(Effect.asVoid),
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      const context = yield* Layer.buildWithScope(registration, scope);
+      const server = Context.get(context, McpServer.McpServer);
+      const call = yield* server
+        .callTool({ name: "delegate_task", arguments: args })
+        .pipe(
+          Effect.provideService(McpSchema.McpServerClient, client),
+          Effect.provide(invocation),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(entered);
+      const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+      if (committed === "blocked") {
+        yield* Deferred.await(checkingReceipt);
+        yield* TestClock.adjust("250 millis");
+      }
+      yield* Fiber.join(closing);
+      yield* Deferred.await(flushed);
+      yield* Fiber.interrupt(call);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "interrupted_by_shutdown",
+        callerThreadId: "caller-ledger",
+        committed: committed === "blocked" ? "unknown" : committed,
+        ...callIdentifiers(args, "caller-ledger"),
+      });
+      expect(rows[0]!.bootId).toBeTruthy();
+      expect(rows[0]!.startedAt).toBe(rows[0]!.ts);
+      expect(rows[0]!.taskId).toBe(committed === true ? "task-committed" : undefined);
+      expect(yield* decodeEvent(rows[0])).toEqual(rows[0]);
+    }),
+);
 const failure = (code: OrchestratorMcpFailure["code"], message = "private error text") =>
   Effect.fail(new OrchestratorMcpFailure({ code, message }));
 
 const outcomes = [
+  ["interruption", Effect.interrupt, { outcome: "interrupted" }],
   ["ok", Effect.succeed({ privateResult: "secret body" }), { outcome: "ok", saved: "unknown" }],
   [
     "error",
@@ -596,4 +677,125 @@ it.effect.each(["throw", "defect", "blocked"] as const)(
         yield* Deferred.succeed(release, undefined);
       }).pipe(Effect.provide(registration));
     }),
+);
+
+it.effect("shutdown uses one second total even when the durable flush blocks", () =>
+  Effect.gen(function* () {
+    const flushing = yield* Deferred.make<void>();
+    const scope = yield* Scope.make();
+    const context = yield* Layer.buildWithScope(
+      McpCallLedger.layer.pipe(
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: () => Effect.void,
+            flush: Deferred.succeed(flushing, undefined).pipe(Effect.andThen(Effect.never)),
+          }),
+        ),
+      ),
+      scope,
+    );
+    const ledger = Context.get(context, McpCallLedger.McpCallLedger);
+    for (let index = 0; index < 3; index++) {
+      yield* ledger.begin(() =>
+        Effect.succeed({
+          ts: "2026-11-13T12:00:00.000Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          outcome: "interrupted_by_shutdown",
+          tool: "delegate_task",
+        }),
+      );
+    }
+    const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+    yield* Deferred.await(flushing);
+    yield* TestClock.adjust("1 second");
+    yield* Fiber.join(closing);
+  }),
+);
+
+const taskIdKeys = [
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const;
+it.effect.each(taskIdKeys.map(([name, key]) => ({ name, key })))(
+  "retains a committed delegated task ID with $name retry keys",
+  ({ key }) =>
+    Effect.gen(function* () {
+      const taskId = IdAllocator.derive.delegatedTaskNode({
+        commandId: CommandId.make(`command:mcp:delegate-task:caller:${encodeURIComponent(key)}`),
+      });
+      const row = {
+        callerThreadId: IdAllocator.derive.delegatedTaskThread({
+          commandId: CommandId.make(`command:mcp:delegate-task:caller:${encodeURIComponent(key)}`),
+        }),
+        ts: "2026-11-13T12:00:00.000Z",
+        kind: "mcp.call",
+        surface: "server" as const,
+        route: "mcp",
+        tool: "delegate_task",
+        committed: true,
+        taskId,
+        outcome: "interrupted_by_shutdown" as const,
+      };
+      expect(yield* decodeEvent(row)).toEqual(row);
+    }),
+);
+
+it.effect("rejects new tool calls while shutdown waits for the disk drain", () =>
+  Effect.gen(function* () {
+    const flushing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let handled = 0;
+    const toolkit = probe("ledger_probe");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      ledger_probe: McpToolAccess.reads(() =>
+        Effect.sync(() => {
+          handled++;
+          return { ok: true };
+        }),
+      ),
+    });
+    const layer = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(McpCallLedger.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: () => Effect.void,
+          flush: Deferred.succeed(flushing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+          ),
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const ledger = yield* McpCallLedger.McpCallLedger;
+      const server = yield* McpServer.McpServer;
+      const closing = yield* ledger.shutdown.pipe(Effect.forkChild);
+      yield* Deferred.await(flushing);
+      const result = yield* server
+        .callTool({ name: "ledger_probe", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ reason: "server_shutting_down" });
+      expect(handled).toBe(0);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(closing);
+      const after = yield* server
+        .callTool({ name: "ledger_probe", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      expect(after.isError).toBe(true);
+      expect(handled).toBe(0);
+    }).pipe(Effect.provide(layer));
+  }),
 );
