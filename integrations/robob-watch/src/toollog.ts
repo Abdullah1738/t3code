@@ -104,6 +104,7 @@ export async function rollup(day: string, dir = logDirectory()) {
     try { statSync(source); }
     catch (error) {
       if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       sourceExists = false;
     }
     const lines = sourceExists ? createInterface({ input: createReadStream(source), crlfDelay: Infinity }) : [];

@@ -94,6 +94,23 @@ test("a missing day writes and prints an empty rollup with exit 0", async () => 
   expect(existsSync(join(dir, "2000-01-02.ndjson"))).toBe(false);
 });
 
+test.each(["logs", "new-parent/logs"])("CLI creates missing log directory %s for an empty day", relativeDir => {
+  const root = fixture(), dir = join(root, relativeDir), emptyDay = "2000-01-01";
+  expect(existsSync(dir)).toBe(false);
+  const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", emptyDay], {
+    env: { ...process.env, TOOLLOG_DIR: dir, ROBOB_WATCH_ROOT: join(root, "watchers-root") },
+  });
+  expect(child.exitCode).toBe(0);
+  const expected = { day: emptyDay, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [] };
+  expect(JSON.parse(child.stdout.toString())).toEqual(expected);
+  const target = join(dir, `rollup-${emptyDay}.json`);
+  expect(JSON.parse(readFileSync(target, "utf8"))).toEqual(expected);
+  expect(statSync(target).mode & 0o777).toBe(0o600);
+  expect(statSync(dir).mode & 0o777).toBe(0o700);
+  expect(statSync(join(dir, "..")).mode & 0o777).toBe(0o700);
+  expect(existsSync(join(dir, `${emptyDay}.ndjson`))).toBe(false);
+});
+
 test.each(["../../secret", "2026-02-30", "2026-13-01"])("invalid day %s still fails", async invalidDay => {
   const dir = fixture();
   expect(await rollup(invalidDay)).toBeUndefined();
@@ -137,6 +154,20 @@ test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", asyn
   });
   expect(child.exitCode).not.toBe(0);
   expect(child.stderr.toString()).toContain("Could not roll up UTC day");
+});
+
+test.skipIf(process.getuid?.() === 0)("a missing log directory beneath an inaccessible parent still fails", async () => {
+  const root = fixture(), parent = join(root, "blocked"), dir = join(parent, "logs"), emptyDay = "2000-01-01";
+  mkdirSync(parent); chmodSync(parent, 0o000);
+  try {
+    expect(await rollup(emptyDay, dir)).toBeUndefined();
+    const child = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "log-rollup", "--day", emptyDay], {
+      env: { ...process.env, TOOLLOG_DIR: dir, ROBOB_WATCH_ROOT: join(root, "watchers-root") },
+    });
+    expect(child.exitCode).not.toBe(0);
+    expect(child.stderr.toString()).toContain("Could not roll up UTC day");
+  } finally { chmodSync(parent, 0o700); }
+  expect(existsSync(dir)).toBe(false);
 });
 
 
