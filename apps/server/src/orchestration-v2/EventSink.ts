@@ -794,13 +794,18 @@ const layerBase: Layer.Layer<
             .withTransaction(
               Effect.gen(function* () {
                 const connection = yield* sql.transactionService;
+                const transactionContext = yield* Effect.context<never>();
                 const results = yield* Effect.forEach(entries, (entry) =>
                   writeDirect(entry.request.input, entry.request.isCancelled).pipe(
-                    // Restore the caller's clock, tracing and references, but never its
-                    // transaction binding: every statement must use this batch's writer.
+                    // Keep the transaction's private savepoint semaphore while restoring
+                    // caller references. Every statement stays on this batch's writer.
                     Effect.provideContext(
                       Context.add(
-                        Context.add(entry.context, sql.transactionService, connection),
+                        Context.add(
+                          Context.merge(transactionContext, entry.context),
+                          sql.transactionService,
+                          connection,
+                        ),
                         WriteBatch,
                         { publications },
                       ),

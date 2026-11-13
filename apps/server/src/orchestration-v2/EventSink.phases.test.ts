@@ -997,3 +997,30 @@ it.effect(
       );
     }),
 );
+
+it.effect(
+  "nested transaction reads retain the batch's savepoint context without retrying writes",
+  () => {
+    const trace = capture();
+    let nestedRead: Effect.Effect<void> = Effect.void;
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const sink = yield* EventSink.EventSinkV2;
+      nestedRead = sql.withTransaction(sql`SELECT 1`).pipe(Effect.asVoid, Effect.orDie);
+      yield* sink.write({ events: [created] });
+      const results = yield* Effect.all(
+        [1, 2].map((i) => sink.write({ events: [item(i)] })),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.withTracer(trace.tracer));
+      assert.lengthOf(writeSpans(trace.spans), 2);
+      assert.lengthOf(
+        trace.spans.filter((span) => span.name === "sql.transaction"),
+        3,
+      );
+      assert.equal(results[1]![0]!.sequence, results[0]![0]!.sequence + 1);
+      const batch = trace.spans.find((span) => span.name === "orchestrationV2.EventSink.batch")!;
+      assert.equal(batch.attributes.get("db.transaction.control.begin_count"), 1);
+      assert.equal(batch.attributes.get("db.transaction.control.commit_count"), 1);
+    }).pipe(Effect.provide(testLayer({ project: () => nestedRead })));
+  },
+);
