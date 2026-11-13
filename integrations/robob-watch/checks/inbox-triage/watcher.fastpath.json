@@ -1,0 +1,14 @@
+{
+  "id": "inbox-triage-fastpath",
+  "title": "Inbox security and large debit alerts",
+  "check": "./check.sh --fast-only",
+  "depends": [
+    "ssd"
+  ],
+  "interval_s": 15,
+  "mode": "notify",
+  "expires_at": null,
+  "max_fires": 0,
+  "serial": false,
+  "triggers": []
+}
