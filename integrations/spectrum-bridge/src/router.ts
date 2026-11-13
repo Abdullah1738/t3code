@@ -1073,7 +1073,13 @@ export class Router {
         else this.retrySynthetic(id, "undelivered");
         return;
       }
-      if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
+      if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) {
+        if (state === "failed") toolLog.capture(() => {
+          const original = this.store.get<Turn | null>(`failed-delivery:${id}`);
+          if (original) this.logTurnEnd(original, "failed");
+        });
+        this.store.set("preparingDelivery", null);
+      }
       this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
       if (state === "failed") this.failInbound(id, "prepare", text);
       else this.store.updateInbound(id, state);

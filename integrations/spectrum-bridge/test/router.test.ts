@@ -1,7 +1,7 @@
 import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
@@ -3386,6 +3386,7 @@ test("previews share a 10-MiB budget, PDFs stay path-only, and omitted previews 
 });
 
 test("storage errors do not create an active turn or send an unpersisted attachment", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
   const h = filesSetup();
   h.input("start", "Start");
   await h.router.tick();
@@ -3393,9 +3394,10 @@ test("storage errors do not create an active turn or send an unpersisted attachm
   await h.router.tick();
   symlinkSync(h.root, join(h.root, "ses_1", "attachments"));
   h.input("file", "Read", { attachments: [attachment()] });
-  await h.router.tick();
+  const logs = await captureLogs(() => h.router.tick());
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.store.get("activeTurn")).toBeNull();
+  expect(logs.filter(line => line.name === "turn.start" || line.name === "turn.end")).toEqual([]);
   expect(h.controls().at(-1)!.text).toBe("I couldn't save those files. Mind sending them again?");
   expect(readdirSync(h.root)).toEqual(["ses_1"]);
 });
@@ -7443,6 +7445,49 @@ test("a held-turn rebuild logs no terminal outcome until the rebuilt turn replie
     await h.router.tick();
   });
   expect(completed.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("rebuild-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["replied", true]]);
+});
+
+test.each(["storage-file", "storage-symlink", "download"])("held-turn rebuild preparation failure %s closes the original logged turn", async failure => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = filesSetup();
+  const start = Date.parse("2026-11-13T12:00:00Z");
+  const id = "failed-preparation-log";
+  const logs = await captureLogs(async () => {
+    setSystemTime(start);
+    h.backend.promptBehavior = async () => { throw new Error("offline"); };
+    h.input(id, "PRIVATE_HELD_PROMPT", { attachments: [attachment()] });
+    await h.router.tick();
+    for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+    h.store.set("resendBody", null);
+    h.store.set("deliveryOutage", null);
+    if (failure === "download") {
+      h.store.set(`incoming-file:${createHash("sha256").update("att_1").digest("hex")}`, null);
+      h.transport.downloadAttachment = async () => { throw new TransportError("invalidAttachment"); };
+    } else {
+      const managed = join(h.root, "ses_1", "attachments");
+      renameSync(managed, managed + ".offline");
+      if (failure === "storage-file") writeFileSync(managed, "PRIVATE_STORAGE_FIXTURE");
+      else symlinkSync(h.root, managed);
+    }
+    h.backend.promptBehavior = undefined;
+    const attempts = h.backend.prompts.length;
+    setSystemTime(start + 2 * 3600_000);
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("failed");
+    expect(h.store.get("activeTurn")).toBeNull();
+    expect(h.store.get("preparingDelivery")).toBeNull();
+    expect(h.backend.prompts).toHaveLength(attempts);
+    expect(h.controls().at(-1)?.text).toBe(failure === "download"
+      ? "That attachment came through broken. Mind resending it?"
+      : "I couldn't save those files. Mind sending them again?");
+    await h.router.tick();
+    h.input("after-preparation-failure", "/new");
+    await h.router.tick();
+  });
+  expect(logs.filter(l => l.name === "turn.start" && l.ids?.messageId === messageId(id))).toHaveLength(1);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId(id)).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });
 
 test("reset during held-turn preparation closes the original logged turn", async () => {
