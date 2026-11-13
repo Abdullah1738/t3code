@@ -116,6 +116,33 @@ const fakeThreads = (
   const views: Array<string> = [];
   const viewControl = { beforeRead: (_threadId: ThreadId): Effect.Effect<void> => Effect.void };
   const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
+  const storeControl: {
+    afterBoardWrite?: () => Effect.Effect<void>;
+    beforeCardEvent?: (
+      event: KanbanStore.NewCardEvent,
+    ) => Effect.Effect<void, KanbanStore.KanbanStoreError>;
+  } = {};
+  const storeLayer = Layer.effect(
+    KanbanStore.KanbanStore,
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      return KanbanStore.KanbanStore.of({
+        ...store,
+        putBoardWithPools: (...args) =>
+          store
+            .putBoardWithPools(...args)
+            .pipe(
+              Effect.tap(() =>
+                Effect.suspend(() => storeControl.afterBoardWrite?.() ?? Effect.void),
+              ),
+            ),
+        addCardEvent: (event) =>
+          Effect.suspend(() => storeControl.beforeCardEvent?.(event) ?? Effect.void).pipe(
+            Effect.andThen(store.addCardEvent(event)),
+          ),
+      });
+    }),
+  ).pipe(Layer.provide(KanbanStore.layer));
   const view: KanbanThreads["Service"]["view"] = (threadId) =>
     Effect.suspend(() => viewControl.beforeRead(threadId)).pipe(
       Effect.andThen(
@@ -311,7 +338,7 @@ const fakeThreads = (
     Layer.provideMerge(serviceLayer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(storeLayer),
     Layer.provideMerge(dbPath ? Sqlite.layerFromPath(dbPath) : Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -328,6 +355,7 @@ const fakeThreads = (
     views,
     viewControl,
     callerControl,
+    storeControl,
     rejectSends,
     layer,
   };
@@ -1893,6 +1921,152 @@ it.effect("board_instructions_set applies an approved change, records it and ret
     assert.deepStrictEqual((yield* kanban.card(card.id)).events, events);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "board_instructions_set preserves the audit across a concurrent cross-board comment",
+  () => {
+    const { layer, storeControl } = fakeThreads();
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card, text } = yield* instructionFixture();
+      const target = yield* kanban.ensureBoard({
+        slug: "target",
+        name: "Target",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.updateBoard(target.id, { instructions: board.instructions });
+      const store = yield* KanbanStore.KanbanStore;
+      const approved = (yield* kanban.card(card.id)).card;
+      yield* store.putCard({
+        ...approved,
+        asks: approved.asks.map((ask) => ({
+          ...ask,
+          changes: ask.changes!.map((change) => ({ ...change, label: "Target escalation" })),
+        })),
+      });
+      storeControl.afterBoardWrite = () => {
+        storeControl.afterBoardWrite = undefined;
+        return kanban
+          .editCard(card.id, { comment: "Concurrent card update" }, owner)
+          .pipe(Effect.orDie, Effect.forkChild, Effect.flatMap(Fiber.join), Effect.asVoid);
+      };
+      const input = { boardId: target.id, field: "escalation", text, card: card.id, ask: "q1" };
+      const first = yield* call(evaluator, "board_instructions_set", input);
+      assert.isFalse(first.isError, first.text);
+      assert.strictEqual(first.structured.applied, true);
+      assert.strictEqual((yield* kanban.snapshot(target.id)).board.instructions.escalation, text);
+      const retry = yield* call(evaluator, "board_instructions_set", input);
+      assert.isFalse(retry.isError, retry.text);
+      assert.strictEqual(retry.structured.applied, false);
+      const events = (yield* kanban.card(card.id)).events;
+      assert.lengthOf(
+        events.filter((event) => event.body === "Concurrent card update"),
+        1,
+      );
+      assert.lengthOf(
+        events.filter((event) => event.body?.startsWith("Applied escalation on board target")),
+        1,
+      );
+      const appliedLogs = logs.filter(
+        (message) => Array.isArray(message) && message[0] === "kanban board instructions applied",
+      );
+      assert.lengthOf(appliedLogs, 1);
+      assert.deepInclude((appliedLogs[0] as unknown[])[1], {
+        boardId: target.id,
+        field: "escalation",
+        cardId: card.id,
+        askId: "q1",
+        threadId: evaluator,
+      });
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+  },
+);
+
+it.effect.each([false, true])(
+  "board_instructions_set recovers a failed audit once with cross-board=%s",
+  (crossBoard) => {
+    const { layer, storeControl } = fakeThreads();
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card, text } = yield* instructionFixture();
+      const target = crossBoard
+        ? yield* kanban.ensureBoard({
+            slug: "target",
+            name: "Target",
+            defaultProjectId: ProjectId.make("project-1"),
+          })
+        : board;
+      if (crossBoard) {
+        yield* kanban.updateBoard(target.id, { instructions: board.instructions });
+        const store = yield* KanbanStore.KanbanStore;
+        const approved = (yield* kanban.card(card.id)).card;
+        yield* store.putCard({
+          ...approved,
+          asks: approved.asks.map((ask) => ({
+            ...ask,
+            changes: ask.changes!.map((change) => ({ ...change, label: "Target escalation" })),
+          })),
+        });
+      }
+      storeControl.beforeCardEvent = (event) => {
+        if (!event.body?.startsWith("Applied ")) return Effect.void;
+        storeControl.beforeCardEvent = undefined;
+        return Effect.fail(
+          new KanbanStore.KanbanStoreError({ operation: "audit regression", cause: "unavailable" }),
+        );
+      };
+      const input = { boardId: target.id, field: "escalation", text, card: card.id, ask: "q1" };
+      const first = yield* call(evaluator, "board_instructions_set", input);
+      assert.isTrue(first.isError, first.text);
+      assert.strictEqual((yield* kanban.snapshot(target.id)).board.instructions.escalation, text);
+      assert.lengthOf(
+        (yield* kanban.card(card.id)).events.filter((event) => event.body?.startsWith("Applied ")),
+        0,
+      );
+      const retryEvaluator = ThreadId.make("retry-evaluator");
+      const retries = yield* Effect.all(
+        [
+          call(evaluator, "board_instructions_set", input),
+          call(retryEvaluator, "board_instructions_set", input),
+        ],
+        { concurrency: "unbounded" },
+      );
+      for (const retry of retries) {
+        assert.isFalse(retry.isError, retry.text);
+        assert.strictEqual(retry.structured.applied, false);
+        assert.strictEqual(retry.structured.reason, "already set");
+      }
+      const events = (yield* kanban.card(card.id)).events;
+      assert.lengthOf(
+        events.filter((event) =>
+          event.body?.startsWith(`Applied escalation on board ${target.slug}`),
+        ),
+        1,
+      );
+      assert.lengthOf(
+        logs.filter(
+          (message) => Array.isArray(message) && message[0] === "kanban board instructions applied",
+        ),
+        1,
+      );
+      const again = yield* call(retryEvaluator, "board_instructions_set", input);
+      assert.isFalse(again.isError, again.text);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, events);
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+  },
+);
 
 it.effect("board_instructions_set matches each board's entry in a multi-change ask", () => {
   const { layer } = fakeThreads();

@@ -10794,7 +10794,7 @@ const make = Effect.gen(function* () {
     if (actor._tag !== "evaluator") {
       return yield* failWith("denied", "Only evaluators use this tool.");
     }
-    return yield* guard(
+    const result = yield* guard(
       "board.applyApprovedInstructions",
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
@@ -10857,24 +10857,42 @@ const make = Effect.gen(function* () {
         const next = yield* updateBoardUnlocked(board.id, {
           instructions: { ...board.instructions, [field]: text },
         });
-        yield* editCard(
-          card.id,
-          {
-            comment: `Applied ${field} on board ${board.slug} from ${askId} (by ${actor.threadId})`,
-          },
-          actor,
-        );
-        yield* Effect.logInfo("kanban board instructions applied", {
-          boardId: board.id,
-          board: board.slug,
-          field,
-          cardId,
-          askId,
-          threadId: actor.threadId,
-        });
         return { board: next, applied: true };
       }),
     );
+    // A cross-board comment must start with a fresh card snapshot. Retries also
+    // complete the audit if the board write committed before the comment failed.
+    yield* guard(
+      "board.auditApprovedInstructions",
+      Effect.gen(function* () {
+        const prefix = `Applied ${field} on board ${result.board.slug} from ${askId} (by `;
+        const events = yield* store.cardEvents(cardId);
+        if (
+          events.some(
+            (event) =>
+              event.kind === "comment" &&
+              event.actor._tag === "evaluator" &&
+              event.body?.startsWith(prefix),
+          )
+        )
+          return;
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* editCard(cardId, { comment: `${prefix}${actor.threadId})` }, actor);
+            yield* Effect.logInfo("kanban board instructions applied", {
+              boardId,
+              board: result.board.slug,
+              field,
+              cardId,
+              askId,
+              threadId: actor.threadId,
+            });
+          }),
+        );
+      }),
+      cardId,
+    );
+    return result;
   });
 
   const openBoard: KanbanServiceShape["openBoard"] = (input) =>
