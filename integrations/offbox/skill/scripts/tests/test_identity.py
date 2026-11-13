@@ -319,6 +319,56 @@ class IdentityTests(unittest.TestCase):
             identity.require_proven(me, "run")
         self.assertIn("resolution=pending", str(refused.exception))
 
+    def test_restart_recovery_pending_has_its_own_fixed_poll_budget(self):
+        cases = (
+            ("early", 0, (0,), 2),
+            ("before-old-deadline", 0, (10, 17.5, 17.5), 59),
+            ("at-old-deadline", 0, (10, 17.5, 18.5), 60),
+            ("late-unreachable", 0, (10, 20, 20), 64),
+            ("late-bad-gateway", 502, (10, 20, 20), 64),
+            ("late-unavailable", 503, (10, 20, 20), 64),
+            ("near-restart-deadline", 0, (10, 20, 20, 15), 89),
+        )
+        for label, status, request_times, recovered_at in cases:
+            for completes in (True, False):
+                with self.subTest(case=label, completes=completes):
+                    self.elapsed = 0
+                    calls = []
+
+                    def request(*args, **kwargs):
+                        calls.append((self.elapsed, kwargs["timeout"]))
+                        index = len(calls) - 1
+                        if index < len(request_times):
+                            self.assertLessEqual(kwargs["timeout"], 90 - self.elapsed)
+                            duration = request_times[index]
+                            self.assertLessEqual(duration, kwargs["timeout"])
+                            self.advance(duration)
+                            return status, {"error": "control request exceeded its deadline"}
+                        if index == len(request_times):
+                            self.assertEqual(self.elapsed, recovered_at)
+                        elif completes:
+                            return 200, {"identity": resolved(OTHER, driver="codex")}
+                        else:
+                            remaining = recovered_at + 60 - self.elapsed
+                            self.assertLessEqual(kwargs["timeout"], remaining)
+                            self.advance(min(8, kwargs["timeout"]))
+                        return 200, {"identity": {"resolution": "pending"}}
+
+                    native = f"restart-pending-{label}-{completes}"
+                    with patch.object(identity, "ctl", side_effect=request):
+                        me = self.who(CODEX_THREAD_ID=native)
+                    if completes:
+                        identity.require_proven(me, "run")
+                        self.assertEqual(me["thread"], OTHER)
+                        self.assertEqual(len(calls), len(request_times) + 2)
+                        self.assertEqual(self.elapsed, recovered_at + 2.5)
+                    else:
+                        self.assertEqual(self.elapsed, recovered_at + 60)
+                        self.assertEqual(me["resolution"], "pending")
+                        with self.assertRaises(OffboxError) as refused:
+                            identity.require_proven(me, "run")
+                        self.assertIn("resolution=pending", str(refused.exception))
+
     def test_pending_invalidates_the_shared_cache_before_any_terminal_log(self):
         con, key, _ = self.seed_resolved_identity(3700)
         calls = 0

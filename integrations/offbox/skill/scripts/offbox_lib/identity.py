@@ -196,9 +196,11 @@ def _resolve_identity(path: str, on_pending: Callable[[dict], None],
         if pending:
             if last_pending is None:
                 on_pending(answer)
+                if restart_waiting:
+                    # Recovery starts a separate pending budget; repeated replies must not extend it.
+                    deadline = monotonic() + IDENTITY_WAIT
             last_pending = body
         if pending:
-            deadline = started + IDENTITY_WAIT
             pause, next_timeout = IDENTITY_POLL, 10
         elif (status == 0 or status >= 500) and last_pending is None and has_stale():
             return status, body, None
