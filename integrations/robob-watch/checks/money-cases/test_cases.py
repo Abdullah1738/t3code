@@ -48,13 +48,13 @@ class Base(unittest.TestCase):
         fields.update(extra)
         return mc.add(self.data, case_id, at=when, root=self.root, **fields)
 
-    def check(self, now, run='r1', ack=True, delivered_at=None):
+    def check(self, now, run='r1', ack=True, delivered_at=None, find=None):
         """One runner tick: build the event, ack the run, then deliver it.
 
         The runner delivers at `delivered_at` (default: the same moment), so a test can delay delivery. A
         delivered event raises `fires` and sets `last_fire_at` in state.json, which is what the check reads.
         With ack=False nothing is delivered (the runner never took the event)."""
-        event = mc.run_check(self.wd, run, self.data, self.root, at(now))
+        event = mc.run_check(self.wd, run, self.data, self.root, at(now), find=find or finder())
         if ack and event:
             (self.wd / '.run-ok').write_text(run)
             self.deliver(delivered_at or now)
@@ -1112,6 +1112,19 @@ HISTORY = {'id': 1, 'ts': at('2026-09-01T12:00').timestamp(), 'sender': BANK, 's
            'body': 'Purchase of EUR 9.99 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit'}
 RECEIPT = {'id': 2, 'ts': at('2026-10-24T10:47').timestamp(), 'sender': 'Acme <noreply@acme.example>',
            'subject': 'Your Acme order', 'body': 'Thanks for ordering. Total €12.34', 'source': 'email', 'from_me': 0}
+DECLINED = ('Transaction of AED 775.01 on your Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB '
+            'was declined due to insufficient limit')
+PAID = ('Purchase of AED 775.01 with Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB, Amsterdam. '
+        'Avl Cr. Limit is AED 1')
+REFUND = {'id': 301, 'ts': at('2026-11-06T22:47').timestamp(), 'source': 'email', 'from_me': 0,
+          'sender': 'DigiCert Accounts Receivable <ar@digicert.com>',
+          'subject': 'RE: Fifth follow-up - final notice before card dispute: Refund request',
+          'body': 'we have manually processed the request and initiated refund from our end. '
+                  'The amount should be credited back to your card within the next few days.\n'
+                  '> If the refund hasn\'t been issued by Tuesday 10 November, I will dispute the charge'}
+NO_REFUND = dict(REFUND, id=302, sender='Dean Lewis <Dean.Lewis@digicert.com>',
+                 body='I am not able to provide any answers to your questions around the refund, '
+                      'as this falls out of my jurisdiction.')
 
 
 def read(row, deadline=None, **_):
@@ -1150,6 +1163,206 @@ class Questions(Base):
             (self.wd / '.run-ok').write_text(run)
             self.deliver(now)
         return event
+
+    def test_paid_after_decline_closes_and_reports_once(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        with mc.Locked(self.data, 'questions') as book:
+            mc.settle(mc.find_question(book, charge['id']), 'receipt', 'ask', at('2026-11-06T23:14'))
+        self.assertEqual(self.follow('2026-11-06T23:20', finder()), '')
+        q = mc.find_question(mc.load_questions(self.data), decline['id'])
+        self.assertEqual((q['status'], q['by']), ('closed', 'check'))
+        self.assertIn('paid after decline: declined 23:07, charged 23:12', q['outcome'])
+        event = self.follow('2026-11-07T08:00', finder(), 'r2')
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertEqual(self.follow('2026-11-07T08:15', finder(), 'r3'), '')
+
+    def test_decline_only_matches_exact_charge_after_it_within_an_hour(self):
+        rows = [
+            ('boundary', PAID, '2026-11-07T00:07', True),
+            ('late', PAID, '2026-11-07T00:08', False),
+            ('same-time', PAID, '2026-11-06T23:07', False),
+            ('earlier', PAID, '2026-11-06T23:06', False),
+            ('amount', PAID.replace('775.01', '775.02'), '2026-11-06T23:12', False),
+            ('currency', PAID.replace('AED 775', 'USD 775'), '2026-11-06T23:12', False),
+            ('card', PAID.replace('1111', '2222'), '2026-11-06T23:12', False),
+            ('merchant', PAID.replace('ANTHROPIC* CLAUDE SUB', 'OTHER MERCHANT'), '2026-11-06T23:12', False),
+        ]
+        for label, alert, charged, closes in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                self.screen(alert, BANK, charged, '2026-11-07T00:10', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-07T00:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed' if closes else 'open')
+
+    def test_paid_decline_closes_only_untouched_linked_cases(self):
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                self.data = self.tmp / str(edited)
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                with mc.Locked(self.data, 'questions') as book:
+                    cid = mc.case_from(self.data, book['questions'][0], at('2026-11-06T23:09'), 'check')
+                if edited:
+                    mc.update(self.data, cid, {'state': 'owner working on it'}, at=at('2026-11-06T23:10'))
+                self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-06T23:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed')
+                self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open' if edited else 'closed')
+
+    def refund_case(self, **kw):
+        return self.case('digicert-refund', merchant='DigiCert', amount='864', currency='USD',
+                         deadline=kw.pop('deadline', '2026-11-10'), when=at('2026-11-06T14:25'), **kw)
+
+    def test_refund_mail_holds_dispute_with_sourced_history_and_one_ping(self):
+        self.refund_case()
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+        self.assertIn('refund promised', case['state'])
+        self.assertTrue(case['next'].startswith('held: watch the card for the credit; then '))
+        self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+        self.assertEqual(len(case['history']), 2)
+        self.assertIn('because: merchant mail 301 says the refund was processed; dispute step held', case['history'][-1]['text'])
+        self.assertEqual(case['history'][-1]['source'], 'mail:301')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+        self.assertEqual(self.follow('2026-11-07T09:00', finder(REFUND), 'r3'), '')
+        self.assertEqual(mc.load(self.data)['cases'][0], case)
+
+    def test_refund_mail_never_shortens_deadline_or_changes_unrelated_next(self):
+        self.refund_case(deadline='2026-11-20', next_action='watch for the credit')
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['deadline'], case['rev'], case['next']), ('2026-11-20', 0, 'watch for the credit'))
+
+    def test_refund_mail_still_holds_a_case_awaiting_his_answer(self):
+        self.refund_case()
+        with mc.Locked(self.data) as book:
+            book['cases'][0]['status'] = 'awaiting_answer'
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['status'], mc.deadline_of(case)), ('awaiting_answer', at('2026-11-13T22:47')))
+        self.assertIn('mailed Fri 6 Nov 22:47', event)
+
+    def test_refund_lookup_searches_all_accepted_credit_wording(self):
+        rows = [
+            ('refund', dict(REFUND, body='Your refund was processed.')),
+            ('credit', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your card.')),
+            ('account', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your account.')),
+        ]
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.refund_case()
+                def search(query, since, **kw):
+                    text = (row['subject'] + ' ' + row['body']).lower().split()
+                    return [row] if any(term in query.split() and term in text for term in ('refund', 'credited')) else []
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, search)
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], row['id'])
+
+    def test_refund_ping_waits_for_daily_cap_and_survives_key_pruning(self):
+        self.refund_case()
+        now = at('2026-11-06T22:50')
+        case = mc.load(self.data)['cases'][0]
+        ask_key = f"digicert-refund|ask|{mc.answered_at(case).isoformat()}"
+        mc.write_json(self.wd / 'pings.json', {'sent': {ask_key: mc.stamp(now),
+                      'digicert-refund|day|2026-11-06': mc.stamp(now)}})
+        self.assertEqual(self.follow('2026-11-06T22:50', finder(REFUND)), '')
+        event = self.follow('2026-11-07T09:00', finder(REFUND), 'r2')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertNotIn('mailed', self.follow('2027-02-01T09:00', finder(REFUND), 'r3'))
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('digicert-refund|refund|301', state['built'])
+
+    def test_reopening_does_not_replay_the_previous_refund_mail(self):
+        self.refund_case()
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        mc.close(self.data, 'digicert-refund', 'refund landed', at=at('2026-11-08T10:00'))
+        self.follow('2027-02-01T09:00', finder(REFUND), 'r2')
+        mc.reopen(self.data, 'digicert-refund', '2027-03-01', 'refund reversed', at=at('2027-02-01T10:00'))
+        self.assertNotIn('refund_mail', mc.load(self.data)['cases'][0])
+        self.assertNotIn('mailed', self.follow('2027-02-01T11:00', finder(REFUND), 'r3'))
+
+    def test_refund_mail_rejects_quotes_negations_senders_and_old_mail(self):
+        rows = [
+            ('dean', NO_REFUND),
+            ('own', dict(REFUND, from_me=1)),
+            ('other', dict(REFUND, sender='Other <ar@other.example>')),
+            ('bank', dict(REFUND, sender='Wio DigiCert alert')),
+            ('sms', dict(REFUND, source='imessage')),
+            ('old', dict(REFUND, ts=at('2026-11-06T14:24').timestamp())),
+            ('same-time', dict(REFUND, ts=at('2026-11-06T14:25').timestamp())),
+            ('later-edit', REFUND),
+        ]
+        for marker in ('> ', '-----Original Message-----\n', 'On Fri, 6 Nov someone wrote:\n'):
+            rows.append(('quoted-' + str(len(rows)), dict(REFUND, body='No update yet.\n' + marker + 'Refund was issued.')))
+        rows.append(('own-negated-quote', dict(REFUND, body="No update yet.\n> If the refund hasn't been issued, I will dispute it.")))
+        for negation in ("not", "can't", "cannot", "unable", "won't", "isn't", 'never'):
+            rows.append(('negation-' + negation, dict(REFUND, body=f'We are {negation} confirming your refund was processed.')))
+        rows.append(('wrapped-negation', dict(REFUND, body='We cannot\nconfirm your refund was issued.')))
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.wd = self.tmp / ('wd-' + label)
+                self.wd.mkdir()
+                self.refund_case()
+                if label == 'later-edit':
+                    mc.update(self.data, 'digicert-refund', {'state': 'already handled'}, at=at('2026-11-07T01:35'))
+                before = mc.load(self.data)
+                event = self.follow('2026-11-07T09:00', finder(row))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_done_wording_and_newest_mail(self):
+        forms = ('Refund processed', 'refund has been issued', 'refund was initiated', 'refund is credited',
+                 'refund refunded', 'refund sent', 'processed the refund', 'issued your refund',
+                 'initiated refund', 'credited back to your card', 'credited back to your account')
+        for i, body in enumerate(forms):
+            with self.subTest(body=body):
+                self.data = self.tmp / str(i)
+                self.refund_case()
+                newest = dict(REFUND, id=303, ts=at('2026-11-06T22:48').timestamp(), body=body)
+                self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8,
+                                               finder(REFUND, newest)), [])
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], 303)
+
+    def test_refund_lookup_cannot_overwrite_concurrent_case_edit(self):
+        self.refund_case()
+        def edited(row, deadline):
+            mc.update(self.data, 'digicert-refund', {'deadline': '2026-11-25'}, source='mail:other',
+                      at=at('2026-11-06T22:49'))
+            return read(row)
+        mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND), edited)
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(case['deadline'], '2026-11-25')
+        self.assertNotIn('refund_mail', case)
+
+    def test_refund_errors_are_recorded_and_budget_stops_remaining_cases(self):
+        self.refund_case()
+        for error in (mc.charges.Lookup('archive unavailable'), TimeoutError('read timed out')):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(mc.charges, 'show', side_effect=error):
+                    self.follow('2026-11-06T22:50', finder(REFUND))
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertIn(str(error), str(state['question_errors']))
+        self.case('other')
+        with patch.object(mc.time, 'time', return_value=100), patch.object(mc.charges, 'search') as find:
+            errors = mc.refund_mails(self.data, at('2026-11-06T22:50'), 99)
+        find.assert_not_called()
+        self.assertIn('out of time', errors[0])
+
+    def test_refund_lookup_skips_closed_holds_and_unmatched_cases(self):
+        self.refund_case(kind='hold')
+        self.case('unknown', merchant=None, unmatched=True)
+        self.case('closed')
+        mc.close(self.data, 'closed', 'done')
+        with patch.object(mc.charges, 'search') as find:
+            self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8), [])
+        find.assert_not_called()
 
     def test_a_merchant_he_pays_waits_then_two_asks_at_most_then_a_money_case(self):
         known = finder(HISTORY)
@@ -3131,24 +3344,26 @@ class PaymentDeadlines(Base):
 
     def test_owner_closes_both_rows(self):
         parent = self.notice('Autopay of AED 3,532.73 is due tonight at 18:00', '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         child = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         mc.close(self.data, child['id'], 'paid', at('2026-11-07T19:30'))
         self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
         with patch.object(mc.charges, 'search') as search:
-            self.assertEqual('', self.check('2026-11-08T09:00'))
+            self.assertEqual('', self.check('2026-11-08T09:00', find=search))
             search.assert_not_called()
         self.assertEqual(mc.find(mc.load(self.data), parent)['status'], 'closed')
 
     def test_expected_missing_confirmation_escalates_at_due_plus_one(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00', '2026-11-07T09:09', 'scheduled')
         with patch.object(mc.charges, 'search', return_value=[]) as search:
-            self.assertEqual('', self.check('2026-11-07T18:59'))
-            search.assert_not_called()
-            self.assertIn('Wio', self.check('2026-11-07T19:00'))
-            self.assertIsNotNone(search.call_args.kwargs['deadline'])
-            event = self.check('2026-11-07T20:00')
+            self.assertEqual('', self.check('2026-11-07T18:59', find=search))
+            self.assertTrue(all(call.args[0].endswith(' refund OR credited') for call in search.call_args_list))
+            self.assertIn('Wio', self.check('2026-11-07T19:00', find=search))
+            payment_calls = [call for call in search.call_args_list if not call.args[0].endswith(' refund OR credited')]
+            self.assertEqual(len(payment_calls), 1)
+            self.assertIsNotNone(payment_calls[0].kwargs['deadline'])
+            event = self.check('2026-11-07T20:00', find=search)
         self.assertIn('Wio', event)
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
@@ -3157,8 +3372,8 @@ class PaymentDeadlines(Base):
     def test_expected_uses_stated_repayment_deadline(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00; repay before midnight if it fails',
                     '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         self.assertEqual(mc.load(self.data)['cases'][1]['deadline'], '2026-11-07T23:59:00+04:00')
 
     def test_search_success_requires_bank_amount_currency_and_time(self):
@@ -3177,8 +3392,9 @@ class PaymentDeadlines(Base):
 
     def test_archive_timeout_still_tracks_an_unconfirmed_payment(self):
         self.notice('Autopay of AED 3,532.73 due today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')):
-            self.check('2026-11-07T20:00')
+        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')) as search:
+            self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
         self.assertIn('confirmation', cases[1]['state'])
@@ -3221,20 +3437,22 @@ class PaymentDeadlines(Base):
         def slow_archive(*args, **kwargs):
             clock[0] = kwargs['deadline'] + .01
             raise mc.charges.Lookup('lookup budget exhausted')
-        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc.charges, 'search', side_effect=slow_archive):
-            event = self.check('2026-11-07T20:00')
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(mc.charges, 'search', side_effect=slow_archive) as search:
+            event = self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         self.assertIn('Wio', event)
         self.assertEqual(sum(c['kind'] == 'payment_deadline' for c in mc.load(self.data)['cases']), 2)
 
     def test_bank_deadline_supersedes_fallback(self):
         self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00', 'missing')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', 'missing', find=search)
         fallback = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         bank = self.notice('Autopay of AED 100.00 failed; repay before midnight', '2026-11-07T20:00', 'bank')
         self.assertEqual(mc.find(mc.load(self.data), fallback['id'])['status'], 'closed')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            event = self.check('2026-11-07T21:00', 'bank-alert')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            event = self.check('2026-11-07T21:00', 'bank-alert', find=search)
         self.assertIn(bank, event)
         self.assertNotIn(fallback['id'], event)
         self.assertNotIn('21:00', event)

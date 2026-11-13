@@ -86,6 +86,8 @@ KEEP_SENT = dt.timedelta(days=60)
 # Charge questions: alerts this close with the same card, amount and merchant are one charge. One
 # ask and one re-ask (not within REASK_GAP of the first). Unanswered questions stay listed indefinitely.
 SAME_CHARGE = dt.timedelta(minutes=15)
+# A successful retry explains a decline only within an hour of that decline.
+PAID_AFTER = dt.timedelta(minutes=60)
 # The same alert seen twice (a re-run, or an ask whose --at is the minute shown) lands this close;
 # a second alert on the same channel further apart is a second charge.
 ALERT_SAME = dt.timedelta(minutes=2)
@@ -104,6 +106,12 @@ DONT_ASK = 3
 EVENT_LIMIT = 4000
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
 FIELDS = ('merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline', 'due', 'why', 'who')
+REFUND_DONE = re.compile(
+    r'\brefund\s+(?:(?:has been|was|is)\s+)?(?P<after>processed|issued|initiated|credited|refunded|sent)\b'
+    r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
+    r'|\b(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
+REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
+QUOTED_REPLY = re.compile(r'^\s*>|^.*Original Message.*$|^.*\bOn\b.+\bwrote:.*$', re.I | re.M)
 CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){12,18}(?!\d)')
 # A secret is a labelled value: a code of 3-12 digits (grouped or not) a few words after the label, a token
 # with a digit right after it ("code", "is", ":"), or anything assigned to a password. The match is removed.
@@ -1037,10 +1045,13 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
 
 @case_operation('case.update')
 def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None,
-           because='', reply='', source='', cascade_questions=True):
+           because='', reply='', source='', cascade_questions=True, refund_mail=None, expected_updated=None):
     checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline, 'due': check_deadline}
     with Locked(data) as book:
         case = find(book, case_id)
+        # Archive reads happen outside the lock; never overwrite a case edited during the lookup.
+        if expected_updated is not None and case['updated'] != expected_updated:
+            raise _DryRun
         before = {key: case.get(key) for key in FIELDS}
         before['watchers'] = list(case['watchers'])
         old_state = case['state']
@@ -1091,6 +1102,8 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
         if not said:
             raise CaseError('nothing to change')
         case['updated'] = stamp(at)
+        if refund_mail is not None:
+            case['refund_mail'] = refund_mail
         entry = {'at': stamp(at), 'text': '; '.join(said)}
         if source:
             entry['source'] = source
@@ -1718,6 +1731,7 @@ def reopen(data, case_id, deadline, note, at=None):
             raise CaseError(f'case {case_id!r} is open')
         note = check_text('note', note)
         case.pop('queued', None)
+        case.pop('refund_mail', None)
         case['asks'] = []
         case.update(status='open', closed=None, outcome=None, deadline=check_deadline(deadline), updated=stamp(at),
                     rev=case.get('rev', 0) + 1, cycle=case.get('cycle', 0) + 1)
@@ -1874,7 +1888,9 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
             continue
         if case.get('kind') in ('payment_deadline', 'autopay_expected'):
             continue
-        if pending and is_bill(case) and not overdue_bill(case, now):
+        refund = case.get('refund_mail')
+        refund_pending = bool(refund and f"{case['id']}|refund|{refund['id']}" not in sent)
+        if pending and is_bill(case) and not overdue_bill(case, now) and not refund_pending:
             continue
         deadline = deadline_of(case)
         cid = case['id']
@@ -1885,6 +1901,10 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
         if case.get('reference'):
             head += f" (ref {clip(redact(case['reference']), 80)})"
         found = []
+        if refund and deadline is not None and moment(refund.get('at')):
+            found.append((f"{cid}|refund|{refund['id']}",
+                          f"{case['merchant']} mailed {when(moment(refund['at']))} that the refund was processed; "
+                          f'dispute step held until {when(deadline)}'))
         bill_key = f'{cid}|bill-ask|r{rev}|c{cycle}'
         urgent = overdue_bill(case, now) and bill_key not in sent
         if urgent:
@@ -1904,7 +1924,7 @@ def attention(cases, now, sent, root=None, since=None, pending=False):
                               f'Options: chase again with a new reply watcher, take the next step, or close the case'))
         answer = answered_at(case)
         ask_key = f'{cid}|ask|{answer.isoformat()}'
-        if ask_key in sent and not urgent:
+        if ask_key in sent and not urgent and not refund_pending:
             # The yes/no is out; the case stays quiet until he answers (a new answer time changes the key).
             continue
         found = [(k, t) for k, t in found if k not in sent]
@@ -1997,6 +2017,7 @@ def live_keys(cases):
         if active(case):
             cid, rev, cycle = case['id'], case.get('rev', 0), case.get('cycle', 0)
             keys += [f'{cid}|r{rev}|c{cycle}|payment|', f'{cid}|r{rev}|soon', f'{cid}|r{rev}|no-deadline', f'{cid}|c{cycle}|', f'{cid}|ask|', f'{cid}|bill-ask|', f'{cid}|initial-ask|']
+            keys.append(f'{cid}|refund|')
     return tuple(keys)
 
 
@@ -2643,10 +2664,24 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             elif q['id'] in failed and (verdicts.get(q['id']) or {}).get('verdict', 'ask') == 'ask':
                 verdicts[q['id']] = {'verdict': 'unverified', 'why': 'sources unreadable; do not ask',
                                       'errors': ['alias source unreadable']}
+        for q in book['questions']:
+            if q['id'] not in looked or q.get('kind') != 'decline' or not (active(q) or q.get('status') == 'case'):
+                continue
+            declined = moment(q.get('at'))
+            if declined is None:
+                continue
+            for c in book['questions']:
+                charged = moment(c.get('at'))
+                if (c.get('kind') == 'charge' and charged and dt.timedelta() < charged - declined <= PAID_AFTER
+                        and all(c.get(k) == q.get(k) for k in ('card', 'currency', 'amount', 'mkey'))):
+                    verdicts[q['id']] = {'verdict': 'paid',
+                                         'why': f'paid after decline: declined {declined:%H:%M}, '
+                                                f"charged {charged:%H:%M} ({c['id']})"}
+                    break
         transactions = alert_verdicts(book['questions'], now, verdicts)
         for q in book['questions']:
-            result = alert_verdict(transactions, q, now) if q.get('kind') == 'charge' else None
-            hit = result if result and result['verdict'] in ('receipt', 'owner', 'subscription') else None
+            result = alert_verdict(transactions, q, now) if q.get('kind') == 'charge' else verdicts.get(q['id'])
+            hit = result if result and result['verdict'] in ('receipt', 'owner', 'subscription', 'paid') else None
             if q['id'] not in looked and q['id'] not in repaired and not result:
                 continue
             q['owner'] = charges.card_owner(charge_of(q))
@@ -2792,6 +2827,57 @@ def mark_daily_skip(data, row, reason, now, end, wait_until=None):
     except CheckTimeout:
         # An exhausted budget leaves the item available for another attempt.
         pass
+
+
+def refund_mails(data, now, deadline, find=None, read=None):
+    find, read = find or charges.search, read or charges.show
+    errors = []
+    for case in load(data)['cases']:
+        merchant = case['merchant']
+        words = charges.words(merchant)
+        since = moment(case.get('updated'))
+        if not active(case) or case.get('kind') == 'hold' or merchant == UNMATCHED or not words or not since:
+            continue
+        if time.time() >= deadline:
+            errors.append('refund mail: out of time; the rest next check')
+            break
+        try:
+            with within(deadline, LookupTimeout('out of time')):
+                rows = find(' OR '.join(f'"{w}"' for w in words) + ' refund OR credited', charges.day(since),
+                            source='email', n=10, deadline=deadline)
+                for row in sorted(rows, key=lambda row: row['ts'], reverse=True):
+                    mailed = dt.datetime.fromtimestamp(row['ts'], TZ)
+                    sender = row.get('sender', '').lower()
+                    if (mailed <= since or row.get('from_me') or row.get('source') != 'email'
+                            or charges.BANKS.search(sender) or not any(w in sender for w in words)
+                            or str(row['id']) == str(case.get('refund_mail', {}).get('id'))):
+                        continue
+                    text = QUOTED_REPLY.split(read(row, deadline), maxsplit=1)[0].replace('’', "'")
+                    done = False
+                    for sentence in re.split(r'[.!?;]+', text):
+                        for match in REFUND_DONE.finditer(sentence):
+                            verb = next(match.start(name) for name in ('after', 'before', 'credit') if match[name])
+                            if not REFUND_NEGATION.search(sentence[:verb]):
+                                done = True
+                    if not done:
+                        continue
+                    changes = {'state': f'refund promised: {merchant} mail {mailed:%a %d %b %H:%M} says it was processed'}
+                    due = mailed + dt.timedelta(days=7)
+                    current = deadline_of(case)
+                    if current is None or due > current:
+                        changes['deadline'] = stamp(due)
+                    if 'dispute' in case['next'].lower() and not case['next'].startswith('held: watch the card for the credit; then '):
+                        changes['next'] = 'held: watch the card for the credit; then ' + case['next']
+                    update(data, case['id'], changes, note=f"refund mail {row['id']}", at=now,
+                           because=f"merchant mail {row['id']} says the refund was processed; dispute step held",
+                           source=f"mail:{row['id']}", refund_mail={'id': row['id'], 'at': stamp(mailed)},
+                           expected_updated=case['updated'])
+                    break
+        except _DryRun:
+            continue
+        except (charges.Lookup, LookupTimeout, TimeoutError) as exc:
+            errors.append(f"refund mail {case['id']}: {exc}")
+    return errors
 
 
 def unasked_candidates(data, now, excluded=None, declined=None):
@@ -3079,6 +3165,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
             errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
+            errors += refund_mails(data or DATA, now, time.time() + 8, find)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
             if errors:
