@@ -676,7 +676,7 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
 }
 
 /**
- * A wake watcher that keeps failing is blind, and a Telegram alert alone went unanswered for 2.5h (4 Oct 2026,
+ * A Telegram alert alone went unanswered for 2.5h (4 Oct 2026,
  * wacli daemon booted out). After ESCALATE_AFTER_MS of failing, wake the agent (iMessage text as fallback) once
  * per failure run so it can repair the cause.
  */
@@ -689,7 +689,7 @@ export function shouldEscalate(watcher: Watcher, state: State, t = now()): boole
 
 export function escalationText(watcher: Watcher, state: State, mins: number): string {
   return [
-    `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs) and is blind until fixed.`,
+    `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state.last_error)}.`,
     ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
     `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
     "",
@@ -701,6 +701,22 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
   ].join("\n");
 }
 
+function failureSummary(error = ""): string {
+  const object = error.match(/\{[\s\S]*\}/)?.[0];
+  if (object) {
+    try {
+      const parsed: unknown = JSON.parse(object);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const entries = Object.entries(parsed);
+        if (entries.length && entries.every(([source, value]) => source.trim() && typeof value === "string")) {
+          return `failing sources: ${entries.map(([source]) => source).join(", ")}`;
+        }
+      }
+    } catch { /* Truncated or non-JSON stderr still gets a useful generic summary. */ }
+  }
+  return "its check is failing";
+}
+
 export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
@@ -710,7 +726,7 @@ export async function escalate(watcher: Watcher, state: State, key: string): Pro
     const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else {
-      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min: ${(state.last_error ?? "").slice(0, 300)}`, key);
+      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state.last_error)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }
     return delivery;

@@ -23,12 +23,13 @@ test.each([
     db.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT); INSERT INTO kv VALUES ('route', '{\"id\":\"ses_fixture\"}')");
     db.close();
     const stub = join(home, "spectrum.ts");
-    writeFileSync(stub, `console.log("PRIVATE_BRIDGE_OUTPUT"); process.exit(process.argv[2] === "wake" ? ${wakeCode} : ${sendCode});`);
+    const capture = join(home, "calls.jsonl");
+    writeFileSync(stub, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2))+"\\n"); console.log("PRIVATE_BRIDGE_OUTPUT"); process.exit(process.argv[2] === "wake" ? ${wakeCode} : ${sendCode});`);
     const key = "PRIVATE_ESCALATION_KEY";
     const program = `const { escalate, normalize } = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
       const watcher = normalize({ id: "escalation-fixture", title: "PRIVATE_TITLE", check: "true", context: "PRIVATE_CONTEXT", mode: "wake", chat: "another-chat" });
       const state = { status: "active", fires: 0, consecutive_failures: 5, failure_alerted: true,
-        failing_since: new Date(Date.now() - 16 * 60000).toISOString(), last_error: "PRIVATE_CHECK_ERROR" };
+        failing_since: new Date(Date.now() - 16 * 60000).toISOString(), last_error: 'exit 1: source failure: {"outlook": "PRIVATE_CHECK_ERROR"}' };
       try { console.log(JSON.stringify(await escalate(watcher, state, ${JSON.stringify(key)}))); }
       catch { console.log(JSON.stringify({ error: true })); }`;
     const logs = join(home, "logs");
@@ -38,6 +39,15 @@ test.each([
     } });
     expect(child.exitCode, child.stderr.toString()).toBe(0);
     expect(JSON.parse(child.stdout.toString())).toMatchObject(spawnFails ? { error: true } : { ok, via });
+    if (!spawnFails) {
+      const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+      expect(calls).toHaveLength(wakeCode ? 2 : 1);
+      for (const args of calls) {
+        const text = args[args.indexOf("--text") + 1]!;
+        expect(text).toContain("failing sources: outlook");
+        expect(text).not.toContain("blind");
+      }
+    }
     const raw = readdirSync(logs).filter(name => name.endsWith(".ndjson")).map(name => readFileSync(join(logs, name), "utf8")).join("");
     const rows = raw.trim().split("\n").map(line => JSON.parse(line));
     const sent = rows.filter(row => row.name === "wake.sent");
