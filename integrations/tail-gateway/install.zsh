@@ -65,7 +65,9 @@ if [[ $mode == check ]]; then
   for l in $labels; do
     $lctl print "$domain/$l" >/dev/null 2>&1 || { print -u2 "tail-gateway: $l is not loaded"; rc=1 }
   done
-  (( rc == 0 )) && print "tail-gateway: live copy matches $(git -C "$repo" rev-parse --short HEAD) and it is on origin"
+  if (( rc == 0 )); then
+    print "tail-gateway: live copy matches $(git -C "$repo" rev-parse --short HEAD) and it is on origin"
+  fi
   exit $rc
 fi
 
@@ -80,11 +82,17 @@ fi
 stamp="$(date +%Y%m%d-%H%M%S)"
 changed=()
 for src dst in ${(kv)files}; do
-  cmp -s "$here/$src" "$dst" && continue
+  if cmp -s "$here/$src" "$dst"; then
+    continue
+  fi
   print "update $dst"
-  (( dry )) && continue
+  if (( dry )); then
+    continue
+  fi
   mkdir -p "${dst:h}"
-  [[ -e "$dst" ]] && cp -p "$dst" "$dst.bak-$stamp"
+  if [[ -e "$dst" ]]; then
+    cp -p "$dst" "$dst.bak-$stamp"
+  fi
   cp "$here/$src" "$dst.tmp.$$"
   case "$src" in bin/*) chmod 755 "$dst.tmp.$$" ;; *) chmod 644 "$dst.tmp.$$" ;; esac
   mv "$dst.tmp.$$" "$dst"
@@ -94,7 +102,9 @@ if [[ "$(readlink "$link" 2>/dev/null)" != "$live/bin/tailname" ]]; then
   print "link $link -> $live/bin/tailname"
   (( dry )) || { mkdir -p "${link:h}"; ln -sfn "$live/bin/tailname" "$link" }
 fi
-(( dry )) && exit 0
+if (( dry )); then
+  exit 0
+fi
 
 # Caddyfile and landing page come from routes.json, so a new tailname/site script regenerates them.
 "$live/bin/tail-gateway-site" >/dev/null
@@ -105,7 +115,12 @@ load_agent() {
   local l=$1 plist="$agents/$1.plist" i
   $lctl bootout "$domain/$l" 2>/dev/null || true
   for i in {1..20}; do $lctl print "$domain/$l" >/dev/null 2>&1 || break; sleep 0.5; done
-  for i in {1..5}; do $lctl bootstrap "$domain" "$plist" 2>/dev/null && return 0; sleep 1; done
+  for i in {1..5}; do
+    if $lctl bootstrap "$domain" "$plist" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
   local bak=( $plist.bak-*(N.om[1]) )
   if (( $#bak )); then
     print -u2 "tail-gateway: $l would not load; putting back $bak[1]"
@@ -130,5 +145,8 @@ if (( ${changed[(I)bin/tailname]} )); then
   print "re-rendered Caddyfile"
 fi
 
-(( failed )) && { print -u2 "tail-gateway: installed with errors (see above)"; exit 1 }
+if (( failed )); then
+  print -u2 "tail-gateway: installed with errors (see above)"
+  exit 1
+fi
 print "tail-gateway: installed $(git -C "$repo" rev-parse --short HEAD)"

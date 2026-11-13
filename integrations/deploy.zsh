@@ -22,7 +22,9 @@ esac
 src="${0:A:h}/$name/"
 dst="$HOME/.local/share/$name/"
 flags=(-a --itemize-changes)
-[[ "${1:-}" == "--dry-run" ]] && flags+=(--dry-run)
+if [[ "${1:-}" == "--dry-run" ]]; then
+  flags+=(--dry-run)
+fi
 
 rsync "${flags[@]}" \
   --exclude node_modules --exclude data --exclude logs --exclude .venv --exclude venv \
@@ -45,4 +47,10 @@ if [[ "$name" == memory-system ]]; then
     install -m 755 "$recall_src" "$recall_dst"
   fi
   /bin/bash "${src}scripts/install_launchagent.sh" "$@"
+fi
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  print -r -- "dry run: $name"
+else
+  print -r -- "deployed $name to $dst"
 fi

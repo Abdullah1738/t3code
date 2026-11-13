@@ -92,6 +92,18 @@ exit 0
         r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout, r.stderr
 
+    def test_dry_run_with_node_hook_and_no_uber_or_lock(self):
+        helper = os.path.join(self.pkg, "libexec/repo-node-pin")
+        with open(os.path.join(self.home, ".zshenv"), "w") as fh:
+            fh.write('. "$ROBOB_REPO_NODE_HELPER/init.sh"\n')
+        argv, env = self.argv_env(["--dry-run"])
+        env["ROBOB_REPO_NODE_HELPER"] = helper
+        result = subprocess.run(argv, cwd=self.home, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("update ", result.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/bin/qcard")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/state/local-helpers")))
+
     def start_install(self, *args, **opts):
         argv, env = self.argv_env(args, **opts)
         return subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -360,7 +372,7 @@ exit 0
         self.assertEqual(sorted(os.listdir(self.loaded)),
                          ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.cards-health",
                           "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
-                          "com.ardud.lydia-ticks-tunnel", "com.ardud.opencode-web",
+                          "com.ardud.lydia-ticks-tunnel", "com.ardud.mirage-beacon-keepalive", "com.ardud.opencode-web",
                           "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog",
                           "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
