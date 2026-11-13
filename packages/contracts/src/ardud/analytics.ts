@@ -72,6 +72,14 @@ export const AnalyticsEvent = Schema.Struct({
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       phase: Schema.optionalKey(Label),
+      tickId: Schema.optionalKey(Id),
+      activeTickId: Schema.optionalKey(Id),
+      cardsScanned: Schema.optionalKey(Measurement),
+      cardsChanged: Schema.optionalKey(Measurement),
+      dbMs: Schema.optionalKey(Measurement),
+      queueWaitMs: Schema.optionalKey(Measurement),
+      heapMB: Schema.optionalKey(Measurement),
+      overlappingTicks: Schema.optionalKey(Measurement),
       createdAt: Schema.optionalKey(Timestamp),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
@@ -130,6 +138,9 @@ export const AnalyticsRollup = Schema.Struct({
   errorCounts: Schema.Record(Label, Measurement),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
+  tickPhases: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
+  ),
   mcpCalls: Schema.Array(
     Schema.Struct({
       tool: Label,

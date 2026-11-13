@@ -51,6 +51,64 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads filtered tick phase percentiles and persists the complete day", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [boardId, durationMs] of [
+        ["a", 10],
+        ["a", 20],
+        ["a", 90],
+        ["b", 1_000],
+      ] as const)
+        yield* analytics.record(
+          event({
+            kind: "kanban.tick_phase",
+            surface: "server",
+            route: "kanban",
+            boardId,
+            durationMs,
+            props: { tickId: "tick-1", phase: "thread_status", count: 1 },
+          }),
+        );
+      yield* analytics.record(
+        event({
+          kind: "kanban.tick_overlap",
+          surface: "server",
+          route: "kanban",
+          boardId: "a",
+          props: { tickId: "tick-2", activeTickId: "tick-1", reason: "local_waits_only" },
+        }),
+      );
+      const result = yield* analytics.read({
+        day,
+        kind: "kanban.tick_phase",
+        boardId: "a",
+        limit: 1,
+      });
+      assert.equal(result.rollup.total, 3);
+      assert.lengthOf(result.samples, 1);
+      assert.deepEqual(result.rollup.tickPhases, [
+        {
+          boardId: "a",
+          phase: "thread_status",
+          count: 3,
+          p50Ms: 20,
+          p95Ms: 90,
+          maxMs: 90,
+          approximate: false,
+        },
+      ]);
+      const full = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(full.total, 5);
+      assert.equal(full.tickPhases?.length, 2);
+      assert.equal(full.kindCounts["kanban.tick_overlap"], 1);
+      assert.isFalse(yield* setup.fs.exists(`${setup.directory}/rollup-${day}.json.tmp`));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>
