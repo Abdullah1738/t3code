@@ -36,6 +36,7 @@ const modelSelection = { instanceId, model: "test-model" };
 const stopEarlierBackgroundWork = ({
   wakeAfterStop = false,
   lateWorkAfterStop,
+  lateWorkState = "held",
   failedStart = false,
   stopWithQueue,
   olderStart = false,
@@ -54,7 +55,8 @@ const stopEarlierBackgroundWork = ({
   readonly retryDuringStop?: "starting" | "completed";
   readonly cancelLastQueued?: boolean;
   readonly wakeAfterStop?: boolean;
-  readonly lateWorkAfterStop?: "provider-wake" | "context-reset";
+  readonly lateWorkAfterStop?: "provider-wake" | "context-reset" | "user-message" | "agent-message";
+  readonly lateWorkState?: "held" | "unheld" | "preparing" | "starting" | "running" | "completed";
   readonly failedStart?: boolean;
   readonly backgroundWorkAfterStop?: "running" | "unknown";
   readonly stopWithQueue?: "thread.stop" | "run.interrupt";
@@ -253,17 +255,54 @@ const stopEarlierBackgroundWork = ({
                   text: "Resume note",
                   attachments: [],
                   dispatchMode: { type: "queue_after_active" },
-                  createdBy: "agent",
+                  createdBy: lateWorkAfterStop === "user-message" ? "user" : "agent",
                   creationSource: "mcp",
-                  contextReset: true,
+                  ...(lateWorkAfterStop === "context-reset" ? { contextReset: true } : {}),
                 });
-            const late = (yield* orchestrator.getThreadProjection(threadId)).runs[1];
-            assert.isTrue(late?.queueHeld);
+            const late = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
+            if (processOwned) {
+              const now = yield* DateTime.now;
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("late-work-state"),
+                    type: "run.updated",
+                    threadId,
+                    occurredAt: now,
+                    payload: {
+                      ...late,
+                      status:
+                        lateWorkState === "held" || lateWorkState === "unheld"
+                          ? "queued"
+                          : lateWorkState,
+                      queueHeld: lateWorkState !== "unheld",
+                      completedAt: lateWorkState === "completed" ? now : null,
+                    },
+                  },
+                ],
+              });
+            } else assert.isTrue(late.queueHeld);
 
+            const automatic =
+              lateWorkAfterStop === "provider-wake" || lateWorkAfterStop === "context-reset";
+            if (processOwned && !(automatic && lateWorkState === "held")) {
+              // Observe Stop before a replacement's start effect can rotate its own session.
+              assert.isTrue(yield* worker.runControlOnce);
+              assert.isFalse(closed);
+              const afterStop = yield* orchestrator.getThreadProjection(threadId);
+              if (lateWorkState === "held")
+                assert.isTrue(afterStop.runs.find((run) => run.id === late.id)?.queueHeld);
+              return;
+            }
             yield* worker.drain();
             yield* orchestrator.resumeQueuedRuns;
             yield* worker.drain();
             const after = yield* orchestrator.getThreadProjection(threadId);
+            if (processOwned) {
+              assert.isTrue(closed);
+              const remaining = after.runs.find((run) => run.id === late.id)!;
+              if (lateWorkState === "held") assert.isTrue(remaining.queueHeld);
+            }
             assert.deepEqual(
               after.runs.map((run) => run.status),
               ["interrupted", "queued"],
@@ -1301,5 +1340,26 @@ it.effect("last queued cancellation closes a Claude native subagent with no task
     stopWithQueue: "run.interrupt",
     cancelLastQueued: true,
     nativeOnly: true,
+  }),
+);
+
+it.effect.each([
+  { kind: "provider-wake", state: "held" },
+  { kind: "context-reset", state: "held" },
+  { kind: "user-message", state: "held" },
+  { kind: "agent-message", state: "held" },
+  { kind: "provider-wake", state: "unheld" },
+  { kind: "context-reset", state: "unheld" },
+  { kind: "provider-wake", state: "preparing" },
+  { kind: "provider-wake", state: "starting" },
+  { kind: "provider-wake", state: "running" },
+  { kind: "provider-wake", state: "completed" },
+] as const)("Stop handles $kind $state late work", ({ kind, state }) =>
+  stopEarlierBackgroundWork({
+    failedStart: true,
+    backgroundWorkAfterStop: "running",
+    processOwned: true,
+    lateWorkAfterStop: kind,
+    lateWorkState: state,
   }),
 );

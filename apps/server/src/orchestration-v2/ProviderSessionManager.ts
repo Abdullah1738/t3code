@@ -8,6 +8,8 @@ import {
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ConversationMessage,
+  type MessageId,
   OrchestrationV2RuntimeRequest,
   ProviderInstanceId,
   ProviderSessionId,
@@ -3038,11 +3040,42 @@ export const layerWithOptions = (
               if (Option.isNone(pending)) continue;
               // The probe yields to the adapter. Re-read the queue before closing,
               // and remove only this entry so a new turn/replacement wins the race.
-              const current = yield* projectionStore.getThreadRecords(input.threadId, ["runs"]);
+              let current = yield* projectionStore.getThreadRecords(input.threadId, ["runs"]);
+              const heldMessagesById = new Map<MessageId, OrchestrationV2ConversationMessage>();
+              const readMessageIds = new Set<MessageId>();
+              while (true) {
+                const messageIds = current.runs
+                  .filter(
+                    (run) =>
+                      run.ordinal > input.throughRunOrdinal &&
+                      run.status === "queued" &&
+                      run.queueHeld === true &&
+                      !readMessageIds.has(run.userMessageId),
+                  )
+                  .map((run) => run.userMessageId);
+                if (messageIds.length === 0) break;
+                // Refresh queue state in the same snapshot as the message lookup.
+                // A newly held automatic wake may need its own lookup before deciding.
+                const refreshed = yield* projectionStore.getThreadRecords(
+                  input.threadId,
+                  ["runs", "messages"],
+                  { messageIds },
+                );
+                current = refreshed;
+                for (const id of messageIds) readMessageIds.add(id);
+                for (const message of refreshed.messages) heldMessagesById.set(message.id, message);
+              }
               if (
-                current.runs.some(
-                  (run) =>
-                    run.ordinal > input.throughRunOrdinal ||
+                current.runs.some((run) => {
+                  const message = heldMessagesById.get(run.userMessageId);
+                  // Stop-held automatic work belongs to the stopped turn, not a replacement.
+                  const heldAutomaticWork =
+                    run.status === "queued" &&
+                    run.queueHeld === true &&
+                    message?.createdBy === "agent" &&
+                    (message.creationSource === "provider" || run.contextReset === true);
+                  return (
+                    (run.ordinal > input.throughRunOrdinal && !heldAutomaticWork) ||
                     (expectedAttempts.has(run.id) &&
                       expectedAttempts.get(run.id) !== run.activeAttemptId) ||
                     (["preparing", "starting", "running"].includes(run.status) &&
@@ -3050,8 +3083,9 @@ export const layerWithOptions = (
                     (input.onlyIfCancelled &&
                       ["queued", "preparing", "starting", "running", "waiting"].includes(
                         run.status,
-                      )),
-                )
+                      ))
+                  );
+                })
               )
                 continue;
               if (input.onlyIfCancelled && current.runs.at(-1)?.status !== "cancelled") continue;

@@ -538,6 +538,7 @@ function layerTest(input: {
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly beforeUnchangedWrite?: Ref.Ref<Effect.Effect<void>>;
+  readonly beforeMessageRead?: Effect.Effect<void>;
   readonly pauseResolve?: {
     readonly armed: Ref.Ref<boolean>;
     readonly paused: Deferred.Deferred<void>;
@@ -574,6 +575,25 @@ function layerTest(input: {
             : input.failReleaseEventWrites
               ? layerFailingReleaseEventSink
               : layerTestEventSink;
+  const layerManagerStores =
+    input.beforeMessageRead === undefined
+      ? layerTestStores
+      : Layer.effect(
+          ProjectionStore.ProjectionStoreV2,
+          Effect.gen(function* () {
+            const delegate = yield* ProjectionStore.ProjectionStoreV2;
+            const getThreadRecords: ProjectionStore.ProjectionStoreV2Shape["getThreadRecords"] = (
+              threadId,
+              fields,
+              filter,
+            ) =>
+              (fields.some((field) => field === "messages")
+                ? input.beforeMessageRead!
+                : Effect.void
+              ).pipe(Effect.andThen(delegate.getThreadRecords(threadId, fields, filter)));
+            return ProjectionStore.ProjectionStoreV2.of({ ...delegate, getThreadRecords });
+          }),
+        ).pipe(Layer.provideMerge(layerTestStores));
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -652,7 +672,7 @@ function layerTest(input: {
           IdAllocator.layer,
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
-          layerTestStores,
+          layerManagerStores,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
         ),
@@ -8151,6 +8171,151 @@ it.effect.each([
           hasPendingBackgroundWorkForThread: Deferred.succeed(probing, undefined).pipe(
             Effect.andThen(Deferred.await(resume)),
             Effect.as(true),
+          ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect.each([
+  { change: "new user queued", releases: false },
+  { change: "new agent queued", releases: false },
+  { change: "wake unheld", releases: false },
+  { change: "wake starting", releases: false },
+  { change: "new automatic wake", releases: true },
+] as const)("Stop revalidates $change during its message lookup", ({ change, releases }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const armed = yield* Ref.make(false);
+    const reading = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const threadId = f.threadIds[0]!;
+      const providerThread = f.providerThreadOf(threadId);
+      yield* f.eventSink.write({
+        events: [
+          {
+            id: yield* f.idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: f.now,
+            payload: providerThread,
+          },
+        ],
+      });
+      yield* f.start(threadId);
+      const seedRun = Effect.fnUntraced(function* (
+        ordinal: number,
+        createdBy: "user" | "agent",
+        creationSource: "provider" | "web" | "mcp",
+      ) {
+        const runId = f.idAllocator.derive.run({ threadId, ordinal });
+        const messageId = yield* f.idAllocator.allocate.message({ threadId, ordinal });
+        const rootNodeId = f.idAllocator.derive.rootNode({ runId });
+        const run = {
+          id: runId,
+          threadId,
+          ordinal,
+          providerInstanceId: modelSelection.instanceId,
+          modelSelection,
+          providerThreadId: providerThread.id,
+          userMessageId: messageId,
+          rootNodeId,
+          activeAttemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          status: "queued" as const,
+          queueHeld: true,
+          requestedAt: f.now,
+          startedAt: null,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: run,
+            },
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "message.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: {
+                id: messageId,
+                threadId,
+                runId,
+                nodeId: rootNodeId,
+                role: "user",
+                text: "late work",
+                attachments: [],
+                streaming: false,
+                createdBy,
+                creationSource,
+                createdAt: f.now,
+                updatedAt: f.now,
+              },
+            },
+          ],
+        });
+        return run;
+      });
+      const wake = yield* seedRun(2, "agent", "provider");
+      yield* Ref.set(armed, true);
+      const stopping = yield* f.manager
+        .stopBackgroundWork({
+          threadId,
+          throughRunOrdinal: 1,
+          onlyIfCancelled: false,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(reading);
+      if (change === "wake unheld" || change === "wake starting") {
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: {
+                ...wake,
+                queueHeld: false,
+                status: change === "wake starting" ? "starting" : "queued",
+              },
+            },
+          ],
+        });
+      } else {
+        yield* seedRun(
+          3,
+          change === "new user queued" ? "user" : "agent",
+          change === "new user queued" ? "web" : change === "new agent queued" ? "mcp" : "provider",
+        );
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const released = yield* Fiber.join(stopping);
+      assert.equal(released.length, releases ? 1 : 0);
+      assert.equal(Option.isNone(yield* f.manager.get(f.providerSessionId)), releases);
+      assert.equal((yield* Ref.get(state)).closeCount, releases ? 1 : 0);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          backgroundTasksEndWithProcess: true,
+          hasPendingBackgroundWorkForThread: Effect.succeed(true),
+          beforeMessageRead: Ref.getAndSet(armed, false).pipe(
+            Effect.flatMap((pause) =>
+              pause
+                ? Deferred.succeed(reading, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+                : Effect.void,
+            ),
           ),
         }),
       ),
