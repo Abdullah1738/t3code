@@ -303,15 +303,6 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         }
       }
       if (ready()) {
-        // Chats tick independently so one slow turn never holds up another chat.
-        for (const chat of chats.all()) {
-          if (chat.parts.busy) continue;
-          chat.parts.busy = true;
-          const revision = chat.revision;
-          void chat.parts.router.tick().then(() => {
-            if (revision === chat.revision && seen.synchronized) chat.controlsPending = false;
-          }, () => log("router-tick-failed")).finally(() => { chat.parts.busy = false; });
-        }
         if (Date.now() - backendCheckedAt >= 30_000) {
           backendCheckedAt = Date.now();
           await backend.health().then(() => { health.backendLastOk = Date.now(); }, () => {});
@@ -323,6 +314,14 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
       void chat.parts.delivery.tick().catch(() => log("sender-failed"));
+      if (ready()) void chat.parts.router.checkInboundLatency().catch(() => log("inbound-latency-check-failed"));
+      if (ready() && !chat.parts.busy) {
+        chat.parts.busy = true;
+        const revision = chat.revision;
+        void chat.parts.router.tick().then(() => {
+          if (revision === chat.revision && seen.synchronized) chat.controlsPending = false;
+        }, () => log("router-tick-failed")).finally(() => { chat.parts.busy = false; });
+      }
       if (ready()) void chat.parts.router.checkFailedInbound().catch(() => log("failed-inbound-check-failed"));
     }
   }, 1_000);
