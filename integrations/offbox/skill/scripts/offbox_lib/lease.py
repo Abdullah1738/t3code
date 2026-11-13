@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+                     file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -25,6 +25,43 @@ DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w
 # Template sizes for new boxes and resumes. The harness template is large too (2026-11-01): xlarge is picked per run
 # by auto_size for container stacks; 0 of ~2,300 harness-template runs in 13-31 Oct hit an OOM.
 DEFAULT_SIZE = {"crpko-harness": "large", "crpko-go": "large", "crpko-node": "large", "generic": "default"}
+
+
+class PinnedLeaseError(OffboxError):
+    """A pin requires retaining the disk and its lease even when the backend cannot find it."""
+
+
+def pinned_until(con, box_id: str) -> float:
+    row = con.execute("SELECT pinned_until FROM leases WHERE box_id=?", (box_id,)).fetchone()
+    return (row[0] or 0) if row else 0
+
+
+def check_deletion(con, box_id: str) -> None:
+    if kv_get(con, 'delete_pending:' + box_id) is not None:
+        raise OffboxError(f"{box_id} deletion is unresolved; keep and reuse are blocked. "
+                          f"Retry `offbox release {box_id} --delete` to confirm deletion of this same box", code=2)
+
+
+@contextlib.contextmanager
+def unpinned(con, box_id: str):
+    # Separate from the run's box lock: keep must work during a run, and its acknowledgement must serialize
+    # with deletion, including the network request. A stale pool/reaper selection cannot overrule a new pin.
+    with file_lock('pin-' + box_id, timeout=120):
+        until = pinned_until(con, box_id)
+        if until > now():
+            by = kv_get(con, 'pin_owner:' + box_id) or 'an unknown thread (legacy pin)'
+            raise PinnedLeaseError(f"{box_id} is pinned by {by} until {iso(until)}; "
+                                   "refusing to delete or forget it", code=2)
+        yield
+
+
+def forget_box(con, box_id: str, kind: str, detail: str) -> None:
+    with unpinned(con, box_id):
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        from . import allocation
+        allocation.clear_resume(con, box_id)
+        con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
+        event(con, box_id, kind, detail)
 
 
 def _rank(size: str | None) -> int:
@@ -448,25 +485,22 @@ def _fit_new(sz: str, size: str | None) -> str:
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
     """-> (sandbox dict, source label, base_remote_dir or None, size).
 
-    Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
-    deleted the template's data."""
+    Source "recipe:<template>" is a box that _bring_up builds when this backend has no usable template."""
     from . import home
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
     name = box_name(me, rk)
-    fresh_on_standby = False
     if not fresh:
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
+                # Saved on the home server, which is down: Boat never had it.
                 say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
                 base = None
-                fresh_on_standby = True
             elif not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
@@ -474,7 +508,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                                f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
             if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
                 say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
         if brow:
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
@@ -488,24 +522,21 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
         # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
-        # which would mark it gone. Such a caller starts from a fresh box instead.
+        # which would mark it gone. Such a caller builds its own box from the recipe instead.
         trow = con.execute(f"SELECT * FROM templates WHERE name=? AND {mine()}", (tname,)).fetchone()
-        if not trow and tname != "generic":
-            trow = con.execute(f"SELECT * FROM templates WHERE name='generic' AND {mine()}").fetchone()
-            if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
-                say(f"template {tname} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
-            elif trow:
-                say(f"template {tname} not built yet; using generic")
+        sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
         if trow:
-            sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
             s = _start_from(con, "templates", trow, sz, name, idem)
             if s:
                 return s, f"template:{trow['name']}", None, sz
             say(f"template {trow['name']} is gone (boat deleted its data); building this box from its recipe "
                 f"instead, which takes a few minutes. The reaper rebuilds the template.")
-            s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
-            return s, f"recipe:{trow['name']}", None, sz
+        else:
+            backend = "home server" if api.BACKEND == "server" else "boat.dev"
+            say(f"template {tname} not built on the {backend}; building this box from its recipe (a few minutes). "
+                f"offbox template build {tname} makes the next one fast.")
+        s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
+        return s, f"recipe:{tname}", None, sz
     sz = _fit_new(size or DEFAULT_SIZE.get(tname or "generic", "default"), size)
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
@@ -517,15 +548,20 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 RECIPE_TIMEOUT_S = 15 * 60
 
 
+def quarantine(box_id: str, why: str) -> None:
+    con = db()
+    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
+    event(con, box_id, "lease_quarantined", why[:300])
+    con.commit()
+
+
 def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
     """A box whose recipe did not finish cleanly is never handed out or reused: it may be half built, or its recipe
     may still be changing it. Quarantine it (pools and reuse only take running/stopped leases), stop the recipe, and
     delete the box: deletion is the one proof the recipe can no longer touch it. A failed delete leaves the lease
     quarantined and the reaper deletes it on a later pass. True once deleted."""
+    quarantine(box_id, why)
     con = db()
-    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
-    con.commit()
-    event(con, box_id, "lease_quarantined", why[:300])
     if pid is not None:
         try:
             api.cmd_kill(box_id, pid)
@@ -754,9 +790,7 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
         if is_recipe:
             _retire_recipe_box(box_id, None, f"bring-up failed before the recipe finished: {e}")
         else:
-            con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-            con.commit()
-            event(con, box_id, "lease_gone", "supply out")
+            forget_box(con, box_id, "lease_gone", "supply out")
         raise
     except OffboxError as e:
         # A recipe-sourced box that failed anywhere in bring-up (before, during or after the recipe) is blank or
@@ -798,11 +832,8 @@ class _ResumeExpired(Exception):
 
 def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    forget_box(con, box_id, "lease_expired", why)
     say(f"lease {box_id} expired ({why}); starting a new box")
-    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    from . import allocation
-    allocation.clear_resume(con, box_id)
-    event(con, box_id, "lease_expired", why)
 
 
 class DiskTooBig(OffboxError):
@@ -870,6 +901,7 @@ class BoxNotReady(OffboxError):
     def __init__(self, box_id: str, state: dict, cause: OffboxError):
         super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
                          code=cause.code, started=cause.started, outage=cause.outage)
+        self.status = getattr(cause, 'status', None)
         self.box_id, self.state = box_id, state
 
 
@@ -883,6 +915,10 @@ class ResumeUnresolved(OffboxError):
 
 class ResumeProvisionStalled(OffboxError):
     """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+    def __init__(self, message):
+        from . import home
+        super().__init__(message, outage=home.may_fail_over())
 
 
 def _wait_unanswered_resume(con, box_id):
@@ -1142,6 +1178,7 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
+    check_deletion(con, row['box_id'])
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \
@@ -1205,16 +1242,16 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                                 code=EXIT_BUSY) from None
         raise
     if s is None or s.get("state") in ("error", "cancelled"):
-        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        allocation.clear_resume(con, box_id)
-        event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
+        forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
     st = s.get("state")
     if st in api.STOPPING_STATES:
-        raise ArchivingSkip(f"{box_id} is {st}; skipping it for now", code=EXIT_BUSY)
+        queued = skip_archiving or allocation.in_queue()
+        action = "skipping it for now" if queued else "retry in a moment"
+        raise ArchivingSkip(f"{box_id} is {st}; {action}", code=EXIT_BUSY if queued else EXIT_INFRA)
     if st == "archiving":
         if skip_archiving or allocation.in_queue():
             action = "skipping it for now" if skip_archiving else "waiting to resume it"
@@ -1483,13 +1520,13 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
-            from . import allocation
-            allocation.clear_resume(con, box_id)
             # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
-                con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-                con.commit()
+                try:
+                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}")
+                except PinnedLeaseError as pin:
+                    say(str(pin))
             return False
         raise
     ssh_sync.close_master(box_id)
@@ -1502,17 +1539,24 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
     return True
 
 
-def delete_box(con, box_id: str, reason: str) -> bool:
+def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
     from .spend import record_final_usage
-    record_final_usage(con, box_id)
-    ssh_sync.close_master(box_id)
-    d = api.delete(box_id)
-    op = (d.get("operation") or {}).get("id")
-    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    from . import allocation
-    allocation.clear_resume(con, box_id)
-    clear_prune_hold(con, box_id)  # deleted: no remote process survives
-    event(con, box_id, "delete", f"{reason} op={op}")
+    with unpinned(con, box_id):
+        if usage:
+            record_final_usage(con, box_id)
+        ssh_sync.close_master(box_id)
+        # The lock cannot survive a killed client or a lost response. Fence keep/reuse durably before sending;
+        # an explicit retry may delete this same box again, but cannot pin new work onto the doomed disk.
+        kv_set(con, 'delete_pending:' + box_id, reason)
+        event(con, box_id, 'delete_pending', reason)
+        d = api.delete(box_id)
+        op = (d.get("operation") or {}).get("id")
+        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
+        from . import allocation
+        allocation.clear_resume(con, box_id)
+        con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
+        clear_prune_hold(con, box_id)  # deleted: no remote process survives
+        event(con, box_id, "delete", f"{reason} op={op}")
     return True
 
 

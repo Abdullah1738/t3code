@@ -110,6 +110,21 @@ export function createReadonlyReplica(
         throw new Error("Readonly export requires a WAL source");
     };
     setupReader(source);
+    const assertRedactionComplete = () => {
+      if (
+        source
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_thread_redaction_recovery'")
+          .get() &&
+        source
+          .prepare("SELECT 1 FROM ardud_thread_redaction_recovery WHERE pending=1 LIMIT 1")
+          .get()
+      ) {
+        const error = new Error("Readonly export is paused for incomplete redaction maintenance.");
+        Object.assign(error, { code: "REDACTION_PENDING" });
+        throw error;
+      }
+    };
+    assertRedactionComplete();
     const baseFilename = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
@@ -1035,6 +1050,7 @@ export function createReadonlyReplica(
       /** One bounded page; false means caught up, ready for the next interval. */
       step(): boolean {
         try {
+          assertRedactionComplete();
           return stepOnce();
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of

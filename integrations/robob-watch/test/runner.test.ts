@@ -297,7 +297,7 @@ test("a trigger file runs the check within a couple of seconds, long before its 
   expect(readCalls().some(call => call.args.includes("robob-watch trig"))).toBe(true);
 }, 20_000);
 
-test("timeouts are transient: no alert before 10 min of failing, fast retry; a real error still alerts after 5", async () => {
+test("timeouts alert into the burst immediately but pause only after ten minutes, with fast retry", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
   const slowEnv = { ...env, ROBOB_WATCH_CHECK_TIMEOUT_MS: "300" };
@@ -309,18 +309,21 @@ test("timeouts are transient: no alert before 10 min of failing, fast retry; a r
   };
   expect(cli("add", "--id", "slow", "--title", "Slow", "--check", "sleep 5", "--mode", "notify", "--interval", "30", "--no-prime").exitCode).toBe(0);
   const file = join(sandbox, "root/watchers/slow/state.json");
-  // Failing x4 for 2 minutes: the 5th timeout must not alert yet, and must retry within 2 min, not 30s x 8 = 4 min.
+  // Early timeouts still retry within two minutes and do not pause the check.
   writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 4, failure_alerted: false,
     failing_since: new Date(Date.now() - 120_000).toISOString() }));
   await runSlow(2_000);
-  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: false });
+  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
+  expect(state("slow").failure_paused_at).toBeUndefined();
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
-  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(0);
-  // The same run of timeouts, 11 minutes long: now it alerts once.
+  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 6, failure_alerted: true });
-  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
+  expect(state("slow").failure_paused_at).toBeString();
+  const notices = readCalls().filter(call => call.cli === "telegram");
+  expect(notices).toHaveLength(2);
+  expect(notices.every(call => call.args[call.args.indexOf("--burst-key") + 1] === "watcher-failure:slow")).toBe(true);
 }, 20_000);
 
 test("checks run with bounded concurrency; queue time does not count against the timeout; runs are timed", async () => {

@@ -1,3 +1,9 @@
+import {
+  claudeRecoveryExcluded,
+  isAutomaticClaudeRecovery,
+  nextLaunchRecovery,
+} from "./launchRecovery.ts";
+import * as Random from "effect/Random";
 import * as DelegatedTaskRecoveryService from "./DelegatedTaskRecoveryService.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
@@ -50,7 +56,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
-import type { ProjectionStoreV2Error } from "./ProjectionStore.ts";
+import { ProjectionStoreReadError, type ProjectionStoreV2Error } from "./ProjectionStore.ts";
 import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
@@ -581,6 +587,13 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly relatedThreadIds?: ReadonlyArray<ThreadId>;
   readonly relatedProviderThreadIds?: ReadonlyArray<ProviderThreadId>;
   readonly shouldStartProviderTurn?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly loadClaudeRefusal?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly loadRecoveryAdmission?: (
+    providerThread: OrchestrationV2ProviderThread,
+  ) => Effect.Effect<
+    { readonly current: boolean; readonly refused: boolean },
+    ProjectionStoreV2Error
+  >;
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
@@ -997,10 +1010,12 @@ export const layer: Layer.Layer<
           input.session.subscribeEvents === undefined
             ? { events: input.session.events, close: Effect.void }
             : yield* input.session.subscribeEvents;
+        // Admission can stop before the detached reader registers its finalizers.
+        const closeSubscription = yield* Effect.cached(eventSubscription.close);
         const inheritedBackgroundTurnItems = yield* (
           input.loadInheritedBackgroundTurnItems?.() ?? Effect.succeed([])
         ).pipe(
-          Effect.onError(() => eventSubscription.close),
+          Effect.onError(() => closeSubscription),
           Effect.mapError(
             (cause) =>
               new RunExecutionStartError({
@@ -1044,18 +1059,45 @@ export const layer: Layer.Layer<
           if ((yield* Ref.get(rootRunFinalized)) || (yield* Ref.get(startupFailurePending))) {
             return;
           }
+          const sessionRefused =
+            (yield* Ref.get(latestProviderThread)).nativeMetadata?.claudeRefusalObserved === true ||
+            (terminal.status === "failed" &&
+              input.providerThread.driver === "claudeAgent" &&
+              input.loadClaudeRefusal !== undefined &&
+              (yield* input.loadClaudeRefusal()));
+          const launch =
+            terminal.status === "failed"
+              ? nextLaunchRecovery({
+                  thread: input.appThread,
+                  run: input.run,
+                  failure: terminal.failure,
+                  driver: input.providerThread.driver,
+                  automated:
+                    input.message.createdBy === "system" || input.message.createdBy === "agent",
+                  text: input.message.text,
+                  jitter: yield* Random.next,
+                })
+              : undefined;
           if (
             terminal.status === "failed" &&
             terminal.threadDisposition === "reusable" &&
+            !sessionRefused &&
+            (terminal.failure.claudeAccess === undefined ||
+              !claudeRecoveryExcluded(terminal.failure)) &&
             (input.shouldFinalizeRun === undefined || (yield* input.shouldFinalizeRun())) &&
-            (yield* recovery.shouldResume({
-              thread: input.appThread,
-              run: input.run,
-              failure: terminal.failure,
-              ...(input.loadDelegatedTask === undefined
-                ? {}
-                : { loadDelegatedTask: input.loadDelegatedTask }),
-            }))
+            (launch !== undefined ||
+              ((input.run.launchRecovery === undefined ||
+                (input.run.launchRecovery.kind === "model_access" &&
+                  (terminal.failure.claudeAccess?.beforeResponse === false ||
+                    input.run.launchRecovery.replayAllowed === false))) &&
+                (yield* recovery.shouldResume({
+                  thread: input.appThread,
+                  run: input.run,
+                  failure: terminal.failure,
+                  ...(input.loadDelegatedTask === undefined
+                    ? {}
+                    : { loadDelegatedTask: input.loadDelegatedTask }),
+                }))))
           ) {
             const now = yield* DateTime.now;
             const attemptOrdinal = input.attempt.attemptOrdinal + 1;
@@ -1067,7 +1109,20 @@ export const layer: Layer.Layer<
               ...input.run,
               status: "starting" as const,
               activeAttemptId: attemptId,
-              transientRecovery: { firstError: terminal.failure, since: DateTime.formatIso(now) },
+              ...(launch === undefined
+                ? {
+                    transientRecovery: {
+                      firstError: terminal.failure,
+                      since: DateTime.formatIso(now),
+                    },
+                  }
+                : {
+                    modelSelection: launch.modelSelection,
+                    launchRecovery: {
+                      ...launch.recovery,
+                      since: DateTime.formatIso(now),
+                    },
+                  }),
               completedAt: null,
             };
             const attempt = {
@@ -1092,11 +1147,22 @@ export const layer: Layer.Layer<
                 payload: {
                   ...(yield* Ref.get(latestProviderThread)),
                   status: "idle" as const,
+                  ...(launch?.fresh === true
+                    ? {
+                        nativeThreadRef: null,
+                        nativeConversationHeadRef: null,
+                        nativeMetadata: null,
+                        contextUsage: null,
+                      }
+                    : {}),
                   updatedAt: now,
                 },
               },
             ];
-            yield* eventSink.writeIfRunCurrent({
+            const retryWrite = yield* eventSink.writeIfRunCurrent({
+              ...(input.providerThread.driver === "claudeAgent"
+                ? { unlessClaudeRefused: input.providerThread.id }
+                : {}),
               threadId: input.run.threadId,
               runId: input.run.id,
               activeAttemptId: input.attempt.id,
@@ -1116,15 +1182,24 @@ export const layer: Layer.Layer<
               ),
               effects: [
                 {
-                  id: `effect:delegated-transient-resume:${input.run.id}`,
+                  id:
+                    launch === undefined
+                      ? `effect:delegated-transient-resume:${input.run.id}`
+                      : `effect:launch-recovery:${input.run.id}:${attemptOrdinal}`,
                   commandId: input.commandId,
                   threadId: input.run.threadId,
-                  request: { type: "provider-turn.start", runId: input.run.id, retryDelayMs: 1000 },
+                  request: {
+                    type: "provider-turn.start",
+                    runId: input.run.id,
+                    retryDelayMs: launch?.recovery.delayMs ?? 1000,
+                  },
                 },
               ],
             });
-            yield* Ref.set(rootRunFinalized, true);
-            return;
+            if (retryWrite.committed) {
+              yield* Ref.set(rootRunFinalized, true);
+              return;
+            }
           }
           const providerThread = yield* Ref.get(latestProviderThread);
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -1726,12 +1801,18 @@ export const layer: Layer.Layer<
               ),
           ),
           Effect.ensuring(endPreviewActivity),
-          Effect.ensuring(eventSubscription.close),
+          Effect.ensuring(closeSubscription),
           // ardud: provider ingest can wait; it must not inherit a foreground lane from
           // the request that started the turn.
           NodeSqliteClient.backgroundReads,
           Effect.scoped,
           Effect.forkDetach,
+        );
+
+        const stopProviderEventIngestion = Fiber.interrupt(providerEventFiber).pipe(
+          // The reader may be interrupted before it registers these finalizers.
+          Effect.ensuring(endPreviewActivity),
+          Effect.ensuring(closeSubscription),
         );
 
         // A provider turn is a sign that the session is still alive. Keep
@@ -1771,6 +1852,10 @@ export const layer: Layer.Layer<
             }),
           );
         }
+        const automaticClaudeRecovery = isAutomaticClaudeRecovery(
+          input.providerThread.driver,
+          input.run,
+        );
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -1791,19 +1876,64 @@ export const layer: Layer.Layer<
           message: input.message,
           modelSelection: standardSelection,
           runtimePolicy: input.runtimePolicy,
+          ...(automaticClaudeRecovery ? { automaticRecovery: true as const } : {}),
           ...(appContext.length === 0 ? {} : { appContext }),
         };
-        // Check after the context read: ingestion can settle the run while
-        // it awaits. A failed ownership read fails the start below.
-        const shouldStart =
-          input.shouldStartProviderTurn === undefined
-            ? Exit.succeed(true)
-            : yield* Effect.exit(input.shouldStartProviderTurn());
+        const admission = yield* Effect.exit(
+          automaticClaudeRecovery
+            ? (input.loadRecoveryAdmission?.(input.providerThread) ??
+                Effect.fail(
+                  new ProjectionStoreReadError({
+                    threadId: input.run.threadId,
+                    cause: "Automatic recovery requires an ownership and refusal snapshot.",
+                  }),
+                ))
+            : (input.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
+                Effect.map((current) => ({ current, refused: false })),
+              ),
+        ).pipe(Effect.onInterrupt(() => stopProviderEventIngestion));
+        const shouldStart = Exit.map(admission, (state) => state.current);
         if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
-          yield* Fiber.interrupt(providerEventFiber);
+          yield* stopProviderEventIngestion;
           return;
         }
 
+        const refused =
+          automaticClaudeRecovery &&
+          ((Exit.isSuccess(admission) && admission.value.refused) ||
+            (yield* Ref.get(latestProviderThread)).nativeMetadata?.claudeRefusalObserved === true);
+        if (refused) {
+          yield* stopProviderEventIngestion;
+          yield* writeFinalRunEvents({
+            run: input.run,
+            rootNode: input.rootNode,
+            checkpointScope: input.checkpointScope,
+            providerThread: yield* Ref.get(latestProviderThread),
+            attempt: input.attempt,
+            writeIfRunCurrent: { activeAttemptId: input.attempt.id, expectedStatus: "running" },
+            terminal: makeFailedTerminalEvent(
+              makeProviderFailure({
+                class: "provider_error",
+                category: "content_filter",
+                code: "model_refusal",
+                message: "Automatic recovery excluded after a native session refusal.",
+              }),
+              (yield* Ref.get(latestTurnItemOrdinal)) + 1,
+            ),
+            failureItemPersisted: false,
+            refreshAfterTurn,
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new RunExecutionStartError({
+                  commandId: input.commandId,
+                  runId: input.run.id,
+                  cause,
+                }),
+            ),
+          );
+          return;
+        }
         const compact =
           input.message.attachments.length === 0 &&
           input.message.text.trim().toLowerCase() === "/compact";
@@ -1846,7 +1976,7 @@ export const layer: Layer.Layer<
         yield* Effect.andThen(shouldStart, startTurn).pipe(
           // The event fiber is detached; an interrupted start must not leak it.
           Effect.onInterrupt(() =>
-            stopStartingRun.pipe(Effect.ensuring(Fiber.interrupt(providerEventFiber))),
+            stopStartingRun.pipe(Effect.ensuring(stopProviderEventIngestion)),
           ),
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
@@ -1871,7 +2001,7 @@ export const layer: Layer.Layer<
                       : Ref.set(startupFailurePending, true),
                   ),
                   Effect.andThen(stopStartingRun),
-                  Effect.andThen(Fiber.interrupt(providerEventFiber)),
+                  Effect.andThen(stopProviderEventIngestion),
                   Effect.andThen(Ref.get(latestProviderThread)),
                   Effect.flatMap((providerThread) =>
                     Ref.get(latestTurnItemOrdinal).pipe(

@@ -12,6 +12,8 @@ import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
+import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
+
 // Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
 export const READ_CHECK_FAILED = 75;
 const exec = promisify(execFile);
@@ -834,6 +836,7 @@ async function main(args) {
       });
     },
   };
+  const hold = await acquireInstallHold();
   try {
     await install(ops, { rollback });
   } catch (e) {
@@ -885,15 +888,47 @@ async function main(args) {
     }
     throw e;
   } finally {
-    // Our own unswapped staging copy is useless after a failure; drop it so the
-    // next run does not trip on it, but only while the live app is in place.
-    if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
-      await fs.rm(next, { recursive: true, force: true });
-      if (quitAt !== undefined) await phase("staging_removed", { path: next });
-    }
-    if (mount) {
-      await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
-      await fs.rmdir(mount).catch(() => {});
+    try {
+      // Our own unswapped staging copy is useless after a failure; drop it so the
+      // next run does not trip on it, but only while the live app is in place.
+      if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
+        await fs.rm(next, { recursive: true, force: true });
+        if (quitAt !== undefined) await phase("staging_removed", { path: next });
+      }
+      if (mount) {
+        await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
+        await fs.rmdir(mount).catch(() => {});
+      }
+    } finally {
+      await finishInstallHold({
+        release: hold.release,
+        quitStarted: quitAt !== undefined,
+        healthy: async () => {
+          const health = await get("/api/ardud/control/health");
+          if (health.ok !== true || health.status !== "healthy") return false;
+          if (!swapped) return true;
+          const report = await get("/api/ardud/control/install-report");
+          return Boolean(report.bootId && report.bootId !== oldBootId);
+        },
+        onWaiting: async () => {
+          await phase("recovery_waiting", {
+            swapped,
+            message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
+            holdBy: hold.by,
+            holdPid: hold.pid,
+          });
+          await exec(
+            "/Users/ardud/.bun/bin/bun",
+            [
+              "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
+              "notify", "--source", "Robob install", "--severity", "attention",
+              "--key", `robob-install:${stamp}:recovery`,
+              "--text", "Robob install needs recovery. Its heartbeat is still held. Keep the installer running while repairing or completing a compatible rollback, then reopen Robob. Check the install log for the hold PID.",
+            ],
+            { timeout: 5000 },
+          ).catch(() => {});
+        },
+      });
     }
   }
 }

@@ -118,11 +118,47 @@ class BackgroundOutputTests(Isolated):
                     self.assertIn('no stream checkpoint', err)
                     remote.unlink()
 
+    def test_remote_log_pid_namespace_matrix(self):
+        home = Path(self.tmp.name) / 'remote-home'
+        for process_id, wrapper_pid, log_pid in ((1001, None, 1001), (None, 4242, 4242),
+                                                 (4242, None, 4242), (1001, 4242, 4242),
+                                                 (1001, 1002, 1002), (None, None, None)):
+            for history_error in (False, True):
+                with self.subTest(process_id=process_id, wrapper_pid=wrapper_pid, history_error=history_error):
+                    self.path.unlink(missing_ok=True)
+                    self.con.execute('UPDATE runs SET process_id=?,wrapper_pid=? WHERE run_id=?',
+                                     (process_id, wrapper_pid, 'run-x'))
+                    self.con.commit()
+                    self.history.side_effect = common.OffboxError('history failed') if history_error else self.empty
+                    remote = home / f'.ascii/processes/{log_pid}.log' if log_pid else None
+                    if remote:
+                        remote.parent.mkdir(parents=True, exist_ok=True)
+                        remote.write_bytes(b'wrapper output retained\n')
+                    self.box_get.return_value = dict(state='running')
+                    real_run = subprocess.run
+                    commands = []
+                    def ssh(argv, **kw):
+                        commands.append(argv[-1])
+                        return real_run(['bash', '-c', argv[-1]], env=dict(os.environ, HOME=str(home)), **kw)
+                    with patch.object(ssh_sync, 'ssh_base', return_value=['ssh']), \
+                            patch.object(misc.subprocess, 'run', side_effect=ssh):
+                        code, out, _ = self.invoke()
+                    self.assertEqual(code, 0 if remote else 1)
+                    self.assertEqual(out, remote.read_text() if remote else '')
+                    if remote:
+                        self.assertIn(f'.ascii/processes/{log_pid}.log', commands[0])
+                        if process_id and process_id != log_pid:
+                            self.assertNotIn(f'.ascii/processes/{process_id}.log', commands[0])
+                        remote.unlink()
+                    else:
+                        self.assertNotIn('.ascii/processes/', commands[0])
+
     def test_stuck_empty_page_falls_back_without_looping(self):
         self.history.side_effect = lambda *a, **kw: dict(data='', nextOffset=0, size=6, done=False)
         code, out, err = self.invoke()
         self.assertEqual((code, out), (1, ''))
-        self.assertIn('no output recorded', err)
+        self.assertIn('this output is incomplete', err)
+        self.assertNotIn('no output', err)
         self.assertEqual(self.history.call_count, 3)
 
     def test_receipt_without_command_id_can_recover_remote_copy(self):
@@ -214,13 +250,22 @@ class BackgroundOutputTests(Isolated):
         self.assertEqual(self.path.read_bytes(), b'')
         self.assertFalse(list(self.path.parent.glob('*.remote.*')))
 
-    def test_stopped_deleted_and_busy_boxes_are_not_accessed_over_ssh(self):
-        for box in (None, dict(state='archived'), dict(state='running')):
+    def test_stopped_and_deleted_boxes_are_not_accessed_over_ssh(self):
+        for box in (None, dict(state='archived')):
             with self.subTest(box=box):
                 self.box_get.return_value = box
-                guard = common.file_lock('box-bx_a', timeout=0) if box and box['state']=='running' else contextlib.nullcontext()
-                with guard, patch.object(misc.subprocess, 'run', side_effect=AssertionError('no ssh')):
+                with patch.object(misc.subprocess, 'run', side_effect=AssertionError('no ssh')):
                     self.assertEqual(self.invoke()[0], 1)
+
+    def test_empty_log_fallback_can_read_a_busy_box(self):
+        self.box_get.return_value = dict(state='running')
+        def ssh(argv, **kw):
+            kw['stdout'].write(b'retained output\n')
+            return subprocess.CompletedProcess(argv, 0)
+        with common.file_lock('box-bx_a', timeout=0), patch.object(misc.subprocess, 'run', side_effect=ssh):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, 'retained output\n'))
+        self.assertIn('no stream checkpoint', err)
 
     def test_foreground_empty_log_keeps_existing_behavior(self):
         self.con.execute("UPDATE runs SET mode='fg' WHERE run_id='run-x'")

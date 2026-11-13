@@ -8,8 +8,8 @@ from unittest.mock import patch
 import urllib.error
 
 import talabat_http_checkout as h
-from test.test_talabat_quote import fixture, card_fixture
-from test.test_talabat_place_contract import draft_inputs
+from test_talabat_quote import fixture, card_fixture
+from test_talabat_place_contract import draft_inputs
 
 
 FLOW = '10000000-0000-4000-8000-000000000001'

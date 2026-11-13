@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import bases, identity, runs
+from test_capacity import Isolated
 
 TEMPLATES = runs.REPO_RECIPES_DIR.parent
 KEY = 'crpko-devops'
@@ -137,7 +139,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.recipes = self.home/'templates/repos'
         self.recipes.mkdir(parents=True)
         (self.recipes.parent/'tools').mkdir()
-        for source in (TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
+        for source in (TEMPLATES/'tools/fetch.sh', TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
             target = self.recipes.parent/source.relative_to(TEMPLATES)
             # Keep all fake installs in a temporary tree, including the absolute Ruby check.
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
@@ -155,7 +157,7 @@ class CrpkoSetupTests(unittest.TestCase):
         (self.home/'state').write_text(json.dumps(self.state))
         with patch.object(runs,'REPO_RECIPES_DIR',self.recipes), \
              patch.object(runs,'DOCKER_REPAIR',':'), patch.object(runs,'LDCACHE_REPAIR',':'), \
-             patch.object(runs,'GO_REPAIR',':'):
+             patch.object(runs,'GO_REPAIR',':'), patch.object(runs.userns,'setup',return_value=':'):
             script = runs.remote_script('w/repo','.',[command],None,'run-test',repo_key=KEY,node=node)
         result = subprocess.run(['bash','-c',script],env=self.env,capture_output=True,text=True,timeout=15)
         self.state = json.loads((self.home/'state').read_text())
@@ -432,7 +434,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn('offbox_crpko_tools\n',body)
 
 
-class RepoKeyTests(unittest.TestCase):
+class RepoKeyTests(Isolated):
     def test_origin_defines_key_for_main_ovnfs_and_tmp_clones(self):
         urls=['https://github.com/Equicom-Crypto/crpko-devops.git',
               'git@github.com:Equicom-Crypto/crpko-devops.git',

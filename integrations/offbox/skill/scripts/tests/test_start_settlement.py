@@ -133,6 +133,32 @@ class StartPaths(Isolated):
         self.assertIn('live output unavailable', output)
         self.assertEqual(send.call_count, 1)
 
+    def test_normal_cmd_start_records_the_api_id_unchanged(self):
+        a = cli.build_parser().parse_args(['run', '--remote', '--bg', '--', 'go test ./...'])
+        with patch.object(api, 'cmd_start', return_value={'processId': 1001, 'commandId': 'cmd-own'}), \
+                patch.object(api, 'get', return_value={'state': 'running'}), \
+                patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.cmd_run(a, self.me), 0)
+        row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.assertEqual((row['process_id'], row['command_id'], row['wrapper_pid']), (1001, 'cmd-own', None))
+
+    def test_start_recovery_records_only_wrapper_pid_foreground_and_background(self):
+        for backend in ('boat', 'server'):
+            for bg in (False, True):
+                for wrapper in (4242, 1002):
+                    with self.subTest(backend=backend, bg=bg, wrapper=wrapper), \
+                            patch.object(api, 'BACKEND', backend), \
+                            patch.object(api, 'cmd_status') as status, patch.object(api, 'cmd_kill') as kill:
+                        code, row, _, _ = self.run_cli(api.NetworkError('reset'),
+                                                       start_check.Result('started', 7, wrapper), bg=bg)
+                        self.assertEqual(code, 0 if bg else 7)
+                        self.assertIsNone(row['process_id'])
+                        self.assertEqual(row['wrapper_pid'], wrapper)
+                        self.assertEqual((row['status'], row['exit_code']), ('failed', 7))
+                        status.assert_not_called()
+                        kill.assert_not_called()
+
     def test_unknown_or_held_claim_settles_and_quarantines(self):
         for result in (start_check.Result(), start_check.Result('started', pid=12345)):
             code, row, output, send = self.run_cli(api.NetworkError('reset'), result, bg=True)

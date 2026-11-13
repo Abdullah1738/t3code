@@ -141,19 +141,6 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
           auth: managedAuth,
           version: draft.version ?? executable.value.version,
           usageLimits,
-          models: draft.models.map((model) => ({
-            ...model,
-            ...(model.capabilities
-              ? {
-                  capabilities: {
-                    ...model.capabilities,
-                    optionDescriptors: (model.capabilities.optionDescriptors ?? []).filter(
-                      (option) => option.id !== "serviceTier",
-                    ),
-                  },
-                }
-              : {}),
-          })),
           setup,
           runtimePaths,
           ...(draft.slashCommands

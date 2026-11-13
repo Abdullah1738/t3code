@@ -624,6 +624,12 @@ class GenerateTests(HarnessTestCase):
                 patterns = [re.compile(group["matcher"]) for group in hooks[event]]
                 for tool in ("mcp__cua-driver__click", "mcp__cua_driver__click", "mcp__node_repl__js"):
                     self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), (event, tool))
+        for hooks in (claude_hooks, codex_hooks):
+            catch_all = [g for g in hooks["PostToolUse"] if g["matcher"] == ".*"]
+            self.assertEqual(len(catch_all), 1)
+            self.assertTrue(catch_all[0]["hooks"][0]["command"].endswith("--card-mask"))
+            for tool in ("Bash", "mcp__dia__dia_evaluate", "mcp__preview__snapshot"):
+                self.assertTrue(re.fullmatch(catch_all[0]["matcher"], tool))
         self.assertEqual(claude_hooks["PostToolUseFailure"][0]["matcher"],
                          codex_hooks["PostToolUse"][0]["matcher"])
 

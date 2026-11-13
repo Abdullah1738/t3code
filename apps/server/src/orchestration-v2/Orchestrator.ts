@@ -1,4 +1,9 @@
 import {
+  claudeRecoveryResult,
+  continuedLaunchRecovery,
+  launchRecoveryDelayMs,
+} from "./launchRecovery.ts";
+import {
   emptyDelegatedRecoveryCounts,
   type DelegatedRecoveryCounts,
 } from "../ardud/observability/StartupPhaseLog.ts";
@@ -1609,7 +1614,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? activeProviderThread
         : storedQueuedProviderThread;
       const providerThreadChanged = queuedProviderThread.id !== providerThreadId;
-      const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
+      const restartWait = yield* projectionStore.getTurnItem({
+        threadId,
+        itemId: TurnItemId.make(
+          `turn-item:restart-pacing:${queuedRun.restartContinuationOfRunId ?? queuedRun.id}`,
+        ),
+      });
+      // A fresh message can put a paced run back in the queue more than once.
+      // Each promotion needs executable work even if the old effect settled.
+      const commandId =
+        restartWait === null
+          ? CommandId.make(`command:system:start-queued:${queuedRun.id}`)
+          : yield* idAllocator.allocate.command({
+              fixtureName: "restart-pacing",
+              commandName: "start-queued",
+            });
       const now = yield* DateTime.now;
       const selectionChanged = !modelSelectionsEqual(
         projection.thread.modelSelection,
@@ -2151,6 +2170,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: startingRun,
           },
+          // Fresh input must see the wait before a worker claims this start.
+          ...(restartWait?.type === "notification"
+            ? [
+                {
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  ...(restartWait.runId === null ? {} : { runId: restartWait.runId }),
+                  occurredAt: now,
+                  payload: {
+                    ...restartWait,
+                    status: "waiting" as const,
+                    completedAt: null,
+                    updatedAt: now,
+                    summary: "Resuming after restart",
+                  },
+                },
+              ]
+            : []),
         ],
         [
           ...sessionsToDetach.map((session) => ({
@@ -2167,7 +2204,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             id: `effect:${commandId}:provider-turn.start:${queuedRun.id}`,
             commandId,
             threadId,
-            request: { type: "provider-turn.start", runId: queuedRun.id },
+            request: {
+              type: "provider-turn.start",
+              runId: queuedRun.id,
+              ...(queuedRun.launchRecovery === undefined
+                ? {}
+                : { retryDelayMs: launchRecoveryDelayMs(queuedRun, DateTime.toEpochMillis(now)) }),
+            },
           },
         ],
       );
@@ -4955,6 +4998,69 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    let restartPacingBypassed = false;
+    if (countsAsUserTurn(command) && command.scheduledTaskId === undefined) {
+      for (const run of projection.runs) {
+        if (
+          run.status !== "starting" ||
+          projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId)
+        )
+          continue;
+        const sourceRunId = run.restartContinuationOfRunId ?? run.id;
+        const wait = yield* projectionStore
+          .getTurnItem({
+            threadId: command.threadId,
+            itemId: TurnItemId.make(`turn-item:restart-pacing:${sourceRunId}`),
+          })
+          .pipe(mapDispatchError(command));
+        if (wait === null || wait.type !== "notification" || wait.status !== "waiting") continue;
+        const now = yield* DateTime.now;
+        // A paced provider start has not touched the harness yet. Put its saved
+        // input back in the normal queue so a fresh person turn can start now.
+        const queued = yield* emit(
+          events,
+          command,
+        )({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...run,
+            status: "queued",
+            startedAt: null,
+            completedAt: null,
+            queueHeld: false,
+            queuePosition:
+              Math.max(
+                0,
+                ...projection.runs
+                  .filter((candidate) => candidate.status === "queued")
+                  .map((candidate) => candidate.queuePosition ?? candidate.ordinal),
+              ) + 1,
+          },
+        });
+        projection = applyToProjection(projection, queued);
+        const cleared = yield* emit(
+          events,
+          command,
+        )({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          ...(wait.runId === null ? {} : { runId: wait.runId }),
+          occurredAt: now,
+          payload: {
+            ...wait,
+            status: "completed",
+            completedAt: now,
+            updatedAt: now,
+            summary: "Queued after your new message",
+          },
+        });
+        projection = applyToProjection(projection, cleared);
+        restartPacingBypassed = true;
+      }
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -5072,9 +5178,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection = applyToProjection(projection, event);
     }
 
-    const continuedTaskId = projection.runs.find(
+    const continuationSource = projection.runs.find(
       (run) => run.id === command.restartContinuationOfRunId,
-    )?.delegatedTaskId;
+    );
+    const continuedTaskId = continuationSource?.delegatedTaskId;
+    const continuedRecovery = continuedLaunchRecovery(continuationSource, projection.providerTurns);
 
     if (projection.thread.settledOverride !== null) {
       const now = yield* DateTime.now;
@@ -5162,11 +5270,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection,
       command.modelSelection ?? projection.thread.modelSelection,
     );
-    let dispatchMode = resolveMessageDispatchIntent(
-      projection,
-      command.dispatchMode,
-      command.deliveryIntent,
-    );
+    let dispatchMode =
+      restartPacingBypassed && command.dispatchMode.type !== "defer_start"
+        ? { type: "start_immediately" as const }
+        : resolveMessageDispatchIntent(projection, command.dispatchMode, command.deliveryIntent);
     if (dispatchMode.type === "steer_active") {
       const targetRunId = dispatchMode.targetRunId;
       const target = projection.runs.find((run) => run.id === targetRunId);
@@ -5600,6 +5707,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
       };
       const attempt: OrchestrationV2RunAttempt = {
@@ -5951,6 +6059,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? { workspacePreparation: dispatchMode.workspaceStrategy }
           : {}),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
       };
@@ -6167,7 +6276,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         id: `effect:${command.commandId}:provider-turn.start:${runId}`,
         commandId: command.commandId,
         threadId: command.threadId,
-        request: { type: "provider-turn.start", runId },
+        request: {
+          type: "provider-turn.start",
+          runId,
+          ...(run.launchRecovery === undefined
+            ? {}
+            : { retryDelayMs: launchRecoveryDelayMs(run, DateTime.toEpochMillis(now)) }),
+        },
       } satisfies PendingOrchestrationEffectV2;
       if (dispatchMode.type !== "defer_start") {
         yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
@@ -6672,6 +6787,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+      ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
       ...(command.contextReset === true ? { contextReset: true } : {}),
       ...wakeWorkStartedAt(projection.runs, command),
     };
@@ -7140,7 +7256,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       id: `effect:${command.commandId}:provider-turn.start:${runId}`,
       commandId: command.commandId,
       threadId: command.threadId,
-      request: { type: "provider-turn.start", runId },
+      request: {
+        type: "provider-turn.start",
+        runId,
+        ...(run.launchRecovery === undefined
+          ? {}
+          : { retryDelayMs: launchRecoveryDelayMs(run, DateTime.toEpochMillis(now)) }),
+      },
     } satisfies PendingOrchestrationEffectV2;
     yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
   });
@@ -10566,6 +10688,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         type: "run_interrupt_result",
         message: "Run interrupted before provider start",
       };
+      const restartWait = yield* projectionStore
+        .getTurnItem({
+          threadId: command.threadId,
+          itemId: TurnItemId.make(
+            `turn-item:restart-pacing:${run.restartContinuationOfRunId ?? run.id}`,
+          ),
+        })
+        .pipe(mapDispatchError(command));
+      if (restartWait?.type === "notification" && restartWait.status === "waiting") {
+        // The replacement may never have reached the process-local gate.
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          ...(restartWait.runId === null ? {} : { runId: restartWait.runId }),
+          occurredAt: now,
+          payload: {
+            ...restartWait,
+            status: "completed",
+            completedAt: now,
+            updatedAt: now,
+            summary: "Restart wait ended",
+          },
+        });
+      }
       yield* emitEvent({
         type: "turn-item.updated",
         threadId: command.threadId,
@@ -11656,7 +11802,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
         ...(childRun.delegatedTaskStall === undefined ? {} : { failureReason: "stalled" as const }),
-        result: result.text,
+        ...(childRun.launchRecovery?.kind === "model_access"
+          ? { model: childRun.modelSelection.model }
+          : {}),
+        result: claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
         completedAt: now,
         updatedAt: now,
       };

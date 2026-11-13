@@ -11,6 +11,7 @@ from pathlib import Path
 import commerce_journal as journal
 import native
 import order_card
+import owner_go
 import noon_http_orders as core
 import noon_vertical_reads as vertical
 from noon_checkout import project_home, QUIET_NOTE
@@ -186,6 +187,8 @@ class FoodFlow:
         return review
 
     def prepare(self):
+        from commerce_pending import register
+        register(self.flow_id, 'food', self.account, self.rows, card_last4=self.card_last4)
         info, items = native.food_menu_raw(self.outlet, self.headers, 15)
         require(info['status']=='open' and info['serviceable'] is True, 'FOOD_OUTLET_UNAVAILABLE')
         validate_choices(self.rows, items)
@@ -232,6 +235,7 @@ class FoodFlow:
         review['display_items']=[{'name':names[r['itemCode']],'qty':r['qty']} for r in self.rows]
         self.state['review_hash']=journal.digest(review); self.state['review']=review; self.save()
         return {'ok':True,'state':'PREPARED_NOT_ORDERED','flow_id':self.flow_id,'review':review,
+                'owner_go_item':owner_go.commerce_item(journal.binding(self.flow_id)),
                 'financial_send':False,'purchase_enabled':True,'cleanup':'Leave this isolated session; no owner basket was reset or cleared.'}
 
 
@@ -239,7 +243,10 @@ def prepare(args):
     raw=json.loads(Path(args.items_file).read_text())
     rows=raw.get('items') if isinstance(raw,dict) else raw
     flow=FoodFlow(args.outlet_code, rows, args.resume_flow)
+    from commerce_pending import cli_review
+    pending=cli_review(flow,args)
     result=flow.prepare()
+    if pending:result['warnings']=pending
     if args.prepare_only:return result
     from noon_food_financial import Coordinator, AutomaticTransport
     from noon_food_recovery import NativeReader, TrackerRegistrar

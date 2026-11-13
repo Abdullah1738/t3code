@@ -162,7 +162,11 @@ def _normalize_items(product_code, quantity, items):
 
 
 def _scope_hash(store_code, items, address_hash):
-    """Single-item keeps the exact legacy digest; multi binds the full manifest."""
+    # Preserve plain-basket resumes; custom selections need their complete wire
+    # manifest so a changed note or modifier cannot reuse an earlier approval.
+    if any(i.get('modifiers') or i.get('notes') is not None for i in items):
+        return journal.digest({'store': store_code, 'items': items,
+                               'home': address_hash, 'card': order_card.LAST4, 'quiet': True})
     if len(items) == 1:
         return journal.digest({'store': store_code, 'product': items[0]['product_code'],
                                'qty': items[0]['quantity'], 'home': address_hash,
@@ -277,6 +281,8 @@ class NowNowOrderFlow:
             if self.review is None or time.time() - self.review['observed_at'] > 60:
                 _fail('NOWNOW_FRESH_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register
+            register(self.flow_id, 'nownow', self.account_hash, self.items)
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='nownow',
                               account_hash=self.account_hash, scope_hash=self.scope_hash)
             self.receipt_store = receipts.create(flow_id=self.flow_id, app='noon', vertical='nownow',
@@ -638,6 +644,8 @@ class NowNowOrderFlow:
         self._expect('payment_complete', body)
         result = self.client.complete_payment(order=None, session_code=self.session_code,
             client_secret=secret, card=self.card, cvv_encryption=encrypted, before_send=self._before, timeout=25)
+        from commerce_pending import record_approval
+        record_approval(self.flow_id,result.wire)
         outcome = payment_outcome(result.projection)
         journal.observe(self.flow_id, 'payment_complete', outcome=outcome, evidence_hash=journal.digest(result.projection))
         if outcome != 'PREORDER_PAYMENT_CONFIRMED':
@@ -751,6 +759,8 @@ class NowNowOrderFlow:
         self.current = native.Snapshot({'data': row}, readback.projection, time.time())
         self.card = saved_card(self.client, timeout=25)
         corroborate_token(self.client, self.card, timeout=25)
+        from commerce_pending import register
+        register(self.flow_id, 'nownow', self.account_hash, self.items)
         return self
 
     def prepare_only(self, *, timeout=25):

@@ -603,7 +603,7 @@ export function planDispatch(
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
-    // Once a card has a work thread it stays on that thread's model.
+    // An existing work thread follows the card's pinned model.
     const model =
       role === "work" && card.workThreadId === null
         ? weightedModel(card, pools, free, pick)
@@ -683,7 +683,9 @@ export function confirmDispatch(
     return false;
   if (
     dispatch.role === "work" &&
-    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+    (kanbanWaitsOnEvaluator(card) ||
+      isBlocked(card, byId) ||
+      (dispatch.fresh && isBlocked(card, byId, null)))
   )
     return false;
   const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;

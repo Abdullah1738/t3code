@@ -17,8 +17,8 @@ Prefix heavy commands with `offbox run --`, from the same directory you'd run th
 
 ```bash
 offbox run -- go test ./...
-offbox run -- npm ci
-offbox run -- npx jest
+# Choose these commands with 'Install with the repo’s package manager' below.
+offbox run -- '<repo-install> && <repo-test>'
 offbox run -- 'docker compose up -d && ./scripts/health.sh'      # one string = run by bash
 offbox run --size xlarge -- make test-integration
 ```
@@ -27,6 +27,9 @@ offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs i
 gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
 file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
+
+A repo’s pool name (at home and on the Boat standby alike) comes from its origin URL’s basename, normalized to lowercase letters, digits and dashes.
+If git is slow or fails, offbox reuses the last good name for that resolved checkout root and logs the fallback; a first failure warns before using the directory name.
 
 **Where it runs.** With no home server set up (no `~/.local/share/offbox/server.json`, or `"disabled": true` in
 it), everything below is boat.dev, as it always was. With one, see "Home server, Boat standby".
@@ -73,6 +76,47 @@ a child when it names the child itself.
 
 The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
 
+## Install with the repo's package manager
+
+Before installing or writing a review packet, inspect the **pinned checkout's repo root**.
+Record the Node version, manager/version, install command and the files that chose them:
+
+1. Read `package.json` `packageManager` first. `pnpm@x` → `corepack pnpm@x install --frozen-lockfile`;
+   `yarn@x` → `corepack yarn@x install --immutable` (v2+) or `--frozen-lockfile` (v1);
+   `npm@x` → `npm ci` using that npm version. `bun@x` → `bun install --frozen-lockfile` using that Bun version.
+2. Without that field, use the lockfile: `pnpm-lock.yaml` → `corepack pnpm install --frozen-lockfile`;
+   `yarn.lock` → Corepack Yarn (v2+ `--immutable`, v1 `--frozen-lockfile`);
+   `bun.lock` / `bun.lockb` → `bun install --frozen-lockfile`;
+   `package-lock.json` / `npm-shrinkwrap.json` → `npm ci`; none → `npm install`.
+   Resolve contradictory metadata against CI; never generate a different manager's lock to get past an error.
+3. Inspect `.github/workflows` and any setup action it calls. Copy the matching install step's flags,
+   including frozen/immutable, script and workspace options. Use the repo's own bootstrap when required
+   (e.g. `vp i` for this fork, once the manager install has put vite-plus in node_modules). An npm pin without its npm lockfile is a repo prerequisite to resolve, not a
+   reason to run a different manager. Hints cover common literal pins; inspect expressions/matrices yourself.
+4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
+   then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
+   Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
+   on PATH); offbox selects from its installed Nodes using file/engine pins. CI fallback on boxes is #694.
+   If offbox warns no Node matches, fix the run's Node before testing. Log `node --version`.
+   pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
+   (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
+   `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
+5. Run scripts/tools with that same manager and version (`corepack pnpm@10 run lint`,
+   `corepack pnpm@10 exec vitest ...`, `corepack yarn@4 run lint`, `npm run lint`, `bun run lint`).
+   Do not substitute `npm run` / `npx` for pnpm/Yarn/Bun, or download an unpinned test tool.
+
+Borrowed `node_modules` (a symlink to another checkout) is not an install target. pnpm 11 can correctly refuse
+`exec`/scripts with `ERR_PNPM_VERIFY_DEPS_BEFORE_RUN` when the source lock differs. For a narrow local check,
+use the repo's supported Node and `node_modules/.bin/<tool>` (or the pinned pnpm's
+`--config.verify-deps-before-run=false exec`) **only after checking the tool and test-relevant dependency
+versions against the pinned lock**, and name those checks in the evidence. This is a scoped workaround,
+not proof of a clean install. Otherwise install from the pinned lock in the isolated offbox checkout.
+Never install into shared symlinked dependencies.
+
+Put the selected install and check in the same `offbox run -- '<repo-install> && <repo-check>'` call.
+Stop on an install failure before reporting later tools as failed code checks. Commands in examples below
+are placeholders unless they name a particular repo; apply this check first.
+
 ## Your box (lease)
 
 A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `--bg` and `offbox wait` instead of a short shell timeout.
@@ -99,13 +143,14 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 - Before each command, pooled boxes report and remove containers left by earlier runs (best effort); boxes pinned with `offbox keep`, saved bases and private leases only report them.
 - Crpko ClickHouse 24.8 alert fixtures need `max_threads=8` on large and xlarge boxes: ClickHouse's own 10000-thread pool runs out on 32 CPUs, and raising OS limits doesn't help.
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
-- Put install and command together: `offbox run -- 'npm ci && npx jest ...'` or
-  `offbox run --step 'npm ci' --step 'npx jest ...'`; repeating an install on a box with deps is quick.
+- Put the repo-selected install and command together (see **Install with the repo's package manager**):
+  `offbox run -- '<repo-install> && <repo-check>'`. Use `&&` so an install failure stops dependent checks;
+  `--step` deliberately keeps going after a failed step.
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
 - Node version: offbox puts the newest nvm Node on the box that fits the repo's `.nvmrc`/`.node-version` and `package.json` `engines.node` (nearest to your cwd) first on PATH and prints `offbox: node vX (...)`. If none fits it warns and keeps the box default; install one with `offbox run -- 'source ~/.nvm/nvm.sh && nvm install 22'`.
-- In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the package manager first (`offbox run -- pnpm install --frozen-lockfile` for pnpm); `vp i` itself needs vite-plus installed.
+- In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
   deleted a template's data, the run builds its box from the template's recipe instead (a few minutes; `offbox:`
   says so) and the reaper rebuilds the template. An expired default base falls back to the template.
@@ -204,8 +249,8 @@ Stopped boxes are free, but boat deletes a stopped box's data 14 days after its 
 are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
 resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
 
-- After an expensive setup (`npm ci`, `go mod download`, harness images pulled, a seeded database), run
-  `offbox save --default --note "npm ci done at <sha>"`. New threads on this repo then start from that state and
+- After an expensive setup (the repo-selected install above, `go mod download`, harness images pulled, a seeded database), run
+  `offbox save --default --note "repo deps installed at <sha>"`. New threads on this repo then start from that state and
   only rsync the delta. `save` briefly stops your lease to capture it (the next run resumes it), costs one machine
   start (~15-25 s), then $0. Names: `offbox save --name pg-seeded`; use one
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
@@ -221,9 +266,11 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 - `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
   `offbox whoami`, `offbox status`.
-- `offbox kill <run>` stops a hung starting/running box run and marks it `killed` once boat confirms the process
+- `offbox kill <run>` stops your starting/running box run and marks it `killed` once the backend confirms the process
   stopped. Release refuses while a run is active and names the run ids. Use kill, not pkill on the box.
-  Local runs are refused; `offbox kill <run>` also cancels a run that is still syncing.
+  Local runs are refused. It also cancels your own run before its command starts, whether queued for a box or
+  still syncing/starting on one, by sending SIGTERM to its proven client and letting it release the pool guard.
+  If the client has not settled the row after 15 seconds, check `offbox list`; kill does not force it to stop.
 - A run that never got a box and whose client is gone is marked lost by the reaper within 5 minutes.
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.
@@ -352,14 +399,16 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Go `package unsafe is not in std` or `build constraints exclude all Go files in /usr/local/go/src/...` while other go commands in the same run pass: a box read glitch seen on the first run after a resume, not your code and not a repair race (one run per box). offbox prints a hint and logs a `go_std_glitch` event; rerun the same command. A nested `/usr/local/go/go` is a half-swapped GOROOT; the next run repairs it under a box-local lock and verifies the replacement.
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
+- npm `EACCES … _cacache` / `EEXIST` on a pool box: an earlier run left foreign-owned cache folders. Every `offbox run` gives the user's npm, .cache, pnpm and yarn caches back before the command. In an `offbox ssh` session, run the printed `sudo chown -R` command yourself.
 - A run whose only output is `Failed to start transient scope unit: Transport endpoint is not connected` means the box's systemd broke. Nothing ran. offbox returns 90, stops the box, and the next run resumes it clean, so just retry. Don't `boat resume` pool boxes by hand: on a 409 "is stopped", offbox marks the box stopped and resumes it itself on the next run.
 - Sync fails with rsync 23 `delete_file: unlink(...) failed: Permission denied (13)`: a container wrote root-owned files into the checkout on the box (LocalStack's `tmp/localstack`). offbox gives them back to the box user (`sudo chown -R`) and syncs once more by itself. If that fails too it exits 90 before your command and names the `offbox ssh <box> -- sudo chown ...` to run.
+- A push with no data for 180 s (`OFFBOX_SYNC_STALL_S`) is killed and retried once with a fresh SSH connection, then fails with exit 90.
 - Push sync retries dropped connections (255/12) up to 3 times, re-reading the box's endpoint before each retry, and resumes the box once if it stopped mid-push, before exit 90.
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
   ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
   Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
-  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm --frozen-lockfile` and `go.sum` checks get their
+  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
   lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - A box wedged after resume (kept image restore stuck and Docker not answering) is stopped and set aside, and the run moves once to another box; offbox release <box> --delete drops it for good.

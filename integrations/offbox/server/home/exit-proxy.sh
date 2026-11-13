@@ -170,6 +170,7 @@ cmd_install() {
 # Keep it short: the address has a fair-use traffic limit. Add a name only when a site refuses the VPN.
 dl.google.com        # Go toolchains and Android SDK: 404 from some Mullvad relays (FAILURE-MODES 3.35)
 go.dev               # redirects to dl.google.com
+ftp.gnu.org          # GNU source archives: TLS reset from Mullvad (FAILURE-MODES 3.41)
 EOF
   write_unit
   echo "sing-box $VERSION installed. Next: offbox-exit-proxy set  (host:port:user:password on stdin)"

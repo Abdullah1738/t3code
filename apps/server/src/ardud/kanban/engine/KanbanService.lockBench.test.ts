@@ -68,6 +68,7 @@ const AGENT_EVERY_MS = env("KANBAN_LOCK_BENCH_AGENT_EVERY_MS", 500);
 
 interface Thread {
   running: boolean;
+  model: ModelSelection;
   readonly messages: Array<string>;
 }
 
@@ -108,9 +109,10 @@ const makeThreads = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: read,
       find: read,
-      model: () => quick<ModelSelection | null>(null),
+      model: (threadId) => quick(null).pipe(Effect.map(() => threads.get(threadId)?.model ?? null)),
       lastFailure: () => quick(null),
       findLastFailure: () => quick(null),
       latestRun: () => quick(null),
@@ -123,7 +125,7 @@ const makeThreads = Effect.gen(function* () {
           for (let i = 0; i < 4; i += 1) yield* hold(READ_MS);
           next += 1;
           const threadId = ThreadId.make(`bench-thread-${next}`);
-          threads.set(threadId, { running: true, messages: [input.text] });
+          threads.set(threadId, { running: true, model: input.model, messages: [input.text] });
           return threadId;
         }),
       send: (input) =>
@@ -137,7 +139,11 @@ const makeThreads = Effect.gen(function* () {
           }
         }),
       withdraw: () => Effect.void,
-      setModel: () => Effect.void,
+      setModel: (threadId, model) =>
+        Effect.sync(() => {
+          const thread = threads.get(threadId);
+          if (thread) thread.model = model;
+        }),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {

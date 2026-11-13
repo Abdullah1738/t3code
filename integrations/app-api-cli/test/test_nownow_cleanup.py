@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 from pathlib import Path
 import tempfile
@@ -11,11 +12,12 @@ import commerce_preorder_release as release
 import commerce_nownow as reads
 from commerce_nownow_capture import retain
 import order_card
-from test import test_commerce_nownow_order as f
+import test_commerce_nownow_order as f
 
 
 class CleanupTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         for mod, key, value in [(j, 'ROOT', Path(self.temp.name)/'commerce'),
@@ -141,9 +143,10 @@ class CleanupTests(unittest.TestCase):
 
 class FailedVerificationTests(CleanupTests):
     def setUp(self):
+        approve_test_flows(self)
         super().setUp()
         from commerce_preorder import IntentVault
-        from test.test_commerce_preorder import Store
+        from test_commerce_preorder import Store
         from noon_checkout import fingerprint
         with j._db() as db:
             db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?", (self.flow.flow_id,))
@@ -175,6 +178,7 @@ class FailedVerificationTests(CleanupTests):
 
 class LegacyCleanupTests(CleanupTests):
     def setUp(self):
+        approve_test_flows(self)
         super().setUp()
         (j.ROOT/'nownow'/(self.flow.flow_id+'.json')).unlink()
         with j._db() as db:

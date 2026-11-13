@@ -65,10 +65,9 @@ class MarketplaceFlow:
         if kind is None:journal.fail('MARKETPLACE_SESSION_REVIEW_REQUIRED')
         financial=kind in ('place','payment')
         if financial:
-            if self.review is None or time.time()-self.review.observed_at>60:
-                journal.fail('MARKETPLACE_FRESH_REVIEW_REQUIRED')
-            if self.review.account_ref!=self.account_hash or self.review.address_ref!=self.address_hash:
-                journal.fail('MARKETPLACE_REVIEW_IDENTITY_CHANGED')
+            # This older adapter's scope omits the basket. The lane-specific
+            # Main/Supermall flows own paid sends and bind their full manifest.
+            journal.fail('OWNER_GO_REQUIRED')
         if not self.opened:
             journal.open_flow(flow_id=self.flow_id,app='noon',vertical=self.service,
                 account_hash=self.account_hash,scope_hash=self.scope_hash)

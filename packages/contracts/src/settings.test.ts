@@ -1278,3 +1278,19 @@ describe("server model preferences", () => {
     });
   });
 });
+
+describe("restart pacing settings", () => {
+  it("defaults old settings and accepts partial environment patches", () => {
+    expect(decodeServerSettings({}).restartPacing).toEqual({
+      maxActive: 4,
+      spacingMs: 20_000,
+      loadHigh: 1.5,
+    });
+    expect(decodeServerSettingsPatch({ restartPacing: { maxActive: 3 } })).toEqual({
+      restartPacing: { maxActive: 3 },
+    });
+    for (const restartPacing of [{ maxActive: 0 }, { spacingMs: -1 }, { loadHigh: 0 }]) {
+      expect(() => decodeServerSettingsPatch({ restartPacing })).toThrow();
+    }
+  });
+});

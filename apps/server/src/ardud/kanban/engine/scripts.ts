@@ -12,6 +12,8 @@
 import {
   KanbanWaitKind,
   ProviderOptionSelections,
+  KanbanScriptCardCommand,
+  KanbanScriptPostCommand,
   type KanbanActor,
   type KanbanCard,
   type KanbanChange,
@@ -80,25 +82,8 @@ export const isDue = (script: KanbanScript, nowMs: number) => {
   return next !== null && next <= nowMs;
 };
 
-const CardCommand = Schema.Struct({
-  kanban: Schema.Literal("card"),
-  prompt: Schema.String,
-  title: Schema.optional(Schema.String),
-  description: Schema.optional(Schema.String),
-  priority: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 4 }))),
-  projects: Schema.optional(Schema.Array(Schema.String)),
-  links: Schema.optional(
-    Schema.Array(Schema.Struct({ url: Schema.String, label: Schema.optional(Schema.String) })),
-  ),
-});
-
-const PostCommand = Schema.Struct({
-  kanban: Schema.Literal("post"),
-  text: Schema.String,
-  /** A discussion id; or `card`, the number of a card on this board. */
-  discussion: Schema.optional(Schema.String),
-  card: Schema.optional(Schema.Int),
-});
+const CardCommand = KanbanScriptCardCommand;
+const PostCommand = KanbanScriptPostCommand;
 
 /** Resizes one of the board's pools, e.g. to pace usage. It never adds a pool. */
 const PoolCommand = Schema.Struct({

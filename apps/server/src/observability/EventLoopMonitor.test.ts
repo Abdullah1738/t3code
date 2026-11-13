@@ -104,6 +104,24 @@ describe("EventLoopMonitor", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("writes heartbeats on quiet ticks so missing samples are observable", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-event-loop-" });
+      const filePath = `${directory}/event-loop-stalls.ndjson`;
+      yield* monitor([quiet, quiet, quiet], { filePath, maxBytes: 4096 });
+      yield* TestClock.adjust("90 seconds");
+      const rows = (yield* fs.readFileString(filePath))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepStrictEqual(rows, [
+        { time: "1970-01-01T00:01:00.000Z", kind: "sample", rssMb: 1536 },
+        { time: "1970-01-01T00:01:30.000Z", kind: "sample", rssMb: 1536 },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("keeps each stall as one line in a capped stall log", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -219,8 +237,15 @@ describe("EventLoopMonitor", () => {
       yield* TestClock.adjust("90 seconds");
       assert.strictEqual(calls, 2);
       const lines = (yield* fs.readFileString(filePath)).trim().split("\n");
-      assert.lengthOf(lines, 1);
-      assert.strictEqual(JSON.parse(lines[0]!).kind, "heap-spaces");
+      assert.lengthOf(lines, 3);
+      assert.lengthOf(
+        lines.filter((line) => JSON.parse(line).kind === "heap-spaces"),
+        1,
+      );
+      assert.lengthOf(
+        lines.filter((line) => JSON.parse(line).kind === "sample"),
+        2,
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

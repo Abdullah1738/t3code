@@ -177,7 +177,25 @@ export const layerWith = (
           );
         }
         const delayMaxMs = stallMs(readings);
-        if (delayMaxMs === undefined) return;
+        if (delayMaxMs === undefined) {
+          // Silence must be distinguishable from a sampler blocked on the event loop.
+          if (stallSink !== undefined) {
+            const time = DateTime.formatIso(yield* DateTime.now);
+            yield* encodeStallLine({
+              time,
+              kind: "sample",
+              rssMb: Math.round(readings.rssBytes / 1024 / 1024),
+            }).pipe(
+              Effect.flatMap((line) => Effect.try(() => stallSink.write(`${line}\n`))),
+              Effect.catch(() =>
+                Effect.logWarning("event loop sample log write failed", {
+                  filePath: stallLog.filePath,
+                }),
+              ),
+            );
+          }
+          return;
+        }
         const { utilization, usage, rssBytes } = readings;
         const attributes = {
           delayMaxMs,

@@ -40,7 +40,8 @@ class RepoToolTests(unittest.TestCase):
 
     def run_script(self, command=None, *, steps=None, rel='.', node=''):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+                patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo with spaces', rel, command or [], None, 'r',
                                         steps=steps, node=node, repo_root=self.root)
         return subprocess.run([shutil.which('bash'), '-c', script], env=self.env, capture_output=True,
@@ -127,7 +128,7 @@ class RepoToolTests(unittest.TestCase):
                 p = self.run_script(command, steps=steps)
                 self.assertEqual(p.returncode, 127, p.stderr)
                 self.assertIn('is a repo-local tool', p.stderr)
-                self.assertIn("Run: offbox run -- sh -c 'pnpm install --frozen-lockfile && <your command>'", p.stderr)
+                self.assertIn("Run: offbox run -- sh -c 'corepack pnpm@11.10.0 install --frozen-lockfile && <your command>'", p.stderr)
                 self.assertNotIn('vp i &&', p.stderr)
                 self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
                 self.assertFalse((self.root / 'node_modules').exists())
@@ -135,10 +136,10 @@ class RepoToolTests(unittest.TestCase):
                     self.assertIn('offbox step 2 rc=0', p.stderr)
 
     def test_hint_uses_package_manager_and_dependency_sections(self):
-        for manager, lock, expected in (('pnpm@11', None, 'pnpm install --frozen-lockfile'),
-                                         ('yarn@1', None, 'yarn install --frozen-lockfile'),
+        for manager, lock, expected in (('pnpm@11', None, 'corepack pnpm@11 install --frozen-lockfile'),
+                                         ('yarn@1', None, 'corepack yarn@1 install --frozen-lockfile'),
                                          ('npm@11', 'package-lock.json', 'npm ci'),
-                                         ('npm@11', None, 'npm install'), ('bun@1', None, 'bun install')):
+                                         ('npm@11', None, 'npm ci'), ('bun@1', None, 'bun install --frozen-lockfile')):
             for key in ('dependencies', 'devDependencies'):
                 with self.subTest(manager=manager, lock=lock, key=key):
                     self.manifest(manager, key)
@@ -222,7 +223,7 @@ class RepoToolTests(unittest.TestCase):
         p = self.run_script([shutil.which('bash'), '-c', 'cd apps/server && CI=1 vp i'])
         self.assertEqual(p.returncode, 127, p.stderr)
         self.assertIn('vp is a repo-local tool (vite-plus)', p.stderr)
-        self.assertIn('pnpm install --frozen-lockfile && <your command>', p.stderr)
+        self.assertIn('corepack pnpm@11.10.0 install --frozen-lockfile && <your command>', p.stderr)
 
     def test_new_bash_shells_do_not_cache_global_tools_across_install(self):
         self.tool(self.global_bin, 'vp', 'global')
@@ -338,7 +339,7 @@ class RepoToolTests(unittest.TestCase):
                                         steps=[command] if stepped else None)
                     self.assertEqual(p.returncode, 127, p.stderr)
                     self.assertIn('vp is a repo-local tool (vite-plus)', p.stderr)
-                    self.assertIn('pnpm install --frozen-lockfile', p.stderr)
+                    self.assertIn('corepack pnpm@11.10.0 install --frozen-lockfile', p.stderr)
                     self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
 
     def test_startup_bash_env_rewrites_keep_grandchild_initialization(self):

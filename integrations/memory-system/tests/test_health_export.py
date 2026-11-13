@@ -4,7 +4,6 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
-import time
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -19,7 +18,7 @@ class ExportHealthTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.db = self.root / 'opencode.sqlite'
-        self.now = time.time()
+        self.now = 1_800_000_000.0
         for patch in (
             mock.patch.object(hc, 'OC_DB', str(self.db)),
             mock.patch.object(hc.time, 'time', return_value=self.now),

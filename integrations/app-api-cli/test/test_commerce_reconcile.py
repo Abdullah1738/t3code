@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ FLOW='10000000-0000-4000-8000-000000000001'
 
 class ReconcileTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         p=patch.object(j,'ROOT',Path(temp.name).resolve()/'commerce');p.start();self.addCleanup(p.stop)
         j.open_flow(flow_id=FLOW,app='noon',vertical='minutes',account_hash='1'*64,scope_hash='2'*64)

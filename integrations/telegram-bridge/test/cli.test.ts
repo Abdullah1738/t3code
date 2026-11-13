@@ -24,6 +24,13 @@ describe("parseCommand", () => {
     });
   });
 
+  test("maps ask and failure source keys and redacts notify text before HTTP", () => {
+    expect(parseCommand([...notify, "--ask-key", "robob:582:q2"]).body?.askKey).toBe("robob:582:q2");
+    expect(parseCommand([...notify, "--burst-key", "infra"]).body?.burstKey).toBe("infra");
+    expect(parseCommand(["notify", "--source", "test", "--text", "token=private", "--key", "k"]).body?.text)
+      .toBe("token=[redacted]");
+  });
+
   test("sanitizes --source to the bridge's accepted shape", () => {
     expect(parseCommand(["notify", "--source", "risk-liquidation-latest#58", "--text", "hi", "--key", "k"]).body?.source)
       .toBe("risk-liquidation-latest-58");

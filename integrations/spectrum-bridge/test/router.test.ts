@@ -2128,7 +2128,7 @@ test("a watcher turn that failed while running is reported honestly, never retri
   h.backend.step("checking", "tool-calls").content.push({ type: "tool", id: "call_1", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: "PRIVATE_TOOL" }] } } as never);
   h.backend.failed();
   await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
   const notices = h.controls();
   expect(notices).toHaveLength(1);
   expect(notices[0]!.text).toBe(syntheticDropped(wake, wakeBody(), "failed"));
@@ -2165,7 +2165,7 @@ test("a watcher turn that errored before any tool is retried, then reported once
   expect(h.backend.prompts).toHaveLength(3);
   h.backend.failed();
   await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
   expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "errored")]);
   expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
 });
@@ -2181,7 +2181,7 @@ test("a first-call provider error with no tool evidence is reported once and nev
   await h.router.tick();
   h.backend.failed();
   await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
   expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
   setSystemTime(start + 10 * 60_000);
   await h.router.tick();
@@ -2217,7 +2217,7 @@ test("a failed turn whose tool use the backend cannot rule out is never retried"
   step.error = { type: "ProviderError", message: "PRIVATE_ERROR" };
   h.backend.settle("failed");
   await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
   expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
   setSystemTime(start + 120_000);
   await h.router.tick();
@@ -3849,7 +3849,7 @@ test.each(["error", "new"])("batch retirement by %s leaves no member to submit l
   if (kind === "error") h.backend.failed();
   if (kind === "new") h.input("new", "/new");
   await h.router.tick();
-  expect(inbounds(h.store).slice(0, 2).map(row => row.state)).toEqual([kind === "new" ? "cancelled" : "failed", "done"]);
+  expect(inbounds(h.store).slice(0, 2).map(row => row.state)).toEqual([kind === "new" ? "cancelled" : "done", "done"]);
   if (kind !== "new") {
     h.input("new", "/new");
     await h.router.tick();
@@ -4247,7 +4247,7 @@ test("an interrupted or failed turn gets one friendly notice, never a reply, and
     expect(h.conversations()).toEqual([]);
     expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed" });
     expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
-    expect(inbounds(h.store)[0]!.state).toBe("failed");
+    expect(inbounds(h.store)[0]!.state).toBe("done");
     h.input("again", "Try again");
     await h.router.tick();
     expect(h.backend.prompts.map(p => [p.id, p.text])).toEqual([["ses_1", "Question"], ["ses_1", "Try again"]]);

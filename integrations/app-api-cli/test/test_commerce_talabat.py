@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Settle of interrupted Talabat mart cart flows with stable-cart adoption.
 
 Covers commerce_talabat.settle_interrupted_cart end-to-end against the real
@@ -18,7 +19,7 @@ import commerce_journal as journal
 import commerce_receipts as receipts
 import talabat_http_checkout as h
 from commerce_talabat import TalabatFlow, settle_interrupted_cart
-from test.test_talabat_http_checkout import context
+from test_talabat_http_checkout import context
 
 KEY = '0123456789abcdef'
 
@@ -38,6 +39,7 @@ class StubAuth:
 
 class SettleInterruptedCartTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         # macOS /var is a system symlink; the store requires the exact real path.
