@@ -32,6 +32,7 @@ class Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
         environment = patch.dict(os.environ, {'HOME': str(self.tmp),
+                                             'CARD_STATUS_FILE': str(self.tmp / 'card-status.json'),
                                              'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'tool-logs')})
         environment.start()
         self.addCleanup(environment.stop)
@@ -751,7 +752,7 @@ class DueDates(Base):
     def test_brief_keeps_real_due_date_after_follow_up_moves(self):
         c = self.case(due='2026-11-01', deadline='2026-11-02', when=at('2026-10-20T09:00'))
         line = mc.brief([c], at('2026-10-31T10:00'))
-        self.assertEqual(line, 'Money: 1 open. due: Acme AED 120.50 due Sun 1 Nov (follow-up Mon 2 Nov).')
+        self.assertEqual(line, 'Money: 1 open; due: Acme AED 120.50 due Sun 1 Nov (follow-up Mon 2 Nov).')
         # The true due date is overdue even before the follow-up time on 2 Nov.
         self.assertIn('overdue since Sun 1 Nov (follow-up Mon 2 Nov)', mc.brief([c], at('2026-11-02T08:00')))
         self.assertIn('due Sun 1 Nov, follow-up Mon 2 Nov', mc.table([c]))
@@ -786,9 +787,9 @@ class DueDates(Base):
         for row in (c, dict(c, due=None)):
             with self.subTest(due=row.get('due')):
                 self.assertEqual(mc.brief([row], at('2026-10-31T10:00')),
-                                 'Money: 1 open. due: Acme AED 120.50 (Sun 1 Nov).')
+                                 'Money: 1 open; due: Acme AED 120.50 (Sun 1 Nov).')
                 self.assertEqual(mc.brief([row], at('2026-11-02T08:00')),
-                                 'Money: 1 open. due: Acme AED 120.50 (overdue since Sun 1 Nov).')
+                                 'Money: 1 open; due: Acme AED 120.50 (overdue since Sun 1 Nov).')
                 self.assertIn('Acme AED 120.50, by Sun 1 Nov (Abdullah)', mc.table([row]))
 
     def test_awaiting_answer_and_urgency_stay_visible_with_due(self):
@@ -852,11 +853,181 @@ class Brief(Base):
         self.case('old', merchant='Old', amount='5', deadline='2026-10-20', when=at('2026-10-10T09:00'))
         mc.close(self.data, 'old', 'done', at=at('2026-10-21T09:00'))
         line = mc.brief(mc.load(self.data)['cases'], at('2026-10-24T08:00'))
-        self.assertEqual(line, 'Money: 3 open. due: Acme AED 120.50 (Sun 25 Oct). changed: Bolt Law GBP 1,234.56.')
+        self.assertEqual(line, 'Money: 3 open; due: Acme AED 120.50 (Sun 25 Oct); changed: Bolt Law GBP 1,234.56.')
         early = [c for c in mc.load(self.data)['cases'] if c['id'] in ('acme', 'zeta')]
-        self.assertEqual(mc.brief(early, at('2026-10-22T10:00')), 'Money: 2 open. nothing due in 48h.')
+        self.assertEqual(mc.brief(early, at('2026-10-22T10:00')), 'Money: 2 open; nothing due in 48h.')
         late = mc.brief(mc.load(self.data)['cases'], at('2026-10-26T08:00'))
         self.assertIn('Acme AED 120.50 (overdue since Sun 25 Oct)', late)
+
+    def test_closed_case_names_running_and_paused_watchers_but_not_ended_or_missing(self):
+        for name, status in (('live', 'active'), ('paused', 'active'), ('done', 'done'), ('expired', 'expired')):
+            self.watcher(name, status)
+        (self.root / 'watchers' / 'paused' / 'watcher.json').write_text(json.dumps({'id': 'paused', 'paused': True}))
+        self.case(watchers=['live', 'paused', 'done', 'expired'])
+        mc.close(self.data, 'acme', 'resolved')
+        case = mc.load(self.data)['cases'][0]
+        case['watchers'].append('missing')
+        line = mc.brief([case], at('2026-10-24T08:00'), root=self.root)
+        self.assertEqual(line, 'Money: 0 open; closed but watcher running: acme (live), acme (paused).')
+        self.watcher('live', 'done')
+        self.watcher('paused', 'expired')
+        self.assertEqual(mc.brief([case], root=self.root), '')
+
+    def test_closed_case_watcher_names_are_capped(self):
+        names = [f'reply-{n}' for n in range(5)]
+        for name in names:
+            self.watcher(name, 'active')
+        self.case(watchers=names)
+        mc.close(self.data, 'acme', 'resolved')
+        line = mc.brief(mc.load(self.data)['cases'], root=self.root)
+        self.assertIn('closed but watcher running: acme (reply-0), acme (reply-1), acme (reply-2), +2 more', line)
+        self.assertNotIn('reply-3', line)
+        self.assertNotIn('reply-4', line)
+
+    def test_closed_case_archived_watchers_are_not_running(self):
+        for name, status in (('done', 'done'), ('expired', 'expired'), ('removed', 'active')):
+            self.watcher(name, status)
+        self.case(watchers=['done', 'expired', 'removed'])
+        mc.close(self.data, 'acme', 'resolved')
+        archive = self.root / 'archive'
+        archive.mkdir()
+        for name in ('done', 'expired', 'removed'):
+            (self.root / 'watchers' / name).rename(archive / f'{name}-1')
+        self.assertEqual(mc.brief(mc.load(self.data)['cases'], root=self.root), '')
+
+    def test_new_parts_keep_owner_scope_and_awaiting_answer_cases(self):
+        self.watcher('moni-reply', 'active')
+        closed = self.case('moni-closed', who='Moni', watchers=['moni-reply'])
+        mc.close(self.data, closed['id'], 'resolved')
+        self.case('moni-refund', who='Moni', state='refund to 5542', merchant='Moni merchant')
+        waiting = self.case('waiting', state='refund to 5542', merchant='Waiting merchant')
+        waiting['status'] = 'awaiting_answer'
+        cases = [c for c in mc.load(self.data)['cases'] if c['id'] != 'waiting'] + [waiting]
+        line = mc.brief(cases, root=self.root, cancelled={'5542'})
+        self.assertIn('Money: 1 open;', line)
+        self.assertIn('awaiting answer', line)
+        self.assertIn('refund to cancelled card 5542: waiting', line)
+        self.assertNotIn('moni', line.lower())
+        self.assertNotIn('closed but watcher running', line)
+
+    def test_cancelled_card_file_open_refunds_and_credit_only(self):
+        path = Path(os.environ['CARD_STATUS_FILE'])
+        self.case('refund', state='AED 109 credited to 5542, awaiting refund')
+        self.case('credit', next_action='check ENBD 5542', state='waiting', why='CREDIT pending', merchant='Elsewhere')
+        self.case('dispute', next_action='keep 5542 account open', state='dispute', merchant='Dispute')
+        self.case('longer', next_action='refund to 15542 or 55421', state='waiting', merchant='Other')
+        self.case('closed', next_action='refund 5542', merchant='Closed')
+        mc.close(self.data, 'closed', 'resolved')
+        cases = mc.load(self.data)['cases']
+        now = at('2026-10-24T08:00')
+        self.assertNotIn('refund to cancelled card', mc.brief(cases, now, root=self.root))
+        path.write_text(json.dumps({'5542': {'state': 'ok', 'at': 1}}))
+        self.assertNotIn('refund to cancelled card', mc.brief(cases, now, root=self.root))
+        path.write_text(json.dumps({'5542': {'state': 'cancelled', 'at': 1}}))
+        line = mc.brief(cases, now, root=self.root)
+        self.assertIn('refund to cancelled card 5542: refund, ask ENBD where it went', line)
+        self.assertIn('refund to cancelled card 5542: credit, ask ENBD where it went', line)
+        self.assertNotIn('5542: dispute', line)
+        self.assertNotIn('5542: longer', line)
+        self.assertNotIn('5542: closed', line)
+
+    def test_cancelled_card_uses_default_file_without_an_override(self):
+        self.case(state='refund to 5542')
+        cases = mc.load(self.data)['cases']
+        path = self.tmp / '.local' / 'state' / 'card-status.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'5542': {'state': 'cancelled', 'at': 1}}))
+        for override in (None, ''):
+            with self.subTest(override=override), patch.dict(os.environ):
+                if override is None:
+                    os.environ.pop('CARD_STATUS_FILE', None)
+                else:
+                    os.environ['CARD_STATUS_FILE'] = override
+                self.assertIn('refund to cancelled card 5542: acme', mc.brief(cases, root=self.root))
+
+    def test_refund_card_matching_across_fields_and_digit_boundaries(self):
+        case = self.case()
+        rows = (
+            ('refund 5542', 'wait', '', True),
+            ('wait', 'REFUND to **5542', '', True),
+            ('wait', 'check ENBD', 'credit to (5542)', True),
+            ('CREDIT pending', 'check 5542', '', True),
+            ('wait', 'refund to 15542', '', False),
+            ('wait', 'refund to 55421', '', False),
+            ('dispute 5542', 'wait', '', False),
+        )
+        for state, next_action, why, expected in rows:
+            with self.subTest(state=state, next_action=next_action, why=why):
+                line = mc.brief([dict(case, state=state, next=next_action, why=why)],
+                                root=self.root, cancelled={'5542'})
+                self.assertEqual('refund to cancelled card 5542:' in line, expected)
+
+    def test_cancelled_card_status_unreadable_or_bad_shape_is_ignored(self):
+        self.case(state='refund to 5542')
+        cases = mc.load(self.data)['cases']
+        path = Path(os.environ['CARD_STATUS_FILE'])
+        for raw in ('not json', '[]', 'null', '{"5542": null}', '{"not-a-last4": {"state": "cancelled"}}'):
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                self.assertNotIn('refund to cancelled card', mc.brief(cases, root=self.root))
+        path.write_bytes(b'\xff')
+        self.assertNotIn('refund to cancelled card', mc.brief(cases, root=self.root))
+        with patch.dict(os.environ, {'CARD_STATUS_FILE': str(self.tmp)}):
+            self.assertNotIn('refund to cancelled card', mc.brief(cases, root=self.root))
+        read_text = Path.read_text
+        def read_unless_status(file, *args, **kwargs):
+            if file == path:
+                raise PermissionError()
+            return read_text(file, *args, **kwargs)
+        with patch.object(Path, 'read_text', read_unless_status):
+            self.assertNotIn('refund to cancelled card', mc.brief(cases, root=self.root))
+
+    def test_cancelled_card_injected_set_is_capped_and_requires_exact_last4(self):
+        self.case(state='refund on 5542 and credit on 2342')
+        self.case('two', state='refund on 5542', merchant='Two')
+        self.case('three', state='refund on 5542', merchant='Three')
+        self.case('four', state='refund on 5542', merchant='Four')
+        line = mc.brief(mc.load(self.data)['cases'], root=self.root,
+                        cancelled={'5542', '2342', '12345542', 'bad'})
+        self.assertEqual(line.count('refund to cancelled card'), 3)
+        self.assertIn('refund to cancelled card 2342: acme', line)
+        self.assertIn('refund to cancelled card 5542: acme', line)
+        self.assertIn('refund to cancelled card 5542: two', line)
+        self.assertIn('+2 more', line)
+        self.assertNotIn('5542: three', line)
+        self.assertNotIn('5542: four', line)
+
+    def test_brief_redacts_identifiers_and_does_not_emit_extra_lines(self):
+        card_number = '4111' + '1111' * 3
+        secret = '482' + '913'
+        self.watcher('reply', 'active')
+        self.case(watchers=['reply'])
+        mc.close(self.data, 'acme', 'resolved')
+        closed = mc.load(self.data)['cases'][0]
+        closed['id'] = f'{card_number}\nOTP {secret}'
+        self.case('refund', state='refund 5542', merchant='Other')
+        refund = mc.find(mc.load(self.data), 'refund')
+        refund['id'] = f'{card_number}\nOTP {secret}'
+        line = mc.brief([closed, refund], root=self.root, cancelled={'5542'})
+        self.assertNotIn(card_number, line)
+        self.assertNotIn(secret, line)
+        self.assertNotIn('\n', line)
+        self.assertIn('[card number removed]', line)
+        self.assertIn('[secret removed]', line)
+
+    def test_cli_brief_includes_both_parts(self):
+        self.watcher('refund-reply', 'active')
+        self.case('resolved', watchers=['refund-reply'])
+        mc.close(self.data, 'resolved', 'resolved')
+        self.case('pending-refund', state='AED 109 credited to 5542, awaiting refund', merchant='Pending merchant')
+        Path(os.environ['CARD_STATUS_FILE']).write_text(json.dumps({'5542': {'state': 'cancelled', 'at': 1}}))
+        result = subprocess.run(['/usr/bin/python3', '-B', str(Path(mc.__file__)), 'brief'],
+                                env={**os.environ, 'MONEY_CASES_DIR': str(self.data),
+                                     'ROBOB_WATCH_ROOT': str(self.root)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertIn('closed but watcher running: resolved (refund-reply)', result.stdout)
+        self.assertIn('refund to cancelled card 5542: pending-refund, ask ENBD where it went', result.stdout)
 
 
 ALERT = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
@@ -2301,8 +2472,10 @@ class Cli(Base):
         code, _, err = self.run_cli('update', 'globex', '--deadline', 'tomorrow')
         self.assertEqual(code, 2)
         self.assertIn('is not a date', err)
-        self.assertTrue(self.run_cli('brief')[1].startswith('Money: 1 open.'))
+        self.assertTrue(self.run_cli('brief')[1].startswith('Money: 1 open;'))
         self.assertEqual(self.run_cli('close', 'globex', '--outcome', 'refunded')[0], 0)
+        self.assertIn('closed but watcher running: globex (globex-refund-chase)', self.run_cli('brief')[1])
+        self.watcher('globex-refund-chase', 'done')
         self.assertEqual(self.run_cli('brief')[1], '')
 
     def test_charge_ask_answered_and_questions(self):
