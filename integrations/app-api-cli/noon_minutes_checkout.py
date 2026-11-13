@@ -652,7 +652,9 @@ class MinutesCheckout:
         if mutation:
             try:
                 accepted = before_send(route, digest)
-            except Exception:
+            except Exception as exc:
+                if str(exc) == 'OWNER_GO_REQUIRED':
+                    raise MinutesError('OWNER_GO_REQUIRED') from None
                 raise MinutesError('SEND_RESERVATION_FAILED') from None
             require(accepted is True, 'SEND_RESERVATION_DENIED')
             sent = True

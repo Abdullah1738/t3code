@@ -271,7 +271,9 @@ def prepared_result(flow, prepared):
             or not isinstance(prepared.get('readback'),dict)
             or not prepared['readback']):
         journal.fail('PREPARE_ONLY_READBACK_UNCONFIRMED')
-    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED',
+    import owner_go
+    approval_item=owner_go.commerce_item(journal.binding(flow.flow_id))
+    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED','owner_go_item':approval_item,
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 

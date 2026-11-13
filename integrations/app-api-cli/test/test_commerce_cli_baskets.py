@@ -20,6 +20,9 @@ import commerce_cli as cli
 
 class BasketCLITests(unittest.TestCase):
     def setUp(self):
+        binding = patch.object(cli.journal, 'binding', return_value={
+            'app':'noon', 'vertical':'minutes', 'scope_hash':'b'*64})
+        binding.start(); self.addCleanup(binding.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'basket.json'

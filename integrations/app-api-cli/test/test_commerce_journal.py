@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
 _os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -28,6 +29,7 @@ def consume_child(root, flow, output=None):
 
 class CommerceJournalTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -384,6 +386,7 @@ class ReleaseTest(unittest.TestCase):
     """Terminal, evidence-reviewed closure of a fenced never-paid flow."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -512,6 +515,7 @@ if __name__ == '__main__': unittest.main()
 
 class StableCartAdoptionTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -607,6 +611,7 @@ class OrderlessPlaceRecoveryTest(unittest.TestCase):
     generic-400 shape seen live on the mart lane."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -795,6 +800,7 @@ class FencedPaymentReconciliationTest(unittest.TestCase):
     supersedes an UNKNOWN fence; the flow reactivates for explicit completion."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)

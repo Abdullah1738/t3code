@@ -129,7 +129,11 @@ def _normalize_items(product_code, quantity, items):
 
 
 def _scope_hash(store_code, items, address_hash):
-    """Single-item keeps the exact legacy digest; multi binds the full manifest."""
+    # Preserve plain-basket resumes; custom selections need their complete wire
+    # manifest so a changed note or modifier cannot reuse an earlier approval.
+    if any(i.get('modifiers') or i.get('notes') is not None for i in items):
+        return journal.digest({'store': store_code, 'items': items,
+                               'home': address_hash, 'card': order_card.LAST4, 'quiet': True})
     if len(items) == 1:
         return journal.digest({'store': store_code, 'product': items[0]['product_code'],
                                'qty': items[0]['quantity'], 'home': address_hash,

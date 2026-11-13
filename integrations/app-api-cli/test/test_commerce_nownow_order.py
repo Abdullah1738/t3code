@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 from decimal import Decimal
@@ -135,6 +136,9 @@ def make_flow(responses, **kwargs):
 
 
 class CapturedContractTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     """The lane replays the exact bodies/paths captured on NNGAANNWEFJMZW8A."""
 
     def test_live_cart_decimal_string_quantities_preserve_exact_manifest(self):
@@ -223,6 +227,9 @@ class CapturedContractTests(unittest.TestCase):
 
 
 class GuardTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_active_order_blocks_before_any_write(self):
         flow, harness = make_flow(happy_responses(
             home={'data': {'active': [{'orderNr': SYNTHETIC_ORDER, 'status': 'placed'}]}}))
@@ -254,6 +261,9 @@ class GuardTests(unittest.TestCase):
 
 
 class LaneTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_prepare_sets_exact_quiet_note_before_fresh_review(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
@@ -397,6 +407,9 @@ class LaneTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def prepare_partial_flow(self):
         """Run guard..quiet_delivery, then simulate a restart before place."""
         temp = tempfile.mkdtemp()
@@ -454,6 +467,9 @@ class ResumeTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_paid_order_completes_journal_with_tracker(self):
         temp = tempfile.mkdtemp()
         with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
@@ -499,6 +515,9 @@ if __name__ == '__main__':
 
 
 class TransportEdgeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_homepage_null_active_means_no_active_orders(self):
         import noon_nownow_checkout as transport
         client = transport.NowNowCheckout(

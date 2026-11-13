@@ -70,6 +70,7 @@ typeset -A live=(
 typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
+  "$HOME/.bun/bin/hcloud:$HOME/.local/bin/hcloud"
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"
   "$HOME/.local/bin/mailsend:$HOME/.local/share/robob-watch/helpers/mailsend"
 )
