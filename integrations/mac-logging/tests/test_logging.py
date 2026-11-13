@@ -673,7 +673,7 @@ class DiskProbeTests(unittest.TestCase):
             self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
             if outcome == 'error':
                 self.assertTrue(self.child.reaped)
-        with patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
+        with patch.object(collector, 'disk_wait'), patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
              patch.object(collector, 'state_path', side_effect=OSError('private state failure')):
             collector.main()
             collect.assert_called_once()

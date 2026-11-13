@@ -64,10 +64,35 @@ def directory():
     return Path(os.environ.get('TOOLLOG_DIR', str(Path.home() / '.robob/logs/tools/mac')))
 
 
-def safe_fields(values):
+def process_fields(values):
+    result = []
+    for proc in values[:10]:
+        if not isinstance(proc, dict):
+            continue
+        if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'ppid', 'ageS')):
+            continue
+        if not all(isinstance(proc.get(k), str) for k in ('stat', 'comm', 'args')):
+            continue
+        clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS')}
+        for key, limit in (('stat', 16), ('comm', 300), ('args', 300)):
+            value = proc[key][:limit]
+            clean[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value)
+        result.append(clean)
+    return result
+
+
+def safe_fields(values, event=None):
     result = {}
     for key, value in (values or {}).items():
-        if key == 'lockHolderCmd' and backup_command(value):
+        if event == 'proc.disk_wait' and key == 'procs' and isinstance(value, list):
+            result[key] = process_fields(value)
+        elif event == 'proc.disk_wait' and key == 'stuckUnmount' and type(value) is bool:
+            result[key] = value
+        elif event == 'proc.disk_wait' and key == 'mountPoint' and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value[:300])
+        elif key == 'lockHolderCmd' and backup_command(value):
             result[key] = value
         elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
             if key != 'trigger' or value != 'agent':
@@ -103,7 +128,7 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
     if type(ok) is bool:
         row['ok'] = ok
     for key, value in [('ids', {'runId': RUN_ID, **(ids or {})}), ('props', props)]:
-        clean = safe_fields(value)
+        clean = safe_fields(value, name if key == 'props' else None)
         if clean:
             row[key] = clean
     if error_tag and re.fullmatch(r'[a-z][a-z0-9_.-]{0,79}', error_tag):
