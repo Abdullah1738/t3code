@@ -832,7 +832,8 @@ def backup_holder(props, processes):
                      lockHolderStartedAgoS=process['age'], lockHolderTrigger=backup_origin(holder, processes))
 
 
-def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_reason='', lock_path=''):
+def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_reason='', lock_path='',
+               load_per_core='', last_success_age_s='', deferred_count=''):
     now = time.time()
     if target not in ('health', 'memory', 'other'):
         return
@@ -848,6 +849,16 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
     if skip_reason and skip_reason not in SKIP_REASONS:
         skip_reason = 'other'
     props = dict(target=target, exitCode=int(exit_code), skipped=int(bool(skip_reason)))
+    for key, value in [('loadPerCore', load_per_core), ('lastSuccessAgeS', last_success_age_s),
+                       ('deferredCount', deferred_count)]:
+        try:
+            if type(value) is bool:
+                continue
+            parsed = float(value) if key == 'loadPerCore' else int(str(value))
+            if math.isfinite(parsed) and parsed >= 0:
+                props[key] = round(parsed, 2) if key == 'loadPerCore' else parsed
+        except (ValueError, TypeError, OverflowError):
+            pass
     if skip_reason == 'lock_held':
         lock_props, gone = backup_lock(lock_path, now)
         props.update(lock_props)
@@ -871,6 +882,8 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
             ok = int(exit_code) == 0 and 'lockAgeS' in props and props['lockAgeS'] < 7200
             tag = (None if ok else 'backup.skip_stale_lock' if props.get('lockAgeS', -1) >= 7200
                    else 'backup.skipped_lock_held')
+        elif skip_reason in ('load_deferred', 'boot_grace') and int(exit_code) == 0:
+            ok, tag = True, None
     # Only counters are copied from restic's summary, never paths/errors or command output.
     for key, source in [('bytes', 'total_bytes_processed'), ('files', 'total_files_processed')]:
         if type(summary.get(source)) is int:
@@ -896,7 +909,7 @@ def main(argv):
             emit('disk', 'event' if ok else 'error', 'disk.alert', ok=ok,
                  props={'exitCode': int(argv[1])}, error_tag=None if ok else 'disk.alert_failed')
         elif argv[0] == 'backup':
-            backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:8])
+            backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:11])
         elif argv[0] == 'backup-reason':
             print(backup_reason(*argv[1:3], sys.stdin.read(16384)))
         elif argv[0] == 'backup-restic-exit':
