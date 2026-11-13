@@ -106,15 +106,18 @@ export function useRightPanelSurfaceClose(input: {
   };
   const labelFor = (terminalId: string) =>
     terminalLabelsById.get(terminalId) ?? getTerminalLabel(terminalId);
-  const closeSurfaces = (toClose: readonly RightPanelSurface[]) => {
+  const closeSurfaces = (toClose: readonly RightPanelSurface[], onClosed?: () => void) => {
     if (!threadRef) return;
-    closeAfterAgentBrowserConfirmation(toClose, () => finishClose(toClose));
+    closeAfterAgentBrowserConfirmation(toClose, () => {
+      finishClose(toClose);
+      onClosed?.();
+    });
   };
 
-  const closeSurface = useStableCallback((surface: RightPanelSurface) => {
+  const closeSurface = useStableCallback((surface: RightPanelSurface, onClosed?: () => void) => {
     if (!threadRef) return;
     if (surface.kind === "preview") {
-      closeSurfaces([surface]);
+      closeSurfaces([surface], onClosed);
       return;
     }
     if (
@@ -122,6 +125,7 @@ export function useRightPanelSurfaceClose(input: {
       !readEnvironmentScope(threadRef.environmentId, AuthTerminalOperateScope)
     ) {
       finishClose([surface]);
+      onClosed?.();
       return;
     }
     const otherLabels = surface.terminalIds
@@ -129,7 +133,10 @@ export function useRightPanelSurfaceClose(input: {
       .map(labelFor);
     void confirmTerminalClose([labelFor(surface.activeTerminalId), ...otherLabels]).then(
       (confirmed) => {
-        if (confirmed) finishClose([surface]);
+        if (confirmed) {
+          finishClose([surface]);
+          onClosed?.();
+        }
       },
     );
   });

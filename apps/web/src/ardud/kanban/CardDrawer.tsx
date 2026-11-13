@@ -49,6 +49,7 @@ import { cn } from "../../lib/utils";
 import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAnalyticsScreen } from "../useAnalytics";
 import { boardViewFor, useBoardClock } from "./useBoardClock";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
@@ -103,6 +104,7 @@ export function CardDrawer(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const { boardId, state } = props;
+  useAnalyticsScreen(usePrimaryEnvironmentId(), "card", boardId, props.cardId);
   const feedCard = state.cards.get(props.cardId);
   const detail = useCardDetail(boardId, props.cardId);
   // The feed's copy has no description or prompt and trims long texts; the card read

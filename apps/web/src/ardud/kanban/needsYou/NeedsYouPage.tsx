@@ -65,6 +65,8 @@ import { Bar, Btn, FilterChip, IconBtn, Layer, linkClass, usePageLayout } from "
 import "../tokens.css";
 import "../kanban.css";
 import "./needsYou.css";
+import { useAnalyticsSearch } from "../../useAnalytics";
+import { analyticsForEnvironment } from "@t3tools/client-runtime/ardud/analytics";
 
 const NO_MARKS: Readonly<Record<string, NeedsYouMark>> = {};
 
@@ -98,6 +100,13 @@ export function NeedsYouPage(props: {
   onSearch: (next: NeedsYouSearch, options?: { readonly replace?: boolean }) => void;
 }) {
   const { search, onSearch } = props;
+  const analyticsEnvironmentId = usePrimaryEnvironmentId();
+  const retryAsks = () => {
+    analyticsForEnvironment(analyticsEnvironmentId)?.record("client.retry", {
+      props: { reason: "retry" },
+    });
+    void refreshAsks();
+  };
   const view: NeedsYouView = search.view ?? "queue";
   const setView = (next: NeedsYouView) =>
     onSearch(patchNeedsYouSearch(search, { view: next === "queue" ? undefined : next }));
@@ -154,6 +163,7 @@ export function NeedsYouPage(props: {
   // An ask whose answer is on its way no longer counts.
   const owed = needsYou.items.filter((item) => !hidden.has(item.key));
   const order = needsYouFocusOrder(sections, openBatches);
+  useAnalyticsSearch(usePrimaryEnvironmentId(), "needs-owner", local.query.length, order.length);
   const focusKey =
     search.ask !== undefined && order.includes(search.ask)
       ? search.ask
@@ -333,7 +343,7 @@ export function NeedsYouPage(props: {
     status,
     // "No asks" is a claim: the rail makes it only for a read that came back.
     emptyLine: askListEmptyLine(askQueueFigures({ feed, status, error }), nowMs),
-    onRetry: () => void refreshAsks(),
+    onRetry: retryAsks,
     unreadable,
     onOpenUnreadable: (ask: AskUnreadable) => {
       if (ask.boardId === null || ask.cardId === null) return;
@@ -560,7 +570,7 @@ export function NeedsYouPage(props: {
                 alert
                 title="Couldn't load asks."
                 detail={error ?? undefined}
-                action={<Btn onClick={() => void refreshAsks()}>Retry</Btn>}
+                action={<Btn onClick={retryAsks}>Retry</Btn>}
               />
             ) : filtered ? (
               <Empty

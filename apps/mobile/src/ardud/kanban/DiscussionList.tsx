@@ -1,4 +1,6 @@
 import type { MenuAction } from "@react-native-menu/menu";
+import { useAnalyticsSearch } from "../useAnalytics";
+import { usePairedEnvironmentId } from "../common/environment";
 import {
   type DiscussionRow,
   discussionRows,
@@ -50,6 +52,7 @@ export function DiscussionList(props: {
   const total =
     groups.pinned.length + groups.active.length + groups.snoozed.length + groups.settled.length;
   const boardId = props.state.board.id;
+  useAnalyticsSearch(usePairedEnvironmentId(), "discussion", query.length, total, boardId);
   const shelves = useDiscussionShelves(boardId);
   const open = shelves.open;
   useEffect(() => kanbanClient().watchPreviews(boardId), [boardId]);

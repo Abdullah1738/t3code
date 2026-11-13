@@ -56,6 +56,7 @@ import {
   KanbanNightlyReviewSettings,
   type KanbanNightlyReview,
   type ModelSelection,
+  type AnalyticsEvent,
   type ProviderOptionSelection,
   type ProjectId,
   ThreadId,
@@ -117,6 +118,11 @@ import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverC
 import * as BoardLocks from "./boardLocks.ts";
 import * as LockedStore from "./lockedStore.ts";
 import * as SavedWrite from "./savedWrite.ts";
+import * as Analytics from "../../analytics/Analytics.ts";
+import {
+  analyticsErrorTag,
+  recordServerAnalytics,
+} from "../../../observability/RpcInstrumentation.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
@@ -1367,6 +1373,9 @@ interface TickKicks {
 const tickKicks = Context.Reference<TickKicks | undefined>("KanbanTickKicks", {
   defaultValue: () => undefined,
 });
+const tickQueueDepths = Context.Reference<
+  { todo?: number; needs_review?: number; evaluator?: number } | undefined
+>("KanbanTickQueueDepths", { defaultValue: () => undefined });
 
 /**
  * The asks a durable owner route answers, fixed by its first attempt. Routing
@@ -1380,6 +1389,23 @@ const ownerRouteAsks = Context.Reference<ReadonlySet<string> | undefined>("Kanba
 });
 
 const make = Effect.gen(function* () {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  // Measurements run inside the board operation's existing spans.
+  const recordAnalytics = Effect.fnUntraced(function* (
+    event: Omit<AnalyticsEvent, "ts" | "surface" | "route">,
+  ) {
+    if (Option.isNone(analytics)) return;
+    yield* recordServerAnalytics(analytics.value, {
+      ...event,
+      ts: DateTime.formatIso(yield* DateTime.now),
+      surface: "server",
+      route: "kanban",
+    });
+  });
+  const poolWaits = new Map<
+    string,
+    { boardId: string; pool: string; movedAt: string; at: number }
+  >();
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
@@ -3828,6 +3854,8 @@ const make = Effect.gen(function* () {
     const rows = yield* boardSql<EvaluatorQueueRow>`
       SELECT * FROM ardud_kanban_evaluator_queue WHERE board_id = ${boardId} AND done_at IS NULL ORDER BY id
     `.pipe(NodeSqliteClient.readOnly);
+    const depths = yield* tickQueueDepths;
+    if (depths !== undefined) depths.evaluator = rows.length;
     let result: EvaluatorLaunch | undefined;
     for (const row of rows) {
       // A discussion may have acquired an owner while its launch was queued.
@@ -6801,6 +6829,68 @@ const make = Effect.gen(function* () {
         );
       }
     }).pipe(Effect.onError(() => cleanup));
+    poolWaits.delete(card.id);
+    const dispatchedAt = yield* nowMillis;
+    yield* recordAnalytics({
+      kind: "kanban.dispatch",
+      boardId: board.id,
+      cardId: card.id,
+      threadId,
+      durationMs: Math.max(0, dispatchedAt - Date.parse(card.movedAt)),
+      props: { poolKey: dispatch.pool, phase: dispatch.role, span: "KanbanService.startCard" },
+    });
+  });
+
+  const recordPoolWaits = Effect.fnUntraced(function* (
+    board: KanbanBoard,
+    cards: ReadonlyArray<KanbanCard>,
+    pools: ReadonlyArray<KanbanPool>,
+    holds: ReadonlyMap<string, string>,
+    attempted: ReadonlySet<string>,
+    now: number,
+  ) {
+    if (Option.isNone(analytics)) return;
+    // Reuse the dispatcher's blockers, retry and pause gates, relaxing capacity alone.
+    const capacity = cards.length + holds.size + 1;
+    const expanded = pools.map((pool) => ({ ...pool, slots: capacity }));
+    for (const card of cards) {
+      const models =
+        card.stage === "needs_review"
+          ? [Rules.nextModel(board, card)].filter((model) => model !== null)
+          : kanbanCardModels(card).map((entry) => entry.model);
+      for (const model of models)
+        if (Rules.poolFor(expanded, model) === undefined)
+          expanded.push({ key: Rules.poolKey(model), model, slots: capacity });
+    }
+    const waiting = Rules.planDispatch(board, cards, expanded, holds, undefined, now, attempted);
+    const waitingIds = new Set(waiting.map((entry) => entry.cardId as string));
+    for (const [id, entry] of poolWaits)
+      if (entry.boardId === board.id && !waitingIds.has(id)) poolWaits.delete(id);
+    const byId = new Map(cards.map((card) => [card.id, card]));
+    for (const entry of waiting) {
+      const card = byId.get(entry.cardId)!;
+      const prior = poolWaits.get(card.id);
+      if (prior?.pool === entry.pool && prior.movedAt === card.movedAt && now - prior.at < 60_000)
+        continue;
+      poolWaits.set(card.id, {
+        boardId: board.id,
+        pool: entry.pool,
+        movedAt: card.movedAt,
+        at: now,
+      });
+      const pool = pools.find((pool) => pool.key === entry.pool);
+      yield* recordAnalytics({
+        kind: "kanban.waiting_for_pool",
+        boardId: board.id,
+        cardId: card.id,
+        durationMs: Math.max(0, now - Date.parse(card.movedAt)),
+        props: {
+          poolKey: entry.pool,
+          phase: entry.role,
+          reason: pool === undefined ? "missing_pool" : pool.slots === 0 ? "no_slots" : "capacity",
+        },
+      });
+    }
   });
 
   const dispatchUnlocked = Effect.fn("KanbanService.dispatchUnlocked")(function* (
@@ -6829,6 +6919,15 @@ const make = Effect.gen(function* () {
                     const board = yield* boardOf(candidate.id);
                     if (board.archivedAt !== null || settingUp.has(board.id)) return null;
                     const cards = yield* upgradeFindings(yield* store.cards(board.id));
+                    const depths = yield* tickQueueDepths;
+                    if (depths !== undefined) {
+                      depths.todo = cards.filter(
+                        (card) => card.stage === "todo" && card.settledAt === null,
+                      ).length;
+                      depths.needs_review = cards.filter(
+                        (card) => card.stage === "needs_review" && card.settledAt === null,
+                      ).length;
+                    }
                     // Old releases could leave a worker instruction after its last
                     // work subtask closed. Repair that persisted note without sending it.
                     for (let i = 0; i < cards.length; i++) {
@@ -6845,19 +6944,25 @@ const make = Effect.gen(function* () {
                       yield* saveCard(repaired);
                       cards[i] = repaired;
                     }
+                    const pools = Rules.maskDownPools(
+                      yield* store.pools(board.id),
+                      new Set((yield* Ref.get(down)).keys()),
+                    );
+                    const held = yield* boardHolds(board.id);
+                    const now = yield* nowMillis;
                     const dispatch = Rules.planDispatch(
                       board,
                       cards,
-                      Rules.maskDownPools(
-                        yield* store.pools(board.id),
-                        new Set((yield* Ref.get(down)).keys()),
-                      ),
-                      yield* boardHolds(board.id),
+                      pools,
+                      held,
                       pick,
-                      yield* nowMillis,
+                      now,
                       attempted,
                     )[0];
-                    if (!dispatch) return null;
+                    if (!dispatch) {
+                      yield* recordPoolWaits(board, cards, pools, held, attempted, now);
+                      return null;
+                    }
                     const card = cards.find((card) => card.id === dispatch.cardId);
                     return card ? { boardId: board.id, dispatch, card } : null;
                   }),
@@ -10035,6 +10140,9 @@ const make = Effect.gen(function* () {
     yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
     const busy = runningTicks.has(boardId);
     if (!busy) runningTicks.add(boardId);
+    const clock = yield* Clock.Clock;
+    const started = clock.monotonicTimeNanosUnsafe();
+    const depths: { todo?: number; needs_review?: number; evaluator?: number } = {};
     const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
     yield* tickLocalWaits(board).pipe(
       Effect.andThen(
@@ -10054,11 +10162,37 @@ const make = Effect.gen(function* () {
       Effect.onExit((exit) =>
         Effect.suspend(() => (Exit.isSuccess(exit) || !kicks.asked ? Effect.void : kick)),
       ),
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          // A busy tick only runs local waits; timing it would skew tick durations.
+          if (Option.isNone(analytics) || busy) return;
+          const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
+          yield* recordAnalytics({
+            kind: "kanban.tick",
+            boardId,
+            durationMs,
+            props: {
+              span: "KanbanService.tickBoard",
+              ...(Exit.isFailure(exit) ? { errorTag: analyticsErrorTag(exit.cause) } : {}),
+            },
+          });
+          for (const [phase, depth] of [
+            ...Object.entries(depths),
+            ["jobs", Math.max(0, yield* Queue.size(jobs))],
+          ] as const)
+            yield* recordAnalytics({
+              kind: "kanban.queue_depth",
+              boardId,
+              props: { phase, depth },
+            });
+        }).pipe(Effect.catchCause(() => Effect.void)),
+      ),
       Effect.ensuring(
         Effect.sync(() => {
           if (!busy) runningTicks.delete(boardId);
         }),
       ),
+      Effect.provideService(tickQueueDepths, Option.isSome(analytics) ? depths : undefined),
     );
   });
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {

@@ -74,6 +74,58 @@ const layer = it.layer(SqliteClient.layer({ filename: ":memory:" }));
 
 layer("NodeSqliteClient", (it) => {
   it.effect(
+    "observes slow read/write metadata, including returning writes, without SQL or bindings",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const observed: SqliteClient.SqliteStatementObservation[] = [];
+        const observer: SqliteClient.SqliteStatementObserver = {
+          slowThresholdMs: 0,
+          record: (entry) =>
+            Effect.sync(() => {
+              observed.push(entry);
+            }),
+        };
+        yield* Effect.gen(function* () {
+          yield* sql`CREATE TABLE observed_statements(secret TEXT UNIQUE)`;
+          yield* sql`SELECT 1 AS result`;
+          yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
+          yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(Effect.exit);
+        }).pipe(Effect.provideService(SqliteClient.StatementObserver, observer));
+        assert.deepEqual(
+          observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+          [
+            ["write", "writer", "success"],
+            ["read", "writer", "success"],
+            ["write", "writer", "success"],
+            ["write", "writer", "failure"],
+          ],
+        );
+        assert.isTrue(
+          observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
+        );
+        assert.isFalse(JSON.stringify(observed).includes("private"));
+        assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
+        yield* sql`SELECT 2`.pipe(
+          Effect.provideService(SqliteClient.StatementObserver, {
+            ...observer,
+            slowThresholdMs: Number.MAX_SAFE_INTEGER,
+          }),
+        );
+        assert.equal(observed.length, 4);
+        assert.deepEqual(
+          yield* sql`SELECT 3 AS result`.pipe(
+            Effect.provideService(SqliteClient.StatementObserver, {
+              slowThresholdMs: 0,
+              record: () => Effect.die("observer defect"),
+            }),
+          ),
+          [{ result: 3 }],
+        );
+      }),
+  );
+
+  it.effect(
     "observes only successful outer commits and keeps observer errors out of SQL results",
     () =>
       Effect.gen(function* () {
@@ -183,6 +235,30 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 });
+
+it.effect("observes worker-reader statements with their lane and no query content", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const rows = yield* sql`SELECT name FROM entries`.pipe(
+        SqliteClient.readOnly,
+        Effect.provideService(SqliteClient.StatementObserver, {
+          slowThresholdMs: 0,
+          record: (entry) =>
+            Effect.sync(() => {
+              observed.push(entry);
+            }),
+        }),
+      );
+      assert.deepEqual(rows, [{ name: "first" }]);
+      assert.deepEqual(
+        observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [["read", "reader", "background"]],
+      );
+      assert.isFalse(JSON.stringify(observed).includes("entries"));
+    }),
+  ),
+);
 
 const largeText = "x".repeat(64 * 1024 + 1);
 
@@ -2106,37 +2182,42 @@ it.effect("stops moving queued reads and respawning readers when they keep stopp
 
 it.effect("marks committed writes separately from reads and rolled back writes", () => {
   const spans: Array<Tracer.NativeSpan> = [];
-  const tracer = Tracer.make({ span: options => {
-    const span = new Tracer.NativeSpan(options);
-    const attribute = span.attribute.bind(span);
-    span.attribute = (key, value) => {
-      if (key === "db.commit.boundary") throw new Error("exporter failure");
-      attribute(key, value);
-    };
-    spans.push(span);
-    return span;
-  }});
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const attribute = span.attribute.bind(span);
+      span.attribute = (key, value) => {
+        if (key === "db.commit.boundary") throw new Error("exporter failure");
+        attribute(key, value);
+      };
+      spans.push(span);
+      return span;
+    },
+  });
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* sql`CREATE TABLE commits(value TEXT)`;
     yield* sql`INSERT INTO commits VALUES ('committed')`;
-    yield* sql.withTransaction(Effect.gen(function* () {
-      yield* sql`INSERT INTO commits VALUES ('rolled back')`;
-      return yield* Effect.fail("rollback");
-    })).pipe(Effect.ignore);
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO commits VALUES ('rolled back')`;
+          return yield* Effect.fail("rollback");
+        }),
+      )
+      .pipe(Effect.ignore);
     yield* sql`SELECT * FROM commits`;
   }).pipe(
     Effect.provide(SqliteClient.layer({ filename: ":memory:", statementMetrics: true })),
     Effect.provideService(Statement.SpanPropagationEnabled, true),
     Effect.withTracer(tracer),
     Effect.map(() => {
-      const commits = spans.filter(span => span.attributes.has("db.commit.at_ms"));
+      const commits = spans.filter((span) => span.attributes.has("db.commit.at_ms"));
       assert.equal(commits.length, 1);
       assert.isNumber(commits[0]!.attributes.get("db.commit.at_ms"));
     }),
   );
 });
-
 
 it.effect("keeps statement metrics opt-in with explicit configuration taking precedence", () =>
   Effect.gen(function* () {
@@ -2165,8 +2246,14 @@ it.effect("keeps statement metrics opt-in with explicit configuration taking pre
         Effect.withTracer(tracer),
         Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
       );
-      assert.equal(spans.some((span) => span.attributes.has("db.commit.at_ms")), expected);
-      assert.equal(spans.some((span) => span.attributes.has("db.rows_returned")), expected);
+      assert.equal(
+        spans.some((span) => span.attributes.has("db.commit.at_ms")),
+        expected,
+      );
+      assert.equal(
+        spans.some((span) => span.attributes.has("db.rows_returned")),
+        expected,
+      );
     }
   }),
 );

@@ -71,6 +71,33 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("requires analytics' destination grant and rechecks revocation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const analytics = createCommandPermissions(runtime, WS_METHODS.analyticsIngest);
+        const input = {
+          events: [
+            { ts: "2026-11-13T12:00:00Z", kind: "screen.open", surface: "web", route: "board" },
+          ],
+        };
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(analytics.requiredScopes(input)).toContain(AuthOrchestrationOperateScope);
+        expect(registry.get(analytics.permissionAtom(env, input))).toBe(true);
+        yield* analytics.authorize(registry, env, input);
+        expect(registry.get(analytics.permissionAtom(other, input))).toBe(false);
+        expect(yield* analytics.authorize(registry, other, input).pipe(Effect.flip)).toMatchObject({
+          _tag: "EnvironmentAuthorizationError",
+        });
+        registry.set(sessions(env), AsyncResult.success(grant(false)));
+        expect(registry.get(analytics.permissionAtom(env, input))).toBe(false);
+        expect(yield* analytics.authorize(registry, env, input).pipe(Effect.flip)).toMatchObject({
+          _tag: "EnvironmentAuthorizationError",
+        });
+      }),
+    ),
+  );
   it.effect("distinguishes unanswered checks, cached grants and scope revocation", () =>
     Effect.scoped(
       Effect.gen(function* () {

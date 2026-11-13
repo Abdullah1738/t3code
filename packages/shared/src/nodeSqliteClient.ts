@@ -203,6 +203,75 @@ export const TransactionCommitObserver = Context.Reference<(() => void) | undefi
   { defaultValue: () => undefined },
 );
 
+export interface SqliteStatementObservation {
+  readonly operation: "read" | "write";
+  readonly connection: "reader" | "writer";
+  readonly lane?: ReaderLaneName;
+  readonly durationMs: number;
+  readonly outcome: "success" | "failure" | "interrupt";
+  readonly span?: string;
+}
+
+export interface SqliteStatementObserver {
+  readonly slowThresholdMs: number;
+  readonly record: (observation: SqliteStatementObservation) => Effect.Effect<void>;
+}
+
+/** Metadata only: neither SQL, bindings, database paths nor causes cross this boundary. */
+export const StatementObserver = Context.Reference<SqliteStatementObserver | undefined>(
+  "@t3tools/shared/nodeSqliteClient/StatementObserver",
+  { defaultValue: () => undefined },
+);
+const observingStatement = Context.Reference(
+  "@t3tools/shared/nodeSqliteClient/observingStatement",
+  {
+    defaultValue: () => false,
+  },
+);
+
+// Each SQL statement already owns its tracing span; observation adds no per-statement span.
+const observeStatement = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  operation: () => "read" | "write",
+  connection: "reader" | "writer",
+  fallback: SqliteStatementObserver | undefined,
+  lane?: ReaderLaneName,
+): Effect.Effect<A, E, R> =>
+  Effect.withFiber((fiber) => {
+    const observer = fiber.getRef(StatementObserver) ?? fallback;
+    if (observer === undefined || fiber.getRef(observingStatement)) return effect;
+    const clock = fiber.getRef(Clock.Clock);
+    const started = clock.monotonicTimeNanosUnsafe();
+    return effect.pipe(
+      Effect.onExit((exit) =>
+        Effect.suspend(() => {
+          const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
+          if (durationMs < observer.slowThresholdMs) return Effect.void;
+          const parent = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+          const span =
+            parent?._tag === "Span" && /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(parent.name)
+              ? parent.name
+              : undefined;
+          return observer.record({
+            operation: operation(),
+            connection,
+            durationMs,
+            ...(lane === undefined ? {} : { lane }),
+            ...(span === undefined ? {} : { span }),
+            outcome: Exit.isSuccess(exit)
+              ? "success"
+              : Exit.hasInterrupts(exit)
+                ? "interrupt"
+                : "failure",
+          });
+        }).pipe(
+          Effect.provideService(observingStatement, true),
+          Effect.catchCause(() => Effect.void),
+        ),
+      ),
+    );
+  });
+
 export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
   "UnsupportedNodeSqliteVersionError",
   {
@@ -1396,6 +1465,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
 ): Effect.fn.Return<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> {
   options = { ...options, errorObserver: options.errorObserver ?? (yield* ErrorObserver) };
+  const statementObserver = yield* StatementObserver;
   yield* checkNodeSqliteCompat();
   const statementMetrics =
     options.statementMetrics ??
@@ -1476,7 +1546,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         activeClassification = previous;
       }
     };
-    if (checkpoint !== undefined) {
+    if (typeof db.setAuthorizer === "function") {
       // SQLite may reprepare an expired statement while it executes. Keep this
       // callback installed and collect only around that statement's prepare/run.
       db.setAuthorizer((actionCode, action, argument) => {
@@ -1520,7 +1590,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         try: () => {
           const classification = { backpressure: false, check: false };
           const statement = withClassification(classification, () => db.prepare(sql));
-          if (checkpoint !== undefined) checkpointClassifications.set(statement, classification);
+          checkpointClassifications.set(statement, classification);
           return statement;
         },
         catch: (cause) =>
@@ -1544,90 +1614,98 @@ const make = Effect.fn("makeWithDatabase")(function* (
       params: ReadonlyArray<unknown>,
       mode: "rows" | "raw" | "values" = "rows",
     ) =>
-      Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-        const classification = checkpointClassifications.get(statement);
-        const execute = () => {
-          let arrays = false;
-          let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
-          try {
-            const value = withClassification(classification, () => {
-              statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
-              if (hasRows(statement)) {
-                arrays = mode === "values";
-                if (arrays) statement.setReturnArrays(true);
-                return statement.all(...(params as any));
-              }
-              const result = statement.run(...(params as any));
-              return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
-            });
-            const commitObserver = fiber.getRef(TransactionCommitObserver);
-            if (
-              commitObserver !== undefined &&
-              !db.isTransaction &&
-              /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)
-            ) {
-              try {
-                commitObserver();
-              } catch {
-                /* An observer cannot turn a successful COMMIT into a failed write. */
-              }
-            }
-            if (statementMetrics) {
-              // SQLite has returned and released the outer transaction. This marks
-              // each commit, not an atomic receipt for a multi-write service call.
-              try {
-                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-                if (span?._tag === "Span") {
-                  span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
-                  span.attribute("db.stmt_status.available", false);
-                  if (
-                    !db.isTransaction &&
-                    /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)
-                  ) {
-                    span.attribute(
-                      "db.commit.at_ms",
-                      fiber.getRef(Clock.Clock).currentTimeMillisUnsafe(),
-                    );
-                    span.attribute("db.commit.boundary", "sqlite-returned");
-                  }
-                }
-              } catch {
-                /* Observing a committed write must never change its result. */
-              }
-            }
-            result = Exit.succeed(value);
-          } catch (cause) {
-            result = Exit.fail(
-              new SqlError({
-                reason: classifyError(cause, "Failed to execute statement", "execute", options),
-              }),
-            );
-          } finally {
-            // OR FAIL may have committed earlier rows even when execution throws.
-            if (classification?.check) checkpoint?.check();
-          }
-          if (arrays) {
+      observeStatement(
+        Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+          const classification = checkpointClassifications.get(statement);
+          const execute = () => {
+            let arrays = false;
+            let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
             try {
-              statement.setReturnArrays(false);
+              const value = withClassification(classification, () => {
+                statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
+                if (hasRows(statement)) {
+                  arrays = mode === "values";
+                  if (arrays) statement.setReturnArrays(true);
+                  return statement.all(...(params as any));
+                }
+                const result = statement.run(...(params as any));
+                return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
+              });
+              const commitObserver = fiber.getRef(TransactionCommitObserver);
+              if (
+                commitObserver !== undefined &&
+                !db.isTransaction &&
+                /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)
+              ) {
+                try {
+                  commitObserver();
+                } catch {
+                  /* An observer cannot turn a successful COMMIT into a failed write. */
+                }
+              }
+              if (statementMetrics) {
+                // SQLite has returned and released the outer transaction. This marks
+                // each commit, not an atomic receipt for a multi-write service call.
+                try {
+                  const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                  if (span?._tag === "Span") {
+                    span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
+                    span.attribute("db.stmt_status.available", false);
+                    if (
+                      !db.isTransaction &&
+                      /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)
+                    ) {
+                      span.attribute(
+                        "db.commit.at_ms",
+                        fiber.getRef(Clock.Clock).currentTimeMillisUnsafe(),
+                      );
+                      span.attribute("db.commit.boundary", "sqlite-returned");
+                    }
+                  }
+                } catch {
+                  /* Observing a committed write must never change its result. */
+                }
+              }
+              result = Exit.succeed(value);
             } catch (cause) {
-              return Exit.die(
+              result = Exit.fail(
                 new SqlError({
-                  reason: classifyError(
-                    cause,
-                    "Failed to reset statement result mode",
-                    "resetResultMode",
-                    options,
-                  ),
+                  reason: classifyError(cause, "Failed to execute statement", "execute", options),
                 }),
               );
+            } finally {
+              // OR FAIL may have committed earlier rows even when execution throws.
+              if (classification?.check) checkpoint?.check();
             }
-          }
-          return result;
-        };
-        return checkpoint !== undefined && classification?.backpressure
-          ? checkpoint.runWithAdmission(execute)
-          : execute();
-      });
+            if (arrays) {
+              try {
+                statement.setReturnArrays(false);
+              } catch (cause) {
+                return Exit.die(
+                  new SqlError({
+                    reason: classifyError(
+                      cause,
+                      "Failed to reset statement result mode",
+                      "resetResultMode",
+                      options,
+                    ),
+                  }),
+                );
+              }
+            }
+            return result;
+          };
+          return checkpoint !== undefined && classification?.backpressure
+            ? checkpoint.runWithAdmission(execute)
+            : execute();
+        }),
+        () => {
+          const classification = checkpointClassifications.get(statement);
+          return classification?.backpressure || classification?.check ? "write" : "read";
+        },
+        "writer",
+        statementObserver,
+      );
 
     const run = (sql: string, params: ReadonlyArray<unknown>, raw = false) =>
       Effect.flatMap(statementFor(sql, params), (statement) =>
@@ -1754,6 +1832,30 @@ const make = Effect.fn("makeWithDatabase")(function* (
   });
   const reservedReader = (lane: "auth" | "identity") =>
     lane === "identity" ? acquireIdentity : acquireAuth;
+  const observedReaders = new WeakMap<Connection, Connection>();
+  const originalReaders = new WeakMap<Connection, Connection>();
+  const observeReaderConnection = (
+    connection: Connection,
+    lane: ReaderLaneName | undefined,
+  ): Connection => {
+    const existing = observedReaders.get(connection);
+    if (existing !== undefined) return existing;
+    const observe = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      observeStatement(effect, () => "read", "reader", statementObserver, lane);
+    const observed: Connection = {
+      ...connection,
+      execute: (sql, params, transform) => observe(connection.execute(sql, params, transform)),
+      executeRaw: (sql, params) => observe(connection.executeRaw(sql, params)),
+      executeValues: (sql, params) => observe(connection.executeValues(sql, params)),
+      executeValuesUnprepared: (sql, params) =>
+        observe(connection.executeValuesUnprepared(sql, params)),
+      executeUnprepared: (sql, params, transform) =>
+        observe(connection.executeUnprepared(sql, params, transform)),
+    };
+    observedReaders.set(connection, observed);
+    originalReaders.set(observed, connection);
+    return observed;
+  };
   const viaPool = (
     pool: NonNullable<typeof background>,
     orElse: Effect.Effect<RouteTarget, SqlError>,
@@ -1790,6 +1892,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
         ? viaPool(foreground, viaBackground)
         : viaBackground;
     }),
+  ).pipe(
+    Effect.map((target) =>
+      target.name === "reader"
+        ? { ...target, connection: observeReaderConnection(target.connection, target.lane) }
+        : target,
+    ),
   );
 
   const acquired = (target: RouteTarget, clock: Clock.Clock, start: bigint): Acquired => ({
@@ -1879,7 +1987,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
         target.lane !== undefined &&
         isReservedLane(target.lane)
       )
-        pending.retire = retireAuthReader(target.connection);
+        pending.retire = retireAuthReader(
+          originalReaders.get(target.connection) ?? target.connection,
+        );
       const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
         const grant = acquired(target, clock, start);
         if (pending !== undefined) pending.acquired = grant;

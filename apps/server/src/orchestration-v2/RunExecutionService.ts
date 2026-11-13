@@ -42,6 +42,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
@@ -68,6 +69,9 @@ import {
 } from "../ardud/durability/transientSqliteRead.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import { recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
 
 export interface ProviderEventRoutingState {
   readonly ownedThreadIds: ReadonlySet<ThreadId>;
@@ -613,6 +617,70 @@ export class RunExecutionServiceV2 extends Context.Service<
   RunExecutionServiceV2Shape
 >()("t3/orchestration-v2/RunExecutionService/RunExecutionServiceV2") {}
 
+// The provider consumer owns the span. This observer runs before text filtering or writes.
+export const makeFirstTokenObserver = Effect.fnUntraced(function* (
+  run: Pick<OrchestrationV2Run, "id" | "threadId" | "startedAt">,
+  attemptId: RunAttemptId,
+) {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+  let seen = false;
+  return Effect.fnUntraced(function* (event: ProviderAdapter.ProviderAdapterV2Event) {
+    if (seen || Option.isNone(analytics)) return;
+    const hasToken =
+      event.type === "message.updated"
+        ? event.message.threadId === run.threadId &&
+          event.message.runId === run.id &&
+          event.message.role === "assistant" &&
+          event.message.text.length > 0
+        : event.type === "turn_item.updated" &&
+          event.turnItem.threadId === run.threadId &&
+          event.turnItem.runId === run.id &&
+          (event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning") &&
+          event.turnItem.text.length > 0;
+    if (!hasToken) return;
+    seen = true;
+    const now = yield* DateTime.now;
+    // Attribution can wait for the boards database; provider output must keep flowing.
+    yield* Effect.gen(function* () {
+      const link = Option.isSome(kanban)
+        ? yield* kanban.value.threadLink(run.threadId).pipe(
+            Effect.timeoutOption("2 seconds"),
+            Effect.map((value) => Option.getOrElse(value, () => null)),
+            Effect.catchCause(() => Effect.succeed(null)),
+          )
+        : null;
+      yield* recordServerAnalytics(analytics.value, {
+        ts: DateTime.formatIso(now),
+        kind: "provider.first_token",
+        surface: "server",
+        route: "provider",
+        threadId: run.threadId,
+        ...(link === null
+          ? {}
+          : {
+              boardId: link.boardId,
+              ...(link.cardId === null ? {} : { cardId: link.cardId }),
+              ...(link.discussionId === null ? {} : { discussionId: link.discussionId }),
+            }),
+        ...(run.startedAt === null
+          ? {}
+          : {
+              durationMs: Math.max(
+                0,
+                DateTime.toEpochMillis(now) - DateTime.toEpochMillis(run.startedAt),
+              ),
+            }),
+        props: {
+          phase: link?.role === "work" ? "worker" : (link?.role ?? "agent"),
+          key: attemptId,
+          span: "RunExecutionService.startRootRun",
+        },
+      });
+    }).pipe(Effect.forkDetach);
+  });
+});
+
 export const layer: Layer.Layer<
   RunExecutionServiceV2,
   never,
@@ -637,6 +705,7 @@ export const layer: Layer.Layer<
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
+    const analyticsContext = yield* Effect.context<never>();
 
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
@@ -890,6 +959,9 @@ export const layer: Layer.Layer<
 
     return RunExecutionServiceV2.of({
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        const observeFirstToken = yield* makeFirstTokenObserver(input.run, input.attempt.id).pipe(
+          Effect.provideContext(analyticsContext),
+        );
         // Startup failure and stream shutdown can report the same attempt.
         const refreshAfterTurn = yield* Effect.cached(
           finalizationObserver.refreshAfterTurn(input.appThread.projectId).pipe(
@@ -1588,6 +1660,7 @@ export const layer: Layer.Layer<
           Stream.tap(({ event, accepted }) =>
             Effect.gen(function* () {
               if (!accepted) return;
+              yield* observeFirstToken(event);
               yield* observeNativeLifecycle(event);
               // Native completion remains termination evidence even if persisting it fails.
               if (event.type === "turn.terminal") {

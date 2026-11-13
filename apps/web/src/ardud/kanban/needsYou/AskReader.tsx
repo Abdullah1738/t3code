@@ -1,3 +1,5 @@
+import { usePrimaryEnvironmentId } from "../../../state/environments";
+import { useAnalyticsScreen } from "../../useAnalytics";
 import {
   STAGE_LABELS,
   askAge,
@@ -116,6 +118,14 @@ export function AskReader(props: {
   onLeave: () => void;
 }) {
   const { entry, item, layout } = props;
+  useAnalyticsScreen(
+    usePrimaryEnvironmentId(),
+    "ask",
+    entry.boardId,
+    entry.cardId,
+    entry.discussionId ?? undefined,
+    entry.ask.id,
+  );
   const key = askKey(entry);
   const turn = askTurn(entry, item);
   const detail = useAskStore((state) => state.details[`${key}@${entry.revision}`]);

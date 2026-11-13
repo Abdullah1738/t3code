@@ -1,4 +1,5 @@
 import { Component, type ReactNode } from "react";
+import { activeAnalytics, analyticsErrorTag } from "@t3tools/client-runtime/ardud/analytics";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "./ui/AppText";
@@ -61,10 +62,14 @@ export class RenderErrorBoundary extends Component<
   }
 
   override componentDidCatch(_error: unknown, info: { componentStack?: string }) {
+    activeAnalytics()?.record("client.error", {
+      props: { errorTag: analyticsErrorTag(_error), phase: "render" },
+    });
     this.setState({ componentStack: info.componentStack });
   }
 
   private readonly retry = () => {
+    activeAnalytics()?.record("client.retry", { props: { reason: "retry", phase: "render" } });
     this.setState({ failed: false, error: null, componentStack: undefined });
   };
 

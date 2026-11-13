@@ -1,3 +1,6 @@
+import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
+import { layerServerAnalyticsErrors } from "./observability/RpcInstrumentation.ts";
+import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
 import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import { redactionRouteLayer } from "./ardud/redaction/http.ts";
@@ -1155,7 +1158,10 @@ const layerMakeServer = Layer.unwrap(
       Layer.provide(layerActivation),
       Layer.provideMerge(RelayTracing.layerServerRelayBroker),
       Layer.provideMerge(layerHttpServer),
+      Layer.provide(layerServerAnalyticsErrors),
       Layer.provide(layerApplicationObservability),
+      Layer.provide(AnalyticsDatabase.layer),
+      Layer.provide(OwnerAnalytics.layer),
       Layer.provide(LargeReplyLog.layer),
       Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),

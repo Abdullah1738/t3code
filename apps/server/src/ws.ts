@@ -1,3 +1,5 @@
+import { AnalyticsError } from "@t3tools/contracts";
+import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -238,7 +240,13 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForDeviceList, rpcAuthorizationError } from "./auth/RpcAuthorization.ts";
 import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
-import { RpcInstrumentation, rpcInstrumentationLayer } from "./observability/RpcInstrumentation.ts";
+import {
+  RpcInstrumentation,
+  rpcInstrumentationLayer,
+  AnalyticsOriginKind,
+  rpcAnalyticsSerialization,
+  recordServerAnalytics,
+} from "./observability/RpcInstrumentation.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -1411,6 +1419,7 @@ export const layerWsRpc = (
       const providerSessionsV2 = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const mcpAppRequests = yield* McpAppRequests.McpAppRequests;
       const analytics = yield* AnalyticsService.AnalyticsService;
+      const ownerAnalytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
       const originProps = clientAnalyticsProps;
       const recordClientCommandAnalytics = (command: OrchestrationV2Command) => {
         switch (command.type) {
@@ -2651,6 +2660,15 @@ export const layerWsRpc = (
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) => resourceTelemetry.retry,
         [WS_METHODS.serverCheckOtlpEndpoint]: (input) => otlpEndpointCheck.check(input),
         [WS_METHODS.serverSignalProcess]: (input) => processDiagnostics.signal(input),
+        [WS_METHODS.analyticsIngest]: (input) =>
+          ownerAnalytics._tag === "Some"
+            ? ownerAnalytics.value.ingest({
+                events: input.events.map((event) => ({
+                  ...event,
+                  props: { ...event.props, originKind: currentSession.origin?._tag ?? "unknown" },
+                })),
+              })
+            : Effect.fail(new AnalyticsError({ operation: "ingest", cause: undefined })),
         [WS_METHODS.serverReportClientActivity]: (input, metadata) =>
           Ref.update(rpcClientIds, (clientIds) => {
             const next = new Set(clientIds);
@@ -3388,6 +3406,23 @@ export const layer = Layer.unwrap(
             failEnvironmentInternal("internal_error", error),
           ),
         );
+        const localAnalytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
+        const analyticsContext = yield* Effect.context<never>();
+        const originKind = session.origin?._tag ?? "unknown";
+        const recordRpcBytes = (method: string, bytes: number) => {
+          if (localAnalytics._tag === "None") return;
+          Effect.runForkWith(analyticsContext)(
+            Effect.flatMap(DateTime.now, (now) =>
+              recordServerAnalytics(localAnalytics.value, {
+                ts: DateTime.formatIso(now),
+                kind: "server.rpc.bytes",
+                surface: "server",
+                route: method,
+                props: { method, bytes, originKind },
+              }),
+            ),
+          );
+        };
         const clientOrigin = readClientConnectionOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
         // ardud: this metadata UPDATE waits for the state writer, which was held for
@@ -3444,16 +3479,20 @@ export const layer = Layer.unwrap(
               Layer.provideMerge(
                 Layer.succeed(
                   RpcSerialization.RpcSerialization,
-                  WsReplySerialization.wrap(
-                    RpcSerialization.json,
-                    largeReplyLog,
-                    new Set(ServerWsRpcGroup.requests.keys()),
+                  rpcAnalyticsSerialization(
+                    WsReplySerialization.wrap(
+                      RpcSerialization.json,
+                      largeReplyLog,
+                      new Set(ServerWsRpcGroup.requests.keys()),
+                    ),
+                    recordRpcBytes,
                   ),
                 ),
               ),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.
               Layer.provide(DefectReporter.layer),
+              Layer.provide(Layer.succeed(AnalyticsOriginKind, originKind)),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AgentSessionScanner.layer),
               Layer.provide(ProviderMaintenanceRunner.layer),
