@@ -50,6 +50,7 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -427,6 +428,7 @@ export interface ThreadManagementServiceShape {
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
+  readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -1147,6 +1149,7 @@ const make = Effect.gen(function* () {
   const waitForThread: ThreadManagementServiceShape["waitForThread"] = Effect.fn(
     "ThreadManagementService.waitForThread",
   )(function* (input) {
+    const waitStartedAt = yield* Clock.monotonicTimeNanos;
     const loadError = (cause: unknown) =>
       new ThreadManagementProjectionLoadError({
         projectId: input.projectId,
@@ -1227,7 +1230,14 @@ const make = Effect.gen(function* () {
       ),
       Stream.filter((current) => current.settled),
       Stream.runHead,
-      Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
+      Effect.timeoutOption(
+        Duration.millis(
+          Math.max(
+            0,
+            input.timeoutMs - Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1_000_000,
+          ),
+        ),
+      ),
     );
     const waited = Option.flatten(yield* wait);
     if (Option.isSome(waited)) {
@@ -1514,6 +1524,7 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,
     ),

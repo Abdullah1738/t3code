@@ -29,9 +29,22 @@ export const GetByCommandIdInput = Schema.Struct({
 });
 export type GetByCommandIdInput = typeof GetByCommandIdInput.Type;
 
+const McpThreadCreationLookup = Schema.Struct({
+  projectId: ProjectId,
+  requestKey: Schema.String,
+  index: Schema.Number,
+});
+const McpThreadCreation = Schema.Struct({ commandId: CommandId, threadId: ThreadId });
+
 export class OrchestrationCommandReceiptRepository extends Context.Service<
   OrchestrationCommandReceiptRepository,
   {
+    readonly findMcpThreadCreations: (
+      input: typeof McpThreadCreationLookup.Type,
+    ) => Effect.Effect<
+      ReadonlyArray<typeof McpThreadCreation.Type>,
+      OrchestrationCommandReceiptRepositoryError
+    >;
     readonly insertIfAbsent: (
       receipt: OrchestrationCommandReceipt,
     ) => Effect.Effect<boolean, OrchestrationCommandReceiptRepositoryError>;
@@ -107,6 +120,35 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
       `,
   });
 
+  const findMcpThreadCreationRows = SqlSchema.findAll({
+    Request: McpThreadCreationLookup,
+    Result: McpThreadCreation,
+    execute: ({ projectId, requestKey, index }) => {
+      const suffix = `:${encodeURIComponent(requestKey)}:${index}`;
+      // The project index bounds the candidate threads; each receipt uses its primary key.
+      return sql`
+        SELECT r.command_id AS "commandId", t.thread_id AS "threadId"
+        FROM orchestration_v2_projection_threads t
+        JOIN orchestration_command_receipts r ON r.command_id =
+          'command:mcp:' || substr(t.thread_id, 12, length(t.thread_id) - 11 - length(${suffix})) || ':create-thread' || ${suffix}
+        WHERE t.project_id = ${projectId}
+          AND substr(t.thread_id, 1, 11) = 'thread:mcp:'
+          AND substr(t.thread_id, -length(${suffix})) = ${suffix}
+          AND r.aggregate_kind = 'thread' AND r.aggregate_id = t.thread_id
+          AND r.command_type = 'thread.create' AND r.status = 'accepted'
+      `;
+    },
+  });
+  const findMcpThreadCreations = Effect.fn(
+    "OrchestrationCommandReceiptRepository.findMcpThreadCreations",
+  )(function* (input: typeof McpThreadCreationLookup.Type) {
+    return yield* findMcpThreadCreationRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlError("OrchestrationCommandReceiptRepository.findMcpThreadCreations:query"),
+      ),
+    );
+  });
+
   const upsert: OrchestrationCommandReceiptRepository["Service"]["upsert"] = (receipt) =>
     upsertReceiptRow(receipt).pipe(
       Effect.mapError(toPersistenceSqlError("OrchestrationCommandReceiptRepository.upsert:query")),
@@ -155,6 +197,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
     );
 
   return {
+    findMcpThreadCreations,
     insertIfAbsent,
     upsert,
     getByCommandId,
