@@ -1068,7 +1068,14 @@ it.effect("wiki_read keeps a 230-page board's index below 50 KB", () => {
 });
 
 it.effect("board helpers resolve delegated ancestry without widening role-bound tools", () => {
-  const { layer, parents, missing, deleted, unreadable } = fakeThreads();
+  const { layer, parents, missing, deleted, unreadable } = fakeThreads(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { findExisting: true, send: () => Effect.void },
+  );
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
     const boardA = yield* kanban.ensureBoard({
@@ -1175,6 +1182,7 @@ it.effect("board helpers resolve delegated ancestry without widening role-bound 
       assert.isTrue(deniedPause.isError);
       assert.include(deniedPause.text, "Only evaluators");
     }
+    yield* TestClock.adjust("1 minute");
     const evaluator = yield* kanban.startEvaluator(boardA.id, {
       kind: "request",
       text: "Read cards",
@@ -2937,7 +2945,10 @@ it.effect.each(["card_move", "card_review_result"] as const)(
     Effect.gen(function* () {
       const held = yield* Deferred.make<void>();
       const resume = yield* Deferred.make<void>();
-      const fake = fakeThreads();
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+        findExisting: true,
+        send: () => Effect.void,
+      });
       const warnings: unknown[] = [];
       const logger = Logger.make(({ message }) => {
         warnings.push(message);
@@ -3736,6 +3747,33 @@ it.effect.each([
     }).pipe(Effect.provide(fake.layer));
   }),
 );
+
+it.effect("#1156 report_bug returns a durable queue result when evaluator slots are full", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "bug-caps",
+      name: "Bug caps",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    for (let i = 0; i < 12; i++)
+      yield* kanban.submitEvaluator(board.id, { kind: "request", text: `Fill ${i}` });
+    const result = yield* call(ThreadId.make("outside"), "report_bug", {
+      boardId: board.slug,
+      title: "Novel parser crash",
+      evidence: "Retain this evidence",
+    });
+    assert.isFalse(result.isError, result.text);
+    assert.isTrue(result.structured.queued);
+    assert.isNumber(result.structured.queueId);
+    assert.lengthOf(fake.launches, 12);
+    yield* TestClock.adjust("1 minute");
+    yield* kanban.tick;
+    assert.lengthOf(fake.launches, 13);
+    assert.include(fake.launches.at(-1)!, "Retain this evidence");
+  }).pipe(Effect.provide(fake.layer));
+});
 
 it.effect("report_bug is safe to retry if its reply times out before any write", () =>
   Effect.gen(function* () {
