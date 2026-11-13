@@ -260,10 +260,12 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     day = (utc.date()-dt.timedelta(days=1)).isoformat()
     if (utc.hour > 0 or utc.minute >= 5) and state.get('rollupDay') != day:
         try:
-            deadline_call(deadline, rollup, day)
+            result = deadline_call(deadline, rollup, day)
             state['rollupDay'] = day
             save_state('crashes', state)
-            emit('rollup', 'event', 'log.rollup', ok=True)
+            emit('rollup', 'event', 'log.rollup', ok=True,
+                 props={'backup.'+key+'.'+target: count
+                        for key, targets in result['backup'].items() for target, count in targets.items()})
         except Exception:
             emit('rollup', 'error', 'log.rollup', ok=False, error_tag='rollup.failed')
     return not errors
