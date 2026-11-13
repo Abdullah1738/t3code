@@ -800,7 +800,8 @@ def amazon_fetch(cfg, state, now):
                               'evidence': ('Complete email manifest and delivered shipment quantities verified.'
                                            if whole else 'Exact-order status email; not completion proof.')}]
     if not whole:
-        pushes, errors = store.evidence(cfg, classify, single_allowed(cfg))
+        with toollog.phase('fetch'):
+            pushes, errors = store.evidence(cfg, classify, single_allowed(cfg))
         result['errors'].extend(errors)
         if pushes:
             candidate = dict(max(pushes, key=lambda e: e['observed_at']))
@@ -920,7 +921,8 @@ def fetch(cfg, state, now):
             verified = state.setdefault('mail_bodies_verified', {})
             if len(verified) > 200:
                 verified.clear()
-            mails, errs = mail_evidence(cfg, verified)
+            with toollog.phase('fetch'):
+                mails, errs = mail_evidence(cfg, verified)
             state['mail_checked'] = now
             state['mail_cache'] = mails
             state['mail_errors'] = errs
@@ -930,11 +932,12 @@ def fetch(cfg, state, now):
     errors.extend(state.get('mail_errors', []))
     single = single_allowed(cfg)
     live_eta, live_source_ok = None, False
-    if cfg['app'] == 'careem' and cfg.get('vertical') != 'box' and single:
-        pushes, live_eta, push_errors = careem_live_evidence(cfg, now)
-        live_source_ok = bool(pushes) and not push_errors
-    else:
-        pushes, push_errors = store.evidence(cfg, classify, single)
+    with toollog.phase('fetch'):
+        if cfg['app'] == 'careem' and cfg.get('vertical') != 'box' and single:
+            pushes, live_eta, push_errors = careem_live_evidence(cfg, now)
+            live_source_ok = bool(pushes) and not push_errors
+        else:
+            pushes, push_errors = store.evidence(cfg, classify, single)
     evidence.extend(pushes)
     errors.extend(push_errors)
     result = {**native_details, 'app': cfg['app'], 'order': cfg['order'], 'status': 'unknown',
@@ -1441,7 +1444,7 @@ def main(argv=None, _locked=False):
         if registered:
             configure_problem_check(cfg, watchpath)
         toollog.emit('order-watch','track.add',kind='event' if registered else 'error',ok=registered,
-                     ids={'orderId':args.order},props={'merchant':app,'source':args.source},
+                     ids={'orderId':args.order},props={'merchant':app,'source':args.source,'lane':args.vertical},
                      error=None if registered else 'TRACK_REGISTRATION_FAILED')
         result = read(watchpath.parent / 'order-tracker-state.json').get('last_result', {})
         card = None

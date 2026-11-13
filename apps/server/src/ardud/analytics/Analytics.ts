@@ -89,6 +89,7 @@ class AnalyticsValidationError extends Schema.TaggedError<AnalyticsValidationErr
 interface PendingEvent {
   readonly day: string;
   readonly line: string;
+  readonly event: AnalyticsEvent;
   readonly bytes: number;
   attempts: number;
 }
@@ -147,8 +148,30 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   let accepting = true;
   let lastMaintenanceDay: string | undefined;
   let retryAt = 0;
-  const incompleteDays = new Set<string>();
   const dirtyDays = new Set<string>();
+  // Only recently read views are resident. Each owns bounded groups and 500 samples, never the day log.
+  const views = new Map<
+    string,
+    {
+      day: string;
+      filter: AnalyticsReadInput | undefined;
+      accumulator: ReturnType<typeof makeAccumulator>;
+      samples: ReturnType<ReturnType<typeof sampleMix>["entries"]>;
+      kinds: string[];
+      signature: string;
+    }
+  >();
+  const matches = (event: AnalyticsEvent, filter?: AnalyticsReadInput) =>
+    (filter?.boardId === undefined || event.kind !== "performance.long-task") &&
+    (filter?.kind === undefined || filter.kind === event.kind) &&
+    (filter?.boardId === undefined || filter.boardId === event.boardId) &&
+    (filter?.tool === undefined || filter.tool === event.tool) &&
+    (filter?.outcome === undefined || filter.outcome === event.outcome);
+  const viewKey = (day: string, filter?: AnalyticsReadInput) =>
+    JSON.stringify([day, filter?.kind, filter?.boardId, filter?.tool, filter?.outcome]);
+  const invalidate = (day: string) => {
+    for (const [key, view] of views) if (view.day === day) views.delete(key);
+  };
   const dropWarnings = new Map<DropReason, { count: number; nextAt: number }>();
 
   // Drop accounting also runs on request paths, where per-event spans would be too frequent.
@@ -173,20 +196,28 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     return yield* fileSystem.readDirectory(directory);
   });
 
+  const signature = Effect.fn("Analytics.signature")(function* (
+    day: string,
+    files: readonly string[],
+  ) {
+    const rows: string[] = [];
+    for (const file of files.toSorted()) {
+      if (LOG_FILE.exec(file)?.[1] !== day) continue;
+      const info = yield* fileSystem.stat(path.join(directory, file));
+      rows.push(
+        `${file}:${info.size}:${Option.getOrUndefined(info.mtime)?.getTime()}:${Option.getOrUndefined(info.ino)}`,
+      );
+    }
+    return rows.join("|");
+  });
+
   const scanDay = Effect.fn("Analytics.scanDay")(function* (
     day: string,
     files: readonly string[],
     filter?: AnalyticsReadInput,
   ) {
-    const full = makeAccumulator();
-    const filtered =
-      filter?.kind !== undefined ||
-      filter?.boardId !== undefined ||
-      filter?.tool !== undefined ||
-      filter?.outcome !== undefined
-        ? makeAccumulator()
-        : full;
-    const samples = sampleMix(filter?.limit ?? 100, filter?.kind);
+    const accumulator = makeAccumulator();
+    const samples = sampleMix(500, filter?.kind);
     const selected = files
       .flatMap((file) => {
         const match = LOG_FILE.exec(file);
@@ -202,20 +233,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           ? undefined
           : yield* decodeLine(line).pipe(Effect.orElseSucceed(() => undefined));
       if (!event || dayOf(DateTime.toEpochMillis(DateTime.makeUnsafe(event.ts))) !== day) {
-        full.invalidLines++;
-        if (filtered !== full) filtered.invalidLines++;
+        accumulator.invalidLines++;
         return;
       }
-      accumulate(full, event);
-      if (
-        (filter?.boardId !== undefined && event.kind === "performance.long-task") ||
-        (filter?.kind !== undefined && filter.kind !== event.kind) ||
-        (filter?.boardId !== undefined && filter.boardId !== event.boardId) ||
-        (filter?.tool !== undefined && filter.tool !== event.tool) ||
-        (filter?.outcome !== undefined && filter.outcome !== event.outcome)
-      )
-        return;
-      if (filtered !== full) accumulate(filtered, event);
+      if (!matches(event, filter)) return;
+      accumulate(accumulator, event);
       samples.add(event);
     });
 
@@ -227,15 +249,37 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       );
       yield* Effect.forEach(lines.finish(), consume, { discard: true });
     }
-    const generatedAt = DateTime.formatIso(yield* DateTime.now);
     return {
-      full: finishRollup(full, day, generatedAt),
-      result: {
-        rollup: finishRollup(filtered, day, generatedAt),
-        samples: samples.finish(),
-      },
-      hasFiles: selected.length > 0,
+      accumulator,
+      samples: samples.entries(),
+      kinds: samples.kinds(),
     };
+  });
+
+  const getView = Effect.fn("Analytics.getView")(function* (
+    day: string,
+    files: readonly string[],
+    filter?: AnalyticsReadInput,
+  ) {
+    const key = viewKey(day, filter);
+    const fingerprint = yield* signature(day, files);
+    if ([...views.values()].some((view) => view.day === day && view.signature !== fingerprint))
+      invalidate(day);
+    const cached = views.get(key);
+    if (cached?.signature === fingerprint) return cached;
+    const scan = yield* scanDay(day, files, filter);
+    const view = {
+      day,
+      filter,
+      accumulator: scan.accumulator,
+      samples: scan.samples,
+      kinds: scan.kinds,
+      signature: fingerprint,
+    };
+    // FIFO bounds cardinality across days and arbitrary filter combinations.
+    if (views.size >= 16) views.delete(views.keys().next().value!);
+    views.set(key, view);
+    return view;
   });
 
   const persistRollup = Effect.fn("Analytics.persistRollup")(function* (rollup: AnalyticsRollup) {
@@ -266,6 +310,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         file.endsWith(".tmp")
       ) {
         yield* fileSystem.remove(path.join(directory, file), { force: true });
+        invalidate(day);
         if (day < cutoff) dirtyDays.delete(day);
       } else retained.push(file);
     }
@@ -294,12 +339,18 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           }
         }
       }
-      if (refresh) yield* persistRollup((yield* scanDay(day, retained)).full);
+      if (refresh) {
+        const view = yield* getView(day, retained);
+        yield* persistRollup(
+          finishRollup(view.accumulator, day, DateTime.formatIso(yield* DateTime.now)),
+        );
+      }
     }
     lastMaintenanceDay = today;
   });
 
   const rotate = Effect.fn("Analytics.rotate")(function* (day: string) {
+    invalidate(day);
     const active = path.join(directory, `${day}.ndjson`);
     if (options.maxSegmentsPerDay === 1) {
       yield* fileSystem.remove(active, { force: true });
@@ -317,12 +368,26 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }
   });
 
+  const unterminatedTail = Effect.fn("Analytics.unterminatedTail")(function* (
+    target: string,
+    size: number,
+  ) {
+    if (size === 0) return false;
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(target, { flag: "r" });
+        yield* file.seek(BigInt(size - 1), "start");
+        const last = new Uint8Array(1);
+        return (yield* file.read(last)) === 1 && last[0] !== 10;
+      }),
+    );
+  });
+
   const drain = Effect.fn("Analytics.drain")(function* (force = false) {
     if (pending.length === 0) return;
     const now = yield* Clock.currentTimeMillis;
     if (!force && now < retryAt) return;
     const cutoff = oldestDay(now, options.retentionDays);
-    for (const day of incompleteDays) if (day < cutoff) incompleteDays.delete(day);
     let remaining = pending.length;
     while (remaining > 0 && pending.length > 0) {
       const first = pending[0]!;
@@ -344,6 +409,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       let appending = false;
       yield* Effect.gen(function* () {
         yield* maintain();
+        const files = yield* listFiles();
+        yield* getView(first.day, files);
         const target = path.join(directory, `${first.day}.ndjson`);
         let size = yield* fileSystem.stat(target).pipe(
           Effect.map((info) => Number(info.size)),
@@ -352,19 +419,17 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
             () => Effect.succeed(0),
           ),
         );
-        const separatorBytes = incompleteDays.has(first.day) && size > 0 ? 1 : 0;
-        if (size + separatorBytes + first.bytes > options.maxFileBytes) {
+        let separate = yield* unterminatedTail(target, size);
+        if (size + (separate ? 1 : 0) + first.bytes > options.maxFileBytes) {
           yield* rotate(first.day);
           size = 0;
+          separate = false;
         }
-        if (incompleteDays.has(first.day)) {
-          // An append can write a prefix before failing. Replay is at least once;
-          // a separator prevents a torn suffix from swallowing the next complete event.
-          if (size > 0) {
-            yield* fileSystem.writeFileString(target, "\n", { flag: "a", mode: 0o600 });
-            size++;
-          }
-          incompleteDays.delete(first.day);
+        if (separate) {
+          // Disk is authoritative after restart or an ambiguous append. One byte is enough
+          // to keep a torn suffix from swallowing the next complete event.
+          yield* fileSystem.writeFileString(target, "\n", { flag: "a", mode: 0o600 });
+          size++;
         }
         bytes = 0;
         let count = 0;
@@ -374,11 +439,28 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           count++;
         }
         attempted = attempted.slice(0, count);
+        // Rotation or recovery may have invalidated the old retained-event view.
+        yield* getView(first.day, yield* listFiles());
         appending = true;
         yield* fileSystem.writeFileString(target, attempted.map((entry) => entry.line).join(""), {
           flag: "a",
           mode: 0o600,
         });
+        // Update only after confirmed append; an ambiguous append invalidates and is rebuilt from disk.
+        const fingerprint = yield* signature(first.day, yield* listFiles());
+        for (const view of views.values()) {
+          if (view.day !== first.day) continue;
+          const samples = sampleMix(500, view.filter?.kind, view.kinds);
+          for (const sample of view.samples) samples.add(sample.event, sample.order);
+          for (const entry of attempted) {
+            if (!matches(entry.event, view.filter)) continue;
+            accumulate(view.accumulator, entry.event);
+            samples.add(entry.event);
+          }
+          view.samples = samples.entries();
+          view.kinds = samples.kinds();
+          view.signature = fingerprint;
+        }
         // Held entries remain in pending (and consume capacity) until append succeeds.
         pending.splice(0, attempted.length);
         appending = false;
@@ -389,7 +471,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         Effect.onError(() =>
           Effect.gen(function* () {
             if (appending) {
-              incompleteDays.add(first.day);
+              invalidate(first.day);
               yield* Metric.update(ambiguousAppends, 1);
             }
             for (const entry of attempted) entry.attempts++;
@@ -421,7 +503,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     if (bytes > options.maxEventBytes || bytes > options.maxFileBytes) {
       return yield* new AnalyticsValidationError({ reason: "event-size" });
     }
-    return { day, line, bytes, attempts: 0 };
+    return { day, line, bytes, event, attempts: 0 };
   });
 
   const record: Analytics["Service"]["record"] = Effect.fnUntraced(function* (event) {
@@ -517,31 +599,34 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         Effect.gen(function* () {
           yield* drain(true);
           yield* maintain();
-          const scan = yield* scanDay(input.day, yield* listFiles(), input);
-          let result = scan.result;
-          let fullRollup = scan.full;
-          if (storedRows !== undefined) {
-            const normalized = storedRows;
-            fullRollup = {
-              ...scan.full,
-              askLatency: askLatencyRollup(normalized, input.day, scan.full.generatedAt),
-            };
-            result = {
-              ...result,
-              rollup: {
-                ...result.rollup,
-                askLatency: askLatencyRollup(
-                  input.boardId === undefined
-                    ? normalized
-                    : normalized.filter((row) => row.boardId === input.boardId),
-                  input.day,
-                  result.rollup.generatedAt,
-                ),
-              },
-            };
-          }
-          if (scan.hasFiles) yield* persistRollup(fullRollup);
-          return result;
+          const files = yield* listFiles();
+          const view = yield* getView(input.day, files, input);
+          const full = yield* getView(input.day, files);
+          const generatedAt = DateTime.formatIso(yield* DateTime.now);
+          const withAskLatency = (rollup: AnalyticsRollup, boardId?: string) =>
+            storedRows === undefined
+              ? rollup
+              : {
+                  ...rollup,
+                  askLatency: askLatencyRollup(
+                    boardId === undefined
+                      ? storedRows
+                      : storedRows.filter((row) => row.boardId === boardId),
+                    input.day,
+                    generatedAt,
+                  ),
+                };
+          if (full.signature)
+            yield* persistRollup(
+              withAskLatency(finishRollup(full.accumulator, input.day, generatedAt)),
+            );
+          return {
+            rollup: withAskLatency(
+              finishRollup(view.accumulator, input.day, generatedAt),
+              input.boardId,
+            ),
+            samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
+          };
         }),
       )
       .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })));

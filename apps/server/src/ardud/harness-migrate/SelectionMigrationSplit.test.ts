@@ -35,6 +35,7 @@ import * as KanbanStore from "../kanban/store/KanbanStore.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { controlDDL } from "../persistence/boardsSchema.ts";
 import { kanbanDDL } from "../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../persistence/kanbanCacheVersions.ts";
 import {
   ensureRunFollowTables,
   readBlockRetry,
@@ -52,6 +53,7 @@ const boardsLayer = Layer.effect(
     yield* Effect.forEach([...controlDDL, ...kanbanDDL], (ddl) => sql.unsafe(ddl), {
       discard: true,
     });
+    yield* ensureKanbanCacheVersions(sql);
     yield* ensureRunFollowTables(sql);
     return BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
   }),

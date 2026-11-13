@@ -19,7 +19,7 @@
   money-cases cards    list dead cards
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
-  money-cases brief    one line for the morning brief, nothing when no case is open
+  money-cases brief    one line for open cases or closed cases with running reply watchers
   money-cases check    the robob-watch check for the money-cases watcher
 
 Charge questions (owner rule, nightly 2026-10-24: never ask about a charge a receipt or his own
@@ -103,7 +103,7 @@ DONT_ASK = 3
 EVENT_LIMIT = 4000
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
 FIELDS = ('merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline', 'due', 'why', 'who')
-CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){14,15}(?!\d)')
+CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){12,18}(?!\d)')
 # A secret is a labelled value: a code of 3-12 digits (grouped or not) a few words after the label, a token
 # with a digit right after it ("code", "is", ":"), or anything assigned to a password. The match is removed.
 _LABEL = (r'(?:otp|one[- ]time (?:pass)?code|verification code|security code|passcode|password|passwd|pwd'
@@ -3067,11 +3067,34 @@ def visible_cases(data):
     return rows
 
 
-def brief(cases, now=None):
+def cancelled_cards():
+    """Read only cancelled last-4s; an unavailable card-status file must not break the brief."""
+    try:
+        path = Path(os.environ.get('CARD_STATUS_FILE') or '~/.local/state/card-status.json').expanduser()
+        records = json.loads(path.read_text())
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return set()
+    if not isinstance(records, dict):
+        return set()
+    return {last4 for last4, record in records.items()
+            if re.fullmatch(r'[0-9]{4}', last4) and isinstance(record, dict) and record.get('state') == 'cancelled'}
+
+
+def brief(cases, now=None, root=None, cancelled=None):
     now = (now or now_dubai()).astimezone(TZ)
+    root = root or WATCH_ROOT
     open_cases = [c for c in cases if active(c) and case_owner(c) == 'abdullah']
-    if not open_cases:
+    running = []
+    for case in cases:
+        if case.get('status') != 'closed' or case_owner(case) != 'abdullah':
+            continue
+        for watcher in case.get('watchers', []):
+            if (isinstance(watcher, str) and ID.fullmatch(watcher)
+                    and (root / 'watchers' / watcher).is_dir() and watcher_end(watcher, root) is None):
+                running.append(f"{case['id']} ({watcher})")
+    if not open_cases and not running:
         return ''
+
     due, changed = [], []
     far = dt.datetime.max.replace(tzinfo=TZ)
     for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', due_of(c) or far)):
@@ -3111,9 +3134,29 @@ def brief(cases, now=None):
         parts.append('due: ' + '; '.join(due))
     if changed:
         parts.append('changed: ' + '; '.join(changed))
-    if not due and not changed:
+    if open_cases and not due and not changed:
         parts.append('nothing due in 48h')
-    return redact('. '.join(parts) + '.')
+    if running:
+        shown = running[:3]
+        if len(running) > len(shown):
+            shown.append(f'+{len(running) - len(shown)} more')
+        parts.append('closed but watcher running: ' + ', '.join(shown))
+
+    if cancelled is None:
+        cancelled = cancelled_cards()
+    cancelled = sorted({c for c in cancelled if isinstance(c, str) and re.fullmatch(r'[0-9]{4}', c)})
+    refunds = []
+    for case in open_cases:
+        text = ' '.join(str(case.get(field) or '') for field in ('state', 'next', 'why'))
+        if not re.search(r'refund|credit', text, re.I):
+            continue
+        for last4 in cancelled:
+            if re.search(r'(?<!\d)' + last4 + r'(?!\d)', text):
+                refunds.append(f"refund to cancelled card {last4}: {case['id']}, ask ENBD where it went")
+    parts.extend(refunds[:3])
+    if len(refunds) > 3:
+        parts.append(f'+{len(refunds) - 3} more')
+    return ' '.join(redact('; '.join(parts) + '.').split())
 
 
 def table(cases):

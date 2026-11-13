@@ -128,6 +128,7 @@ import * as TickTimings from "./tickTimings.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import * as BoardAnalytics from "./analytics.ts";
+import { McpCall, resolvedContext } from "../../analytics/McpCall.ts";
 import {
   askKind,
   askTimingProps,
@@ -2446,6 +2447,19 @@ const make = Effect.gen(function* () {
     const discussion = yield* store.discussion(id);
     if (!discussion) return yield* failWith("not-found", `discussion ${id}`);
     return discussion;
+  });
+
+  // Runs inside the primary read/post span. Internal discussion lookups can refer
+  // to related cards, so they must not replace the tool's target.
+  const captureDiscussionContext = Effect.fnUntraced(function* (discussion: KanbanDiscussion) {
+    const call = yield* Effect.serviceOption(McpCall);
+    if (call._tag === "None" || call.value.cardId !== undefined) return;
+    const card = discussion.cardId === null ? null : yield* store.card(discussion.cardId);
+    yield* resolvedContext({
+      boardId: discussion.boardId,
+      ...(discussion.cardId === null ? {} : { id: discussion.cardId }),
+      ...(card === null ? {} : { number: card.number }),
+    });
   });
 
   const goalOf = Effect.fn("KanbanService.goalOf")(function* (card: KanbanCard) {
@@ -6328,11 +6342,13 @@ const make = Effect.gen(function* () {
     askId?: string,
     /** With askId, for a message that is the ask itself: the revision it shows. */
     askRevision?: number,
+    captureContext = false,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
       return yield* failWith("invalid", "a message needs at least one block");
     const discussion = yield* discussionOf(discussionId);
+    if (captureContext) yield* captureDiscussionContext(discussion);
     if (
       dedupe &&
       isRetryActor(author) &&
@@ -15213,6 +15229,7 @@ const make = Effect.gen(function* () {
       (board) => board.id === input.boardId.trim() || board.slug === input.boardId.trim(),
     );
     if (!board) return yield* failWith("invalid", `No Missions board "${input.boardId}".`);
+    yield* resolvedContext({ boardId: board.id });
     const body = `sighting\n\n${evidence}`;
     const actor: KanbanActor = { _tag: "thread", threadId: input.threadId };
     // Recover a committed append if publishing the card change races another board write.
@@ -15499,7 +15516,7 @@ const make = Effect.gen(function* () {
     setGroups,
     discussions: (boardId) => readDb(store.discussions(boardId)),
     threads: (boardId) => readDb(threadRowsOf(boardId)),
-    discussion: (id) => readDb(discussionOf(id)),
+    discussion: (id) => readDb(discussionOf(id).pipe(Effect.tap(captureDiscussionContext))),
     createDiscussion,
     updateDiscussion,
     cardDiscussion: Effect.fn("KanbanService.cardDiscussion")(function* (cardId) {
@@ -15547,6 +15564,9 @@ const make = Effect.gen(function* () {
             author._tag !== "owner",
             true,
             durableOwnerRoutes,
+            undefined,
+            undefined,
+            true,
           ),
         ),
         (saved) => (saved.kind === "message" ? saved.message : undefined),

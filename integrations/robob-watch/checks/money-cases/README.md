@@ -30,7 +30,7 @@ money-cases close ID --outcome "refund landed 27 Oct"
 money-cases reopen ID --deadline 2026-11-01 --note "..."
 money-cases card-dead 5542 --note "cancelled 30 Oct, replaced by 2342"
 money-cases cards      # list dead cards
-money-cases brief      # one line for the morning brief, nothing when no case is open
+money-cases brief      # one line for the morning brief, including closed cases with running watchers
 ```
 
 A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open case needs one. Setting a new deadline re-arms the ping. Every change is kept in the case's `history`.
