@@ -1,6 +1,6 @@
 # Home server: the headless installer stick
 
-The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 96 GB in two of the four sticks bought, 2x 2 TB NVMe) has no monitor and
+The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 96 GB in two sticks (the second pair is being returned, 13 Nov 2026: four never trained, FAILURE-MODES 1.15), 2x 2 TB NVMe) has no monitor and
 nobody sitting at it. This directory builds the USB stick that installs it with zero touch, the tests that
 prove it, and the Mac-side scripts for the day it arrives. It replaces the `os` and `ts` steps of
 `../bootstrap.zsh`.
