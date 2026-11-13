@@ -100,10 +100,24 @@ else
 fi
 __offbox_actual=$(node --version 2>/dev/null) || __offbox_stop "$__offbox_want: selected Node cannot execute"
 [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" || __offbox_stop "$__offbox_want: selected Node $__offbox_actual does not match"
-__offbox_pin_command node "$(command -v node)"
+# Keep the real bin on PATH: nvm use replaces its entry in place.
+export __offbox_node_bin=$(dirname "$(command -v node)")
+__offbox_node_path=; __offbox_sep=; __offbox_tail=$PATH
+while :; do
+  __offbox_entry=${__offbox_tail%%:*}
+  case "$__offbox_entry" in
+    "$__offbox_node_bin"|"${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin) ;;
+    *) __offbox_node_path="$__offbox_node_path$__offbox_sep$__offbox_entry"; __offbox_sep=: ;;
+  esac
+  [[ $__offbox_tail == *:* ]] || break
+  __offbox_tail=${__offbox_tail#*:}
+done
+export PATH="$__offbox_node_bin${__offbox_sep:+:}$__offbox_node_path"
+hash -r
 [ "${__offbox_installed:-}" = 1 ] || echo "offbox: node $__offbox_actual ($__offbox_want)" >&2
 unset -f __offbox_nk __offbox_in
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
+unset __offbox_node_path __offbox_sep __offbox_tail __offbox_entry
 """
 
 
@@ -209,7 +223,7 @@ def parse_nvmrc(text):
     p = _partial(line)
     if not p:
         return None
-    return [(_lower(p), _key(p[0] + 1))]
+    return [(_lower(p), _lower(p) + 1 if len(p) == 3 else _upper(p))]
 
 
 def _read(p):
@@ -258,7 +272,8 @@ def _want(root, cwd):
         if text is None and eng is None:
             continue
         nv = parse_nvmrc(text) if text is not None else None
-        nv_label = f"{prefix}{name} {_first_line(text)}" if nv else None
+        exact = bool(nv and len(nv) == 1 and nv[0][1] == nv[0][0] + 1)
+        nv_label = f"{prefix}{name} {_first_line(text)}" + (" (exact)" if exact else "") if nv else None
         en = parse_range(eng) if eng else None
         en_label = f"{prefix}package.json engines {eng}" if en is not None else None
         if nv is not None and en is not None:

@@ -19,14 +19,14 @@ TOP = node_version.TOP
 class ParserTests(unittest.TestCase):
     def test_nvmrc_cases(self):
         p = node_version.parse_nvmrc
-        self.assertEqual(p("22.13"), [(K(22, 13), K(23))])
-        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(23))])
+        self.assertEqual(p("22.13"), [(K(22, 13), K(22, 14))])
+        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(22, 13) + 1)])
         self.assertEqual(p("22"), [(K(22), K(23))])
         self.assertEqual(p("lts/jod"), [(K(22), K(23))])
         self.assertIsNone(p("lts/*"))
         self.assertIsNone(p("node"))
         self.assertIsNone(p(""))
-        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(21))])
+        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(20, 11, 1) + 1)])
         self.assertIsNone(p("abc"))
 
     def test_engines_cases(self):
@@ -80,14 +80,14 @@ class WantTests(unittest.TestCase):
         self.pkg('^24.13.1')
         self.write('sub/.nvmrc', '22.13\n')
         ranges, label = node_version.want(self.root, self.root / 'sub')
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 14))])
         self.assertEqual(label, 'sub/.nvmrc 22.13')
 
     def test_nvmrc_and_engines_intersect(self):
         self.write('.nvmrc', '22.13.0\n')
         self.pkg('>=22.13 <23')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
         self.assertIn('.nvmrc 22.13.0', label)
         self.assertIn('package.json engines >=22.13 <23', label)
 
@@ -101,8 +101,8 @@ class WantTests(unittest.TestCase):
     def test_node_version_file_used_without_nvmrc(self):
         self.write('.node-version', '22.13.0\n')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
-        self.assertEqual(label, '.node-version 22.13.0')
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
+        self.assertEqual(label, '.node-version 22.13.0 (exact)')
 
     def test_unusable_inputs_give_none(self):
         self.write('package.json', '{not json')
@@ -192,11 +192,11 @@ class ProvisionTests(unittest.TestCase):
             fake_nvm(tmp, installed)
             bindir = root / 'bin'; bindir.mkdir()
             node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
-            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.2 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
+            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.5 1\nv22.23.2 1\nv22.13.9 1\nv22.13.0 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
             body = b'node archive fixture'
             (root / 'archive').write_bytes(body)
             digest = '0' * 64 if checksum_bad else hashlib.sha256(body).hexdigest()
-            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.23.2', 'v24.22.1')))
+            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.13.0', 'v22.13.9', 'v22.23.2', 'v22.23.5', 'v24.22.1')))
             (root / 'nvm-fixture.sh').write_text(r'''
 nvm_get_download_slug() { echo node-$3-linux-x64; }
 nvm_get_artifact_compression() { echo tar.xz; }
@@ -232,7 +232,7 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
         for pin, engine, installed, expected in [
             ('v20', '^20.19.0 || >=22.12.0 <23', ('v22.23.2', 'v24.22.1'), 'v20.20.2'),
             ('v20', '^20.19.0 || >=22.12.0 <23', (), 'v20.20.2'),
-            ('22.13', '>=22.13 <23', (), 'v22.23.2'),
+            ('22.13', '>=22.13 <23', (), 'v22.13.9'),
         ]:
             with self.subTest(pin=pin, installed=installed):
                 result, count = self.run_provision(pin, engine, installed)
