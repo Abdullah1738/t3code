@@ -60,6 +60,133 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
 
+    def test_heredoc_delimiters_follow_shell_quote_removal(self):
+        rows = [
+            (r'\EOF', 'EOF', True),
+            (r'\"EOF\"', '"EOF"', True),
+            ('E"O"F', 'EOF', True),
+            ("'E'OF", 'EOF', True),
+            ('EOF', 'EOF', False),
+            ('"E\\OF"', r'E\OF', True),
+            ('"E\\$OF"', 'E$OF', True),
+            ('"E\\`OF"', 'E`OF', True),
+            ('"E\\\\OF"', r'E\OF', True),
+            ('"E\\\"OF"', 'E"OF', True),
+            ('E\\\nOF', 'EOF', False),
+            ('"E\\\nOF"', 'EOF', True),
+            ("''", '', True),
+        ]
+        for raw, delimiter, quoted in rows:
+            with self.subTest(raw=raw):
+                command = 'cat <<' + raw + '\nhi\n' + delimiter + '\n'
+                shell, bodies = guard._heredocs(command)
+                self.assertEqual(bodies, {'__guard_heredoc_0__': ('hi\n', quoted)})
+                self.assertIn('<< __guard_heredoc_0__', shell)
+                # Compare the delimiter with the shell without running fixture payloads.
+                result = subprocess.run(['/bin/bash', '--noprofile', '--norc'], input=command,
+                                        text=True, capture_output=True, check=True)
+                self.assertEqual((result.stdout, result.stderr), ('hi\n', ''))
+        self.assertEqual(guard._heredocs('cat <<-\\EOF\n\thi\n\tEOF\n')[1],
+                         {'__guard_heredoc_0__': ('hi\n', True)})
+        for raw in ['"EOF', "E'OF", 'E"OF']:
+            with self.subTest(raw=raw):
+                with self.assertRaises(guard.AmbiguousScript) as error:
+                    guard._heredocs('cat <<' + raw + '\n')
+                self.assertIn(repr(raw), str(error.exception))
+        with self.assertRaises(guard.AmbiguousScript):
+            guard._heredocs('cat <<\\EOF\nhi\nMISSING\n')
+        with self.assertRaises(guard.AmbiguousScript):
+            guard._heredocs('cat <<\\"EOF\\"\nhi\nEOF\n')
+
+    def test_wrapped_heredoc_reporters(self):
+        fixtures = Path(__file__).with_name('fixtures') / 'heredoc-delims'
+        for name in ['robob-1182-bash-c.sh', 'robob-639-offbox.sh']:
+            with self.subTest(reporter=name):
+                self.assertEqual(guard.classify_detail((fixtures / name).read_text(), str(self.root)),
+                                 (None, None))
+        minimal = "node --input-type=module <<'NODE'\nconsole.log(1)\nNODE\n"
+        self.assertEqual(guard.classify_detail('offbox run -- ' + shlex.quote(minimal), str(self.root)),
+                         (None, None))
+
+    def test_heredocs_unwrap_before_parsing_and_still_check_bodies(self):
+        wrappers = [
+            lambda payload: 'offbox run -- ' + shlex.quote(payload),
+            lambda payload: 'bash -c ' + shlex.quote(payload),
+            lambda payload: 'bash -c "' + payload.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`') + '"',
+            lambda payload: 'ssh box ' + shlex.quote(payload),
+            lambda payload: 'python3 /abs/offbox.py ssh box bash -c "' + payload.replace('"', '\\"') + '"',
+        ]
+        for wrapper in wrappers:
+            for raw in ['EOF', r'\EOF', 'E"O"F', "'E'OF"]:
+                with self.subTest(wrapper=wrapper, delimiter=raw):
+                    safe = 'bash <<' + raw + '\necho hi\nEOF\n'
+                    self.assertIsNone(self.classify(wrapper(safe)))
+                    self.assertEqual(self.classify(wrapper(safe.replace('echo hi', 'sqlite3 ' + LIVE))), READ)
+            for payload in ['bash <<"EOF\necho hi\nEOF\n', 'bash <<EOF\necho hi\n']:
+                with self.subTest(wrapper=wrapper, payload=payload):
+                    self.assertEqual(self.classify(wrapper(payload)), UNRESOLVED)
+        self.table([
+            ('bash <<EOF\nsqlite3 ' + LIVE + '\nEOF\n', READ),
+            ('cat <<EOF\n$(sqlite3 ' + LIVE + ')\nEOF\n', READ),
+            ('cat <<E"O"F\n$(sqlite3 ' + LIVE + ')\nEOF\n', None),
+            ('cat <<E\\\nOF\n$(sqlite3 ' + LIVE + ')\nEOF\n', READ),
+            ('bash <<E"O"F\nsqlite3 ' + LIVE + '\nEOF\n', READ),
+            ("offbox run -- bash <<'EOF'\nsqlite3 " + LIVE + '\nEOF\n', READ),
+        ])
+
+    def test_stdin_argv_reporter_regressions(self):
+        for arg in ['"$results_dir"', '"$task_pr_dir/body.md"']:
+            command = "results_dir=$(mktemp -d)\npython3 -I - " + arg + " <<'PY'\nimport sys; print(sys.argv[1])\nPY\n"
+            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.assertIsNone(self.classify('bash -s "$x" <<\'SH\'\necho hi\nSH\n'))
+        self.assertEqual(self.classify('python3 -I - "$x" <<\'PY\'\nimport sqlite3; sqlite3.connect(' + repr(LIVE) + ')\nPY\n'), READ)
+
+    def test_remote_payloads_cannot_replace_caller_proofs(self):
+        wrappers = [
+            ('offbox', lambda text: 'offbox run -- ' + shlex.quote(text)),
+            ('offbox argv', lambda text: 'offbox run -- bash -c ' + shlex.quote(text)),
+            ('offbox stdin', lambda text: "offbox run -- bash <<'REMOTE'\n" + text + '\nREMOTE\n'),
+            ('ssh', lambda text: 'ssh box ' + shlex.quote(text)),
+            ('python ssh', lambda text: 'python3 /abs/offbox.py ssh box ' + shlex.quote(text)),
+            ('nested shell', lambda text: 'offbox run -- ' + shlex.quote('bash -c ' + shlex.quote(text))),
+        ]
+        for name, wrapper in wrappers:
+            for payload in ['cd /', "cat > tmp/live.py <<'EOF'\nprint(1)\nEOF\n",
+                            'S=tmp/t.py']:
+                with self.subTest(wrapper=name, payload=payload):
+                    self.assertEqual(self.classify('S=tmp/live.py; ' + wrapper(payload) + '; python3 "$S"'), SCRIPT)
+                    self.assertEqual(self.classify(wrapper(payload) + '; python3 tmp/live.py'), SCRIPT)
+                    self.assertIsNone(self.classify(wrapper(payload) + '; python3 tmp/t.py'))
+            self.assertEqual(self.classify(wrapper('python3 tmp/live.py')), SCRIPT)
+            self.assertEqual(self.classify("cat > tmp/p.py <<'EOF'\nopen(" + repr(LIVE) + ").read()\nEOF\n" + wrapper('python3 tmp/p.py')), SCRIPT)
+        self.assertEqual(self.classify("cat > tmp/p.py <<'EOF'\nprint(1)\nEOF\noffbox run -- 'echo hi' > tmp/p.py\npython3 tmp/p.py"), UNRESOLVED)
+        self.assertEqual(self.classify('offbox run -- cd /; python3 tmp/live.py'), SCRIPT)
+
+    def test_substitution_quotes_cannot_hide_later_documents(self):
+        prefixes = [
+            "echo \"`printf '\"'`\"",
+            "echo `printf '\"'`",
+            'echo "`printf "x"`"',
+            'echo "$(printf \'"\')"',
+            'echo "`printf \'x\'`"',
+        ]
+        for prefix in prefixes:
+            for interpreter, marker, body in [
+                ('python3 -', 'PY', 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')'),
+                ('bash -s', 'SH', 'sqlite3 ' + LIVE),
+            ]:
+                with self.subTest(prefix=prefix, interpreter=interpreter):
+                    command = prefix + '\n' + interpreter + " <<'" + marker + "'\n" + body + '\n' + marker + '\n'
+                    self.assertEqual(self.classify(command), READ)
+        self.assertEqual(self.classify('echo "`python3 - <<\'PY\'\nopen(' + repr(LIVE) + ').read()\nPY\n`"'), READ)
+
+    def test_unsupported_dollar_quotes_fail_closed_in_delimiters(self):
+        for raw in ["$'EOF'", '$"EOF"', "E$'OF'", 'E$"OF"', "$'E\\x4fF'"]:
+            with self.subTest(raw=raw):
+                with self.assertRaises(guard.AmbiguousScript):
+                    guard._heredocs('cat <<' + raw + '\nhi\nEOF\n')
+                self.assertEqual(self.classify('cat <<' + raw + '\nhi\nEOF\nsqlite3 ' + LIVE + '\n$EOF\n'), UNRESOLVED)
+
     def test_stdin_programs_keep_positional_arguments_out_of_script_resolution(self):
         rows = [
             ('python3 - "$X"', 'print(1)'),

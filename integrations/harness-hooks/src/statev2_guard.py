@@ -875,6 +875,10 @@ class AmbiguousScript(Exception):
     """An explicit script invocation has no statically established location."""
 
 
+class UnterminatedHeredoc(AmbiguousScript):
+    pass
+
+
 class LiveRead(Exception):
     def __init__(self, rule, detail=None):
         self.rule = rule
@@ -972,14 +976,58 @@ def _substitutions(text, shell=False, spans=False):
     return result
 
 
+def _heredoc_word(source, start):
+    index, value, quote, quoted = start, [], None, False
+    while index < len(source):
+        char = source[index]
+        if char == "\\" and quote != "'":
+            if index + 1 == len(source):
+                raise AmbiguousScript("unterminated heredoc delimiter " + _token(source[start:index + 1]))
+            following = source[index + 1]
+            # Bare line continuations disappear before shell tokenization;
+            # they must not suppress expansions in the document body.
+            quoted |= following != '\n'
+            if quote == '"' and following not in '$`"\\\n':
+                value.append('\\')
+                index += 1
+                continue
+            if following != '\n':
+                value.append(following)
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                value.append(char)
+        elif char == '$' and source[index + 1:index + 2] in {"'", '"'}:
+            raise AmbiguousScript("unsupported dollar-quoted heredoc delimiter " + _token(source[start:].split('\n', 1)[0]))
+        elif char in "\"'":
+            quoted, quote = True, char
+        elif char.isspace() or char in ';&|<>()':
+            break
+        else:
+            value.append(char)
+        index += 1
+    if quote:
+        raise AmbiguousScript("unterminated heredoc delimiter " + _token(source[start:index].rstrip('\r\n')))
+    return index, ''.join(value), quoted
+
+
 def _heredocs(source, offset=0, known=()):
     lines = source.splitlines(keepends=True)
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line))
     output, bodies = [], {}
-    index = 0
+    index, quote, escaped, substitutions = 0, None, False, []
     while index < len(lines):
         line = lines[index]
+        line_start = starts[index]
         index += 1
-        matches, quote, escaped, substitutions = [], None, False, []
+        # A wrapped shell payload can be one quoted word across many lines.
+        # Its heredocs belong to the recursive scan after outer quote removal.
+        matches = []
         i = 0
         while i < len(line):
             char = line[i]
@@ -987,6 +1035,18 @@ def _heredocs(source, offset=0, known=()):
                 escaped = False
             elif char == "\\" and quote != "'":
                 escaped = True
+            elif char == '`' and quote != "'":
+                # Backtick contents have their own quote context. They are
+                # inspected recursively by the substitution walker.
+                end = line_start + i + 1
+                while end < len(source) and source[end] != '`':
+                    end += 2 if source[end] == '\\' else 1
+                if end >= len(source):
+                    raise AmbiguousScript('unterminated backtick substitution')
+                while end - line_start >= len(line) and index < len(lines):
+                    line += lines[index]
+                    index += 1
+                i = end - line_start
             elif quote != "'" and line.startswith("$(", i) and not line.startswith("$((", i):
                 substitutions.append([quote, 1])
                 quote = None
@@ -1007,13 +1067,22 @@ def _heredocs(source, offset=0, known=()):
             elif line.startswith('<<<', i):
                 i += 2
             elif line.startswith("<<", i):
-                match = re.match(r"<<(-)?[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|<>()'\"]+))", line[i:])
-                if match:
-                    delimiter = next(x for x in match.groups()[1:] if x is not None)
+                start = i + 2
+                tabs = line[start:start + 1] == '-'
+                start += tabs
+                while start < len(line) and line[start] in ' \t':
+                    start += 1
+                end, delimiter, quoted = _heredoc_word(source, line_start + start)
+                end -= line_start
+                if end > start:
+                    while end > len(line) and index < len(lines):
+                        line += lines[index]
+                        index += 1
                     if delimiter not in known:
                         key = f"__guard_heredoc_{offset + len(bodies) + len(matches)}__"
-                        matches.append((i, i + match.end(), bool(match[1]), delimiter, key, match[2] is not None or match[3] is not None))
-                    i += match.end() - 1
+                        matches.append((i, end, tabs, delimiter, key, quoted))
+                    consumed = end - i
+                    i += consumed - 1
             i += 1
         for start, end, tabs, delimiter, key, quoted in reversed(matches):
             line = line[:start] + "<< " + key + line[end:]
@@ -1027,7 +1096,7 @@ def _heredocs(source, offset=0, known=()):
                     break
                 body.append(candidate.lstrip("\t") if tabs else candidate)
             else:
-                raise AmbiguousScript("unterminated heredoc " + _token(delimiter))
+                raise UnterminatedHeredoc("unterminated heredoc " + _token(delimiter))
             bodies[key] = ("".join(body), quoted)
             output.append("\n" * (len(body) + 1))
     return "".join(output), bodies
@@ -1382,13 +1451,20 @@ def _quoted_punctuation(source, script_literals=False):
     return "".join(output), quoted
 
 
-def scripts_in(command: str, cwd: str) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     written = {}
     invalidated_written = set()
     write_history = {}
     variable_written = set()
+    stdin_words, stdin_bodies = _stdin or ([], {})
+    if _sources is not None:
+        prior_written, prior_invalidated, prior_history, prior_variable = _sources
+        written.update(prior_written)
+        invalidated_written.update(prior_invalidated)
+        write_history.update((path, list(history)) for path, history in prior_history.items())
+        variable_written.update(prior_variable)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
     shell_values = {"HOME": str(Path.home())}
@@ -1799,9 +1875,21 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
+    def scan_remote(source, directory, depth, input_words=(), input_bodies=None):
+        # Synced source evidence may be read remotely, but remote writes,
+        # bindings and cwd cannot prove anything about the caller's files.
+        remote_paths = scripts_in(source, directory, _depth=depth,
+                                  _sources=(written, invalidated_written, write_history, variable_written),
+                                  _stdin=(input_words, input_bodies or {}))
+        paths.extend(path for path in remote_paths if path not in paths)
+        if len(paths) > MAX_SCRIPTS:
+            raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
+
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False):
         nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_quoted, unsafe_bindings, noclobber
         words = list(words)
+        if stdin_words and not any(word in {'<<', '<<<', '<'} for word in words):
+            words.extend(stdin_words)
         checked = set()
         literal_words = set()
         double_words = set()
@@ -1815,7 +1903,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             else:
                 unquoted_words.add(decoded)
             return decoded
-        documents, redirects, exact_documents, here_strings = [], [], True, []
+        documents, document_keys, redirects, exact_documents, here_strings = [], [], [], True, []
         index = 0
         while index < len(words):
             if words[index] in {"<<", "<<<", ">", ">>", "<"} and index + 1 < len(words):
@@ -1825,6 +1913,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     literal = '\0guard_literal_' in value and not re.search(r'[$`]', value) and '\0guard_double_' not in value and '\0guard_quoted_' not in value
                     here_strings.append((text, literal or not any(char in text for char in '$`')))
                 elif op == "<<" and value in bodies:
+                    document_keys.append(value)
                     body, heredoc_quoted = bodies[value]
                     exact_documents &= heredoc_quoted or not any(char in body for char in '$`\\')
                     if not heredoc_quoted:
@@ -1897,6 +1986,26 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                             directory = _literal_path(value, directory)
             elif binary == "offbox" and words[1:2] == ["run"] and "--" in words[2:]:
                 words = words[words.index("--", 2) + 1:]
+                remote_input, remote_bodies = [], {key: bodies[key] for key in document_keys}
+                for key in document_keys:
+                    remote_input.extend(['<<', key])
+                for text, exact in here_strings:
+                    key = f'__guard_remote_stdin_{len(remote_bodies)}__'
+                    remote_bodies[key] = (text, exact)
+                    remote_input.extend(['<<', key])
+                for op, target in redirects:
+                    if op == '<':
+                        remote_input.extend([op, target])
+                if words:
+                    scan_remote(words[0] if len(words) == 1 else shlex.join(words), directory, depth + 1,
+                                remote_input, remote_bodies)
+                    if may_change_scripts(words, directory, documents):
+                        changed_sources.update(written)
+                        fresh_variables.clear()
+                # Local output redirects still need the normal invalidation
+                # pass after the remote command has been checked.
+                words = ['true']
+                break
             else:
                 break
         if not words:
@@ -2152,6 +2261,19 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 return after
         if binary == "eval":
             return scan(" ".join(args), directory, depth + 1)
+        if binary == 'ssh':
+            remote = list(args)
+            while remote and remote[0].startswith('-'):
+                flag = remote.pop(0)
+                if flag == '--':
+                    break
+                if flag[:2] in {'-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w'} and len(flag) == 2:
+                    if not remote:
+                        raise AmbiguousScript('missing ssh option operand ' + _token(flag))
+                    remote.pop(0)
+            if len(remote) > 1:
+                scan_remote(' '.join(remote[1:]), directory, depth + 1)
+            return after
         interpreter = binary in shells | {"node", "bun", "deno"} or re.fullmatch(r"python[\d.]*", binary)
         if interpreter or binary in {"source", "."}:
             while args and args[0].startswith("-"):
@@ -2195,6 +2317,9 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                         if migration_args is not None:
                             migration_context(words)
                         add(target, directory, binary, migration_args, target if node_test else None)
+                        if python and Path(target).name == 'offbox.py' and args[1:2] == ['ssh'] and len(args) > 3:
+                            remote = args[3:]
+                            scan_remote(remote[0] if len(remote) == 1 else shlex.join(remote), directory, depth + 1)
         elif words[0].startswith(("/", "./", "../", "~/", "$HOME/", "${HOME}/")) and re.search(r"\.(?:py|mjs|cjs|js|ts|sh)$", words[0]):
             add(words[0], directory, binary)
         return after
@@ -2206,11 +2331,14 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 raise AmbiguousScript(f"shell nesting deeper than MAX_SHELL_DEPTH ({MAX_SHELL_DEPTH})")
             return None
         try:
+            inherited_bodies = {**stdin_bodies, **(inherited_bodies or {})}
             source, bodies = _heredocs(source, len(inherited_bodies or {}), inherited_bodies or ())
             bodies = {**(inherited_bodies or {}), **bodies}
-        except AmbiguousScript:
+        except UnterminatedHeredoc:
+            # Shells accept EOF as an implicit terminator for data-only
+            # documents. Executable or database-reading text stays refused.
             if (SCRIPT.search(source) or DIRECT.search(source) or
-                    re.search(r"(?:^|[\s;&|])(?:python[\d.]*|bash|sh|zsh|node)\s+[^<\s]", source) or
+                    re.search(r"(?:^|[\s;&|])(?:python[\d.]*|bash|sh|zsh|node)\s+\S", source) or
                     source_touches_live(source) and READER.search(source)):
                 raise
             return directory
@@ -2410,7 +2538,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
 
         return walk(0, directory)[0]
 
-    scan(command, Path(cwd))
+    scan(command, Path(cwd) if cwd is not None else None, _depth)
     return paths
 
 
