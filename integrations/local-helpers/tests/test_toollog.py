@@ -27,6 +27,26 @@ class ToolLogTests(unittest.TestCase):
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
 
+    def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, status, duration in [('noon', 401, 10), ('noon', 401, 20),
+                                           ('noon', 500, 30), ('amazon', 500, 5000),
+                                           (None, None, 40)]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                'name': 'track.poll', 'kind': 'error', 'durationMs': duration, 'ok': False,
+                'props': {'merchant': merchant},
+                'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual({(row['httpStatus'], row['merchant']): row['count'] for row in result['topErrors']},
+                         {(401, 'noon'): 2, (500, 'noon'): 1, (500, 'amazon'): 1, (None, 'unknown'): 1})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant']['noon'],
+                         {'count': 3, 'p50': 20, 'p95': 30, 'max': 30})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 30, 'p95': 5000, 'max': 5000})
+        self.assertEqual(result['topErrorTags'][0]['count'], 5)
+
     def test_format_privacy_modes_and_fail_open(self):
         os.chmod(self.tmp.name, 0o755)
         command = 'curl --password do-not-log-me --header token-secret https://private.invalid'
