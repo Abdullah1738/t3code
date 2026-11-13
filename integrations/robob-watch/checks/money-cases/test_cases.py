@@ -1985,7 +1985,7 @@ class CardSwap(Base):
         path.write_text(json.dumps(book))
         for dry in (True, False):
             out = io.StringIO()
-            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+            with patch.object(mc.charges, 'search', return_value=[]), patch.object(mc, 'DATA', self.data), redirect_stdout(out):
                 mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
             text = out.getvalue()
             self.assertNotIn('4242', text.replace('[card number removed]', ''), f'dry={dry}')
@@ -2004,7 +2004,7 @@ class CardSwap(Base):
         path.write_text(json.dumps(book))
         for dry in (True, False):
             out = io.StringIO()
-            with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+            with patch.object(mc.charges, 'search', return_value=[]), patch.object(mc, 'DATA', self.data), redirect_stdout(out):
                 mc.main(['card-swap', '--old', '5542', '--new', '2342'] + (['--dry-run'] if dry else []))
             text = out.getvalue()
             for leaked in ('4242554242420004', '4242 5542 4242 0004', '4242 2342 4242 0004', '4242 2342'):
@@ -2022,7 +2022,7 @@ class CardSwap(Base):
         book['cases'][0]['next'] = f'pay {full} then 5542'
         path.write_text(json.dumps(book))
         out = io.StringIO()
-        with patch.object(mc, 'DATA', self.data), redirect_stdout(out):
+        with patch.object(mc.charges, 'search', return_value=[]), patch.object(mc, 'DATA', self.data), redirect_stdout(out):
             mc.main(['card-swap', '--old', '5542', '--new', '2342', '--case', 'other'])
         self.assertIn('1 case(s) updated', out.getvalue())
         stored = mc.load(self.data)
@@ -2047,7 +2047,7 @@ class CardSwap(Base):
 
     def run_card_swap(self, *args):
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
+        with patch.object(mc.charges, 'search', return_value=[]), patch.object(mc, 'DATA', self.data), redirect_stdout(out), redirect_stderr(err):
             code = mc.main(['card-swap', '--old', '5542', '--new', '2342', *args])
         return code, out.getvalue(), err.getvalue()
 
@@ -2107,7 +2107,7 @@ class CardSwap(Base):
 class Cli(Base):
     def run_cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(mc, 'DATA', self.data), patch.object(mc, 'WATCH_ROOT', self.root), \
+        with patch.object(mc.charges, 'search', return_value=[]), patch.object(mc, 'DATA', self.data), patch.object(mc, 'WATCH_ROOT', self.root), \
                 redirect_stdout(out), redirect_stderr(err), patch.object(mc.faulthandler, 'enable'), \
                 patch.object(mc.faulthandler, 'dump_traceback_later'), \
                 patch.object(mc.faulthandler, 'cancel_dump_traceback_later'):

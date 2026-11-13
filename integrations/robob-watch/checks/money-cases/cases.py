@@ -32,6 +32,7 @@ words already explain, wait for the receipt from a merchant he already pays, nev
 A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has one.
 """
 import argparse
+import calendar
 from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
@@ -271,6 +272,8 @@ def check_charged(text):
 
 def charge_key(case):
     """Merchant, amount, currency and day, normalised the way the CLI stores them (trim, case, 2 places)."""
+    if not case.get('amount') or not case.get('currency'):
+        return None
     amount = format(Decimal(str(case['amount'])).normalize(), 'f')
     return (' '.join(str(case['merchant']).split()).lower(), amount, str(case['currency']).upper(),
             case.get('charged') or case['opened'][:10])
@@ -290,6 +293,8 @@ def same_charge(cases, new):
     if new['merchant'] == UNMATCHED:
         return []
     key, kind = charge_key(new), new.get('kind', 'charge')
+    if key is None:
+        return []
     return [c['id'] for c in cases
             if c.get('merchant') != UNMATCHED and c.get('kind', 'charge') == kind and charge_key(c) == key]
 
@@ -343,6 +348,8 @@ def answered_at(case):
 def money(case):
     if case.get('kind') == 'merchant_card':
         return 'saved card'
+    if not case.get('amount') or not case.get('currency'):
+        return 'amount unknown'
     return f"{case['currency']} {Decimal(case['amount']):,}"
 
 
@@ -422,6 +429,271 @@ def dead_cards(data=None):
     return load_cards(data)['dead']
 
 
+SUB_FIELDS = ('merchant', 'last4', 'amount', 'currency', 'cadence', 'next_renewal', 'account', 'status')
+SUB_STATUSES = ('active', 'needs card update', 'cancelled')
+
+
+def subscription(values):
+    row = {key: check_text(key, values.get(key, ''), key == 'merchant') for key in SUB_FIELDS}
+    if not sub_merchant(row['merchant']):
+        raise CaseError('merchant needs letters or digits')
+    if row['last4']:
+        last4_arg('card', row['last4'])
+    if row['amount']:
+        row['amount'] = check_amount(row['amount'])
+    if row['currency']:
+        row['currency'] = check_currency(row['currency'])
+    if row['cadence'] not in ('', 'monthly', 'yearly'):
+        raise CaseError('cadence must be monthly, yearly or blank')
+    if row['next_renewal']:
+        check_charged(row['next_renewal'])
+    row['status'] = row['status'] or 'active'
+    if row['status'] not in SUB_STATUSES:
+        raise CaseError('status must be active, needs card update or cancelled')
+    return row
+
+
+def load_subscriptions(data=None):
+    book = read_json((data or DATA) / 'subscriptions.json', {'version': 1, 'subscriptions': []})
+    if not isinstance(book, dict) or not isinstance(book.get('subscriptions'), list):
+        raise CaseError('subscriptions.json is not a subscriptions file')
+    ids = set()
+    for row in book['subscriptions']:
+        if not isinstance(row, dict) or not ID.fullmatch(str(row.get('id', ''))) or row['id'] in ids:
+            raise CaseError('subscriptions.json has an invalid or duplicate id')
+        row.update(subscription(row))
+        ids.add(row['id'])
+    return book
+
+
+def sub_change(data, sid, changes, operation='edit'):
+    check_secret('subscription id', sid)
+    if not ID.fullmatch(sid):
+        raise CaseError('subscription id must be 1-48 lowercase letters, digits or hyphens')
+    with Locked(data, 'subscriptions') as book:
+        row = next((s for s in book['subscriptions'] if s['id'] == sid), None)
+        if (operation == 'add') == bool(row):
+            raise CaseError('subscription already exists' if row else 'subscription not found')
+        if operation == 'remove':
+            book['subscriptions'].remove(row)
+            return row
+        updated = subscription({**(row or {}), **changes})
+        if row:
+            reset_anchor = any(updated[k] != row.get(k) for k in ('next_renewal', 'cadence'))
+            row.update(updated)
+            if reset_anchor:
+                row.pop('anchor_day', None)
+        else:
+            row = {'id': sid, **updated}
+            book['subscriptions'].append(row)
+    return row
+
+
+def sub_merchant(name):
+    # Only punctuation/case aliases; shared words such as Google must not match Google Pro.
+    return re.sub(r'[\W_]', '', name.casefold())
+
+
+def renewal_alias(name, domain):
+    neutral = {'notifications', 'notification', 'mail', 'email', 'billing', 'alerts', 'alert',
+               'noreply', 'support', 'updates', 'accounts', 'account', 'co', 'com', 'org', 'net', 'gov', 'edu', 'ac'}
+    key = re.sub(r'[^a-z0-9]', '', name.lower())
+    return key and key not in neutral and key in {
+        re.sub(r'[^a-z0-9]', '', label) for label in domain.split('.')[:-1]}
+
+
+def learn_subscription(data, notice, end=None):
+    learned = subscription({'merchant': notice['merchant'], 'last4': notice['last4'],
+                            'amount': notice['amount'], 'currency': notice['currency'],
+                            'next_renewal': notice['date'], 'cadence': notice.get('cadence', '')})
+    identity = check_text('identity', notice.get('identity', ''), False)
+    try:
+        with Locked(data, 'subscriptions', wait=lock_wait(end)) as book:
+            candidates = [s for s in book['subscriptions'] if identity and s.get('identity') == identity
+                          and s['last4'] in ('', learned['last4'])]
+            if not candidates:
+                candidates = [s for s in book['subscriptions'] if sub_merchant(s['merchant']) == sub_merchant(learned['merchant'])
+                              and s['last4'] in ('', learned['last4']) and s.get('identity', '') in ('', identity)]
+            if not candidates:
+                candidates = [s for s in book['subscriptions'] if s['last4'] in ('', learned['last4']) and (
+                    (not identity and s.get('identity') and renewal_alias(learned['merchant'], s['identity'])) or
+                    (identity and not s.get('identity') and renewal_alias(s['merchant'], identity)))]
+            if len(candidates) > 1:
+                raise _DryRun
+            row = candidates[0] if candidates else None
+            if row and (row['status'] == 'cancelled' or row.get('next_renewal', '') > learned['next_renewal']):
+                raise _DryRun
+            if row:
+                changes = {k: v for k, v in learned.items() if v and k not in ('merchant', 'account', 'status')}
+                if all(row.get(k) == v for k, v in changes.items()) and row.get('identity', '') == (identity or row.get('identity', '')):
+                    raise _DryRun
+                if any(k in changes and row.get(k) != changes[k] for k in ('next_renewal', 'cadence')):
+                    row.pop('anchor_day', None)
+                row.update(changes)
+            else:
+                sid = 'sub-' + hashlib.sha256((sub_merchant(learned['merchant']) + ':' + learned['last4'] + ':' + identity).encode()).hexdigest()[:16]
+                row = {'id': sid, **learned}
+                book['subscriptions'].append(row)
+            row['identity'] = identity or row.get('identity', '')
+    except _DryRun:
+        pass
+
+
+def sub_next(date, cadence, anchor=None):
+    date = dt.date.fromisoformat(date)
+    year, month = date.year, date.month
+    if cadence == 'yearly':
+        year += 1
+    else:
+        year, month = year + month // 12, month % 12 + 1
+    return dt.date(year, month, min(anchor or date.day, calendar.monthrange(year, month)[1])).isoformat()
+
+
+def subscription_match(data, charge, at, record=False, end=None):
+    if charge['kind'] != 'charge' or charge.get('pending'):
+        return None
+    date = at.astimezone(TZ).date()
+
+    def matches(book):
+        out = []
+        for row in book['subscriptions']:
+            if row['status'] == 'cancelled' or not all(row.get(k) for k in ('last4', 'amount', 'currency', 'cadence', 'next_renewal')):
+                continue
+            if sub_merchant(row['merchant']) != sub_merchant(charge['merchant']) or row['last4'] != charge['card'] or row['currency'] != charge['currency']:
+                continue
+            expected, amount = Decimal(row['amount']), Decimal(charge['amount'])
+            if expected <= 0 or abs(amount - expected) > expected * Decimal('.05'):
+                continue
+            due = dt.date.fromisoformat(row['next_renewal'])
+            if abs((date - due).days) <= 3:
+                out.append((row, due.isoformat()))
+        return out
+
+    if not record:
+        found = matches(load_subscriptions(data))
+    else:
+        try:
+            with Locked(data, 'subscriptions', wait=lock_wait(end)) as book:
+                found = matches(book)
+                if len(found) != 1:
+                    raise _DryRun
+                row, due = found[0]
+                row['anchor_day'] = row.get('anchor_day') or dt.date.fromisoformat(due).day
+                row['next_renewal'] = sub_next(due, row['cadence'], row['anchor_day'])
+        except _DryRun:
+            return None
+    if len(found) != 1:
+        return None
+    row, due = found[0]
+    return {'verdict': 'subscription', 'why': f"subscription {row['id']} renewal {due}", 'errors': []}
+
+
+def subscriptions_due(data, now, days=3):
+    if days < 0:
+        raise CaseError('days must be non-negative')
+    return [s for s in load_subscriptions(data)['subscriptions'] if s['status'] != 'cancelled' and s['next_renewal']
+            and 0 <= (dt.date.fromisoformat(s['next_renewal']) - now.astimezone(TZ).date()).days <= days]
+
+
+def subscription_entries(data, now, handled):
+    dead = dead_cards(data)
+    entries = []
+    for row in subscriptions_due(data, now):
+        key = f"subs:{sub_merchant(row['merchant'])}:{row['next_renewal']}"
+        if key in handled or not (row['last4'] in dead or row['status'] == 'needs card update'):
+            continue
+        entries.append((clip(row['merchant'], 100), [(key, f"renews {row['next_renewal']}; card {row['last4'] or 'unknown'} needs update")],
+                        f"money-cases subs list ({row['id']}); move to a live card or cancel", None))
+        handled = {**handled, key: stamp(now)}
+    return entries
+
+
+def sweep_dead_card(data, last4, now=None, alerts=None, end=None):
+    now = now or now_dubai()
+    start = now - dt.timedelta(days=60)
+    if alerts is None:
+        # Search the existing archive, then parse whole alerts rather than clipped snippets.
+        alerts = []
+        for hit in charges.search(last4, charges.day(start), until=charges.day(now + dt.timedelta(days=1)), n=1000, deadline=end):
+            if hit.get('from_me') or not start.timestamp() <= hit.get('ts', 0) <= now.timestamp():
+                continue
+            alerts.append({**hit, 'text': charges.alert_text(charges.show(hit, end))})
+    groups = {}
+    for hit in alerts:
+        charge = charges.parse(hit.get('text', ''), hit.get('sender', ''))
+        at = dt.datetime.fromtimestamp(hit.get('ts', 0), TZ)
+        if not charge or charge['kind'] != 'charge' or charge.get('pending') or charge['card'] != last4 or not start <= at <= now:
+            continue
+        group = groups.setdefault(sub_merchant(charge['merchant']), [])
+        # Copies across SMS/email do not establish a recurring merchant.
+        if any(c['amount'] == charge['amount'] and c['currency'] == charge['currency'] and abs((at - t).total_seconds()) <= 900 for t, c in group):
+            continue
+        group.append((at, charge))
+    flagged = []
+    try:
+        with Locked(data, 'subscriptions', wait=lock_wait(end)) as book:
+            before = [dict(s) for s in book['subscriptions']]
+            for name, group in groups.items():
+                rows = [s for s in book['subscriptions'] if sub_merchant(s['merchant']) == name and s['last4'] == last4 and s['status'] != 'cancelled']
+                if not rows and any(sub_merchant(s['merchant']) == name and s['last4'] == last4 for s in book['subscriptions']):
+                    continue
+                if not rows and len(group) < 2:
+                    continue
+                _, charge = max(group, key=lambda x: x[0])
+                if not rows:
+                    sid = 'sub-' + hashlib.sha256((name + ':' + last4).encode()).hexdigest()[:16]
+                    # Repetition is evidence for a card update, not proof of cadence or a future date.
+                    row = {'id': sid, **subscription({'merchant': charge['merchant'], 'last4': last4,
+                           'amount': charge['amount'], 'currency': charge['currency']})}
+                    book['subscriptions'].append(row)
+                    rows = [row]
+                for row in rows:
+                    row['status'] = 'needs card update'
+            for row in book['subscriptions']:
+                if row['last4'] == last4 and row['status'] != 'cancelled':
+                    row['status'] = 'needs card update'
+                    flagged.append(dict(row))
+            if before == book['subscriptions']:
+                raise _DryRun
+    except _DryRun:
+        pass
+    handled_merchants = set()
+    for row in sorted(flagged, key=lambda s: (s['next_renewal'] or '9999-12-31', s['id'])):
+        merchant = sub_merchant(row['merchant'])
+        if merchant in handled_merchants:
+            continue
+        handled_merchants.add(merchant)
+        references = {'subscription:' + s['id'] for s in flagged if sub_merchant(s['merchant']) == merchant}
+        if any(c.get('reference') in references or (c.get('subscription_card') == last4 and
+               sub_merchant(c['merchant']) == merchant) for c in load(data)['cases']):
+            continue
+        if row['next_renewal'] and row['amount'] and row['currency']:
+            case = renewal_case(data, {'merchant': row['merchant'], 'last4': last4, 'date': row['next_renewal'],
+                                      'amount': row['amount'], 'currency': row['currency'], 'identity': row.get('identity', '')},
+                                'subscription:' + row['id'], now, end=end, include_existing=True)
+            if case:
+                with Locked(data, wait=lock_wait(end)) as book:
+                    find(book, case['id'])['subscription_card'] = last4
+        else:
+            # No guessed renewal date: make an actionable case due today until the date is confirmed.
+            cid = 'subs-card-' + hashlib.sha256((sub_merchant(row['merchant']) + ':' + last4).encode()).hexdigest()[:20]
+            try:
+                with Locked(data, wait=lock_wait(end)) as book:
+                    if any(c['id'] == cid for c in book['cases']):
+                        raise _DryRun
+                    book['cases'].append({'id': cid, 'kind': 'charge', 'subscription_card': last4,
+                        'merchant': row['merchant'], 'amount': row['amount'],
+                        'currency': row['currency'], 'charged': now.date().isoformat(), 'reference': 'subscription:' + row['id'],
+                        'state': f'subscription uses dead card {last4}; renewal details incomplete',
+                        'next': 'confirm renewal details and move to a live card or cancel', 'deadline': now.date().isoformat(),
+                        'who': 'Abdullah', 'why': '', 'watchers': [], 'status': 'open', 'rev': 0, 'cycle': 0,
+                        'opened': stamp(now), 'updated': stamp(now), 'closed': None, 'outcome': None,
+                        'history': [{'at': stamp(now), 'text': 'opened from dead-card subscription sweep'}]})
+            except _DryRun:
+                pass
+    return flagged
+
+
 class Locked:
     """Serialise read-modify-write of cases.json (or questions.json) between CLI calls and checks."""
 
@@ -435,7 +707,8 @@ class Locked:
         try:
             with within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
                 fcntl.flock(self.lock, fcntl.LOCK_EX)
-            self.book = {'cases': load, 'questions': load_questions, 'cards': load_cards}[self.name](self.data)
+            self.book = {'cases': load, 'questions': load_questions, 'cards': load_cards,
+                         'subscriptions': load_subscriptions}[self.name](self.data)
         except BaseException:
             self.lock.close()
             raise
@@ -793,6 +1066,13 @@ def renewal(text, sender='', subject=''):
         return None
     notice = {'merchant': merchant, 'amount': amount, 'currency': currency,
               'date': date, 'last4': cards.pop()}
+    cadences = set()
+    if re.search(r'\bmonthly\b|\bevery month\b', text, re.I):
+        cadences.add('monthly')
+    if re.search(r'\b(?:yearly|annual|annually)\b|\bevery year\b', text, re.I):
+        cadences.add('yearly')
+    if len(cadences) == 1:
+        notice['cadence'] = cadences.pop()
     if domain:
         notice['identity'] = domain
     return notice
@@ -800,6 +1080,7 @@ def renewal(text, sender='', subject=''):
 
 def renewal_case(data, notice, source, now=None, end=None, include_existing=False):
     data, now = data or DATA, now or now_dubai()
+    learn_subscription(data, notice, end=end)
     if notice['last4'] not in dead_cards(data):
         return None
     source = check_text('source', source)
@@ -820,15 +1101,9 @@ def renewal_case(data, notice, source, now=None, end=None, include_existing=Fals
             if not existing:
                 # SMS has a merchant name but no mailbox domain. Match a unique
                 # domain label in either arrival order; ambiguous aliases stay in triage.
-                neutral = {'notifications', 'notification', 'mail', 'email', 'billing', 'alerts', 'alert',
-                           'noreply', 'support', 'updates', 'accounts', 'account', 'co', 'com', 'org', 'net', 'gov', 'edu', 'ac'}
-                def domain_alias(name, domain):
-                    key = re.sub(r'[^a-z0-9]', '', name.lower())
-                    return key and key not in neutral and key in {
-                        re.sub(r'[^a-z0-9]', '', label) for label in domain.split('.')[:-1]}
                 aliases = [c for c in book['cases'] if c.get('renewal_date') == due and (
-                    (not identity and c.get('renewal_identity') and domain_alias(merchant, c['renewal_identity'])) or
-                    (identity and not c.get('renewal_identity') and domain_alias(c['merchant'], identity)))]
+                    (not identity and c.get('renewal_identity') and renewal_alias(merchant, c['renewal_identity'])) or
+                    (identity and not c.get('renewal_identity') and renewal_alias(c['merchant'], identity)))]
                 if len(aliases) > 1:
                     case = None
                     raise _DryRun
@@ -1373,10 +1648,13 @@ def find_question(book, qid):
 def new_question(book, charge, text, at, now, chan='sms', item=None):
     key = merchant_key(charge['merchant'])
     base = '|'.join([charge['kind'], charge['card'], charge['currency'], charge['amount'], key, chan, stamp(at)])
+    if item:
+        # Distinct bank alerts can share a timestamp; their questions must still have distinct ids.
+        base += '|' + item
     q = {'id': 'q-' + hashlib.sha256(base.encode()).hexdigest()[:8], 'kind': charge['kind'],
          'owner': charges.card_owner(charge), 'card': charge['card'], 'currency': charge['currency'], 'amount': charge['amount'],
          'merchant': clip(redact(charge['merchant']), 80), 'pending': bool(charge.get('pending')),
-         'mkey': key, 'at': stamp(at),
+         'mkey': key, 'at': stamp(at), 'subscription_dated': True,
          'alert': clip(redact(text or ''), 240), 'alerts': [{'channel': chan, 'at': stamp(at), 'item': item}],
          'status': 'open', 'wait_until': None, 'asks': [], 'passed': False, 'item': None, 'why': '',
          'case': None, 'by': None, 'outcome': None, 'checked': None,
@@ -1501,6 +1779,7 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     charge = charges.parse(text, sender)
     if not charge:
         return None
+    dated = at is not None
     now = (now or now_dubai()).astimezone(TZ)
     at = (at or now).astimezone(TZ)
     chan = channel(sender)
@@ -1527,12 +1806,15 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     if owner != 'moni' and q and q.get('passed') and item and q.get('item') and q['item'] != item:
         return {**base, 'verdict': 'asked', 'why': f"another alert for this charge ({q['item']}) went to him",
                 'id': q['id']}
-    r = charges.explain(charge, at, now, deadline, find, said)
-    verdict = 'explained' if r['verdict'] in ('receipt', 'owner') else r['verdict']
+    matched = subscription_match(data, charge, at, record=record, end=deadline) if dated else None
+    r = matched or charges.explain(charge, at, now, deadline, find, said)
+    verdict = 'explained' if r['verdict'] in ('receipt', 'owner', 'subscription') else r['verdict']
     qid = q['id'] if q else None
     if record:
         with Locked(data or DATA, 'questions') as book:
             q = question_for(book, charge, at, chan, item) or new_question(book, charge, text, at, now, chan, item)
+            if not dated:
+                q['subscription_dated'] = False
             q['owner'] = owner
             recover_case(data, q)
             repeat_bill(data, q, now)
@@ -1590,7 +1872,9 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
         q = question_for(load_questions(data), charge, at, chan)
     recover_case(data, q)
     # Lookups run before taking the lock; a settled question needs none.
-    r = None if q and q['status'] != 'open' else charges.explain(charge, at, now, deadline, find, said)
+    r = None if q and q['status'] != 'open' else (
+        (subscription_match(data, charge, at, record=True, end=deadline) if not q or q.get('subscription_dated', False) else None)
+        or charges.explain(charge, at, now, deadline, find, said))
     with Locked(data, 'questions') as book:
         q = (find_question(book, q['id']) if q else None) or question_for(book, charge, at, chan) \
             or new_question(book, charge, text, at, now, chan)
@@ -1608,7 +1892,7 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
         note_why(q, r['why'], now)
         if r['errors']:
             return 4, '\n'.join(f"UNVERIFIED: source {e.split(':', 1)[0]} unreadable ({q['id']})" for e in r['errors'])
-        if r['verdict'] in ('receipt', 'owner'):
+        if r['verdict'] in ('receipt', 'owner', 'subscription'):
             settle(q, r['why'], 'ask', now)
             if q['owner'] == 'moni':
                 return DONT_ASK, f"{q['id']}: explained for Moni (owner: moni); {r['why']}."
@@ -1709,7 +1993,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             stats['lookups'] += 1
             try:
                 with within(each, LookupTimeout('out of time')):
-                    hit = charges.found(charge_of(q), at, now, each, find, owner, errors, memo, stats)
+                    matched = subscription_match(data, charge_of(q), at, record=True, end=each) if q.get('subscription_dated', False) else None
+                    hit = matched or charges.found(charge_of(q), at, now, each, find, owner, errors, memo, stats)
             except (charges.Lookup, LookupTimeout) as e:
                 errors.append(str(e))
                 # A slow receipt cannot hide owner evidence already loaded in this run.
@@ -1911,6 +2196,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                     combined.append((head, items, tail, case_id))
                 payment_due = payment_entries(cases, now, handled)
                 entries = payment_due[:1] if payment_due else [entry for entry in due if entry[3] not in covered.values()] + combined
+                if not payment_due:
+                    entries += subscription_entries(data, now, handled)
                 phases[phase] = time.time() - phase_at
                 phase, phase_at = 'build_write', time.time()
                 if entries:
@@ -2093,6 +2380,17 @@ def main(argv=None):
     p.add_argument('last4')
     p.add_argument('--note', required=True)
     sub.add_parser('cards', help='list dead cards')
+    p = sub.add_parser('subs', help='subscription register; blank fields mean unknown')
+    subs = p.add_subparsers(dest='subs_command', required=True)
+    subs.add_parser('list')
+    p = subs.add_parser('due')
+    p.add_argument('--days', type=int, default=3)
+    subs.add_parser('remove').add_argument('id')
+    for operation in ('add', 'edit'):
+        p = subs.add_parser(operation)
+        p.add_argument('id')
+        for field in SUB_FIELDS:
+            p.add_argument('--' + field.replace('_', '-'), required=operation == 'add' and field == 'merchant')
     sub.add_parser('brief')
     sub.add_parser('check')
     p = sub.add_parser('charge')
@@ -2119,7 +2417,9 @@ def main(argv=None):
             if not charge:
                 raise CaseError('not a card charge or decline alert this reads')
             now = parse_time(args.now) if args.now else now_dubai()
-            r = charges.explain(charge, parse_time(args.at) if args.at else now, now, time.time() + 30)
+            at = parse_time(args.at) if args.at else now
+            matched = subscription_match(DATA, charge, at) if args.at else None
+            r = matched or charges.explain(charge, at, now, time.time() + 30)
             print(json.dumps(redact_all({'charge': charge, **r}), ensure_ascii=False, indent=1))
         elif args.command == 'ask':
             if bool(args.alert) == bool(args.id):
@@ -2159,7 +2459,7 @@ def main(argv=None):
                     data = wd / 'scratch-books'
                     if not data.exists():
                         data.mkdir(mode=0o700)
-                        for name in ('cases.json', 'questions.json'):
+                        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
                             if (DATA / name).exists():
                                 shutil.copy2(DATA / name, data / name)
                 with (wd / 'check.lock').open('a') as lock:
@@ -2200,12 +2500,22 @@ def main(argv=None):
             print(table([find(load(), args.id)]))
         elif args.command == 'card-dead':
             card_dead(DATA, args.last4, args.note)
+            sweep_dead_card(DATA, args.last4, end=time.time() + 60)
             print(f'card {args.last4} marked dead')
+        elif args.command == 'subs':
+            if args.subs_command in ('add', 'edit', 'remove'):
+                changes = {f: getattr(args, f) for f in SUB_FIELDS if getattr(args, f, None) is not None}
+                result = sub_change(DATA, args.id, changes, args.subs_command)
+            else:
+                result = subscriptions_due(DATA, now_dubai(), args.days) if args.subs_command == 'due' else load_subscriptions(DATA)['subscriptions']
+            print(json.dumps(redact_all(result), ensure_ascii=False, indent=1))
         elif args.command == 'cards':
             print(json.dumps(redact_all(dead_cards(DATA)), ensure_ascii=False, indent=1))
         elif args.command == 'card-swap':
             changes = card_swap(DATA, args.old, args.new, args.also, dry_run=args.dry_run, cases=args.case)
             if not args.dry_run:
+                for last4 in sorted({args.old, *args.also}):
+                    sweep_dead_card(DATA, last4, end=time.time() + 60)
                 print('marked dead: ' + ', '.join(sorted({args.old, *args.also})))
             for c in changes:
                 # Same redaction as show/list: a hand-edited case may hold a card number or code in next.
