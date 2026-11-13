@@ -28,7 +28,7 @@ import * as Asks from "../engine/asks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
-import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
+import { WAITS_ENGINE_WIRED, waitingFor } from "../engine/waits.ts";
 import {
   AGENT_READ_BYTES,
   MESSAGE_PAGE_MAX,
@@ -552,11 +552,31 @@ const handlers = {
           input.to,
           isCardThread(caller) ? "cardThread" : "evaluator",
           caller.actor,
-          { note: input.note ?? null, question: input.question ?? null },
+          {
+            note: input.note ?? null,
+            question: input.question ?? null,
+            ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
+          },
         );
+        const dependency = card.wait?.card
+          ? yield* service.card(KanbanCardId.make(card.wait.card)).pipe(
+              Effect.map((detail) => detail.card),
+              Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
+            )
+          : null;
+        const waitMessage =
+          card.wait !== undefined &&
+          (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
+            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+                moved.wait === undefined
+                  ? "cleared by this move; set it again with card_wait or pass keepWait"
+                  : "kept"
+              }`
+            : null;
         return {
           card: moved,
-          ...(moved.stage === card.stage
+          ...(waitMessage === null ? {} : { message: waitMessage }),
+          ...(moved.stage === card.stage && waitMessage === null
             ? {
                 message:
                   input.to === moved.stage

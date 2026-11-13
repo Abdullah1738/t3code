@@ -1231,6 +1231,22 @@ describe("resolveWait", () => {
     ).toBe("end");
   });
 
+  it.each(["evaluator", "work", "review", null] as const)(
+    "stale safety net wakes the requested role %s",
+    (wakeRole) => {
+      const step = resolveWait(
+        card(1, {
+          movedAt: "2026-11-10T11:00:00.000Z" as never,
+          wait: wait({ wakeRole }),
+        }),
+        facts(),
+        ctx,
+        AT,
+      );
+      expect(step).toMatchObject({ _tag: "end", wake: { to: wakeRole ?? "none" } });
+    },
+  );
+
   it("drops a wait left on a card someone moved, without a wake", () => {
     const moved = card(1, {
       stage: "todo",

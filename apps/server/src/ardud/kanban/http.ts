@@ -23,6 +23,7 @@ import {
   KanbanScriptAcknowledgeInput,
   KanbanScriptTrigger,
   KanbanStage,
+  KanbanMoveOptions,
   ProviderOptionSelections,
   ProjectId,
 } from "@t3tools/contracts";
@@ -130,7 +131,7 @@ const CreateCardBody = Schema.Struct({
   reviewChain: Text,
 });
 
-const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
+const MoveBody = Schema.Struct({ to: KanbanStage, ...KanbanMoveOptions.fields });
 
 const PostBody = Schema.Struct({
   revision: Schema.optional(Schema.Number),
@@ -516,6 +517,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         return yield* service.moveCard(card.id, input.to, "owner", OWNER, {
           note: input.note ?? null,
           question: input.question ?? null,
+          ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
         });
       }),
     );
