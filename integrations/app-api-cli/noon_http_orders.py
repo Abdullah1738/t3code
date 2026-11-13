@@ -3,6 +3,7 @@
 Only verified native reads are allowed. Marketplace evidence is shipment-scoped;
 bounded active/history pages never certify whole-order terminal completion.
 """
+import toollog
 import datetime as dt
 import html
 import http.client
@@ -458,6 +459,7 @@ def _merge_cards(rows, reads):
     return merged
 
 
+@toollog.timed("noon", "provider.track")
 def track(order, timeout=10, *, deadline=None):
     if not isinstance(order, str) or not ORDER.fullmatch(order):
         raise NoonError('INVALID_ORDER_ID')
@@ -534,6 +536,7 @@ def track(order, timeout=10, *, deadline=None):
     return reads.finish(out)
 
 
+@toollog.timed("noon", "provider.orders")
 def orders(service='all', page=1, timeout=10):
     if service not in {'all', 'minutes', 'marketplace'} or type(page) is not int or not 1 <= page <= 100:
         raise NoonError('INVALID_ORDER_LIST_OPTIONS')

@@ -3,6 +3,7 @@
 Food only is enabled for first validation; Quik/Shops wire service/provider
 bindings remain unverified. No guest fallback, login, refresh or UI calls.
 """
+import toollog
 import argparse
 import datetime as dt
 import re
@@ -36,6 +37,7 @@ def project(data, order, service):
             'coverage': 'native_contract_static; live_status_eta_rider_unverified'}
 
 
+@toollog.timed('careem', 'provider.track')
 def track(order, timeout=12, *, service='food', latitude=None, longitude=None,
           provider_id=None, image_scale=None):
     if service != 'food':

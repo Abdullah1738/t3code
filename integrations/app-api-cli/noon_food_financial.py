@@ -4,6 +4,7 @@ The coordinator is exercised with injected transports. Recovery uses only exact
 session/order/intent reads and never calls a financial writer. No secret is
 persisted: intent and selected-card bindings are hashes.
 """
+import toollog
 import fcntl
 import json
 import os
@@ -153,6 +154,7 @@ class Coordinator:
     def _observe_unknown(self, operation):
         j.observe(self.flow_id,operation,outcome='UNKNOWN',evidence_hash=j.digest({'operation':operation,'outcome':'unknown'}))
 
+    @toollog.timed('commerce', 'step.payment_submit', lane="food")
     def place(self):
         def action():
             self.transport.assert_enabled()  # Gate before reads, reservation or journal consumption.
@@ -204,6 +206,7 @@ class Coordinator:
             state['intent_hash']=digest;self.save(state)
         return row
 
+    @toollog.timed('commerce', 'step.payment_submit', lane="food")
     def complete_payment(self, *, cvv_encryption=None):
         require(not isinstance(self.transport, AutomaticTransport), 'FOOD_NEEDS_APP_PAYMENT_REQUIREMENT')
         def action():
@@ -228,6 +231,7 @@ class Coordinator:
             return self._recover()
         return self.locked(action)
 
+    @toollog.timed('commerce', 'step.confirmation', lane="food")
     def recover(self):
         return self.locked(self._recover_report)
 

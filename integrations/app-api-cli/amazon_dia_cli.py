@@ -3,6 +3,7 @@
 No navigation, sign-in, cache, email override or tracker integration. Run with
 `python3 amazon_dia_cli.py orders --json` or `track ORDER_ID --json`.
 """
+import toollog
 import argparse
 import datetime as dt
 import json
@@ -111,6 +112,7 @@ def _bounded_process(command, *, timeout, max_bytes=MAX_BYTES):
                 process.stdout.close()
 
 
+@toollog.timed("amazon", "provider.orders")
 def read_orders(*, tab_id=None, expected_order_id=None, timeout=30):
     if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or
             not math.isfinite(timeout) or not 5 <= timeout <= 60):

@@ -3,6 +3,7 @@
 Food and NowNow tracking are exact-order. Marketplace completion requires the
 exact full-detail inventory to reconcile with its independent invoice count.
 """
+import toollog
 import http.client
 import datetime as dt
 import json
@@ -302,6 +303,7 @@ def nownow_projection(detail, tracking, order):
     return out
 
 
+@toollog.timed("noon", "provider.track")
 def track(order, service, timeout=10, *, deadline=None):
     deadline = _deadline(timeout, deadline)
     valid = isinstance(order, str) and ((service == 'food' and FOOD_ORDER.fullmatch(order))
@@ -325,6 +327,7 @@ def track(order, service, timeout=10, *, deadline=None):
     return out
 
 
+@toollog.timed("noon", "provider.orders")
 def food_orders(timeout=10):
     deadline = _deadline(timeout)
     headers = _headers('food', deadline)
@@ -351,6 +354,7 @@ def food_orders(timeout=10):
                                   'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
 
 
+@toollog.timed("noon", "provider.orders")
 def nownow_orders(timeout=10):
     deadline = _deadline(timeout)
     headers = _headers('nownow', deadline)
