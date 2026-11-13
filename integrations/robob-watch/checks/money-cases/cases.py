@@ -4,11 +4,12 @@
   money-cases list [--all] [--json]
   money-cases show ID
   money-cases add ID --merchant M --amount 12.34 --currency AED --state S --next N
-                  --deadline D --who W [--reference R] [--why TEXT] [--watcher ID]...
+                  --deadline D --who W [--due D] [--reference R] [--why TEXT] [--watcher ID]...
   money-cases update ID [--merchant M] [--amount A] [--currency C] [--reference R]
-                  [--state S] [--next N] [--deadline D] [--why TEXT] [--who W]
+                  [--state S] [--next N] [--deadline D] [--due D] [--why TEXT] [--who W]
                   [--add-watcher ID] [--drop-watcher ID] [--note TEXT]
                   [--source REF | --reply ID]   required for deadline changes; [--because TEXT] is optional
+                  [--because TEXT | --reply ID]   required for due changes
   money-cases add ... --unmatched     no merchant match: recorded as "unmatched", never guessed
                   [--charged YYYY-MM-DD] [--kind charge|hold]   hold = pre-auth, dropped off = released
   money-cases card-swap --old OLD --new NEW [--also STALE ...] [--case ID ...] [--dry-run]
@@ -31,6 +32,7 @@ words already explain, wait for the receipt from a merchant he already pays, nev
   money-cases unasked [--json | --ask]   daily first asks, screened before listing
 
 A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has one.
+An optional due date uses the same format; deadline remains the follow-up ping date.
 """
 import argparse
 import calendar
@@ -92,7 +94,7 @@ DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
 EVENT_LIMIT = 4000
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
-FIELDS = ('merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline', 'why', 'who')
+FIELDS = ('merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline', 'due', 'why', 'who')
 CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){14,15}(?!\d)')
 # A secret is a labelled value: a code of 3-12 digits (grouped or not) a few words after the label, a token
 # with a digit right after it ("code", "is", ":"), or anything assigned to a password. The match is removed.
@@ -186,6 +188,14 @@ def deadline_of(case):
     """The case deadline, or None when the stored value can't be read."""
     try:
         return parse_time(case['deadline'])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def due_of(case):
+    """Display dates use due when set; ping scheduling still uses deadline_of."""
+    try:
+        return parse_time(case.get('due') or case['deadline'])
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -814,7 +824,7 @@ def find(book, case_id):
 
 def add(data, case_id, merchant, amount, currency, state, next_action, deadline, who,
         reference='', why='', watchers=(), at=None, root=None, charged='', kind='charge', unmatched=False,
-        repeat=None, distinct=False, end=None):
+        repeat=None, distinct=False, end=None, due=None):
     if not ID.fullmatch(case_id):
         raise CaseError(f'id {case_id!r} must be lowercase letters, digits and dashes')
     if kind not in KINDS:
@@ -836,6 +846,8 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
         'opened': stamp(at), 'updated': stamp(at), 'closed': None, 'outcome': None,
         'history': [{'at': stamp(at), 'text': 'opened'}],
     }
+    if due is not None:
+        case['due'] = check_deadline(due)
     with Locked(data, wait=lock_wait(end)) as book:
         if any(c['id'] == case_id for c in book['cases']):
             raise CaseError(f'case {case_id!r} already exists')
@@ -858,12 +870,13 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
 
 def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', at=None, root=None,
            because='', reply='', source='', cascade_questions=True):
-    checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline}
+    checks = {'amount': check_amount, 'currency': check_currency, 'deadline': check_deadline, 'due': check_deadline}
     with Locked(data) as book:
         case = find(book, case_id)
         old_state = case['state']
         said = []
         moved = False
+        due_moved = False
         for field, value in changes.items():
             if value is None:
                 continue
@@ -878,11 +891,15 @@ def update(data, case_id, changes, add_watchers=(), drop_watchers=(), note='', a
                     # A new revision re-arms deadline pings, even when the date goes back to an earlier one.
                     case['rev'] = case.get('rev', 0) + 1
                     moved = True
+                elif field == 'due':
+                    due_moved = True
         because = check_text('because', because, False)
         reply = check_text('reply', reply, False)
         source = check_source(source) if source else ''
         if moved and not (source or reply):
             raise CaseError('deadline changes need --source (mail:, sms:, imessage: or statement:) or --reply (his reply id); nothing was changed')
+        if due_moved and not (because or reply):
+            raise CaseError('due changes need --because or --reply; nothing was changed')
         if because:
             said.append(f'because: {because}')
         if reply:
@@ -2729,23 +2746,38 @@ def brief(cases, now=None):
         return ''
     due, changed = [], []
     far = dt.datetime.max.replace(tzinfo=TZ)
-    for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', deadline_of(c) or far)):
+    for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', due_of(c) or far)):
         deadline = deadline_of(case)
+        due_date = due_of(case)
+        date = ''
+        if case.get('due'):
+            if due_date is None:
+                date = 'no valid due date'
+            else:
+                local = due_date.astimezone(TZ)
+                display = f'{day(local)} {local:%H:%M} Dubai' if case.get('kind') == 'payment_deadline' else when(due_date)
+                date = ('overdue since ' if due_date <= now else 'due ') + display
+            if deadline is not None and deadline != due_date:
+                date += f' (follow-up {when(deadline)})'
         if case.get('kind') == 'merchant_card':
-            due.append(case['state'])
+            due.append(case['state'] + (f'; {date}' if date else ''))
         elif case.get('status') == 'awaiting_answer':
             due.append(f"{case['merchant']} {money(case)} (awaiting answer"
-                       + (f"; {case['state']}" if case.get('urgency') == 'overdue' else '') + ')')
+                       + (f"; {case['state']}" if case.get('urgency') == 'overdue' else '')
+                       + (f'; {date}' if date else '') + ')')
         elif case.get('urgency') == 'overdue':
-            due.append(f"{case['merchant']} {money(case)} ({case['state']})")
-        elif deadline is None:
-            due.append(f"{case['merchant']} {money(case)} (no valid deadline)")
-        elif case.get('kind') == 'payment_deadline' or deadline <= now + BRIEF_DUE:
-            late = 'overdue since ' if deadline <= now else ''
-            display = f'{day(deadline)} {deadline:%H:%M} Dubai' if case.get('kind') == 'payment_deadline' else when(deadline)
-            due.append(f"{case['merchant']} {money(case)} ({late}{display})")
+            due.append(f"{case['merchant']} {money(case)} ({case['state']}" + (f'; {date}' if date else '') + ')')
+        elif due_date is None:
+            due.append(f"{case['merchant']} {money(case)} ({date or 'no valid deadline'})")
+        elif case.get('kind') == 'payment_deadline' or due_date <= now + BRIEF_DUE:
+            if date:
+                due.append(f"{case['merchant']} {money(case)} {date}")
+            else:
+                late = 'overdue since ' if deadline <= now else ''
+                display = f'{day(deadline)} {deadline:%H:%M} Dubai' if case.get('kind') == 'payment_deadline' else when(deadline)
+                due.append(f"{case['merchant']} {money(case)} ({late}{display})")
         elif parse_time(case['updated']) >= now - BRIEF_CHANGED:
-            changed.append(f"{case['merchant']} {money(case)}")
+            changed.append(f"{case['merchant']} {money(case)}" + (f' {date}' if date else ''))
     parts = [f'Money: {len(open_cases)} open']
     if due:
         parts.append('due: ' + '; '.join(due))
@@ -2758,12 +2790,18 @@ def brief(cases, now=None):
 
 def table(cases):
     rows = []
-    for c in sorted(cases, key=lambda c: (not active(c), str(c.get('deadline')))):
+    for c in sorted(cases, key=lambda c: (not active(c), str(c.get('due') or c.get('deadline')))):
         flag = ' [awaiting_answer]' if c['status'] == 'awaiting_answer' else '' if active(c) else ' [closed]'
         deadline = deadline_of(c)
         by = when(deadline) if deadline else f"{c.get('deadline')!r} (not a valid deadline)"
+        dates = f'by {by}'
+        if c.get('due'):
+            due_date = due_of(c)
+            dates = (f'due {when(due_date)}' if due_date else f"{c['due']!r} (not a valid due date)")
+            if c.get('deadline'):
+                dates += f', follow-up {by}'
         # Redact each field before clipping it: a clipped card number would no longer match.
-        rows.append(f"{c['id']}{flag}: {redact(c['merchant'])} {money(c)}, by {by} ({redact(c['who'])})\n"
+        rows.append(f"{c['id']}{flag}: {redact(c['merchant'])} {money(c)}, {dates} ({redact(c['who'])})\n"
                     f"  next: {clip(redact(c['next']), 200)}\n  state: {clip(redact(c['state']), 200)}")
     return redact('\n'.join(rows)) or 'No cases.'
 
@@ -2781,7 +2819,7 @@ def main(argv=None):
         p.add_argument('id')
         for field in FIELDS:
             # merchant is optional on add: --unmatched stands in for it.
-            required = name == 'add' and field not in ('reference', 'why', 'merchant')
+            required = name == 'add' and field not in ('reference', 'why', 'merchant', 'due')
             p.add_argument('--' + field, required=required)
         if name == 'add':
             p.add_argument('--repeat', default=None, metavar='ID',
@@ -2797,9 +2835,9 @@ def main(argv=None):
             p.add_argument('--add-watcher', action='append', default=[])
             p.add_argument('--drop-watcher', action='append', default=[])
             p.add_argument('--note', default='')
-            p.add_argument('--because', default='', help='optional reason for a deadline change')
+            p.add_argument('--because', default='', help='reason for a due change; optional for deadline changes')
             p.add_argument('--source', default='', help='evidence: mail:, sms:, imessage: or statement:<path>#<line>')
-            p.add_argument('--reply', default='', help="his reply id for a deadline change (or use --source)")
+            p.add_argument('--reply', default='', help="his reply id for a due or deadline change")
     p = sub.add_parser('close')
     p.add_argument('id')
     p.add_argument('--outcome', required=True)
@@ -2951,7 +2989,7 @@ def main(argv=None):
         elif args.command == 'add':
             case = add(DATA, args.id, args.merchant, args.amount, args.currency, args.state, args.next,
                        args.deadline, args.who, args.reference, args.why, args.watcher, charged=args.charged,
-                       kind=args.kind, unmatched=args.unmatched, repeat=args.repeat, distinct=args.distinct)
+                       kind=args.kind, unmatched=args.unmatched, repeat=args.repeat, distinct=args.distinct, due=args.due)
             # With --repeat, add returns the existing case and creates nothing: show that one.
             print(table([case]))
         elif args.command == 'update':
