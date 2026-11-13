@@ -119,11 +119,21 @@ class BackgroundQueueTests(Isolated):
         proc.communicate(timeout=5)
 
     def stop_child(self, pid, caller):
-        if pid and pid != caller:
+        if not pid or pid == caller:
+            return
+        # The child settles its run on SIGTERM; wait for it so it isn't still writing when the tempdir is removed.
+        for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, sig)
             except ProcessLookupError:
-                pass
+                return
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(.02)
 
     def until(self, predicate, proc=None):
         end = time.monotonic() + 8
