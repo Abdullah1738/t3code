@@ -948,3 +948,50 @@ it.effect("a later batch waits for publication and cannot overtake earlier seque
     );
   }),
 );
+
+it.effect(
+  "cancelling a write waiting for publication rolls back its batch and retains other callers",
+  () =>
+    Effect.gen(function* () {
+      const publishing = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let enqueues = 0;
+      yield* Effect.gen(function* () {
+        const sink = yield* EventSink.EventSinkV2;
+        const store = yield* EventStore.EventStoreV2;
+        const first = yield* sink.write({ events: [created] }).pipe(Effect.forkChild);
+        yield* Deferred.await(publishing);
+        const cancelled = yield* sink.write({ events: [item(1)] }).pipe(Effect.forkChild);
+        const kept = yield* sink.write({ events: [item(2)] }).pipe(Effect.forkChild);
+        yield* Deferred.await(waiting);
+        yield* Fiber.interrupt(cancelled);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(kept);
+        const events = yield* store.read().pipe(Stream.runCollect);
+        assert.deepEqual(
+          Array.from(events, (stored) => stored.event.id),
+          [created.id, item(2).id],
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer({
+            outbox: Effect.suspend(() =>
+              ++enqueues === 3
+                ? Deferred.succeed(waiting, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            ),
+            publish: (events) =>
+              events[0] !== undefined &&
+              "event" in events[0] &&
+              events[0].event.type === "thread.created"
+                ? Deferred.succeed(publishing, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  )
+                : Effect.void,
+          }),
+        ),
+      );
+    }),
+);

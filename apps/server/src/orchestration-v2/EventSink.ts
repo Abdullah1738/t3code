@@ -236,6 +236,7 @@ const WriteBatch = Context.Reference<
 >("t3/orchestration-v2/EventSink/WriteBatch", { defaultValue: () => undefined });
 
 interface QueuedWrite extends Request.Request<ReadonlyArray<OrchestrationV2StoredEvent>, unknown> {
+  readonly isCancelled: () => boolean;
   readonly input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0];
 }
 const QueuedWrite = Request.of<QueuedWrite>();
@@ -604,6 +605,7 @@ const layerBase: Layer.Layer<
 
     const writeDirect = Effect.fn("orchestrationV2.EventSink.write")(function* (
       input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+      isCancelled?: () => boolean,
     ) {
       yield* Effect.annotateCurrentSpan({
         "orchestration_v2.command_id": input.commandId ?? null,
@@ -756,6 +758,12 @@ const layerBase: Layer.Layer<
             }
             yield* publishStoredEvents(storedEvents);
           }),
+        isCancelled === undefined
+          ? undefined
+          : {
+              check: () => !isCancelled(),
+              prepare: () => () => {},
+            },
       );
     });
 
@@ -770,7 +778,10 @@ const layerBase: Layer.Layer<
       collectWhile: (entries) => entries.size < 100,
       runAll: (entries) => {
         const direct = (entry: Request.Entry<QueuedWrite>) =>
-          writeDirect(entry.request.input).pipe(Effect.provideContext(entry.context));
+          (entry.request.isCancelled()
+            ? Effect.interrupt
+            : writeDirect(entry.request.input, entry.request.isCancelled)
+          ).pipe(Effect.provideContext(entry.context));
         if (entries.length === 1)
           return Effect.exit(direct(entries[0]!)).pipe(
             Effect.tap((exit) => Effect.sync(() => entries[0]!.completeUnsafe(exit))),
@@ -784,7 +795,7 @@ const layerBase: Layer.Layer<
               Effect.gen(function* () {
                 const connection = yield* sql.transactionService;
                 const results = yield* Effect.forEach(entries, (entry) =>
-                  writeDirect(entry.request.input).pipe(
+                  writeDirect(entry.request.input, entry.request.isCancelled).pipe(
                     // Restore the caller's clock, tracing and references, but never its
                     // transaction binding: every statement must use this batch's writer.
                     Effect.provideContext(
@@ -795,6 +806,8 @@ const layerBase: Layer.Layer<
                 );
                 yield* publishLane.take(1);
                 holdsLane = true;
+                if (entries.some((entry) => entry.request.isCancelled()))
+                  return yield* Effect.interrupt;
                 return results;
               }),
             )
@@ -831,7 +844,17 @@ const layerBase: Layer.Layer<
       if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
         return yield* writeDirect(input);
       }
-      return yield* Effect.request(QueuedWrite({ input }), writeResolver);
+      let cancelled = false;
+      return yield* Effect.request(
+        QueuedWrite({ input, isCancelled: () => cancelled }),
+        writeResolver,
+      ).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancelled = true;
+          }),
+        ),
+      );
     });
 
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
