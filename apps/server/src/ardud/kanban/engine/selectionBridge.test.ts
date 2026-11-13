@@ -4,18 +4,23 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { modelSelectionResult } from "./defaults.ts";
 import { resolveScriptSelection } from "./selectionBridge.ts";
 
-it.each(["sol", "terra"] as const)("preserves serviceTier on card and script %s remaps", (name) => {
+it.each([
+  ["opus/cx/gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+  ["opus/cx/gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+  ["opus/gpt-6-astra", "gpt-6-astra", "codex"],
+  ["layso/gpt-6-astra", "gpt-6-astra", "codex"],
+] as const)("preserves serviceTier on card and script %s remaps", (source, model, instanceId) => {
   const selection = {
     instanceId: ProviderInstanceId.make("opencode"),
-    model: `opus/cx/gpt-6.1-${name}`,
+    model: source,
     options: [
       { id: "variant", value: "xhigh" },
       { id: "serviceTier", value: "default" },
     ],
   };
   const expected = {
-    instanceId: ProviderInstanceId.make(name === "sol" ? "codex" : "codex-cu"),
-    model: `gpt-6.1-${name}`,
+    instanceId: ProviderInstanceId.make(instanceId),
+    model,
     options: [
       { id: "reasoningEffort", value: "xhigh" },
       { id: "serviceTier", value: "default" },

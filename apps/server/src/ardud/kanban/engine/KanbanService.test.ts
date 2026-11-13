@@ -71,6 +71,7 @@ import * as Scribe from "./scribe.ts";
 import * as KanbanService from "./KanbanService.ts";
 import type { KanbanScriptsShape } from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
+import { mapCodexModelCapabilities } from "../../../provider/CodexProvider.ts";
 import {
   KanbanThreadError,
   KanbanThreads,
@@ -13318,17 +13319,20 @@ it.effect(
 );
 
 it.effect.each([
-  ["sol", false],
-  ["sol", true],
-  ["terra", false],
-  ["terra", true],
+  ["gpt-6.1-sol", "opus/cx/gpt-6.1-sol", "codex"],
+  ["gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+  ["gpt-6.1-terra", "opus/cx/gpt-6.1-terra", "codex-cu"],
+  ["gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+  ["gpt-6-astra", "opus/gpt-6-astra", "codex"],
+  ["gpt-6-astra", "layso/gpt-6-astra", "codex"],
+  ["gpt-6-astra", "gpt-6-astra", "codex"],
 ] as const)(
-  "card %s selections keep serviceTier through pool matching (legacy %s)",
-  ([name, legacy]) =>
+  "card %s selections keep serviceTier through pool matching (%s)",
+  ([model, source, destination]) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
-      const instanceId = ProviderInstanceId.make(name === "sol" ? "codex" : "codex-cu");
-      const model = `gpt-6.1-${name}`;
+      const instanceId = ProviderInstanceId.make(destination);
+      const legacy = source !== model;
       const pool = {
         instanceId,
         model,
@@ -13336,7 +13340,7 @@ it.effect.each([
       };
       const requested = {
         instanceId: legacy ? ProviderInstanceId.make("opencode") : instanceId,
-        model: legacy ? `opus/cx/${model}` : model,
+        model: source,
         options: [
           { id: legacy ? "variant" : "reasoningEffort", value: "xhigh" },
           { id: "serviceTier", value: "default" },
@@ -13390,7 +13394,25 @@ it.effect.each([
               ...opencodeTestProvider(),
               instanceId,
               driver: ProviderDriverKind.make("codex"),
-              models: [{ slug: model, name: model, isCustom: false, capabilities: null }],
+              models: [
+                {
+                  slug: model,
+                  name: model,
+                  isCustom: false,
+                  capabilities: mapCodexModelCapabilities({
+                    id: model,
+                    model,
+                    displayName: model,
+                    description: "",
+                    hidden: false,
+                    isDefault: true,
+                    defaultReasoningEffort: "xhigh",
+                    additionalSpeedTiers: [],
+                    supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "" }],
+                    serviceTiers: [{ id: "priority", name: "Fast", description: "" }],
+                  }),
+                },
+              ],
             },
           ]),
         ),

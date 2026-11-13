@@ -57,6 +57,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { mapCodexModelCapabilities } from "../provider/CodexProvider.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -3537,7 +3538,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         id,
         label: id,
         type: "select" as const,
-        options: ["high", "max", "xhigh", "default"].map((value) => ({ id: value, label: value })),
+        options: ["high", "max", "xhigh"].map((value) => ({ id: value, label: value })),
       });
       const haiku = "claude-haiku-5-5";
       const legacyHaiku = `opus/cc/${haiku}`;
@@ -3570,6 +3571,21 @@ describe("OrchestratorMcpService provider resolution", () => {
           },
         ],
       );
+      const codexDescriptors = mapCodexModelCapabilities({
+        id: "gpt-6.1-sol",
+        model: "gpt-6.1-sol",
+        displayName: "Sol",
+        description: "",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "high",
+        additionalSpeedTiers: [],
+        supportedReasoningEfforts: ["high", "max", "xhigh"].map((reasoningEffort) => ({
+          reasoningEffort,
+          description: "",
+        })),
+        serviceTiers: [{ id: "priority", name: "Fast", description: "" }],
+      }).optionDescriptors!;
       const providers = [
         snapshot(
           claude,
@@ -3585,42 +3601,57 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           ],
         ),
-        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", [
-          select("reasoningEffort"),
-          select("serviceTier"),
+        snapshot(codexInstanceId, "codex", "gpt-6.1-sol", codexDescriptors, [
+          {
+            slug: "gpt-6-astra",
+            name: "Astra",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: codexDescriptors,
+            },
+          },
         ]),
-        snapshot(ProviderInstanceId.make("codex-cu"), "codex", "gpt-6.1-terra", [
-          select("reasoningEffort"),
-          select("serviceTier"),
-        ]),
+        snapshot(ProviderInstanceId.make("codex-cu"), "codex", "gpt-6.1-terra", codexDescriptors),
       ];
       const maxVariant = [{ id: "variant", value: "max" }] as const;
       const maxEffort = [{ id: "effort", value: "max" }] as const;
       const nativeParent = { instanceId: claude, model: "claude-opus-5-5" };
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
-        ...(["sol", "terra"] as const).flatMap((name) =>
-          (["variant", "reasoningEffort"] as const).map((effortId) => ({
-            name: `preserves serviceTier on ${name} remap with ${effortId}`,
-            mode: "apply" as const,
-            parent: nativeParent,
-            target: {
-              providerInstanceId: opencode,
-              model: `opus/cx/gpt-6.1-${name}`,
-              options: [
-                { id: effortId, value: "xhigh" },
-                { id: "serviceTier", value: "default" },
-              ],
-            },
-            expected: {
-              instanceId: ProviderInstanceId.make(name === "sol" ? "codex" : "codex-cu"),
-              model: `gpt-6.1-${name}`,
-              options: [
-                { id: "reasoningEffort", value: "xhigh" },
-                { id: "serviceTier", value: "default" },
-              ],
-            },
-          })),
+        ...(
+          [
+            ["opus/cx/gpt-6.1-sol", "gpt-6.1-sol", "codex"],
+            ["opus/cx/gpt-6.1-terra", "gpt-6.1-terra", "codex-cu"],
+            ["opus/gpt-6-astra", "gpt-6-astra", "codex"],
+            ["layso/gpt-6-astra", "gpt-6-astra", "codex"],
+          ] as const
+        ).flatMap(([source, model, instanceId]) =>
+          (["variant", "reasoningEffort"] as const).flatMap((effortId) =>
+            (["array", "record"] as const).map((shape) => ({
+              name: `preserves serviceTier on ${source} remap with ${effortId} ${shape}`,
+              mode: "apply" as const,
+              parent: nativeParent,
+              target: {
+                providerInstanceId: opencode,
+                model: source,
+                options:
+                  shape === "record"
+                    ? { [effortId]: "xhigh", serviceTier: "default" }
+                    : [
+                        { id: effortId, value: "xhigh" },
+                        { id: "serviceTier", value: "default" },
+                      ],
+              },
+              expected: {
+                instanceId: ProviderInstanceId.make(instanceId),
+                model,
+                options: [
+                  { id: "reasoningEffort", value: "xhigh" },
+                  { id: "serviceTier", value: "default" },
+                ],
+              },
+            })),
+          ),
         ),
         {
           name: "reports an explicit legacy Haiku request",
@@ -3845,7 +3876,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "variant", value: "high" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
           target: { options: { reasoningEffort: "max" } },
@@ -3854,7 +3885,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             model: "gpt-6.1-sol",
             options: [
               { id: "reasoningEffort", value: "max" },
-              { id: "serviceTier", value: "high" },
+              { id: "serviceTier", value: "default" },
             ],
           },
         },
