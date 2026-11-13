@@ -306,6 +306,29 @@ cat "$T/.robob/userdata/statev2.sqlite"
     ):
         setup = generated_sql if expected else ''
         cases.append(('sqlite-input-' + label, minimal.replace('\n}\n', '\n' + setup + '  ' + call + '\n}\n'), expected))
+    sql_file = '  SQLFILE="$TOP/fixture.sql"\n' + generated_sql.replace('"$TOP/fixture.sql"', '"$SQLFILE"')
+    for loader in ('.read $SQLFILE', '.read "$SQLFILE"', '.read $TOP/fixture.sql', '.read /tmp/fixture.sql',
+                   '.r $SQLFILE', '.re $SQLFILE', '.rea $SQLFILE', '.READ $SQLFILE', '.read |cat $SQLFILE'):
+        call = sqlite + " '" + loader + "'"
+        if loader == '.read $SQLFILE':
+            call = sqlite + ' ".read $SQLFILE"'
+        cases.append(('sqlite-input-load-file', minimal.replace('\n}\n', '\n' + sql_file + '  ' + call + '\n}\n'), 'live-database-script'))
+    for argument in ('"$(cat "$SQLFILE")"', '"`cat "$SQLFILE"`"', '"$SQL"'):
+        call = sqlite + ' ' + argument
+        cases.append(('sqlite-input-dynamic-sql', minimal.replace('\n}\n', '\n' + sql_file + '  ' + call + '\n}\n'), 'live-database-script'))
+    for prefix, expected in (
+        ('-safe -noinit -- :memory:', None),
+        ('-safe -- :memory:', 'live-database-script'),
+        ('-noinit -- :memory:', 'live-database-script'),
+        ('-safe -noinit :memory:', 'live-database-script'),
+        ('-safe -noinit -nonce fixture -- :memory:', 'live-database-script'),
+        ('-safe -noinit -- "$TOP/db.sqlite"', None),
+        ('-safe -noinit -- "$HOME/db.sqlite"', 'live-database-script'),
+        ('-safe -noinit -- /tmp/unproved.sqlite', 'live-database-script'),
+    ):
+        call = '/opt/homebrew/opt/sqlite/bin/sqlite3 ' + prefix + ' "$(cat "$TOP/fixture.sql")" "SELECT 1;"'
+        setup = '  printf "SELECT 1;" > "$TOP/fixture.sql"\n'
+        cases.append(('sqlite-input-safe-restore', minimal.replace('\n}\n', '\n' + setup + '  ' + call + '\n}\n'), expected))
     cases.append(('trap-root-mutation', minimal.replace('setup fake\n', 'trap \'rm -rf "$T"; ln -s "$HOME" "$T"\' DEBUG\nsetup fake\n'), 'live-database-script'))
     for linker in ('"$LINKER"', '"${LINKER}"', '"$(printf ln)"', '`printf ln`'):
         cases.append(('computed-link', original.replace('  R="$T/.local/share/memory-system"', '  LINKER=ln\n  ' + linker + ' -s "$HOME" "$T"\n  R="$T/.local/share/memory-system"'), 'live-database-script'))

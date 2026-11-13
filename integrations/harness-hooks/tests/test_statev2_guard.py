@@ -143,6 +143,19 @@ class GuardTests(unittest.TestCase):
                 with self.subTest(case=label, source=source, prefix=prefix):
                     self.assertEqual(self.classify(prefix + 'tmp/fixture.sh'), expected)
 
+    @unittest.skipUnless(Path('/opt/homebrew/opt/sqlite/bin/sqlite3').is_file(), 'requires fixture SQLite CLI')
+    def test_safe_sqlite_dump_restore(self):
+        command = ['/opt/homebrew/opt/sqlite/bin/sqlite3', '-safe', '-noinit', '--', ':memory:']
+        dump = "CREATE TABLE scheduled_tasks(name); INSERT INTO scheduled_tasks VALUES ('it''s 7');\nCREATE TABLE ardud_mission_events(id); INSERT INTO ardud_mission_events VALUES ('m');"
+        result = subprocess.run(command + [dump, 'SELECT name FROM scheduled_tasks', 'SELECT id FROM ardud_mission_events'], capture_output=True, text=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "it's 7\nm\n", ''))
+        fixture = self.write('fixture.sql', 'SELECT 1;')
+        for sql in ('.read ' + str(fixture), "SELECT readfile('" + str(fixture) + "');"):
+            with self.subTest(sql=sql):
+                result = subprocess.run(command + [sql], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr.lower(), 'safe|no such function')
+
     def test_backup_live_output_redirects(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
         self.write('tmp/fixture.sh', backup.read_text())

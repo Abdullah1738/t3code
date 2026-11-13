@@ -494,7 +494,10 @@ def _fixture_setup(source):
         binary = os.path.basename(executable)
         if binary == 'sqlite3':
             sql_args = list(args)
-            if sql_args[:1] == ['-readonly']:
+            safe_sql = sql_args[:3] == ['-safe', '-noinit', '--']
+            if safe_sql:
+                sql_args = sql_args[3:]
+            elif sql_args[:1] == ['-readonly']:
                 sql_args.pop(0)
             # Only argv SQL is inspected here. File, pipe, heredoc and inherited
             # stdin can carry additional commands, so none proves isolation.
@@ -505,7 +508,12 @@ def _fixture_setup(source):
             # These SQLite helpers can change the fixture's filesystem; inspect
             # only SQL operands so Python's json.load remains a normal read.
             sql = '\n'.join(bodies[word][0] if word in bodies else word for word in sql_args[1:])
-            if re.search(r'(?i)\.(?:shell|system|load)\b|\b(?:load_extension|writefile)\s*\(', sql):
+            if re.search(r'(?m)^\s*\.|(?i:\b(?:load_extension|writefile)\s*\()', sql):
+                return False
+            # Generated dumps are evaluated only by SQLite's restricted mode.
+            # -- fixes option parsing and -noinit excludes startup SQL. Ordinary
+            # fixture SQL only interpolates the numeric clock value it uses.
+            if not safe_sql and any(char in sql.replace('$(date +%s)', '') for char in '$`'):
                 return False
         if binary == 'cp':
             if not args or not confined_path(args[-1]) or any(not (confined_path(word) or re.fullmatch(r'\$HERE/(?:scripts/[\w.-]+\.sh|src/[\w.-]+\.py)', word)) or '..' in word.split('/') for word in args):
