@@ -180,24 +180,73 @@ def _relative_source_live(source, directory):
 
 
 def _python_touches_live(source, directory, replica=False):
+    try:
+        tree, aliases, bindings = _python_tree(source)
+    except (SyntaxError, ValueError):
+        return bool(replica or source_touches_live(source) or _relative_source_live(source, directory) or
+                    directory is not None and any(LIVE.search(str(directory / name))
+                                                  for name in {'statev2.sqlite', 'state.sqlite', 'opencode.db'}))
+
+    definitions, stores = {}, {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            stores[node.id] = stores.get(node.id, 0) + 1
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg)):
+            name = node.arg if isinstance(node, ast.arg) else node.name
+            stores[name] = stores.get(name, 0) + 1
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                if isinstance(target, ast.Name):
+                    definitions[target.id] = node.value
+
+    def uri_value(node, seen=frozenset()):
+        value = _path_expression(node, bindings, aliases)
+        if value is not None:
+            return value
+        if isinstance(node, ast.Name) and node.id not in seen and stores.get(node.id) == 1 and node.id in definitions:
+            return uri_value(definitions[node.id], seen | {node.id})
+        if isinstance(node, ast.Call) and _name(node.func) == 'str' and 'str' not in stores and 'str' not in aliases and len(node.args) == 1:
+            return uri_value(node.args[0], seen)
+        if isinstance(node, ast.JoinedStr):
+            parts = [uri_value(n.value, seen) if isinstance(n, ast.FormattedValue) and
+                     n.conversion == -1 and n.format_spec is None else uri_value(n, seen) for n in node.values]
+            return ''.join(parts) if all(p is not None for p in parts) else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = uri_value(node.left, seen), uri_value(node.right, seen)
+            return left + right if left is not None and right is not None else None
+        return None
+
+    replica = replica or any(REPLICA.search(value) for node in ast.walk(tree)
+                             if (value := _path_expression(node, bindings, aliases)) is not None)
+    original_live = source_touches_live(source)
+    replica_calls = set()
+    for node in ast.walk(tree):
+        if not replica or original_live or not isinstance(node, ast.Call) or not node.args:
+            continue
+        root, *rest = _name(node.func).split('.')
+        if '.'.join([aliases.get(root, root), *rest]) != 'sqlite3.connect':
+            continue
+        value = uri_value(node.args[0])
+        if value is None:
+            continue
+        value = re.sub(r'^file:', '', value).split('?', 1)[0]
+        match = REPLICA.search(value)
+        if match and match.end() == len(value) and not _direct_read(['cat', value], directory):
+            replica_calls.update(id(n) for n in ast.walk(node.func))
     relative_live = _relative_source_live(source, directory)
-    mentions = source_touches_live(source) or relative_live or bool(replica and DATABASE_NAME.search(source))
+    mentions = original_live or relative_live or replica
     changed_directory = bool(re.search(r"\bchdir\b", source) and
                              ("statev2.sqlite" in source or "state.sqlite" in source or "opencode.db" in source) and
                              (relative_live or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", source)))
     if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "state.sqlite", "opencode.db"})):
         return False
-    try:
-        tree, aliases, bindings = _python_tree(source)
-    except (SyntaxError, ValueError):
-        return True
     db = {"sqlite3", "apsw", "sqlalchemy", "duckdb", "peewee"}
-    direct_callables = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    direct_callables = {id(part) for n in ast.walk(tree) if isinstance(n, ast.Call) for part in ast.walk(n.func)}
     for node in ast.walk(tree):
         name = _name(node)
         root, *rest = name.split(".")
         canonical = ".".join([aliases.get(root, root), *rest])
-        if canonical.split(".")[0] in db:
+        if canonical.split(".")[0] in db and id(node) not in replica_calls:
             return True
         if canonical in {"__import__", "builtins", "importlib", "eval", "exec", "getattr", "__builtins__"} or canonical.startswith(("builtins.", "importlib.", "__builtins__.")):
             return True
@@ -211,7 +260,8 @@ def _python_touches_live(source, directory, replica=False):
             return True
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             modules = [n.name for n in node.names] if isinstance(node, ast.Import) else [node.module or ""]
-            if any(m.split(".")[0] in db | {"builtins", "importlib"} for m in modules):
+            if any(m.split(".")[0] in db | {"builtins", "importlib"} and
+                   not (m == 'sqlite3' and replica_calls) for m in modules):
                 return True
         if not isinstance(node, ast.Call):
             continue
@@ -1011,12 +1061,83 @@ def _fixture_shell_live(text, depth=0):
     return False
 
 
+def _replica_reader_source(source):
+    # A literal is discounted only at a reader, or in an immutable binding whose
+    # every use is a reader argument. Unknown transformations retain the name.
+    identifier = r'[A-Za-z_$][\w$]*'
+    reader = re.compile(r'\bnew\s+(?:' + identifier + r'\s*\.\s*)*(?:DatabaseSync|Database)\s*\(\s*$')
+    strings = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"''')
+    code = strings.sub(lambda m: ' ' * len(m[0]), source)
+    if re.search(r'\b(?:eval|Function|Reflect|Proxy)\b', code):
+        return source
+    literal = r'''(?:'[^'\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?'|"[^"\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?")'''
+    home = r'(?:process\.env\.HOME|(?:' + identifier + r'\.)*homedir\(\s*\))'
+    seed = re.compile(r'(?:' + identifier + r'\.)*(?:join|resolve)\(\s*' + home + r'\s*,\s*' + literal + r'\s*\)|' + home + r'\s*\+\s*' + literal + '|' + literal)
+
+    def reader_use(start, end):
+        return reader.search(code[:start]) and re.match(r'\s*[,)]', code[end:])
+
+    def binding_reads(name, declaration, text=code):
+        uses = list(re.finditer(r'(?<![\w$])' + re.escape(name) + r'(?![\w$])', text))
+        reads = [m for m in uses if m.span() != declaration]
+        return bool(reads) and all(reader_use(m.start(), m.end()) for m in reads)
+
+    discounted = []
+    for command in re.finditer(r'(?m)^\s*sqlite3\s+-readonly\s+([^\s;|&]+)', source):
+        if (replica := REPLICA.search(command[1])) and replica.end() == len(command[1]):
+            discounted.append(command.span(1))
+    for match in seed.finditer(source):
+        if not REPLICA.search(match[0]):
+            continue
+        start, end = match.span()
+        # Parentheses around an expression are transparent; call parentheses
+        # must remain so a helper's argument cannot look like a direct read.
+        while (opening := re.search(r'\(\s*$', source[:start])) and re.match(r'\s*\)', source[end:]):
+            before = source[:opening.start()].rstrip()
+            if before and re.search(r'[\w$.)\]]$', before):
+                break
+            start = opening.start()
+            end += re.match(r'\s*\)', source[end:]).end()
+        safe = reader_use(start, end)
+        declaration = re.search(r'\bconst\s+(' + identifier + r')\s*=\s*$', code[:start])
+        if declaration and re.match(r'\s*;', code[end:]):
+            safe = binding_reads(declaration[1], declaration.span(1))
+        option = re.search(r'''\breplica\s*:\s*\{\s*type\s*:\s*(['"])string\1\s*,\s*default\s*:\s*$''', source[:start])
+        parser = re.search(r'\bconst\s*\{\s*(values)\s*\}\s*=\s*(?:' + identifier + r'\.)*parseArgs\(\s*\{\s*options\s*:\s*\{', code)
+        if option and parser and parser.start() < option.start() and re.match(r'\s*,?\s*}', code[end:]):
+            # The probe's parseArgs option is another immutable binding. Reject
+            # option overrides and unknown uses of the returned values object.
+            depth, close = 1, code.index('(', parser.start()) + 1
+            while close < len(code) and depth:
+                depth += (code[close] == '(') - (code[close] == ')')
+                close += 1
+            options = code[parser.start():close]
+            uses = code
+            for access in re.finditer(r'''\bvalues\s*\[\s*(['"])([^'"\n]+)\1\s*\]''', source):
+                if access[2] != 'replica' and not re.match(r'\s*(?:[+*/%&|?^-]*=(?!=)|\+\+|--)', code[access.end():]):
+                    uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
+            for access in re.finditer(r'\bvalues\.replica\b', code):
+                if reader_use(access.start(), access.end()):
+                    uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
+            uses = uses[:parser.start(1)] + ' ' * len(parser[1]) + uses[parser.end(1):]
+            safe = (end < close and '...' not in options and
+                    len(re.findall(r'\breplica\s*:', options)) == 1 and
+                    len(re.findall(r'\boptions\s*:', options)) == 1 and
+                    not re.search(r'\bvalues\b', uses))
+        if safe:
+            discounted.append((start, end))
+    for start, end in reversed(discounted):
+        source = source[:start] + ' ' * (end - start) + source[end:]
+    return source
+
+
 def _source_hit(source, directory, python=False, shell=False):
     # Keep the root evidence so the replica cannot hide a second database name.
     replica = REPLICA.search(source)
-    source = REPLICA.sub("guard_readonly_replica", source)
     if python:
         return _python_touches_live(source, directory, replica=bool(replica))
+    if replica and not shell:
+        source = _replica_reader_source(source)
     if shell:
         original = source
         source = _shell_fixture_source(source, directory)

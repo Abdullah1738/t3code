@@ -160,6 +160,74 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(match[0], 'statev2.sqlite')
         self.assertEqual(match.start(), source.index('statev2.sqlite'))
 
+    def test_replica_paths_cannot_be_transformed_before_opening(self):
+        node_replica = '(process.env.HOME + "/.robob/userdata/readonly/state.sqlite")'
+        node_rows = [
+            ('exact', 'replica', None),
+            ('replace-directory', 'replica.replace("/readonly/", "/")', SCRIPT),
+            ('replace-name', 'replica.replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('replace-all', 'replica.replaceAll("/readonly/", "/")', SCRIPT),
+            ('join-traversal', 'path.join(replica, "../..", path.basename(replica))', SCRIPT),
+            ('resolve-traversal', 'path.resolve(replica, "../..", path.basename(replica))', SCRIPT),
+            ('dirname', 'path.join(path.dirname(path.dirname(replica)), path.basename(replica))', SCRIPT),
+            ('helper', 'rewrite(replica)', SCRIPT),
+        ]
+        for name, expression, expected in node_rows:
+            for assigned in (False, True):
+                target = expression
+                source = ('import { DatabaseSync } from "node:sqlite";\n'
+                          'import path from "node:path";\n')
+                if assigned:
+                    source += f'const replica = {node_replica};\n'
+                else:
+                    target = expression.replace('replica', node_replica)
+                source += f'new DatabaseSync({target}, {{readOnly: true}});\n'
+                with self.subTest(language='node', operation=name, assigned=assigned):
+                    script = self.write('tmp/derived-replica.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), expected)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'),
+                                     READ if expected else None)
+
+        python_rows = [
+            ('exact', 'str(replica)', None),
+            ('replace-directory', 'str(replica).replace("/readonly/", "/")', SCRIPT),
+            ('replace-name', 'str(replica).replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('join-traversal', 'os.path.join(str(replica), "../..", replica.name)', SCRIPT),
+            ('parent', 'replica.parent.parent / replica.name', SCRIPT),
+            ('with-name', 'replica.parent.parent / "statev2.sqlite"', SCRIPT),
+            ('helper', 'rewrite(replica)', SCRIPT),
+        ]
+        for name, expression, expected in python_rows:
+            for suffix in ['".robob/userdata/readonly/state.sqlite"',
+                           '".robob/userdata" / "readonly" / "state.sqlite"']:
+                source = ('from pathlib import Path\nimport sqlite3\nimport os\n'
+                          f'replica = Path.home() / {suffix}\n'
+                          f'p = {expression}\n'
+                          'sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True)\n')
+                with self.subTest(language='python', operation=name, suffix=suffix):
+                    script = self.write('tmp/derived-replica.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), expected)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'),
+                                     READ if expected else None)
+
+    def test_original_replica_probe_is_allowed(self):
+        source = Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts'
+        original = source.read_text()
+        for expression, expected in [
+            ('values.replica', None),
+            ('values.replica.replace("/readonly/", "/")', SCRIPT),
+            ('values.replica.replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('NodePath.join(values.replica, "../..", NodePath.basename(values.replica))', SCRIPT),
+            ('rewrite(values.replica)', SCRIPT),
+        ]:
+            with self.subTest(expression=expression):
+                content = original.replace('DatabaseSync(values.replica,', f'DatabaseSync({expression},')
+                script = self.write('tmp/original-probe.ts', content)
+                self.assertEqual(self.classify(f'node {script} --thread-id x'), expected)
+        script = self.write('tmp/eval-probe.ts', original.replace(
+            'const db = new', 'eval(\'values.replica = values.replica.replace("/readonly/", "/")\');\nconst db = new'))
+        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+
     def test_heredoc_delimiters_follow_shell_quote_removal(self):
         rows = [
             (r'\EOF', 'EOF', True),
