@@ -6,29 +6,29 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
-import { realpathSync, existsSync, lstatSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { homedir } from "node:os";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
 import { migrationManifest, runMigrations } from "../../persistence/Migrations.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 export async function runMigrationCheck(directory: string) {
-  const root = realpathSync(directory);
-  const live = resolve(homedir(), ".robob/userdata");
+  const root = NodeFS.realpathSync(directory);
+  const live = NodePath.resolve(NodeOS.homedir(), ".robob/userdata");
   if (
     root === live ||
-    (existsSync(live) && root === realpathSync(live)) ||
-    !existsSync(join(root, ".install-clone"))
+    (NodeFS.existsSync(live) && root === NodeFS.realpathSync(live)) ||
+    !NodeFS.existsSync(NodePath.join(root, ".install-clone"))
   ) {
     throw new Error("Migration check requires a marked, isolated install clone");
   }
   for (const name of ["statev2.sqlite", "boards.sqlite"]) {
-    const file = join(root, name);
-    if (existsSync(file) && (lstatSync(file).isSymbolicLink() || realpathSync(file) !== file)) {
+    const file = NodePath.join(root, name);
+    if (NodeFS.existsSync(file) && (NodeFS.lstatSync(file).isSymbolicLink() || NodeFS.realpathSync(file) !== file)) {
       throw new Error("Migration clone files must not link outside their directory");
     }
   }
-  const state = join(root, "statev2.sqlite");
+  const state = NodePath.join(root, "statev2.sqlite");
   const timed = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
     Effect.gen(function* () {
       const start = performance.now();
@@ -63,7 +63,7 @@ export async function runMigrationCheck(directory: string) {
       Effect.gen(function* () {
         yield* (yield* BoardsDatabase.BoardsDatabase).ready;
       }).pipe(
-        Effect.provide(BoardsDatabase.layerFromPaths(join(root, "boards.sqlite"), state).pipe(Layer.provide(NodeServices.layer))),
+        Effect.provide(BoardsDatabase.layerFromPaths(NodePath.join(root, "boards.sqlite"), state).pipe(Layer.provide(NodeServices.layer))),
         Effect.scoped,
         Effect.timeout("20 seconds"),
       ),
