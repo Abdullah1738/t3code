@@ -70,6 +70,12 @@ net.ipv6.conf.all.forwarding = 1
 kernel.dmesg_restrict = 1
 vm.swappiness = 10
 EOF
+# Incus already allows userns in its outer profile. Ubuntu's restriction still transitions unconfined
+# processes inside the nested AppArmor namespace to unprivileged_userns, denying their uid_map write.
+# This dedicated box host keeps AppArmor confinement; only that extra userns restriction is disabled.
+cat > /etc/sysctl.d/90-offbox-userns.conf <<'EOF'
+kernel.apparmor_restrict_unprivileged_userns = 0
+EOF
 sysctl -q --system
 cat > /etc/security/limits.d/90-offbox.conf <<'EOF'
 * soft nofile 1048576
