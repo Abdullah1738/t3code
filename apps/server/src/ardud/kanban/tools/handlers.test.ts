@@ -1015,6 +1015,76 @@ it.effect(
   },
 );
 
+it.effect("nightly pages include early active cards among more than 500 settled cards", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "nightly-coverage",
+      name: "Nightly coverage",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const early = yield* kanban.createCard(board.id, { prompt: "Old", title: "Old" }, owner);
+    yield* Effect.forEach(Array.from({ length: 510 }, (_, i) => i + 1), (number) =>
+      store.putCard({
+        ...early,
+        id: number === 1 ? early.id : KanbanCardId.make(`settled-${number}`),
+        number,
+        stage: "verified",
+        settledAt: early.createdAt,
+      }),
+    );
+    yield* TestClock.adjust(Duration.hours(30));
+    yield* kanban.editCard(early.id, { comment: "Active today" }, owner);
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const current = yield* kanban.createCard(board.id, { prompt: "Current", title: "Current" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(current.id)).card.activeThreadId!;
+    running.add(thread);
+    yield* TestClock.adjust(Duration.minutes(1));
+    const since = DateTime.formatIso(
+      DateTime.makeUnsafe((yield* Clock.currentTimeMillis) - 24 * 60 * 60 * 1000),
+    );
+    const read = (args: Record<string, unknown>) =>
+      call(thread, "board_get", args).pipe(
+        Effect.map((result) => {
+          assert.isFalse(result.isError, result.text);
+          return result.structured.board as {
+            activeCards?: number;
+            cards: Array<{ number: number; settled?: boolean }>;
+            page: { hasMore: boolean; nextAfter: number | null };
+          };
+        }),
+      );
+
+    const first = yield* read({ since, limit: 1 });
+    assert.strictEqual(first.activeCards, 2);
+    assert.deepStrictEqual(first.cards.map((row) => row.number), [1]);
+    assert.isTrue(first.cards[0]!.settled);
+    assert.isTrue(first.page.hasMore);
+    const last = yield* read({ since, limit: 1, after: first.page.nextAfter });
+    assert.deepStrictEqual(last.cards.map((row) => row.number), [current.number]);
+    assert.isFalse(last.page.hasMore);
+
+    const skipped = yield* read({ since, after: 60 });
+    assert.deepStrictEqual(skipped.cards.map((row) => row.number), [current.number]);
+    const restarted = yield* read({ since, after: 0, limit: 500 });
+    assert.deepStrictEqual(restarted.cards.map((row) => row.number), [1, current.number]);
+    assert.isFalse(restarted.page.hasMore);
+
+    const unfiltered = yield* read({ limit: 500 });
+    assert.lengthOf(unfiltered.cards, 500);
+    assert.isTrue(unfiltered.page.hasMore);
+    const remainder = yield* read({ limit: 500, after: unfiltered.page.nextAfter });
+    assert.deepStrictEqual(
+      [...unfiltered.cards, ...remainder.cards].map((row) => row.number),
+      Array.from({ length: current.number }, (_, i) => i + 1),
+    );
+    assert.isFalse(remainder.page.hasMore);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("compact reads: board_get since, card_get pages, discussion_read limit, board_activity", () => {
   const { running, layer } = fakeThreads();
   return Effect.gen(function* () {
