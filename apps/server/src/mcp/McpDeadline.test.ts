@@ -50,6 +50,7 @@ it.effect("an outer deadline reports the nested caller read that is still pendin
           code: "caller_unresolved",
           stage: "caller",
           threadId: "caller",
+          threadKind: "thread",
           elapsedMs: 10000,
           wait: "statev2 background caller shell",
           waitElapsedMs: 8000,
@@ -92,6 +93,7 @@ it.effect.each(["caller", "dispatch", "receipt"] as const)(
             code: failure.code,
             stage,
             threadId: "caller",
+            threadKind: "thread",
             elapsedMs: 10000,
             wait: stage === "caller" ? "caller identity" : `threadManagement.${stage}`,
             waitElapsedMs: 10000,
@@ -123,6 +125,50 @@ it.effect("returns a typed deadline even while cancellation is deferred", () =>
       error.message,
       "Caller resolution timed out during caller for thread caller. Nothing was saved; retry the same call.",
     );
+  }),
+);
+
+it.effect("logs a delegated caller's pending foreground read without changing its deadline", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    const threadId = ThreadId.make("thread:delegated-task:caller");
+    const pending = yield* McpDeadline.withDeadline(
+      McpDeadline.waitingOn(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        "statev2 foreground caller row",
+      ),
+      { code: "caller_unresolved", threadId, stage: "caller" },
+    ).pipe(
+      Effect.flip,
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust("10 seconds");
+    const failure = yield* Fiber.join(pending);
+    assert.equal(failure.code, "caller_unresolved");
+    assert.equal(
+      failure.message,
+      `Caller resolution timed out during caller for thread ${threadId}. Nothing was saved; retry the same call.`,
+    );
+    assert.deepEqual(logs, [
+      [
+        "MCP operation timed out",
+        {
+          code: "caller_unresolved",
+          stage: "caller",
+          threadId,
+          threadKind: "delegated-task",
+          elapsedMs: 10000,
+          wait: "statev2 foreground caller row",
+          waitElapsedMs: 10000,
+        },
+      ],
+    ]);
   }),
 );
 
