@@ -5156,6 +5156,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const projectClaudeWorkflowMembers = Effect.fnUntraced(function* (input: {
           readonly coordinator: ActiveClaudeSubagent;
           readonly workflow: OrchestrationV2SubagentWorkflow;
+          readonly skipTranscriptReads?: boolean;
         }) {
           const parentThread = input.coordinator.childThread;
           const taskId = input.coordinator.task.nativeTaskRef?.nativeId;
@@ -5205,6 +5206,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               previous?.model !== model;
             const agentId = member.agentId;
             const readTranscript =
+              input.skipTranscriptReads !== true &&
               settled &&
               transcriptDir !== undefined &&
               agentId !== undefined &&
@@ -5214,7 +5216,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             // The CLI forwards nothing a member says, so every frame while it
             // runs reads what its transcript gained since the last one.
             const readLiveTranscript =
-              status === "running" && transcriptDir !== undefined && agentId !== undefined;
+              input.skipTranscriptReads !== true &&
+              status === "running" &&
+              transcriptDir !== undefined &&
+              agentId !== undefined;
             if (!changed && !readTranscript && !readLiveTranscript) continue;
 
             const nodeId = idAllocator.derive.nodeFromProviderItem({
@@ -5432,6 +5437,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               // Only the progress excerpt is left when the transcript says
               // nothing, read after its last writes had time to land.
               if (
+                input.skipTranscriptReads !== true &&
                 !textShown &&
                 !resultShown &&
                 member.result !== undefined &&
@@ -5541,6 +5547,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             { readonly type: "system"; readonly subtype: "task_notification" }
           >;
           readonly onlyIfRunningInRun?: RunId | null;
+          readonly deferWorkflowTranscripts?: boolean;
         }) {
           const registeredSubagent = (yield* Ref.get(sessionSubagentsByTaskId)).get(input.taskId);
           const existingSubagent =
@@ -5874,6 +5881,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             yield* projectClaudeWorkflowMembers({
               coordinator: subagent,
               workflow: workflowWithThreads,
+              skipTranscriptReads: input.deferWorkflowTranscripts === true,
             });
             if ((yield* Ref.get(sessionSubagentsByTaskId)).get(input.taskId) !== subagent) return;
           }
@@ -5935,6 +5943,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ordinal: resultItemOrdinal,
               now,
             });
+          }
+          if (workflowWithThreads !== undefined && input.deferWorkflowTranscripts === true) {
+            // Disposal publishes every member's terminal state before any file
+            // read. Enrichment cannot retain the shutdown/admission locks.
+            yield* projectClaudeWorkflowMembers({
+              coordinator: subagent,
+              workflow: workflowWithThreads,
+            }).pipe(
+              Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.claude-disposal-transcript-enrichment-failed", {
+                  taskId: input.taskId,
+                  cause,
+                }),
+              ),
+              Effect.forkIn(sessionScope),
+            );
           }
         });
 
@@ -6612,6 +6637,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly failure?: OrchestrationV2ProviderFailure;
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
+          readonly deferWorkflowTranscripts?: boolean;
         }) {
           yield* Effect.gen(function* () {
             input.context.acceptingSteers = false;
@@ -6656,6 +6682,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   taskId,
                   status: input.status === "failed" ? "failed" : "cancelled",
                   onlyIfRunningInRun: input.context.input.runId,
+                  deferWorkflowTranscripts: input.deferWorkflowTranscripts === true,
                 });
               }
             }
@@ -7055,6 +7082,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               context,
               status: interrupted ? "interrupted" : "failed",
               completedAt: yield* DateTime.now,
+              deferWorkflowTranscripts: failure !== undefined,
               ...(interrupted
                 ? {}
                 : {
@@ -7109,6 +7137,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 ? {}
                 : { workflowFrame: completion, result: completion.summary }),
               onlyIfRunningInRun: subagent.task.runId,
+              deferWorkflowTranscripts: failure !== undefined,
             });
           }
           yield* Ref.update(interruptedTurns, (current) => {
@@ -7548,23 +7577,33 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context.compactionWatchdogStop = null;
                     liveQuery.stopping = true;
                     yield* Ref.set(queryContext, null);
-                    // This path owns disposal after fencing. Stream exit can no
-                    // longer settle native tasks left running by earlier turns.
-                    yield* finalizeActiveTurnAfterQueryExit(
-                      liveQuery,
-                      undefined,
-                      makeProviderFailure({
-                        class: "provider_error",
-                        category: "transient",
-                        code: "compaction_no_progress",
-                        message: "Claude compaction made no progress for 5 min.",
-                      }),
-                    );
-                    yield* endSubagentCallsOfClosedQuery(liveQuery, "failed");
+                    // Close starts independently of both turn cleanup and
+                    // workflow transcript enrichment, including their failures.
                     yield* liveQuery.query.close.pipe(
                       Effect.timeout("10 seconds"),
                       Effect.ignore,
                       Effect.forkIn(sessionScope),
+                    );
+                    yield* Effect.gen(function* () {
+                      yield* finalizeActiveTurnAfterQueryExit(
+                        liveQuery,
+                        undefined,
+                        makeProviderFailure({
+                          class: "provider_error",
+                          category: "transient",
+                          code: "compaction_no_progress",
+                          message: "Claude compaction made no progress for 5 min.",
+                        }),
+                      );
+                      yield* endSubagentCallsOfClosedQuery(liveQuery, "failed");
+                    }).pipe(
+                      Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("orchestration-v2.claude-compaction-disposal-failed", {
+                          providerTurnId: context.providerTurnId,
+                          cause,
+                        }),
+                      ),
                     );
                     return 0;
                   }).pipe(turnControlLock.withPermits(1)),

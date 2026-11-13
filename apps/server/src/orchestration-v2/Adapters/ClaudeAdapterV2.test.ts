@@ -17028,6 +17028,128 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each([
+    "query exit",
+    "watchdog",
+    "watchdog close stalls",
+    "watchdog current workflow",
+  ] as const)("%s releases recovery while workflow transcript cleanup stalls", (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const digestStarted = yield* Deferred.make<void>();
+        const digestStopped = yield* Deferred.make<void>();
+        const releaseDigest = yield* Deferred.make<void>();
+        const closeStarted = yield* Deferred.make<void>();
+        const watchdog = mode !== "query exit";
+        const earlierRun = mode !== "watchdog current workflow";
+        let pauseDigest = false;
+        yield* Effect.gen(function* () {
+          const h = yield* makeWorkflowHarnessWithOptions({
+            close: (q) =>
+              Deferred.succeed(closeStarted, undefined).pipe(
+                Effect.andThen(mode === "watchdog close stalls" ? Effect.never : Queue.shutdown(q)),
+              ),
+            freshQueueOnReopen: true,
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("workflow-old"),
+            text: "Launch workflow",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(first);
+          yield* launchWorkflow({ harness: h, snapshotUuid: "workflow-snapshot" });
+          if (earlierRun) {
+            yield* h.offerAndWait(
+              makeResultFrame({ uuid: "workflow-launched", result: "Running in background" }),
+            );
+            yield* Queue.take(h.terminalReceipts);
+            yield* h.runtime.startTurn({
+              ...first,
+              runId: RunId.make("compaction"),
+              attemptId: RunAttemptId.make("compaction"),
+              providerTurnOrdinal: 2,
+            });
+          }
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: "compacting",
+              uuid: "compaction",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          pauseDigest = true;
+          if (watchdog) yield* TestClock.adjust("5 minutes");
+          else yield* Queue.shutdown(h.sdkMessages);
+          yield* Deferred.await(digestStarted);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          const next = {
+            ...first,
+            runId: RunId.make("recovery"),
+            attemptId: RunAttemptId.make("recovery"),
+            providerTurnOrdinal: 3,
+          };
+          const recovering = yield* h.runtime
+            .startTurn(next)
+            .pipe(Effect.timeoutOption("30 seconds"), Effect.forkScoped);
+          if (watchdog) yield* TestClock.adjust("30 seconds");
+          assert.isTrue(
+            Option.isSome(yield* Fiber.join(recovering)),
+            "recovery admission stayed blocked behind transcript cleanup",
+          );
+          if (watchdog) {
+            assert.isTrue(
+              Option.isSome(yield* Deferred.poll(closeStarted)),
+              "native close never started",
+            );
+            assert.isTrue(
+              Option.isSome(yield* Deferred.poll(digestStopped)),
+              "transcript enrichment was not bounded",
+            );
+            assert.equal(workflowCoordinatorEvents(h.events).at(-1)?.subagent.status, "failed");
+            for (const index of [1, 2])
+              assert.equal(workflowMemberEvents(h.events, index).at(-1)?.subagent.status, "failed");
+            assert.isFalse(yield* h.hasPendingBackgroundWork);
+          }
+          yield* Queue.offer(
+            h.processQueues[1]!,
+            makeResultFrame({ uuid: "recovery-result", result: "Recovered" }),
+          );
+          assert.equal((yield* Queue.take(h.terminalReceipts)).status, "completed");
+          assert.lengthOf(h.terminalEvents(), earlierRun ? 3 : 2);
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(releaseDigest, undefined)),
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fileSystem,
+            readDirectory: () => Effect.succeed([]),
+            readFileString: () => Effect.succeed(""),
+            exists: () => Effect.succeed(false),
+          }),
+          Effect.provideService(WorkflowAgentTranscriptReadObserver, () =>
+            Effect.gen(function* () {
+              if (!pauseDigest) return;
+              pauseDigest = false;
+              yield* Deferred.succeed(digestStarted, undefined);
+              yield* Deferred.await(releaseDigest).pipe(
+                Effect.ensuring(Deferred.succeed(digestStopped, undefined)),
+              );
+            }),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect.each(["terminal", "query exit"] as const)(
     "joins a stalled terminal once and preserves a replacement query's background roster: %s",
     (source) =>
