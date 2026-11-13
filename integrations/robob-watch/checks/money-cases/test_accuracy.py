@@ -26,7 +26,7 @@ class Accuracy(Base):
     def fire(self, n):
         return mc.run_check(self.wd, f'r{n}', self.data, self.root, at(f'2026-10-25T10:{n:02}'), finder(), nobody)
 
-    def test_unacked_closed_and_case_transitions_emit_once_across_three_fires(self):
+    def test_unacked_closure_and_unasked_case_emit_once_across_three_fires(self):
         q = self.seed()
         with mc.Locked(self.data, 'questions') as book:
             closed = mc.find_question(book, q['id'])
@@ -34,14 +34,15 @@ class Accuracy(Base):
             mc.settle(closed, 'receipt matched', 'check', at('2026-10-25T09:00'))
             second = mc.new_question(book, dict(mc.charge_of(q), amount='19.99'), '',
                                      at('2026-10-24T09:00'), at('2026-10-24T09:00'))
-            mc.case_from(self.data, second, at('2026-10-25T09:00'), 'check', self.root)
+            mc.case_from(self.data, second, at('2026-10-24T09:00'), 'check', self.root)
         events = [self.fire(n) for n in range(3)]
         self.assertEqual(sum('explained now' in e for e in events), 1)
-        self.assertEqual(sum("he didn't answer" in e for e in events), 1)
+        self.assertEqual(sum("he didn't answer" in e for e in events), 0)
+        self.assertEqual(sum("unasked charges older than 24 h" in e for e in events), 1)
         state = json.loads((self.wd / 'pings.json').read_text())
         self.assertEqual(state['sent'], {})
         self.assertIn(f'q|{q["id"]}|closed', state['built'])
-        self.assertIn(f'q|{second["id"]}|case', state['built'])
+        self.assertIn('daily-unasked|2026-10-25', state['built'])
         self.assertEqual(events[1:], ['', ''])
 
     def test_closed_case_cascades_and_repairs_old_questions(self):
@@ -110,11 +111,15 @@ class Accuracy(Base):
             with self.subTest(outcome=outcome):
                 self.data = self.tmp / f'repeat-{i}'
                 self.case(case_id='old', merchant='Acme Eats')
-                mc.close(self.data, 'old', outcome, at('2026-10-23T10:00'))
+                with mc.Locked(self.data) as book:
+                    mc.find(book, 'old')['asks'] = [{'at': '2026-10-22T09:00+04:00', 'question': 'old cycle'}]
+                mc.close(self.data, 'old', outcome, at('2026-10-23T10:00'), source='sms:closed')
                 q = self.seed()
                 case = mc.find(mc.load(self.data), 'old')
                 self.assertEqual((case['status'], case['cycle']), ('open', 1))
                 self.assertEqual(q['case'], 'old')
+                self.assertEqual(q['case_cycle'], 1)
+                self.assertEqual(case['asks'], [])
                 self.seed()
                 self.assertEqual(mc.find(mc.load(self.data), 'old')['cycle'], 1)
 

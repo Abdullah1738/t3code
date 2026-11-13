@@ -603,7 +603,7 @@ class Rules(Base):
         (self.wd / '.run-ok').write_text('r1')
         self.deliver('2026-10-26T10:00')
         # Delivery day 26 Oct: that is the one reminder for the day, so no second reminder today.
-        self.assertEqual(self.check('2026-10-26T11:00', 'r2'), '')
+        self.assertNotIn('acme:', self.check('2026-10-26T11:00', 'r2'))
         # The clock starts at delivery (26 Oct), so no yes/no on 27 Oct; it is due 28 Oct, two full days later.
         self.assertNotIn('Yes or no', self.check('2026-10-27T10:00', 'r3'))
         self.assertIn('Yes or no', self.check('2026-10-28T10:00', 'r4'))
@@ -865,8 +865,8 @@ class Questions(Base):
         self.assertEqual(r['verdict'], 'wait')
         self.assertEqual(self.follow('2026-10-25T09:00', finder(HISTORY)), '')
         event = self.follow('2026-10-25T12:00', finder(HISTORY))
-        self.assertIn('no receipt came while we waited', event)
-        self.assertIn(f"money-cases ask --id {self.questions()[0]['id']}", event)
+        self.assertIn('unasked charges older than 24 h', event)
+        self.assertIn('money-cases unasked --ask', event)
         self.assertEqual(self.follow('2026-10-25T12:15', finder(HISTORY), 'r2'), '')
 
     def screen(self, text, sender, when, now, item):
@@ -900,11 +900,11 @@ class Questions(Base):
         mc.triaged(self.data, [(a['id'], 'imsg:1', False)], at('2026-10-24T00:37'))
         self.assertEqual((self.questions()[0]['status'], self.questions()[0]['outcome']),
                          ('closed', 'already answered in a chat'))
-        # Held for a receipt and never raised: age cannot bypass the first-question queue.
+        # A never-raised charge still joins the daily list after the receipt wait.
         held = self.screen(ALERT.replace('12.34', '5.55'), BANK, '2026-10-23T23:47', '2026-10-23T23:48', 'imsg:2')
         event = self.follow('2026-10-31T09:00', finder())
         self.assertEqual(mc.find_question(mc.load_questions(self.data), held['id'])['status'], 'open')
-        self.assertIn('money-cases ask --id ' + held['id'], event)
+        self.assertIn('money-cases unasked --ask', event)
 
     def test_ask_on_an_open_pending_hold_keeps_the_wait_verdict(self):
         pending = 'Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit is AED 1'
