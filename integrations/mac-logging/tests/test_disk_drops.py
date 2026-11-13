@@ -126,6 +126,81 @@ class DiskDropTests(unittest.TestCase):
         self.assertEqual(p['grower1Name'], str(self.big/'dir1'))
         self.assertNotIn('grower6Name', p)
 
+    def test_new_child_directory_growth_coverage_matrix(self):
+        cases = (
+            ('complete', True, True), ('empty_parent', True, True),
+            ('other_root_failed', True, False), ('current_parent_partial', True, False),
+            ('previous_parent_partial', False, False), ('previous_missing', False, False),
+            ('previous_stale', False, False), ('previous_unknown_type', False, False),
+            ('previous_file', False, False), ('legacy_snapshot', False, False),
+            ('previous_zero', True, True), ('previous_bad_size', False, False),
+            ('invalid_snapshot_size', False, False),
+        )
+        for status, new_is_known, complete in cases:
+            with self.subTest(status=status):
+                self.inventory()
+                before = jobs.read_state('disk-inventory')
+                child = str(self.big/'new-directory')
+                if status == 'empty_parent':
+                    before['children'][str(self.big)] = {}
+                    before['childState'][str(self.big)] = {}
+                    before['sizes'][str(self.big)] = 0
+                elif status == 'previous_parent_partial':
+                    before['partials'][str(self.big)] = dict(partial=True)
+                    before['sourceErrors'] = 1
+                elif status == 'previous_missing':
+                    before = {}
+                elif status == 'previous_stale':
+                    before['at'] -= 7201
+                elif status == 'other_root_failed':
+                    before['sourceErrors'] = 1
+                    before['sizes'].pop(str(self.ext_root))
+                elif status in ('previous_unknown_type', 'previous_file'):
+                    before['children'][str(self.big)][child] = 2*GB
+                    before['childState'][str(self.big)][child] = dict(
+                        bytes=2*GB, at=before['at'], partial=False,
+                        isDirectory=False if status == 'previous_file' else None)
+                elif status in ('previous_zero', 'previous_bad_size'):
+                    size = 0 if status == 'previous_zero' else None
+                    before['children'][str(self.big)][child] = size
+                    before['childState'][str(self.big)][child] = dict(
+                        bytes=size, at=before['at'], partial=False, isDirectory=True)
+                jobs.save_state('disk-inventory', before)
+                self.sample()
+                if status in ('legacy_snapshot', 'invalid_snapshot_size'):
+                    state = jobs.read_state('disk')
+                    snapshot = state['freeInventory']['internalFreeGb']
+                    if status == 'legacy_snapshot':
+                        snapshot.pop('parentEntries', None)
+                    else:
+                        snapshot['sizes'][child] = None
+                    jobs.save_state('disk', state)
+                self.inventory()
+                after = jobs.read_state('disk-inventory')
+                after['children'][str(self.big)][child] = 15*GB
+                after['childState'][str(self.big)][child] = dict(
+                    bytes=15*GB, at=after['at'], partial=False, isDirectory=True)
+                existing = str(self.big/'dir1')
+                after['children'][str(self.big)][existing] += GB
+                after['childState'][str(self.big)][existing]['bytes'] += GB
+                if status == 'current_parent_partial':
+                    after['partials'][str(self.big)] = dict(partial=True)
+                    after['sourceErrors'] = 1
+                jobs.save_state('disk-inventory', after)
+                self.sample(84)
+                p = self.rows('disk.drop')[-1]['props']
+                self.assertEqual(p['deltaGb'], -16)
+                self.assertEqual(p['inventoryComplete'], complete)
+                growers = {p['grower%dName' % i]: p['grower%dBytes' % i]
+                           for i in range(1, 6) if 'grower%dName' % i in p}
+                if new_is_known:
+                    self.assertEqual(p['grower1Name'], child)
+                    self.assertEqual(growers[child], 15*GB)
+                else:
+                    self.assertNotIn(child, growers)
+                if status not in ('previous_missing', 'previous_stale', 'empty_parent'):
+                    self.assertEqual(growers[existing], GB)
+
     def test_unverified_or_deeper_children_mark_incomplete_without_names(self):
         for status in ('unknown_type', 'partial', 'stale', 'nested'):
             with self.subTest(status=status):
@@ -149,6 +224,26 @@ class DiskDropTests(unittest.TestCase):
                 p = self.rows('disk.drop')[-1]['props']
                 self.assertFalse(p['inventoryComplete'])
                 self.assertNotIn(child, [p.get('grower%dName' % i) for i in range(1, 6)])
+
+    def test_new_external_child_directory_uses_complete_parent_baseline(self):
+        with patch.object(self, 'big', self.external/'big-root'):
+            with patch.object(jobs, 'DIRECTORY_ROOTS', [self.big, self.ext_root]), \
+                 patch.object(jobs, 'BIG_ROOTS', {self.big}):
+                self.inventory()
+                self.sample()
+                self.inventory()
+                state = jobs.read_state('disk-inventory')
+                child = str(self.big/'new-directory')
+                state['children'][str(self.big)][child] = 15*GB
+                state['childState'][str(self.big)][child] = dict(
+                    bytes=15*GB, at=state['at'], partial=False, isDirectory=True)
+                jobs.save_state('disk-inventory', state)
+                self.sample(external=184)
+                p = self.rows('disk.drop')[-1]['props']
+                self.assertEqual(p['volume'], 'external')
+                self.assertTrue(p['inventoryComplete'])
+                self.assertEqual(p['grower1Name'], child)
+                self.assertEqual(p['grower1Bytes'], 15*GB)
 
     def test_missing_stale_partial_and_reused_inventory(self):
         for status in ('missing', 'stale', 'partial', 'reused'):

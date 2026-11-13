@@ -460,13 +460,14 @@ def drop_inventory(inventory, volume, now):
     children = children if isinstance(children, dict) else {}
     child_state = inventory.get('childState', {})
     child_state = child_state if isinstance(child_state, dict) else {}
-    candidates = {}
+    candidates, parent_entries = {}, {}
     roots = [p for p in DIRECTORY_ROOTS
              if p.is_relative_to('/Volumes/ExternalSSD') == (volume == 'external')]
     complete = bool(fresh and roots and inventory.get('sourceErrors') == 0 and not partials)
     for root in roots:
         key = str(root)
-        if not number(sizes.get(key)) or key in partials:
+        parent_complete = bool(fresh and number(sizes.get(key)) and key not in partials)
+        if not parent_complete:
             complete = False
         if root not in BIG_ROOTS:
             if fresh and key not in partials and number(sizes.get(key)):
@@ -484,10 +485,15 @@ def drop_inventory(inventory, volume, now):
                      and state.get('partial') is False and number(state.get('at'))
                      and 0 <= now-state['at'] <= 7200)
             if not valid:
-                complete = False
+                complete = parent_complete = False
             elif state['isDirectory']:
                 candidates[path] = size
-    return dict(at=at if fresh else None, sizes=candidates, complete=complete)
+        if parent_complete:
+            # Keep all entry names: a previous file at this path is not proof
+            # of absence, even though files are excluded from directory growers.
+            parent_entries[key] = list(measured)
+    return dict(at=at if fresh else None, sizes=candidates, complete=complete,
+                parentEntries=parent_entries)
 
 
 def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/ExternalSSD'), paths=None):
@@ -609,14 +615,26 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
                           and 0 <= sampled_at.timestamp()-before_at <= 7200 and before_at < after_at)
             before_sizes = before.get('sizes', {})
             before_sizes = before_sizes if isinstance(before_sizes, dict) else {}
-            growth = sorted(((path, size-before_sizes[path]) for path, size in current_inventory['sizes'].items()
-                             if comparable and number(before_sizes.get(path)) and size > before_sizes[path]),
-                            key=lambda item: (-item[1], item[0]))[:5]
+            parent_entries = before.get('parentEntries', {})
+            parent_entries = parent_entries if isinstance(parent_entries, dict) else {}
+            growth = []
+            growth_complete = bool(comparable)
+            if comparable:
+                for path, size in current_inventory['sizes'].items():
+                    old_size = before_sizes.get(path)
+                    entries = parent_entries.get(str(Path(path).parent))
+                    if path not in before_sizes and isinstance(entries, list) and path not in entries:
+                        old_size = 0
+                    if not number(old_size):
+                        growth_complete = False
+                    elif size > old_size:
+                        growth.append((path, size-old_size))
+            growth = sorted(growth, key=lambda item: (-item[1], item[0]))[:5]
             drop = dict(volume=prefix, deltaGb=props[key+'Delta'], windowS=props[prefix+'DeltaWindowS'],
                         deltaFromTs=props[prefix+'DeltaFromTs'],
                         purgeableGb=props.get(prefix+'PurgeableGb'),
                         localSnapshotCount=props.get(prefix+'LocalSnapshotCount'),
-                        inventoryComplete=bool(comparable and before.get('complete') is True
+                        inventoryComplete=bool(growth_complete and before.get('complete') is True
                                                and current_inventory['complete']))
             for i, (path, size) in enumerate(growth, 1):
                 drop['grower%dName' % i] = path

@@ -75,7 +75,11 @@ the two big roots, or the other tracked roots. File entries and deeper names
 are excluded. Fresh, fully measured child directories remain useful evidence
 when their parent scan is partial. `inventoryComplete=false` explicitly marks
 missing, stale, partial or reused inventory on either side; stale or reused
-snapshots supply no growers. These events never alert or launch extra scans.
+snapshots supply no growers. A newly created child directory has a zero baseline
+only when a prior complete parent entry set proves that path was absent.
+Partial inventories and older snapshots without that evidence remain unknown.
+An unknown directory baseline also makes the event incomplete.
+These events never alert or launch extra scans.
 
 ## Source events
 
