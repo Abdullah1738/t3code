@@ -855,6 +855,138 @@ class GuardTests(unittest.TestCase):
             with self.subTest(case='script-assigns-tmpdir', command=command):
                 self.assertEqual(self.classify(command), SCRIPT)
 
+    def repo_node_pin(self, init=None, select=None, wrapper=None):
+        """A temp HOME carrying a repo-node-pin chain shaped like the fork's."""
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        home = self.root / 'home'
+        helper = home / '.local/libexec/repo-node-pin'
+        (helper / 'pnpm-bin').mkdir(parents=True, exist_ok=True)
+        (helper / 'pnpm-bin/pnpm').write_text('#!/bin/sh\n')
+        (helper / 'bash-env.sh').write_text((source / 'bash-env.sh').read_text() if wrapper is None else wrapper)
+        (helper / 'init.sh').write_text((source / 'init.sh').read_text() if init is None else init)
+        (helper / 'select.py').write_text((source / 'select.py').read_text() if select is None else select)
+        (home / '.nvm/versions/node/v26.0.0/bin').mkdir(parents=True, exist_ok=True)
+        (home / '.nvm/versions/node/v26.0.0/bin/node').write_text('')
+        environment = {'HOME': str(home), 'BASH_ENV': str(helper / 'bash-env.sh'),
+                       'ROBOB_REPO_PREVIOUS_BASH_ENV': '', 'ROBOB_REPO_NODE_HELPER': '',
+                       'ROBOB_REPO_NODE_PYTHON': '', 'NVM_DIR': '', '_repo_node_added_node': '', 'ZDOTDIR': ''}
+        return home, helper, environment
+
+    def write_plain_subpath_fixture(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite'))
+        return ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                'offbox run --bg -- bash tmp/fixture.sh')
+
+    def test_inherited_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+            # The previous BASH_ENV may equal this one (init.sh's own guard).
+            with patch.dict(os.environ, {'ROBOB_REPO_PREVIOUS_BASH_ENV': environment['BASH_ENV'],
+                                         'ROBOB_REPO_NODE_HELPER': str(helper),
+                                         'ROBOB_REPO_NODE_PYTHON': '/opt/homebrew/bin/python3'}):
+                self.assertIsNone(self.classify(commands[0]))
+            self.assertIsNone(self.classify('bash -n tmp/fixture.sh'))
+            # Bindings the command sets are never inherited.
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'BASH_ENV=' + environment['BASH_ENV'] + ' ',
+                           'ENV=/tmp/preload.sh ', 'export BASH_ENV=/tmp/preload.sh; ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace ', 'HOME=/tmp/elsewhere ',
+                           'export HOME=/tmp/elsewhere; ', 'ROBOB_REPO_PREVIOUS_BASH_ENV=/tmp/preload.sh ',
+                           'ROBOB_REPO_NODE_HELPER=/tmp/helper ', 'ROBOB_REPO_NODE_PYTHON=/tmp/python ',
+                           'NVM_DIR=/tmp/nvm ', '_repo_node_added_node=/usr/bin ', 'unset HOME; ', 'env -u HOME '):
+                for wrapper in ('', 'offbox run -- ', 'offbox run --bg -- '):
+                    command = prefix + wrapper + 'bash tmp/fixture.sh'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+            # A command that rewrites the chain before running the fixture.
+            for writer in ("cat > " + str(helper / 'init.sh') + " <<'SH'\n:\nSH\n",
+                           "cp /tmp/evil.sh ~/.local/libexec/repo-node-pin/init.sh; ",
+                           "cp /tmp/evil.py " + str(home / '.nvm/versions/node/v26.0.0/bin/cat') + "; "):
+                with self.subTest(writer=writer):
+                    self.assertEqual(self.classify(writer + 'bash tmp/fixture.sh'), SCRIPT)
+
+    def test_inherited_bash_env_refusals(self):
+        commands = self.write_plain_subpath_fixture()
+        live_read = 'cat "' + LIVE + '"\n'
+        refusals = []
+
+        def chain(label, *, init=None, select=None, wrapper=None, environment=None, setup=None):
+            refusals.append((label, dict(init=init, select=select, wrapper=wrapper), environment or {}, setup))
+
+        chain('init-live-read', init=live_read)
+        chain('init-split-live-read', init='cat "$HOME/.ro""bob/userdata/state""v2.sqlite"\n')
+        chain('select-live-read', select='open(' + repr(LIVE) + ').read()\n')
+        chain('init-sources-live-reader', init='. "$HOME/reader.sh"\n',
+              setup=lambda home, helper: (home / 'reader.sh').write_text(live_read))
+        chain('init-sources-clean-file', init='if true; then source "$HOME/clean.sh"; fi\n',
+              setup=lambda home, helper: (home / 'clean.sh').write_text(':\n'))
+        chain('init-sources-unresolved', init='. "$UNRESOLVED"\n')
+        chain('wrapper-sources-unresolved', wrapper='. "$UNRESOLVED"\n')
+        chain('wrapper-extra-source', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '. "$HOME/x.sh"\n')
+        chain('wrapper-live-read', wrapper=live_read)
+        chain('previous-bash-env-live', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(live_read))
+        chain('previous-bash-env-clean', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(':\n'))
+        chain('bash-env-missing', setup=lambda home, helper: (helper / 'bash-env.sh').unlink())
+        chain('bash-env-directory', setup=lambda home, helper: ((helper / 'bash-env.sh').unlink(), (helper / 'bash-env.sh').mkdir()))
+        chain('init-missing', setup=lambda home, helper: (helper / 'init.sh').unlink())
+        chain('select-missing', setup=lambda home, helper: (helper / 'select.py').unlink())
+        if os.geteuid() != 0:
+            chain('bash-env-unreadable', setup=lambda home, helper: (helper / 'bash-env.sh').chmod(0))
+        chain('bash-env-elsewhere', environment={'BASH_ENV': '{home}/bash-env.sh'},
+              setup=lambda home, helper: (home / 'bash-env.sh').write_text((helper / 'bash-env.sh').read_text()))
+        chain('bash-env-unexpanded', environment={'BASH_ENV': '$HOME/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('bash-env-relative', environment={'BASH_ENV': 'home/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('node-helper-elsewhere', environment={'ROBOB_REPO_NODE_HELPER': '{home}'})
+        chain('node-python-elsewhere', environment={'ROBOB_REPO_NODE_PYTHON': '/tmp/python3'})
+        chain('nvm-shadows-cat', setup=lambda home, helper: (home / '.nvm/versions/node/v26.0.0/bin/cat').write_text(''))
+        chain('nvm-dir-shadows-mktemp', environment={'NVM_DIR': '{home}/other-nvm'},
+              setup=lambda home, helper: ((home / 'other-nvm/versions/node/v1.0.0/bin').mkdir(parents=True),
+                                          (home / 'other-nvm/versions/node/v1.0.0/bin/mktemp').write_text('')))
+        chain('pnpm-bin-shadows-rm', setup=lambda home, helper: (helper / 'pnpm-bin/rm').write_text(''))
+        chain('added-node-shadows-cp', environment={'_repo_node_added_node': '{home}/added'},
+              setup=lambda home, helper: ((home / 'added').mkdir(), (home / 'added/cp').write_text('')))
+        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.local/share/quint-guard/bin').mkdir(parents=True),
+                                                                      (home / '.local/share/quint-guard/bin/cat').write_text('')))
+        chain('helper-module-hijack', setup=lambda home, helper: (helper / 'json.py').write_text(''))
+        chain('helper-package-hijack', setup=lambda home, helper: ((helper / 're').mkdir(), (helper / 're/__init__.py').write_text('')))
+        chain('python-startup', environment={'PYTHONPATH': '/tmp'})
+        chain('env-also-set', environment={'ENV': '/tmp/preload.sh'})
+        chain('zdotdir-set', environment={'ZDOTDIR': '/tmp'})
+        chain('exported-function', environment={'BASH_FUNC_cd%%': '() { :; }'})
+        for label, files, extra, setup in refusals:
+            shutil_root = self.root / 'home'
+            if shutil_root.exists():
+                for path in sorted(shutil_root.rglob('*'), reverse=True):
+                    path.chmod(0o700) if path.is_dir() else path.chmod(0o600)
+                    path.rmdir() if path.is_dir() and not path.is_symlink() else path.unlink()
+            home, helper, environment = self.repo_node_pin(**files)
+            if setup:
+                setup(home, helper)
+            environment.update({name: value.replace('{home}', str(home)) for name, value in extra.items()})
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_real_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        # Drift in this Mac's installed chain should show up here first.
+        helper = Path.home() / '.local/libexec/repo-node-pin'
+        if not (helper / 'bash-env.sh').is_file():
+            self.skipTest('repo-node-pin is not installed')
+        commands = self.write_plain_subpath_fixture()
+        environment = {'BASH_ENV': str(helper / 'bash-env.sh'), 'ROBOB_REPO_PREVIOUS_BASH_ENV': '',
+                       'ROBOB_REPO_NODE_HELPER': '', 'ROBOB_REPO_NODE_PYTHON': '', 'ZDOTDIR': ''}
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
     def test_mktemp_fixture_plain_subpath_straight_line(self):
         for root in ('$T', '${T}'):
             # Keep a live-root marker so both cases exercise the source fallback.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import glob
 import json
 import os
 from pathlib import Path
@@ -254,6 +255,126 @@ def _trusted_fixture_tool(executable, name, directory):
         search.append(entry)
     resolved = shutil.which(name, path=os.pathsep.join(search))
     return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
+
+
+FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', 'mkfifo')
+# integrations/local-helpers/libexec/repo-node-pin/bash-env.sh, statement by statement.
+REPO_NODE_PIN_WRAPPER = (
+    'if [ -n "${ROBOB_REPO_PREVIOUS_BASH_ENV:-}" ] && [ "$ROBOB_REPO_PREVIOUS_BASH_ENV" != "${BASH_ENV:-}" ]; then',
+    '. "$ROBOB_REPO_PREVIOUS_BASH_ENV"',
+    'fi',
+    '. "${ROBOB_REPO_NODE_HELPER:-$HOME/.local/libexec/repo-node-pin}/init.sh"',
+)
+REPO_NODE_PIN_PYTHON = '/opt/homebrew/bin/python3'
+# select.py may move these harness guard dirs to the front of PATH.
+REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blockers',
+                         '.local/share/harness-hooks/coord-blockers', '.local/share/quint-guard/bin')
+REPO_NODE_PIN_COMMAND = re.compile(
+    r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|'
+    r'(?<![\w$])HOME\+?=|\bunset\b[^;&|\n]*\bHOME\b|-u\s*HOME\b')
+
+
+def _inherited_startup_safe(name, directory, command=None, bindings=None, written=()):
+    """Accept an inherited BASH_ENV only as this Mac's repo-node-pin wrapper.
+
+    Every agent shell here inherits it from ~/.zshenv. Its init.sh evals
+    select.py's output, which no static scan resolves, so the proof pins the
+    whole chain instead: the wrapper's exact statements, default helper and
+    Python locations, clean init.sh and select.py text, and no fixture tool
+    reachable through any PATH entry the chain can add or reorder. A binding
+    set by the command itself is never inherited and stays refused by callers.
+    """
+    value = os.environ.get(name, '')
+    home = os.environ.get('HOME', '')
+    if name != 'BASH_ENV' or not value or not home or not os.path.isabs(home) or str(Path.home()) != home:
+        return False
+    if any(other != 'BASH_ENV' and setting and STARTUP_ENV.fullmatch(other) for other, setting in os.environ.items()):
+        return False
+    if any(other.startswith('BASH_FUNC_') for other in os.environ) or os.environ.get('ZDOTDIR'):
+        return False
+    if bindings is not None and (bindings.get('HOME', home) != home or any(key != 'HOME' and REPO_NODE_PIN_COMMAND.search(key + '=') for key in bindings)):
+        return False
+    if command is not None and REPO_NODE_PIN_COMMAND.search(command):
+        return False
+    helper = os.path.join(home, '.local/libexec/repo-node-pin')
+    # Bash expands BASH_ENV before reading it.
+    if not os.path.isabs(value) or re.search(r'[$`~\\]', value):
+        return False
+    real_helper = os.path.realpath(helper)
+    if os.path.realpath(value) != os.path.join(real_helper, 'bash-env.sh'):
+        return False
+    if os.environ.get('ROBOB_REPO_PREVIOUS_BASH_ENV', '') not in {'', value}:
+        return False
+    if os.path.realpath(os.environ.get('ROBOB_REPO_NODE_HELPER') or helper) != real_helper:
+        return False
+    if (os.environ.get('ROBOB_REPO_NODE_PYTHON') or REPO_NODE_PIN_PYTHON) != REPO_NODE_PIN_PYTHON:
+        return False
+    nvm = os.environ.get('NVM_DIR') or os.path.join(home, '.nvm')
+    for remembered in written:
+        resolved = os.path.realpath(remembered)
+        if any(resolved == root or resolved.startswith(root + os.sep)
+               for root in (real_helper, os.path.realpath(nvm))):
+            return False
+    texts = {}
+    for part in ('bash-env.sh', 'init.sh', 'select.py'):
+        try:
+            with open(os.path.join(real_helper, part), 'rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
+                    return False
+                texts[part] = handle.read(MAX_SOURCE_BYTES + 1).decode('utf-8', errors='replace')
+        except OSError:
+            return False
+    statements = tuple(' '.join(line.split()) for line in texts['bash-env.sh'].splitlines()
+                       if line.strip() and not line.lstrip().startswith('#'))
+    if statements != REPO_NODE_PIN_WRAPPER:
+        return False
+    # select.py's reads take computed paths (fixed basenames under the cwd,
+    # NVM and Corepack dirs), which the Python reader proof cannot follow.
+    if any(_source_hit(texts[part], directory) for part in ('init.sh', 'select.py')):
+        return False
+    try:
+        # Shell words assembled from adjacent quoted pieces, as in fixtures.
+        if _fixture_shell_live(_heredocs(texts['init.sh'])[0]):
+            return False
+    except (ValueError, AmbiguousScript):
+        return False
+    # A file init.sh sources is outside the proof.
+    code = '\n'.join(line for line in texts['init.sh'].splitlines() if not line.lstrip().startswith('#'))
+    if re.search(r'(?:^|[;&|(){}`]|\$\(|\b(?:then|do|else)|\b(?:eval|exec|command|builtin)\s)\s*(?:\.|source)\s', code, re.M):
+        return False
+    # Python puts the script's directory first on sys.path, even with -S.
+    try:
+        entries = list(os.scandir(real_helper))
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.name == 'select.py':
+            continue
+        if entry.name == '__pycache__' or entry.name.endswith(('.py', '.pyc', '.so', '.pth')):
+            return False
+        try:
+            if entry.is_dir() and any(os.path.lexists(os.path.join(entry.path, init)) for init in ('__init__.py', '__init__.pyc')):
+                return False
+        except OSError:
+            return False
+    # Startup prepends Node and pnpm dirs, moves managed dirs forward and drops
+    # one Node entry, so no fixture tool may resolve differently in any order.
+    search = list(os.get_exec_path())
+    search += glob.glob(os.path.join(glob.escape(nvm), 'versions', 'node', '*', 'bin'))
+    search += [os.path.join(helper, 'pnpm-bin'), *(os.path.join(home, managed) for managed in REPO_NODE_PIN_MANAGED)]
+    added = os.environ.get('_repo_node_added_node', '')
+    if added:
+        search.append(added)
+    if any(not os.path.isabs(entry) for entry in search):
+        return False
+    for tool in FIXTURE_TOOLS:
+        trusted = {os.path.realpath(f'/bin/{tool}'), os.path.realpath(f'/usr/bin/{tool}')}
+        for entry in search:
+            candidate = os.path.join(entry, tool)
+            if os.path.lexists(candidate) and os.path.realpath(candidate) not in trusted:
+                return False
+    return True
 
 
 def _fixture_python_paths(tree, aliases, local_module):
@@ -833,7 +954,8 @@ def _fixture_setup(source):
 
 def _shell_fixture_source(source, directory):
     """Discount only paths rooted in single, literal mktemp assignments."""
-    if any(value and STARTUP_ENV.fullmatch(name) for name, value in os.environ.items()):
+    if any(value and STARTUP_ENV.fullmatch(name) and not (name == 'BASH_ENV' and _inherited_startup_safe(name, directory))
+           for name, value in os.environ.items()):
         return source
     try:
         stripped, _ = _heredocs(source)
@@ -1836,6 +1958,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     strings.add(name)
         return _fixture_python_readonly(source, tree=tree, pathlib_reads=True, data_helpers=True)
 
+    def inherited_startup_safe(name, directory):
+        return _inherited_startup_safe(name, directory, caller_command if caller_command is not None else command,
+                                       shell_values, written)
+
     def may_change_scripts(words, directory, stdin_sources=()):
         words = list(words)
         while words and (words[0] in {'do', 'then', 'else', 'if', '!'} or re.match(r'^[A-Za-z_]\w*=', words[0])):
@@ -1846,7 +1972,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
             if (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(words) == 3 and words[1] == '-n' and
                     not words[2].startswith('-') and not unsafe_bindings and
-                    not any(os.environ.get(name) or name in shell_values for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'}) and
+                    not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'}) and
                     not any(name.startswith('BASH_FUNC_') for name in os.environ)):
                 return False
             if re.fullmatch(r'python[\d.]*', binary):
@@ -2085,7 +2211,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                  os.path.basename(invocation[0]) == binary and invocation[1] == value and
                  _trusted_fixture_tool(invocation[0], binary, directory) and
                  not value.startswith(('~', '$')) and '\\\n' not in proof_command and '\\\r\n' not in proof_command and
-                 not any(os.environ.get(name) or name in shell_values for name in ('BASH_ENV', 'ENV')) and
+                 not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in ('BASH_ENV', 'ENV')) and
                  not any(name.startswith('BASH_FUNC_') for name in os.environ))
         if path in written:
             body, replaced = written[path]
