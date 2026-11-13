@@ -6,10 +6,300 @@ import json
 import io
 import os
 import tempfile
+from types import SimpleNamespace
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import order_tracker as t
+
+
+class BankChargeTest(unittest.TestCase):
+    BODY = ('Your Mashreq noon Card ending with 9546 was used for a purchase of AED 2,997.59 '
+            'at Noon 80038888 AE on 08-NOV-2026 08:50 PM.')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.root, self.watchers = base / 'tracker', base / 'watchers'
+        self.root.mkdir()
+        self.now = float(int(time.time()))
+        self.cfg = {'app': 'noon', 'order': 'FGB8NN4KUNY0L2A', 'watcher': 'order-noon-bank',
+                    'for': 'owner', 'chat': 'owner', 'total': 'AED 3,010.30',
+                    'placed_at': t.stamp(self.now - 3600), 'registered_at': t.stamp(self.now - 3600)}
+        self.folder = self.watchers / self.cfg['watcher']
+        self.folder.mkdir(parents=True)
+        self.record = self.root / 'orders' / (self.cfg['watcher'] + '.json')
+        t.write(self.record, self.cfg)
+        self.state_path = self.folder / 'order-tracker-state.json'
+        t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+        source = Path(t.__file__).resolve().parents[1] / 'robob-watch/checks/money-cases/charges.py'
+        with mock.patch.dict(os.environ, ORDER_WATCH_CHARGES=str(source)):
+            parser = t.order_bank_charge.load_charges()
+        self.assertIsNotNone(parser)
+        self.row = {'id': 515561, 'source': 'email', 'sender': 'MashreqAlerts@mashreq.com',
+                    'ts': self.now - 3540}
+        self.charges = SimpleNamespace(BANKS=parser.BANKS, Lookup=parser.Lookup, parse=parser.parse,
+                                      iso=parser.iso, day=parser.day, alert_text=mock.Mock(side_effect=parser.alert_text),
+                                      search=mock.Mock(return_value=[self.row]), show=mock.Mock(return_value=self.BODY))
+        self.result = {'status': 'delivered', 'whole_order_complete': True, 'errors': []}
+        self.loader = t.order_bank_charge.load_charges
+        for patch in (mock.patch.object(t, 'ROOT', self.root), mock.patch.object(t, 'WATCHERS', self.watchers),
+                      mock.patch.object(t, 'fetch', return_value=self.result),
+                      mock.patch.object(t.store, 'reconcile'), mock.patch.object(t, 'retire_terminal'),
+                      mock.patch.object(t.delivery_cards, 'safe_sync', return_value={'status': 'ready', 'link_health': 'ok'}),
+                      mock.patch.object(t.order_bank_charge, 'load_charges', return_value=self.charges)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tick(self, cfg=None, folder=None, now=None):
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, WATCH_DIR=str(folder or self.folder)), \
+             mock.patch.object(t.time, 'time', return_value=now or self.now), redirect_stdout(output):
+            t.check(cfg or self.cfg)
+        return json.loads(output.getvalue()) if output.getvalue() else None
+
+    def test_exact_match_stored_without_gap(self):
+        self.cfg['total'] = 'AED 2,997.59'
+        t.write(self.record, self.cfg)
+        wake = self.tick()
+        bank = wake['bank_charge']
+        self.assertEqual(bank, {'bank_amount': 'AED 2,997.59', 'bank_card_last4': '9546',
+                                'bank_msg_id': '515561', 'bank_charged_at': self.charges.iso(
+                                    t.dt.datetime.fromtimestamp(self.row['ts'], t.dt.timezone.utc))})
+        self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+        for path in (self.record, self.state_path):
+            self.assertEqual({key: t.read(path)[key] for key in bank}, bank)
+        self.assertEqual(self.charges.search.call_args.args, ('noon',))
+        kwargs = self.charges.search.call_args.kwargs
+        self.assertEqual(kwargs['n'], 20)
+        self.assertLessEqual(kwargs['deadline'], self.now + 10)
+
+    def test_hamper_gap_sent_once(self):
+        wake = self.tick()
+        gap = next(e for e in wake['events'] if e['kind'] == 'bank_amount_gap')
+        self.assertEqual((gap['order_total'], gap['bank_amount'], gap['gap'], gap['card']),
+                         ('AED 3,010.30', 'AED 2,997.59', 'AED 12.71', '9546'))
+        self.assertEqual(gap['message'], 'Bank charged AED 2,997.59 on card 9546; order total was AED 3,010.30 '
+                         '(gap AED 12.71). Say both numbers once; this alone is not proof of an overcharge or refund.')
+        self.assertIsNone(self.tick(now=self.now + 601))
+        self.charges.search.assert_called_once()
+        self.assertTrue(t.read(self.state_path)['bank_gap_sent'])
+
+    def test_no_bank_message_and_throttled_retry(self):
+        self.charges.search.return_value = []
+        wake = self.tick()
+        self.assertIsNone(wake['bank_charge'])
+        self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+        self.assertIsNone(self.tick(now=self.now + 599))
+        self.charges.search.assert_called_once()
+        # Terminal orders get a bank-only retry; provider delivery reads stop.
+        self.charges.search.return_value = [self.row]
+        wake = self.tick(now=self.now + 600)
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+        t.fetch.assert_called_once()
+
+    def test_unacceptable_bank_alerts(self):
+        cases = [('merchant', self.BODY.replace('Noon 80038888', 'Other 80038888'), self.row),
+                 ('decline', 'Transaction of AED 2,997.59 on your Card 9546 at Noon was declined', self.row),
+                 ('over two percent', self.BODY.replace('2,997.59', '2,900.00'), self.row),
+                 ('currency', self.BODY.replace('AED', 'USD'), self.row),
+                 ('sender', self.BODY, {**self.row, 'sender': 'noon@example.com'}),
+                 ('too early', self.BODY, {**self.row, 'ts': self.now - 4201}),
+                 ('too late', self.BODY, {**self.row, 'ts': self.now + 82801})]
+        for label, body, row in cases:
+            with self.subTest(label=label):
+                self.charges.search.return_value = [row]
+                self.charges.show.return_value = body
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                self.assertIsNone(self.tick()['bank_charge'])
+                self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_one_alert_cannot_be_claimed_by_two_orders(self):
+        self.tick()
+        other = {**self.cfg, 'order': 'other', 'watcher': 'order-noon-other'}
+        for key in t.order_bank_charge.FIELDS:
+            other.pop(key, None)
+        folder = self.watchers / other['watcher']
+        folder.mkdir()
+        path = self.root / 'orders' / (other['watcher'] + '.json')
+        t.write(path, other)
+        t.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+        self.assertIsNone(self.tick(other, folder)['bank_charge'])
+        self.assertNotIn('bank_msg_id', t.read(path))
+        self.charges.show.assert_called_once()
+
+    def test_scratch_watch_dir_updates_only_its_state(self):
+        scratch = Path(self.tmp.name) / 'scratch'
+        scratch.mkdir()
+        t.write(scratch / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+        before = self.record.read_bytes()
+        self.assertEqual(self.tick(folder=scratch)['bank_charge']['bank_msg_id'], '515561')
+        self.assertEqual(self.record.read_bytes(), before)
+        self.assertNotIn('bank_msg_id', self.cfg)
+        self.assertFalse((self.root / 'bank-charge.lock').exists())
+
+    def test_lookup_errors_and_missing_module_are_quiet(self):
+        for failure in ('missing', 'search', 'show'):
+            with self.subTest(failure=failure):
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                self.charges.search.side_effect = self.charges.Lookup('search unavailable') if failure == 'search' else None
+                self.charges.show.side_effect = self.charges.Lookup('show unavailable') if failure == 'show' else None
+                with mock.patch.object(t.order_bank_charge, 'load_charges', return_value=None if failure == 'missing' else self.charges):
+                    wake = self.tick()
+                self.assertIsNone(wake['bank_charge'])
+                self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+                if failure != 'missing':
+                    self.assertIn('unavailable', t.read(self.state_path)['bank_lookup_error'])
+                self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_missing_or_broken_parser_import(self):
+        # Exercise the loader itself, rather than the stub used for the polls.
+        for contents in (None, 'raise RuntimeError("broken import")'):
+            path = Path(self.tmp.name) / ('absent.py' if contents is None else 'broken.py')
+            if contents:
+                path.write_text(contents)
+            before = sys.path[:]
+            with mock.patch.dict(os.environ, ORDER_WATCH_CHARGES=str(path)):
+                self.assertIsNone(self.loader())
+            self.assertEqual(sys.path, before)
+
+    def test_claim_lock_is_nonblocking(self):
+        with (self.root / 'bank-charge.lock').open('a') as lock:
+            t.fcntl.flock(lock, t.fcntl.LOCK_EX | t.fcntl.LOCK_NB)
+            self.assertIsNone(self.tick()['bank_charge'])
+        self.charges.search.assert_called_once()
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_lookup_not_run_for_old_or_undelivered_order(self):
+        for status, age in [('preparing', 3600), ('delivered', 48 * 3600), ('cancelled', 3600)]:
+            with self.subTest(status=status, age=age):
+                self.cfg['placed_at'] = t.stamp(self.now - age)
+                self.result['status'] = status
+                t.write(self.state_path, {'primed': True, 'status': 'placed'})
+                self.tick()
+        self.charges.search.assert_not_called()
+
+    def test_small_gaps_are_recorded_without_an_event(self):
+        for total in ('AED 2,997.59', 'AED 2,998.59', 'AED 2,996.59'):
+            with self.subTest(total=total):
+                self.cfg['total'] = total
+                for key in t.order_bank_charge.FIELDS:
+                    self.cfg.pop(key, None)
+                t.write(self.record, self.cfg)
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                wake = self.tick()
+                self.assertEqual(wake['bank_charge']['bank_amount'], 'AED 2,997.59')
+                self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+
+    def test_closest_amount_then_time_and_ties(self):
+        self.cfg['total'] = 'AED 100.00'
+        for amounts, times, expected in [(['99.00', '100.00'], [0, 60], '2'),
+                                         (['99.00', '99.00'], [60, 0], '2'),
+                                         (['99.00', '101.00'], [0, 0], None),
+                                         (['98.00', '97.99'], [0, 0], '1')]:
+            with self.subTest(amounts=amounts, times=times):
+                rows = [{**self.row, 'id': str(i + 1), 'ts': self.now - 3600 + delta}
+                        for i, delta in enumerate(times)]
+                self.charges.search.return_value = rows
+                self.charges.show.side_effect = [self.BODY.replace('2,997.59', amount) for amount in amounts]
+                match, error = t.order_bank_charge.find(self.cfg, t.Decimal('100'), set(), self.charges, self.now + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match['bank_msg_id'] if match else None, expected)
+
+    def test_body_reads_bounded_and_chat_body_selected(self):
+        self.charges.search.return_value = [{**self.row, 'id': i + 1, 'source': 'sms'} for i in range(20)]
+        self.charges.show.return_value = '> 1 2026-11-08 20:51 Mashreq: ' + self.BODY
+        match, error = t.order_bank_charge.find(self.cfg, t.Decimal('3010.30'), set(), self.charges, self.now + 10)
+        self.assertIsNone(error)
+        self.assertIsNone(match)  # Same amount and time across six different alerts is ambiguous.
+        self.assertEqual(self.charges.show.call_count, 6)
+        self.assertEqual(self.charges.alert_text.call_count, 6)
+
+    def test_expired_budget_makes_no_lookup(self):
+        match, error = t.order_bank_charge.find(self.cfg, t.Decimal('3010.30'), set(), self.charges, self.now - 1)
+        self.assertIsNone(match)
+        self.assertIn('out of time', error)
+        self.charges.search.assert_not_called()
+
+    def test_provider_fetch_leaves_less_bank_budget(self):
+        # Fetch already spent 48 seconds of the poll's 60-second allowance.
+        with mock.patch.object(t.time, 'time', return_value=self.now + 48):
+            events = t.bank_charge_events(self.cfg, self.result, {'status': 'delivered'}, self.folder,
+                                         self.now, min(t.time.time() + 10, self.now + 50))
+        self.assertTrue(events)
+        self.assertEqual(self.charges.search.call_args.kwargs['deadline'], self.now + 50)
+
+    def test_registration_prime_defers_bank_claim_until_scheduled_check(self):
+        with mock.patch.dict(os.environ, WATCH_RUN='prime-fixture'):
+            wake = self.tick()
+        self.assertIsNone(wake['bank_charge'])
+        self.charges.search.assert_not_called()
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+        wake = self.tick()
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+
+    def test_saved_claim_recovers_gap_after_interrupted_state_save(self):
+        self.tick()
+        # The order record was saved, but this watcher state predates the claim.
+        t.write(self.state_path, {'primed': True, 'status': 'delivered'})
+        wake = self.tick(cfg=t.read(self.record))
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+        self.assertIsNone(self.tick(cfg=t.read(self.record)))
+        self.charges.search.assert_called_once()
+
+    def test_retirement_preserves_claim_from_an_older_config_snapshot(self):
+        stale = dict(self.cfg)
+        self.tick()
+        with mock.patch.object(t, 'run', return_value=''):
+            t.retire(stale, self.record)
+        saved = t.read(self.record)
+        self.assertFalse(saved['active'])
+        self.assertEqual(saved['bank_msg_id'], '515561')
+        self.assertEqual(saved['bank_amount'], 'AED 2,997.59')
+
+    def test_claim_is_rechecked_after_lookup_before_saving(self):
+        def show(*args, **kwargs):
+            t.write(self.root / 'orders' / 'another-order.json', {'bank_msg_id': '515561'})
+            return self.BODY
+        self.charges.show.side_effect = show
+        self.assertIsNone(self.tick()['bank_charge'])
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_date_search_covers_full_timestamp_window(self):
+        # msgs --until is exclusive midnight; the following date must be searched
+        # even when the order or the alert straddles Dubai midnight.
+        cases = [('2026-11-08T23:55:00+04:00', '2026-11-09T00:01:00+04:00'),
+                 ('2026-11-08T12:00:00+04:00', '2026-11-09T11:59:00+04:00'),
+                 ('2026-11-08T00:05:00+04:00', '2026-11-07T23:56:00+04:00'),
+                 ('2026-11-08T19:55:00Z', '2026-11-08T20:01:00Z')]
+        for placed, charged in cases:
+            with self.subTest(placed=placed, charged=charged):
+                row = {**self.row, 'ts': t.epoch(charged)}
+                def search(query, since, until, **kwargs):
+                    date = self.charges.day(t.dt.datetime.fromisoformat(charged.replace('Z', '+00:00')))
+                    return [row] if since <= date < until else []
+                self.charges.search.side_effect = search
+                match, error = t.order_bank_charge.find({**self.cfg, 'placed_at': placed}, t.Decimal('3010.30'),
+                                                        set(), self.charges, time.time() + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match['bank_msg_id'], '515561')
+
+    def test_merchant_tokens_and_separators(self):
+        cases = [('noon', 'Noon 80038888 AE', True), ('noon', 'NOON.COM AE', True),
+                 ('noon', 'NOON*FOOD AE', True), ('noon', 'NOON-FOOD AE', True),
+                 ('noon', 'NOON_FOOD AE', True), ('noon', 'AFTERNOON CAFE AE', False),
+                 ('noon', 'NOONISH CAFE AE', False), ('noon', 'NOON2 CAFE AE', False),
+                 ('careem', 'CAREEM*FOOD AE', True), ('careem', 'MYCAREEM CAFE AE', False),
+                 ('amazon', 'AMAZON.AE', True), ('amazon', 'AMAZONIAN BOOKS AE', False),
+                 ('talabat', 'TALABAT.COM AE', True), ('talabat', 'TALABATI CAFE AE', False)]
+        for app, merchant, accepted in cases:
+            with self.subTest(app=app, merchant=merchant):
+                self.charges.show.return_value = self.BODY.replace('Noon 80038888 AE', merchant)
+                match, error = t.order_bank_charge.find({**self.cfg, 'app': app}, t.Decimal('3010.30'),
+                                                        set(), self.charges, time.time() + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match is not None, accepted)
 
 
 class TrackerTest(unittest.TestCase):
