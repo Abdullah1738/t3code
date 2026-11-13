@@ -310,7 +310,7 @@ def telegram(session):
         result = subprocess.run([
             str(HOME / ".bun/bin/bun"), str(HOME / ".local/share/telegram-bridge/src/cli.ts"),
             "notify", "--source", "offbox monitor", "--severity", "attention", "--text", text,
-            "--key", "offbox-monitor:" + session], stdin=subprocess.DEVNULL, capture_output=True,
+            "--key", "offbox-monitor:" + session, "--burst-key", "pressure"], stdin=subprocess.DEVNULL, capture_output=True,
             text=True, timeout=40, env=env)
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):

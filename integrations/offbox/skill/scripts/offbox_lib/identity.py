@@ -133,12 +133,13 @@ def opencode_session(ses: str) -> dict | None:
         return None
 
 
-def telegram(text: str, key: str, severity: str = "info") -> bool:
+def telegram(text: str, key: str, severity: str = "info", burst_key: str | None = None) -> bool:
     env = dict(os.environ)
     env.pop("BUN_INSPECT", None)
     try:
         p = subprocess.run([BUN, TG_CLI, "notify", "--source", "offbox", "--severity", severity,
-                            "--text", text[:4000], "--key", key[:200]],
+                            "--text", text[:4000], "--key", key[:200],
+                            *(["--burst-key", burst_key] if burst_key else [])],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
         ok = p.returncode == 0
     except Exception:  # noqa: BLE001
