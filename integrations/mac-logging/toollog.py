@@ -14,14 +14,17 @@ CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
-BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError'}
+NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
+BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
+NULLABLE.add('inventoryAgeS')
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
+TEXT.add('failure')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
@@ -44,7 +47,7 @@ def safe_fields(values):
     return result
 
 
-def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, props=None, error_tag=None):
+def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None):
     if kind not in ('event', 'perf', 'error') or not re.fullmatch(r'[a-z][a-z0-9_.-]{0,79}', name):
         raise ValueError('invalid event')
     if not re.fullmatch(r'[a-z][a-z0-9_-]{0,39}', component):
@@ -60,8 +63,14 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         if clean:
             row[key] = clean
     if error_tag and re.fullmatch(r'[a-z][a-z0-9_.-]{0,79}', error_tag):
-        # Stable messages only; exception text and subprocess output may contain credentials.
-        row['error'] = dict(tag=error_tag, message=error_tag)
+        message = error_tag
+        # Only source adapters opt in with stderr or filesystem errors. Never
+        # accept command stdout, report contents or arbitrary exception text.
+        if name in ('disk.inventory.source', 'crash.source') and isinstance(error_message, str):
+            lines = error_message.strip().splitlines()
+            if lines:
+                message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
+        row['error'] = dict(tag=error_tag, message=message)
     return row
 
 
@@ -74,10 +83,10 @@ def append(fd, row):
     os.write(fd, (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode())
 
 
-def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, now=None):
+def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None, now=None):
     try:
         now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-        row = record(component, kind, name, now, duration_ms, ok, ids, props, error_tag)
+        row = record(component, kind, name, now, duration_ms, ok, ids, props, error_tag, error_message)
         root = directory()
         private_dir(root)
         day = now.date().isoformat()
