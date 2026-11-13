@@ -60,6 +60,7 @@ export const liveThreadShell = (
 };
 
 export const liveThreadsLayer = Layer.mock(ThreadManagement.ThreadManagementService)({
+  getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
   getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
 });
 

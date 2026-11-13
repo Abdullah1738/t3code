@@ -404,6 +404,7 @@ export interface ThreadManagementServiceShape {
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
   >;
+  readonly getCallerRow: Orchestrator.OrchestratorV2["Service"]["getCallerRow"];
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly listProjectThreads: (input: {
     readonly projectId: ProjectId;
@@ -1522,6 +1523,7 @@ const make = Effect.gen(function* () {
     getProjectThread,
     getShellSnapshot: orchestrator.getShellSnapshot,
     readShellSnapshot: orchestrator.readShellSnapshot,
+    getCallerRow: orchestrator.getCallerRow,
     getThreadShell: orchestrator.getThreadShell,
     listProjectThreads,
     sendToThread,

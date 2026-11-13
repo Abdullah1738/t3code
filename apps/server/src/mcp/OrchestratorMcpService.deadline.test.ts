@@ -62,6 +62,10 @@ it.effect.each([
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: () =>
+              stage === "caller"
+                ? snapshot.pipe(Effect.as(liveThreadShell(parent)))
+                : Effect.succeed(liveThreadShell(parent)),
             getThreadShell: () =>
               stage === "caller"
                 ? snapshot.pipe(Effect.as(liveThreadShell(parent)))
@@ -110,7 +114,11 @@ it.effect.each([
           if (cancelling !== undefined) yield* Fiber.join(cancelling);
           else {
             const result = yield* Fiber.join(reading);
-            assert.deepEqual(result, { taskId: NodeId.make("node:review516"), partial: true });
+            assert.deepEqual(result, {
+              taskId: NodeId.make("node:review516"),
+              partial: true,
+              ...(stage === "records" ? { callerResolved: true } : {}),
+            });
           }
           yield* Deferred.await(finalized);
           // A fresh BEGIN on the same reader fails if cancellation stranded its transaction.

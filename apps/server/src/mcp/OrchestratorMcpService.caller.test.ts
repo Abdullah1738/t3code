@@ -88,6 +88,7 @@ it.effect("capabilities and listings read caller limits and selection without an
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: () => Effect.succeed(shell),
           getThreadShell: () => Effect.succeed(shell),
           getThreadRecords: () =>
             Effect.sync(() => {
@@ -124,6 +125,15 @@ it.effect.each(["missing", "deleted"] as const)(
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: () =>
+            Effect.succeed(
+              state === "missing"
+                ? null
+                : {
+                    ...liveThreadShell(callerId),
+                    deletedAt: liveThreadShell(callerId).createdAt,
+                  },
+            ),
           getThreadShell: () =>
             Effect.succeed(
               state === "missing"
@@ -146,6 +156,7 @@ it.effect("reading an unrelated target does not load caller records", () =>
   }).pipe(
     Effect.provide(
       layer({
+        getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
         getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
         getThreadRecords: (id) => Effect.die(`Unexpected record read: ${id}`),
         getProjectThreadRecords: ({ threadId }, fields) => {
@@ -172,6 +183,7 @@ it.effect.each(["foreign", "native"] as const)(
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
           getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
           getThreadRecords: (id, fields) => {
             assert.equal(id, callerId);
@@ -208,6 +220,8 @@ it.effect("bounds a stalled caller shell before loading any records", () =>
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
           getThreadShell: () =>
             Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
         }),
@@ -224,9 +238,8 @@ it.effect.each(["self", "other"] as const)("loads the full scoped target only fo
       const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
       const result = yield* mcp.waitForThread(scope, { threadId: id });
       assert.equal(result.status, "idle");
-      assert.deepEqual(
-        recordReads,
-        target === "self"
+      assert.deepEqual(recordReads, [
+        ...(target === "self"
           ? [
               [
                 "runs",
@@ -239,11 +252,13 @@ it.effect.each(["self", "other"] as const)("loads the full scoped target only fo
                 "turnItems",
               ],
             ]
-          : [],
-      );
+          : []),
+        ["runs"],
+      ]);
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (threadId, fields) => {
             recordReads.push(Array.from(fields, String));
@@ -308,6 +323,7 @@ it.effect.each([0, 3])(
         Effect.provide(
           layer(
             {
+              getCallerRow: () => Effect.succeed(shell),
               getThreadShell: () => Effect.succeed(shell),
               getThreadRecords: (id, fields) => {
                 assert.equal(id, callerId);
@@ -374,6 +390,7 @@ it.effect.each([
     }).pipe(
       Effect.provide(
         layer({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
           getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
           getProjectThreadRecords: () => Effect.succeed(projection),
           getThreadRecords: (id) => Effect.die(`Unexpected acknowledgement records for ${id}`),

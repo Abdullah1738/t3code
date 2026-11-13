@@ -311,6 +311,7 @@ it.effect.each([
     Effect.provide(
       probeServer(
         Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
           getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
         }),
       ),
@@ -345,6 +346,8 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
     Effect.provide(
       probeServer(
         Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: (threadId) =>
+            Effect.fail(new OrchestratorProjectionError({ threadId, cause: "unreadable" })),
           getThreadShell: (threadId) =>
             Effect.fail(new OrchestratorProjectionError({ threadId, cause: "unreadable" })),
         }),
@@ -392,8 +395,12 @@ it.effect.each(["caller", "target"] as const)(
         }),
       );
       const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+        getCallerRow: (id) =>
+          blocked === "caller"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(liveThreadShell(id)),
         getThreadShell: (id) =>
-          id === (blocked === "caller" ? fullAccessThreadId : target)
+          blocked === "target" && id === target
             ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
             : Effect.succeed(liveThreadShell(id)),
       });
@@ -423,6 +430,7 @@ it.effect("actsAsCaller returns caller_unresolved when the caller shell read sta
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getCallerRow: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
       getThreadShell: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
     });
     const result = yield* call("acts_as_caller", fullAccess).pipe(

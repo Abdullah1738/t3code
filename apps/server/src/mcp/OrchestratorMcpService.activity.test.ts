@@ -39,7 +39,7 @@ import type * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
-it.effect.each(["caller", "idle target", "dispatch"] as const)(
+it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as const)(
   "bounds thread sends waiting on %s before saving",
   (blocked) =>
     Effect.gen(function* () {
@@ -51,8 +51,10 @@ it.effect.each(["caller", "idle target", "dispatch"] as const)(
         Layer.provide(
           Layer.mergeAll(
             Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getCallerRow: (id) =>
+                blocked === "caller row" ? wait : Effect.succeed(liveThreadShell(id)),
               getThreadRecords: (id) =>
-                blocked === "caller" ? wait : Effect.succeed(projection(id)),
+                blocked === "caller records" ? wait : Effect.succeed(projection(id)),
               getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
               getProjectThreadRecords: ({ threadId }) =>
                 blocked === "idle target" ? wait : Effect.succeed(projection(threadId)),
@@ -81,13 +83,16 @@ it.effect.each(["caller", "idle target", "dispatch"] as const)(
           })
           .pipe(Effect.result, Effect.forkChild);
         yield* Deferred.await(entered);
-        yield* TestClock.adjust("15 seconds");
+        yield* TestClock.adjust(blocked === "caller row" ? "10 seconds" : "15 seconds");
         const result = yield* Fiber.join(send);
         expect(result).toMatchObject({
           _tag: "Failure",
-          failure: { code: "send_timeout" },
+          failure: { code: blocked === "caller row" ? "caller_unresolved" : "send_timeout" },
         });
-        if (result._tag === "Failure") expect(result.failure.message).toContain("not save");
+        if (result._tag === "Failure")
+          expect(result.failure.message).toContain(
+            blocked === "caller row" ? "Nothing was saved" : "not save",
+          );
         expect(sends).toBe(blocked === "dispatch" ? 1 : 0);
       }).pipe(Effect.provide(layer));
     }),
@@ -208,6 +213,12 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
             threadId === parentThreadId
               ? Effect.succeed(projection)
               : Effect.die(`unexpected thread ${threadId}`),
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === parentThreadId
+                ? (projection.thread as unknown as OrchestrationV2ThreadShell)
+                : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -281,6 +292,12 @@ it("readThread prefers waiting activity status over a newer cancelled queued run
             threadId === parentThreadId
               ? Effect.succeed(projection)
               : Effect.die(`unexpected thread ${threadId}`),
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === parentThreadId
+                ? (projection.thread as unknown as OrchestrationV2ThreadShell)
+                : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -481,6 +498,7 @@ it.each([
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           delegatedTaskResultPending: () => Effect.succeed(false),
           getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
@@ -605,6 +623,22 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));
             return Effect.die(`unexpected thread ${threadId}`);
           },
+          getCallerRow: (threadId) =>
+            Effect.succeed(
+              threadId === foreignThreadId
+                ? ({
+                    ...liveThreadShell(threadId),
+                    ...foreignProjection(threadId).thread,
+                  } as OrchestrationV2ThreadShell)
+                : threadId === parentThreadId
+                  ? (parentShell ?? {
+                      ...liveThreadShell(parentThreadId, {
+                        activeRunId: parentRuns.length > 0 ? RunId.make("run-parent-live") : null,
+                      }),
+                      ...parentProjection.thread,
+                    })
+                  : null,
+            ),
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
@@ -828,6 +862,12 @@ it.each(["missing-session", "capability", "replay"] as const)(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              Effect.succeed(
+                threadId === targetThreadId
+                  ? (targetProjection.thread as unknown as OrchestrationV2ThreadShell)
+                  : liveThreadShell(parentThreadId),
+              ),
             getThreadShell: (threadId) =>
               Effect.succeed(
                 threadId === targetThreadId
@@ -949,6 +989,7 @@ it("readThread exposes the stored sender thread only for thread-sent messages", 
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: () => Effect.succeed(shell),
           getThreadShell: () => Effect.succeed(shell),
           getThreadRecords: () => Effect.succeed(projection),
           getProjectThreadRecords: () => Effect.succeed(projection),

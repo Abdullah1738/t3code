@@ -1,4 +1,6 @@
 import * as McpDeadline from "./McpDeadline.ts";
+import { readCallerIdentity } from "./callerIdentity.ts";
+import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
@@ -232,6 +234,8 @@ export class OrchestratorMcpService extends Context.Service<
   OrchestratorMcpService,
   OrchestratorMcpServiceShape
 >()("t3/mcp/OrchestratorMcpService") {}
+
+type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
 
@@ -1249,16 +1253,17 @@ const make = Effect.gen(function* () {
 
   const loadCallerShell = Effect.fn("OrchestratorMcpService.loadCallerShell")(function* (
     threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId | undefined,
   ) {
-    const thread = yield* threadManagement
-      .getThreadShell(threadId)
-      .pipe(Effect.mapError(threadManagementFailure), (effect) =>
+    const thread = yield* readCallerIdentity(threadManagement, threadId, providerInstanceId).pipe(
+      Effect.mapError(threadManagementFailure),
+      (effect) =>
         McpDeadline.withDeadline(effect, { code: "caller_unresolved", threadId, stage: "caller" }),
-      );
+    );
     if (thread === null || thread.deletedAt !== null) {
       return yield* failure("thread_not_found", "The calling thread was not found.");
     }
-    return { thread: { ...thread, lastVisitedAt: thread.lastVisitedAt ?? null } };
+    return { thread };
   });
 
   const loadCaller = Effect.fn("OrchestratorMcpService.loadCaller")(function* (
@@ -1274,7 +1279,7 @@ const make = Effect.gen(function* () {
         } satisfies { runtimeMode: RuntimeMode; interactionMode: ProviderInteractionMode },
       } as const;
     }
-    const parent = yield* loadCallerShell(scope.thread.threadId);
+    const parent = yield* loadCallerShell(scope.thread.threadId, scope.thread.providerInstanceId);
     return {
       parent,
       limits: {
@@ -1290,12 +1295,15 @@ const make = Effect.gen(function* () {
   ) {
     yield* requireCapability(scope);
     const threadScope = yield* requireThreadScope(scope, operation);
-    const parent = yield* loadCallerShell(threadScope.thread.threadId);
+    const parent = yield* loadCallerShell(
+      threadScope.thread.threadId,
+      threadScope.thread.providerInstanceId,
+    );
     return { scope: threadScope, parent } as const;
   });
 
   const resolveProjectTarget = (
-    parent: Pick<OrchestrationV2ThreadProjection, "thread"> | undefined,
+    parent: CallerParent | undefined,
     projectId: ProjectId | undefined,
   ) =>
     projectId !== undefined
@@ -1348,8 +1356,8 @@ const make = Effect.gen(function* () {
    */
   const assertLiveCallerForOtherThread = (
     scope: McpInvocationScope,
-    parent: Pick<OrchestrationV2ThreadProjection, "thread"> | undefined,
-    target: Pick<OrchestrationV2ThreadProjection, "thread">,
+    parent: CallerParent | undefined,
+    target: CallerParent,
   ) =>
     parent === undefined || target.thread.id === parent.thread.id
       ? Effect.void
@@ -1357,7 +1365,7 @@ const make = Effect.gen(function* () {
 
   const assertLiveCallerForOtherProject = (
     scope: McpInvocationScope,
-    parent: Pick<OrchestrationV2ThreadProjection, "thread"> | undefined,
+    parent: CallerParent | undefined,
     projectId: ProjectId,
   ) =>
     parent === undefined || projectId === parent.thread.projectId
@@ -1366,7 +1374,7 @@ const make = Effect.gen(function* () {
 
   const assertLiveCaller = Effect.fn("OrchestratorMcpService.assertLiveCaller")(function* (
     scope: McpInvocationScope,
-    parent: Pick<OrchestrationV2ThreadProjection, "thread">,
+    parent: CallerParent,
   ) {
     const notActive = failure(
       "parent_not_active",
@@ -1376,8 +1384,18 @@ const make = Effect.gen(function* () {
     const activeRun = ThreadManagementService.latestActiveRun(records);
     if (parent.thread.archivedAt === null && activeRun === undefined) {
       // Decide from this one fresh snapshot: a run may have started since `parent` was read.
-      return yield* threadManagement.getThreadShell(parent.thread.id).pipe(
+      return yield* readCallerIdentity(
+        threadManagement,
+        parent.thread.id,
+        scope.thread?.providerInstanceId,
+      ).pipe(
         Effect.mapError(threadManagementFailure),
+        (effect) =>
+          McpDeadline.withDeadline(effect, {
+            code: "caller_unresolved",
+            threadId: parent.thread.id,
+            stage: "caller",
+          }),
         Effect.flatMap((shell) =>
           isLiveCallerShell(shell, scope.thread?.providerInstanceId)
             ? Effect.void
@@ -1426,7 +1444,7 @@ const make = Effect.gen(function* () {
    * Re-probe the requested instance once before refusing it.
    */
   const assertTargetEnabledForProject = (
-    parent: Pick<OrchestrationV2ThreadProjection, "thread">,
+    parent: CallerParent,
     commandId: CommandId,
     target: ResolvedTarget,
   ) =>
@@ -1467,7 +1485,7 @@ const make = Effect.gen(function* () {
   };
 
   const resolveTarget = Effect.fn("OrchestratorMcpService.resolveTarget")(function* (input: {
-    readonly parent: Pick<OrchestrationV2ThreadProjection, "thread">;
+    readonly parent: CallerParent;
     readonly target: OrchestratorMcpTarget | undefined;
     readonly providers: ReadonlyArray<ServerProvider>;
     readonly delegateSelection?: boolean;
@@ -2279,7 +2297,7 @@ const make = Effect.gen(function* () {
     function* (
       scope: McpInvocationScope,
       caller: {
-        readonly parent: Pick<OrchestrationV2ThreadProjection, "thread"> | undefined;
+        readonly parent: CallerParent | undefined;
         readonly limits: {
           readonly runtimeMode: RuntimeMode;
           readonly interactionMode: ProviderInteractionMode;
@@ -2945,11 +2963,14 @@ const make = Effect.gen(function* () {
       let partial: Omit<Partial<OrchestratorMcpDelegateTaskResult>, "partial"> & {
         taskId: NodeId;
         partial: true;
+        callerResolved?: true;
       } = { taskId, partial: true };
       const read = Effect.gen(function* () {
-        const caller = yield* threadManagement
-          .getThreadShell(scope.thread.threadId)
-          .pipe(Effect.mapError(threadManagementFailure));
+        const caller = yield* readCallerIdentity(
+          threadManagement,
+          scope.thread.threadId,
+          scope.thread.providerInstanceId,
+        ).pipe(Effect.mapError(threadManagementFailure));
         if (caller === null || caller.deletedAt !== null)
           return yield* failure("thread_not_found", "The calling thread was not found.");
         if (!isLiveCallerShell(caller, scope.thread.providerInstanceId))
@@ -2957,6 +2978,7 @@ const make = Effect.gen(function* () {
             "parent_not_active",
             "The calling provider no longer owns an active thread run.",
           );
+        partial = { ...partial, callerResolved: true };
         return yield* readTask(scope, taskId, false, "background", undefined, (progress) => {
           partial = { ...partial, ...progress, partial: true };
         });
